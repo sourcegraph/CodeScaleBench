@@ -62,11 +62,9 @@ Each benchmark directory contains:
 
 ## Metrics Extraction Pipeline
 
-The `ralph/scripts/` directory contains a stdlib-only Python 3.10+ pipeline for extracting deterministic metrics from Harbor run output:
+The `scripts/` directory contains a stdlib-only Python 3.10+ pipeline for extracting deterministic metrics from Harbor run output:
 
 ```bash
-cd ralph/
-
 # Generate evaluation report from Harbor runs
 python3 scripts/generate_eval_report.py \
   --runs-dir /path/to/runs/official/ \
@@ -75,7 +73,7 @@ python3 scripts/generate_eval_report.py \
 # Generate LLM judge context files
 python3 -m scripts.ccb_metrics.judge_context \
   --runs-dir /path/to/runs/official/ \
-  --benchmarks-dir ../benchmarks/ \
+  --benchmarks-dir ./benchmarks/ \
   --output-dir ./judge_contexts/
 ```
 
@@ -85,23 +83,23 @@ The report generator produces:
 - `harness_configs.json` — exact harness configuration per run
 - CSV files per table for downstream analysis
 
-See `python3 ralph/scripts/generate_eval_report.py --help` for all options.
+See `python3 scripts/generate_eval_report.py --help` for all options.
 
 ---
 
 ## Running with Harbor
 
-Each benchmark has a shell runner in `ralph/configs/` that executes all tasks across the 3-config matrix:
+Each benchmark has a shell runner in `configs/` that executes all tasks across the 3-config matrix:
 
 ```bash
 # Run all 50 LoCoBench tasks across 3 configs
-bash ralph/configs/locobench_3config.sh
+bash configs/locobench_3config.sh
 
 # Run only the baseline config
-bash ralph/configs/locobench_3config.sh --baseline-only
+bash configs/locobench_3config.sh --baseline-only
 
 # Run only MCP-Full config
-bash ralph/configs/locobench_3config.sh --full-only
+bash configs/locobench_3config.sh --full-only
 ```
 
 Available runners: `locobench_3config.sh`, `swebenchpro_3config.sh`, `bigcode_3config.sh`, `k8s_docs_3config.sh`.
