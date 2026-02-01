@@ -21,19 +21,15 @@ python_default /utils/eval.py \
     echo '{"score": 0, "checkpoints": [], "error": "Evaluator failed"}' > "$OUTPUT_PATH"
 }
 
+mkdir -p /logs/verifier
+
 if [ -f "$OUTPUT_PATH" ]; then
     SCORE=$(python3 -c "import json; print(json.load(open('$OUTPUT_PATH')).get('score', 0))" 2>/dev/null || echo "0")
     echo "TAC Score: $SCORE"
-    cp "$OUTPUT_PATH" /logs/reward.json 2>/dev/null || true
-    
-    if [ "$SCORE" != "0" ] && [ -n "$SCORE" ]; then
-        echo "Task passed with score: $SCORE"
-        exit 0
-    else
-        echo "Task failed with score: $SCORE"
-        exit 1
-    fi
+    echo "$SCORE" > /logs/verifier/reward.txt
+    cp "$OUTPUT_PATH" /logs/verifier/reward.json 2>/dev/null || true
+    exit 0
 else
-    echo "No result file generated"
-    exit 1
+    echo "0.0" > /logs/verifier/reward.txt
+    exit 0
 fi

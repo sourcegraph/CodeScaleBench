@@ -2,11 +2,7 @@
 FROM ghcr.io/theagentcompany/sde-implement-hyperloglog-image:1.0.0
 
 # Create logs directory for Harbor compatibility
-RUN mkdir -p /logs /workspace/tests
-
-# Copy our test wrapper script
-COPY tests/test.sh /workspace/tests/test.sh
-RUN chmod +x /workspace/tests/test.sh
+RUN mkdir -p /logs /workspace
 
 # Set working directory
 WORKDIR /workspace

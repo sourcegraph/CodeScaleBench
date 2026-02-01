@@ -36,7 +36,7 @@ cp -r "$CORPUS_PATH" "$TEMP_DIR/10Figure-Codebases"
 
 # Build image
 cd "$SCRIPT_DIR"
-podman build -t harbor-ccb_crossrepo:base -f Dockerfile "$TEMP_DIR"
+docker build -t harbor-ccb_crossrepo:base -f Dockerfile "$TEMP_DIR"
 
 echo ""
 echo "✓ Image built successfully: harbor-ccb_crossrepo:base"

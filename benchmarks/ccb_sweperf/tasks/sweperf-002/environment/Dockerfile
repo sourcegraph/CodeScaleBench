@@ -14,7 +14,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 
 # Create working directories
-RUN mkdir -p /workspace /tests /logs /benchmark
+RUN mkdir -p /workspace /logs /benchmark
 
 # Install benchmarking and profiling tools
 RUN pip install --no-cache-dir \
