@@ -83,6 +83,7 @@ class RunMetrics:
     timestamp: str
     task_count: int
     tasks: list[TaskMetrics] = field(default_factory=list)
+    harness_config: Optional[dict] = None
 
     # --- computed properties ---
 
@@ -126,6 +127,7 @@ class RunMetrics:
             "timestamp": self.timestamp,
             "task_count": self.task_count,
             "tasks": [t.to_dict() for t in self.tasks],
+            "harness_config": self.harness_config,
             "mean_reward": self.mean_reward,
             "mean_partial_score": self.mean_partial_score,
             "pass_rate": self.pass_rate,

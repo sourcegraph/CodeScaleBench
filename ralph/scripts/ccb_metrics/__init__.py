@@ -2,5 +2,6 @@
 
 from .models import TaskMetrics, RunMetrics, EvalReport
 from .discovery import discover_runs
+from .extractors import extract_run_config
 
-__all__ = ["TaskMetrics", "RunMetrics", "EvalReport", "discover_runs"]
+__all__ = ["TaskMetrics", "RunMetrics", "EvalReport", "discover_runs", "extract_run_config"]

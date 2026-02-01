@@ -22,6 +22,7 @@ from .extractors import (
     extract_tool_usage_from_transcript,
     extract_swebench_partial_score,
     extract_reward_from_file,
+    extract_run_config,
 )
 
 
@@ -182,6 +183,7 @@ def discover_runs(runs_dir: str | Path) -> list[RunMetrics]:
     # Key: (benchmark, config_name) -> {task_id: TaskMetrics}
     grouped: dict[tuple[str, str], dict[str, TaskMetrics]] = {}
     run_metadata: dict[tuple[str, str], dict] = {}
+    harness_configs: dict[tuple[str, str], dict] = {}
 
     for run_dir in sorted(runs_dir.iterdir()):
         if not run_dir.is_dir():
@@ -216,6 +218,20 @@ def discover_runs(runs_dir: str | Path) -> list[RunMetrics]:
                         "timestamp": timestamp,
                     }
 
+                # Extract harness config from batch dir + first task transcript
+                # Find a transcript path from the first task dir in this batch
+                _transcript_for_config = None
+                for _td in sorted(batch_dir.iterdir()):
+                    if _is_task_dir(_td):
+                        _candidate = _td / "agent" / "claude-code.txt"
+                        if _candidate.is_file():
+                            _transcript_for_config = _candidate
+                            break
+
+                hc = extract_run_config(batch_dir, _transcript_for_config)
+                if key not in harness_configs or hc.get("model_name") is not None:
+                    harness_configs[key] = hc
+
                 # Process each task directory
                 for task_dir in sorted(batch_dir.iterdir()):
                     if not _is_task_dir(task_dir):
@@ -243,6 +259,7 @@ def discover_runs(runs_dir: str | Path) -> list[RunMetrics]:
             timestamp=meta.get("timestamp", "unknown"),
             task_count=len(tasks),
             tasks=tasks,
+            harness_config=harness_configs.get((benchmark, config_name)),
         )
         results.append(run)
 

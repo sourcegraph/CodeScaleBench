@@ -102,13 +102,16 @@ def _write_csv(path: Path, headers: list[str], rows: list[list[str]]) -> None:
 
 def _build_run_inventory(runs: list[RunMetrics]) -> tuple[list[str], list[list[str]]]:
     """Table 1: Run Inventory."""
-    headers = ["Benchmark", "Config", "Model", "Tasks", "Timestamp"]
+    headers = ["Benchmark", "Config", "Model", "MCP Mode", "Tasks", "Timestamp"]
     rows = []
     for r in runs:
+        hc = r.harness_config or {}
+        mcp_mode = hc.get("mcp_mode") or r.config_name
         rows.append([
             r.benchmark,
             r.config_name,
             r.model,
+            mcp_mode,
             str(r.task_count),
             r.timestamp,
         ])
@@ -264,6 +267,16 @@ def generate_report(
     json_path = output_dir / "eval_report.json"
     report.to_json(json_path)
     print(f"Written: {json_path}")
+
+    # Write harness_configs.json
+    harness_configs = {}
+    for r in runs:
+        if r.harness_config:
+            harness_configs[r.run_id] = r.harness_config
+    if harness_configs:
+        hc_path = output_dir / "harness_configs.json"
+        hc_path.write_text(json.dumps(harness_configs, indent=2) + "\n")
+        print(f"Written: {hc_path}")
 
     # Build all tables
     tables: list[tuple[str, str, list[str], list[list[str]]]] = []

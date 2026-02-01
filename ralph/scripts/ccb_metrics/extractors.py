@@ -373,6 +373,102 @@ def extract_tool_usage_from_transcript(
     return _build_tool_usage_dict(tool_counts)
 
 
+def extract_run_config(
+    batch_dir: str | Path,
+    transcript_path: Optional[str | Path] = None,
+) -> dict:
+    """Extract harness configuration from a batch directory.
+
+    Reads config.json from the batch directory and optionally parses the
+    system init line from claude-code.txt to capture runtime details.
+
+    Args:
+        batch_dir: Path to the batch timestamp directory containing config.json.
+        transcript_path: Optional path to agent/claude-code.txt for init data.
+
+    Returns:
+        Dict with keys: model_name, agent_import_path, timeout_multiplier,
+        mcp_mode, task_source, claude_code_version, permission_mode,
+        tools, mcp_servers, model. Missing values are None.
+    """
+    result: dict = {
+        "model_name": None,
+        "agent_import_path": None,
+        "timeout_multiplier": None,
+        "mcp_mode": None,
+        "task_source": None,
+        "claude_code_version": None,
+        "permission_mode": None,
+        "tools": None,
+        "mcp_servers": None,
+        "model": None,
+    }
+
+    batch_dir = Path(batch_dir)
+    config_path = batch_dir / "config.json"
+
+    # --- Extract from config.json ---
+    if config_path.is_file():
+        try:
+            data = json.loads(config_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            data = {}
+
+        # Batch-level config has "agents" (list); task-level has "agent" (dict)
+        agents = data.get("agents") or []
+        agent = data.get("agent") or {}
+        if agents and isinstance(agents, list):
+            agent = agents[0]
+        result["model_name"] = agent.get("model_name")
+        result["agent_import_path"] = agent.get("import_path")
+        result["timeout_multiplier"] = data.get("timeout_multiplier")
+
+        task = data.get("task") or {}
+        # Batch-level uses "tasks" list; task-level uses "task" dict
+        tasks_list = data.get("tasks") or []
+        if not task and tasks_list and isinstance(tasks_list, list):
+            task = tasks_list[0]
+        result["task_source"] = task.get("git_url") or task.get("path")
+
+    # --- Extract from claude-code.txt init line ---
+    if transcript_path is not None:
+        tp = Path(transcript_path)
+        if tp.is_file():
+            try:
+                for line in tp.open():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if entry.get("type") == "system" and entry.get("subtype") == "init":
+                        result["claude_code_version"] = entry.get("claude_code_version")
+                        result["permission_mode"] = entry.get("permissionMode")
+                        result["tools"] = entry.get("tools")
+                        result["mcp_servers"] = entry.get("mcp_servers")
+                        result["model"] = entry.get("model")
+                        # Infer mcp_mode from mcp_servers
+                        servers = entry.get("mcp_servers") or []
+                        server_names = [s.get("name") for s in servers if isinstance(s, dict)]
+                        if not server_names:
+                            result["mcp_mode"] = "none"
+                        elif "sourcegraph" in server_names and "deepsearch" in server_names:
+                            result["mcp_mode"] = "sourcegraph_hybrid"
+                        elif "sourcegraph" in server_names:
+                            result["mcp_mode"] = "sourcegraph_no_deepsearch"
+                        elif "deepsearch" in server_names:
+                            result["mcp_mode"] = "deepsearch"
+                        else:
+                            result["mcp_mode"] = ",".join(server_names)
+                        break
+            except OSError:
+                pass
+
+    return result
+
+
 def extract_reward_from_file(
     reward_txt_path: str | Path,
 ) -> Optional[float]:
