@@ -35,7 +35,7 @@ if [ "$UNSTAGED_COUNT" -eq 0 ] && [ "$STAGED_COUNT" -eq 0 ] && [ "$UNTRACKED_COU
     echo "No code changes detected — agent did not execute successfully"
     echo "0.0" > /logs/verifier/reward.txt
     echo ""
-    echo "✗ Tests completed - Score: 0.0 (no changes)"
+    echo "[ ] Tests completed - Score: 0.0 (no changes)"
     exit 0
 fi
 
@@ -43,28 +43,28 @@ echo "Testing W4A8_MXFP4_INT8 quantization mode implementation..."
 
 # Check if quantization mode code exists
 if grep -r "W4A8_MXFP4_INT8" . --include="*.py" --include="*.h" --include="*.cc" 2>/dev/null | head -5; then
-    echo "✓ W4A8_MXFP4_INT8 mode references found"
+    echo "[x] W4A8_MXFP4_INT8 mode references found"
     MODE_FOUND=1
 else
-    echo "⚠ No W4A8_MXFP4_INT8 mode references found"
+    echo "NOTE: No W4A8_MXFP4_INT8 mode references found"
     MODE_FOUND=0
 fi
 
 # Check for enum definitions
 if grep -r "MXFP4" . --include="*.py" --include="*.h" 2>/dev/null | head -3; then
-    echo "✓ MXFP4 quantization mode references found"
+    echo "[x] MXFP4 quantization mode references found"
     MXFP4_FOUND=1
 else
-    echo "⚠ No MXFP4 mode references"
+    echo "NOTE: No MXFP4 mode references"
     MXFP4_FOUND=0
 fi
 
 # Check for relevant code changes
 if git diff --name-only 2>/dev/null | grep -E "(quant|mode|config)" | head -5; then
-    echo "✓ Quantization-related files modified"
+    echo "[x] Quantization-related files modified"
     CHANGES_MADE=1
 else
-    echo "⚠ No quantization-related changes detected"
+    echo "NOTE: No quantization-related changes detected"
     CHANGES_MADE=0
 fi
 
@@ -85,4 +85,4 @@ SCORE=$(awk "BEGIN {printf \"%.1f\", $SCORE_NUMERATOR / 10}")
 
 echo "$SCORE" > /logs/verifier/reward.txt
 echo ""
-echo "✓ Tests completed - Score: $SCORE"
+echo "[x] Tests completed - Score: $SCORE"

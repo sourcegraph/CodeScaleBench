@@ -29,10 +29,10 @@ Navigate to the OpenHands GitLab at http://the-agent-company.com:8929/root/openh
 
 ## Success Criteria
 
-✅ Repository cloned and Poetry set up  
-✅ test_search_file function exists  
-✅ Test is comprehensive and covers function behavior  
-✅ Test passes when run
+[x] Repository cloned and Poetry set up  
+[x] test_search_file function exists  
+[x] Test is comprehensive and covers function behavior  
+[x] Test passes when run
 
 ## Notes
 

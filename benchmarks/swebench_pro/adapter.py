@@ -329,7 +329,7 @@ if [ -n "$SOURCEGRAPH_ACCESS_TOKEN" ] && [ -n "$SOURCEGRAPH_URL" ]; then
 }
 MCPEOF
   
-  echo "✓ MCP configuration created"
+  echo "OK MCP configuration created"
 else
   echo "No Sourcegraph credentials provided, MCP disabled"
 fi
@@ -552,7 +552,7 @@ cat << 'PATCH_EOF' | git apply -v -
 {patch_text}
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"
 '''
         paths.solve_sh_path.write_text(content)
         paths.solve_sh_path.chmod(0o755)

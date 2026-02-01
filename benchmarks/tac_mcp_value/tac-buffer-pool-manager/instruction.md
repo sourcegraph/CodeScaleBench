@@ -28,10 +28,10 @@ You can also find further hints and instructions in the files of the cloned repo
 
 ## Success Criteria
 
-✅ Repository cloned successfully  
-✅ Buffer pool manager implementation complete  
-✅ All related unit tests pass  
-✅ Integration with existing components verified
+[x] Repository cloned successfully  
+[x] Buffer pool manager implementation complete  
+[x] All related unit tests pass  
+[x] Integration with existing components verified
 
 ## Notes
 

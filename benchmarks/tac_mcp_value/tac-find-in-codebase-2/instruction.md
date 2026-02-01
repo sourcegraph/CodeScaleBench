@@ -26,8 +26,8 @@ After you find it you need to send the PR number to Chen Xinyi on RocketChat
 
 ## Success Criteria
 
-✅ Correct PR number found for file change  
-✅ PR number communicated to Chen Xinyi via RocketChat
+[x] Correct PR number found for file change  
+[x] PR number communicated to Chen Xinyi via RocketChat
 
 ## Notes
 

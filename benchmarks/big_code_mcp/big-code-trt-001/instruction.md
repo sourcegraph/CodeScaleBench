@@ -94,16 +94,16 @@ Find and modify code in these areas:
 
 ## Success Criteria
 
-✅ `W4A8_MXFP4_INT8` enum value defined in Python and C++  
-✅ Python code can select and use the new mode  
-✅ C++ kernel selection routes to Blackwell GPU kernels  
-✅ Validation prevents unsupported mode combinations  
-✅ Clear build-time errors for incompatible configurations  
-✅ Python and C++ quantization enums stay in sync  
-✅ Tests added for mode creation, kernel selection, and validation  
-✅ All tests pass  
-✅ No regressions in existing quantization modes  
-✅ Code follows TensorRT-LLM conventions  
+[x] `W4A8_MXFP4_INT8` enum value defined in Python and C++  
+[x] Python code can select and use the new mode  
+[x] C++ kernel selection routes to Blackwell GPU kernels  
+[x] Validation prevents unsupported mode combinations  
+[x] Clear build-time errors for incompatible configurations  
+[x] Python and C++ quantization enums stay in sync  
+[x] Tests added for mode creation, kernel selection, and validation  
+[x] All tests pass  
+[x] No regressions in existing quantization modes  
+[x] Code follows TensorRT-LLM conventions  
 
 ## Critical Requirement
 

@@ -48,7 +48,7 @@ if [ "$UNSTAGED_COUNT" -eq 0 ] && [ "$STAGED_COUNT" -eq 0 ] && [ "$UNTRACKED_COU
     echo "No code changes detected — agent did not execute successfully"
     echo "0.0" > /logs/verifier/reward.txt
     echo ""
-    echo "✗ Tests completed - Score: 0.0 (no changes)"
+    echo "[ ] Tests completed - Score: 0.0 (no changes)"
     exit 0
 fi
 
@@ -56,10 +56,10 @@ echo "Running Kubernetes tests for taint effects..."
 
 # Check if NoScheduleNoTraffic taint effect was added
 if grep -r "NoScheduleNoTraffic" pkg/ 2>/dev/null | head -3; then
-    echo "✓ NoScheduleNoTraffic taint effect found"
+    echo "[x] NoScheduleNoTraffic taint effect found"
     TAINT_ADDED=1
 else
-    echo "⚠ NoScheduleNoTraffic taint effect not found"
+    echo "NOTE: NoScheduleNoTraffic taint effect not found"
     TAINT_ADDED=0
 fi
 
@@ -77,19 +77,19 @@ CHANGED_FILES="$CHANGED_FILES
 $(git diff --name-only 2>/dev/null)
 $(git diff --cached --name-only 2>/dev/null)"
 if echo "$CHANGED_FILES" | grep -E "(taint|scheduler|kubelet|endpoint)" | head -5; then
-    echo "✓ Taint-related files modified"
+    echo "[x] Taint-related files modified"
     CHANGES_MADE=1
 else
-    echo "⚠ No taint-related changes detected"
+    echo "NOTE: No taint-related changes detected"
     CHANGES_MADE=0
 fi
 
 # Check for test additions (K8s tests are *_test.go files throughout pkg/ and staging/)
 if grep -r "NoScheduleNoTraffic" --include="*_test.go" pkg/ staging/ test/ 2>/dev/null | head -3; then
-    echo "✓ Tests for new taint effect found"
+    echo "[x] Tests for new taint effect found"
     TESTS_ADDED=1
 else
-    echo "⚠ No tests for new taint effect"
+    echo "NOTE: No tests for new taint effect"
     TESTS_ADDED=0
 fi
 
@@ -110,4 +110,4 @@ SCORE=$(awk "BEGIN {printf \"%.1f\", $SCORE_NUMERATOR / 10}")
 
 echo "$SCORE" > /logs/verifier/reward.txt
 echo ""
-echo "✓ Tests completed - Score: $SCORE"
+echo "[x] Tests completed - Score: $SCORE"

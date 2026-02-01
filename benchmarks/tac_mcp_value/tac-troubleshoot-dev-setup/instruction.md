@@ -36,9 +36,9 @@ version issues. You will need to:
 
 ## Success Criteria
 
-✅ Requirements documentation found  
-✅ myenv.txt properly updated  
-✅ Changes explained and communicated via RocketChat
+[x] Requirements documentation found  
+[x] myenv.txt properly updated  
+[x] Changes explained and communicated via RocketChat
 
 ## Notes
 

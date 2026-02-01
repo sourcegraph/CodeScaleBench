@@ -183,14 +183,14 @@ def get_all_task_ids() -> list[str]:
 
 def print_result(result: VerificationResult, verbose: bool = False):
     """Print verification result for a task."""
-    status = "✓" if result.passed else "✗"
+    status = "PASS" if result.passed else "FAIL"
     print(f"\n{status} {result.task_id}")
     
     if verbose or not result.passed:
-        print(f"  instruction.md: {'✓' if result.has_instruction else '✗'}")
-        print(f"  environment/Dockerfile: {'✓' if result.has_dockerfile else '✗'}")
-        print(f"  tests/test.sh: {'✓' if result.has_test_script else '✗'}")
-        print(f"  task.toml: {'✓' if result.has_task_toml and result.task_toml_valid else '✗'}")
+        print(f"  instruction.md: {'PASS' if result.has_instruction else 'FAIL'}")
+        print(f"  environment/Dockerfile: {'PASS' if result.has_dockerfile else 'FAIL'}")
+        print(f"  tests/test.sh: {'PASS' if result.has_test_script else 'FAIL'}")
+        print(f"  task.toml: {'PASS' if result.has_task_toml and result.task_toml_valid else 'FAIL'}")
         
         if result.errors:
             print("  Errors:")

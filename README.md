@@ -55,7 +55,7 @@ swe_bench_configs/       # SWE-Bench integration configuration
 ```
 
 Each benchmark directory contains:
-- `MANIFEST.json` — metadata, task IDs, evaluation config
+- `MANIFEST.json` -- metadata, task IDs, evaluation config
 - Per-task subdirectories with `instruction.md`, `task.toml`, tests, and ground truth (or `solution/`)
 
 ---
@@ -78,9 +78,9 @@ python3 -m scripts.ccb_metrics.judge_context \
 ```
 
 The report generator produces:
-- `eval_report.json` — full structured report
-- `REPORT.md` — markdown tables (performance, efficiency, tool utilization)
-- `harness_configs.json` — exact harness configuration per run
+- `eval_report.json` -- full structured report
+- `REPORT.md` -- markdown tables (performance, efficiency, tool utilization)
+- `harness_configs.json` -- exact harness configuration per run
 - CSV files per table for downstream analysis
 
 See `python3 scripts/generate_eval_report.py --help` for all options.

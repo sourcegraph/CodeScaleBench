@@ -27,13 +27,13 @@ if [ -f "$OUTPUT_PATH" ]; then
     cp "$OUTPUT_PATH" /logs/reward.json 2>/dev/null || true
     
     if [ "$SCORE" != "0" ] && [ -n "$SCORE" ]; then
-        echo "✓ Task passed with score: $SCORE"
+        echo "Task passed with score: $SCORE"
         exit 0
     else
-        echo "✗ Task failed with score: $SCORE"
+        echo "Task failed with score: $SCORE"
         exit 1
     fi
 else
-    echo "✗ No result file generated"
+    echo "No result file generated"
     exit 1
 fi

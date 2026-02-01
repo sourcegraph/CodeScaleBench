@@ -29,7 +29,7 @@ the number to Chen Xinyi. You can find her on RocketChat (http://the-agent-compa
 
 ## Success Criteria
 
-✅ Correct PR number (#8676) found and communicated to Chen Xinyi via RocketChat
+[x] Correct PR number (#8676) found and communicated to Chen Xinyi via RocketChat
 
 ## Notes
 

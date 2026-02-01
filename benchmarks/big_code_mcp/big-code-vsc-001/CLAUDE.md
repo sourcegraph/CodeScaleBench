@@ -2,11 +2,11 @@
 
 This repository is large. If a search spans more than a narrow, well-defined set of directories, you **MUST** use Sourcegraph MCP search tools:
 
-- ✅ Use `sg_keyword_search`, `sg_nls_search`, or `sg_deepsearch` for broad architectural queries
-- ✅ Use MCP to find all references across the codebase quickly
-- ✅ Use MCP to understand patterns and conventions at scale
-- ❌ Do NOT use local `grep` or `rg` for cross-module searches
-- ❌ Local tools only for narrow, single-directory scopes
+- Use `sg_keyword_search`, `sg_nls_search`, or `sg_deepsearch` for broad architectural queries
+- Use MCP to find all references across the codebase quickly
+- Use MCP to understand patterns and conventions at scale
+- Do NOT use local `grep` or `rg` for cross-module searches
+- Do NOT use local tools except for narrow, single-directory scopes
 
 ## VS Code Architecture Notes
 

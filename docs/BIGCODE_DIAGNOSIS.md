@@ -4,13 +4,13 @@
 
 **Investigation of:** `runs/official/bigcode_mcp_opus_20260131_130446/`
 **Date:** 2026-02-01
-**Conclusion:** Task directories exist and contain valid results. The "0 task dirs" observation was incorrect — the issue is that results are scattered across multiple batch timestamp directories (one per `harbor run` invocation) rather than grouped into a single batch, and the run is incomplete (missing `sourcegraph_no_deepsearch` config entirely, `deepsearch_hybrid` has only 1 of 4 tasks).
+**Conclusion:** Task directories exist and contain valid results. The "0 task dirs" observation was incorrect -- the issue is that results are scattered across multiple batch timestamp directories (one per `harbor run` invocation) rather than grouped into a single batch, and the run is incomplete (missing `sourcegraph_no_deepsearch` config entirely, `deepsearch_hybrid` has only 1 of 4 tasks).
 
 ---
 
 ## Root Cause
 
-The BigCode MCP shell runner (`bigcode_mcp_comparison.sh`) calls `harbor run --path` **once per task** in a loop. Each invocation creates a **separate batch timestamp directory** under the config's `--jobs-dir`. This is correct behavior — it is not a bug.
+The BigCode MCP shell runner (`bigcode_mcp_comparison.sh`) calls `harbor run --path` **once per task** in a loop. Each invocation creates a **separate batch timestamp directory** under the config's `--jobs-dir`. This is correct behavior -- it is not a bug.
 
 The actual issues are:
 
@@ -46,8 +46,8 @@ The observation likely came from looking at the batch directory level without de
 ```
 bigcode_mcp_opus_20260131_130446/
 ├── baseline/
-│   ├── 2026-01-31__13-04-54/          # ← batch dir (not a task dir)
-│   │   └── big-code-k8s-001__Qt4rwLj/ # ← actual task dir (inside batch)
+│   ├── 2026-01-31__13-04-54/          # <- batch dir (not a task dir)
+│   │   └── big-code-k8s-001__Qt4rwLj/ # <- actual task dir (inside batch)
 │   ├── 2026-01-31__13-11-22/
 │   │   └── big-code-k8s-001-precise__A4DeByn/
 │   └── ...
@@ -64,9 +64,9 @@ All 15 completed task runs scored **reward = 1.0** (100% pass rate):
 | Task | Baseline | Deepsearch_hybrid | Sourcegraph_hybrid |
 |------|----------|-------------------|--------------------|
 | big-code-k8s-001 | 1.0 | 1.0 | 1.0 |
-| big-code-servo-001 | 1.0 | — | 1.0 |
-| big-code-trt-001 | 1.0 | — | 1.0 |
-| big-code-vsc-001 | 1.0 | — | 1.0 |
+| big-code-servo-001 | 1.0 | -- | 1.0 |
+| big-code-trt-001 | 1.0 | -- | 1.0 |
+| big-code-vsc-001 | 1.0 | -- | 1.0 |
 
 One `sourcegraph_hybrid` servo task had an `AgentTimeoutError` (timed out after 6000s) but still received reward=1.0 from the verifier.
 
@@ -74,12 +74,12 @@ One `sourcegraph_hybrid` servo task had an `AgentTimeoutError` (timed out after 
 
 ## Errors Found
 
-1. **AgentTimeoutError** — `sourcegraph_hybrid/2026-01-31__14-31-09/big-code-servo-001__C7y6Z86`
+1. **AgentTimeoutError** -- `sourcegraph_hybrid/2026-01-31__14-31-09/big-code-servo-001__C7y6Z86`
    - Agent execution timed out after 6000s (~1h40m)
    - Verifier still evaluated and assigned reward=1.0
    - Not a blocking issue; task completed before timeout was enforced at result level
 
-2. **Session directory warnings** — Some tasks logged "No Claude Code session directory found" or "Multiple Claude Code session directories found"
+2. **Session directory warnings** -- Some tasks logged "No Claude Code session directory found" or "Multiple Claude Code session directories found"
    - Did not affect task completion or rewards
    - Likely a session ID detection issue in the trajectory writer
 
@@ -93,7 +93,7 @@ The fix is a **config and execution change**, not a code change:
 
 1. **Use the updated `bigcode_3config.sh`** (already created in US-004) which supports all 3 configs: `baseline`, `sourcegraph_no_deepsearch`, `sourcegraph_hybrid`
 
-2. **Use a fresh `--jobs-dir` timestamp** — do NOT reuse `bigcode_mcp_opus_20260131_130446`. The new script already generates a unique timestamp per invocation.
+2. **Use a fresh `--jobs-dir` timestamp** -- do NOT reuse `bigcode_mcp_opus_20260131_130446`. The new script already generates a unique timestamp per invocation.
 
 3. **Run all 3 configs in a single invocation:**
    ```bash
@@ -101,7 +101,7 @@ The fix is a **config and execution change**, not a code change:
    ./configs/bigcode_3config.sh
    ```
 
-4. **No changes needed to `configs/bigcode_3config.yaml`** — the YAML is reference-only (BigCode is a local benchmark); the shell script is the execution mechanism.
+4. **No changes needed to `configs/bigcode_3config.yaml`** -- the YAML is reference-only (BigCode is a local benchmark); the shell script is the execution mechanism.
 
 ### Verification after re-run:
 

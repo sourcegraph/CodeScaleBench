@@ -33,10 +33,10 @@ and add a new mock endpoint that mirrors an existing endpoint's response format.
 
 ## Success Criteria
 
-✅ Repository cloned successfully  
-✅ Server running on port 5000  
-✅ mock_create_pair endpoint returns expected JSON format  
-✅ Completions in response are "test" strings
+[x] Repository cloned successfully  
+[x] Server running on port 5000  
+[x] mock_create_pair endpoint returns expected JSON format  
+[x] Completions in response are "test" strings
 
 ## Notes
 

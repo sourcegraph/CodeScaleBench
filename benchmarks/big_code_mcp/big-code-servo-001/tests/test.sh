@@ -35,7 +35,7 @@ if [ "$UNSTAGED_COUNT" -eq 0 ] && [ "$STAGED_COUNT" -eq 0 ] && [ "$UNTRACKED_COU
     echo "No code changes detected — agent did not execute successfully"
     echo "0.0" > /logs/verifier/reward.txt
     echo ""
-    echo "✗ Tests completed - Score: 0.0 (no changes)"
+    echo "[ ] Tests completed - Score: 0.0 (no changes)"
     exit 0
 fi
 
@@ -43,30 +43,30 @@ echo "Testing scrollend event implementation..."
 
 # Check if scrollend event code exists
 if grep -r "scrollend" . --include="*.rs" 2>/dev/null | head -5; then
-    echo "✓ scrollend event references found"
+    echo "[x] scrollend event references found"
     SCROLLEND_FOUND=1
 else
-    echo "⚠ No scrollend event references found"
+    echo "NOTE: No scrollend event references found"
     SCROLLEND_FOUND=0
 fi
 
 # Check for relevant code changes
 if git diff --name-only 2>/dev/null | grep -E "(scroll|event)" | head -5; then
-    echo "✓ Scroll/event-related files modified"
+    echo "[x] Scroll/event-related files modified"
     CHANGES_MADE=1
 else
-    echo "⚠ No scroll-related changes detected"
+    echo "NOTE: No scroll-related changes detected"
     CHANGES_MADE=0
 fi
 
 # Check for WPT tests
 if [ -d "tests/wpt" ]; then
-    echo "✓ WPT test directory exists"
+    echo "[x] WPT test directory exists"
     if grep -r "scrollend" tests/wpt 2>/dev/null | head -2; then
-        echo "✓ scrollend WPT tests found"
+        echo "[x] scrollend WPT tests found"
         WPT_TESTS=1
     else
-        echo "⚠ No scrollend WPT tests"
+        echo "NOTE: No scrollend WPT tests"
         WPT_TESTS=0
     fi
 else
@@ -90,4 +90,4 @@ SCORE=$(awk "BEGIN {printf \"%.1f\", $SCORE_NUMERATOR / 10}")
 
 echo "$SCORE" > /logs/verifier/reward.txt
 echo ""
-echo "✓ Tests completed - Score: $SCORE"
+echo "[x] Tests completed - Score: $SCORE"

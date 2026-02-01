@@ -14,7 +14,7 @@ This benchmark evaluates AI coding agents on documentation generation and update
 
 Sourcegraph's cloud index contains the **full** Kubernetes organization including all documentation.
 
-#### ⚠️ Critical Limitation: Deep Search Cannot Be Filtered
+#### Critical Limitation: Deep Search Cannot Be Filtered
 
 **Deep Search is a conversational AI that internally queries the index.**
 We cannot intercept or modify its internal searches - filtering only works for keyword/regex search.
@@ -30,8 +30,8 @@ Agent: "How does PodTopologySpread work?"
   │  2. Finds doc.go, KEPs, READMEs ← CANNOT PREVENT      │
   │  3. Synthesizes answer with doc content                │
   │                                                        │
-  │  ❌ Cannot intercept internal queries                  │
-  │  ❌ Filtering response doesn't remove incorporated     │
+  │  [x] Cannot intercept internal queries                  │
+  │  [x] Filtering response doesn't remove incorporated     │
   │     knowledge                                          │
   └────────────────────────────────────────────────────────┘
 ```
@@ -40,9 +40,9 @@ Agent: "How does PodTopologySpread work?"
 
 | Approach                       | Deterministic? | Deep Search? | Effort |
 | ------------------------------ | -------------- | ------------ | ------ |
-| **A. Keyword search only**     | ✅ Yes         | ❌ Disabled  | Low    |
-| **B. Self-hosted Sourcegraph** | ✅ Yes         | ✅ Yes       | High   |
-| **C. Accept limitation**       | ⚠️ No          | ✅ Yes       | Low    |
+| **A. Keyword search only**     | Yes            | Disabled     | Low    |
+| **B. Self-hosted Sourcegraph** | Yes            | Yes          | High   |
+| **C. Accept limitation**       | No             | Yes          | Low    |
 
 **Option A: Keyword Search Only (Deterministic)**
 

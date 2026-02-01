@@ -173,16 +173,16 @@ def pull_docker_image(tac_id: str) -> bool:
             timeout=300
         )
         if result.returncode == 0:
-            print(f"  ✓ Successfully pulled {image}")
+            print(f"  OK Successfully pulled {image}")
             return True
         else:
-            print(f"  ✗ Failed to pull {image}: {result.stderr}")
+            print(f"  FAIL Failed to pull {image}: {result.stderr}")
             return False
     except subprocess.TimeoutExpired:
-        print(f"  ✗ Timeout pulling {image}")
+        print(f"  FAIL Timeout pulling {image}")
         return False
     except FileNotFoundError:
-        print("  ✗ Docker not found. Is Docker installed?")
+        print("  FAIL Docker not found. Is Docker installed?")
         return False
 
 def verify_all_images() -> dict:
@@ -195,7 +195,7 @@ def verify_all_images() -> dict:
         image = get_docker_image(task.tac_id)
         available = verify_docker_image(task.tac_id)
         results[task.tac_id] = available
-        status = "✓" if available else "✗"
+        status = "OK" if available else "FAIL"
         print(f"  {status} {task.tac_id}")
     
     print("-" * 60)
@@ -307,7 +307,7 @@ def main():
         if args.pull:
             pull_docker_image(task.tac_id)
         create_task_directory(task, args.force)
-        print(f"✓ Task imported: {task.harbor_id}")
+        print(f"OK Task imported: {task.harbor_id}")
         return 0
     
     if args.all:
@@ -317,7 +317,7 @@ def main():
             if args.pull:
                 pull_docker_image(task.tac_id)
             create_task_directory(task, args.force)
-        print(f"\n✓ All tasks imported")
+        print(f"\nOK All tasks imported")
         return 0
     
     # Default: show help

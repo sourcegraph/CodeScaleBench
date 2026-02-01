@@ -28,7 +28,7 @@ except ModuleNotFoundError:
 
 RANDOM_SEED = 42
 
-# SWE-Bench Pro language corrections: repo slug → correct language
+# SWE-Bench Pro language corrections: repo slug -> correct language
 SWEBENCH_LANGUAGE_OVERRIDES: dict[str, str] = {
     "navidrome/navidrome": "go",
     "element-hq/element-web": "typescript",
@@ -36,7 +36,7 @@ SWEBENCH_LANGUAGE_OVERRIDES: dict[str, str] = {
     "qutebrowser/qutebrowser": "python",
 }
 
-# (benchmark, category) → SDLC phase
+# (benchmark, category) -> SDLC phase
 SDLC_PHASE_MAP: dict[tuple[str, str], str] = {
     # Requirements & Discovery
     ("tac_mcp_value", "find-in-codebase"): "Requirements & Discovery",
@@ -98,7 +98,7 @@ MCP_WEIGHTS = {
     "task_category_weight": 0.25,
 }
 
-# TAC task-id → effective category for SDLC mapping
+# TAC task-id -> effective category for SDLC mapping
 TAC_CATEGORY_MAP: dict[str, str] = {
     "tac-buffer-pool-manager": "implement",
     "tac-copilot-arena-endpoint": "endpoint",
@@ -482,7 +482,7 @@ def score_mcp_benefit(task: TaskRecord) -> tuple[float, dict[str, float]]:
 
 
 def select_swebench_pro(tasks: list[TaskRecord], rng: Random) -> list[TaskRecord]:
-    """Select ~35 from SWE-Bench Pro, proportional by repo, ≥1 per repo."""
+    """Select ~35 from SWE-Bench Pro, proportional by repo, >=1 per repo."""
     target = 35
 
     # Group by repo
@@ -813,8 +813,8 @@ def write_markdown(
     lines.append("### SWE-Bench Pro (~35 tasks)")
     lines.append("Proportional allocation by repository, ensuring at least 1 task per repo. "
                  "Within each repo, tasks with the most files changed in their solution patch "
-                 "are preferred. Language corrections applied (e.g., NodeBB → javascript, "
-                 "navidrome → go). Diversity check ensures ≥3 tasks each for Go, TypeScript, "
+                 "are preferred. Language corrections applied (e.g., NodeBB -> javascript, "
+                 "navidrome -> go). Diversity check ensures >=3 tasks each for Go, TypeScript, "
                  "and JavaScript language families.")
     lines.append("")
 

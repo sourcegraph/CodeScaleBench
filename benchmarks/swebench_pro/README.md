@@ -13,11 +13,11 @@ SWE-bench Pro extends the original SWE-bench with:
 
 ## Key Features
 
-- ✅ Converts ScaleAI/SWE-bench_Pro dataset to Harbor format
-- ✅ Multi-language support (Go, TypeScript, Python)
-- ✅ Pre-built Docker images from DockerHub (jefzda/sweap-images)
-- ✅ Optional Sourcegraph MCP configuration for code intelligence
-- ✅ Compatible with SWE-agent as baseline agent
+- Converts ScaleAI/SWE-bench_Pro dataset to Harbor format
+- Multi-language support (Go, TypeScript, Python)
+- Pre-built Docker images from DockerHub (jefzda/sweap-images)
+- Optional Sourcegraph MCP configuration for code intelligence
+- Compatible with SWE-agent as baseline agent
 
 ---
 
@@ -154,7 +154,7 @@ tasks/{instance_id}/
 
 ---
 
-## ⚠️ Important Notes
+## Important Notes
 
 ### Test Environment Services
 

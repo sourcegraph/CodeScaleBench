@@ -33,11 +33,11 @@ Required tasks (ALL MUST BE COMPLETED):
 
 ## Success Criteria
 
-✅ All tests pass: run "make test" successfully.  
-✅ Code changes are committed to git (verify with `git diff HEAD`)  
-✅ Code follows repository conventions.  
-✅ No regressions in existing functionality.  
-✅ All modified files have actual code changes.  
+- All tests pass: run "make test" successfully.
+- Code changes are committed to git (verify with `git diff HEAD`)
+- Code follows repository conventions.
+- No regressions in existing functionality.
+- All modified files have actual code changes.  
 
 ## Critical Requirement
 

