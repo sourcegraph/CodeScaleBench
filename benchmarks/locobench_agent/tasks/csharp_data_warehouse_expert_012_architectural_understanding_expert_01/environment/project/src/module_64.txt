@@ -1,0 +1,422 @@
+```csharp
+// File: src/Module64/KpiComputationOrchestrator.cs
+// Project: PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//
+// Description:
+//  Implements the Strategy-Pattern based KPI computation orchestrator that runs
+//  inside a Lambda.  The orchestrator resolves a concrete IKpiComputationStrategy
+//  for the requested KPI, fans the work out across multiple threads (or
+//  reserved-concurrency Lambda instances, depending on runtime settings),
+//  handles transient failures with an exponential back-off policy, and finally
+//  streams the normalized result back to the Data-Lake.
+//
+//  The class is intentionally generic and can be reused from both the
+//  stream-processing (real-time) and batch-processing (historical back-fill)
+//  pipelines.
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon;
+using Amazon.Runtime;
+using Amazon.S3;
+using Amazon.S3.Model;
+using Microsoft.Extensions.Logging;
+using PulseOps.Warehouse.Common;
+using PulseOps.Warehouse.Contracts;
+using PulseOps.Warehouse.Transformations.Strategies;
+
+namespace PulseOps.Warehouse.Transformations
+{
+    /// <summary>
+    /// Orchestrates KPI computations by delegating the heavy lifting to a pool of
+    /// <see cref="IKpiComputationStrategy"/> implementations.  Responsibilities:
+    ///
+    /// • Resolve the correct strategy for a given <see cref="KpiRequest"/>
+    /// • Run the computation across a configurable degree of parallelism
+    /// • Persist results to the Lake (S3) using a structured partition scheme
+    /// • Emit CloudWatch observable metrics & traces
+    /// • Provide robust error-handling / back-off semantics
+    /// </summary>
+    public sealed class KpiComputationOrchestrator : IKpiComputationOrchestrator
+    {
+        private const string DefaultRegion = "us-east-1";
+        private readonly IKpiComputationStrategyRegistry _strategyRegistry;
+        private readonly IAmazonS3 _s3Client;
+        private readonly ILogger<KpiComputationOrchestrator> _logger;
+        private readonly OrchestratorOptions _options;
+
+        public KpiComputationOrchestrator(
+            IKpiComputationStrategyRegistry strategyRegistry,
+            ILogger<KpiComputationOrchestrator> logger,
+            OrchestratorOptions? options = null,
+            IAmazonS3? s3Client = null)
+        {
+            _strategyRegistry = strategyRegistry ?? throw new ArgumentNullException(nameof(strategyRegistry));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _options = options ?? OrchestratorOptions.FromEnvironment();
+            _s3Client = s3Client ?? new AmazonS3Client(FallbackCredentialsFactory.GetCredentials(), RegionEndpoint.GetBySystemName(DefaultRegion));
+        }
+
+        public async Task<KpiBatchResult> ProcessBatchAsync(
+            IEnumerable<KpiRequest> requests,
+            CancellationToken cancellationToken = default)
+        {
+            if (requests == null) throw new ArgumentNullException(nameof(requests));
+
+            var requestList = requests.ToList();
+            _logger.LogInformation("Processing {Count} KPI requests", requestList.Count);
+
+            var throttler = new SemaphoreSlim(_options.DegreeOfParallelism);
+            var resultCollector = new ConcurrentBag<KpiComputationResult>();
+            var failures = new ConcurrentBag<KpiComputationFailure>();
+
+            var tasks = requestList.Select(async request =>
+            {
+                await throttler.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await ExecuteWithRetryAsync(request, cancellationToken, async () =>
+                    {
+                        var strategy = _strategyRegistry.Resolve(request.KpiName);
+                        _logger.LogDebug("Resolved strategy {Strategy} for KPI {Kpi}",
+                            strategy.GetType().Name, request.KpiName);
+
+                        var result = await strategy.ComputeAsync(request, cancellationToken)
+                            .ConfigureAwait(false);
+
+                        await PersistToLakeAsync(result, cancellationToken)
+                            .ConfigureAwait(false);
+
+                        _logger.LogInformation("Successfully processed KPI {Kpi} for Tenant {TenantId}",
+                            request.KpiName, request.TenantId);
+
+                        resultCollector.Add(result);
+                    }).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to process KPI {Kpi} for Tenant {TenantId}",
+                        request.KpiName, request.TenantId);
+
+                    failures.Add(new KpiComputationFailure(request, ex));
+                }
+                finally
+                {
+                    throttler.Release();
+                }
+            }).ToArray();
+
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+
+            return new KpiBatchResult(resultCollector.ToArray(), failures.ToArray());
+        }
+
+        #region Helpers
+
+        private async Task ExecuteWithRetryAsync(
+            KpiRequest request,
+            CancellationToken cancellationToken,
+            Func<Task> action)
+        {
+            var attempt = 0;
+            var delay = _options.InitialBackoff;
+
+            while (true)
+            {
+                try
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    await action().ConfigureAwait(false);
+                    return; // success
+                }
+                catch (Exception ex) when (IsTransient(ex) && attempt < _options.MaxRetryAttempts)
+                {
+                    attempt++;
+                    _logger.LogWarning(ex,
+                        "[Attempt {Attempt}/{MaxAttempts}] Transient failure while processing {Kpi} (Tenant {TenantId}). Retrying in {DelayMs}ms…",
+                        attempt, _options.MaxRetryAttempts, request.KpiName, request.TenantId, delay.TotalMilliseconds);
+
+                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                    delay = TimeSpan.FromMilliseconds(delay.TotalMilliseconds * _options.BackoffMultiplier);
+                }
+            }
+        }
+
+        private static bool IsTransient(Exception ex)
+        {
+            return ex switch
+            {
+                AmazonServiceException ase
+                    when ase.StatusCode is HttpStatusCode.InternalServerError or HttpStatusCode.ServiceUnavailable => true,
+                TimeoutException => true,
+                _ => false
+            };
+        }
+
+        private async Task PersistToLakeAsync(
+            KpiComputationResult result,
+            CancellationToken cancellationToken)
+        {
+            // Example partition: kpi_name=FocusTimeRatio/year=2023/month=08/day=14/hour=13/<tenantId>.json
+            var (bucket, key) = GetS3LocationForResult(result);
+
+            using var stream = JsonSerializer.SerializeToUtf8Bytes(result).AsStream();
+            var putRequest = new PutObjectRequest
+            {
+                BucketName = bucket,
+                Key = key,
+                InputStream = stream,
+                ContentType = "application/json",
+                AutoCloseStream = true
+            };
+
+            await _s3Client.PutObjectAsync(putRequest, cancellationToken)
+                .ConfigureAwait(false);
+
+            _logger.LogDebug("Persisted KPI {Kpi} result to s3://{Bucket}/{Key}", result.KpiName, bucket, key);
+        }
+
+        private (string Bucket, string Key) GetS3LocationForResult(KpiComputationResult result)
+        {
+            var timestamp = result.GeneratedAtUtc;
+            var key =
+                $"{result.KpiName}/year={timestamp:yyyy}/month={timestamp:MM}/day={timestamp:dd}/hour={timestamp:HH}/{result.TenantId}.json";
+
+            return (_options.S3Bucket, key);
+        }
+
+        #endregion
+    }
+
+    #region Options & Contracts
+
+    public sealed record OrchestratorOptions(
+        int DegreeOfParallelism,
+        int MaxRetryAttempts,
+        TimeSpan InitialBackoff,
+        double BackoffMultiplier,
+        string S3Bucket)
+    {
+        public static OrchestratorOptions FromEnvironment()
+        {
+            int GetInt(string name, int defaultValue) =>
+                int.TryParse(Environment.GetEnvironmentVariable(name), out var value) ? value : defaultValue;
+
+            double GetDouble(string name, double defaultValue) =>
+                double.TryParse(Environment.GetEnvironmentVariable(name), out var value) ? value : defaultValue;
+
+            string GetString(string name, string defaultValue) =>
+                Environment.GetEnvironmentVariable(name) ?? defaultValue;
+
+            return new OrchestratorOptions(
+                DegreeOfParallelism: GetInt("KPI_DOP", Environment.ProcessorCount),
+                MaxRetryAttempts: GetInt("KPI_MAX_RETRIES", 3),
+                InitialBackoff: TimeSpan.FromMilliseconds(GetInt("KPI_RETRY_BACKOFF_MS", 400)),
+                BackoffMultiplier: GetDouble("KPI_BACKOFF_MULTIPLIER", 2.0),
+                S3Bucket: GetString("KPI_LAKE_BUCKET", "pulseops-data-lake"));
+        }
+    }
+
+    public record KpiBatchResult(
+        IReadOnlyCollection<KpiComputationResult> Successes,
+        IReadOnlyCollection<KpiComputationFailure> Failures)
+    {
+        public bool HasFailures => Failures.Count > 0;
+    }
+
+    public record KpiComputationFailure(
+        KpiRequest Request,
+        Exception Exception);
+
+    #endregion
+
+    #region Interfaces
+
+    /// <summary>
+    /// Abstraction used for Dependency-Injection in Lambda entry-points.
+    /// </summary>
+    public interface IKpiComputationOrchestrator
+    {
+        Task<KpiBatchResult> ProcessBatchAsync(
+            IEnumerable<KpiRequest> requests,
+            CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Registry used to look up strategy implementations at run-time.
+    /// </summary>
+    public interface IKpiComputationStrategyRegistry
+    {
+        IKpiComputationStrategy Resolve(string kpiName);
+    }
+
+    /// <summary>
+    /// All KPI strategies must implement this contract.
+    /// </summary>
+    public interface IKpiComputationStrategy
+    {
+        string KpiName { get; }
+
+        Task<KpiComputationResult> ComputeAsync(
+            KpiRequest request,
+            CancellationToken cancellationToken);
+    }
+
+    #endregion
+}
+
+// ---------------------------------------------
+// Additional supporting code, typically placed
+// in their respective files/namespaces but kept
+// here for brevity.
+// ---------------------------------------------
+namespace PulseOps.Warehouse.Contracts
+{
+    public record KpiRequest(
+        string TenantId,
+        string KpiName,
+        DateTimeOffset WindowStartUtc,
+        DateTimeOffset WindowEndUtc,
+        string PayloadS3Uri); // Pointer to raw data inside the lake
+
+    public record KpiComputationResult(
+        string TenantId,
+        string KpiName,
+        DateTimeOffset WindowStartUtc,
+        DateTimeOffset WindowEndUtc,
+        DateTimeOffset GeneratedAtUtc,
+        IReadOnlyDictionary<string, double> Metrics);
+}
+
+namespace PulseOps.Warehouse.Transformations.Strategies
+{
+    using System.Threading;
+    using System.Threading.Tasks;
+    using PulseOps.Warehouse.Contracts;
+    using Microsoft.Extensions.Logging;
+
+    /// <summary>
+    /// Example strategy that calculates the Focus-Time Ratio KPI.
+    /// </summary>
+    public sealed class FocusTimeRatioStrategy : IKpiComputationStrategy
+    {
+        private readonly ILogger<FocusTimeRatioStrategy> _logger;
+
+        public FocusTimeRatioStrategy(ILogger<FocusTimeRatioStrategy> logger)
+        {
+            _logger = logger;
+        }
+
+        public string KpiName => "FocusTimeRatio";
+
+        public async Task<KpiComputationResult> ComputeAsync(
+            KpiRequest request,
+            CancellationToken cancellationToken)
+        {
+            // Simulated heavy computation (replace with real SQL or EMR job)
+            await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken);
+
+            var focusMinutes = Random.Shared.NextDouble() * 300;
+            var meetingMinutes = Random.Shared.NextDouble() * 180;
+
+            var ratio = focusMinutes / Math.Max(1, meetingMinutes + focusMinutes);
+
+            _logger.LogDebug("Computed Focus-Time Ratio {Ratio:F2} for Tenant {Tenant}", ratio, request.TenantId);
+
+            return new KpiComputationResult(
+                TenantId: request.TenantId,
+                KpiName: KpiName,
+                WindowStartUtc: request.WindowStartUtc,
+                WindowEndUtc: request.WindowEndUtc,
+                GeneratedAtUtc: DateTimeOffset.UtcNow,
+                Metrics: new Dictionary<string, double>
+                {
+                    ["FocusMinutes"] = focusMinutes,
+                    ["MeetingMinutes"] = meetingMinutes,
+                    ["FocusTimeRatio"] = ratio
+                });
+        }
+    }
+
+    /// <summary>
+    /// Example strategy that calculates Meeting-Cost Index KPI.
+    /// </summary>
+    public sealed class MeetingCostIndexStrategy : IKpiComputationStrategy
+    {
+        private readonly ILogger<MeetingCostIndexStrategy> _logger;
+
+        public MeetingCostIndexStrategy(ILogger<MeetingCostIndexStrategy> logger)
+        {
+            _logger = logger;
+        }
+
+        public string KpiName => "MeetingCostIndex";
+
+        public async Task<KpiComputationResult> ComputeAsync(
+            KpiRequest request,
+            CancellationToken cancellationToken)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken);
+
+            var averageHourlyRate = 75.0; // USD – would be looked up from HR data
+            var totalMeetingHours = Random.Shared.NextDouble() * 50;
+            var costIndex = averageHourlyRate * totalMeetingHours;
+
+            _logger.LogDebug("Computed Meeting-Cost Index {Cost} for Tenant {Tenant}", costIndex, request.TenantId);
+
+            return new KpiComputationResult(
+                TenantId: request.TenantId,
+                KpiName: KpiName,
+                WindowStartUtc: request.WindowStartUtc,
+                WindowEndUtc: request.WindowEndUtc,
+                GeneratedAtUtc: DateTimeOffset.UtcNow,
+                Metrics: new Dictionary<string, double>
+                {
+                    ["AverageHourlyRate"] = averageHourlyRate,
+                    ["TotalMeetingHours"] = totalMeetingHours,
+                    ["MeetingCostIndex"] = costIndex
+                });
+        }
+    }
+
+    /// <summary>
+    /// Simple in-memory registry used in Lambda start-up; could be replaced by DI scanning.
+    /// </summary>
+    public sealed class KpiComputationStrategyRegistry : IKpiComputationStrategyRegistry
+    {
+        private readonly IReadOnlyDictionary<string, IKpiComputationStrategy> _strategies;
+
+        public KpiComputationStrategyRegistry(IEnumerable<IKpiComputationStrategy> strategies)
+        {
+            _strategies = strategies.ToDictionary(s => s.KpiName, StringComparer.OrdinalIgnoreCase);
+        }
+
+        public IKpiComputationStrategy Resolve(string kpiName)
+        {
+            if (string.IsNullOrWhiteSpace(kpiName))
+                throw new ArgumentException("KPI name is required", nameof(kpiName));
+
+            if (_strategies.TryGetValue(kpiName, out var strategy))
+                return strategy;
+
+            throw new InvalidOperationException($"No strategy registered for KPI '{kpiName}'.");
+        }
+    }
+}
+
+namespace PulseOps.Warehouse.Common
+{
+    using System.IO;
+
+    internal static class ByteArrayExtensions
+    {
+        public static Stream AsStream(this byte[] bytes) => new MemoryStream(bytes);
+    }
+}
+```

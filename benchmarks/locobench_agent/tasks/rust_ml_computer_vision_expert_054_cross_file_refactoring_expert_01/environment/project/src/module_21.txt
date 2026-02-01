@@ -1,0 +1,394 @@
+```rust
+//! Module 21 – Model-Monitoring & Adaptive Retraining
+//! --------------------------------------------------
+//! This module implements a production-ready Observer pattern that continuously
+//! monitors model-level runtime metrics (accuracy, latency, drift, etc.) and
+//! automatically triggers model retraining when user-defined thresholds are
+//! breached.  The module is intentionally self-contained so that it can be
+//! embedded into any of the higher-level Pipeline stages without introducing
+//! cyclic dependencies.
+//!
+//! Core Design
+//! ===========
+//! • Subject:      `MonitoringHub` – Async event bus that receives MetricEvents
+//!                 and notifies registered observers.
+//! • Observers:    `LoggingObserver` (writes to tracing), `RetrainTrigger`
+//!                 (schedules automated retraining via `ModelOps` trait).
+//! • Error Model:  Rich `MonitoringError` enum carrying context & backtraces.
+//! • Concurrency:  Tokio-powered channel + tasks; observers run in parallel.
+//! • Extensibility: Consumers provide their own `MetricObserver` impls or swap
+//!                  in real `ModelOps` backends (e.g., k8s jobs, Airflow DAGs).
+//!
+//! NOTE: This file purposely uses `async_trait` for ergonomic async traits even
+//! though it incurs minimal overhead.  In performance-critical hot paths you
+//! might prefer blanket generic impls or GAT-powered designs.
+
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::mpsc::{self, Receiver, Sender},
+    task::JoinHandle,
+};
+use tracing::{error, info, warn};
+
+// -------------------------------------------------------------------------------------------------
+// Domain Types
+// -------------------------------------------------------------------------------------------------
+
+/// Runtime metric event emitted by the Serving-Ops layer.
+#[derive(Debug, Clone)]
+pub struct MetricEvent {
+    pub timestamp:     DateTime<Utc>,
+    pub model_name:    String,
+    pub model_version: String,
+    pub accuracy:      f32,
+    pub latency_ms:    f32,
+    pub drift_score:   f32,
+}
+
+impl MetricEvent {
+    pub fn new<N: Into<String>, V: Into<String>>(
+        model_name: N,
+        model_version: V,
+        accuracy: f32,
+        latency_ms: f32,
+        drift_score: f32,
+    ) -> Self {
+        Self {
+            timestamp: Utc::now(),
+            model_name: model_name.into(),
+            model_version: model_version.into(),
+            accuracy,
+            latency_ms,
+            drift_score,
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Error Handling
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Error, Debug)]
+pub enum MonitoringError {
+    #[error("observer failure: {0}")]
+    ObserverFailure(String),
+
+    #[error("model-ops error: {0}")]
+    ModelOps(String),
+
+    #[error("internal channel closed")]
+    ChannelClosed,
+}
+
+impl MonitoringError {
+    pub fn observer<E: fmt::Display>(err: E) -> Self {
+        MonitoringError::ObserverFailure(err.to_string())
+    }
+
+    pub fn model_ops<E: fmt::Display>(err: E) -> Self {
+        MonitoringError::ModelOps(err.to_string())
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Observer Traits
+// -------------------------------------------------------------------------------------------------
+
+/// Consumer trait for parties interested in receiving `MetricEvent`s.
+#[async_trait]
+pub trait MetricObserver: Send + Sync {
+    async fn on_metric(&self, event: &MetricEvent) -> Result<(), MonitoringError>;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Subject – MonitoringHub
+// -------------------------------------------------------------------------------------------------
+
+/// Central event bus that receives metrics and fans them out to observers.
+pub struct MonitoringHub {
+    observers: Arc<Mutex<Vec<Arc<dyn MetricObserver>>>>,
+    tx:        Sender<MetricEvent>,
+    _worker:   JoinHandle<()>,
+}
+
+impl MonitoringHub {
+    /// Creates a new hub with an internal worker task.
+    pub fn new(buffer: usize) -> Self {
+        let (tx, rx) = mpsc::channel::<MetricEvent>(buffer);
+        let observers: Arc<Mutex<Vec<Arc<dyn MetricObserver>>>> = Arc::new(Mutex::new(Vec::new()));
+        let worker = Self::spawn_worker(rx, Arc::clone(&observers));
+        Self {
+            observers,
+            tx,
+            _worker: worker,
+        }
+    }
+
+    /// Registers a new observer. Safe to call at runtime.
+    pub fn register<O>(&self, observer: O)
+    where
+        O: MetricObserver + 'static,
+    {
+        let mut guard = self
+            .observers
+            .lock()
+            .expect("Mutex poisoned while registering observer");
+        guard.push(Arc::new(observer));
+    }
+
+    /// Publishes a metric event into the async channel.
+    pub async fn publish(&self, event: MetricEvent) -> Result<(), MonitoringError> {
+        self.tx.send(event).await.map_err(|_| MonitoringError::ChannelClosed)
+    }
+
+    /// Background worker that drains the channel and dispatches to observers.
+    fn spawn_worker(
+        mut rx: Receiver<MetricEvent>,
+        observers: Arc<Mutex<Vec<Arc<dyn MetricObserver>>>>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                let observers_snapshot = {
+                    let guard = observers.lock().expect("Mutex poisoned");
+                    guard.clone()
+                };
+
+                // Fan-out in parallel while bounding concurrency.
+                for obs in observers_snapshot {
+                    let evt_clone = event.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = obs.on_metric(&evt_clone).await {
+                            error!(error = ?e, "MetricObserver failed");
+                        }
+                    });
+                }
+            }
+            warn!("MonitoringHub worker exiting – channel closed.");
+        })
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Model-Ops Trait (bridge to downstream training orchestration)
+// -------------------------------------------------------------------------------------------------
+
+#[async_trait]
+pub trait ModelOps: Send + Sync {
+    async fn schedule_retraining(
+        &self,
+        model_name: &str,
+        model_version: &str,
+        reason: &str,
+    ) -> Result<(), MonitoringError>;
+}
+
+/// Proof-of-concept Model-Ops impl that prints to logs.
+pub struct MockModelOps;
+
+#[async_trait]
+impl ModelOps for MockModelOps {
+    async fn schedule_retraining(
+        &self,
+        model_name: &str,
+        model_version: &str,
+        reason: &str,
+    ) -> Result<(), MonitoringError> {
+        info!(
+            model_name,
+            model_version,
+            reason,
+            "Scheduling retraining due to {}", reason
+        );
+        // In production, enqueue a job or hit a REST endpoint.
+        Ok(())
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Observer Implementations
+// -------------------------------------------------------------------------------------------------
+
+/// Emits all metric events to tracing.  Acts as a real-time audit log.
+pub struct LoggingObserver;
+
+#[async_trait]
+impl MetricObserver for LoggingObserver {
+    async fn on_metric(&self, event: &MetricEvent) -> Result<(), MonitoringError> {
+        info!(
+            model = %event.model_name,
+            version = %event.model_version,
+            accuracy = %event.accuracy,
+            latency_ms = %event.latency_ms,
+            drift = %event.drift_score,
+            "metric"
+        );
+        Ok(())
+    }
+}
+
+/// Observer that triggers automated retraining when thresholds are breached.
+pub struct RetrainTrigger<O: ModelOps> {
+    ops:              Arc<O>,
+    min_accuracy:     f32,
+    max_latency_ms:   f32,
+    max_drift_score:  f32,
+    cool_down:        Duration,
+    last_triggered:   Arc<Mutex<Option<DateTime<Utc>>>>,
+}
+
+impl<O: ModelOps> RetrainTrigger<O> {
+    pub fn builder(ops: Arc<O>) -> RetrainTriggerBuilder<O> {
+        RetrainTriggerBuilder::new(ops)
+    }
+}
+
+#[async_trait]
+impl<O: ModelOps + 'static> MetricObserver for RetrainTrigger<O> {
+    async fn on_metric(&self, event: &MetricEvent) -> Result<(), MonitoringError> {
+        let breach_accuracy = event.accuracy < self.min_accuracy;
+        let breach_latency = event.latency_ms > self.max_latency_ms;
+        let breach_drift = event.drift_score > self.max_drift_score;
+
+        if !(breach_accuracy || breach_latency || breach_drift) {
+            return Ok(());
+        }
+
+        // Debounce triggers so we don't spam retraining.
+        {
+            let mut guard = self
+                .last_triggered
+                .lock()
+                .expect("Mutex poisoned in RetrainTrigger");
+            if let Some(last) = *guard {
+                if Utc::now() - last < chrono::Duration::from_std(self.cool_down).unwrap() {
+                    // Still cooling down; skip.
+                    return Ok(());
+                }
+            }
+            *guard = Some(Utc::now());
+        }
+
+        let reason = if breach_accuracy {
+            format!(
+                "accuracy {:.4} below threshold {:.4}",
+                event.accuracy, self.min_accuracy
+            )
+        } else if breach_latency {
+            format!(
+                "latency {:.2}ms above threshold {:.2}ms",
+                event.latency_ms, self.max_latency_ms
+            )
+        } else {
+            format!(
+                "drift {:.4} above threshold {:.4}",
+                event.drift_score, self.max_drift_score
+            )
+        };
+
+        self.ops
+            .schedule_retraining(&event.model_name, &event.model_version, &reason)
+            .await
+            .map_err(MonitoringError::model_ops)?;
+
+        Ok(())
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Builder for RetrainTrigger
+// -------------------------------------------------------------------------------------------------
+
+pub struct RetrainTriggerBuilder<O: ModelOps> {
+    ops:             Arc<O>,
+    min_accuracy:    Option<f32>,
+    max_latency_ms:  Option<f32>,
+    max_drift_score: Option<f32>,
+    cool_down:       Option<Duration>,
+}
+
+impl<O: ModelOps> RetrainTriggerBuilder<O> {
+    fn new(ops: Arc<O>) -> Self {
+        Self {
+            ops,
+            min_accuracy: None,
+            max_latency_ms: None,
+            max_drift_score: None,
+            cool_down: None,
+        }
+    }
+
+    pub fn min_accuracy(mut self, val: f32) -> Self {
+        self.min_accuracy = Some(val);
+        self
+    }
+
+    pub fn max_latency_ms(mut self, val: f32) -> Self {
+        self.max_latency_ms = Some(val);
+        self
+    }
+
+    pub fn max_drift_score(mut self, val: f32) -> Self {
+        self.max_drift_score = Some(val);
+        self
+    }
+
+    pub fn cool_down(mut self, val: Duration) -> Self {
+        self.cool_down = Some(val);
+        self
+    }
+
+    pub fn build(self) -> RetrainTrigger<O> {
+        RetrainTrigger {
+            ops: self.ops,
+            min_accuracy: self.min_accuracy.unwrap_or(0.90),
+            max_latency_ms: self.max_latency_ms.unwrap_or(200.0),
+            max_drift_score: self.max_drift_score.unwrap_or(0.10),
+            cool_down: self.cool_down.unwrap_or(Duration::from_secs(3600)),
+            last_triggered: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Example Wiring (for tests / binaries)
+// -------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::sleep;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_retraining_trigger() {
+        tracing_subscriber::fmt::try_init().ok(); // ignore double-init
+
+        let hub = MonitoringHub::new(8);
+
+        // Dummy model-ops
+        let model_ops = Arc::new(MockModelOps);
+
+        // Build retraining trigger with low accuracy threshold to guarantee breach.
+        let retrain_trigger = RetrainTrigger::builder(model_ops)
+            .min_accuracy(0.95)
+            .build();
+
+        hub.register(LoggingObserver);
+        hub.register(retrain_trigger);
+
+        let evt = MetricEvent::new("quality-inspector", "v1.0.0", 0.80, 150.0, 0.05);
+        hub.publish(evt).await.unwrap();
+
+        // Give background tasks time to flush.
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+```

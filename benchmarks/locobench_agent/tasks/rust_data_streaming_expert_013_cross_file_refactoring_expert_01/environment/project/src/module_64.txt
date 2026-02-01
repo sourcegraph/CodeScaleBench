@@ -1,0 +1,327 @@
+```rust
+//! ChirpPulse – Stream Processing Core (module_64)
+//!
+//! This module owns the mission-critical run-loop that powers a single logical
+//! ETL “stage” inside the ChirpPulse data-streaming pipeline.  It wraps a
+//! Kafka consumer + producer, executes a pluggable enrichment strategy
+//! (Strategy Pattern), emits observability spans, and applies a self-healing
+//! back-off loop for resiliency during social-traffic spikes.
+//!
+//! NOTE: This file is purposely self-contained for compilation-as-example.
+//! In the real code-base, the config structs and error types would live in
+//! dedicated crates shared across micro-services.
+//
+// -------------- External Crates --------------
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::StreamExt;
+use rdkafka::config::RDKafkaLogLevel;
+use rdkafka::consumer::{CommitMode, Consumer, ConsumerContext, Rebalance, StreamConsumer};
+use rdkafka::error::KafkaError;
+use rdkafka::message::{BorrowedMessage, OwnedHeaders};
+use rdkafka::producer::{BaseRecord, FutureProducer, FutureRecord};
+use rdkafka::{ClientConfig, ClientContext};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::Notify;
+use tokio::time::sleep;
+use tracing::{debug, error, info, instrument, warn};
+
+//
+// -------------- Domain Types --------------
+//
+
+/// Raw event as received from an upstream micro-service (e.g. tweet, post, comment).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SocialEvent {
+    pub id: String,
+    pub author_id: String,
+    pub lang: Option<String>,
+    pub payload: String,
+    pub timestamp_ms: i64,
+}
+
+/// Enriched version of [`SocialEvent`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EnrichedEvent {
+    pub base: SocialEvent,
+    pub sentiment: f32,
+    pub toxicity: f32,
+    pub keywords: Vec<String>,
+}
+
+/// Trait defining a pluggable enrichment strategy.
+///
+/// A new algorithm can be hot-swapped at runtime by shipping a new dynamic
+/// library and updating the `processor.strategy_name` env.
+#[async_trait::async_trait]
+pub trait EnrichmentStrategy: Send + Sync + 'static {
+    /// Executes the enrichment logic.
+    async fn enrich(&self, event: SocialEvent) -> Result<EnrichedEvent, StrategyError>;
+}
+
+/// Errors surfaced by an [`EnrichmentStrategy`].
+#[derive(Debug, Error)]
+pub enum StrategyError {
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
+    #[error("external service failed: {0}")]
+    ExternalDependency(String),
+
+    #[error("unknown strategy error: {0}")]
+    Other(String),
+}
+
+/// A trivial default implementation that passes through the event unchanged.
+pub struct NoopEnrichment;
+
+#[async_trait::async_trait]
+impl EnrichmentStrategy for NoopEnrichment {
+    async fn enrich(&self, event: SocialEvent) -> Result<EnrichedEvent, StrategyError> {
+        Ok(EnrichedEvent {
+            sentiment: 0.0,
+            toxicity: 0.0,
+            keywords: vec![],
+            base: event,
+        })
+    }
+}
+
+//
+// -------------- Config & Errors --------------
+///
+
+/// Configuration for the [`StreamProcessor`].
+#[derive(Debug, Clone)]
+pub struct StreamProcessorConfig {
+    pub kafka_brokers: String,
+    pub consume_topic: String,
+    pub produce_topic: String,
+    pub group_id: String,
+    pub auto_offset_reset: String,
+    pub commit_interval: Duration,
+    pub max_backoff: Duration,
+}
+
+/// Global errors emitted by the processing loop.
+#[derive(Debug, Error)]
+pub enum ProcessorError {
+    #[error("kafka error: {0}")]
+    Kafka(#[from] KafkaError),
+
+    #[error("strategy error: {0}")]
+    Strategy(#[from] StrategyError),
+
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+//
+// -------------- Kafka Contexts --------------
+//
+
+/// Custom consumer context that logs rebalance events.
+struct LoggingConsumerContext;
+
+impl ClientContext for LoggingConsumerContext {}
+
+impl ConsumerContext for LoggingConsumerContext {
+    fn rebalance(&self, rebalance: &Rebalance) {
+        info!(?rebalance, "consumer rebalance");
+    }
+}
+
+//
+// -------------- Stream Processor --------------
+//
+
+/// Orchestrates consumption, enrichment, and production.
+///
+/// The processor is intended to run under an asynchronous executor (Tokio).
+pub struct StreamProcessor<S>
+where
+    S: EnrichmentStrategy,
+{
+    config: StreamProcessorConfig,
+    consumer: StreamConsumer<LoggingConsumerContext>,
+    producer: FutureProducer,
+    strategy: Arc<S>,
+    shutdown: Arc<Notify>,
+}
+
+impl<S> StreamProcessor<S>
+where
+    S: EnrichmentStrategy,
+{
+    /// Builds a new [`StreamProcessor`] with the given config and strategy.
+    pub fn new(config: StreamProcessorConfig, strategy: S) -> Result<Self, KafkaError> {
+        let consumer: StreamConsumer<_> = ClientConfig::new()
+            .set("bootstrap.servers", &config.kafka_brokers)
+            .set("group.id", &config.group_id)
+            .set("enable.partition.eof", "false")
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false") // manual commits
+            .set("auto.offset.reset", &config.auto_offset_reset)
+            .set_log_level(RDKafkaLogLevel::Info)
+            .create_with_context(LoggingConsumerContext)?;
+
+        consumer.subscribe(&[&config.consume_topic])?;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &config.kafka_brokers)
+            .set("message.timeout.ms", "5000")
+            .create()?;
+
+        Ok(Self {
+            config,
+            consumer,
+            producer,
+            strategy: Arc::new(strategy),
+            shutdown: Arc::new(Notify::new()),
+        })
+    }
+
+    /// Requests a graceful shutdown of the processor.
+    pub fn shutdown(&self) {
+        self.shutdown.notify_waiters();
+    }
+
+    /// Starts the processing loop.  Resolves when `shutdown()` has been
+    /// requested and the consumer stream has been drained.
+    #[instrument(skip(self), name = "stream_processor_run")]
+    pub async fn run(self) -> Result<(), ProcessorError> {
+        let mut stream = self.consumer.stream();
+        let mut backoff = Duration::from_millis(250);
+
+        loop {
+            tokio::select! {
+                _ = self.shutdown.notified() => {
+                    info!("shutdown signal received, draining consumer");
+                    break;
+                }
+                maybe_message = stream.next() => {
+                    match maybe_message {
+                        Some(Ok(msg)) => {
+                            // Reset back-off on successful poll.
+                            backoff = Duration::from_millis(250);
+                            if let Err(e) = self.process_message(msg).await {
+                                error!(error = %e, "failed to process message");
+
+                                // Implement simple exponential back-off on error.
+                                warn!(?backoff, "backing off after error");
+                                sleep(backoff).await;
+                                backoff = std::cmp::min(backoff * 2, self.config.max_backoff);
+                            }
+                        }
+                        Some(Err(e)) => {
+                            error!(error = %e, "error while reading from consumer stream");
+                            sleep(backoff).await;
+                            backoff = std::cmp::min(backoff * 2, self.config.max_backoff);
+                        }
+                        None => {
+                            // Stream ended — Kafka rebalance? Sleep a bit then continue.
+                            warn!("consumer stream returned None, retrying after short sleep");
+                            sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        info!("flush + commit final offsets before exit");
+        self.consumer.commit_consumer_state(CommitMode::Sync)?;
+        self.producer.flush(None);
+        Ok(())
+    }
+
+    /// Handles a single Kafka message end-to-end.
+    #[instrument(skip(self, msg))]
+    async fn process_message(&self, msg: BorrowedMessage<'_>) -> Result<(), ProcessorError> {
+        let payload = msg
+            .payload_view::<str>()?
+            .ok_or_else(|| ProcessorError::Serde(serde_json::Error::custom("empty payload")))?;
+
+        let social_event: SocialEvent = serde_json::from_str(payload)?;
+        debug!(event_id = %social_event.id, "consumed event");
+
+        // Enrich with strategy
+        let enriched = self.strategy.enrich(social_event).await?;
+
+        // Serialize and produce
+        let serialized = serde_json::to_vec(&enriched)?;
+        let record = FutureRecord::to(&self.config.produce_topic)
+            .key(&enriched.base.id)
+            .payload(&serialized)
+            .headers(OwnedHeaders::new().add("content-type", "application/json"));
+
+        // Send asynchronously; we don't await here to cut latency.
+        let _ = self.producer.send(record, 0);
+
+        // Commit offset after successful processing
+        self.consumer.commit_message(&msg, CommitMode::Async)?;
+
+        Ok(())
+    }
+}
+
+//
+// -------------- Tests --------------
+//
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+    use tokio::task;
+
+    struct DummyStrategy;
+
+    #[async_trait::async_trait]
+    impl EnrichmentStrategy for DummyStrategy {
+        async fn enrich(&self, event: SocialEvent) -> Result<EnrichedEvent, StrategyError> {
+            Ok(EnrichedEvent {
+                base: event,
+                sentiment: 0.99,
+                toxicity: 0.01,
+                keywords: vec!["chirp".into()],
+            })
+        }
+    }
+
+    // NOTE: Requires local Kafka cluster to pass.
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn processor_startup_and_shutdown() {
+        tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_target(false)
+            .init();
+
+        let cfg = StreamProcessorConfig {
+            kafka_brokers: "localhost:9092".into(),
+            consume_topic: "chirp.raw".into(),
+            produce_topic: "chirp.enriched".into(),
+            group_id: "test-group".into(),
+            auto_offset_reset: "earliest".into(),
+            commit_interval: Duration::from_secs(5),
+            max_backoff: Duration::from_secs(10),
+        };
+
+        let processor = StreamProcessor::new(cfg, DummyStrategy).unwrap();
+        let shutdown_handle = processor.shutdown.clone();
+
+        let join = task::spawn(async move {
+            let started = Instant::now();
+            let _ = processor.run().await;
+            assert!(started.elapsed() < Duration::from_secs(30));
+        });
+
+        // Wait some time then shutdown
+        sleep(Duration::from_secs(3)).await;
+        shutdown_handle.notify_waiters();
+        join.await.unwrap();
+    }
+}
+```

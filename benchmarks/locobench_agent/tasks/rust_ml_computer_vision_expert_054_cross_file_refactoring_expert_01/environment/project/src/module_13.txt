@@ -1,0 +1,415 @@
+```rust
+//! VisuTility Orchestrator – Model-Monitoring & Automated-Retraining module.
+//!
+//! This source file demonstrates how the Observer pattern is applied inside
+//! VisuTility to automatically trigger hyper-parameter tuning and model
+//! retraining when a live model’s performance degrades in production.
+//
+//  ┌─────────────────────────────────────────────────────────────────────────┐
+//  │  IMPORTANT NOTE                                                        │
+//  │  This module is **self-contained** and therefore intentionally keeps   │
+//  │  stubs for external subsystems (e.g. storage, model serving) so that   │
+//  │  the code can be compiled and unit-tested stand-alone.                 │
+//  └─────────────────────────────────────────────────────────────────────────┘
+
+#![allow(clippy::missing_errors_doc)]
+
+use std::{
+    fmt::Debug,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc},
+    task::JoinHandle,
+    time::sleep,
+};
+use tracing::{error, info, instrument, warn};
+
+// ---------------------------------------------------------------------------
+// Error handling
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum MonitorError {
+    #[error("channel send failed: {0}")]
+    ChannelSend(#[from] broadcast::error::SendError<MonitorEvent>),
+    #[error("registry error: {0}")]
+    Registry(#[from] RegistryError),
+    #[error("tuner error: {0}")]
+    Tuner(#[from] TunerError),
+    #[error("scheduler error: {0}")]
+    Scheduler(#[from] SchedulerError),
+}
+
+#[derive(Debug, Error)]
+pub enum RegistryError {
+    #[error("I/O failure: {0}")]
+    Io(std::io::Error),
+    #[error("serialization failure: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("model version not found: {0}")]
+    NotFound(String),
+}
+
+#[derive(Debug, Error)]
+pub enum TunerError {
+    #[error("search space exhausted")]
+    SearchSpaceExhausted,
+}
+
+#[derive(Debug, Error)]
+pub enum SchedulerError {
+    #[error("job execution failed")]
+    JobFailed,
+}
+
+// ---------------------------------------------------------------------------
+// Domain: Metrics and Events
+// ---------------------------------------------------------------------------
+
+/// Primary KPI we care about when deciding if retraining is required.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PerformanceMetrics {
+    pub precision: f32,
+    pub recall: f32,
+    pub f1_score: f32,
+}
+
+impl PerformanceMetrics {
+    /// Simple heuristic: average of precision and recall must stay ≥ `min_avg`.
+    pub fn is_degraded(&self, min_avg: f32) -> bool {
+        ((self.precision + self.recall) / 2.0) < min_avg
+    }
+}
+
+/// Events broadcasted by `ModelMonitor`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MonitorEvent {
+    Metrics(PerformanceMetrics),
+    DriftDetected,
+}
+
+// ---------------------------------------------------------------------------
+// Observer Pattern – Traits
+// ---------------------------------------------------------------------------
+
+/// Subscribers implement this trait to receive production events.
+#[async_trait]
+pub trait Observer: Send + Sync {
+    async fn on_event(&self, event: MonitorEvent) -> Result<(), MonitorError>;
+}
+
+/// The emitting side lets observers subscribe and then pushes events.
+pub trait Subject {
+    fn subscribe(&self) -> broadcast::Receiver<MonitorEvent>;
+}
+
+// ---------------------------------------------------------------------------
+// Concrete Subject: ModelMonitor
+// ---------------------------------------------------------------------------
+
+pub struct ModelMonitor {
+    tx: broadcast::Sender<MonitorEvent>,
+    metric_rx: mpsc::UnboundedReceiver<PerformanceMetrics>,
+    min_avg_threshold: f32,
+}
+
+impl ModelMonitor {
+    pub fn new(
+        metric_rx: mpsc::UnboundedReceiver<PerformanceMetrics>,
+        min_avg_threshold: f32,
+    ) -> Self {
+        // Capacity `16` – more than enough for KPI events (high-frequency).
+        let (tx, _rx) = broadcast::channel(16);
+        Self {
+            tx,
+            metric_rx,
+            min_avg_threshold,
+        }
+    }
+
+    /// Spawn an async task that consumes KPI updates and emits events.
+    pub fn start(self: Arc<Self>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            self.run().await;
+        })
+    }
+
+    #[instrument(level = "info", skip(self))]
+    async fn run(self: Arc<Self>) {
+        loop {
+            select! {
+                Some(metrics) = self.metric_rx.recv() => {
+                    if let Err(e)= self.tx.send(MonitorEvent::Metrics(metrics)) {
+                        warn!(?e,"All observers dropped – no one is listening");
+                    }
+                    // Detect degradation & emit Drift event.
+                    if metrics.is_degraded(self.min_avg_threshold) {
+                        if let Err(e) = self.tx.send(MonitorEvent::DriftDetected) {
+                            warn!(?e,"Unable to broadcast DriftDetected");
+                        }
+                    }
+                }
+                else => {
+                    // Channel closed => Stop monitor.
+                    info!("Metrics channel closed – ModelMonitor exiting");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl Subject for ModelMonitor {
+    fn subscribe(&self) -> broadcast::Receiver<MonitorEvent> {
+        self.tx.subscribe()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Supporting Infrastructure stubs (Registry, Tuner, Scheduler)
+// ---------------------------------------------------------------------------
+
+/// Models are versioned and located in an internal registry storage backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelVersion {
+    pub name: String,
+    pub sha256: String,
+    pub hyper_params: HyperParams,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HyperParams {
+    pub learning_rate: f32,
+    pub max_depth: u16,
+    pub batch_size: u32,
+}
+
+/// Minimal in-memory registry implementation.
+#[derive(Debug, Default)]
+pub struct ModelRegistry {
+    inner: RwLock<Vec<ModelVersion>>,
+}
+
+impl ModelRegistry {
+    pub fn register(&self, mv: ModelVersion) -> Result<(), RegistryError> {
+        self.inner.write().unwrap().push(mv);
+        Ok(())
+    }
+
+    pub fn latest(&self, name: &str) -> Result<ModelVersion, RegistryError> {
+        self.inner
+            .read()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|mv| mv.name == name)
+            .cloned()
+            .ok_or_else(|| RegistryError::NotFound(name.to_owned()))
+    }
+}
+
+/// Hyper-parameter tuner trait.
+#[async_trait]
+pub trait HyperParamTuner: Send + Sync {
+    async fn tune(&self, base: &HyperParams) -> Result<HyperParams, TunerError>;
+}
+
+/// Example tuner that performs a naïve learning-rate decay search.
+pub struct SimpleDecayTuner;
+
+#[async_trait]
+impl HyperParamTuner for SimpleDecayTuner {
+    async fn tune(&self, base: &HyperParams) -> Result<HyperParams, TunerError> {
+        let new_lr = (base.learning_rate * 0.8).max(1e-5);
+        if (new_lr - base.learning_rate).abs() < f32::EPSILON {
+            return Err(TunerError::SearchSpaceExhausted);
+        }
+        Ok(HyperParams {
+            learning_rate: new_lr,
+            ..*base
+        })
+    }
+}
+
+/// Scheduler responsible for launching the actual training job.
+pub struct TrainingScheduler;
+
+impl TrainingScheduler {
+    #[instrument(level = "info", skip_all)]
+    pub async fn schedule(
+        new_params: HyperParams,
+        registry: Arc<ModelRegistry>,
+        model_name: &str,
+    ) -> Result<ModelVersion, SchedulerError> {
+        // Simulate long-running training job
+        sleep(Duration::from_secs(2)).await;
+
+        let new_version = ModelVersion {
+            name: model_name.to_owned(),
+            sha256: uuid::Uuid::new_v4().to_string(), // pretend artifact checksum
+            hyper_params: new_params,
+            created_at: chrono::Utc::now(),
+        };
+
+        registry
+            .register(new_version.clone())
+            .map_err(|e| {
+                error!(?e, "Failed to register new model version");
+                SchedulerError::JobFailed
+            })?;
+
+        Ok(new_version)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Concrete Observer: AdaptiveRetrainObserver
+// ---------------------------------------------------------------------------
+
+pub struct AdaptiveRetrainObserver<T: HyperParamTuner + 'static> {
+    model_name: String,
+    tuner: Arc<T>,
+    registry: Arc<ModelRegistry>,
+    /// Internal receiver for events
+    rx: tokio::sync::Mutex<broadcast::Receiver<MonitorEvent>>,
+}
+
+impl<T: HyperParamTuner + 'static> AdaptiveRetrainObserver<T> {
+    pub fn new(
+        subject: &impl Subject,
+        model_name: String,
+        tuner: Arc<T>,
+        registry: Arc<ModelRegistry>,
+    ) -> Self {
+        let rx = subject.subscribe();
+        Self {
+            model_name,
+            tuner,
+            registry,
+            rx: tokio::sync::Mutex::new(rx),
+        }
+    }
+
+    /// Spawn background task that listens & reacts.
+    pub fn start(self: Arc<Self>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            if let Err(e) = self.run().await {
+                error!(?e,"AdaptiveRetrainObserver task exited with error");
+            }
+        })
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    async fn run(self: Arc<Self>) -> Result<(), MonitorError> {
+        loop {
+            let mut guard = self.rx.lock().await;
+            let evt = guard.recv().await?;
+            drop(guard);
+
+            match evt {
+                MonitorEvent::DriftDetected => {
+                    info!("Performance degradation detected – triggering retrain");
+                    self.handle_drift().await?;
+                }
+                MonitorEvent::Metrics(_m) => {
+                    // No-op – other observers might care.
+                }
+            }
+        }
+    }
+
+    async fn handle_drift(&self) -> Result<(), MonitorError> {
+        let latest = self.registry.latest(&self.model_name)?;
+        let tuned_params = self.tuner.tune(&latest.hyper_params).await?;
+        let new_version =
+            TrainingScheduler::schedule(tuned_params, self.registry.clone(), &self.model_name)
+                .await?;
+        info!(
+            model = %new_version.sha256,
+            "New model version registered and ready for serving"
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Example wiring (would be invoked by Orchestrator bootstrap)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::runtime::Runtime;
+
+    #[test]
+    fn smoke_test_monitoring_and_retraining() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_target(false)
+                .init();
+
+            let (metric_tx, metric_rx) = mpsc::unbounded_channel::<PerformanceMetrics>();
+            let monitor = Arc::new(ModelMonitor::new(metric_rx, 0.6));
+            monitor.start();
+
+            let registry = Arc::new(ModelRegistry::default());
+            registry
+                .register(ModelVersion {
+                    name: "quality_detector".into(),
+                    sha256: "initial".into(),
+                    hyper_params: HyperParams {
+                        learning_rate: 0.001,
+                        max_depth: 5,
+                        batch_size: 64,
+                    },
+                    created_at: chrono::Utc::now(),
+                })
+                .unwrap();
+
+            let tuner = Arc::new(SimpleDecayTuner);
+            let retrain_observer = Arc::new(AdaptiveRetrainObserver::new(
+                &*monitor,
+                "quality_detector".into(),
+                tuner,
+                registry.clone(),
+            ));
+            retrain_observer.start();
+
+            // Send healthy KPI – no drift.
+            metric_tx
+                .send(PerformanceMetrics {
+                    precision: 0.9,
+                    recall: 0.9,
+                    f1_score: 0.9,
+                })
+                .unwrap();
+
+            // Send degraded KPI – should trigger retraining.
+            metric_tx
+                .send(PerformanceMetrics {
+                    precision: 0.4,
+                    recall: 0.4,
+                    f1_score: 0.4,
+                })
+                .unwrap();
+
+            // Allow background tasks to finish.
+            sleep(Duration::from_secs(5)).await;
+
+            // Assert new version exists.
+            let latest = registry.latest("quality_detector").unwrap();
+            assert_ne!(latest.sha256, "initial");
+        });
+    }
+}
+```

@@ -1,0 +1,512 @@
+```rust
+//! module_22 – Runtime-hot-swappable sentiment analysis strategies and Kafka
+//! stream processor used by ChirpPulse.
+//!
+//! This module demonstrates how data-scientists can plug-in new sentiment
+//! algorithms without taking the pipeline offline.  A registry keeps multiple
+//! strategies in memory and a lightweight control message on the
+//! `STRATEGY_CONTROL_TOPIC` lets operators promote a new default strategy
+//! instantly.  The processor consumes raw social messages, enriches them with
+//! sentiment, and republishes them to the lake in real-time.
+//!
+//! Production-ready aspects demonstrated here:
+//! • async Kafka consumer/producer (`rdkafka` + `tokio`)  
+//! • Strategy pattern with dynamic dispatch & hot-swap capabilities  
+//! • Robust error handling (`thiserror`) and observability (`tracing`)  
+//! • Graceful back-pressure and DLQ for poison messages  
+//!
+//! NOTE: In a real deployment this module would live in its own crate with the
+//! dependencies declared in `Cargo.toml`.  For brevity all source is presented
+//! in a single file.
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use async_trait::async_trait;
+use futures::{future::Either, StreamExt};
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    error::KafkaError,
+    message::{BorrowedMessage, OwnedMessage},
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Message,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::{mpsc, RwLock};
+use tracing::{debug, error, info, warn};
+
+///////////////////////////////////////////////////////////////////////////////
+// Domain models
+///////////////////////////////////////////////////////////////////////////////
+
+/// An enriched sentiment score produced by an analysis algorithm.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentimentScore {
+    /// Final sentiment in `[-1.0, 1.0]` where -1 is negative, 1 positive.
+    pub polarity: f32,
+    /// Confidence score in `[0, 1]`.
+    pub confidence: f32,
+    /// Optional explanation payload which some advanced models emit.
+    pub meta: Option<serde_json::Value>,
+}
+
+/// The wire format for an input social message ingested from Kafka.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialMessage {
+    pub id: String,
+    pub user_id: String,
+    pub platform: String,
+    pub language: String,
+    pub text: String,
+    pub created_at: SystemTime,
+}
+
+/// Combined structure sent to the downstream lake after enrichment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichedSocialMessage {
+    #[serde(flatten)]
+    pub original: SocialMessage,
+    pub sentiment: SentimentScore,
+    /// The algorithm identifier that produced the score.
+    pub strategy: String,
+    /// Event time for the enrichment.
+    pub enriched_at: SystemTime,
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Errors
+///////////////////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Error)]
+pub enum ProcessorError {
+    #[error("kafka error: {0}")]
+    Kafka(#[from] KafkaError),
+    #[error("strategy '{0}' not found")]
+    StrategyNotFound(String),
+    #[error("json serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("channel error: {0}")]
+    Channel(#[from] mpsc::error::SendError<OwnedMessage>),
+    #[error("other: {0}")]
+    Other(String),
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Sentiment Strategy Pattern
+///////////////////////////////////////////////////////////////////////////////
+
+/// Trait representing any sentiment analysis algorithm.
+///
+/// The `analyze` function is async to allow network calls (e.g., model server).
+#[async_trait]
+pub trait SentimentStrategy: Send + Sync + 'static {
+    /// Identifier shown in telemetry and persisted to records.
+    fn name(&self) -> &'static str;
+
+    /// Perform sentiment analysis on the given message body.
+    async fn analyze(&self, text: &str) -> Result<SentimentScore, ProcessorError>;
+}
+
+/// Trivial implementation that returns neutral sentiment.
+/// Useful as a circuit-breaker fallback.
+pub struct NeutralStrategy;
+
+#[async_trait]
+impl SentimentStrategy for NeutralStrategy {
+    fn name(&self) -> &'static str {
+        "neutral"
+    }
+
+    async fn analyze(&self, _text: &str) -> Result<SentimentScore, ProcessorError> {
+        Ok(SentimentScore {
+            polarity: 0.0,
+            confidence: 0.0,
+            meta: None,
+        })
+    }
+}
+
+/// Example lexical strategy that looks for positive/negative keywords
+/// (purely demonstrative – not production grade).
+pub struct LexiconStrategy {
+    positives: Vec<&'static str>,
+    negatives: Vec<&'static str>,
+}
+
+impl Default for LexiconStrategy {
+    fn default() -> Self {
+        Self {
+            positives: vec!["good", "great", "love", "excellent", "happy"],
+            negatives: vec!["bad", "hate", "terrible", "awful", "sad"],
+        }
+    }
+}
+
+#[async_trait]
+impl SentimentStrategy for LexiconStrategy {
+    fn name(&self) -> &'static str {
+        "lexicon_v1"
+    }
+
+    async fn analyze(&self, text: &str) -> Result<SentimentScore, ProcessorError> {
+        let mut score = 0f32;
+        let mut hits = 0u32;
+
+        for token in text.split_whitespace() {
+            if self.positives.iter().any(|p| token.eq_ignore_ascii_case(p)) {
+                score += 1.0;
+                hits += 1;
+            } else if self.negatives.iter().any(|n| token.eq_ignore_ascii_case(n)) {
+                score -= 1.0;
+                hits += 1;
+            }
+        }
+
+        if hits == 0 {
+            // Unknown sentiment
+            return Ok(SentimentScore {
+                polarity: 0.0,
+                confidence: 0.0,
+                meta: None,
+            });
+        }
+
+        let polarity = (score / hits as f32).clamp(-1.0, 1.0);
+        Ok(SentimentScore {
+            polarity,
+            confidence: (hits as f32 / text.split_whitespace().count() as f32).clamp(0.0, 1.0),
+            meta: None,
+        })
+    }
+}
+
+/// Registry containing all available strategies and the currently active default one.
+#[derive(Clone)]
+pub struct StrategyRegistry {
+    strategies: Arc<RwLock<HashMap<String, Arc<dyn SentimentStrategy>>>>,
+    default: Arc<RwLock<String>>,
+}
+
+impl StrategyRegistry {
+    pub fn new() -> Self {
+        let mut map: HashMap<String, Arc<dyn SentimentStrategy>> = HashMap::new();
+        let neutral = Arc::new(NeutralStrategy);
+        map.insert(neutral.name().to_owned(), neutral.clone());
+
+        let lex = Arc::new(LexiconStrategy::default());
+        map.insert(lex.name().to_owned(), lex.clone());
+
+        Self {
+            strategies: Arc::new(RwLock::new(map)),
+            default: Arc::new(RwLock::new(lex.name().to_owned())),
+        }
+    }
+
+    /// Register or override a strategy at runtime.
+    pub async fn register<S: SentimentStrategy>(&self, strategy: S) {
+        let name = strategy.name().to_owned();
+        self.strategies
+            .write()
+            .await
+            .insert(name, Arc::new(strategy));
+    }
+
+    /// Promote the named strategy to be the default going forward.
+    pub async fn promote_default(&self, name: &str) -> Result<(), ProcessorError> {
+        let read = self.strategies.read().await;
+        if read.contains_key(name) {
+            *self.default.write().await = name.to_owned();
+            Ok(())
+        } else {
+            Err(ProcessorError::StrategyNotFound(name.to_owned()))
+        }
+    }
+
+    /// Get the current default strategy.
+    pub async fn default(&self) -> Arc<dyn SentimentStrategy> {
+        let name = self.default.read().await.clone();
+        self.get(&name)
+            .await
+            .unwrap_or_else(|_| Arc::new(NeutralStrategy))
+    }
+
+    /// Fetch a strategy by name.
+    pub async fn get(&self, name: &str) -> Result<Arc<dyn SentimentStrategy>, ProcessorError> {
+        self.strategies
+            .read()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ProcessorError::StrategyNotFound(name.into()))
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Kafka configuration helpers
+///////////////////////////////////////////////////////////////////////////////
+
+const INPUT_TOPIC: &str = "raw_social_stream";
+const OUTPUT_TOPIC: &str = "enriched_social_stream";
+const DLQ_TOPIC: &str = "enrichment_dlq";
+const STRATEGY_CONTROL_TOPIC: &str = "sentiment_strategy_ctrl";
+
+fn kafka_config(brokers: &str, group_id: &str) -> ClientConfig {
+    let mut cfg = ClientConfig::new();
+    cfg.set("bootstrap.servers", brokers)
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .set("group.id", group_id)
+        .set("fetch.message.max.bytes", "1048576") // 1 MiB
+        .set("message.timeout.ms", "5000");
+    cfg
+}
+
+fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer, KafkaError> {
+    kafka_config(brokers, group_id)
+        .create::<StreamConsumer>()
+}
+
+fn build_producer(brokers: &str) -> Result<FutureProducer, KafkaError> {
+    ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("message.timeout.ms", "5000")
+        .set("compression.type", "lz4")
+        .create::<FutureProducer>()
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Stream Processor
+///////////////////////////////////////////////////////////////////////////////
+
+pub struct StreamProcessor {
+    registry: StrategyRegistry,
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+}
+
+impl StreamProcessor {
+    pub fn new(
+        registry: StrategyRegistry,
+        consumer: StreamConsumer,
+        producer: FutureProducer,
+    ) -> Self {
+        Self {
+            registry,
+            consumer,
+            producer,
+        }
+    }
+
+    /// Run the event loop until process is terminated.
+    pub async fn run(mut self) -> Result<(), ProcessorError> {
+        // Subscribe to both the data topic and the control topic
+        self.consumer
+            .subscribe(&[INPUT_TOPIC, STRATEGY_CONTROL_TOPIC])?;
+
+        info!("Sentiment enrichment processor started, awaiting messages...");
+        let (dlq_tx, mut dlq_rx) = mpsc::channel::<OwnedMessage>(1024);
+
+        // Spawn DLQ producer
+        let producer_clone = self.producer.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = dlq_rx.recv().await {
+                let payload = msg.payload().unwrap_or_default();
+                if let Err(e) = producer_clone
+                    .send(
+                        FutureRecord::to(DLQ_TOPIC)
+                            .payload(payload)
+                            .key(msg.key().unwrap_or_default()),
+                        Duration::from_secs(0),
+                    )
+                    .await
+                {
+                    error!("failed to produce to DLQ: {}", e.0);
+                }
+            }
+        });
+
+        let stream = self.consumer.stream();
+        tokio::pin!(stream);
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(msg) => {
+                    let topic = msg.topic().to_owned();
+                    let owned = msg.detach();
+
+                    let registry = self.registry.clone();
+                    let producer = self.producer.clone();
+                    let dlq_tx = dlq_tx.clone();
+
+                    tokio::spawn(async move {
+                        if let Err(err) =
+                            Self::handle_message(owned, &topic, registry, producer, dlq_tx).await
+                        {
+                            error!("processing error: {:?}", err);
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!("Kafka error encountered: {}", e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_message(
+        msg: OwnedMessage,
+        topic: &str,
+        registry: StrategyRegistry,
+        producer: FutureProducer,
+        dlq_tx: mpsc::Sender<OwnedMessage>,
+    ) -> Result<(), ProcessorError> {
+        match topic {
+            INPUT_TOPIC => {
+                let payload = std::str::from_utf8(msg.payload().unwrap_or_default())
+                    .map_err(|e| ProcessorError::Other(e.to_string()))?;
+
+                let social: SocialMessage = match serde_json::from_str(payload) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("invalid JSON payload, sending to DLQ: {}", e);
+                        dlq_tx.send(msg).await?;
+                        return Ok(());
+                    }
+                };
+
+                let strategy = registry.default().await;
+                let sentiment = strategy.analyze(&social.text).await?;
+
+                let enriched = EnrichedSocialMessage {
+                    original: social,
+                    sentiment,
+                    strategy: strategy.name().to_owned(),
+                    enriched_at: SystemTime::now(),
+                };
+
+                let serialized = serde_json::to_vec(&enriched)?;
+
+                // produce to output topic
+                producer
+                    .send(
+                        FutureRecord::to(OUTPUT_TOPIC)
+                            .payload(&serialized)
+                            .key(&enriched.original.id),
+                        Duration::from_secs(0),
+                    )
+                    .await
+                    .map_err(|(e, _)| ProcessorError::Kafka(e))?;
+
+                // manual commit
+                if let Err(e) = msg.commit(&producer.client(), rdkafka::consumer::CommitMode::Async)
+                {
+                    warn!("commit failed: {}", e);
+                }
+            }
+            STRATEGY_CONTROL_TOPIC => {
+                let cmd: StrategyControl =
+                    serde_json::from_slice(msg.payload().unwrap_or_default())?;
+
+                match cmd {
+                    StrategyControl::Promote { name } => {
+                        registry.promote_default(&name).await?;
+                        info!("Promoted strategy '{}' as new default", &name);
+                    }
+                }
+            }
+            _ => {
+                warn!("message on unexpected topic '{}', ignoring", topic);
+            }
+        }
+        Ok(())
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Strategy Control Plane
+///////////////////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StrategyControl {
+    Promote { name: String },
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Embedded integration test (requires 'kafka-integration-test' feature flag)
+///////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::timeout;
+
+    /// Simple smoke test ensuring lexicon logic works in isolation.
+    #[tokio::test]
+    async fn test_lexicon_strategy() {
+        let strat = LexiconStrategy::default();
+        let res = strat
+            .analyze("I love great, excellent code but hate bugs")
+            .await
+            .unwrap();
+        assert!(res.polarity.abs() > 0.0);
+    }
+
+    /// Registry promotion logic.
+    #[tokio::test]
+    async fn test_registry_promote() {
+        let registry = StrategyRegistry::new();
+        registry.promote_default("neutral").await.unwrap();
+        let default = registry.default().await;
+        assert_eq!(default.name(), "neutral");
+    }
+
+    /// Ensure invalid promotion yields error.
+    #[tokio::test]
+    async fn test_registry_promote_invalid() {
+        let registry = StrategyRegistry::new();
+        let err = registry.promote_default("non-existent").await.unwrap_err();
+        matches!(err, ProcessorError::StrategyNotFound(_));
+    }
+
+    /// Strategy control serialization round-trip.
+    #[test]
+    fn test_strategy_control_ser() {
+        let msg = StrategyControl::Promote {
+            name: "lexicon_v1".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: StrategyControl = serde_json::from_str(&json).unwrap();
+        match back {
+            StrategyControl::Promote { name } => assert_eq!(name, "lexicon_v1"),
+        }
+    }
+
+    // Integration with Kafka omitted in unit tests; would be covered in system
+    // tests using testcontainers or embedded-kafka.
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Entrypoint (only compiled for bin target)
+///////////////////////////////////////////////////////////////////////////////
+
+#[cfg(feature = "bin")]
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+
+    let brokers = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
+    let registry = StrategyRegistry::new();
+    let consumer = build_consumer(&brokers, "chirppulse-sentiment")?;
+    let producer = build_producer(&brokers)?;
+
+    let processor = StreamProcessor::new(registry, consumer, producer);
+    processor.run().await?;
+    Ok(())
+}
+```

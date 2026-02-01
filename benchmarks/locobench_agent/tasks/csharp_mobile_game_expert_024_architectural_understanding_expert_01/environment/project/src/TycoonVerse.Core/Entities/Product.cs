@@ -1,0 +1,337 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Text.Json.Serialization;
+using System.Threading;
+
+namespace TycoonVerse.Core.Entities
+{
+    /// <summary>
+    /// Represents a sellable or consumable item inside TycoonVerse. 
+    /// A product can be manufactured, traded on the marketplace, and it
+    /// affects company financials such as revenue, COGS, and inventory valuation.
+    /// </summary>
+    public class Product
+    {
+        private readonly object _locker = new object();
+        private readonly List<ProductPriceHistoryItem> _priceHistory = new();
+        private readonly List<DomainEvent> _domainEvents = new();
+
+        /// <summary>
+        /// Surrogate key used by persistence provider.
+        /// </summary>
+        [Key]
+        public Guid Id { get; private set; }
+
+        /// <summary>
+        /// Human-readable name that is unique per publisher.
+        /// </summary>
+        [Required]
+        [MaxLength(120)]
+        public string Name { get; private set; } = null!;
+
+        /// <summary>
+        /// COGS (Cost Of Goods Sold) in game currency for a single unit.
+        /// </summary>
+        [Range(0, double.MaxValue)]
+        public decimal UnitCost { get; private set; }
+
+        /// <summary>
+        /// Default selling price in game currency for a single unit.
+        /// </summary>
+        [Range(0, double.MaxValue)]
+        public decimal BaseUnitPrice { get; private set; }
+
+        /// <summary>
+        /// How long (real seconds) it takes to manufacture a single unit.
+        /// </summary>
+        [Range(0, int.MaxValue)]
+        public int ManufacturingSeconds { get; private set; }
+
+        /// <summary>
+        /// Category is used for supply/demand modeling.
+        /// </summary>
+        [Required]
+        [MaxLength(64)]
+        public string Category { get; private set; } = null!;
+
+        /// <summary>
+        /// Elasticity coefficient: if negative, price increase reduces demand.
+        /// </summary>
+        public float DemandElasticity { get; private set; }
+
+        /// <summary>
+        /// Optional region lock (e.g., due to licensing).
+        /// </summary>
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? RegionCode { get; private set; }
+
+        /// <summary>
+        /// Total units that are currently in stock and available for sale.
+        /// Thread-safe operations ensure consistency in multi-actor simulations.
+        /// </summary>
+        public int UnitsInInventory
+        {
+            get => Volatile.Read(ref _inventory);
+            private set => Volatile.Write(ref _inventory, value);
+        }
+
+        private int _inventory;
+
+        /// <summary>
+        /// UTC timestamp of last entity change – used by sync logic for offline play.
+        /// </summary>
+        public DateTimeOffset LastModifiedUtc { get; private set; }
+
+        /// <summary>
+        /// Immutable collection of price history entries.
+        /// </summary>
+        [JsonIgnore]
+        public IReadOnlyCollection<ProductPriceHistoryItem> PriceHistory => _priceHistory.AsReadOnly();
+
+        /// <summary>
+        /// Domain events raised by this aggregate root.
+        /// </summary>
+        [JsonIgnore]
+        public IReadOnlyCollection<DomainEvent> DomainEvents => _domainEvents.AsReadOnly();
+
+        #region Constructors
+
+        // Required for EF Core (or other ORMs)
+        private Product() { }
+
+        public Product(
+            string name,
+            decimal unitCost,
+            decimal baseUnitPrice,
+            int manufacturingSeconds,
+            string category,
+            float demandElasticity,
+            string? regionCode = null)
+        {
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Name cannot be empty", nameof(name));
+            if (string.IsNullOrWhiteSpace(category)) throw new ArgumentException("Category cannot be empty", nameof(category));
+            if (unitCost < 0) throw new ArgumentOutOfRangeException(nameof(unitCost));
+            if (baseUnitPrice < 0) throw new ArgumentOutOfRangeException(nameof(baseUnitPrice));
+            if (manufacturingSeconds < 0) throw new ArgumentOutOfRangeException(nameof(manufacturingSeconds));
+
+            Id = Guid.NewGuid();
+            Name = name.Trim();
+            UnitCost = unitCost;
+            BaseUnitPrice = baseUnitPrice;
+            ManufacturingSeconds = manufacturingSeconds;
+            Category = category.Trim();
+            DemandElasticity = demandElasticity;
+            RegionCode = regionCode;
+            LastModifiedUtc = DateTimeOffset.UtcNow;
+
+            _priceHistory.Add(new ProductPriceHistoryItem(BaseUnitPrice, LastModifiedUtc));
+        }
+
+        #endregion
+
+        #region Public Behaviour
+
+        /// <summary>
+        /// Computes the gross revenue generated by selling the defined quantity
+        /// at the specified (or current) unit price.
+        /// </summary>
+        public decimal ComputeRevenueForUnits(int quantity, decimal? unitPriceOverride = null)
+        {
+            if (quantity < 0) throw new ArgumentOutOfRangeException(nameof(quantity));
+
+            var price = unitPriceOverride ?? BaseUnitPrice;
+            return Math.Round(price * quantity, 2, MidpointRounding.AwayFromZero);
+        }
+
+        /// <summary>
+        /// Records a sale and removes inventory. 
+        /// Returns revenue for the transaction.
+        /// </summary>
+        public decimal RecordSaleUnits(int quantity, decimal? unitPriceOverride = null)
+        {
+            if (quantity <= 0) throw new ArgumentOutOfRangeException(nameof(quantity));
+
+            lock (_locker)
+            {
+                if (_inventory < quantity)
+                {
+                    throw new InvalidOperationException(
+                        $"Insufficient inventory. Requested={quantity}, Available={_inventory}");
+                }
+
+                _inventory -= quantity;
+            }
+
+            var revenue = ComputeRevenueForUnits(quantity, unitPriceOverride);
+            AddDomainEvent(new ProductInventoryChangedEvent(this, -quantity));
+            UpdateLastModified();
+
+            return revenue;
+        }
+
+        /// <summary>
+        /// Adds newly manufactured or procured units to inventory.
+        /// </summary>
+        public void Restock(int quantity)
+        {
+            if (quantity <= 0) throw new ArgumentOutOfRangeException(nameof(quantity));
+
+            lock (_locker)
+            {
+                _inventory += quantity;
+            }
+
+            AddDomainEvent(new ProductInventoryChangedEvent(this, quantity));
+            UpdateLastModified();
+        }
+
+        /// <summary>
+        /// Restores inventory to an explicit absolute value. 
+        /// Useful for cross-device sync conflict resolution.
+        /// </summary>
+        public void SetInventoryAbsolute(int newQuantity)
+        {
+            if (newQuantity < 0) throw new ArgumentOutOfRangeException(nameof(newQuantity));
+
+            lock (_locker)
+            {
+                var delta = newQuantity - _inventory;
+                _inventory = newQuantity;
+                AddDomainEvent(new ProductInventoryChangedEvent(this, delta));
+            }
+
+            UpdateLastModified();
+        }
+
+        /// <summary>
+        /// Adjusts the base unit price and records the change in price history.
+        /// </summary>
+        public void AdjustBasePrice(decimal newPrice, string? changeReason = null)
+        {
+            if (newPrice < 0) throw new ArgumentOutOfRangeException(nameof(newPrice));
+            if (newPrice == BaseUnitPrice) return; // no-op
+
+            var previousPrice = BaseUnitPrice;
+            BaseUnitPrice = newPrice;
+
+            var priceChangeUtc = DateTimeOffset.UtcNow;
+            _priceHistory.Add(new ProductPriceHistoryItem(newPrice, priceChangeUtc, changeReason));
+
+            AddDomainEvent(new ProductPriceChangedEvent(this, previousPrice, newPrice, changeReason));
+            UpdateLastModified();
+        }
+
+        /// <summary>
+        /// Calculates a dynamic price suggestion based on remaining inventory 
+        /// and elasticity. Used by AI assistants or auto-pilot mode.
+        /// </summary>
+        /// <param name="targetSellThroughHours">
+        /// Desired time (real hours) to deplete current inventory.
+        /// </param>
+        public decimal CalculateDynamicPrice(float targetSellThroughHours)
+        {
+            if (targetSellThroughHours <= 0)
+                throw new ArgumentOutOfRangeException(nameof(targetSellThroughHours));
+
+            // Simple algorithm: if inventory is high relative to target sell-through,
+            // discount based on elasticity; otherwise, markup.
+            const float baseDemand = 100f; // arbitrary units
+            var desiredDemandPerHour = UnitsInInventory / targetSellThroughHours;
+            var priceAdjustmentFactor = (desiredDemandPerHour - baseDemand) / baseDemand * -DemandElasticity;
+
+            // Limit adjustment within ±50% to prevent extreme prices
+            priceAdjustmentFactor = MathF.Max(-0.5f, MathF.Min(0.5f, priceAdjustmentFactor));
+
+            var suggestedPrice = BaseUnitPrice * (1m + (decimal)priceAdjustmentFactor);
+            suggestedPrice = Math.Round(suggestedPrice, 2, MidpointRounding.AwayFromZero);
+
+            return suggestedPrice < UnitCost ? UnitCost : suggestedPrice;
+        }
+
+        /// <summary>
+        /// Clears domain events after they have been dispatched by the infrastructure layer.
+        /// </summary>
+        public void ClearDomainEvents() => _domainEvents.Clear();
+
+        #endregion
+
+        #region Private helpers
+
+        private void AddDomainEvent(DomainEvent @event) => _domainEvents.Add(@event);
+
+        private void UpdateLastModified() => LastModifiedUtc = DateTimeOffset.UtcNow;
+
+        #endregion
+    }
+
+    #region Nested / supporting types
+
+    /// <summary>
+    /// Immutable value object that records price evolution.
+    /// </summary>
+    public readonly struct ProductPriceHistoryItem
+    {
+        public ProductPriceHistoryItem(decimal price, DateTimeOffset timestampUtc, string? reason = null)
+        {
+            Price = price;
+            TimestampUtc = timestampUtc;
+            Reason = reason;
+        }
+
+        public decimal Price { get; }
+        public DateTimeOffset TimestampUtc { get; }
+        public string? Reason { get; }
+    }
+
+    /// <summary>
+    /// Base type for domain events. Infrastructure layer will dispatch to observers.
+    /// </summary>
+    public abstract class DomainEvent
+    {
+        protected DomainEvent(Guid aggregateId)
+        {
+            AggregateId = aggregateId;
+            OccurredOnUtc = DateTimeOffset.UtcNow;
+        }
+
+        public Guid AggregateId { get; }
+        public DateTimeOffset OccurredOnUtc { get; }
+    }
+
+    public sealed class ProductPriceChangedEvent : DomainEvent
+    {
+        public ProductPriceChangedEvent(
+            Product product,
+            decimal previousPrice,
+            decimal newPrice,
+            string? reason)
+            : base(product.Id)
+        {
+            Product = product ?? throw new ArgumentNullException(nameof(product));
+            PreviousPrice = previousPrice;
+            NewPrice = newPrice;
+            Reason = reason;
+        }
+
+        public Product Product { get; }
+        public decimal PreviousPrice { get; }
+        public decimal NewPrice { get; }
+        public string? Reason { get; }
+    }
+
+    public sealed class ProductInventoryChangedEvent : DomainEvent
+    {
+        public ProductInventoryChangedEvent(Product product, int quantityDelta)
+            : base(product.Id)
+        {
+            Product = product ?? throw new ArgumentNullException(nameof(product));
+            QuantityDelta = quantityDelta;
+        }
+
+        public Product Product { get; }
+        public int QuantityDelta { get; }
+    }
+
+    #endregion
+}

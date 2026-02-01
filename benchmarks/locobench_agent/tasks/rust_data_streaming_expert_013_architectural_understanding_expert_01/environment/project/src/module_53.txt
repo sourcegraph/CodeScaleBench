@@ -1,0 +1,446 @@
+```rust
+//! module_53.rs
+//! Hot-swappable sentiment-analysis strategy manager for the
+//! ChirpPulse real-time data-streaming platform.
+//
+//  This module demonstrates an opinionated yet reusable
+//  implementation of the Strategy pattern.  A background task
+//  listens to a dedicated Kafka topic (`strategy.updates`) for
+//  JSON-encoded control messages.  When a new strategy revision
+//  is announced, the manager seamlessly swaps the active
+//  `SentimentAnalyzer` without interrupting the processing
+//  workers.
+//
+//  The code purposefully limits its external surface: all public
+//  types are re-exported by `pub use` so parent crates can simply
+//  `use module_53::*;`.
+//
+//  ──────────────────────────────────────────────────────────────
+//  Sample control message (sent to `strategy.updates` topic)
+//  {
+//      "version": "v1.3.7",
+//      "kind":    "fasttext",
+//      "payload": {
+//          "model_path": "s3://models/sentiment/fasttext_v1.3.7.bin"
+//      }
+//  }
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use parking_lot::RwLock;
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    error::KafkaError,
+    message::BorrowedMessage,
+    ClientConfig, Message,
+};
+use serde::Deserialize;
+use serde_json::Value as Json;
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    task::JoinHandle,
+    time::{interval_at, Instant},
+};
+
+/// Publicly available items.
+pub use analyzer::{FastTextAnalyzer, RuleBasedAnalyzer, SentimentAnalyzer};
+pub use manager::{AnalyzerManager, AnalyzerManagerHandle, AnalyzerManagerSettings};
+
+mod analyzer {
+    use super::*;
+
+    /// Domain error type for all analyzers.
+    #[derive(Debug, Error)]
+    pub enum AnalyzerError {
+        #[error("model loading failed: {0}")]
+        ModelLoad(String),
+        #[error("classification failed: {0}")]
+        Classification(String),
+    }
+
+    /// Shared result alias.
+    pub type Result<T> = std::result::Result<T, AnalyzerError>;
+
+    /// The Strategy trait: any sentiment analyzer must implement
+    /// this interface.
+    pub trait SentimentAnalyzer: Send + Sync + 'static {
+        /// Returns a unique identifier for the strategy version.
+        fn version(&self) -> &str;
+
+        /// Classify the given text, returning a score in the range
+        /// [-1.0, 1.0] where –1 is negative and 1 is positive.
+        fn score(&self, text: &str) -> Result<f32>;
+    }
+
+    /// Simple rule-based fallback analyzer.
+    ///
+    /// It is intentionally naive but useful when machine-learning
+    /// models are unavailable.
+    pub struct RuleBasedAnalyzer {
+        version: String,
+        rules: HashMap<String, f32>,
+    }
+
+    impl RuleBasedAnalyzer {
+        pub fn new(version: impl Into<String>) -> Self {
+            let mut rules = HashMap::new();
+            rules.insert("love".into(), 0.8);
+            rules.insert("hate".into(), -0.8);
+            rules.insert("great".into(), 0.6);
+            rules.insert("terrible".into(), -0.6);
+
+            Self {
+                version: version.into(),
+                rules,
+            }
+        }
+    }
+
+    impl SentimentAnalyzer for RuleBasedAnalyzer {
+        fn version(&self) -> &str {
+            &self.version
+        }
+
+        fn score(&self, text: &str) -> Result<f32> {
+            let mut acc = 0.0;
+            for (k, v) in &self.rules {
+                if text.contains(k) {
+                    acc += v;
+                }
+            }
+            Ok(acc.clamp(-1.0, 1.0))
+        }
+    }
+
+    /// Machine-learning powered analyzer backed by FastText.
+    ///
+    /// The actual FastText inference is mocked for brevity; in a
+    /// production build you would link to an FFI wrapper such as
+    /// `fasttext-rs` or call into a microservice.
+    pub struct FastTextAnalyzer {
+        version: String,
+        model_path: String,
+    }
+
+    impl FastTextAnalyzer {
+        pub async fn load(version: impl Into<String>, model_path: impl Into<String>) -> Result<Self> {
+            // Simulated I/O delay for model loading.
+            tokio::time::sleep(Duration::from_millis(120)).await;
+
+            // Placeholder: check the model path exists or is reachable.
+            let path: String = model_path.into();
+            if !path.starts_with("s3://") {
+                return Err(AnalyzerError::ModelLoad(format!(
+                    "unsupported model URI: {}",
+                    path
+                )));
+            }
+
+            Ok(Self {
+                version: version.into(),
+                model_path: path,
+            })
+        }
+    }
+
+    impl SentimentAnalyzer for FastTextAnalyzer {
+        fn version(&self) -> &str {
+            &self.version
+        }
+
+        fn score(&self, text: &str) -> Result<f32> {
+            // Mocks classification by hashing.
+            let hash = seahash::hash(text.as_bytes());
+            let normalized = (hash % 2000) as f32 / 1000.0 - 1.0;
+            Ok(normalized.clamp(-1.0, 1.0))
+        }
+    }
+}
+
+mod manager {
+    use super::*;
+
+    /// Settings for bootstrapping an `AnalyzerManager`.
+    ///
+    /// `bootstrap_servers` and `group_id` are Kafka connection
+    /// properties; `initial_strategy` sets the default analyzer
+    /// before the first control message is consumed.
+    #[derive(Debug, Clone)]
+    pub struct AnalyzerManagerSettings {
+        pub bootstrap_servers: String,
+        pub group_id: String,
+        pub control_topic: String,
+        pub initial_strategy: Box<dyn SentimentAnalyzer>,
+        pub heartbeat_interval: Duration,
+    }
+
+    impl Default for AnalyzerManagerSettings {
+        fn default() -> Self {
+            Self {
+                bootstrap_servers: "localhost:9092".into(),
+                group_id: "chirp-pulse.strategy.manager".into(),
+                control_topic: "strategy.updates".into(),
+                initial_strategy: Box::new(RuleBasedAnalyzer::new("builtin-fallback")),
+                heartbeat_interval: Duration::from_secs(30),
+            }
+        }
+    }
+
+    /// Handle that gives read-only (concurrent) access to the
+    /// currently active strategy.
+    ///
+    /// The underlying analyzer is protected by an `RwLock`.
+    /// Readers obtain an `Arc` clone, ensuring the live object
+    /// outlives any ongoing classification call when a swap
+    /// occurs.
+    #[derive(Clone)]
+    pub struct AnalyzerManagerHandle {
+        inner: Arc<RwLock<Box<dyn SentimentAnalyzer>>>,
+    }
+
+    impl AnalyzerManagerHandle {
+        pub fn analyze(&self, text: &str) -> f32 {
+            let guard = self.inner.read();
+            match guard.score(text) {
+                Ok(score) => score,
+                Err(err) => {
+                    tracing::error!(error = ?err, "failed to classify text; returning neutral");
+                    0.0
+                }
+            }
+        }
+
+        pub fn current_version(&self) -> String {
+            let guard = self.inner.read();
+            guard.version().to_string()
+        }
+    }
+
+    /// The manager spawns two background tasks:
+    ///   1. Kafka control-stream listener.
+    ///   2. Heartbeat emitter (prometheus, logs, etc.).
+    pub struct AnalyzerManager {
+        settings: AnalyzerManagerSettings,
+        handle: AnalyzerManagerHandle,
+        _bg_task: JoinHandle<()>,
+    }
+
+    impl AnalyzerManager {
+        pub fn new(settings: AnalyzerManagerSettings) -> Self {
+            let handle = AnalyzerManagerHandle {
+                inner: Arc::new(RwLock::new(settings.initial_strategy)),
+            };
+
+            let bg_handle = {
+                let handle_clone = handle.clone();
+                let settings_clone = settings.clone();
+
+                tokio::spawn(async move {
+                    let (kafka_task, mut hb_rx) =
+                        match Self::spawn_kafka_listener(settings_clone.clone(), handle_clone.clone())
+                        {
+                            Ok(ok) => ok,
+                            Err(e) => {
+                                tracing::error!(error = ?e, "unable to start Kafka listener; manager aborting");
+                                return;
+                            }
+                        };
+
+                    let mut heartbeat_tick =
+                        interval_at(Instant::now() + settings_clone.heartbeat_interval, settings_clone.heartbeat_interval);
+
+                    loop {
+                        select! {
+                            _ = heartbeat_tick.tick() => {
+                                Self::emit_heartbeat(&handle_clone);
+                            },
+                            _ = &mut hb_rx.recv() => {
+                                // channel closed; Kafka task ended
+                                tracing::warn!("Kafka control listener terminated; attempting restart in 5s");
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                // Attempt to restart the consumer.
+                            },
+                            _ = &mut tokio::signal::ctrl_c() => {
+                                tracing::info!("shutdown signal received in AnalyzerManager background task");
+                                kafka_task.abort();
+                                break;
+                            }
+                        }
+                    }
+                })
+            };
+
+            Self {
+                settings,
+                handle,
+                _bg_task: bg_handle,
+            }
+        }
+
+        pub fn handle(&self) -> AnalyzerManagerHandle {
+            self.handle.clone()
+        }
+
+        /// A heartbeat makes it easier for ops to detect a stuck
+        /// manager even when no strategy updates occur for long
+        /// periods.
+        fn emit_heartbeat(handle: &AnalyzerManagerHandle) {
+            let version = handle.current_version();
+            tracing::info!(target = "heartbeat", version, "analyzer manager heartbeat");
+            metrics::gauge!("analyzer_active_version", 1.0, "version" => version);
+        }
+
+        /// Spawns an async Kafka consumer to listen for strategy
+        /// control messages. Returns an error if the consumer fails
+        /// to start.
+        fn spawn_kafka_listener(
+            settings: AnalyzerManagerSettings,
+            handle: AnalyzerManagerHandle,
+        ) -> Result<(JoinHandle<()>, UnboundedReceiver<()>), KafkaError> {
+            let consumer: StreamConsumer = ClientConfig::new()
+                .set("bootstrap.servers", &settings.bootstrap_servers)
+                .set("group.id", &settings.group_id)
+                .set("enable.auto.commit", "true")
+                .set("auto.offset.reset", "latest")
+                .create()?;
+
+            consumer.subscribe(&[&settings.control_topic])?;
+
+            let (tx, rx) = mpsc::unbounded_channel::<()>();
+
+            let join_handle = tokio::spawn(async move {
+                tracing::info!("controller: listening for analyzer updates on {}", settings.control_topic);
+                loop {
+                    match consumer.recv().await {
+                        Err(err) => {
+                            tracing::error!(error = ?err, "Kafka receive error in strategy controller");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                        Ok(msg) => {
+                            if let Err(e) = Self::process_control_message(msg, &handle).await {
+                                tracing::warn!(error = ?e, "failed to process control message");
+                            }
+                        }
+                    }
+                }
+                // unreachable but keep compiler happy
+                #[allow(unreachable_code)]
+                {
+                    let _ = tx.send(());
+                }
+            });
+
+            Ok((join_handle, rx))
+        }
+
+        async fn process_control_message<'a>(
+            msg: BorrowedMessage<'a>,
+            handle: &AnalyzerManagerHandle,
+        ) -> anyhow::Result<()> {
+            let payload = msg.payload().ok_or_else(|| anyhow::anyhow!("empty message payload"))?;
+            let ctrl: ControlMessage = serde_json::from_slice(payload)?;
+
+            tracing::info!(
+                version = ctrl.version,
+                kind = ctrl.kind,
+                "received strategy update request"
+            );
+
+            match ctrl.kind.as_str() {
+                "fasttext" => {
+                    let model_path = ctrl
+                        .payload
+                        .get("model_path")
+                        .and_then(Json::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("fasttext update missing model_path"))?;
+                    let analyzer = match FastTextAnalyzer::load(ctrl.version.clone(), model_path.to_string()).await {
+                        Ok(a) => a,
+                        Err(err) => {
+                            tracing::error!(error = ?err, "failed to load fasttext model; ignoring control message");
+                            return Ok(());
+                        }
+                    };
+                    {
+                        let mut guard = handle.inner.write();
+                        *guard = Box::new(analyzer);
+                    }
+                    tracing::info!(new_version = ctrl.version, "successfully activated new FastText analyzer");
+                }
+                "rule_based" => {
+                    let analyzer = RuleBasedAnalyzer::new(ctrl.version.clone());
+                    {
+                        let mut guard = handle.inner.write();
+                        *guard = Box::new(analyzer);
+                    }
+                    tracing::info!(new_version = ctrl.version, "activated rule-based analyzer");
+                }
+                unknown => {
+                    tracing::warn!(unknown, "unsupported analyzer kind");
+                }
+            }
+            Ok(())
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Control message definitions
+    // ──────────────────────────────────────────────────────────────
+
+    #[derive(Debug, Deserialize)]
+    struct ControlMessage {
+        version: String,
+        kind: String,
+        #[serde(default)]
+        payload: Json,
+        #[serde(default = "now_ts")]
+        ts: u64,
+    }
+
+    fn now_ts() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default()
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Unit tests
+// ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rule_based_basic_sentiment() {
+        let analyzer = RuleBasedAnalyzer::new("unittest");
+        assert!(analyzer.score("I love rust").unwrap() > 0.0);
+        assert!(analyzer.score("I hate bugs").unwrap() < 0.0);
+    }
+
+    #[tokio::test]
+    async fn analyzer_manager_handle_swaps_version() {
+        let settings = AnalyzerManagerSettings::default();
+        let manager = AnalyzerManager::new(settings);
+        let handle = manager.handle();
+
+        let version1 = handle.current_version();
+        assert_eq!(version1, "builtin-fallback");
+
+        {
+            let mut guard = handle.inner.write();
+            *guard = Box::new(RuleBasedAnalyzer::new("new-version"));
+        }
+
+        let version2 = handle.current_version();
+        assert_eq!(version2, "new-version");
+    }
+}
+```

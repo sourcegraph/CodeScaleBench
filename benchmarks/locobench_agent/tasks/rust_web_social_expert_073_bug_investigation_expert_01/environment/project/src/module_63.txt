@@ -1,0 +1,362 @@
+```rust
+//! src/module_63.rs
+//!
+//! Learning-pulse domain module.
+//!
+//! This file contains a slice of the core domain that handles the creation of
+//! “learning pulses” (short student activities) and student replies.  It
+//! persists data through Postgres (via `sqlx`) and emits domain events through
+//! a pluggable producer (e.g. NATS, RabbitMQ, Kafka).  The design follows the
+//! Repository + Service Layer patterns and is fully async.
+//!
+//! IMPORTANT: This file is meant to be self-contained.  It exposes public
+//! structs and traits that other parts of the codebase can depend on while
+//! keeping implementation details private.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::broadcast;
+use tracing::{error, info};
+use uuid::Uuid;
+
+/// Unique identifier for accounts in the platform.
+pub type AccountId = Uuid;
+/// Unique identifier for learning pulses.
+pub type PulseId = Uuid;
+/// Unique identifier for replies.
+pub type ReplyId = Uuid;
+
+/// Represents a short activity/challenge pushed by an instructor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningPulse {
+    pub id: PulseId,
+    pub title: String,
+    pub description: String,
+    pub author_id: AccountId,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Represents a learner's reply to a pulse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StudentReply {
+    pub id: ReplyId,
+    pub pulse_id: PulseId,
+    pub author_id: AccountId,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Domain-level events emitted by the module.
+///
+/// Events are deliberately flat; any additional information should be embedded
+/// in the payload field so downstream services do not need to re-parse unknown
+/// variants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event_type", content = "payload")]
+pub enum DomainEvent {
+    LearningPulseCreated(LearningPulse),
+    StudentReplied(StudentReply),
+}
+
+/// Wrapper that adds cross-cutting metadata to every event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub event_id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub aggregate_id: Uuid,
+    pub actor_id: AccountId,
+    pub data: DomainEvent,
+}
+
+impl EventEnvelope {
+    pub fn new(aggregate_id: Uuid, actor_id: AccountId, data: DomainEvent) -> Self {
+        Self {
+            event_id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            aggregate_id,
+            actor_id,
+            data,
+        }
+    }
+}
+
+/// Trait that abstracts the broker/publisher used to ship events out
+/// of the bounded context.
+#[async_trait]
+pub trait EventProducer: Send + Sync {
+    async fn publish(&self, event: EventEnvelope) -> Result<(), EventPublishError>;
+}
+
+/// Because the platform can be deployed with different brokers, we ship a
+/// naive in-process implementation based on a Tokio broadcast channel –
+/// perfect for tests and local dev.
+#[derive(Clone)]
+pub struct InMemoryEventProducer {
+    tx: broadcast::Sender<EventEnvelope>,
+}
+
+impl InMemoryEventProducer {
+    /// Creates an in-memory producer with the specified ring buffer capacity.
+    pub fn new(buffer: usize) -> Self {
+        let (tx, _rx) = broadcast::channel(buffer);
+        Self { tx }
+    }
+
+    /// Returns a receiver that listens to all future events.
+    pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
+        self.tx.subscribe()
+    }
+}
+
+#[async_trait]
+impl EventProducer for InMemoryEventProducer {
+    async fn publish(&self, event: EventEnvelope) -> Result<(), EventPublishError> {
+        self.tx
+            .send(event)
+            .map_err(|e| EventPublishError::Delivery(format!("broadcast error: {e}")))
+    }
+}
+
+/// SQLx-based repository for pulses and replies.
+#[derive(Clone)]
+pub struct LearningPulseRepository {
+    pool: Arc<sqlx::PgPool>,
+}
+
+impl LearningPulseRepository {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool: Arc::new(pool) }
+    }
+
+    /// Creates a new pulse and returns the persisted row.
+    pub async fn insert_pulse(&self, pulse: &LearningPulse) -> Result<(), RepositoryError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO learning_pulses (id, title, description, author_id, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            pulse.id,
+            pulse.title,
+            pulse.description,
+            pulse.author_id,
+            pulse.created_at
+        )
+        .execute(&*self.pool)
+        .await
+        .map_err(RepositoryError::from)?;
+        Ok(())
+    }
+
+    /// Creates a new reply and returns the persisted row.
+    pub async fn insert_reply(&self, reply: &StudentReply) -> Result<(), RepositoryError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO pulse_replies (id, pulse_id, author_id, content, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            reply.id,
+            reply.pulse_id,
+            reply.author_id,
+            reply.content,
+            reply.created_at
+        )
+        .execute(&*self.pool)
+        .await
+        .map_err(RepositoryError::from)?;
+        Ok(())
+    }
+}
+
+/// Service layer that orchestrates repository + event producer.
+///
+/// This is the entry point consumed by the REST/controller layer.
+#[derive(Clone)]
+pub struct LearningPulseService<E: EventProducer> {
+    repo: LearningPulseRepository,
+    producer: Arc<E>,
+}
+
+impl<E: EventProducer> LearningPulseService<E> {
+    pub fn new(repo: LearningPulseRepository, producer: E) -> Self {
+        Self {
+            repo,
+            producer: Arc::new(producer),
+        }
+    }
+
+    /// Creates a new pulse, persists it, and emits a DomainEvent.
+    pub async fn create_pulse(
+        &self,
+        author_id: AccountId,
+        title: String,
+        description: String,
+    ) -> Result<LearningPulse, ServiceError> {
+        let pulse = LearningPulse {
+            id: Uuid::new_v4(),
+            title,
+            description,
+            author_id,
+            created_at: Utc::now(),
+        };
+
+        // Persist
+        self.repo.insert_pulse(&pulse).await?;
+
+        // Emit event
+        let envelope = EventEnvelope::new(
+            pulse.id,
+            author_id,
+            DomainEvent::LearningPulseCreated(pulse.clone()),
+        );
+        if let Err(e) = self.producer.publish(envelope).await {
+            error!("Failed to publish LearningPulseCreated event: {e}");
+        };
+
+        Ok(pulse)
+    }
+
+    /// Records a learner reply and emits a DomainEvent.
+    pub async fn submit_reply(
+        &self,
+        author_id: AccountId,
+        pulse_id: PulseId,
+        content: String,
+    ) -> Result<StudentReply, ServiceError> {
+        let reply = StudentReply {
+            id: Uuid::new_v4(),
+            pulse_id,
+            author_id,
+            content,
+            created_at: Utc::now(),
+        };
+
+        self.repo.insert_reply(&reply).await?;
+
+        let envelope = EventEnvelope::new(
+            pulse_id,
+            author_id,
+            DomainEvent::StudentReplied(reply.clone()),
+        );
+        if let Err(e) = self.producer.publish(envelope).await {
+            error!("Failed to publish StudentReplied event: {e}");
+        };
+
+        Ok(reply)
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                   Errors                                   */
+/* -------------------------------------------------------------------------- */
+
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("database error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum EventPublishError {
+    #[error("delivery failure: {0}")]
+    Delivery(String),
+}
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error(transparent)]
+    Repo(#[from] RepositoryError),
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                 Unit Tests                                 */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::{Executor, PgPool, Postgres};
+
+    // Helper that sets up an isolated in-memory PostgreSQL (using `sqlx::PgPool`)
+    // IMPORTANT: Requires `DATABASE_URL=postgres://…` pointing at a test DB.
+    async fn setup_db() -> PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set for integration tests");
+        let pool = PgPool::connect(&database_url).await.unwrap();
+
+        // Clean and migrate minimal schema for the tests.
+        let mut conn = pool.acquire().await.unwrap();
+        conn.execute("DROP TABLE IF EXISTS learning_pulses").await.unwrap();
+        conn.execute("DROP TABLE IF EXISTS pulse_replies").await.unwrap();
+
+        conn.execute(
+            r#"
+            CREATE TABLE learning_pulses (
+                id UUID PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                author_id UUID NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL
+            );
+        "#,
+        )
+        .await
+        .unwrap();
+
+        conn.execute(
+            r#"
+            CREATE TABLE pulse_replies (
+                id UUID PRIMARY KEY,
+                pulse_id UUID NOT NULL REFERENCES learning_pulses(id),
+                author_id UUID NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL
+            );
+        "#,
+        )
+        .await
+        .unwrap();
+
+        pool
+    }
+
+    #[tokio::test]
+    async fn pulse_creation_and_reply_flow() {
+        let pool = setup_db().await;
+        let repo = LearningPulseRepository::new(pool);
+        let producer = InMemoryEventProducer::new(16);
+        let mut rx = producer.subscribe();
+
+        let service = LearningPulseService::new(repo, producer);
+
+        // Create pulse
+        let author_id = Uuid::new_v4();
+        let pulse = service
+            .create_pulse(author_id, "Vectors".into(), "Explain vectors".into())
+            .await
+            .unwrap();
+
+        // Ensure we received the event
+        let envelope = rx.recv().await.unwrap();
+        assert!(matches!(
+            envelope.data,
+            DomainEvent::LearningPulseCreated(_)
+        ));
+        assert_eq!(envelope.aggregate_id, pulse.id);
+
+        // Reply
+        let student_id = Uuid::new_v4();
+        let _reply = service
+            .submit_reply(student_id, pulse.id, "Here is my answer".into())
+            .await
+            .unwrap();
+
+        let envelope = rx.recv().await.unwrap();
+        assert!(matches!(envelope.data, DomainEvent::StudentReplied(_)));
+        assert_eq!(envelope.aggregate_id, pulse.id);
+    }
+}
+```

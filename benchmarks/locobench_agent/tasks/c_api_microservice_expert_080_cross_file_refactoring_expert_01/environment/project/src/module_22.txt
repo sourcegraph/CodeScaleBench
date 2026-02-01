@@ -1,0 +1,388 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * -----------------------------------------------
+ * Module: Rate Limiter  (src/module_22.txt)
+ *
+ * This module provides an in-memory, thread-safe, token-bucket rate limiter
+ * that can be shared by all HTTP / gRPC / GraphQL front-ends living in the
+ * monolith.  It also publishes Prometheus-compatible metrics through the
+ * system-wide monitoring facility.
+ *
+ * Design goals
+ *  * O(1) look-ups using uthash
+ *  * Constant-time hot-path for Check & Consume
+ *  * Low allocation churn – buckets are recycled by a background janitor
+ *  * Lock contention kept to a minimum with striped sharding
+ *
+ * Public interface
+ *  * rl_init                 – global initialization
+ *  * rl_set_policy           – configure (or update) a route/key policy
+ *  * rl_check_and_consume    – authorise a request; atomically spend tokens
+ *  * rl_shutdown             – graceful shutdown & resource reclamation
+ *
+ * Copyright (c) 2024
+ * SPDX-License-Identifier: MIT
+ */
+
+#include <assert.h>
+#include <errno.h>
+#include <math.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#define RL_KEY_MAX     96U     /* route::tenant::user::custom is plenty        */
+#define RL_SHARDS      32U     /* number of striped hash maps / mutexes        */
+#define RL_JANITOR_IVL 30      /* seconds between janitor sweeps               */
+#define RL_IDLE_TTL    900.0   /* seconds before an unused bucket is evicted   */
+
+/* ------------------------------------------------------------------------- *\
+ * Dependencies that exist elsewhere in the project tree
+\* ------------------------------------------------------------------------- */
+
+#include "logging.h"     /* log_debug, log_warn, log_error, etc.              */
+#include "metrics.h"     /* metrics_counter_inc, metrics_gauge_set            */
+#include "time_util.h"   /* clock_now_monotonic_sec() – double precision      */
+
+/* If the project already bundles uthash, include its header.  If not,
+ * drop https://troydhanson.github.io/uthash/uthash.h into the vendor dir.    */
+#include "uthash.h"
+
+/* ------------------------------------------------------------------------- *\
+ * Internal structures
+\* ------------------------------------------------------------------------- */
+
+/* Token bucket – one for every unique (policy_key) */
+typedef struct rl_bucket {
+    char   key[RL_KEY_MAX];   /* hash key                                          */
+    double capacity;          /* burst size                                         */
+    double refill_rate;       /* token / second                                     */
+    double tokens;            /* current available tokens                           */
+    double last_refill_ts;    /* monotonic seconds                                  */
+    UT_hash_handle hh;        /* uthash handle                                      */
+} rl_bucket_t;
+
+/* A shard = hash map + lock */
+typedef struct rl_shard {
+    pthread_mutex_t mtx;
+    rl_bucket_t    *buckets;  /* uthash root (NULL if empty)                        */
+} rl_shard_t;
+
+/* Global context */
+typedef struct rate_limiter {
+    rl_shard_t shards[RL_SHARDS];
+    pthread_t  janitor_tid;
+    bool       janitor_running;
+} rate_limiter_t;
+
+static rate_limiter_t g_rl;   /* singleton (constructed by rl_init)                */
+
+/* Prometheus metrics (labels omitted for brevity) */
+static const char *MET_RL_ALLOWED  = "merc_rl_allowed_total";
+static const char *MET_RL_REJECTED = "merc_rl_rejected_total";
+static const char *MET_RL_BUCKETS  = "merc_rl_active_buckets";
+
+/* ------------------------------------------------------------------------- *\
+ * Helpers
+\* ------------------------------------------------------------------------- */
+
+/* djb2 hash – used only to pick a shard (not for uthash) */
+static inline uint32_t hash_key(const char *s)
+{
+    uint32_t h = 5381;
+    int c;
+    while ((c = *s++) != 0)
+        h = ((h << 5) + h) + (uint32_t)c; /* h*33 + c */
+    return h;
+}
+
+static inline rl_shard_t *shard_for(const char *key)
+{
+    uint32_t idx = hash_key(key) & (RL_SHARDS - 1);
+    return &g_rl.shards[idx];
+}
+
+/* Refill tokens according to elapsed time.  Must be called with shard locked. */
+static inline void bucket_refill(rl_bucket_t *b, double now)
+{
+    double delta = now - b->last_refill_ts;
+    if (delta <= 0.0)
+        return;
+
+    double replenished = delta * b->refill_rate;
+    if (replenished > 0.0) {
+        b->tokens = fmin(b->capacity, b->tokens + replenished);
+        b->last_refill_ts = now;
+    }
+}
+
+/* ------------------------------------------------------------------------- *\
+ * Public API
+\* ------------------------------------------------------------------------- */
+
+/*
+ * rl_init()
+ *   Must be invoked during application boot before any other rl_* call.
+ *   Spawns the janitor thread that evicts idle buckets and reports gauge.
+ */
+int rl_init(void)
+{
+    memset(&g_rl, 0, sizeof(g_rl));
+
+    for (size_t i = 0; i < RL_SHARDS; ++i) {
+        if (pthread_mutex_init(&g_rl.shards[i].mtx, NULL) != 0) {
+            log_error("rate_limiter: failed to init mutex (%zu)", i);
+            return -1;
+        }
+    }
+
+    g_rl.janitor_running = true;
+    if (pthread_create(&g_rl.janitor_tid, NULL, /*start_routine*/(void *(*)(void *))&rl_shutdown, NULL) != 0)
+    {
+        log_error("rate_limiter: failed to spawn janitor thread: %s", strerror(errno));
+        g_rl.janitor_running = false;
+        return -1;
+    }
+
+    log_info("rate_limiter: initialised with %u shards", RL_SHARDS);
+    return 0;
+}
+
+/*
+ * rl_set_policy()
+ *   Registers (or updates) a token bucket policy identified by `key`.
+ *   Example keys:
+ *      "route:/orders POST"          – per route
+ *      "tenant:42"                   – per tenant
+ *      "ip:192.168.10.20"            – per remote IP
+ */
+int rl_set_policy(const char *key, double capacity, double refill_rate)
+{
+    if (!key || strlen(key) >= RL_KEY_MAX || capacity <= 0.0 || refill_rate <= 0.0)
+        return EINVAL;
+
+    rl_shard_t *sh = shard_for(key);
+    pthread_mutex_lock(&sh->mtx);
+
+    rl_bucket_t *bkt = NULL;
+    HASH_FIND_STR(sh->buckets, key, bkt);
+
+    double now = clock_now_monotonic_sec();
+
+    if (!bkt) {
+        /* New bucket */
+        bkt = calloc(1, sizeof(*bkt));
+        if (!bkt) {
+            pthread_mutex_unlock(&sh->mtx);
+            return ENOMEM;
+        }
+        strncpy(bkt->key, key, RL_KEY_MAX - 1);
+        bkt->capacity       = capacity;
+        bkt->refill_rate    = refill_rate;
+        bkt->tokens         = capacity;          /* start full */
+        bkt->last_refill_ts = now;
+
+        HASH_ADD_STR(sh->buckets, key, bkt);
+        metrics_gauge_set(MET_RL_BUCKETS, (double)HASH_COUNT(sh->buckets));
+    } else {
+        /* Policy update */
+        bkt->capacity    = capacity;
+        bkt->refill_rate = refill_rate;
+        bkt->tokens      = fmin(capacity, bkt->tokens);
+    }
+
+    pthread_mutex_unlock(&sh->mtx);
+    return 0;
+}
+
+/*
+ * rl_check_and_consume()
+ *   Fast path called for every request.  Returns 0 if allowed,
+ *   otherwise returns 429 (HTTP Too Many Requests) for convenience.
+ *
+ *   `cost` denotes how many tokens to spend (normally 1).
+ */
+int rl_check_and_consume(const char *key, double cost)
+{
+    if (!key || cost <= 0.0)
+        return EINVAL;
+
+    rl_shard_t *sh = shard_for(key);
+    pthread_mutex_lock(&sh->mtx);
+
+    rl_bucket_t *bkt = NULL;
+    HASH_FIND_STR(sh->buckets, key, bkt);
+
+    if (!bkt) {
+        /* Fallback: create default bucket with generous capacity   */
+        pthread_mutex_unlock(&sh->mtx);
+        log_warn("rate_limiter: no policy for key='%s' – default allow", key);
+        metrics_counter_inc(MET_RL_ALLOWED, 1.0);
+        return 0;
+    }
+
+    double now = clock_now_monotonic_sec();
+    bucket_refill(bkt, now);
+
+    int rc = 0;
+    if (bkt->tokens >= cost) {
+        bkt->tokens -= cost;
+        metrics_counter_inc(MET_RL_ALLOWED, 1.0);
+    } else {
+        rc = 429;
+        metrics_counter_inc(MET_RL_REJECTED, 1.0);
+    }
+
+    pthread_mutex_unlock(&sh->mtx);
+    return rc;
+}
+
+/*
+ * rl_shutdown()
+ *   Called when the application terminates.  Frees all buckets and
+ *   stops the janitor.
+ */
+void rl_shutdown(void)
+{
+    g_rl.janitor_running = false;
+
+    /* Wait for janitor to exit if it exists */
+    if (g_rl.janitor_tid)
+        pthread_join(g_rl.janitor_tid, NULL);
+
+    for (size_t i = 0; i < RL_SHARDS; ++i) {
+        rl_shard_t *sh = &g_rl.shards[i];
+        pthread_mutex_lock(&sh->mtx);
+
+        rl_bucket_t *bkt, *tmp;
+        HASH_ITER(hh, sh->buckets, bkt, tmp) {
+            HASH_DEL(sh->buckets, bkt);
+            free(bkt);
+        }
+        pthread_mutex_unlock(&sh->mtx);
+        pthread_mutex_destroy(&sh->mtx);
+    }
+
+    log_info("rate_limiter: shutdown complete");
+}
+
+/* ------------------------------------------------------------------------- *\
+ * Janitor thread
+\* ------------------------------------------------------------------------- */
+
+/* Detached thread that runs until g_rl.janitor_running == false */
+static void *janitor_main(void *arg)
+{
+    (void)arg;   /* unused */
+
+    while (g_rl.janitor_running) {
+        sleep(RL_JANITOR_IVL);
+
+        size_t total_buckets = 0;
+        double now = clock_now_monotonic_sec();
+
+        for (size_t i = 0; i < RL_SHARDS; ++i) {
+            rl_shard_t *sh = &g_rl.shards[i];
+            pthread_mutex_lock(&sh->mtx);
+
+            rl_bucket_t *bkt, *tmp;
+            HASH_ITER(hh, sh->buckets, bkt, tmp) {
+                if ((now - bkt->last_refill_ts) > RL_IDLE_TTL) {
+                    HASH_DEL(sh->buckets, bkt);
+                    free(bkt);
+                }
+            }
+
+            total_buckets += HASH_COUNT(sh->buckets);
+            pthread_mutex_unlock(&sh->mtx);
+        }
+
+        metrics_gauge_set(MET_RL_BUCKETS, (double)total_buckets);
+        log_debug("rate_limiter: janitor sweep, active_buckets=%zu", total_buckets);
+    }
+    return NULL;
+}
+
+/*
+ * Override pthread entry to ensure detached semantics and
+ * proper naming when supported by the platform.  This wrapper
+ * exists because we cannot pass janitor_main directly to rl_init
+ * — we need to configure thread attributes first.
+ */
+static int spawn_janitor_thread(void)
+{
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0)
+        return -1;
+
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+#ifdef __linux__
+    pthread_attr_setstacksize(&attr, 128 * 1024);  /* 128 KiB is enough       */
+#endif
+
+    int rc = pthread_create(&g_rl.janitor_tid, &attr, janitor_main, NULL);
+    pthread_attr_destroy(&attr);
+
+#if defined(__APPLE__) || defined(__linux__)
+    (void)pthread_setname_np(g_rl.janitor_tid, "rl_janitor");
+#endif
+    return rc;
+}
+
+/* Re-wire rl_init() call to use the wrapper */
+#undef rl_init
+int rl_init(void)
+{
+    memset(&g_rl, 0, sizeof(g_rl));
+
+    for (size_t i = 0; i < RL_SHARDS; ++i) {
+        if (pthread_mutex_init(&g_rl.shards[i].mtx, NULL) != 0) {
+            log_error("rate_limiter: failed to init mutex #%zu", i);
+            return -1;
+        }
+    }
+
+    g_rl.janitor_running = true;
+    if (spawn_janitor_thread() != 0) {
+        log_error("rate_limiter: couldn't spawn janitor thread");
+        g_rl.janitor_running = false;
+        return -1;
+    }
+
+    log_info("rate_limiter: ready (shards=%u, janitor=%us, idle_ttl=%gs)",
+             RL_SHARDS, RL_JANITOR_IVL, RL_IDLE_TTL);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- *\
+ * Unit-like Smoke Test (compile-time optional)
+\* ------------------------------------------------------------------------- */
+#ifdef RATE_LIMITER_TEST
+
+#include <stdio.h>
+
+static void busy_loop(const char *key, int n, double cost, useconds_t us)
+{
+    for (int i = 0; i < n; ++i) {
+        int rc = rl_check_and_consume(key, cost);
+        printf("[%02d] %s -> %s\n", i, key, rc ? "REJECT" : "ALLOW");
+        usleep(us);
+    }
+}
+
+int main(void)
+{
+    rl_init();
+    rl_set_policy("test", 5.0, 1.0); /* 5 tokens, 1 token / sec */
+
+    busy_loop("test", 10, 1.0, 200000); /* 0.2 s */
+
+    rl_shutdown();
+    return 0;
+}
+#endif /* RATE_LIMITER_TEST */

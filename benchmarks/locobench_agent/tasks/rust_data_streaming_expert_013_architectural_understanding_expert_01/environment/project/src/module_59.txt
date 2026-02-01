@@ -1,0 +1,488 @@
+```rust
+//! module_59 — Data-Quality & Observability utilities
+//!
+//! This module hosts the generic, pluggable data-quality framework used by
+//! ChirpPulse ingestion and enrichment services.  Every incoming
+//! `SocialRecord` is validated against a configurable set of `QualityRule`s.
+//! Validation results are published as Prometheus metrics and surfaced through
+//! structured `tracing` spans for distributed debugging.
+//!
+//! The implementation follows the *Pipeline* and *Strategy* patterns: each rule
+//! is a small, composable strategy; multiple rules are chained into a single
+//! `QualityGate` pipeline stage.
+//!
+//! © 2024 ChirpPulse Contributors. MIT licensed.
+
+#![deny(
+    clippy::all,
+    clippy::pedantic,
+    missing_docs,
+    unsafe_code,
+    rust_2018_idioms
+)]
+
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
+use lazy_static::lazy_static;
+use prometheus::{IntCounter, IntCounterVec, Opts, Registry};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use thiserror::Error;
+use tracing::{debug, error, info, instrument, warn};
+
+/// The canonical representation of an event flowing through ChirpPulse.
+///
+/// In practice the struct is usually generated from Avro/Protobuf schemas.
+/// For demonstration purposes it is re-declared here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialRecord {
+    pub id: String,
+    pub user_id: String,
+    pub created_at: DateTime<Utc>,
+    pub lang: Option<String>,
+    pub text: String,
+    pub metadata: Value,
+}
+
+impl SocialRecord {
+    /// Returns the age of the event w.r.t. the current wall-clock time.
+    #[must_use]
+    pub fn age(&self) -> Duration {
+        let now = Utc::now();
+        (now - self.created_at).to_std().unwrap_or_default()
+    }
+}
+
+/// High-level outcome of a data-quality validation pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateDecision {
+    /// Record passed every rule.
+    Accept,
+    /// At least one rule vetoed the record.
+    Reject {
+        /// Human-readable failure reasons—one entry per failing rule.
+        reasons: Vec<String>,
+    },
+}
+
+/// A strongly-typed quality-rule error.
+#[derive(Debug, Error)]
+#[error("{rule}: {msg}")]
+pub struct RuleError {
+    rule: &'static str,
+    msg: String,
+}
+
+/// The core strategy trait.
+///
+/// A rule returns `Ok(())` on success or `Err(RuleError)` when the record
+/// violates the rule.
+pub trait QualityRule: Send + Sync + 'static {
+    /// A stable, unique name used in metrics and traces.
+    fn name(&self) -> &'static str;
+
+    /// Validate a single record.
+    fn validate(&self, record: &SocialRecord) -> Result<(), RuleError>;
+}
+
+/// Gate/pipeline that chains multiple `QualityRule`s together.
+///
+/// While *not* thread-safe on its own, the struct is cheap to `Arc` wrap and
+/// can therefore be shared across lightweight async tasks.
+///
+/// NOTE: `QualityGate` is purposely **synchronous**—validation is expected to
+/// run in-line on the consumer thread where back-pressure semantics are
+/// clearer. Heavy/remote rules should be moved into a downstream enrichment
+/// stage.
+#[derive(Debug, Default)]
+pub struct QualityGate {
+    rules: Vec<Arc<dyn QualityRule>>,
+    metrics: Metrics,
+}
+
+impl QualityGate {
+    /// Build a new gate from a list of rules.
+    pub fn new(rules: Vec<Arc<dyn QualityRule>>, registry: &Registry) -> Self {
+        Self {
+            rules,
+            metrics: Metrics::register(registry),
+        }
+    }
+
+    /// Validate one record. Returns [`GateDecision`].
+    #[instrument(skip(self, record))]
+    pub fn check(&self, record: &SocialRecord) -> GateDecision {
+        let mut failures = Vec::new();
+
+        for rule in &self.rules {
+            match rule.validate(record) {
+                Ok(()) => self.metrics.rule_pass.with_label_values(&[rule.name()]).inc(),
+                Err(err) => {
+                    self.metrics.rule_fail.with_label_values(&[rule.name()]).inc();
+                    failures.push(err.to_string());
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            self.metrics.accepted.inc();
+            GateDecision::Accept
+        } else {
+            self.metrics.rejected.inc();
+            GateDecision::Reject { reasons: failures }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Concrete rule implementations.
+// ---------------------------------------------------------------------------
+
+/// Rejects records whose timestamp differs from *now* by more than the allowed
+/// skew.
+#[derive(Debug)]
+pub struct TimestampSkewRule {
+    max_future_skew: Duration,
+    max_past_skew: Duration,
+}
+
+impl TimestampSkewRule {
+    #[must_use]
+    pub fn new(max_future_skew: Duration, max_past_skew: Duration) -> Self {
+        Self {
+            max_future_skew,
+            max_past_skew,
+        }
+    }
+}
+
+impl QualityRule for TimestampSkewRule {
+    fn name(&self) -> &'static str {
+        "timestamp_skew"
+    }
+
+    fn validate(&self, record: &SocialRecord) -> Result<(), RuleError> {
+        let age = record.age();
+        if record.created_at > Utc::now() + chrono::Duration::from_std(self.max_future_skew).unwrap()
+        {
+            return Err(RuleError {
+                rule: self.name(),
+                msg: format!("future timestamp: {:?}", record.created_at),
+            });
+        }
+
+        if age > self.max_past_skew {
+            return Err(RuleError {
+                rule: self.name(),
+                msg: format!("stale record (age {:?})", age),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+/// Ensures the language code is present and belongs to an allow-list.
+#[derive(Debug)]
+pub struct LangAllowListRule {
+    allowed: HashSet<String>,
+}
+
+impl LangAllowListRule {
+    #[must_use]
+    pub fn new<I, S>(langs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            allowed: langs.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl QualityRule for LangAllowListRule {
+    fn name(&self) -> &'static str {
+        "lang_allowlist"
+    }
+
+    fn validate(&self, record: &SocialRecord) -> Result<(), RuleError> {
+        match record.lang.as_deref() {
+            Some(code) if self.allowed.contains(code) => Ok(()),
+            Some(code) => Err(RuleError {
+                rule: self.name(),
+                msg: format!("unsupported lang: {code}"),
+            }),
+            None => Err(RuleError {
+                rule: self.name(),
+                msg: "missing lang".into(),
+            }),
+        }
+    }
+}
+
+/// Very naive profanity filter using regex; suitable only for demonstration.
+#[derive(Debug)]
+pub struct ProfanityRule {
+    pattern: Regex,
+}
+
+impl ProfanityRule {
+    #[must_use]
+    pub fn default_english() -> Self {
+        lazy_static! {
+            static ref PATTERN: Regex = Regex::new(
+                r"(?i)\b(?:damn|shit|fuck|bitch|asshole|bastard|dick)\b"
+            )
+            .expect("valid regex");
+        }
+        Self {
+            pattern: PATTERN.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn from_regex(pattern: Regex) -> Self {
+        Self { pattern }
+    }
+}
+
+impl QualityRule for ProfanityRule {
+    fn name(&self) -> &'static str {
+        "profanity"
+    }
+
+    fn validate(&self, record: &SocialRecord) -> Result<(), RuleError> {
+        if self.pattern.is_match(&record.text) {
+            Err(RuleError {
+                rule: self.name(),
+                msg: "profanity detected".into(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prometheus instrumentation.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct Metrics {
+    accepted: IntCounter,
+    rejected: IntCounter,
+    rule_pass: IntCounterVec,
+    rule_fail: IntCounterVec,
+}
+
+impl Metrics {
+    fn register(registry: &Registry) -> Self {
+        let accepted = IntCounter::with_opts(Opts::new(
+            "chirppulse_quality_records_accepted_total",
+            "Number of records accepted by the data-quality gate",
+        ))
+        .expect("metric can be created");
+        registry
+            .register(Box::new(accepted.clone()))
+            .expect("metric can be registered");
+
+        let rejected = IntCounter::with_opts(Opts::new(
+            "chirppulse_quality_records_rejected_total",
+            "Number of records rejected by the data-quality gate",
+        ))
+        .expect("metric can be created");
+        registry
+            .register(Box::new(rejected.clone()))
+            .expect("metric can be registered");
+
+        let rule_pass = IntCounterVec::new(
+            Opts::new(
+                "chirppulse_quality_rule_pass_total",
+                "Number of rule passes grouped by rule",
+            ),
+            &["rule"],
+        )
+        .expect("metric can be created");
+        registry
+            .register(Box::new(rule_pass.clone()))
+            .expect("metric can be registered");
+
+        let rule_fail = IntCounterVec::new(
+            Opts::new(
+                "chirppulse_quality_rule_fail_total",
+                "Number of rule failures grouped by rule",
+            ),
+            &["rule"],
+        )
+        .expect("metric can be created");
+        registry
+            .register(Box::new(rule_fail.clone()))
+            .expect("metric can be registered");
+
+        Self {
+            accepted,
+            rejected,
+            rule_pass,
+            rule_fail,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Builder helpers for ergonomic configuration.
+// ---------------------------------------------------------------------------
+
+/// Deserializable configuration blob.
+#[derive(Debug, Deserialize)]
+pub struct GateConfig {
+    pub max_future_skew_sec: Option<u64>,
+    pub max_past_skew_sec: Option<u64>,
+    pub allowed_langs: Option<Vec<String>>,
+    pub enable_profanity: Option<bool>,
+}
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        Self {
+            max_future_skew_sec: Some(30),
+            max_past_skew_sec: Some(86_400),
+            allowed_langs: Some(vec![
+                "en".to_string(),
+                "es".to_string(),
+                "pt".to_string(),
+                "fr".to_string(),
+                "de".to_string(),
+            ]),
+            enable_profanity: Some(true),
+        }
+    }
+}
+
+/// Fluent builder producing a ready-to-use gate from [`GateConfig`].
+pub struct GateBuilder {
+    cfg: GateConfig,
+    registry: Registry,
+}
+
+impl GateBuilder {
+    #[must_use]
+    pub fn new(cfg: GateConfig) -> Self {
+        Self {
+            cfg,
+            registry: Registry::new_custom(Some("chirppulse".into()), None)
+                .expect("registry"),
+        }
+    }
+
+    /// Override the prometheus registry (handy for tests).
+    #[must_use]
+    pub fn with_registry(mut self, registry: Registry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// Consume the builder and produce a fully configured `QualityGate`.
+    pub fn build(self) -> QualityGate {
+        // Mandatory timestamp rule
+        let mut rules: Vec<Arc<dyn QualityRule>> = vec![Arc::new(TimestampSkewRule::new(
+            Duration::from_secs(self.cfg.max_future_skew_sec.unwrap_or(30)),
+            Duration::from_secs(self.cfg.max_past_skew_sec.unwrap_or(86_400)),
+        ))];
+
+        // Language allow-list
+        if let Some(langs) = self.cfg.allowed_langs {
+            rules.push(Arc::new(LangAllowListRule::new(langs)));
+        }
+
+        // Profanity filter
+        if self.cfg.enable_profanity.unwrap_or(false) {
+            rules.push(Arc::new(ProfanityRule::default_english()));
+        }
+
+        QualityGate::new(rules, &self.registry)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDur;
+    use prometheus::Registry;
+
+    fn mock_record(text: &str) -> SocialRecord {
+        SocialRecord {
+            id: "id_1".into(),
+            user_id: "user_1".into(),
+            created_at: Utc::now(),
+            lang: Some("en".into()),
+            text: text.into(),
+            metadata: Value::Null,
+        }
+    }
+
+    #[test]
+    fn test_happy_path() {
+        let cfg = GateConfig::default();
+        let gate = GateBuilder::new(cfg).with_registry(Registry::new()).build();
+        let rec = mock_record("hello world");
+        assert_eq!(gate.check(&rec), GateDecision::Accept);
+    }
+
+    #[test]
+    fn test_profanity_rejected() {
+        let cfg = GateConfig {
+            enable_profanity: Some(true),
+            ..GateConfig::default()
+        };
+        let gate = GateBuilder::new(cfg).with_registry(Registry::new()).build();
+        let rec = mock_record("this is some shit");
+        match gate.check(&rec) {
+            GateDecision::Reject { reasons } => {
+                assert!(reasons.iter().any(|m| m.contains("profanity")));
+            }
+            _ => panic!("expected rejection"),
+        }
+    }
+
+    #[test]
+    fn test_lang_rejected() {
+        let cfg = GateConfig {
+            allowed_langs: Some(vec!["fr".into()]),
+            ..GateConfig::default()
+        };
+        let gate = GateBuilder::new(cfg).with_registry(Registry::new()).build();
+        let rec = mock_record("hello world");
+        match gate.check(&rec) {
+            GateDecision::Reject { reasons } => {
+                assert!(reasons.iter().any(|m| m.contains("unsupported lang")));
+            }
+            _ => panic!("expected rejection"),
+        }
+    }
+
+    #[test]
+    fn test_timestamp_rejected() {
+        let cfg = GateConfig::default();
+        let gate = GateBuilder::new(cfg).with_registry(Registry::new()).build();
+        let mut rec = mock_record("hello world");
+        rec.created_at -= ChronoDur::days(5); // very old
+        match gate.check(&rec) {
+            GateDecision::Reject { reasons } => {
+                assert!(reasons.iter().any(|m| m.contains("stale record")));
+            }
+            _ => panic!("expected rejection"),
+        }
+    }
+}
+```

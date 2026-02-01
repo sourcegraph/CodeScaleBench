@@ -1,0 +1,460 @@
+```rust
+//! src/module_70.rs
+//!
+//! Sentiment Enrichment Pipeline
+//! -----------------------------
+//! This module owns the end-to-end “toxicity / sentiment” enrichment pipeline
+//! for ChirpPulse.  A highly configurable strategy pattern allows data-science
+//! teams to hot-swap analysis algorithms without stopping the consumer group.
+//!
+//! The public surface is the [`run`] function, which bootstraps a Tokio runtime
+//! and continuously:
+//!   1. Consumes raw social events from the `raw.social_events` Kafka topic
+//!   2. Applies one of many pluggable [`SentimentAnalyzer`] strategies
+//!   3. Publishes an enriched event to the `enriched.social_events` topic
+//!
+//! Strong error handling and observability guarantees make sure that:
+//!   * Poison pills are parked into a dead-letter topic
+//!   * Telemetry is emitted for every hop (tracing / metrics)
+//!   * The consumer group is self-healing
+//!
+//! ## Example
+//! ```no_run
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     let cfg = module_70::PipelineConfig::from_env()?;
+//!     module_70::run(cfg).await?;
+//!     Ok(())
+//! }
+//! ```
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::ClientConfig;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use thiserror::Error;
+use tokio::sync::oneshot;
+use tokio::time;
+use tracing::{error, info, instrument, warn};
+
+/// Topic names used by this pipeline.
+const RAW_TOPIC: &str = "raw.social_events";
+const ENRICHED_TOPIC: &str = "enriched.social_events";
+const DLQ_TOPIC: &str = "dlq.social_events";
+
+/// Public runner – spawns the pipeline and blocks until SIGINT / SIGTERM.
+pub async fn run(cfg: PipelineConfig) -> Result<(), PipelineError> {
+    // --------- Initialize observability stack -------------
+    init_tracing(&cfg)?;
+
+    info!("Booting ChirpPulse sentiment pipeline {:?}", cfg);
+
+    // --------- Build kafka clients ------------------------
+    let consumer: StreamConsumer = build_consumer(&cfg)?;
+    let producer: FutureProducer = build_producer(&cfg)?;
+
+    // Seek start offsets
+    consumer.subscribe(&[RAW_TOPIC])?;
+
+    // --------- Instantiate analyzer strategy --------------
+    let analyzer = AnalyzerFactory::build(&cfg.analysis)?;
+    info!("Using analyzer strategy: {}", analyzer.name());
+
+    // --------- Run until ctrl-c ---------------------------
+    let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::select! {
+        _ = processing_loop(consumer, producer, analyzer, cfg.clone()) => {},
+        _ = shutdown_signal(shutdown_rx) => {
+            info!("Shutdown signal received, draining...")
+        }
+    }
+
+    Ok(())
+}
+
+// =========================================================
+// ==================== CONFIGURATION =======================
+// =========================================================
+
+/// /// Environment-driven runtime configuration for the pipeline.
+///
+/// Values can come from:
+///   * a YAML/TOML/JSON file
+///   * environment variables
+///   * CLI overrides
+///
+/// The implementation below reads exclusively from env for brevity, but can be
+/// extended to hierarchical sources using `config` crate.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PipelineConfig {
+    /// Brokers in `<host:port,host:port>` form
+    pub brokers: String,
+    /// Kafka consumer group id
+    pub group_id: String,
+    /// Maximum batch size retrieved from kafka
+    #[serde(default = "default_fetch_bytes")]
+    pub fetch_bytes: usize,
+    /// General application log level
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    /// Analyzer section
+    pub analysis: AnalysisConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnalysisConfig {
+    /// Identifier of analyzer strategy (e.g. "vader", "bert", "openai-completions")
+    pub strategy: String,
+    /// Arbitrary key-value blob passed verbatim to the strategy’s `configure` call
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+impl PipelineConfig {
+    pub fn from_env() -> Result<Self, PipelineError> {
+        let brokers = std::env::var("CP_KAFKA_BROKERS")
+            .map_err(|_| PipelineError::MissingEnv("CP_KAFKA_BROKERS"))?;
+        let group_id = std::env::var("CP_GROUP_ID")
+            .unwrap_or_else(|_| "chirp-sentiment".to_string());
+        let analysis_strategy =
+            std::env::var("CP_ANALYSIS_STRATEGY").unwrap_or_else(|_| "vader".to_string());
+        let analysis_params =
+            std::env::var("CP_ANALYSIS_PARAMS").unwrap_or_else(|_| "{}".to_string());
+        let analysis_params: serde_json::Value =
+            serde_json::from_str(&analysis_params).map_err(PipelineError::Serde)?;
+        let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+
+        Ok(Self {
+            brokers,
+            group_id,
+            fetch_bytes: default_fetch_bytes(),
+            log_level,
+            analysis: AnalysisConfig {
+                strategy: analysis_strategy,
+                params: analysis_params,
+            },
+        })
+    }
+}
+
+fn default_fetch_bytes() -> usize {
+    1_048_576 // 1 MB
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+// =========================================================
+// ===================== ANALYZERS ==========================
+// =========================================================
+
+/// A pluggable sentiment / toxicity algorithm.
+///
+/// Implementors must be Send + Sync because the pipeline will clone the Arc
+/// and share between threads.
+pub trait SentimentAnalyzer: Send + Sync {
+    /// Human-readable name for logs/metrics.
+    fn name(&self) -> &'static str;
+
+    /// Returns a [-1.0, 1.0] sentiment score, plus an independent toxicity
+    /// probability in [0, 1].
+    fn analyze(&self, text: &str) -> AnalysisScore;
+}
+
+/// Factory for analyzer strategies.
+pub struct AnalyzerFactory;
+impl AnalyzerFactory {
+    pub fn build(cfg: &AnalysisConfig) -> Result<Arc<dyn SentimentAnalyzer>, PipelineError> {
+        match cfg.strategy.to_lowercase().as_str() {
+            "vader" => {
+                let analyzer = VaderAnalyzer::default();
+                Ok(Arc::new(analyzer))
+            }
+            "mock-toxic" => {
+                // A deterministic fake analyzer useful for tests.
+                let threshold: f32 = cfg
+                    .params
+                    .get("toxicity_threshold")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.8) as f32;
+                Ok(Arc::new(MockToxicAnalyzer { threshold }))
+            }
+            unknown => Err(PipelineError::UnknownAnalyzer(unknown.into())),
+        }
+    }
+}
+
+/// Analyzed score response.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct AnalysisScore {
+    /// Overall sentiment in [-1, 1]; 0 means neutral.
+    pub sentiment: f32,
+    /// Toxicity probability [0, 1].
+    pub toxicity: f32,
+}
+
+// --------------- Strategy: VADER --------------------------
+
+/// A fake VADER analyzer – in production this would call a SIMD-optimized
+/// lexicon scanner. This code mimics the interface without the heavy logic.
+#[derive(Default)]
+pub struct VaderAnalyzer;
+
+impl SentimentAnalyzer for VaderAnalyzer {
+    fn name(&self) -> &'static str {
+        "vader"
+    }
+
+    fn analyze(&self, text: &str) -> AnalysisScore {
+        // Extremely naive heuristics purely for demonstration.
+        let sentiment = if text.contains(":)") {
+            0.75
+        } else if text.contains(":(") {
+            -0.6
+        } else {
+            0.0
+        };
+
+        let toxicity = if text.to_lowercase().contains("hate") {
+            0.9
+        } else {
+            0.1
+        };
+
+        AnalysisScore {
+            sentiment,
+            toxicity,
+        }
+    }
+}
+
+// --------------- Strategy: MockToxic ----------------------
+
+struct MockToxicAnalyzer {
+    threshold: f32,
+}
+
+impl SentimentAnalyzer for MockToxicAnalyzer {
+    fn name(&self) -> &'static str {
+        "mock-toxic"
+    }
+
+    fn analyze(&self, _text: &str) -> AnalysisScore {
+        // A dumb deterministic sequence alternating toxic / non-toxic.
+        static TOGGLE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(true);
+        let prev = TOGGLE.swap(!TOGGLE.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+
+        let toxicity = if prev { self.threshold + 0.1 } else { 0.0 };
+        AnalysisScore {
+            sentiment: 0.0,
+            toxicity,
+        }
+    }
+}
+
+// =========================================================
+// ================= ==  PIPELINE CORE  == =================
+// =========================================================
+
+#[instrument(skip_all, name = "processing_loop")]
+async fn processing_loop(
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+    analyzer: Arc<dyn SentimentAnalyzer>,
+    cfg: PipelineConfig,
+) -> Result<(), PipelineError> {
+    let mut message_stream = consumer.stream();
+
+    while let Some(result) = message_stream.next().await {
+        match result {
+            Err(e) => {
+                // Transient errors trigger retry via sleep/backoff.
+                error!("Kafka error: {:?}. Sleeping 2s", e);
+                time::sleep(Duration::from_secs(2)).await;
+            }
+            Ok(msg) => {
+                if let Err(e) =
+                    handle_message(&producer, &analyzer, &cfg, &msg.payload()?.unwrap_or_default())
+                        .await
+                {
+                    // Park into DLQ for offline inspection.
+                    error!(%e, "Failed to handle message, sending to DLQ");
+                    send_to_dlq(&producer, &msg.payload()?.unwrap_or_default()).await?;
+                }
+                // Manual offset commit for at-least-once semantics.
+                consumer.commit_message(&msg, CommitMode::Async)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Parses raw json bytes, enriches them, and produces to enriched topic.
+#[instrument(skip_all, fields(text_len = payload.len()))]
+async fn handle_message(
+    producer: &FutureProducer,
+    analyzer: &Arc<dyn SentimentAnalyzer>,
+    _cfg: &PipelineConfig,
+    payload: &[u8],
+) -> Result<(), PipelineError> {
+    // Domain-specific schema – keep minimal for brevity
+    #[derive(Deserialize)]
+    struct RawEvent<'a> {
+        id: &'a str,
+        user: &'a str,
+        text: &'a str,
+        timestamp: i64,
+    }
+
+    let raw: RawEvent =
+        serde_json::from_slice(payload).map_err(PipelineError::Serde)?;
+
+    let score = analyzer.analyze(raw.text);
+    let enriched = json!({
+        "id": raw.id,
+        "user": raw.user,
+        "text": raw.text,
+        "timestamp": raw.timestamp,
+        "sentiment": score.sentiment,
+        "toxicity": score.toxicity,
+        "analyzer": analyzer.name(),
+    });
+
+    // Fire-and-forget; we still grab the JoinHandle so we can await result
+    // later if stricter guarantees are needed.
+    let record = FutureRecord::to(ENRICHED_TOPIC)
+        .key(raw.id)
+        .payload(&enriched.to_string());
+    let produce_future = producer.send(record, Duration::from_secs(0));
+
+    // We choose to ignore the returned delivery status to minimize latency,
+    // but we still log failures.
+    tokio::spawn(async move {
+        if let Err((e, _owned_message)) = produce_future.await {
+            warn!("Delivery failed: {}", e);
+        }
+    });
+
+    Ok(())
+}
+
+#[instrument(skip_all)]
+async fn send_to_dlq(producer: &FutureProducer, payload: &[u8]) -> Result<(), PipelineError> {
+    let record = FutureRecord::to(DLQ_TOPIC)
+        .payload(payload);
+    producer
+        .send(record, Duration::from_secs(0))
+        .await
+        .map_err(|(e, _)| PipelineError::Kafka(e))?;
+    Ok(())
+}
+
+// =========================================================
+// ===================  INFRASTRUCTURE  =====================
+// =========================================================
+
+fn build_consumer(cfg: &PipelineConfig) -> Result<StreamConsumer, PipelineError> {
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &cfg.brokers)
+        .set("group.id", &cfg.group_id)
+        .set("enable.partition.eof", "false")
+        .set("session.timeout.ms", "6000")
+        .set("enable.auto.commit", "false")
+        .set("fetch.message.max.bytes", &cfg.fetch_bytes.to_string())
+        .create()
+        .map_err(PipelineError::Kafka)?;
+    Ok(consumer)
+}
+
+fn build_producer(cfg: &PipelineConfig) -> Result<FutureProducer, PipelineError> {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &cfg.brokers)
+        .set("message.timeout.ms", "5000")
+        .create()
+        .map_err(PipelineError::Kafka)?;
+    Ok(producer)
+}
+
+/// Initialize tracing & logging based on the env / cfg.
+fn init_tracing(cfg: &PipelineConfig) -> Result<(), PipelineError> {
+    let filter_layer = tracing_subscriber::EnvFilter::try_new(&cfg.log_level)
+        .or_else(|_| tracing_subscriber::EnvFilter::try_new("info"))?;
+    let subscriber = tracing_subscriber::fmt()
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_env_filter(filter_layer)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|_| PipelineError::Tracing)?;
+    Ok(())
+}
+
+/// Completable future waiting for ctrl-c or programmatic shutdown.
+async fn shutdown_signal(mut shutdown_rx: oneshot::Receiver<()>) {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = &mut shutdown_rx => {},
+    }
+    info!("Shutdown signal captured, exiting.");
+}
+
+// =========================================================
+// =======================  ERRORS  =========================
+// =========================================================
+
+#[derive(Debug, Error)]
+pub enum PipelineError {
+    #[error("Required environment variable not found: {0}")]
+    MissingEnv(&'static str),
+
+    #[error("Unknown analyzer strategy: {0}")]
+    UnknownAnalyzer(String),
+
+    #[error("Serde error: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("Kafka error: {0}")]
+    Kafka(#[from] rdkafka::error::KafkaError),
+
+    #[error("Tracing initialization error")]
+    Tracing,
+
+    #[error("Other error: {0}")]
+    Other(String),
+}
+
+// =========================================================
+// ========================  TESTS  =========================
+// =========================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vader_analyzer_basic() {
+        let analyzer = VaderAnalyzer::default();
+        let happy = analyzer.analyze("I love Rust :)");
+        assert!(happy.sentiment > 0.5 && happy.toxicity < 0.5);
+
+        let sad = analyzer.analyze("I hate bugs :(");
+        assert!(sad.sentiment < -0.1 && sad.toxicity > 0.5);
+    }
+
+    #[test]
+    fn factory_unknown() {
+        let cfg = AnalysisConfig {
+            strategy: "does-not-exist".into(),
+            params: serde_json::Value::Null,
+        };
+        let factory = AnalyzerFactory::build(&cfg);
+        assert!(matches!(factory, Err(PipelineError::UnknownAnalyzer(_))));
+    }
+}
+```

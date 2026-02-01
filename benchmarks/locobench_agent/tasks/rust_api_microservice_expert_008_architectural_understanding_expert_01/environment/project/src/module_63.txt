@@ -1,0 +1,273 @@
+```rust
+//! src/module_63.rs
+//!
+//! Pagination utilities shared between REST and GraphQL layers.
+//! -----------------------------------------------------------------------------
+//!  • Supports extraction/validation from Actix-Web HTTP requests
+//!  • Converts to limit/offset pairs for SQLx / Diesel
+//!  • Exposes cursor helpers for GraphQL relay-style connections
+//!  • Plays nice with our response-caching layer (implements [`CacheKey`])
+//!
+//! The goal of this module is to ensure **consistent semantics** and **guard-rail
+//! validation** for all paginated endpoints throughout LedgerLink Nexus.
+//!
+//! -----------------------------------------------------------------------------
+
+#![allow(clippy::module_name_repetitions)]
+
+use std::fmt;
+use std::future::Future;
+use std::num::NonZeroU32;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use actix_web::dev::Payload;
+use actix_web::{error, FromRequest, HttpRequest};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tracing::{instrument, warn};
+
+/// Marker trait used by the response-caching middleware.  
+/// A `CacheKey` is *stable* across identical user-visible requests so that
+/// different layers (Redis, CDN, browser) can cache whole objects safely.
+pub trait CacheKey {
+    /// Unique, deterministic key describing the resource.
+    fn cache_key(&self) -> String;
+}
+
+/// Compile-time defaults (override via `Config`).
+const DEFAULT_PAGE: u32 = 1;
+const DEFAULT_PER_PAGE: u32 = 50;
+const MAX_PER_PAGE: u32 = 250;
+
+/// A validated page request sent by the client.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pagination {
+    /// The *1-based* page number requested.
+    page: NonZeroU32,
+
+    /// Maximum number of records for each page.
+    per_page: NonZeroU32,
+
+    /// The total amount of records *if* the service decided to compute it.
+    ///
+    /// Optional because some list endpoints deliberately skip `COUNT(*)`
+    /// operations for performance reasons.
+    #[serde(skip)]
+    total: Option<u64>,
+}
+
+/// Intermediate struct used to extract raw query parameters.
+#[derive(Debug, Deserialize)]
+struct PaginationQuery {
+    page: Option<u32>,
+    per_page: Option<u32>,
+}
+
+impl Pagination {
+    /// Creates a new validated [`Pagination`] instance or returns an error with
+    /// appropriate context.
+    pub fn new(page: u32, per_page: u32) -> Result<Self, PaginationError> {
+        // Fallback values
+        let page = if page == 0 { DEFAULT_PAGE } else { page };
+        let per_page = if per_page == 0 { DEFAULT_PER_PAGE } else { per_page };
+
+        if per_page > MAX_PER_PAGE {
+            return Err(PaginationError::PerPageTooHigh {
+                requested: per_page,
+                maximum: MAX_PER_PAGE,
+            });
+        }
+
+        // SAFETY: > 0 by construction.
+        let page = NonZeroU32::new(page).unwrap();
+        let per_page = NonZeroU32::new(per_page).unwrap();
+
+        Ok(Self {
+            page,
+            per_page,
+            total: None,
+        })
+    }
+
+    /// Page number (1-based).
+    #[inline]
+    pub fn page(&self) -> u32 {
+        self.page.get()
+    }
+
+    /// Records per page
+    #[inline]
+    pub fn per_page(&self) -> u32 {
+        self.per_page.get()
+    }
+
+    /// Offset for SQL queries (`LIMIT ... OFFSET ...`).
+    #[inline]
+    pub fn offset(&self) -> u32 {
+        (self.page.get() - 1) * self.per_page.get()
+    }
+
+    /// Limit for SQL queries (`LIMIT ... OFFSET ...`).
+    #[inline]
+    pub fn limit(&self) -> u32 {
+        self.per_page.get()
+    }
+
+    /// The total number of elements in the *entire* collection, if known.
+    #[inline]
+    pub fn total(&self) -> Option<u64> {
+        self.total
+    }
+
+    /// Set the total record count once computed by the service or repository.
+    #[inline]
+    pub fn with_total(mut self, total: u64) -> Self {
+        self.total = Some(total);
+        self
+    }
+}
+
+impl CacheKey for Pagination {
+    fn cache_key(&self) -> String {
+        // Example output: "p=2&pp=50"
+        format!("p={}&pp={}", self.page.get(), self.per_page.get())
+    }
+}
+
+impl fmt::Display for Pagination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.total {
+            Some(t) => write!(
+                f,
+                "page={}, per_page={}, total_records={}",
+                self.page, self.per_page, t
+            ),
+            None => write!(f, "page={}, per_page={}", self.page, self.per_page),
+        }
+    }
+}
+
+/// Domain-level errors returned during pagination validation or extraction.
+#[derive(Debug, Error)]
+pub enum PaginationError {
+    #[error("`per_page` parameter ({requested}) exceeds configured maximum ({maximum})")]
+    PerPageTooHigh { requested: u32, maximum: u32 },
+
+    #[error("Malformed pagination query string: {0}")]
+    MalformedQuery(#[from] serde_qs::Error),
+
+    #[error("Invalid UTF-8 in query string")]
+    InvalidUtf8,
+
+    #[error("Missing or invalid query payload")]
+    Payload(#[from] error::QueryPayloadError),
+}
+
+// -----------------------------------------------------------------------------
+// Actix-Web integration – extractor
+// -----------------------------------------------------------------------------
+
+type PaginationFuture = Pin<Box<dyn Future<Output = Result<Pagination, PaginationError>>>>;
+
+impl FromRequest for Pagination {
+    type Error = PaginationError;
+    type Future = PaginationFuture;
+
+    #[instrument(level = "trace", skip_all)]
+    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
+        // We cannot block here, so we capture the data needed for async parsing.
+        let raw_query = req.query_string().to_owned();
+
+        Box::pin(async move {
+            if raw_query.is_empty() {
+                // Use default values if no query is provided.
+                return Pagination::new(DEFAULT_PAGE, DEFAULT_PER_PAGE);
+            }
+
+            // Actix's `Query::<T>` extractor rejects duplicate keys (e.g. `?page=1&page=2`),
+            // but we want more control, so we parse manually via `serde_qs`.
+            let query: PaginationQuery = serde_qs::from_str(&raw_query)
+                .map_err(PaginationError::MalformedQuery)?;
+
+            Pagination::new(
+                query.page.unwrap_or(DEFAULT_PAGE),
+                query.per_page.unwrap_or(DEFAULT_PER_PAGE),
+            )
+        })
+    }
+}
+
+// -----------------------------------------------------------------------------
+// GraphQL cursor helpers (opt-in via crate feature)
+// -----------------------------------------------------------------------------
+#[cfg(feature = "graphql")]
+mod graphql {
+    use super::*;
+    use async_graphql::{InputObject, SimpleObject};
+
+    /// Relay-style page information returned along with every connection.
+    #[derive(Clone, Debug, SimpleObject)]
+    pub struct PageInfo {
+        pub has_previous_page: bool,
+        pub has_next_page: bool,
+        pub start_cursor: Option<String>,
+        pub end_cursor: Option<String>,
+    }
+
+    /// GraphQL input for cursor-based navigation.
+    #[derive(InputObject)]
+    pub struct PaginationInput {
+        /// Opaque cursor after which we start collecting results.
+        pub after: Option<String>,
+        /// Opaque cursor before which we start collecting results.
+        pub before: Option<String>,
+        /// Maximum number of elements returned.
+        pub first: Option<u32>,
+        /// See [`PaginationInput::first`].
+        pub last: Option<u32>,
+    }
+
+    impl From<Pagination> for PaginationInput {
+        fn from(value: Pagination) -> Self {
+            // This conversion is inherently lossy because relay uses cursors.
+            Self {
+                after: None,
+                before: None,
+                first: Some(value.per_page()),
+                last: None,
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Internal sanity tests
+// -----------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_values_are_applied() {
+        let p = Pagination::new(0, 0).unwrap();
+        assert_eq!(p.page(), DEFAULT_PAGE);
+        assert_eq!(p.per_page(), DEFAULT_PER_PAGE);
+        assert_eq!(p.offset(), 0);
+    }
+
+    #[test]
+    fn computed_offsets_are_correct() {
+        let p = Pagination::new(3, 50).unwrap();
+        assert_eq!(p.offset(), 100);
+        assert_eq!(p.limit(), 50);
+        assert_eq!(p.cache_key(), "p=3&pp=50");
+    }
+
+    #[test]
+    fn per_page_is_capped() {
+        let err = Pagination::new(1, MAX_PER_PAGE + 1).unwrap_err();
+        matches!(err, PaginationError::PerPageTooHigh { .. });
+    }
+}
+```

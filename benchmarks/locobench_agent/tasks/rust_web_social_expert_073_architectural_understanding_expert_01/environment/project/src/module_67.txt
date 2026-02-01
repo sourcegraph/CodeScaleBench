@@ -1,0 +1,417 @@
+```rust
+//! src/module_67.rs
+//!
+//! Learning Pulse domain service + event publisher wiring.
+//!
+//! This module demonstrates how a domain service can be wired with a
+//! repository implementation (SQLx/Postgres) and an async event publisher
+//! implementation (NATS) using Tokio.  The code is representative of what
+//! we run in “EduPulse Live”, but stripped-down to avoid leaking internal
+//! business logic.  All heavy lifting—search indexing, plagiarism checks,
+//! achievements, notifications—is triggered via emitted domain events.
+//
+//  -------------------- Crate features & external dependencies -----------------
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use nats::{asynk::Connection as NatsConnection, Message as NatsMessage};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use thiserror::Error;
+use tokio::{sync::mpsc, task, time};
+use tracing::{debug, error, info, instrument};
+use uuid::Uuid;
+
+//  -------------------- Domain events -----------------------------------------
+
+/// Event namespace for learning pulse activities.
+///
+/// All events are emitted to the broker (subject `learning.pulse.*`) and
+/// consumed by downstream services (plagiarism-checker, notification-svc,
+/// recommendation-engine, …).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PulseEvent {
+    PulseCreated {
+        pulse_id: Uuid,
+        author_id: Uuid,
+        title: String,
+        created_at: DateTime<Utc>,
+    },
+    PulseResponded {
+        pulse_id: Uuid,
+        responder_id: Uuid,
+        response_id: Uuid,
+        submitted_at: DateTime<Utc>,
+    },
+}
+
+//  -------------------- Error abstraction -------------------------------------
+
+#[derive(Debug, Error)]
+pub enum PulseError {
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+
+    #[error("messaging error: {0}")]
+    Messaging(#[from] nats::asynk::Error),
+
+    #[error("pulse with id {0} does not exist")]
+    NotFound(Uuid),
+
+    #[error("validation error: {0}")]
+    Validation(String),
+}
+
+//  -------------------- Persistence layer -------------------------------------
+
+/// Domain model persisted in storage.
+#[derive(Debug, Clone)]
+pub struct LearningPulse {
+    pub id: Uuid,
+    pub author_id: Uuid,
+    pub title: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[async_trait]
+pub trait PulseRepository: Send + Sync {
+    async fn insert(&self, pulse: &LearningPulse) -> Result<(), PulseError>;
+    async fn exists(&self, pulse_id: Uuid) -> Result<bool, PulseError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct SqlxPulseRepository {
+    pool: PgPool,
+}
+
+impl SqlxPulseRepository {
+    pub async fn new(database_url: &str, max_connections: u32) -> Result<Self, PulseError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("SET application_name = 'edupulse_pulse_service'")
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(database_url)
+            .await?;
+        Ok(Self { pool })
+    }
+}
+
+#[async_trait]
+impl PulseRepository for SqlxPulseRepository {
+    #[instrument(name = "repository_insert_pulse", skip_all, fields(pulse_id = %pulse.id))]
+    async fn insert(&self, pulse: &LearningPulse) -> Result<(), PulseError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO learning_pulse (id, author_id, title, created_at)
+            VALUES ($1, $2, $3, $4)
+            "#,
+            pulse.id,
+            pulse.author_id,
+            pulse.title,
+            pulse.created_at
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    #[instrument(name = "repository_pulse_exists", skip(self))]
+    async fn exists(&self, pulse_id: Uuid) -> Result<bool, PulseError> {
+        let rec = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM learning_pulse WHERE id = $1
+            )
+            "#,
+            pulse_id
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(rec.unwrap_or(false))
+    }
+}
+
+//  -------------------- Messaging publisher -----------------------------------
+
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, event: PulseEvent) -> Result<(), PulseError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct NatsPublisher {
+    connection: Arc<NatsConnection>,
+    /// Subject prefix e.g. “learning.pulse”.
+    subject_root: String,
+}
+
+impl NatsPublisher {
+    pub async fn new(nats_url: &str, subject_root: &str) -> Result<Self, PulseError> {
+        let connection = nats::asynk::connect(nats_url).await?;
+        Ok(Self {
+            connection: Arc::new(connection),
+            subject_root: subject_root.to_owned(),
+        })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for NatsPublisher {
+    #[instrument(name = "publisher_publish_event", skip(self))]
+    async fn publish(&self, event: PulseEvent) -> Result<(), PulseError> {
+        let subject = format!("{}.{}", self.subject_root, event.subject_suffix());
+        let payload = serde_json::to_vec(&event)
+            .expect("serialization for PulseEvent cannot fail (verified by tests)");
+        self.connection.publish(&subject, payload).await?;
+        Ok(())
+    }
+}
+
+impl PulseEvent {
+    fn subject_suffix(&self) -> &'static str {
+        match self {
+            PulseEvent::PulseCreated { .. } => "created",
+            PulseEvent::PulseResponded { .. } => "responded",
+        }
+    }
+}
+
+//  -------------------- Domain service ----------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct PulseService<R: PulseRepository, P: EventPublisher> {
+    repository: Arc<R>,
+    publisher: Arc<P>,
+}
+
+impl<R, P> PulseService<R, P>
+where
+    R: PulseRepository + 'static,
+    P: EventPublisher + 'static,
+{
+    pub fn new(repository: Arc<R>, publisher: Arc<P>) -> Self {
+        Self {
+            repository,
+            publisher,
+        }
+    }
+
+    /// Create a new learning pulse and publish an event.
+    #[instrument(skip(self))]
+    pub async fn create_pulse(
+        &self,
+        author_id: Uuid,
+        title: String,
+    ) -> Result<Uuid, PulseError> {
+        if title.trim().is_empty() {
+            return Err(PulseError::Validation(
+                "title must not be empty".to_string(),
+            ));
+        }
+
+        let pulse = LearningPulse {
+            id: Uuid::new_v4(),
+            author_id,
+            title: title.clone(),
+            created_at: Utc::now(),
+        };
+
+        self.repository.insert(&pulse).await?;
+        self.publisher
+            .publish(PulseEvent::PulseCreated {
+                pulse_id: pulse.id,
+                author_id,
+                title,
+                created_at: pulse.created_at,
+            })
+            .await?;
+        Ok(pulse.id)
+    }
+
+    /// Respond to an existing pulse and publish an event.
+    #[instrument(skip(self))]
+    pub async fn respond_to_pulse(
+        &self,
+        pulse_id: Uuid,
+        responder_id: Uuid,
+    ) -> Result<Uuid, PulseError> {
+        let exists = self.repository.exists(pulse_id).await?;
+        if !exists {
+            return Err(PulseError::NotFound(pulse_id));
+        }
+
+        let response_id = Uuid::new_v4();
+        // In a real system we would persist the response here. Omitted for brevity.
+
+        self.publisher
+            .publish(PulseEvent::PulseResponded {
+                pulse_id,
+                responder_id,
+                response_id,
+                submitted_at: Utc::now(),
+            })
+            .await?;
+
+        Ok(response_id)
+    }
+}
+
+//  -------------------- Background re-publisher (fan-out) ----------------------
+
+/// A thin re-publisher that listens to a local MPSC channel and forwards
+/// messages to NATS with back-pressure handling.  This decouples user-facing
+/// HTTP request latencies from broker hiccups.
+pub struct BufferedNatsPublisher {
+    sender: mpsc::Sender<PulseEvent>,
+}
+
+impl BufferedNatsPublisher {
+    pub async fn spawn(nats_url: &str) -> Result<Self, PulseError> {
+        // 10 kB per event approx. × 4 K events = 40 MiB
+        const BUFFER: usize = 4096;
+        let (tx, mut rx) = mpsc::channel::<PulseEvent>(BUFFER);
+        let nats_connection = nats::asynk::connect(nats_url).await?;
+        let connection = Arc::new(nats_connection);
+
+        // Spawn worker task
+        task::spawn({
+            let connection = connection.clone();
+            async move {
+                while let Some(event) = rx.recv().await {
+                    let subject = format!("learning.pulse.{}", event.subject_suffix());
+                    // Retry indefinitely with exponential back-off.
+                    let mut attempt: u32 = 0;
+                    loop {
+                        match connection
+                            .publish(&subject, serde_json::to_vec(&event).unwrap())
+                            .await
+                        {
+                            Ok(()) => {
+                                debug!("published event on {}", subject);
+                                break;
+                            }
+                            Err(e) => {
+                                attempt += 1;
+                                let delay = Duration::from_millis(
+                                    (2u64.pow(attempt.min(8)) * 100).clamp(100, 10_000),
+                                );
+                                error!(
+                                    "failed to publish event (attempt {attempt}): {e}; retrying in {:?}",
+                                    delay
+                                );
+                                time::sleep(delay).await;
+                            }
+                        }
+                    }
+                }
+                info!("BufferedNatsPublisher worker shut down")
+            }
+        });
+
+        Ok(Self { sender: tx })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for BufferedNatsPublisher {
+    async fn publish(&self, event: PulseEvent) -> Result<(), PulseError> {
+        self.sender
+            .send(event)
+            .await
+            .map_err(|_| PulseError::Messaging(nats::asynk::Error::NoServers))
+    }
+}
+
+//  -------------------- Lightweight integration test --------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::{Executor, PgPool};
+    use tokio::sync::Mutex;
+
+    struct MockPublisher {
+        events: Mutex<Vec<PulseEvent>>,
+    }
+
+    #[async_trait]
+    impl EventPublisher for MockPublisher {
+        async fn publish(&self, event: PulseEvent) -> Result<(), PulseError> {
+            self.events.lock().await.push(event);
+            Ok(())
+        }
+    }
+
+    struct InMemRepo {
+        store: Mutex<HashMap<Uuid, LearningPulse>>,
+    }
+
+    #[async_trait]
+    impl PulseRepository for InMemRepo {
+        async fn insert(&self, pulse: &LearningPulse) -> Result<(), PulseError> {
+            self.store.lock().await.insert(pulse.id, pulse.clone());
+            Ok(())
+        }
+
+        async fn exists(&self, pulse_id: Uuid) -> Result<bool, PulseError> {
+            Ok(self.store.lock().await.contains_key(&pulse_id))
+        }
+    }
+
+    #[tokio::test]
+    async fn create_and_respond_happy_path() {
+        let repo = Arc::new(InMemRepo {
+            store: Mutex::new(HashMap::new()),
+        });
+        let publisher = Arc::new(MockPublisher {
+            events: Mutex::new(Vec::new()),
+        });
+
+        let service = super::PulseService::new(repo.clone(), publisher.clone());
+
+        let author = Uuid::new_v4();
+        let pulse_id = service
+            .create_pulse(author, "Unit testing pulse".to_owned())
+            .await
+            .unwrap();
+
+        assert!(repo.exists(pulse_id).await.unwrap());
+
+        let responder = Uuid::new_v4();
+        let response_id = service
+            .respond_to_pulse(pulse_id, responder)
+            .await
+            .unwrap();
+
+        let events = publisher.events.lock().await;
+        assert_eq!(events.len(), 2);
+
+        match &events[0] {
+            PulseEvent::PulseCreated { pulse_id: id, .. } => assert_eq!(*id, pulse_id),
+            _ => panic!("unexpected event order"),
+        };
+
+        match &events[1] {
+            PulseEvent::PulseResponded {
+                pulse_id: id,
+                responder_id,
+                response_id: rid,
+                ..
+            } => {
+                assert_eq!(*id, pulse_id);
+                assert_eq!(*responder_id, responder);
+                assert_eq!(*rid, response_id);
+            }
+            _ => panic!("unexpected event type"),
+        }
+    }
+}
+```

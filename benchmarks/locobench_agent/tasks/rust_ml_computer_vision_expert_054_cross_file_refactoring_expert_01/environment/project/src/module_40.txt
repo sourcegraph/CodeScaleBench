@@ -1,0 +1,394 @@
+```rust
+//! src/module_40.rs
+//!
+//! Adaptive Hyper-Parameter Tuning utilities for VisuTility Orchestrator.
+//!
+//! This module demonstrates a Strategy + Observer–pattern implementation
+//! that can be plugged into the larger MLOps pipeline.  The tuner is able
+//! to receive live training metrics over an async channel, pick the next
+//! configuration via a pluggable `SearchStrategy`, and notify interested
+//! subscribers when new proposals are generated.
+//!
+//! NOTE: The implementation purposefully stays *stateless* and *pure-Rust*
+//! so that the orchestration layer can serialize/deserialize state to the
+//! internal Model Registry without involving external services.
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use indexmap::IndexMap;
+use rand::{distributions::Uniform, prelude::*};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc, oneshot},
+    task::JoinHandle,
+    time::timeout,
+};
+
+/// Length of time the tuner waits for metric updates before it times out.
+const METRIC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Public type alias for readability.
+pub type RunId = String;
+
+/// Errors that may arise during hyper-parameter tuning.
+#[derive(Error, Debug)]
+pub enum TuningError {
+    #[error("search strategy failed: {0}")]
+    StrategyFailed(String),
+    #[error("metric channel closed unexpectedly")]
+    MetricChannelClosed,
+    #[error("proposal receiver dropped before it could be fulfilled")]
+    ProposalRecvDropped,
+    #[error("metric timeout exceeded")]
+    MetricTimeout,
+}
+
+/// Convenience result type.
+pub type Result<T, E = TuningError> = std::result::Result<T, E>;
+
+/// Represents a single hyper-parameter value.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value")]
+pub enum ParamValue {
+    Int(i64),
+    Float(f64),
+    Categorical(String),
+}
+
+impl ParamValue {
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            ParamValue::Float(v) => Some(*v),
+            ParamValue::Int(v) => Some(*v as f64),
+            _ => None,
+        }
+    }
+}
+
+/// A collection of hyper-parameters for a *single* training run.
+pub type HyperParams = IndexMap<String, ParamValue>;
+
+/// Provides live feedback from the training process.
+#[derive(Clone, Debug)]
+pub struct TrainingMetric {
+    pub run_id: RunId,
+    /// Smaller is better (e.g. loss); feel free to invert for accuracy, etc.
+    pub value: f64,
+}
+
+/// All events produced by the tuner.
+#[derive(Clone, Debug)]
+pub enum TuningEvent {
+    /// A new proposal was generated.
+    NewProposal { run_id: RunId, params: HyperParams },
+    /// New metric observed for an existing run.
+    Metric { run_id: RunId, value: f64 },
+}
+
+/// Observer trait for parties interested in tuning lifecycle events.
+pub trait TuningEventListener: Send + Sync + 'static {
+    fn on_event(&self, event: &TuningEvent);
+}
+
+impl<F> TuningEventListener for F
+where
+    F: Fn(&TuningEvent) + Send + Sync + 'static,
+{
+    fn on_event(&self, event: &TuningEvent) {
+        (self)(event)
+    }
+}
+
+/// Factory-pattern trait for search strategies.
+pub trait SearchStrategy: Send + Sync + 'static {
+    /// Propose the next set of parameters, given historical performance.
+    fn propose(
+        &mut self,
+        history: &[(HyperParams, f64)],
+    ) -> Result<HyperParams>;
+}
+
+/// A very simple Random Search strategy.
+pub struct RandomSearch {
+    param_space: HashMap<String, ParamSpace>,
+    rng: ThreadRng,
+}
+
+impl RandomSearch {
+    pub fn new(param_space: HashMap<String, ParamSpace>) -> Self {
+        Self {
+            param_space,
+            rng: thread_rng(),
+        }
+    }
+}
+
+impl SearchStrategy for RandomSearch {
+    fn propose(
+        &mut self,
+        _history: &[(HyperParams, f64)],
+    ) -> Result<HyperParams> {
+        let mut params = HyperParams::default();
+        for (name, space) in &self.param_space {
+            params.insert(name.clone(), space.sample(&mut self.rng));
+        }
+        Ok(params)
+    }
+}
+
+/// A simple description of the search space for one parameter.
+#[derive(Clone, Debug)]
+pub enum ParamSpace {
+    Int { low: i64, high: i64 },
+    Float { low: f64, high: f64 },
+    Categorical { choices: Vec<String> },
+}
+
+impl ParamSpace {
+    fn sample(&self, rng: &mut ThreadRng) -> ParamValue {
+        match self {
+            ParamSpace::Int { low, high } => {
+                let dist = Uniform::new_inclusive(*low, *high);
+                ParamValue::Int(rng.sample(dist))
+            }
+            ParamSpace::Float { low, high } => {
+                let dist = Uniform::new_inclusive(*low, *high);
+                ParamValue::Float(rng.sample(dist))
+            }
+            ParamSpace::Categorical { choices } => {
+                let idx = rng.gen_range(0..choices.len());
+                ParamValue::Categorical(choices[idx].clone())
+            }
+        }
+    }
+}
+
+/// Builder for an [`AdaptiveTuner`].
+pub struct AdaptiveTunerBuilder<S>
+where
+    S: SearchStrategy,
+{
+    strategy: S,
+    buffer: usize,
+    listeners: Vec<Arc<dyn TuningEventListener>>,
+}
+
+impl<S> AdaptiveTunerBuilder<S>
+where
+    S: SearchStrategy,
+{
+    pub fn new(strategy: S) -> Self {
+        Self {
+            strategy,
+            buffer: 32,
+            listeners: Vec::new(),
+        }
+    }
+
+    pub fn buffer(mut self, capacity: usize) -> Self {
+        self.buffer = capacity;
+        self
+    }
+
+    pub fn add_listener<L>(mut self, listener: L) -> Self
+    where
+        L: TuningEventListener,
+    {
+        self.listeners.push(Arc::new(listener));
+        self
+    }
+
+    pub fn build(self) -> AdaptiveTuner<S> {
+        AdaptiveTuner::new(self.strategy, self.buffer, self.listeners)
+    }
+}
+
+/// Coordinates communication between trainers and the search strategy.
+pub struct AdaptiveTuner<S>
+where
+    S: SearchStrategy,
+{
+    strategy: Arc<Mutex<S>>,
+    metric_rx: mpsc::Receiver<TrainingMetric>,
+    proposal_tx: mpsc::Sender<HyperParams>,
+    listeners: Vec<Arc<dyn TuningEventListener>>,
+    /// Keeps full history for reproducibility & analysis.
+    history: Arc<Mutex<Vec<(HyperParams, f64)>>>,
+}
+
+impl<S> AdaptiveTuner<S>
+where
+    S: SearchStrategy,
+{
+    fn new(
+        strategy: S,
+        buffer: usize,
+        listeners: Vec<Arc<dyn TuningEventListener>>,
+    ) -> Self {
+        let (metric_tx, metric_rx) = mpsc::channel(buffer);
+        let (proposal_tx, _) = mpsc::channel(buffer);
+
+        // Expose sender clones for external systems.
+        TUNER_CHANNELS
+            .set(Channels {
+                metric_tx,
+                proposal_rx: proposal_tx.subscribe(),
+            })
+            .ok();
+
+        Self {
+            strategy: Arc::new(Mutex::new(strategy)),
+            metric_rx,
+            proposal_tx,
+            listeners,
+            history: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Launches tuner event loop in a detached Tokio task.
+    pub fn start(self) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            if let Err(e) = self.run().await {
+                log::error!("AdaptiveTuner stopped due to error: {e}");
+            }
+        })
+    }
+
+    async fn run(mut self) -> Result<()> {
+        loop {
+            // Wait for next metric or timeout.
+            let metric = match timeout(METRIC_TIMEOUT, self.metric_rx.recv()).await
+            {
+                Ok(Some(m)) => m,
+                Ok(None) => return Err(TuningError::MetricChannelClosed),
+                Err(_) => return Err(TuningError::MetricTimeout),
+            };
+
+            // Record metric and notify observers.
+            self.notify(TuningEvent::Metric {
+                run_id: metric.run_id.clone(),
+                value: metric.value,
+            });
+            {
+                let mut history = self.history.lock().unwrap();
+                if let Some((params, _)) = history
+                    .iter()
+                    .find(|(p, _)| p.get("_run_id") == Some(&ParamValue::Categorical(metric.run_id.clone())))
+                {
+                    // Update in place – in a real system we'd have better lookup.
+                    history.push((params.clone(), metric.value));
+                }
+            }
+
+            // Generate next proposal.
+            let proposal = {
+                let mut strategy = self.strategy.lock().unwrap();
+                strategy
+                    .propose(&self.history.lock().unwrap())
+                    .map_err(|e| TuningError::StrategyFailed(e.to_string()))?
+            };
+
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let mut proposal_clone = proposal.clone();
+            proposal_clone.insert(
+                "_run_id".into(),
+                ParamValue::Categorical(run_id.clone()),
+            );
+
+            // Record & send to channel so trainers can pick it up.
+            {
+                let mut history = self.history.lock().unwrap();
+                history.push((proposal_clone.clone(), f64::INFINITY));
+            }
+            // Ignore send errors: means nobody is listening yet.
+            let _ = self.proposal_tx.send(proposal_clone.clone()).await;
+
+            self.notify(TuningEvent::NewProposal {
+                run_id,
+                params: proposal_clone,
+            });
+        }
+    }
+
+    fn notify(&self, event: TuningEvent) {
+        for listener in &self.listeners {
+            listener.on_event(&event);
+        }
+    }
+}
+
+/// Globally accessible channels for feeding metrics / consuming proposals.
+///
+/// Using `once_cell` so that other modules can easily plug in w/o having to
+/// juggle ownership or pass Tx/Rx handles through several layers.
+use once_cell::sync::OnceCell;
+use tokio::sync::broadcast::Receiver as BroadcastReceiver;
+
+struct Channels {
+    metric_tx: mpsc::Sender<TrainingMetric>,
+    proposal_rx: mpsc::Receiver<HyperParams>,
+}
+
+static TUNER_CHANNELS: OnceCell<Channels> = OnceCell::new();
+
+/// Send a metric to the global tuner (if it exists).
+pub async fn emit_metric(metric: TrainingMetric) -> Result<()> {
+    let chans = TUNER_CHANNELS
+        .get()
+        .ok_or(TuningError::MetricChannelClosed)?;
+    chans.metric_tx
+        .send(metric)
+        .await
+        .map_err(|_| TuningError::MetricChannelClosed)
+}
+
+/// Acquire a receiver for new proposals.
+pub fn subscribe_proposals() -> Result<mpsc::Receiver<HyperParams>> {
+    let chans = TUNER_CHANNELS
+        .get()
+        .ok_or(TuningError::ProposalRecvDropped)?;
+    Ok(chans.proposal_rx.clone())
+}
+
+/* ------------------------- Example Usage ---------------------------
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    env_logger::init();
+
+    // 1) Build strategy + tuner
+    let mut param_space = HashMap::new();
+    param_space.insert("lr".into(), ParamSpace::Float { low: 1e-5, high: 1e-2 });
+    param_space.insert("batch".into(), ParamSpace::Int { low: 16, high: 128 });
+
+    let tuner = AdaptiveTunerBuilder::new(RandomSearch::new(param_space))
+        .add_listener(|event| println!("Tuner Event: {event:?}"))
+        .build();
+
+    tuner.start();
+
+    // 2) Somewhere in your training loop:
+    let mut proposal_rx = subscribe_proposals()?;
+    loop {
+        if let Some(params) = proposal_rx.recv().await {
+            // Kick off training job...
+            let run_id = params
+                .get("_run_id")
+                .and_then(|v| match v { ParamValue::Categorical(s) => Some(s.clone()), _ => None })
+                .unwrap_or_default();
+            // Fake metric
+            let metric = TrainingMetric { run_id, value: rand::random() };
+            emit_metric(metric).await?;
+        }
+    }
+}
+
+-------------------------------------------------------------------- */
+
+```

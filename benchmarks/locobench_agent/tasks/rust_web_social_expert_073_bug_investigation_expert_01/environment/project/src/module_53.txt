@@ -1,0 +1,341 @@
+```rust
+//! Event-sourcing infrastructure for EduPulse Live.
+//
+//  This module is responsible for:
+//
+//  1.  Defining domain-event primitives used across bounded contexts.
+//  2.  Persisting events to Postgres (append-only event store).
+//  3.  Publishing events to NATS for inter-service communication.
+//
+//  The implementation follows the Repository + Service Layer pattern.
+//  All operations are asynchronous and cancellation-safe.
+//
+//  Production quality considerations:
+//
+//  •   Events are idempotent (id is always generated server-side).
+//  •   Structured logging via `tracing`.
+//  •   Resilient error handling with `thiserror`.
+//  •   Secure JSON serialization (deny unknown fields).
+//  •   Observability hooks (OpenTelemetry compatible).
+//
+//  To keep the example self-contained, migrations and consumer side are
+//  omitted. In a real deployment, refer to `migrations/20240229101000_create_event_store.sql`.
+
+#![allow(clippy::missing_docs_in_private_items)]
+
+use std::time::Duration;
+
+use async_nats::{Client as NatsClient, ConnectionOptions};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
+use thiserror::Error;
+use tokio::time::timeout;
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
+
+/// Maximum time allotted for a single database or network operation.
+///
+/// NOTE: Tokio’s cooperative scheduling may add a small overhead.
+const IO_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// ------------------------------------------------------------------------------------------------
+/// DOMAIN-EVENT INFRASTRUCTURE
+/// ------------------------------------------------------------------------------------------------
+
+///   Every domain event MUST implement this marker trait.
+///
+///   `Serialize` ensures we can persist / publish the event payload.
+///   `Send + Sync + 'static` are required to cross async ‑await boundaries safely.
+pub trait DomainEvent: Serialize + Send + Sync + 'static {
+    /// Fully-qualified name used by subscribers for routing.
+    ///
+    /// String instead of `TypeId` to keep binary compatibility across FFI boundaries
+    /// (e.g. WASM plugins).
+    fn kind() -> &'static str;
+}
+
+/// Envelope persisted to the event store and emitted on the message bus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EventEnvelope<T: DomainEvent> {
+    pub id: Uuid,
+    pub aggregate_id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub payload: T,
+}
+
+impl<T: DomainEvent> EventEnvelope<T> {
+    pub fn new(aggregate_id: Uuid, payload: T) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            aggregate_id,
+            occurred_at: Utc::now(),
+            payload,
+        }
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// DOMAIN EVENTS (EXAMPLES)
+/// ------------------------------------------------------------------------------------------------
+
+/// Raised when an educator creates a new “Learning Pulse”.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LearningPulseCreated {
+    pub pulse_id: Uuid,
+    pub author_id: Uuid,
+    pub title: String,
+}
+
+impl DomainEvent for LearningPulseCreated {
+    fn kind() -> &'static str {
+        "learning_pulse.created"
+    }
+}
+
+/// Raised when a student submits an artefact (file / snippet / recording).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArtefactSubmitted {
+    pub submission_id: Uuid,
+    pub student_id: Uuid,
+    pub pulse_id: Uuid,
+    pub artefact_url: String,
+}
+
+impl DomainEvent for ArtefactSubmitted {
+    fn kind() -> &'static str {
+        "artefact.submitted"
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// EVENT STORE (POSTGRES) + PUBLISHER (NATS)
+/// ------------------------------------------------------------------------------------------------
+
+/// High-level service responsible for transactional persistence + publication.
+#[derive(Clone)]
+pub struct EventBus {
+    db: PgPool,
+    nats: NatsClient,
+}
+
+impl EventBus {
+    /// Establish a new [`EventBus`] from environment variables:
+    ///   DATABASE_URL, NATS_URL, NATS_TOKEN (optional).
+    pub async fn from_env() -> Result<Self, EventBusError> {
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| EventBusError::MissingEnvVar("DATABASE_URL".into()))?;
+        let nats_url =
+            std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string());
+
+        let db = PgPoolOptions::new()
+            .max_connections(10)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(&database_url)
+            .await?;
+
+        // Build NATS connection options (timeouts, compression, TLS, etc.).
+        let mut nats_opts = ConnectionOptions::new();
+        nats_opts = nats_opts.name("edupulse_live_event_bus");
+        if let Ok(token) = std::env::var("NATS_TOKEN") {
+            nats_opts = nats_opts.auth_token(token);
+        }
+
+        let nats = nats_opts.connect(&nats_url).await?;
+
+        Ok(Self { db, nats })
+    }
+
+    ///   Persist + publish a single domain event.
+    ///
+    ///   Atomicity guarantees:
+    ///   1.  We always persist *before* publishing.
+    ///   2.  In case of a process crash after COMMIT but before PUB,
+    ///       the outbox pattern with a background re-publisher SHALL be used.
+    #[instrument(skip_all, fields(event = %T::kind()))]
+    pub async fn dispatch<T>(&self, aggregate_id: Uuid, event: T) -> Result<(), EventBusError>
+    where
+        T: DomainEvent,
+    {
+        let envelope = EventEnvelope::new(aggregate_id, event);
+        // 1. Persist
+        self.append_to_store(&envelope).await?;
+
+        // 2. Publish
+        self.publish_to_bus(&envelope).await?;
+
+        Ok(())
+    }
+
+    /// Append event to the Postgres event store.
+    async fn append_to_store<T>(&self, envelope: &EventEnvelope<T>) -> Result<(), EventBusError>
+    where
+        T: DomainEvent,
+    {
+        // Serialize payload as compact JSON.
+        let payload_json =
+            serde_json::to_value(&envelope.payload).map_err(EventBusError::Serialization)?;
+
+        let mut qb: QueryBuilder<Postgres> =
+            QueryBuilder::new("INSERT INTO event_store(id, aggregate_id, kind, occurred_at, payload) ");
+        qb.push_values(
+            std::iter::once(()),
+            |mut b, _| {
+                b.push_bind(envelope.id)
+                    .push_bind(envelope.aggregate_id)
+                    .push_bind(T::kind())
+                    .push_bind(envelope.occurred_at)
+                    .push_bind(payload_json);
+            },
+        );
+
+        let query = qb.build();
+        timeout(IO_TIMEOUT, query.execute(&self.db))
+            .await
+            .map_err(|_| EventBusError::Timeout)?
+            .map_err(EventBusError::Database)?;
+
+        debug!(
+            aggregate_id = %envelope.aggregate_id,
+            event_id = %envelope.id,
+            "Event persisted"
+        );
+        Ok(())
+    }
+
+    /// Publish event to NATS.
+    async fn publish_to_bus<T>(&self, envelope: &EventEnvelope<T>) -> Result<(), EventBusError>
+    where
+        T: DomainEvent,
+    {
+        // Serialize *entire* envelope to JSON so downstream services receive metadata.
+        let payload = serde_json::to_vec(envelope).map_err(EventBusError::Serialization)?;
+
+        let subject = T::kind();
+
+        timeout(
+            IO_TIMEOUT,
+            self.nats
+                .publish(subject.into(), payload.into())
+                .await
+                .map(|_| ()),
+        )
+        .await
+        .map_err(|_| EventBusError::Timeout)?
+        .map_err(EventBusError::MessageBroker)?;
+
+        info!(subject, "Event published to NATS");
+        Ok(())
+    }
+
+    /// Replays events of a given aggregate for state reconstruction (CQRS).
+    #[instrument(skip_all)]
+    pub async fn stream_for<T>(&self, aggregate_id: Uuid) -> Result<Vec<EventEnvelope<T>>, EventBusError>
+    where
+        T: DomainEvent + DeserializeOwned,
+    {
+        let records: Vec<(Uuid, DateTime<Utc>, serde_json::Value)> = sqlx::query_as(
+            r#"
+            SELECT id, occurred_at, payload
+            FROM   event_store
+            WHERE  aggregate_id = $1 AND kind = $2
+            ORDER  BY occurred_at ASC
+            "#,
+        )
+        .bind(aggregate_id)
+        .bind(T::kind())
+        .fetch_all(&self.db)
+        .await
+        .map_err(EventBusError::Database)?;
+
+        let mut out = Vec::with_capacity(records.len());
+        for (id, occurred_at, payload) in records {
+            let payload: T =
+                serde_json::from_value(payload).map_err(EventBusError::Deserialization)?;
+            out.push(EventEnvelope {
+                id,
+                aggregate_id,
+                occurred_at,
+                payload,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// ERRORS
+/// ------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum EventBusError {
+    #[error("missing env var: {0}")]
+    MissingEnvVar(String),
+
+    #[error("serialization error: {0}")]
+    Serialization(serde_json::Error),
+
+    #[error("deserialization error: {0}")]
+    Deserialization(serde_json::Error),
+
+    #[error("database error: {0}")]
+    Database(sqlx::Error),
+
+    #[error("message-broker error: {0}")]
+    MessageBroker(async_nats::Error),
+
+    #[error("operation timed out")]
+    Timeout,
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// UNIT TESTS
+/// ------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use once_cell::sync::Lazy;
+    use tokio::sync::OnceCell;
+
+    static BUS: Lazy<OnceCell<EventBus>> = Lazy::new(OnceCell::new);
+
+    async fn bus() -> EventBus {
+        BUS.get_or_init(|| async {
+            // Spin up an in-memory test setup. For brevity, we reuse `from_env`.
+            // Ensure test env has a local Postgres + NATS or mock them accordingly.
+            EventBus::from_env().await.expect("init event bus")
+        })
+        .await
+        .clone()
+    }
+
+    #[tokio::test]
+    async fn roundtrip_learning_pulse_created() {
+        let bus = bus().await;
+
+        let aggregate_id = Uuid::new_v4();
+        let event = LearningPulseCreated {
+            pulse_id: aggregate_id,
+            author_id: Uuid::new_v4(),
+            title: "Async Rust 101".into(),
+        };
+
+        bus.dispatch(aggregate_id, event.clone())
+            .await
+            .expect("dispatch");
+
+        let events = bus
+            .stream_for::<LearningPulseCreated>(aggregate_id)
+            .await
+            .expect("stream");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload.title, "Async Rust 101");
+    }
+}
+```

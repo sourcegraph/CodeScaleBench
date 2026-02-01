@@ -1,0 +1,413 @@
+```rust
+//! module_81.rs
+//!
+//! ChirpPulse – Real-Time Social Sentiment Lake
+//! -------------------------------------------
+//! This module contains the ingestion + enrichment “edge” service that
+//! consumes raw social-network events from Kafka, applies a configurable
+//! enrichment pipeline (strategy pattern), performs data-quality checks,
+//! and republishes the validated, enriched record to the next Kafka topic.
+//!
+//! Key responsibilities
+//! * High-throughput, at-least-once consumption of raw events
+//! * Extensible transformation pipeline
+//! * QoS / observability: metrics & structured logging
+//! * Graceful shutdown & back-pressure handling
+//!
+//! To keep the sample self-contained we selectively `cfg`-gate integrations
+//! that require heavy deps (Iceberg, real ML models).  They can be plugged
+//! in without touching the public API.
+//!
+//! Build with: `cargo build --features "with-kafka"`
+//! Run   with: `RUST_LOG=info cargo run --features "with-kafka"`
+
+#![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
+#![cfg_attr(not(feature = "with-kafka"), allow(dead_code))]
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use anyhow::{Context, Result};
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
+use tracing::{debug, error, info, instrument, warn};
+
+#[cfg(feature = "with-kafka")]
+use rdkafka::{
+    consumer::{CommitMode, Consumer, StreamConsumer},
+    message::BorrowedMessage,
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Message,
+};
+
+/// ------------------------------------------------------------------------
+/// Domain Types
+/// ------------------------------------------------------------------------
+
+/// Raw event as ingested from social networks.
+/// In production we read the byte payload from Kafka and deserialize.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawEvent {
+    pub id: String,
+    pub network: String,
+    pub payload: serde_json::Value,
+    #[serde(default)]
+    pub timestamp: u64,
+}
+
+/// Enriched & validated event forwarded to the unified topic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichedEvent {
+    pub id: String,
+    pub network: String,
+    pub language: Option<String>,
+    pub toxicity_score: Option<f32>,
+    pub sentiment: Option<f32>,
+    pub enriched_at: u64,
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Errors produced by transformer stages.
+#[derive(Debug, Error)]
+pub enum TransformError {
+    #[error("precondition failed: {0}")]
+    Precondition(String),
+
+    #[error("transient I/O: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("underlying: {0}")]
+    Other(#[from] anyhow::Error),
+}
+
+/// Trait defining a single transformation/enrichment step.
+///
+/// Implementations must be thread-safe (`Send + Sync`) so that the pipeline
+/// can run in a multi-thread executor.
+pub trait Transformer: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn transform(&self, event: &mut EnrichedEvent) -> Result<(), TransformError>;
+}
+
+/// A reusable enrichment pipeline that owns a vector of transformers.
+///
+/// The pipeline can be mutated at runtime (e.g. hot swap) with a `RwLock`.
+#[derive(Default)]
+pub struct Pipeline {
+    stages: Vec<Arc<dyn Transformer>>,
+}
+
+impl Pipeline {
+    pub fn new(stages: Vec<Arc<dyn Transformer>>) -> Self {
+        Self { stages }
+    }
+
+    #[instrument(skip_all, level = "debug", fields(stages = self.stages.len()))]
+    pub fn run(&self, mut event: EnrichedEvent) -> Result<EnrichedEvent> {
+        for t in &self.stages {
+            debug!(stage = t.name(), "running transformer");
+            t.transform(&mut event).with_context(|| t.name().to_string())?;
+        }
+        Ok(event)
+    }
+
+    pub fn insert_stage(&mut self, stage: Arc<dyn Transformer>) {
+        self.stages.push(stage);
+    }
+}
+
+/// ------------------------------------------------------------------------
+/// Example transformer implementations
+/// ------------------------------------------------------------------------
+
+/// Very naive language detector based on presence of UTF-8 ranges.
+/// Real implementation would call a ML crate or remote service.
+#[derive(Debug, Default)]
+pub struct LanguageDetector;
+
+impl Transformer for LanguageDetector {
+    fn name(&self) -> &'static str {
+        "language_detector"
+    }
+
+    #[instrument(skip_all)]
+    fn transform(&self, event: &mut EnrichedEvent) -> Result<(), TransformError> {
+        if event.language.is_some() {
+            return Ok(());
+        }
+        let text = event
+            .extra
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        // Dummy heuristic: presence of '¿' => es, 'é' => fr
+        let lang = if text.contains('¿') { "es" } else if text.contains('é') { "fr" } else { "en" };
+
+        event.language = Some(lang.to_string());
+        Ok(())
+    }
+}
+
+/// Simple toxicity scoring stub.
+#[derive(Debug, Default)]
+pub struct ToxicityScorer;
+
+impl Transformer for ToxicityScorer {
+    fn name(&self) -> &'static str {
+        "toxicity_scorer"
+    }
+
+    #[instrument(skip_all)]
+    fn transform(&self, event: &mut EnrichedEvent) -> Result<(), TransformError> {
+        let text = event
+            .extra
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| TransformError::Precondition("text field missing".into()))?;
+
+        // Dummy rule: more than three exclamation marks is toxic 🙂
+        let score = (text.matches('!').count() as f32) / 10.0;
+        event.toxicity_score = Some(score.min(1.0));
+        Ok(())
+    }
+}
+
+/// ------------------------------------------------------------------------
+/// Streaming Orchestrator
+/// ------------------------------------------------------------------------
+
+/// Runtime control messages (e.g. for graceful shutdown or pipeline hot-swap)
+enum Control {
+    Shutdown,
+    ReloadPipeline(Vec<Arc<dyn Transformer>>),
+}
+
+/// Top-level service struct tying together consumer, pipeline, and producer.
+pub struct StreamProcessor {
+    pipeline: Arc<RwLock<Pipeline>>,
+    shutdown_tx: mpsc::Sender<Control>,
+    join_handle: JoinHandle<()>,
+}
+
+impl StreamProcessor {
+    /// Start the streaming service asynchronously.
+    #[cfg(feature = "with-kafka")]
+    pub async fn start(
+        consumer_cfg: &KafkaConfig,
+        producer_cfg: &KafkaConfig,
+        pipeline: Pipeline,
+    ) -> Result<Self> {
+        let pipeline = Arc::new(RwLock::new(pipeline));
+
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Control>(16);
+        let c_pipeline = pipeline.clone();
+
+        let consumer = consumer_cfg.build_consumer()?;
+        consumer.subscribe(&[&consumer_cfg.topic])?;
+
+        let producer = producer_cfg.build_producer()?;
+
+        let join_handle = tokio::spawn(async move {
+            // Streaming loop
+            loop {
+                select! {
+                    biased;
+
+                    Some(ctrl) = ctrl_rx.recv() => {
+                        match ctrl {
+                            Control::Shutdown => {
+                                info!("shutdown signal received, flushing...");
+                                break;
+                            }
+                            Control::ReloadPipeline(stages) => {
+                                info!("reloading pipeline, new stage count = {}", stages.len());
+                                *c_pipeline.write() = Pipeline::new(stages);
+                            }
+                        }
+                    }
+
+                    msg = consumer.recv() => {
+                        match msg {
+                            Err(e) => {
+                                warn!("kafka error: {}", e);
+                                continue;
+                            },
+                            Ok(m) => {
+                                if let Err(e) = handle_message(&producer, &c_pipeline, &m).await {
+                                    error!("failed to process message: {:#}", e);
+                                }
+                                let _ = consumer.commit_message(&m, CommitMode::Async);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Flush pending messages before exit
+            if let Err(e) = producer.flush(Duration::from_secs(5)) {
+                warn!("producer flush error: {}", e);
+            }
+
+            info!("stream processor terminated");
+        });
+
+        Ok(Self { pipeline, shutdown_tx: ctrl_tx, join_handle })
+    }
+
+    /// Gracefully shut down the streaming service.
+    pub async fn shutdown(self) -> Result<()> {
+        self.shutdown_tx.send(Control::Shutdown).await.ok();
+        self.join_handle.await.context("worker join failed")?;
+        Ok(())
+    }
+
+    /// Hot-swap the enrichment pipeline at runtime.
+    pub async fn reload_pipeline(&self, stages: Vec<Arc<dyn Transformer>>) -> Result<()> {
+        self.shutdown_tx
+            .send(Control::ReloadPipeline(stages))
+            .await
+            .map_err(|e| anyhow::anyhow!("control channel closed: {}", e))
+    }
+}
+
+/// Consume a single Kafka message; run pipeline; publish to output topic.
+#[cfg(feature = "with-kafka")]
+#[instrument(skip_all, level = "trace")]
+async fn handle_message(
+    producer: &FutureProducer,
+    pipeline: &Arc<RwLock<Pipeline>>,
+    msg: &BorrowedMessage<'_>,
+) -> Result<()> {
+    let payload = msg
+        .payload()
+        .context("message payload empty")?;
+
+    let raw: RawEvent =
+        serde_json::from_slice(payload).context("json decode")?;
+
+    // Initial projection RawEvent -> EnrichedEvent
+    let mut extra = HashMap::new();
+    extra.insert("text".into(), raw.payload.clone()); // naive
+
+    let enriched = EnrichedEvent {
+        id: raw.id,
+        network: raw.network,
+        language: None,
+        toxicity_score: None,
+        sentiment: None,
+        enriched_at: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_secs(),
+        extra,
+    };
+
+    let enriched = pipeline.read().run(enriched)?;
+
+    let bytes = serde_json::to_vec(&enriched)?;
+
+    let record = FutureRecord::to("chirp_enriched")
+        .payload(&bytes)
+        .key(&enriched.id);
+
+    // Send asynchronously; we don't await the delivery report to keep latency down.
+    producer.send(record, Duration::from_secs(0)).await.map_err(|(e, _)| e)?;
+
+    Ok(())
+}
+
+/// ------------------------------------------------------------------------
+/// Configuration helpers
+/// ------------------------------------------------------------------------
+
+/// Simplified Kafka client config.
+#[derive(Debug, Clone)]
+pub struct KafkaConfig {
+    pub brokers: String,
+    pub group_id: String,
+    pub topic: String,
+    pub client_id: String,
+}
+
+#[cfg(feature = "with-kafka")]
+impl KafkaConfig {
+    fn base(&self) -> ClientConfig {
+        let mut c = ClientConfig::new();
+        c.set("bootstrap.servers", &self.brokers)
+            .set("group.id", &self.group_id)
+            .set("client.id", &self.client_id)
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .set("message.timeout.ms", "5000");
+        c
+    }
+
+    pub fn build_consumer(&self) -> Result<StreamConsumer> {
+        Ok(self
+            .base()
+            .create()
+            .context("creating Kafka consumer")?)
+    }
+
+    pub fn build_producer(&self) -> Result<FutureProducer> {
+        Ok(self
+            .base()
+            .create()
+            .context("creating Kafka producer")?)
+    }
+}
+
+/// ------------------------------------------------------------------------
+/// Test utilities (run with `cargo test --features "with-kafka"`).
+/// ------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct Counter(AtomicUsize);
+
+    impl Transformer for Counter {
+        fn name(&self) -> &'static str {
+            "counter"
+        }
+
+        fn transform(&self, _: &mut EnrichedEvent) -> Result<(), TransformError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pipeline_executes_all_stages() {
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let mut pipeline = Pipeline::default();
+        pipeline.insert_stage(counter.clone());
+
+        let evt = EnrichedEvent {
+            id: "1".into(),
+            network: "tw".into(),
+            language: None,
+            toxicity_score: None,
+            sentiment: None,
+            enriched_at: 0,
+            extra: HashMap::new(),
+        };
+
+        let result = pipeline.run(evt);
+        assert!(result.is_ok());
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+    }
+}
+```

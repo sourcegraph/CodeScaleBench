@@ -1,0 +1,305 @@
+```csharp
+// ---------------------------------------------------------------------------------------------------------------------
+//  File: src/module_41.txt  (mapped to namespace PulseOps.Warehouse.Transformation)
+//  Project: PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+// ---------------------------------------------------------------------------------------------------------------------
+//  Description
+//  -----------
+//  This module implements a dynamic Transformation Strategy resolver that embraces the Strategy and
+//  Observer patterns.  It watches AWS SSM Parameter Store for changes to the "active" transformation
+//  strategy identifier and hot-swaps the concrete implementation at runtime without requiring a
+//  Lambda redeploy.  Because changes are propagated via an event, other in-process components can
+//  subscribe and react immediately (e.g., drain in-flight batches, warm up caches, etc.).
+//
+//  The module scans all loaded assemblies for types annotated with [TransformationStrategyMetadata]
+//  and registers them in a thread-safe cache.  The first time a transform is requested—or when a
+//  change notification is received—the active strategy is lazily instantiated.  Subsequent calls are
+//  served from the cache to avoid reflection overhead.
+//
+//  Error handling is comprehensive: invalid SSM parameters, constructor exceptions, or missing
+//  implementations are surfaced through a custom ResolverException to aid observability.  Structured
+//  logging (ILogger<>) embeds relevant context, allowing downstream collectors to index strategy
+//  identifiers, stack traces, and correlation IDs.
+// ---------------------------------------------------------------------------------------------------------------------
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.SimpleSystemsManagement;
+using Amazon.SimpleSystemsManagement.Model;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformation
+{
+    #region Public Contracts ───────────────────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A minimal in-memory data frame abstraction used as the canonical payload between ETL stages.
+    /// </summary>
+    public sealed record DataFrame(
+        IReadOnlyDictionary<string, string> Headers,
+        IReadOnlyList<IDictionary<string, object>> Rows);
+
+    /// <summary>
+    /// All transformation strategies must implement this interface.
+    /// Implementations must be stateless and thread-safe; the resolver shares
+    /// them across concurrent invocations.
+    /// </summary>
+    public interface ITransformationStrategy : IAsyncDisposable
+    {
+        /// <summary>
+        /// Applies a transformation to the supplied <see cref="DataFrame"/>.
+        /// </summary>
+        /// <param name="input">The data frame to transform.</param>
+        /// <param name="cancellationToken">A token for cooperative cancellation.</param>
+        /// <returns>A new, transformed data frame.</returns>
+        Task<DataFrame> TransformAsync(DataFrame input, CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Attribute that marks a concrete type as a discoverable Transformation Strategy.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Class, Inherited = false)]
+    public sealed class TransformationStrategyMetadataAttribute : Attribute
+    {
+        public string Identifier { get; }
+
+        public TransformationStrategyMetadataAttribute(string identifier)
+        {
+            Identifier = string.IsNullOrWhiteSpace(identifier)
+                ? throw new ArgumentException("Identifier must be non-blank", nameof(identifier))
+                : identifier.Trim();
+        }
+    }
+
+    #endregion
+
+    #region Exceptions ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+    public sealed class ResolverException : Exception
+    {
+        public ResolverException(string message) : base(message) { }
+        public ResolverException(string message, Exception inner) : base(message, inner) { }
+    }
+
+    #endregion
+
+    #region Resolver ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Dynamically resolves and caches transformation strategies based on an identifier stored in
+    /// AWS SSM Parameter Store.
+    /// </summary>
+    public sealed class TransformationStrategyResolver : IAsyncDisposable
+    {
+        private const string ParameterName = "/pulseops/warehouse/active-transform-strategy";
+
+        private readonly ILogger<TransformationStrategyResolver> _logger;
+        private readonly IAmazonSimpleSystemsManagement _ssm;
+
+        // Cache: identifier -> singleton strategy instance.
+        private readonly ConcurrentDictionary<string, Lazy<Task<ITransformationStrategy>>> _strategies = new();
+
+        // Lookup: identifier -> concrete type.
+        private readonly IReadOnlyDictionary<string, Type> _registry;
+
+        private string? _currentIdentifier;
+        private ITransformationStrategy? _currentStrategy;
+        private DateTimeOffset _lastRefresh = DateTimeOffset.MinValue;
+        private readonly SemaphoreSlim _refreshSemaphore = new(1, 1);
+
+        /// <summary>
+        /// Event triggered whenever the active strategy changes.
+        /// </summary>
+        public event EventHandler<string>? StrategyChanged;
+
+        public TransformationStrategyResolver(
+            ILogger<TransformationStrategyResolver> logger,
+            IAmazonSimpleSystemsManagement ssmClient)
+        {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _ssm = ssmClient ?? throw new ArgumentNullException(nameof(ssmClient));
+            _registry = ScanStrategies();
+
+            _logger.LogInformation(
+                "Discovered {StrategyCount} transformation strategies: {Identifiers}",
+                _registry.Count,
+                _registry.Keys);
+        }
+
+        /// <summary>
+        /// Resolves the active strategy (according to SSM) and executes the transformation.
+        /// Hot-reloads the strategy if the parameter value has changed since the last call.
+        /// </summary>
+        public async Task<DataFrame> TransformAsync(
+            DataFrame input,
+            CancellationToken cancellationToken = default)
+        {
+            var strategy = await GetActiveStrategyAsync(cancellationToken).ConfigureAwait(false);
+            return await strategy.TransformAsync(input, cancellationToken).ConfigureAwait(false);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            foreach (var lazyTask in _strategies.Values)
+            {
+                if (lazyTask.IsValueCreated &&
+                    lazyTask.Value.IsCompletedSuccessfully &&
+                    lazyTask.Value.Result is IAsyncDisposable disposable)
+                {
+                    await disposable.DisposeAsync().ConfigureAwait(false);
+                }
+            }
+
+            _refreshSemaphore.Dispose();
+        }
+
+        #region Internal Implementation ────────────────────────────────────────────────────────────────────────────────
+
+        private static IReadOnlyDictionary<string, Type> ScanStrategies()
+        {
+            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            var strategies = from assembly in assemblies
+                             from type in assembly.GetTypes()
+                             let attr = type.GetCustomAttribute<TransformationStrategyMetadataAttribute>()
+                             where attr is not null
+                             select new { attr.Identifier, StrategyType = type };
+
+            return strategies.ToDictionary(x => x.Identifier, x => x.StrategyType, StringComparer.OrdinalIgnoreCase);
+        }
+
+        private async Task<ITransformationStrategy> GetActiveStrategyAsync(
+            CancellationToken cancellationToken)
+        {
+            // Refresh parameter if expired (>30s) or unknown.
+            if ((DateTimeOffset.UtcNow - _lastRefresh) > TimeSpan.FromSeconds(30) || _currentIdentifier is null)
+            {
+                await RefreshActiveIdentifierAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            if (_currentIdentifier is null)
+                throw new ResolverException(
+                    $"Unable to determine active transformation strategy from SSM parameter {ParameterName}");
+
+            // Return cached/instantiated strategy.
+            var strategy = await GetOrCreateStrategyAsync(_currentIdentifier, cancellationToken)
+                .ConfigureAwait(false);
+
+            return strategy;
+        }
+
+        private async Task RefreshActiveIdentifierAsync(CancellationToken cancellationToken)
+        {
+            if (!await _refreshSemaphore.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            {
+                // Another thread is already refreshing; we can return immediately.
+                return;
+            }
+
+            try
+            {
+                var response = await _ssm.GetParameterAsync(
+                    new GetParameterRequest
+                    {
+                        Name = ParameterName,
+                        WithDecryption = false
+                    },
+                    cancellationToken).ConfigureAwait(false);
+
+                var identifier = response.Parameter?.Value?.Trim();
+                if (string.IsNullOrWhiteSpace(identifier))
+                    throw new ResolverException(
+                        $"SSM parameter {ParameterName} contains a blank or null identifier.");
+
+                if (!string.Equals(identifier, _currentIdentifier, StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogWarning("Active transformation strategy changed: {Old} → {New}",
+                        _currentIdentifier ?? "<null>",
+                        identifier);
+
+                    _currentIdentifier = identifier;
+                    _currentStrategy = null; // Force re-resolve next invocation.
+                    StrategyChanged?.Invoke(this, identifier);
+                }
+
+                _lastRefresh = DateTimeOffset.UtcNow;
+            }
+            catch (ParameterNotFoundException ex)
+            {
+                throw new ResolverException($"SSM parameter {ParameterName} not found.", ex);
+            }
+            catch (Exception ex) when (ex is not ResolverException)
+            {
+                throw new ResolverException(
+                    $"Failed to load SSM parameter {ParameterName}: {ex.Message}", ex);
+            }
+            finally
+            {
+                _refreshSemaphore.Release();
+            }
+        }
+
+        private Task<ITransformationStrategy> GetOrCreateStrategyAsync(
+            string identifier,
+            CancellationToken cancellationToken)
+        {
+            var lazy = _strategies.GetOrAdd(identifier, id => new Lazy<Task<ITransformationStrategy>>(() =>
+            {
+                if (!_registry.TryGetValue(id, out var type))
+                {
+                    throw new ResolverException(
+                        $"No transformation strategy registered under identifier '{id}'.");
+                }
+
+                _logger.LogInformation("Instantiating transformation strategy {Identifier} ({Type})", id, type.FullName);
+
+                try
+                {
+                    var ctor = type.GetConstructor(Type.EmptyTypes)
+                               ?? throw new ResolverException($"Strategy {type.FullName} lacks a public parameter-less constructor.");
+
+                    var instance = (ITransformationStrategy)ctor.Invoke(null);
+                    return Task.FromResult(instance);
+                }
+                catch (Exception ex)
+                {
+                    throw new ResolverException($"Failed to instantiate strategy {type.FullName}.", ex);
+                }
+            }, isThreadSafe: true));
+
+            return lazy.Value.WithCancellation(cancellationToken);
+        }
+
+        #endregion
+    }
+
+    #endregion
+
+    #region Extension Helpers ─────────────────────────────────────────────────────────────────────────────────────────
+
+    internal static class TaskExtensions
+    {
+        /// <summary>
+        /// Adds cooperative cancellation support for a Task value.
+        /// </summary>
+        public static async Task<T> WithCancellation<T>(this Task<T> task, CancellationToken token)
+        {
+            using var registration = token.Register(state => ((TaskCompletionSource<bool>)state!).TrySetResult(true),
+                                                    new TaskCompletionSource<bool>());
+
+            if (task != await Task.WhenAny(task, registration.Task).ConfigureAwait(false))
+            {
+                throw new OperationCanceledException(token);
+            }
+
+            return await task.ConfigureAwait(false);
+        }
+    }
+
+    #endregion
+}
+```

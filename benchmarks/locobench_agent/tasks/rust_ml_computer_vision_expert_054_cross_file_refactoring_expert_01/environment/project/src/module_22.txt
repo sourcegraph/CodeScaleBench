@@ -1,0 +1,370 @@
+```rust
+//! module_22.rs
+//!
+//! Model Monitoring & Observer Infrastructure
+//! ------------------------------------------
+//! This module provides a production-grade implementation of model–metric
+//! observation that plugs into the `VisuTility Orchestrator` runtime.  All
+//! components use trait-based abstractions so that additional observers can be
+//! injected at runtime without recompilation (Factory/Observer Pattern combo).
+//!
+//! The public surface area is intentionally small—`EventBus`, `ModelMetricEvent`,
+//! and `Observer`—so that other layers (Feature-Ops, Serving-Ops, etc.) depend
+//! only on stable contracts.
+//!
+//! Example
+//! -------
+//! ```no_run
+//! use visu_tility::monitoring::*;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), MonitoringError> {
+//!     let bus = EventBus::default();
+//!     bus.register(ConsoleLoggerObserver::default())?;
+//!     bus.register(RetrainingTriggerObserver::default())?;
+//!
+//!     let model = ModelVersion::new("object_detector", "v1.2.3");
+//!     bus.emit(ModelMetricEvent::InferenceLatency { model: model.clone(), latency_ms: 183 })?;
+//!     bus.emit(ModelMetricEvent::AccuracyDrift  { model, drift: 0.17 })?;
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! Build features
+//! --------------
+//! * `tokio`         – used for asynchronous dispatch (compiled by default).
+//! * `serde`/`json`  – (soft dependency) enables serialisation of events for
+//!                     external sinks (e.g., Kafka, Elasticsearch).
+//!
+//! Note: To keep the demo self-contained, all soft dependencies are behind
+//! `#[cfg(feature = "…")]` gates.  Remove the gates if your crate already
+//! enables them globally.
+
+#![allow(clippy::missing_errors_doc)] // Documentation added in trait & impls only.
+#![allow(clippy::module_name_repetitions)]
+
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt::{self, Display, Formatter},
+    sync::{Arc, RwLock},
+};
+
+use uuid::Uuid;
+
+/// Semantic version wrapper around an ML model.
+///
+/// This is a lightweight mirror of the entity stored in the project-wide
+/// `Model Registry`.  We keep it duplicated here for compilation isolation;
+/// the `From`/`Into` conversions will be implemented on the real type.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ModelVersion {
+    pub name:    String,
+    pub version: String,
+}
+
+impl ModelVersion {
+    pub fn new<S: Into<String>>(name: S, version: S) -> Self {
+        Self { name: name.into(), version: version.into() }
+    }
+}
+
+/// High-level events that can be emitted by Serving-Ops or Data-Ops layers.
+///
+/// Extend this enum as needed—listeners will automatically receive the new
+/// variants at runtime (thanks to the dynamic dispatch in [`Observer`]).
+#[derive(Clone, Debug)]
+pub enum ModelMetricEvent {
+    /// Online inference latency in **milliseconds**.
+    InferenceLatency {
+        model:      ModelVersion,
+        latency_ms: u128,
+    },
+
+    /// Population accuracy drift between *current* batch and *reference*.
+    AccuracyDrift {
+        model: ModelVersion,
+        drift: f32,
+    },
+
+    /// Population concept drift between *current* batch and *reference*.
+    ConceptDrift {
+        model: ModelVersion,
+        p_value: f32,
+    },
+
+    /// Non-exhaustive marker so that adding new variants is non-breaking.
+    #[doc(hidden)]
+    __NonExhaustive,
+}
+
+/// Top-level error type bubbled up by the monitoring subsystem.
+#[derive(Debug)]
+pub enum MonitoringError {
+    ObserverNotFound(Uuid),
+    DispatchFailure(String),
+}
+
+impl Display for MonitoringError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ObserverNotFound(id) => write!(f, "observer not found: {id}"),
+            Self::DispatchFailure(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl Error for MonitoringError {}
+
+/// A trait implemented by all metric observers.
+///
+/// Implementors **must** be cheap to clone (`Arc<dyn Observer>` behind the
+/// scenes) and thread-safe (`Send + Sync`) as they are fanned out to multiple
+/// worker tasks.
+pub trait Observer: Send + Sync {
+    /// Handle a freshly published [`ModelMetricEvent`] from the [`EventBus`].
+    ///
+    /// Returning an error **does not** stop the bus from delivering the event
+    /// to other observers; it is simply logged.
+    fn on_event(&self, event: &ModelMetricEvent) -> Result<(), MonitoringError>;
+
+    /// Human-readable component identifier for logging/metric purposes.
+    fn name(&self) -> &str;
+}
+
+/// Type alias used by internal structures.
+type SharedObserver = Arc<dyn Observer>;
+
+/// Thread-safe, fail-fast event broadcaster (multi-producer to multi-observer).
+///
+/// Internally, the bus holds a registry of observers protected by `RwLock` so
+/// that reads are uncontended while updates remain serialised.
+#[derive(Default)]
+pub struct EventBus {
+    observers: RwLock<HashMap<Uuid, SharedObserver>>,
+}
+
+impl EventBus {
+    /// Register a new [`Observer`] and receive a **detach handle**.
+    ///
+    /// Observers are weakly referenced by UUID; hold on to the returned value
+    /// if you need to de-register the observer later.
+    pub fn register<T>(&self, observer: T) -> Result<ObserverHandle, MonitoringError>
+    where
+        T: Observer + 'static,
+    {
+        let id = Uuid::new_v4();
+        self.observers
+            .write()
+            .map_err(|_| MonitoringError::DispatchFailure("lock poisoned".to_owned()))?
+            .insert(id, Arc::new(observer));
+
+        Ok(ObserverHandle { id, bus: self })
+    }
+
+    /// De-register an existing observer by its UUID.
+    pub fn unregister(&self, id: Uuid) -> Result<(), MonitoringError> {
+        let removed = self
+            .observers
+            .write()
+            .map_err(|_| MonitoringError::DispatchFailure("lock poisoned".to_owned()))?
+            .remove(&id);
+
+        if removed.is_some() {
+            Ok(())
+        } else {
+            Err(MonitoringError::ObserverNotFound(id))
+        }
+    }
+
+    /// Publish a metric event to *all* registered observers.
+    ///
+    /// Each observer is invoked **sequentially**; individual failures are
+    /// recorded via `log::error!` but do **not** prevent others from executing.
+    pub fn emit(&self, event: ModelMetricEvent) -> Result<(), MonitoringError> {
+        // Snapshot observers in a read lock to keep the critical section short.
+        let observers = {
+            let guard = self
+                .observers
+                .read()
+                .map_err(|_| MonitoringError::DispatchFailure("lock poisoned".to_owned()))?;
+            guard.values().cloned().collect::<Vec<_>>()
+        };
+
+        // Dispatch outside of the lock for minimal contention.
+        for obs in observers {
+            if let Err(e) = obs.on_event(&event) {
+                log::error!(
+                    target: "monitoring",
+                    "observer \"{}\" failed to handle event: {e}",
+                    obs.name()
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// A scoped handle that automatically un-registers its observer when dropped.
+///
+/// The handle is *cheap to clone* and can be sent across threads, making it
+/// ergonomic to attach observers in different system layers.
+///
+/// Example
+/// -------
+/// ```
+/// # use visu_tility::monitoring::*;
+/// let bus = EventBus::default();
+/// let handle = bus.register(ConsoleLoggerObserver::default()).unwrap();
+///
+/// // Observer will be detached at this point
+/// drop(handle);
+/// ```
+#[derive(Clone)]
+pub struct ObserverHandle<'a> {
+    id:  Uuid,
+    bus: &'a EventBus,
+}
+
+impl<'a> Drop for ObserverHandle<'a> {
+    fn drop(&mut self) {
+        if let Err(e) = self.bus.unregister(self.id) {
+            log::warn!(target: "monitoring", "failed to remove observer: {e}");
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------
+ *  Built-in Observers
+ * ---------------------------------------------------------------------- */
+
+/// Simple observer that prints events to `stdout` using `log` facade.
+///
+/// Recommended for development & debugging only (replace in prod with a
+/// structured, centralised logger like `tracing`).
+#[derive(Default)]
+pub struct ConsoleLoggerObserver;
+
+impl Observer for ConsoleLoggerObserver {
+    fn on_event(&self, event: &ModelMetricEvent) -> Result<(), MonitoringError> {
+        log::info!(target: "monitoring", "{event:?}");
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "console_logger"
+    }
+}
+
+/// Observer that triggers an **automated retraining job** whenever a drift
+/// threshold is exceeded.  Uses Strategy Pattern: runtime decides which
+/// `DriftStrategy` to apply (e.g., `FixedThreshold`, `p-value`, `EWMA`).
+#[derive(Default)]
+pub struct RetrainingTriggerObserver {
+    strategy: Box<dyn DriftStrategy + Send + Sync>,
+}
+
+impl Observer for RetrainingTriggerObserver {
+    fn on_event(&self, event: &ModelMetricEvent) -> Result<(), MonitoringError> {
+        if let Some(drift) = self.extract_drift(event) {
+            if self.strategy.evaluate(drift) {
+                self.schedule_retraining(event)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "auto_retraining_trigger"
+    }
+}
+
+impl RetrainingTriggerObserver {
+    fn extract_drift(&self, event: &ModelMetricEvent) -> Option<f32> {
+        match event {
+            ModelMetricEvent::AccuracyDrift { drift, .. } => Some(*drift),
+            ModelMetricEvent::ConceptDrift { p_value, .. } => Some(*p_value),
+            _ => None,
+        }
+    }
+
+    fn schedule_retraining(&self, event: &ModelMetricEvent) -> Result<(), MonitoringError> {
+        // In real deployment, this would enqueue a job to the Model-Ops
+        // scheduler or trigger a K8s-based CI/CD pipeline.
+        log::warn!(
+            target: "monitoring",
+            "Retraining triggered by event: {event:?}"
+        );
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------
+ *  Strategy Pattern for Drift Evaluation
+ * ---------------------------------------------------------------------- */
+
+/// Decide whether a given drift measurement is significant enough to trigger.
+pub trait DriftStrategy {
+    fn evaluate(&self, drift: f32) -> bool;
+}
+
+/// Fixed threshold strategy (simplest policy).
+pub struct FixedThreshold {
+    /// Acceptable drift delta before retraining.
+    pub threshold: f32,
+}
+
+impl Default for FixedThreshold {
+    fn default() -> Self {
+        Self { threshold: 0.05 }
+    }
+}
+
+impl DriftStrategy for FixedThreshold {
+    fn evaluate(&self, drift: f32) -> bool {
+        drift >= self.threshold
+    }
+}
+
+/* -------------------------------------------------------------------------
+ *  Tests
+ * ---------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ensure observers are called.
+    #[test]
+    fn smoke_test_event_bus() {
+        let bus = EventBus::default();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        struct CounterObserver {
+            counter: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl Observer for CounterObserver {
+            fn on_event(&self, _event: &ModelMetricEvent) -> Result<(), MonitoringError> {
+                self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn name(&self) -> &str {
+                "counter"
+            }
+        }
+
+        bus.register(CounterObserver { counter: counter.clone() })
+            .unwrap();
+
+        let model = ModelVersion::new("test", "0.1.0");
+        bus.emit(ModelMetricEvent::AccuracyDrift { model, drift: 0.1 })
+            .unwrap();
+
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+```

@@ -1,0 +1,342 @@
+```rust
+//! module_64.txt
+//! ----------------------------------------------
+//! Pagination + Response Caching Utilities
+//! ----------------------------------------------
+//! This module centralises pagination and response–caching helpers that
+//! are shared across both REST and GraphQL surface areas in LedgerLink Nexus.
+//!
+//! Key responsibilities
+//! --------------------
+//! * Extract strongly-typed page requests from incoming HTTP/GraphQL queries
+//! * Validate paging parameters against tenant-level limits
+//! * Provide pagination metadata helpers (total pages, cursors, etc.)
+//! * Offer best-effort cache hints (TTL, `ETag`) for out-going responses
+//! * Provide ergonomic extension traits to attach cache hints to Actix
+//!   responses without polluting endpoint code.
+//!
+//! Crate features required
+//! -----------------------
+//! * `validator`   – Data validation of incoming query parameters
+//! * `serde`       – (De)serialisation to/from JSON
+//! * `sha2`        – Create stable `ETag`s
+//! * `tracing`     – Structured logging
+//! * `actix-web`   – Extractor and response extension traits
+//!
+//! Note: All code is `no_std`-friendly except for Actix feature gates.
+
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::missing_errors_doc)]
+
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use actix_web::dev::{Payload, ServiceResponse};
+use actix_web::error::{ErrorBadRequest, ErrorInternalServerError};
+use actix_web::http::{header, HeaderValue};
+use actix_web::{FromRequest, HttpMessage, HttpRequest};
+use futures_util::future::{ready, Ready};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tracing::{debug, instrument};
+use validator::{Validate, ValidationError};
+
+/// Default maximum size a client can request in a single page.
+pub const DEFAULT_MAX_PAGE_SIZE: u32 = 500;
+
+/// Pagination parameters extracted from queries.
+///
+/// These parameters are intentionally kept simple to support
+/// both offset-based REST paging and cursor / relay-style GraphQL
+/// pagination schemes.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct PageRequest {
+    /// 1-based page index. Must be ≥ 1.
+    pub page: u32,
+
+    /// Number of records requested in a single page.
+    /// The effective upper bound is enforced by [`TenantLimits`]
+    /// or the hard-coded [`DEFAULT_MAX_PAGE_SIZE`].
+    pub per_page: u32,
+}
+
+impl Default for PageRequest {
+    fn default() -> Self {
+        Self {
+            page: 1,
+            per_page: 50,
+        }
+    }
+}
+
+/// External validation wrapper generating rich errors on invalid
+/// query parameters. Delegates the actual rules to [`PageRequest::validate`].
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct PageRequestValidated {
+    #[validate(range(min = 1))]
+    pub page: u32,
+
+    #[validate(range(min = 1, max = 10_000))]
+    pub per_page: u32,
+}
+
+impl TryFrom<PageRequestValidated> for PageRequest {
+    type Error = ValidationError;
+
+    fn try_from(value: PageRequestValidated) -> Result<Self, Self::Error> {
+        value.validate()?;
+        Ok(PageRequest {
+            page: value.page,
+            per_page: value.per_page,
+        })
+    }
+}
+
+/// `actix-web` extractor that produces a validated [`PageRequest`] instance.
+///
+/// Usage in handlers:
+///
+/// ```ignore
+/// async fn list_entries(page: PageExtractor) -> impl Responder { /* … */ }
+/// ```
+pub struct PageExtractor(pub PageRequest);
+
+impl FromRequest for PageExtractor {
+    type Error = actix_web::Error;
+    type Future = Ready<Result<Self, Self::Error>>;
+
+    #[instrument(skip_all, fields(page, per_page))]
+    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
+        // Attempt to pull `PageRequestValidated` from the query string.
+        match actix_web::web::Query::<PageRequestValidated>::from_query(req.query_string()) {
+            Ok(query) => {
+                match PageRequest::try_from(query.into_inner()) {
+                    Ok(pr) => {
+                        tracing::Span::current().record("page", pr.page);
+                        tracing::Span::current().record("per_page", pr.per_page);
+                        ready(Ok(PageExtractor(pr)))
+                    }
+                    Err(e) => ready(Err(ErrorBadRequest(format!(
+                        "Invalid pagination parameters: {e:?}"
+                    )))),
+                }
+            }
+            Err(e) => ready(Err(ErrorBadRequest(format!(
+                "Failed to parse pagination query: {e}"
+            )))),
+        }
+    }
+}
+
+impl std::ops::Deref for PageExtractor {
+    type Target = PageRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Container emitted together with list payloads so that clients can implement
+/// generic paging UIs. Mirrors `Content-Range` semantics.
+#[derive(Debug, Clone, Serialize)]
+pub struct PageMetadata {
+    pub page: u32,
+    pub per_page: u32,
+    pub total_items: u64,
+    pub total_pages: u64,
+}
+
+impl PageMetadata {
+    #[must_use]
+    pub fn new(page: PageRequest, total_items: u64) -> Self {
+        let total_pages = (total_items + page.per_page as u64 - 1) / page.per_page as u64;
+        Self {
+            page: page.page,
+            per_page: page.per_page,
+            total_items,
+            total_pages,
+        }
+    }
+}
+
+/// Response caching hint communicated to middleware or gateways.
+///
+/// The actual cache implementation (Redis / CDN) lives outside this module.
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheHint {
+    /// Positive TTL in seconds. `0` means “do not cache”.
+    pub max_age: u32,
+    /// Strong ETag for content negotiation. Optional because some responses
+    /// might not be amenable to hashing (e.g. streaming).
+    pub etag: Option<String>,
+}
+
+impl CacheHint {
+    #[must_use]
+    pub fn no_cache() -> Self {
+        Self {
+            max_age: 0,
+            etag: None,
+        }
+    }
+
+    #[must_use]
+    pub fn short_lived(seconds: u32) -> Self {
+        Self {
+            max_age: seconds,
+            etag: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_etag<T: Serialize>(ttl: u32, payload: &T) -> Self {
+        Self {
+            max_age: ttl,
+            etag: Some(generate_etag(payload)),
+        }
+    }
+}
+
+/// Compute a stable SHA-256 hexadecimal digest over a serialised payload,
+/// suitable for use as a strong `ETag`.
+#[instrument(skip(payload))]
+pub fn generate_etag<T: Serialize>(payload: &T) -> String {
+    let json = match serde_json::to_vec(payload) {
+        Ok(j) => j,
+        Err(e) => {
+            // As ETag generation is best-effort, we log the serialisation error
+            // but still supply a randomised fallback ETag to avoid breaking
+            // callers.
+            debug!("Failed to serialise payload for ETag generation: {e}");
+            return uuid::Uuid::new_v4().to_string();
+        }
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(json);
+    let digest = hasher.finalize();
+    format!("W/\"{:x}\"", digest)
+}
+
+/// Extension trait to attach cache hints to outgoing `ServiceResponse`s.
+/// This ensures a single, consistent location for cache header logic.
+pub trait WithCacheHint {
+    fn with_cache_hint(self, hint: &CacheHint) -> Self;
+}
+
+impl<B> WithCacheHint for ServiceResponse<B> {
+    fn with_cache_hint(mut self, hint: &CacheHint) -> Self {
+        {
+            let headers = self.headers_mut();
+            // `Cache-Control`
+            let cc_value = if hint.max_age == 0 {
+                "no-cache, no-store, must-revalidate".to_owned()
+            } else {
+                format!("public, max-age={}", hint.max_age)
+            };
+            headers.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_str(&cc_value)
+                    .expect("Cache-Control value should be ASCII only"),
+            );
+
+            // `ETag`
+            if let Some(etag) = &hint.etag {
+                headers.insert(
+                    header::ETAG,
+                    HeaderValue::from_str(etag).expect("ETag must be ASCII only"),
+                );
+            }
+        }
+        self
+    }
+}
+
+/// Future wrapper that augments an Actix handler’s result with the supplied
+/// [`CacheHint`]. This is a convenience to keep handler bodies ergonomic.
+///
+/// ```ignore
+/// async fn list_entries(
+///     page: PageExtractor,
+///     svc: web::Data<LedgerService>
+/// ) -> impl Responder {
+///     let result = svc.list_entries(page.into_inner()).await?;
+///     with_cache_hint(Json(result), CacheHint::short_lived(60))
+/// }
+/// ```
+pub fn with_cache_hint<R, F>(
+    fut: F,
+    hint: CacheHint,
+) -> impl Future<Output = Result<ServiceResponse<R>, actix_web::Error>>
+where
+    F: Future<Output = Result<ServiceResponse<R>, actix_web::Error>>,
+{
+    CacheHintFuture { fut, hint }
+}
+
+struct CacheHintFuture<R, F> {
+    fut: F,
+    hint: CacheHint,
+}
+
+impl<R, F> Future for CacheHintFuture<R, F>
+where
+    F: Future<Output = Result<ServiceResponse<R>, actix_web::Error>>,
+{
+    type Output = Result<ServiceResponse<R>, actix_web::Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.get_mut();
+        match unsafe { Pin::new_unchecked(&mut this.fut) }.poll(cx) {
+            Poll::Ready(Ok(resp)) => {
+                let resp_with_header = resp.with_cache_hint(&this.hint);
+                Poll::Ready(Ok(resp_with_header))
+            }
+            other => other,
+        }
+    }
+}
+
+/// Simple unit tests covering validation and header injection.
+/// These tests are `#[cfg(test)]` so they don’t end up in the binary.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::test;
+
+    #[test]
+    fn validate_page_request() {
+        let valid = PageRequestValidated { page: 3, per_page: 10 };
+        assert!(PageRequest::try_from(valid).is_ok());
+
+        let invalid = PageRequestValidated { page: 0, per_page: 0 };
+        assert!(PageRequest::try_from(invalid).is_err());
+    }
+
+    #[actix_rt::test]
+    async fn attach_headers() {
+        let req = test::TestRequest::default().to_srv_request();
+        let resp = ServiceResponse::new(req, actix_web::HttpResponse::Ok().finish());
+        let resp = resp.with_cache_hint(&CacheHint::short_lived(30));
+        let hdrs = resp.headers();
+        assert_eq!(
+            hdrs.get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=30"
+        );
+    }
+
+    #[test]
+    fn etag_generation_is_stable() {
+        #[derive(Serialize)]
+        struct Foo {
+            a: u8,
+            b: &'static str,
+        }
+        let payload = Foo { a: 1, b: "bar" };
+        let etag1 = generate_etag(&payload);
+        let etag2 = generate_etag(&payload);
+        assert_eq!(etag1, etag2);
+    }
+}
+```

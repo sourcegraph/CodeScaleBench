@@ -1,0 +1,376 @@
+```rust
+//! src/module_2.rs
+//! -----------------------------------------------------------------------------
+//! Event-driven infrastructure for **EduPulse Live – Event-Driven Social Learning
+//! Hub**.  This module materialises the *Domain Event* concept mentioned in the
+//! architecture description and provides a pluggable, async publisher that can
+//! be wired to a real message-broker (e.g. RabbitMQ via *lapin*) or gracefully
+//! degrade to a pure in-process logger in tests or local development.
+//!
+//! Key design points
+//! -----------------
+//! • A strongly-typed `DomainEvent` enum prevents the *stringly-typed* antipattern.  
+//! • An `EventEnvelope` carries universal metadata used by downstream services.  
+//! • The `EventPublisher` trait abstracts the transport; a concrete
+//!   `RabbitMqPublisher` is behind a crate feature flag (`broker`).  
+//! • `thiserror` provides ergonomic error handling.  
+//! • `async_trait` allows `async` functions in traits while staying on stable Rust.
+//!
+//! -----------------------------------------------------------------------------
+//! Crate features
+//! --------------
+//! `broker` – Enables the real AMQP publisher that talks to RabbitMQ.  When the
+//! feature is **not** enabled, a lightweight logger implementation is compiled
+//! instead. This keeps test binaries small and fast.
+//!
+//! -----------------------------------------------------------------------------
+//! External crates
+//! ---------------
+//!  - `serde`, `serde_json`  – (de)serialisation
+//!  - `uuid`                – event correlation / id
+//!  - `chrono`              – timestamps with timezone
+//!  - `async_trait`         – async in traits
+//!  - `thiserror`           – error enums
+//!  - `log`                 – structured logging facade
+//!  - `lapin`               – AMQP client  (only with `broker` feature)
+//!  - `tokio`               – async runtime, required by lapin
+//! -----------------------------------------------------------------------------
+
+#![allow(clippy::large_enum_variant)]
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use uuid::Uuid;
+
+#[cfg(feature = "broker")]
+use {
+    lapin::{
+        options::BasicPublishOptions,
+        publisher_confirm::Confirmation,
+        types::FieldTable,
+        BasicProperties, Channel, Connection, ConnectionProperties,
+    },
+    tokio::time::timeout,
+};
+
+/// Maximum time we wait for the broker to confirm our message.
+///
+/// The constant is visible because tests may want to shorten the interval with
+/// `tokio::time::pause`.
+pub const PUBLISH_CONFIRM_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Common metadata added to **every** event before leaving the bounded context.
+///
+/// The data is intentionally generic and keeps the envelope small so that
+/// high-volume events remain cheap to serialize and ship.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventMetadata {
+    /// Globally unique identifier used for idempotence and correlation.
+    pub id: Uuid,
+
+    /// RFC3339 timestamp indicating when the event was created at the source.
+    pub occurred_at: DateTime<Utc>,
+
+    /// Name of the bounded context / micro-service that originally emitted this
+    /// event (e.g. `eduplse.api`, `eduplse.analytics-svc`).
+    pub source: String,
+
+    /// Optional correlation id (e.g. HTTP request id) allowing us to trace the
+    /// causal chain across service boundaries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<Uuid>,
+}
+
+impl Default for EventMetadata {
+    fn default() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            source: env!("CARGO_PKG_NAME").to_owned(),
+            correlation_id: None,
+        }
+    }
+}
+
+/// The **DomainEvent** enum encapsulates the canonical vocabulary for the
+/// EduPulse domain.  Each variant is versioned so we can evolve payloads
+/// without breaking existing subscribers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum DomainEvent {
+    /// A teacher has published a new lesson.
+    LessonPublishedV1 {
+        lesson_id: Uuid,
+        title: String,
+        author_id: Uuid,
+    },
+
+    /// A student submitted answers to a quiz.
+    QuizSubmittedV1 {
+        quiz_id: Uuid,
+        attempt_id: Uuid,
+        student_id: Uuid,
+    },
+
+    /// A peer gave feedback to someone else's submission.
+    PeerFeedbackGivenV1 {
+        feedback_id: Uuid,
+        submission_id: Uuid,
+        reviewer_id: Uuid,
+    },
+
+    /// A student was granted a badge.
+    BadgeAwardedV1 {
+        badge_id: Uuid,
+        awardee_id: Uuid,
+        reason: String,
+    },
+
+    /// Money changed hands for a premium micro-course.
+    PaymentCapturedV1 {
+        payment_id: Uuid,
+        amount_cents: i64,
+        currency: String,
+        payer_id: Uuid,
+    },
+}
+
+/// Envelope that wraps the event payload with universal metadata.
+///
+/// Storing metadata *outside* the payload makes it trivial to evolve individual
+/// events without duplicating the same bookkeeping fields everywhere.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub meta: EventMetadata,
+    pub event: DomainEvent,
+}
+
+impl EventEnvelope {
+    pub fn new<E: Into<DomainEvent>>(event: E) -> Self {
+        Self {
+            meta: EventMetadata::default(),
+            event: event.into(),
+        }
+    }
+}
+
+/// Serialise the envelope into a compact JSON payload.
+///
+/// We purposefully avoid pretty printing for network efficiency; producers that
+/// want human-readable output can call `pretty_json()` instead.
+impl EventEnvelope {
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, EventError> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    #[allow(dead_code)]
+    pub fn pretty_json(&self) -> Result<String, EventError> {
+        Ok(serde_json::to_string_pretty(self)?)
+    }
+
+    /// Derive the *logical* routing key used in AMQP brokers.  Topic exchange
+    /// policies can fan-out events to multiple queues, e.g. `lesson.published.v1`.
+    pub fn routing_key(&self) -> String {
+        match &self.event {
+            DomainEvent::LessonPublishedV1 { .. } => "lesson.published.v1",
+            DomainEvent::QuizSubmittedV1 { .. } => "quiz.submitted.v1",
+            DomainEvent::PeerFeedbackGivenV1 { .. } => "feedback.given.v1",
+            DomainEvent::BadgeAwardedV1 { .. } => "badge.awarded.v1",
+            DomainEvent::PaymentCapturedV1 { .. } => "payment.captured.v1",
+        }
+        .into()
+    }
+}
+
+/// Error type for publishing and serialisation failures.
+#[derive(Error, Debug)]
+pub enum EventError {
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[cfg(feature = "broker")]
+    #[error("amqp error: {0}")]
+    Amqp(#[from] lapin::Error),
+
+    #[error("broker confirmation timed out")]
+    ConfirmationTimeout,
+
+    #[error("other: {0}")]
+    Other(String),
+}
+
+/// Trait every publisher (mock or real) must implement.
+///
+/// The abstraction enables dependency injection in application services and
+/// makes *unit* testing simpler:  we can just inject the `LoggingPublisher`.
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, envelope: EventEnvelope) -> Result<(), EventError>;
+}
+
+/// A publisher that merely writes events to the `log` sink.
+///
+/// Enabled by default, also used when the `broker` feature is disabled. The
+/// design means the rest of the application can always depend on
+/// `dyn EventPublisher`, regardless of compilation mode.
+pub struct LoggingPublisher;
+
+#[async_trait]
+impl EventPublisher for LoggingPublisher {
+    async fn publish(&self, envelope: EventEnvelope) -> Result<(), EventError> {
+        // Format into single-line JSON to keep log ingestion systems happy.
+        let json = envelope.to_json_bytes()?;
+        // Safe because JSON is UTF-8.
+        log::info!(
+            target: "eduplse.events",
+            "event={} meta_id={} payload={}",
+            envelope.routing_key(),
+            envelope.meta.id,
+            String::from_utf8_lossy(&json)
+        );
+        Ok(())
+    }
+}
+
+/// Real AMQP publisher that talks to RabbitMQ.  
+///
+/// Compiled **only** when the `broker` feature is present.  Uses publisher
+/// confirms so we know the broker durably persisted the message.
+#[cfg(feature = "broker")]
+pub struct RabbitMqPublisher {
+    channel: Channel,
+    exchange: String,
+}
+
+#[cfg(feature = "broker")]
+impl RabbitMqPublisher {
+    /// Connect to the AMQP broker and prepare the channel.
+    ///
+    /// A production-grade implementation would configure TLS, heartbeat, and
+    /// automatic reconnection. Those details are omitted for brevity.
+    pub async fn connect(
+        amqp_uri: &str,
+        exchange: &str,
+    ) -> Result<Self, EventError> {
+        let connection = Connection::connect(
+            amqp_uri,
+            ConnectionProperties::default().with_default_executor(8),
+        )
+        .await
+        .map_err(EventError::from)?;
+
+        let channel = connection.create_channel().await?;
+        channel
+            .confirm_select(lapin::options::ConfirmSelectOptions::default())
+            .await?;
+
+        Ok(Self {
+            channel,
+            exchange: exchange.to_owned(),
+        })
+    }
+}
+
+#[cfg(feature = "broker")]
+#[async_trait]
+impl EventPublisher for RabbitMqPublisher {
+    async fn publish(&self, envelope: EventEnvelope) -> Result<(), EventError> {
+        let payload = envelope.to_json_bytes()?;
+        let routing_key = envelope.routing_key();
+
+        let confirm: Confirmation = self
+            .channel
+            .basic_publish(
+                &self.exchange,
+                &routing_key,
+                BasicPublishOptions {
+                    mandatory: false,
+                    immediate: false,
+                },
+                &payload,
+                BasicProperties::default().with_content_type("application/json"),
+            )
+            .await?
+            .await?; // Wait for broker confirm (publisher confirms must be enabled)
+
+        // lapin returns Nack(…) in error path; we check for `Ack`.
+        if !confirm.is_ack() {
+            return Err(EventError::Other(format!(
+                "broker did not acknowledge event id {}",
+                envelope.meta.id
+            )));
+        }
+
+        // Additionally enforce a timeout because `await?` can hang if broker is
+        // misconfigured (e.g., confirm_select was forgotten).
+        timeout(PUBLISH_CONFIRM_TIMEOUT, async {
+            while !confirm.is_ack() {}
+        })
+        .await
+        .map_err(|_| EventError::ConfirmationTimeout)?;
+
+        Ok(())
+    }
+}
+
+/// When compiled **without** the `broker` feature, alias [`LoggingPublisher`]
+/// to `DefaultPublisher` to satisfy DI containers effortlessly.
+///
+/// ```
+/// use eduplse::events::DefaultPublisher;
+/// let publisher = DefaultPublisher;
+/// ```
+#[cfg(not(feature = "broker"))]
+pub type DefaultPublisher = LoggingPublisher;
+
+#[cfg(feature = "broker")]
+pub type DefaultPublisher = RabbitMqPublisher;
+
+//
+// ----------------------------- Tests ----------------------------------------
+//
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::runtime::Runtime;
+
+    #[test]
+    fn envelope_roundtrip() {
+        let ev = EventEnvelope::new(DomainEvent::BadgeAwardedV1 {
+            badge_id: Uuid::new_v4(),
+            awardee_id: Uuid::new_v4(),
+            reason: "Top Performer".into(),
+        });
+
+        let json = ev.to_json_bytes().unwrap();
+        let deser: EventEnvelope = serde_json::from_slice(&json).unwrap();
+
+        assert_eq!(ev.meta.id, deser.meta.id);
+        match deser.event {
+            DomainEvent::BadgeAwardedV1 { reason, .. } => {
+                assert_eq!(reason, "Top Performer");
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn logging_publisher_works() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let publisher = LoggingPublisher;
+            let env = EventEnvelope::new(DomainEvent::LessonPublishedV1 {
+                lesson_id: Uuid::new_v4(),
+                title: "Async in Rust".into(),
+                author_id: Uuid::new_v4(),
+            });
+            let res = publisher.publish(env).await;
+            assert!(res.is_ok());
+        });
+    }
+}
+```

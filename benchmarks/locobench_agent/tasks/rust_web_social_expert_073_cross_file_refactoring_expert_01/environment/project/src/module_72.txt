@@ -1,0 +1,319 @@
+```rust
+//! src/module_72.rs
+//! ==========================================================
+//! Domain-event infrastructure for EduPulse Live
+//!
+//! This module encapsulates all logic necessary to create,
+//! enrich, and publish domain events to an external message
+//! broker (NATS in our case).  Keeping this code in a single
+//! file allows the rest of the application to stay broker-agnostic
+//! by relying solely on the `EventPublisher` trait.
+//!
+//! Production ready features delivered here:
+//!  - Typed domain event enum with Serde (de)serialization
+//!  - Envelope that adds traceability metadata (correlation,
+//!    causation, tenant & GDPR-erase flags)
+//!  - Pluggable async publisher with a NATS implementation
+//!  - Back-pressure aware buffering (tower::buffer)
+//!  - Observability via tracing
+//!  - Unit tests with an in-memory mock publisher
+//!
+//! NOTE: In `Cargo.toml` ensure these deps are available
+//! ```toml
+//! async-nats = { version = "0.32", default-features = false, features = ["tls"] }
+//! serde = { version = "1", features = ["derive"] }
+//! serde_json = "1"
+//! thiserror = "1"
+//! tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+//! tracing = "0.1"
+//! uuid = { version = "1", features = ["v4"] }
+//! tower = "0.4"
+//! ```
+//! ==========================================================
+
+use async_nats::{self, ConnectOptions};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, time::SystemTime};
+use thiserror::Error;
+use tokio::sync::mpsc;
+use tracing::{debug, error, instrument, trace, warn};
+use uuid::Uuid;
+
+/// Convenience result alias for the module
+pub type Result<T, E = PublisherError> = std::result::Result<T, E>;
+
+/// Domain event root type.  Extend as needed.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type", content = "payload")]
+pub enum DomainEvent {
+    LessonPublished {
+        lesson_id: Uuid,
+        author_id: Uuid,
+        title: String,
+    },
+    QuizSubmitted {
+        quiz_id: Uuid,
+        student_id: Uuid,
+        answers: HashMap<String, String>,
+    },
+    BadgeAwarded {
+        badge_id: Uuid,
+        recipient_id: Uuid,
+        reason: String,
+    },
+    PaymentProcessed {
+        payment_id: Uuid,
+        from_user: Uuid,
+        amount_cents: u32,
+    },
+}
+
+/// Envelope that wraps a `DomainEvent` adding cross-cutting metadata.
+///
+/// This envelope is what gets serialized and shipped through NATS.
+/// It can be enriched by middleware (e.g. correlation extraction)
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EventEnvelope {
+    /// Globally unique identifier for the event itself
+    pub event_id: Uuid,
+    /// If this event was triggered because of another event
+    pub causation_id: Option<Uuid>,
+    /// ID that allows grouping events belonging to the same request/transaction
+    pub correlation_id: Option<Uuid>,
+    /// Multi-tenant support
+    pub tenant_id: Option<String>,
+    /// When the event was created
+    pub created_at: SystemTime,
+    /// GDPR delete flag
+    pub personally_identifiable: bool,
+    /// Actual domain event
+    pub data: DomainEvent,
+}
+
+impl EventEnvelope {
+    /// Create a new envelope from a plain `DomainEvent`
+    pub fn new(
+        data: DomainEvent,
+        correlation_id: Option<Uuid>,
+        causation_id: Option<Uuid>,
+        tenant_id: Option<String>,
+        personally_identifiable: bool,
+    ) -> Self {
+        Self {
+            event_id: Uuid::new_v4(),
+            causation_id,
+            correlation_id,
+            tenant_id,
+            created_at: SystemTime::now(),
+            personally_identifiable,
+            data,
+        }
+    }
+}
+
+/// Result acknowledgment from a broker publish call.
+#[derive(Debug)]
+pub struct PublishAck {
+    pub broker_sequence: Option<u64>,
+}
+
+/// Errors that can occur while publishing
+#[derive(Debug, Error)]
+pub enum PublisherError {
+    #[error("connection or I/O error with broker: {0}")]
+    Broker(#[from] async_nats::Error),
+
+    #[error("serialization failure: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("channel closed")]
+    ChannelClosed,
+}
+
+/// Contract for async event publishers.
+#[async_trait::async_trait]
+pub trait EventPublisher: Send + Sync {
+    /// Publishes an already-enveloped event.
+    async fn publish(&self, envelope: EventEnvelope) -> Result<PublishAck>;
+}
+
+/// No-op publisher useful for tests.
+pub struct InMemoryPublisher {
+    sender: mpsc::Sender<EventEnvelope>,
+}
+
+impl InMemoryPublisher {
+    pub fn new(buffer: usize) -> (Self, mpsc::Receiver<EventEnvelope>) {
+        let (tx, rx) = mpsc::channel(buffer);
+        (Self { sender: tx }, rx)
+    }
+}
+
+#[async_trait::async_trait]
+impl EventPublisher for InMemoryPublisher {
+    #[instrument(skip(self, envelope))]
+    async fn publish(&self, envelope: EventEnvelope) -> Result<PublishAck> {
+        self.sender
+            .send(envelope)
+            .await
+            .map_err(|_| PublisherError::ChannelClosed)?;
+        Ok(PublishAck { broker_sequence: None })
+    }
+}
+
+/// Production NATS publisher.
+pub struct NatsPublisher {
+    client: async_nats::Client,
+    subject: String,
+    /// Buffer to offer some back-pressure. tower::buffer will
+    /// spawn background tasks to flush to NATS.
+    pipeline: tower::buffer::Buffer<EventEnvelope, Result<PublishAck>>,
+}
+
+impl NatsPublisher {
+    /// Connects to a NATS server using TLS and auth token.
+    ///
+    /// # Arguments
+    /// * `url` – nats:// or tls:// URL
+    /// * `subject` – target subject (topic) where events are sent
+    /// * `auth_token` – JWT or static token configured server-side
+    pub async fn with_tls(
+        url: &str,
+        subject: impl Into<String>,
+        auth_token: Option<String>,
+    ) -> Result<Self> {
+        // Build connect options
+        let mut opts = ConnectOptions::new();
+        if let Some(token) = auth_token {
+            opts = opts.auth_token(token);
+        }
+
+        // Enable TLS automatically when url scheme is tls://
+        let client = opts.connect(url).await?;
+
+        let subject = subject.into();
+        // Create a tower service that serializes and ships the message
+        let svc = tower::service_fn({
+            let client = client.clone();
+            let subject = subject.clone();
+            move |env: EventEnvelope| {
+                let client = client.clone();
+                let subject = subject.clone();
+                async move {
+                    // encode to json
+                    let payload = serde_json::to_vec(&env)?;
+                    trace!(%subject, size = payload.len(), "Publishing to NATS");
+                    let ack = client.publish(subject, payload.into()).await?;
+                    Ok(PublishAck {
+                        broker_sequence: ack.map(|a| a.sequence),
+                    })
+                }
+            }
+        });
+
+        // Buffer with sensible defaults (in-memory)
+        let buffer = tower::buffer::Buffer::new(svc, 256);
+
+        Ok(Self {
+            client,
+            subject,
+            pipeline: buffer,
+        })
+    }
+
+    /// Flush buffered messages (best effort)
+    pub async fn flush(&self) -> Result<()> {
+        self.client.flush().await.map_err(Into::into)
+    }
+}
+
+#[async_trait::async_trait]
+impl EventPublisher for NatsPublisher {
+    #[instrument(skip(self))]
+    async fn publish(&self, envelope: EventEnvelope) -> Result<PublishAck> {
+        self.pipeline.clone().oneshot(envelope).await?
+    }
+}
+
+/// Builder that knows how to instantiate an `EventPublisher`
+/// according to environment configuration.  This keeps details
+/// such as local vs integration test conditions in one place.
+pub struct EventPublisherFactory;
+
+impl EventPublisherFactory {
+    /// Build from standard `EDUPULSE_*` environment variables.
+    ///
+    ///  - `EDUPULSE_EVENT_BROKER_URL`
+    ///  - `EDUPULSE_EVENT_BROKER_SUBJECT`
+    ///  - `EDUPULSE_EVENT_BROKER_TOKEN`
+    ///
+    /// If the variables are not set, falls back to an in-memory publisher.
+    pub async fn build_from_env() -> Box<dyn EventPublisher> {
+        match (
+            std::env::var("EDUPULSE_EVENT_BROKER_URL").ok(),
+            std::env::var("EDUPULSE_EVENT_BROKER_SUBJECT").ok(),
+        ) {
+            (Some(url), Some(subject)) => {
+                let token = std::env::var("EDUPULSE_EVENT_BROKER_TOKEN").ok();
+                match NatsPublisher::with_tls(&url, subject, token).await {
+                    Ok(p) => {
+                        debug!("Using NATS event publisher ({url})");
+                        Box::new(p)
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to create NATS publisher, falling back to in-memory");
+                        Self::in_memory().0.into()
+                    }
+                }
+            }
+            _ => {
+                warn!("No broker env vars found, using in-memory event publisher");
+                Self::in_memory().0.into()
+            }
+        }
+    }
+
+    pub fn in_memory() -> (Box<dyn EventPublisher>, mpsc::Receiver<EventEnvelope>) {
+        let (p, rx) = InMemoryPublisher::new(256);
+        (Box::new(p), rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn envelope_roundtrip_json() {
+        let ev = DomainEvent::LessonPublished {
+            lesson_id: Uuid::new_v4(),
+            author_id: Uuid::new_v4(),
+            title: "Intro to Rust".into(),
+        };
+        let envelope = EventEnvelope::new(ev, None, None, None, false);
+        let json = serde_json::to_string(&envelope).unwrap();
+        let de: EventEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(envelope.event_id, de.event_id);
+    }
+
+    #[tokio::test]
+    async fn in_memory_publisher_works() {
+        let (pub_, mut rx) = InMemoryPublisher::new(1);
+        let ev = DomainEvent::BadgeAwarded {
+            badge_id: Uuid::new_v4(),
+            recipient_id: Uuid::new_v4(),
+            reason: "Helping peers".into(),
+        };
+        let env = EventEnvelope::new(ev, None, None, None, false);
+        pub_.publish(env.clone()).await.unwrap();
+
+        let received = timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+
+        assert_eq!(env.event_id, received.event_id);
+    }
+}
+```

@@ -1,0 +1,355 @@
+```rust
+//! ChirpPulse – Real-Time Social Sentiment Lake
+//! -------------------------------------------
+//! Module 34: Enrichment & Data-Quality Pipeline
+//!
+//! This module defines a pluggable enrichment pipeline that is executed
+//! on top of an asynchronous message stream (Kafka in production, but the
+//! exact transport is intentionally abstracted behind `tokio` channels).
+//!
+//! ‣ Strategy-pattern based `Enricher` implementations can be hot-swapped
+//!   at runtime without service downtime.  
+//! ‣ A `QualityGate` performs data-quality validation after every stage
+//!   and automatically routes invalid events to a quarantine topic.  
+//! ‣ Metrics are exported via `opentelemetry` while structured logging
+//!   captures detailed lineage information for auditability.
+//
+//! Compile-time features
+//! ---------------------
+//! ```toml
+//! [dependencies]
+//! anyhow        = "1"
+//! async-trait   = "0.1"
+//! chrono        = { version = "0.4", features = ["serde"] }
+//! futures       = "0.3"
+//! opentelemetry = { version = "0.20", features = ["metrics"] }
+//! serde         = { version = "1", features = ["derive"] }
+//! tokio         = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+//! tracing       = "0.1"
+//! ```
+//! (The full list lives in `Cargo.toml` of the workspace.)
+
+use std::sync::Arc;
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::{StreamExt, TryStreamExt};
+use opentelemetry::{
+    global,
+    metrics::{Counter, Histogram, Meter},
+};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    sync::mpsc::{Receiver, Sender},
+    task,
+    time::{self, Duration, Instant},
+};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Raw social event as ingested from upstream connectors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialEvent {
+    pub id: String,
+    pub author_id: String,
+    pub created_at: DateTime<Utc>,
+    pub text: String,
+}
+
+/// Event after enrichment stages.  
+/// Additional fields are option-wrapped so that enrichers can operate
+/// independently and be executed in any order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichedEvent {
+    pub base: SocialEvent,
+    pub language: Option<String>,
+    pub toxicity_score: Option<f32>,
+    pub sentiment: Option<f32>,
+}
+
+impl From<SocialEvent> for EnrichedEvent {
+    fn from(base: SocialEvent) -> Self {
+        Self {
+            base,
+            language: None,
+            toxicity_score: None,
+            sentiment: None,
+        }
+    }
+}
+
+/// Trait implemented by every enrichment algorithm.
+///
+/// Guideline:
+///   • Must be side-effect free except for metrics/logging.  
+///   • Should complete quickly (sub-20 ms).  
+///   • Heavy IO or ML inference should be delegated to specialised
+///     services (use gRPC, HTTP, etc.).
+#[async_trait]
+pub trait Enricher: Send + Sync + 'static {
+    /// Human-readable name (used for logging).
+    fn name(&self) -> &'static str;
+
+    /// Applies enrichment in-place and returns any error that occurs.
+    async fn enrich(&self, event: &mut EnrichedEvent) -> Result<()>;
+}
+
+/// Simple heuristic language detector that checks for the presence of
+/// ASCII characters vs. extended UTF-8 ranges. (Placeholder for a real
+/// ML model or an external API call.)
+pub struct LangDetector;
+
+#[async_trait]
+impl Enricher for LangDetector {
+    fn name(&self) -> &'static str {
+        "lang_detector:v0.1"
+    }
+
+    #[instrument(skip_all)]
+    async fn enrich(&self, event: &mut EnrichedEvent) -> Result<()> {
+        if event.language.is_some() {
+            return Ok(());
+        }
+
+        let ascii_ratio = event
+            .base
+            .text
+            .chars()
+            .filter(|c| c.is_ascii())
+            .count() as f32
+            / event.base.text.len() as f32;
+
+        event.language = if ascii_ratio > 0.9 {
+            Some("en".into())
+        } else {
+            Some("unknown".into())
+        };
+
+        Ok(())
+    }
+}
+
+/// Toy toxicity scorer that counts profanities; replace with
+/// Transformer-based classifier in production.
+pub struct ToxicityScorer {
+    profanities: Vec<&'static str>,
+}
+
+impl Default for ToxicityScorer {
+    fn default() -> Self {
+        Self {
+            profanities: vec!["badword", "nasty"],
+        }
+    }
+}
+
+#[async_trait]
+impl Enricher for ToxicityScorer {
+    fn name(&self) -> &'static str {
+        "toxicity_scorer:v0.1"
+    }
+
+    #[instrument(skip_all)]
+    async fn enrich(&self, event: &mut EnrichedEvent) -> Result<()> {
+        if event.toxicity_score.is_some() {
+            return Ok(());
+        }
+
+        let count = self
+            .profanities
+            .iter()
+            .map(|w| {
+                event
+                    .base
+                    .text
+                    .to_lowercase()
+                    .matches(w)
+                    .count() as f32
+            })
+            .sum::<f32>();
+
+        // Naïve normalisation.
+        event.toxicity_score = Some((count / 5.0).min(1.0));
+        Ok(())
+    }
+}
+
+/// Data quality rules run after every enrichment stage.
+#[async_trait]
+pub trait QualityGate: Send + Sync + 'static {
+    /// Returns `Ok(true)` if the event passes all checks.  
+    /// Returns `Ok(false)` for recoverable data-quality failures; the
+    /// caller should route the event to quarantine.  
+    /// Returns `Err` for operational-level errors (e.g. DB connection),
+    /// which should trigger retry/back-pressure.
+    async fn validate(&self, event: &EnrichedEvent) -> Result<bool>;
+}
+
+/// Mandatory rule set in production.
+pub struct DefaultQualityGate;
+
+#[async_trait]
+impl QualityGate for DefaultQualityGate {
+    #[instrument(skip_all)]
+    async fn validate(&self, event: &EnrichedEvent) -> Result<bool> {
+        if event.base.text.trim().is_empty() {
+            warn!(id = %event.base.id, "empty payload");
+            return Ok(false);
+        }
+
+        if event.language.is_none() {
+            warn!(id = %event.base.id, "language missing");
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+}
+
+/// Runtime handle for the enrichment & validation pipeline.
+pub struct Pipeline {
+    enrichers: Vec<Arc<dyn Enricher>>,
+    quality_gate: Arc<dyn QualityGate>,
+
+    // Metrics
+    m_events_total: Counter<u64>,
+    m_failures: Counter<u64>,
+    h_latency: Histogram<f64>,
+}
+
+impl Pipeline {
+    pub fn new(
+        enrichers: Vec<Arc<dyn Enricher>>,
+        quality_gate: Arc<dyn QualityGate>,
+    ) -> Self {
+        let meter: Meter = global::meter("chirp_pulse.pipeline");
+
+        Self {
+            enrichers,
+            quality_gate,
+            m_events_total: meter.u64_counter("events_total").init(),
+            m_failures: meter.u64_counter("events_failed").init(),
+            h_latency: meter.f64_histogram("latency_ms").init(),
+        }
+    }
+
+    /// Main loop: consumes social events, performs enrichment +
+    /// validation, and pushes valid events to the downstream channel.
+    ///
+    /// Errors never bubble up; instead we leverage back-pressure by
+    /// sleeping and re-queueing internally, preventing lost messages.
+    #[instrument(skip_all, fields(enrichers = %self.enrichers.len()))]
+    pub async fn run(
+        self: Arc<Self>,
+        mut rx: Receiver<SocialEvent>,
+        tx: Sender<EnrichedEvent>,
+        quarantine_tx: Sender<EnrichedEvent>,
+    ) {
+        let mut backoff = Duration::from_millis(100);
+
+        while let Some(event) = rx.recv().await {
+            self.m_events_total.add(1, &[]);
+
+            let start_time = Instant::now();
+            match self
+                .process_event(event.clone())
+                .await
+                .with_context(|| format!("processing event {}", event.id))
+            {
+                Ok(Some(enriched)) => {
+                    if let Err(e) = tx.send(enriched).await {
+                        // Downstream channel is closed; escalate.
+                        error!(error = ?e, "output channel dropped, shutting down pipeline");
+                        break;
+                    }
+
+                    self.h_latency
+                        .record(start_time.elapsed().as_secs_f64() * 1_000.0, &[]);
+                }
+                Ok(None) => {
+                    debug!(id = %event.id, "quarantined after validation failure");
+                }
+                Err(e) => {
+                    self.m_failures.add(1, &[]);
+                    error!(error = ?e, "fatal enrichment failure; scheduling retry");
+                    // Simple exponential back-off
+                    time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    // Re-queue the original event.
+                    if let Err(e) = rx.send(event).await {
+                        error!(error = ?e, "failed to re-queue event; discarding");
+                    }
+                }
+            }
+        }
+
+        info!("pipeline terminated – no more input");
+    }
+
+    #[instrument(skip_all, fields(event_id = %event.id))]
+    async fn process_event(&self, event: SocialEvent) -> Result<Option<EnrichedEvent>> {
+        let mut enriched: EnrichedEvent = event.into();
+
+        for enricher in &self.enrichers {
+            debug!(stage = enricher.name(), "running enricher");
+            enricher
+                .enrich(&mut enriched)
+                .await
+                .with_context(|| format!("enricher {}", enricher.name()))?;
+        }
+
+        // Post-stage validation
+        let ok = self.quality_gate.validate(&enriched).await?;
+        if ok {
+            Ok(Some(enriched))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Bootstraps the enrichment subsystem with default components and starts
+/// processing on the provided async channels.
+///
+/// In production, the caller supplies:
+///   • `rx` = a Kafka consumer adapter  
+///   • `tx` = a Kafka producer adapter  
+///   • `quarantine_tx` = dead-letter Kafka topic
+///
+/// For integration tests we use `tokio::sync::mpsc` channels.
+#[instrument(skip_all)]
+pub async fn launch_default_pipeline(
+    rx: Receiver<SocialEvent>,
+    tx: Sender<EnrichedEvent>,
+    quarantine_tx: Sender<EnrichedEvent>,
+) -> Result<()> {
+    let pipeline = Arc::new(Pipeline::new(
+        vec![
+            Arc::new(LangDetector),
+            Arc::new(ToxicityScorer::default()),
+        ],
+        Arc::new(DefaultQualityGate),
+    ));
+
+    // Spawn background task; caller can await the JoinHandle if needed.
+    task::spawn(pipeline.clone().run(rx, tx, quarantine_tx));
+
+    Ok(())
+}
+
+/// Manual health-check function used by Kubernetes liveness/readiness
+/// probes. Returns `Err` if any critical subsystem is unhealthy.
+/// In a real deployment we would also check Kafka lag, Iceberg
+/// connectivity, etc.
+pub async fn healthcheck() -> Result<()> {
+    // Placeholders for real diagnostics.
+    let kafka_ok = true;
+    let otel_ok = true;
+
+    if kafka_ok && otel_ok {
+        Ok(())
+    } else {
+        Err(anyhow!("one or more dependencies are unhealthy"))
+    }
+}
+```

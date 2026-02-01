@@ -1,0 +1,398 @@
+```rust
+//! Cash-flow forecast query layer (service + repository + DTO + view).
+//!
+//! This module demonstrates the typical “VM ↔ Model ↔ Service ↔ Repository”
+//! flow used across LedgerLink Nexus.  It owns *only* read–side logic
+//! (Query) in accordance with CQRS; write–side commands live elsewhere.
+//
+//  ┌──────────┐
+//  │  View     │  — public JSON/GraphQL payload
+//  └────┬─────┘
+//       │ maps to
+//  ┌────▼─────┐
+//  │ ViewModel│  — validated DTO, pagination, caching hints
+//  └────┬─────┘
+//       │ orchestrates
+//  ┌────▼─────┐
+//  │ Service  │  — business rules, cache, metrics, tracing
+//  └────┬─────┘
+//       │ relies on
+//  ┌────▼─────┐
+//  │Repository│  — data access isolation (PostgreSQL / Redis)
+//  └──────────┘
+//
+//! NOTE: Only synchronous DB I/O is mocked for brevity; in the real crate
+//! this is async/await backed by a Pg pool (sqlx) and multiplexed redis.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, Utc};
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::time::timeout;
+use tracing::{debug, error, info, instrument};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+// ---------- Pagination helpers ------------------------------------------------
+
+/// Generic paginated envelope returned by LedgerLink Nexus.
+#[derive(Debug, Clone, Serialize)]
+pub struct Page<T> {
+    pub data: Vec<T>,
+    pub page: u32,
+    pub per_page: u32,
+    pub total_records: u64,
+    pub total_pages: u32,
+}
+
+/// Simple helper to pre-calculate limits/offsets.
+#[derive(Debug, Copy, Clone)]
+pub struct Pagination {
+    pub page: u32,
+    pub per_page: u32,
+}
+
+impl Pagination {
+    pub fn offset_limit(&self) -> (i64, i64) {
+        let offset = ((self.page.saturating_sub(1)) * self.per_page) as i64;
+        let limit = self.per_page as i64;
+        (offset, limit)
+    }
+}
+
+// ---------- Domain model -------------------------------------------------------
+
+/// Projected cash balance for a specific account on a given day.
+#[derive(Debug, Clone)]
+pub struct CashFlowForecast {
+    pub account_id: Uuid,
+    pub date: NaiveDate,
+    pub projected_balance: rust_decimal::Decimal,
+    pub generated_at: DateTime<Utc>,
+}
+
+// ---------- View (public response) --------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct CashFlowForecastView {
+    pub date: NaiveDate,
+    pub projected_balance: rust_decimal::Decimal,
+}
+
+// Mapping utility
+impl From<CashFlowForecast> for CashFlowForecastView {
+    fn from(model: CashFlowForecast) -> Self {
+        Self {
+            date: model.date,
+            projected_balance: model.projected_balance,
+        }
+    }
+}
+
+// ---------- View-Model (DTO) ---------------------------------------------------
+
+#[derive(Debug, Deserialize, Validate)]
+pub struct CashFlowForecastQueryDTO {
+    #[validate]
+    pub tenant_id: Uuid,
+
+    #[validate(custom = "validate_account_id")]
+    pub account_id: Uuid,
+
+    #[validate(range(min = 1, max = 366))]
+    pub horizon_days: u16,
+
+    #[validate(range(min = 1, max = 500))]
+    pub per_page: u32,
+
+    #[validate(range(min = 1))]
+    pub page: u32,
+}
+
+fn validate_account_id(id: &Uuid) -> Result<(), ValidationError> {
+    // Placeholder for tenant/account scoping rule; disallow Nil UUIDs.
+    if *id == Uuid::nil() {
+        return Err(ValidationError::new("invalid_account"));
+    }
+    Ok(())
+}
+
+impl CashFlowForecastQueryDTO {
+    pub fn pagination(&self) -> Pagination {
+        Pagination {
+            page: self.page,
+            per_page: self.per_page,
+        }
+    }
+}
+
+// ---------- Repository abstraction --------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("database error: {0}")]
+    Database(anyhow::Error),
+
+    #[error("connection timeout")]
+    Timeout,
+}
+
+#[async_trait]
+pub trait CashFlowForecastRepository: Send + Sync {
+    async fn query_forecast(
+        &self,
+        tenant_id: Uuid,
+        account_id: Uuid,
+        horizon_days: u16,
+        pagination: Pagination,
+    ) -> Result<(Vec<CashFlowForecast>, u64), RepositoryError>;
+}
+
+// ---------- Postgres implementation (sqlx) ------------------------------------
+
+pub struct PostgresCashFlowForecastRepo {
+    pool: sqlx::PgPool,
+}
+
+impl PostgresCashFlowForecastRepo {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl CashFlowForecastRepository for PostgresCashFlowForecastRepo {
+    #[instrument(skip_all, fields(tenant=%tenant_id, account=%account_id))]
+    async fn query_forecast(
+        &self,
+        tenant_id: Uuid,
+        account_id: Uuid,
+        horizon_days: u16,
+        pagination: Pagination,
+    ) -> Result<(Vec<CashFlowForecast>, u64), RepositoryError> {
+        let (offset, limit) = pagination.offset_limit();
+
+        // In production this would be a CTE hitting a partitioned table. For
+        // demonstration we craft a minimal static SQL.
+        let sql = r#"
+            SELECT date, projected_balance, generated_at, COUNT(*) OVER() AS total
+            FROM ledger.cashflow_forecast
+            WHERE tenant_id = $1
+              AND account_id = $2
+              AND date >= CURRENT_DATE
+              AND date < CURRENT_DATE + $3::interval
+            ORDER BY date ASC
+            OFFSET $4 LIMIT $5
+        "#;
+
+        let horizon_interval = format!("{} days", horizon_days);
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            RepositoryError::Database(anyhow::anyhow!("pg acquire: {}", e))
+        })?;
+
+        let rows =
+            sqlx::query(sql)
+                .bind(tenant_id)
+                .bind(account_id)
+                .bind(horizon_interval)
+                .bind(offset)
+                .bind(limit)
+                .fetch_all(&mut conn)
+                .await
+                .map_err(|e| RepositoryError::Database(anyhow::anyhow!(e)))?;
+
+        let total_records = rows
+            .get(0)
+            .and_then(|row| row.try_get::<i64, _>("total").ok())
+            .unwrap_or_default() as u64;
+
+        // Map sqlx::Row into domain model.
+        let items = rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(CashFlowForecast {
+                    account_id,
+                    date: row.try_get("date").ok()?,
+                    projected_balance: row.try_get("projected_balance").ok()?,
+                    generated_at: row.try_get("generated_at").ok()?,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok((items, total_records))
+    }
+}
+
+// ---------- Service layer ------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation failed: {0:?}")]
+    Validation(validator::ValidationErrors),
+
+    #[error("repository error: {0}")]
+    Repository(#[from] RepositoryError),
+
+    #[error("cache error: {0}")]
+    Cache(anyhow::Error),
+}
+
+/// TTL for redis-cached forecasts.
+const CACHE_TTL_SECS: usize = 300;
+
+pub struct CashFlowForecastService<R> {
+    repo: Arc<R>,
+    redis: redis::Client,
+}
+
+impl<R: CashFlowForecastRepository + 'static> CashFlowForecastService<R> {
+    pub fn new(repo: Arc<R>, redis: redis::Client) -> Self {
+        Self { repo, redis }
+    }
+
+    /// Main query entrypoint used by handlers / resolvers.
+    #[instrument(skip(self))]
+    pub async fn fetch(
+        &self,
+        dto: CashFlowForecastQueryDTO,
+    ) -> Result<Page<CashFlowForecastView>, ServiceError> {
+        // --- 1. Validate DTO --------------------------------------------------
+        if let Err(e) = dto.validate() {
+            return Err(ServiceError::Validation(e));
+        }
+
+        // --- 2. Attempt redis cache ------------------------------------------
+        let cache_key = Self::build_cache_key(&dto);
+        if let Ok(mut conn) = self.redis.get_async_connection().await {
+            match timeout(Duration::from_millis(100), conn.get::<_, String>(&cache_key)).await {
+                Ok(Ok(cached_json)) => {
+                    debug!(%cache_key, "cache hit");
+                    let page: Page<CashFlowForecastView> =
+                        serde_json::from_str(&cached_json).map_err(|e| {
+                            ServiceError::Cache(anyhow::anyhow!("json decode error: {}", e))
+                        })?;
+                    return Ok(page);
+                }
+                Ok(Err(_)) | Err(_) => {
+                    debug!(%cache_key, "cache miss");
+                }
+            }
+        }
+
+        // --- 3. Repository call ----------------------------------------------
+        let (rows, total) = self
+            .repo
+            .query_forecast(
+                dto.tenant_id,
+                dto.account_id,
+                dto.horizon_days,
+                dto.pagination(),
+            )
+            .await?;
+
+        let views: Vec<CashFlowForecastView> =
+            rows.into_iter().map(Into::into).collect();
+
+        let total_pages =
+            ((total as f32) / (dto.per_page as f32)).ceil() as u32;
+
+        let page_envelope = Page {
+            data: views,
+            page: dto.page,
+            per_page: dto.per_page,
+            total_records: total,
+            total_pages,
+        };
+
+        // --- 4. Cache result (fire-and-forget) -------------------------------
+        let json = serde_json::to_string(&page_envelope).expect("serialize");
+
+        if let Ok(mut conn) = self.redis.get_async_connection().await {
+            let _: () = redis::pipe()
+                .cmd("SET")
+                .arg(&cache_key)
+                .arg(&json)
+                .arg("EX")
+                .arg(CACHE_TTL_SECS)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or_else(|e| {
+                    error!(%cache_key, "failed to set cache: {}", e);
+                    ()
+                });
+        }
+
+        Ok(page_envelope)
+    }
+
+    fn build_cache_key(dto: &CashFlowForecastQueryDTO) -> String {
+        format!(
+            "cf_forecast:{}:{}:{}:{}:{}",
+            dto.tenant_id, dto.account_id, dto.horizon_days, dto.page, dto.per_page
+        )
+    }
+}
+
+// ---------- Unit tests ---------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use once_cell::sync::Lazy;
+    use rust_decimal_macros::dec;
+
+    static REDIS: Lazy<redis::Client> =
+        Lazy::new(|| redis::Client::open("redis://localhost/").unwrap());
+
+    struct MockRepo;
+
+    #[async_trait]
+    impl CashFlowForecastRepository for MockRepo {
+        async fn query_forecast(
+            &self,
+            _tenant_id: Uuid,
+            _account_id: Uuid,
+            horizon_days: u16,
+            pagination: Pagination,
+        ) -> Result<(Vec<CashFlowForecast>, u64), RepositoryError> {
+            assert_eq!(horizon_days, 30);
+            assert_eq!(pagination.page, 2);
+
+            let records = (0..pagination.per_page)
+                .map(|i| CashFlowForecast {
+                    account_id: Uuid::new_v4(),
+                    date: chrono::NaiveDate::from_ymd_opt(2024, 1, 1 + i as u32).unwrap(),
+                    projected_balance: dec!(1000.0) + rust_decimal::Decimal::new(i as i64, 0),
+                    generated_at: Utc::now(),
+                })
+                .collect::<Vec<_>>();
+
+            Ok((records, 1337))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_ok() {
+        let dto = CashFlowForecastQueryDTO {
+            tenant_id: Uuid::new_v4(),
+            account_id: Uuid::new_v4(),
+            horizon_days: 30,
+            per_page: 25,
+            page: 2,
+        };
+
+        let service =
+            CashFlowForecastService::new(Arc::new(MockRepo), (*REDIS).clone());
+
+        let resp = service.fetch(dto).await.expect("service resp");
+
+        assert_eq!(resp.page, 2);
+        assert_eq!(resp.data.len(), 25);
+        assert!(resp.total_pages >= 1);
+    }
+}
+```

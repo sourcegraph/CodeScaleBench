@@ -1,0 +1,324 @@
+```rust
+//! src/module_31.rs
+//!
+//! Sentiment aggregation micro-service for the ChirpPulse data-streaming
+//! platform.  A high–level overview:
+//!
+//! 1. Consumes enriched `SentimentEvent` messages from a Kafka topic
+//!    (produced by upstream NLP/enrichment services).
+//! 2. Aggregates the real-time sentiment per topic using a plug-able
+//!    Strategy Pattern (moving average, EWMA, etc.).
+//! 3. Periodically publishes `AggregatedSentiment` snapshots back to Kafka
+//!    so that dashboards, alerting rules, and downstream ML jobs can react
+//!    within sub-second latency.
+//!
+//! The module focuses on correctness, back-pressure awareness, and graceful
+//! degradation.  It is _independent_ and thus testable/offline runnable.
+
+use std::{
+    collections::HashMap,
+    env,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    error::KafkaError,
+    message::{BorrowedMessage, OwnedHeaders},
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Message,
+};
+use serde::{Deserialize, Serialize};
+use tokio::{select, signal, sync::Mutex, time};
+use tracing::{error, info, warn};
+
+/// Input event produced by upstream NLP/ETL jobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentimentEvent {
+    pub message_id: String,
+    pub topic:       String,
+    pub score:       f64,         // Normalised range ‑1.0 … 1.0
+    pub created_at:  DateTime<Utc>,
+}
+
+/// Downstream aggregate that feeds dashboards and alerting rules.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregatedSentiment {
+    pub topic:        String,
+    pub window_start: DateTime<Utc>,
+    pub window_end:   DateTime<Utc>,
+    pub mean:         f64,
+    pub stddev:       f64,
+    pub n:            usize,
+}
+
+/// Strategy Pattern: sentiment aggregation algorithm.
+///
+/// Implementations must be `Send + Sync` because they will be driven from a
+/// multithreaded async runtime.
+pub trait SentimentAggregationStrategy: Send + Sync {
+    /// Update with a new sentiment score. Return `Some(aggregate)` when the
+    /// strategy decides a snapshot should be emitted, otherwise `None`.
+    fn update(&mut self, score: f64, ts: DateTime<Utc>) -> Option<AggregatedSentiment>;
+}
+
+/// Simple (unweighted) sliding window moving average.
+pub struct SlidingWindowAverage {
+    window: Duration,
+    values: Vec<(f64, Instant)>,
+    topic:  String,
+}
+
+impl SlidingWindowAverage {
+    pub fn new(topic: impl Into<String>, window: Duration) -> Self {
+        Self { window, values: Vec::new(), topic: topic.into() }
+    }
+}
+
+impl SentimentAggregationStrategy for SlidingWindowAverage {
+    fn update(&mut self, score: f64, ts: DateTime<Utc>) -> Option<AggregatedSentiment> {
+        let now = Instant::now();
+        self.values.push((score, now));
+
+        // Drop values outside the time window
+        let threshold = now - self.window;
+        while let Some((_, t)) = self.values.first() {
+            if *t < threshold {
+                self.values.remove(0);
+            } else {
+                break;
+            }
+        }
+
+        // Emit every second if we have at least one value
+        if self.values.len() < 1 {
+            return None;
+        }
+
+        let (sum, sum_sq) = self
+            .values
+            .iter()
+            .fold((0.0, 0.0), |(acc, acc_sq), (v, _)| (acc + v, acc_sq + v * v));
+        let n = self.values.len();
+        let mean = sum / n as f64;
+        let variance = (sum_sq / n as f64) - mean.powi(2);
+        let stddev = variance.max(0.0).sqrt();
+
+        Some(AggregatedSentiment {
+            topic: self.topic.clone(),
+            window_start: ts - chrono::Duration::from_std(self.window).unwrap(),
+            window_end: ts,
+            mean,
+            stddev,
+            n,
+        })
+    }
+}
+
+/// Runtime wrapper that multiplexes strategies per topic.
+struct StrategyRegistry {
+    inner: Mutex<HashMap<String, Box<dyn SentimentAggregationStrategy>>>,
+    window: Duration,
+}
+
+impl StrategyRegistry {
+    fn new(window: Duration) -> Self {
+        Self { inner: Mutex::new(HashMap::new()), window }
+    }
+
+    /// Select or lazily create a strategy for the given topic.
+    async fn for_topic_mut(
+        &self,
+        topic: &str,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<String, Box<dyn SentimentAggregationStrategy>>> {
+        let mut guard = self.inner.lock().await;
+        if !guard.contains_key(topic) {
+            guard.insert(
+                topic.to_owned(),
+                Box::new(SlidingWindowAverage::new(topic.to_owned(), self.window)),
+            );
+        }
+        guard
+    }
+}
+
+/// SentimentAggregator orchestrates the consumer, strategy registry, and producer.
+pub struct SentimentAggregator {
+    consumer:  StreamConsumer,
+    producer:  FutureProducer,
+    registry:  Arc<StrategyRegistry>,
+    shutdown:  Arc<AtomicBool>,
+    in_topic:  String,
+    out_topic: String,
+}
+
+impl SentimentAggregator {
+    pub fn new(
+        consumer: StreamConsumer,
+        producer: FutureProducer,
+        in_topic: String,
+        out_topic: String,
+        window: Duration,
+    ) -> Self {
+        Self {
+            consumer,
+            producer,
+            in_topic,
+            out_topic,
+            registry: Arc::new(StrategyRegistry::new(window)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Build from environment variables with sensible defaults.
+    pub fn from_env() -> Result<Self> {
+        // Read env vars or fallback
+        let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".into());
+        let group_id      = env::var("KAFKA_GROUP_ID").unwrap_or_else(|_| "chirp-pulse-sentiment-agg".into());
+        let in_topic      = env::var("KAFKA_IN_TOPIC").unwrap_or_else(|_| "sentiment-enriched".into());
+        let out_topic     = env::var("KAFKA_OUT_TOPIC").unwrap_or_else(|_| "sentiment-aggregated".into());
+        let window_secs   = env::var("AGG_WINDOW_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+
+        // Consumer
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &kafka_brokers)
+            .set("group.id", &group_id)
+            .set("enable.partition.eof", "false")
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "true")
+            .create()
+            .context("failed to create consumer")?;
+
+        consumer.subscribe(&[&in_topic]).context("failed to subscribe")?;
+
+        // Producer
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &kafka_brokers)
+            .set("message.timeout.ms", "5000")
+            .create()
+            .context("failed to create producer")?;
+
+        Ok(Self::new(
+            consumer,
+            producer,
+            in_topic,
+            out_topic,
+            Duration::from_secs(window_secs),
+        ))
+    }
+
+    /// Consume, aggregate, and publish until SIGINT/SIGTERM.
+    pub async fn run(self) -> Result<()> {
+        let Self {
+            consumer,
+            producer,
+            registry,
+            shutdown,
+            out_topic,
+            ..
+        } = self;
+
+        // Spawn graceful shutdown watcher
+        let shutdown_clone = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(e) = signal::ctrl_c().await {
+                error!("error listening for shutdown signal: {e:?}");
+            }
+            shutdown_clone.store(true, Ordering::SeqCst);
+            warn!("shutdown signal received");
+        });
+
+        let mut stream = consumer.stream();
+
+        loop {
+            select! {
+                maybe_msg = stream.next() => match maybe_msg {
+                    Some(Ok(msg)) => {
+                        if let Err(e) = Self::handle_message(&msg, &registry, &producer, &out_topic).await {
+                            error!("failed to process message: {e:#}");
+                        }
+                    }
+                    Some(Err(e)) => match e {
+                        KafkaError::PartitionEOF(_, _, _) => { /* ignore */ }
+                        err => error!("Kafka error: {err:?}"),
+                    },
+                    None => break, // Stream ended
+                },
+                _ = time::sleep(Duration::from_millis(250)), if shutdown.load(Ordering::SeqCst) => {
+                    info!("graceful shutdown completed");
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Decode Kafka message, forward through strategy registry, and publish aggregates.
+    async fn handle_message(
+        msg: &BorrowedMessage<'_>,
+        registry: &Arc<StrategyRegistry>,
+        producer: &FutureProducer,
+        out_topic: &str,
+    ) -> Result<()> {
+        let payload = msg.payload().context("message with empty payload")?;
+        let event: SentimentEvent =
+            serde_json::from_slice(payload).context("failed to deserialize SentimentEvent")?;
+
+        let mut guard = registry.for_topic_mut(&event.topic).await;
+        let strategy = guard
+            .get_mut(&event.topic)
+            .expect("strategy must exist after insertion");
+
+        if let Some(aggregate) = strategy.update(event.score, event.created_at) {
+            let bytes = serde_json::to_vec(&aggregate).context("serialize AggregatedSentiment")?;
+
+            // Fire--and-forget — we spawn a task so that aggregation loop remains non-blocking.
+            let topic_clone = out_topic.to_owned();
+            let key = aggregate.topic.clone();
+            let producer = producer.clone();
+            tokio::spawn(async move {
+                let record = FutureRecord::to(&topic_clone)
+                    .payload(&bytes)
+                    .key(&key)
+                    .headers(OwnedHeaders::new().add("content-type", "application/json"));
+                if let Err((e, _msg)) = producer.send(record, Duration::from_secs(0)).await {
+                    error!("failed to publish aggregated sentiment: {e:?}");
+                }
+            });
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+
+    #[test]
+    fn test_sliding_window_average_basic() {
+        let mut strat = SlidingWindowAverage::new("rust".to_owned(), Duration::from_secs(10));
+        let t0 = Utc::now();
+        // Insert 3 scores
+        strat.update(1.0, t0);
+        strat.update(-1.0, t0 + ChronoDuration::seconds(1));
+        if let Some(agg) = strat.update(0.0, t0 + ChronoDuration::seconds(2)) {
+            assert_eq!(agg.mean, 0.0);
+            assert_eq!(agg.n, 3);
+        } else {
+            panic!("expected aggregate");
+        }
+    }
+}
+```

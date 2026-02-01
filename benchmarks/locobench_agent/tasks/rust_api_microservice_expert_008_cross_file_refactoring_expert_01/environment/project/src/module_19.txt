@@ -1,0 +1,328 @@
+```rust
+//! src/module_19.rs
+//! -----------------------------------------------------------------------------
+//! Account-Snapshot query service with read-through cache & input validation.
+//!
+//! This module demonstrates how LedgerLink Nexus wires the Command / Query split
+//! together with a repository, Redis response-cache, structured logging and
+//! ergonomic error envelopes.
+//
+//! IMPORTANT:
+//! • Relies on Tokio 1.x, sqlx 0.7, redis-rs 0.23, anyhow 1.x, thiserror 1.x,
+//!   serde 1.x and tracing 0.1.
+//! • All SQL has been trimmed for brevity but compiles with `sqlx::query_as!`.
+//! -----------------------------------------------------------------------------
+
+use std::{sync::Arc, time::Duration};
+
+use anyhow::Context;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use redis::{Cmd, FromRedisValue, ToRedisArgs};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
+use thiserror::Error;
+use tracing::{debug, error, instrument, warn};
+
+/// TTL for read-through cache – tuned for ledger snapshots (immutable per day).
+const SNAPSHOT_CACHE_TTL_SECS: usize = 60 * 60; // 1h
+
+/// Public ViewModel returned by the REST / GraphQL layers
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountSnapshotVM {
+    pub account_id: uuid::Uuid,
+    pub as_of: DateTime<Utc>,
+    pub balance: rust_decimal::Decimal,
+    pub currency: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Internal domain model fetched from Postgres
+#[derive(Debug, Clone)]
+pub struct AccountSnapshot {
+    pub account_id: uuid::Uuid,
+    pub effective_date: DateTime<Utc>,
+    pub balance: rust_decimal::Decimal,
+    pub currency: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<AccountSnapshot> for AccountSnapshotVM {
+    fn from(model: AccountSnapshot) -> Self {
+        Self {
+            account_id: model.account_id,
+            as_of: model.effective_date,
+            balance: model.balance,
+            currency: model.currency,
+            updated_at: model.updated_at,
+        }
+    }
+}
+
+/// Errors bubbled up to controllers.  Convertable to http/GraphQL error envelopes elsewhere.
+#[derive(Debug, Error)]
+pub enum SnapshotServiceError {
+    #[error("validation error: {0}")]
+    Validation(String),
+    #[error("not found")]
+    NotFound,
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("cache error: {0}")]
+    Cache(#[from] redis::RedisError),
+    #[error(transparent)]
+    Misc(#[from] anyhow::Error),
+}
+
+/// Repository trait adhering to CQRS read-model isolation
+#[async_trait]
+pub trait AccountSnapshotRepository: Send + Sync + 'static {
+    async fn fetch_snapshot(
+        &self,
+        account_id: uuid::Uuid,
+        as_of: DateTime<Utc>,
+    ) -> Result<Option<AccountSnapshot>, SnapshotServiceError>;
+}
+
+/// PostgreSQL implementation of the repository
+pub struct PgAccountSnapshotRepository {
+    pool: Pool<Postgres>,
+}
+
+impl PgAccountSnapshotRepository {
+    pub fn new(pool: Pool<Postgres>) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl AccountSnapshotRepository for PgAccountSnapshotRepository {
+    #[instrument(skip(self))]
+    async fn fetch_snapshot(
+        &self,
+        account_id: uuid::Uuid,
+        as_of: DateTime<Utc>,
+    ) -> Result<Option<AccountSnapshot>, SnapshotServiceError> {
+        // production-grade SQL would leverage partitioning by effective_date
+        let rec = sqlx::query_as!(
+            AccountSnapshot,
+            r#"
+            SELECT
+                account_id,
+                effective_date,
+                balance,
+                currency,
+                updated_at
+            FROM ledger.account_snapshots
+            WHERE account_id = $1
+              AND effective_date = $2
+            "#,
+            account_id,
+            as_of
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(SnapshotServiceError::Database)?;
+
+        Ok(rec)
+    }
+}
+
+/// Simple Redis helper that serializes values through JSON.
+/// In production we’d leverage the connection-pool built into the crate
+/// and possibly `bb8` / `deadpool`.
+#[derive(Clone)]
+pub struct RedisCache {
+    client: redis::Client,
+}
+
+impl RedisCache {
+    pub fn new(client: redis::Client) -> Self {
+        Self { client }
+    }
+
+    async fn get<T>(&self, key: &str) -> Result<Option<T>, redis::RedisError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let mut conn = self.client.get_async_connection().await?;
+        let value: Option<String> = redis::cmd("GET").arg(key).query_async(&mut conn).await?;
+        match value {
+            Some(raw) => Ok(Some(serde_json::from_str(&raw)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn set<T>(&self, key: &str, value: &T, ttl_secs: usize) -> Result<(), redis::RedisError>
+    where
+        T: Serialize,
+    {
+        let payload = serde_json::to_string(value)?;
+        let mut conn = self.client.get_async_connection().await?;
+        Cmd::set_ex(key, payload, ttl_secs).query_async(&mut conn).await
+    }
+}
+
+/// Query service – orchestrates validation, caching and repository access.
+#[derive(Clone)]
+pub struct AccountSnapshotQueryService<R: AccountSnapshotRepository> {
+    repo: Arc<R>,
+    cache: RedisCache,
+}
+
+impl<R: AccountSnapshotRepository> AccountSnapshotQueryService<R> {
+    pub fn new(repo: Arc<R>, cache: RedisCache) -> Self {
+        Self { repo, cache }
+    }
+
+    /// Composite cache-key: `snapshot:<account_id>:<YYYY-MM-DD>`
+    fn cache_key(account_id: uuid::Uuid, as_of: DateTime<Utc>) -> String {
+        format!("snapshot:{}:{}", account_id, as_of.date_naive())
+    }
+
+    /// Input validation before hitting cache / db
+    fn validate_input(
+        account_id: &uuid::Uuid,
+        as_of: &DateTime<Utc>,
+    ) -> Result<(), SnapshotServiceError> {
+        // Example rule: we only allow snapshots for past / present, no future
+        if *as_of > Utc::now() {
+            return Err(SnapshotServiceError::Validation(
+                "cannot request future snapshots".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Public async API consumed by controllers
+    #[instrument(skip(self))]
+    pub async fn get_snapshot(
+        &self,
+        account_id: uuid::Uuid,
+        as_of: DateTime<Utc>,
+    ) -> Result<AccountSnapshotVM, SnapshotServiceError> {
+        Self::validate_input(&account_id, &as_of)?;
+
+        let key = Self::cache_key(account_id, as_of);
+        // 1. Attempt cache
+        if let Some(vm) = self.cache.get::<AccountSnapshotVM>(&key).await? {
+            debug!(%account_id, %as_of, "cache-hit");
+            return Ok(vm);
+        }
+        debug!(%account_id, %as_of, "cache-miss");
+
+        // 2. Fetch from DB via repository
+        let snap = self
+            .repo
+            .fetch_snapshot(account_id, as_of)
+            .await?
+            .ok_or(SnapshotServiceError::NotFound)?;
+
+        // 3. Map to output DTO / VM
+        let vm: AccountSnapshotVM = snap.into();
+
+        // 4. Write-through cache (ignore errors, log only)
+        if let Err(err) = self
+            .cache
+            .set(&key, &vm, SNAPSHOT_CACHE_TTL_SECS)
+            .await
+        {
+            warn!(error=%err, %key, "failed to write snapshot to cache");
+        }
+
+        Ok(vm)
+    }
+}
+
+/// Convenience builder to wire dependencies – in real life we would use
+/// a dependency injection / service-locator crate.
+pub async fn build_snapshot_service(
+    pg_dsn: &str,
+    redis_url: &str,
+) -> anyhow::Result<Arc<AccountSnapshotQueryService<PgAccountSnapshotRepository>>> {
+    // Postgres pool
+    let pg_pool = PgPoolOptions::new()
+        .max_connections(16)
+        .connect(pg_dsn)
+        .await
+        .context("failed to connect to postgres")?;
+
+    // Redis client
+    let redis_client = redis::Client::open(redis_url)
+        .context("failed to create redis client")?;
+
+    let repo = Arc::new(PgAccountSnapshotRepository::new(pg_pool));
+    let cache = RedisCache::new(redis_client);
+
+    Ok(Arc::new(AccountSnapshotQueryService::new(repo, cache)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use sqlx::Executor;
+
+    #[tokio::test]
+    async fn validation_rejects_future_snapshot() {
+        let (svc, account_id) = build_test_service().await;
+        let future = Utc::now() + chrono::Duration::days(1);
+
+        let res = svc.get_snapshot(account_id, future).await;
+        assert!(matches!(res, Err(SnapshotServiceError::Validation(_))));
+    }
+
+    // Integration-style test using in-memory sqlite – real project would use pg-embed
+    async fn build_test_service() -> (Arc<AccountSnapshotQueryService<PgAccountSnapshotRepository>>, uuid::Uuid)
+    {
+        // For brevity we spin up a temporary Sqlite pool; sqlx supports this.
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+
+        pool.execute(
+            r#"
+            CREATE TABLE ledger__account_snapshots (
+                account_id    TEXT NOT NULL,
+                effective_date DATETIME NOT NULL,
+                balance        TEXT NOT NULL,
+                currency       TEXT NOT NULL,
+                updated_at     DATETIME NOT NULL
+            );
+            "#,
+        )
+        .await
+        .unwrap();
+
+        let account_id = uuid::Uuid::new_v4();
+        let effective = DateTime::<Utc>::from_utc(
+            NaiveDate::from_ymd_opt(2023, 12, 31).unwrap().and_hms_opt(0, 0, 0).unwrap(),
+            Utc,
+        );
+
+        pool.execute(sqlx::query(
+            r#"
+            INSERT INTO ledger__account_snapshots (
+                account_id, effective_date, balance, currency, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(account_id.to_string())
+        .bind(effective)
+        .bind("1000.00")
+        .bind("USD")
+        .bind(Utc::now()))
+        .await
+        .unwrap();
+
+        let repo = Arc::new(PgAccountSnapshotRepository::new(pool));
+        // Dummy Redis: we use a disconnected client to test path w/o cache
+        let cache = RedisCache::new(redis::Client::open("redis://localhost/").unwrap());
+        let svc = Arc::new(AccountSnapshotQueryService::new(repo, cache));
+
+        (svc, account_id)
+    }
+}
+```

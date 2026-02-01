@@ -1,0 +1,339 @@
+```rust
+//! src/module_74.txt
+//! Event-bus utilities and default infrastructure for EduPulse Live.
+//!
+//! This module is **self-contained** but highly integrated with the rest of
+//! the system.  It provides:
+//!   • A serialisable `DomainEvent` enum used across services  
+//!   • A generic `EventHandler` trait for subscribers  
+//!   • A resilient, idempotent `EventConsumer` with exponential back-off  
+//!   • A minimal example handler (`SearchIndexerHandler`) that shows how
+//!     downstream services plug in
+//!
+//! NOTE: this file is checked into the repo with a `.txt` extension so that
+//! non-Rust tooling can perform language-agnostic transforms.  Cargo sees the
+//! module via `mod module_74;` in `lib.rs`.
+
+// ---------- Crate dependencies ----------
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::Duration,
+};
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use backoff::{future::retry, ExponentialBackoff};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgQueryResult, PgPool};
+use tokio::{
+    select,
+    sync::{mpsc, Notify},
+};
+use tracing::{error, info, instrument, warn};
+use uuid::Uuid;
+
+// ---------- Domain event definitions ----------
+
+/// Enum holding *all* top-level domain events emitted by the core API.
+///
+/// IMPORTANT:  
+/// • Keep event variants additive; never reorder or delete existing ones.  
+/// • Use semantic versioning in the event name if shape changes (e.g., `V2`).  
+/// • Payloads must be forward/backward compatible (see event-sourcing rules).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum DomainEvent {
+    LearningPulseSubmitted {
+        pulse_id: Uuid,
+        author_id: Uuid,
+        /// ISO-8601 timestamp when the submission occurred (server clock).
+        submitted_at: DateTime<Utc>,
+    },
+    QuizSubmitted {
+        quiz_id: Uuid,
+        student_id: Uuid,
+        score_raw: f32,
+        submitted_at: DateTime<Utc>,
+    },
+    BadgeAwarded {
+        badge_id: Uuid,
+        recipient_id: Uuid,
+        awarded_at: DateTime<Utc>,
+    },
+    PaymentProcessed {
+        payment_id: Uuid,
+        user_id: Uuid,
+        amount_cents: i64,
+        processed_at: DateTime<Utc>,
+    },
+}
+
+/// Wrapper that adds transport-level metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    /// Uniquely identifies the envelope itself, **not** the aggregate root.
+    pub id:        Uuid,
+    pub occurred:  DateTime<Utc>,
+    pub event:     DomainEvent,
+    /// Originating micro-service (helps with traceability & routing).
+    pub producer:  String,
+}
+
+// ---------- Persistence for idempotency ----------
+
+/// Postgres table (DDL):
+///
+/// ```sql
+/// CREATE TABLE IF NOT EXISTS consumer_offsets (
+///   consumer_key  TEXT      PRIMARY KEY,
+///   last_event_id UUID      NOT NULL,
+///   processed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+/// );
+/// ```
+pub struct ConsumerOffsetRepo {
+    pool: PgPool,
+}
+
+impl ConsumerOffsetRepo {
+    pub fn new(pool: PgPool) -> Self { Self { pool } }
+
+    /// Checks whether the event with `event_id` has already been processed by
+    /// the consumer identified by `consumer_key`.
+    pub async fn was_processed(
+        &self,
+        consumer_key: &str,
+        event_id: Uuid,
+    ) -> Result<bool> {
+        let rec: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT last_event_id FROM consumer_offsets WHERE consumer_key = $1",
+        )
+        .bind(consumer_key)
+        .fetch_optional(&self.pool)
+        .await
+        .context("checking consumer offset")?;
+
+        Ok(matches!(rec, Some((stored,)) if stored == event_id))
+    }
+
+    /// Atomically stores the last processed event id.  
+    /// Upsert semantics keep the row thin & idempotent.
+    pub async fn save_offset(
+        &self,
+        consumer_key: &str,
+        event_id: Uuid,
+    ) -> Result<PgQueryResult> {
+        sqlx::query(
+            r#"
+            INSERT INTO consumer_offsets (consumer_key, last_event_id)
+            VALUES ($1, $2)
+            ON CONFLICT (consumer_key)
+            DO UPDATE SET last_event_id = EXCLUDED.last_event_id,
+                          processed_at  = NOW()
+            "#,
+        )
+        .bind(consumer_key)
+        .bind(event_id)
+        .execute(&self.pool)
+        .await
+        .context("saving consumer offset")
+    }
+}
+
+// ---------- Event handler abstraction ----------
+
+/// Every downstream service implements this trait to receive events.
+///
+/// The blanket `Send + Sync + 'static` makes it easy to store behind an `Arc`.
+#[async_trait]
+pub trait EventHandler: Send + Sync + 'static {
+    /// An identifier used for logging and offset persistence.
+    fn name(&self) -> &'static str;
+
+    /// The **business logic** executed for each event.
+    async fn handle(&self, event: &EventEnvelope) -> Result<()>;
+}
+
+// ---------- Resilient, idempotent event consumer ----------
+
+/// EventConsumer receives envelopes through an internal channel and dispatches
+/// them to all registered handlers.  Each handler is executed *independently*
+/// with its own offset persistence, making them failure-isolated.
+pub struct EventConsumer {
+    handlers: Vec<Arc<dyn EventHandler>>,
+    offset_repo: ConsumerOffsetRepo,
+    inbox: mpsc::Receiver<EventEnvelope>,
+    /// Push side kept to allow graceful shutdown flush.
+    _inbox_tx: mpsc::Sender<EventEnvelope>,
+    shutdown: Arc<Notify>,
+}
+
+impl EventConsumer {
+    /// Creates a new consumer with an unbounded internal queue.  Back-pressure
+    /// must be handled by the upstream broker.
+    pub fn new(pool: PgPool) -> Self {
+        let (tx, rx) = mpsc::channel(16_384);
+        Self {
+            handlers: Vec::new(),
+            offset_repo: ConsumerOffsetRepo::new(pool),
+            inbox: rx,
+            _inbox_tx: tx,
+            shutdown: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Returns a clone of the sender so that external code can enqueue events
+    /// (e.g. NATS/Kafka connector task).
+    pub fn inbox_sender(&self) -> mpsc::Sender<EventEnvelope> {
+        self._inbox_tx.clone()
+    }
+
+    /// Registers an `EventHandler`.
+    pub fn register<H>(&mut self, handler: H)
+    where
+        H: EventHandler,
+    {
+        self.handlers.push(Arc::new(handler));
+    }
+
+    /// Asynchronously run the consumer until `shutdown()` is called.
+    #[instrument(name = "event_consumer.run", skip(self))]
+    pub async fn run(mut self) -> Result<()> {
+        loop {
+            select! {
+                maybe_env = self.inbox.recv() => {
+                    match maybe_env {
+                        Some(env) => {
+                            for handler in &self.handlers {
+                                let handler = Arc::clone(handler);
+                                let repo = self.offset_repo.clone();
+                                tokio::spawn(process_single_event(repo, handler, env.clone()));
+                            }
+                        }
+                        None => {
+                            warn!("inbox closed; consumer exiting");
+                            break;
+                        }
+                    }
+                },
+                _ = self.shutdown.notified() => {
+                    info!("event consumer shutting down gracefully");
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Signals a graceful shutdown.
+    pub fn shutdown(&self) {
+        self.shutdown.notify_waiters();
+    }
+}
+
+// Helper executes an event for a single handler with retries & idempotency.
+#[instrument(
+    name = "event_consumer.process_single_event",
+    skip_all,
+    fields(handler = %handler.name()))
+]
+async fn process_single_event(
+    repo: ConsumerOffsetRepo,
+    handler: Arc<dyn EventHandler>,
+    env: EventEnvelope,
+) {
+    // Check idempotency upfront
+    match repo.was_processed(handler.name(), env.id).await {
+        Ok(true) => {
+            trace!(
+                event_id = %env.id,
+                handler = handler.name(),
+                "event already processed; skipping"
+            );
+            return;
+        }
+        Ok(false) => {} // proceed
+        Err(e) => {
+            error!(error = ?e, "could not verify consumer offset");
+            return;
+        }
+    }
+
+    // Exponential back-off in case the downstream system is flaky.
+    let op = || async {
+        handler.handle(&env).await.map_err(backoff::Error::transient)
+    };
+
+    let res = retry(ExponentialBackoff::default(), op).await;
+
+    match res {
+        Ok(_) => {
+            if let Err(e) = repo.save_offset(handler.name(), env.id).await {
+                error!(
+                    error=?e,
+                    "failed to persist consumer offset; duplicate processing possible"
+                );
+            }
+            info!(
+                event_id = %env.id,
+                handler = handler.name(),
+                "event processed successfully"
+            );
+        }
+        Err(e) => {
+            error!(error=?e, "handler permanently failed after retries");
+        }
+    }
+}
+
+// We need trace macro in this module
+use tracing::trace;
+
+// ---------- Example concrete handler ----------
+
+/// Dummy search-service integration.  
+/// Real implementation would perform an async HTTP call or push to Elastic.
+pub struct SearchIndexerHandler;
+
+#[async_trait]
+impl EventHandler for SearchIndexerHandler {
+    fn name(&self) -> &'static str { "search_indexer" }
+
+    #[instrument(name = "search_indexer.handle", skip(self))]
+    async fn handle(&self, env: &EventEnvelope) -> Result<()> {
+        match &env.event {
+            DomainEvent::LearningPulseSubmitted { pulse_id, .. } => {
+                info!(%pulse_id, "indexing learning pulse");
+                // pretend we make a network call taking ~50ms
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            DomainEvent::QuizSubmitted { quiz_id, .. } => {
+                info!(%quiz_id, "indexing quiz result");
+            }
+            _ => {
+                // Search indexer is not interested in other events.
+                return Ok(());
+            }
+        };
+        Ok(())
+    }
+}
+
+// ---------- Wiring helper (called by outer application bootstrap) ----------
+
+/// Spawns the consumer on a dedicated task and returns the `Sender` used by
+/// the broker connector.  The task is *detached* so it runs until process exit.
+pub async fn spawn_default_consumer(pool: PgPool) -> mpsc::Sender<EventEnvelope> {
+    let mut consumer = EventConsumer::new(pool);
+    consumer.register(SearchIndexerHandler);
+
+    let sender = consumer.inbox_sender();
+    tokio::spawn(async move {
+        if let Err(e) = consumer.run().await {
+            error!(error=?e, "event consumer exited with error");
+        }
+    });
+    sender
+}
+```

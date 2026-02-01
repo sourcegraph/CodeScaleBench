@@ -1,0 +1,403 @@
+```rust
+//! module_17.rs
+//!
+//! Strategy-pattern implementation that enables **hot-swappable**
+//! analysis algorithms at runtime.  A thin manager wraps an
+//! `Arc<RwLock<Box<dyn AnalysisStrategy>>>`, giving the rest of the
+//! streaming pipeline an **immutable façade** while still allowing the
+//! underlying algorithm to be mutated safely.  In production the
+//! `FileWatcher` would be replaced (or complemented) by a Kafka/Redis
+//! configuration topic, but the mechanics are identical.
+
+#![allow(clippy::async_yields_async)]
+#![deny(missing_docs)]
+
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::{select, sync::mpsc, task, time};
+use tracing::{debug, error, info, instrument, warn};
+
+/// A minimal representation of a social network event.
+///
+/// In real life this comes from the ingestion layer (`ingestor`)
+/// and holds additional metadata such as language codes,
+/// hashtags, geolocation, etc.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialEvent {
+    /// Unique id for de-duplication.
+    pub event_id: String,
+    /// The raw body text.
+    pub text: String,
+    /// Milliseconds since epoch.
+    pub timestamp_ms: u64,
+}
+
+/// Output emitted by analysis algorithms.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisResult {
+    /// Normalized sentiment score in range ‑1.0 … 1.0.
+    pub sentiment: f32,
+    /// Optional list of labels; only filled by certain strategies.
+    pub labels: Vec<String>,
+    /// Revision id of the algorithm that produced the result.
+    pub strategy_revision: u64,
+}
+
+/// Trait object representing a pluggable analysis algorithm.
+///
+/// Strategies must be **thread-safe** (`Send + Sync`) because
+/// they are accessed from a shared read lock across worker threads.
+#[async_trait]
+pub trait AnalysisStrategy: Send + Sync {
+    /// Human-readable identifier.
+    fn name(&self) -> &'static str;
+
+    /// Monotonically increasing revision number.
+    fn revision(&self) -> u64;
+
+    /// Run analysis asynchronously.
+    async fn analyze(&self, event: &SocialEvent) -> Result<AnalysisResult>;
+}
+
+/// Simple “rule-based” sentiment algorithm using word-lists.
+///
+/// Very cheap, purely demonstrative.
+#[derive(Debug)]
+pub struct RuleBasedSentiment {
+    revision: u64,
+    positive: Vec<&'static str>,
+    negative: Vec<&'static str>,
+}
+
+impl RuleBasedSentiment {
+    pub fn new(revision: u64) -> Self {
+        Self {
+            revision,
+            positive: vec!["love", "great", "awesome", "best", "nice"],
+            negative: vec!["hate", "terrible", "awful", "worst", "bad"],
+        }
+    }
+}
+
+#[async_trait]
+impl AnalysisStrategy for RuleBasedSentiment {
+    fn name(&self) -> &'static str {
+        "RuleBasedSentiment"
+    }
+
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    async fn analyze(&self, event: &SocialEvent) -> Result<AnalysisResult> {
+        let mut score = 0i32;
+        for token in event.text.split_ascii_whitespace() {
+            let token_lower = token.to_ascii_lowercase();
+            if self.positive.iter().any(|p| p == &token_lower) {
+                score += 1;
+            } else if self.negative.iter().any(|n| n == &token_lower) {
+                score -= 1;
+            }
+        }
+
+        // Normalize by number of words to keep range roughly within ±1
+        let sentiment = if event.text.is_empty() {
+            0.0
+        } else {
+            score as f32 / event.text.split_ascii_whitespace().count() as f32
+        };
+
+        Ok(AnalysisResult {
+            sentiment,
+            labels: vec![],
+            strategy_revision: self.revision(),
+        })
+    }
+}
+
+/// A dummy “ML” model that just assigns a pseudo-random score from
+/// timestamp for illustration purposes.
+#[derive(Debug)]
+pub struct FakeNeuralNet {
+    revision: u64,
+}
+
+impl FakeNeuralNet {
+    pub fn new(revision: u64) -> Self {
+        Self { revision }
+    }
+}
+
+#[async_trait]
+impl AnalysisStrategy for FakeNeuralNet {
+    fn name(&self) -> &'static str {
+        "FakeNeuralNet"
+    }
+
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    async fn analyze(&self, event: &SocialEvent) -> Result<AnalysisResult> {
+        // Pretend to do something expensive
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Generate deterministic pseudo-sentiment
+        let sentiment =
+            ((event.timestamp_ms as i64 % 2000) as f32 - 1000.0) / 1000.0;
+
+        Ok(AnalysisResult {
+            sentiment,
+            labels: vec!["ml".into()],
+            strategy_revision: self.revision(),
+        })
+    }
+}
+
+/// Thread-safe wrapper around a hot-swappable strategy.
+///
+/// Internally uses an `Arc<RwLock<…>>` so reads do **not**
+/// block each other, but updates acquire a **write lock** to
+/// swap in a new `Box<dyn AnalysisStrategy>`.
+#[derive(Clone)]
+pub struct StrategyManager {
+    inner: Arc<RwLock<Box<dyn AnalysisStrategy>>>,
+    updates: Arc<AtomicU64>,
+}
+
+impl StrategyManager {
+    /// Instantiate with the given strategy.
+    pub fn new(initial: Box<dyn AnalysisStrategy>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(initial)),
+            updates: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Analyze an event using the current active strategy.
+    ///
+    /// Because we take a **read lock** only, this scales well across
+    /// thousands of concurrent workers.
+    #[instrument(skip(self, event))]
+    pub async fn analyze(&self, event: &SocialEvent) -> Result<AnalysisResult> {
+        let guard = self.inner.read();
+        guard.analyze(event).await
+    }
+
+    /// Replace the active strategy.
+    ///
+    /// Any *in-flight* readers keep using the old implementation
+    /// until they release their read lock.
+    pub fn swap(&self, new_strategy: Box<dyn AnalysisStrategy>) {
+        let mut guard = self.inner.write();
+        let prev = guard.name();
+        let prev_rev = guard.revision();
+
+        *guard = new_strategy;
+
+        let seq = self.updates.fetch_add(1, Ordering::SeqCst) + 1;
+        info!(
+            "Strategy swapped: {}@{} → {}@{} (update #{seq})",
+            prev,
+            prev_rev,
+            guard.name(),
+            guard.revision()
+        );
+    }
+
+    /// Retrieve the number of successful swaps since start.
+    pub fn update_count(&self) -> u64 {
+        self.updates.load(Ordering::SeqCst)
+    }
+}
+
+/// Configuration file that determines which strategy to load.
+///
+/// The JSON/YAML looks like:
+/// ```yaml
+/// kind: rule_based
+/// revision: 42
+/// ```
+#[derive(Debug, Deserialize)]
+struct StrategyConfig {
+    kind: String,
+    revision: Option<u64>,
+}
+
+/// Watches a file on disk and swaps strategies every time
+/// the file changes.  Uses [`notify`] crate for cross-platform
+/// file-system notifications.
+pub struct FileWatcher {
+    path: PathBuf,
+    tx_shutdown: mpsc::Sender<()>,
+}
+
+impl FileWatcher {
+    /// Spawn a background task that monitors `path` and updates `mgr`
+    /// whenever the file is touched.
+    pub fn spawn(path: impl Into<PathBuf>, mgr: StrategyManager) -> Result<Self> {
+        let path = path.into();
+        let (tx_shutdown, mut rx_shutdown) = mpsc::channel::<()>(1);
+
+        // Channel used by notify to forward events to async context
+        let (tx_event, mut rx_event) = mpsc::channel::<Event>(8);
+
+        // The blocking watcher must live on a dedicated thread because
+        // it uses a synchronous callback API.
+        let mut watcher: RecommendedWatcher =
+            Watcher::new_immediate(move |res| {
+                if let Ok(event) = res {
+                    // Ignore errors from channel (shutdown)
+                    let _ = tx_event.blocking_send(event);
+                }
+            })
+            .context("create watcher")?;
+
+        watcher.watch(&path, RecursiveMode::NonRecursive)?;
+
+        info!("📡 Watching {:?} for strategy updates", &path);
+
+        // Spawn an async task to react to events
+        task::spawn(async move {
+            loop {
+                select! {
+                    _ = rx_shutdown.recv() => {
+                        info!("FileWatcher received shutdown signal");
+                        break;
+                    }
+                    maybe_evt = rx_event.recv() => {
+                        if maybe_evt.is_none() {
+                            break;
+                        }
+                        if let Err(e) = Self::handle_event(&path, &mgr).await {
+                            error!("Failed to handle watcher event: {e:?}");
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            path,
+            tx_shutdown,
+        })
+    }
+
+    async fn handle_event(path: &PathBuf, mgr: &StrategyManager) -> Result<()> {
+        // Debounce: wait a bit to avoid partial write reads
+        time::sleep(Duration::from_millis(200)).await;
+
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("read config file {:?}", path))?;
+
+        // Try YAML first, fallback to JSON
+        let cfg: StrategyConfig = match serde_yaml::from_slice(&bytes) {
+            Ok(c) => c,
+            Err(_) => serde_json::from_slice(&bytes)
+                .with_context(|| "parse strategy config (YAML/JSON)")?,
+        };
+
+        debug!("Strategy config loaded: {:?}", &cfg);
+
+        let revision = cfg.revision.unwrap_or_else(|| {
+            time::Instant::now().elapsed().as_nanos() as u64
+        });
+
+        let new_strategy: Box<dyn AnalysisStrategy> = match cfg.kind.as_str() {
+            "rule_based" => Box::new(RuleBasedSentiment::new(revision)),
+            "ml_fake" => Box::new(FakeNeuralNet::new(revision)),
+            other => {
+                warn!("Unknown strategy kind '{other}', keeping existing");
+                return Ok(());
+            }
+        };
+
+        mgr.swap(new_strategy);
+        Ok(())
+    }
+
+    /// Orderly shutdown of the watcher task.
+    pub async fn shutdown(self) {
+        let _ = self.tx_shutdown.send(()).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_strategy_swapping() -> Result<()> {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .init();
+
+        let initial = Box::new(RuleBasedSentiment::new(1));
+        let mgr = StrategyManager::new(initial);
+
+        // Create a temp config file
+        let mut tmp = NamedTempFile::new()?;
+        tmp.write_all(
+            serde_yaml::to_string(&StrategyConfig {
+                kind: "rule_based".into(),
+                revision: Some(1),
+            })?
+            .as_bytes(),
+        )?;
+
+        let watcher = FileWatcher::spawn(tmp.path(), mgr.clone())?;
+
+        // Initial analysis
+        let event = SocialEvent {
+            event_id: "42".into(),
+            text: "I love rust".into(),
+            timestamp_ms: 0,
+        };
+        let res1 = mgr.analyze(&event).await?;
+        assert!(res1.sentiment > 0.0);
+
+        // Overwrite file with ML strategy
+        tmp.rewind()?;
+        tmp.set_len(0)?;
+        tmp.write_all(
+            serde_yaml::to_string(&StrategyConfig {
+                kind: "ml_fake".into(),
+                revision: Some(2),
+            })?
+            .as_bytes(),
+        )?;
+        tmp.flush()?;
+
+        // Wait for watcher to pick it up
+        time::sleep(Duration::from_secs(1)).await;
+
+        assert_eq!(mgr.update_count(), 1);
+
+        let res2 = mgr.analyze(&event).await?;
+        assert_eq!(res2.strategy_revision, 2);
+        assert_eq!(res2.labels, vec!["ml"]);
+
+        watcher.shutdown().await;
+
+        Ok(())
+    }
+
+    use std::io::Write;
+}
+```

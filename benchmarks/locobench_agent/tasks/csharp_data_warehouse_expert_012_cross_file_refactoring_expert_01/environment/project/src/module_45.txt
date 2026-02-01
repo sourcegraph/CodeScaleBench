@@ -1,0 +1,314 @@
+```csharp
+// File: src/module_45.txt
+//
+// NOTE: Even though the extension is `.txt`, this file purposely contains
+//       production-quality C# source code. Build scripts in this repository
+//       glob the `src/**` folder and dynamically rename *.txt → *.cs during
+//       the MSBuild pre-processing stage to avoid certain tooling conflicts
+//       in legacy IDE pipelines.
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Globalization;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Polly;
+using Polly.Retry;
+
+namespace PulseOps.Warehouse.Transformations
+{
+    #region Contracts ────────────────────────────────────────────────────────
+
+    /// <summary>
+    ///     Defines the target KPI that a transformation strategy can compute.
+    /// </summary>
+    public enum KpiType
+    {
+        FocusTimeRatio,
+        DeploymentLeadTime,
+        MeetingCostIndex
+    }
+
+    /// <summary>
+    ///     Immutable context object containing the normalized raw rows that
+    ///     a transform strategy will operate on, plus any auxiliary metadata.
+    /// </summary>
+    public sealed record TransformationContext(
+        KpiType TargetKpi,
+        IReadOnlyList<IReadOnlyDictionary<string, object>> Rows,
+        ImmutableDictionary<string, string> Metadata);
+
+    /// <summary>
+    ///     Result returned from <see cref="IKpiTransformer.TransformAsync" />.
+    /// </summary>
+    public sealed record KpiResult(
+        KpiType Kpi,
+        double Value,
+        DateTimeOffset CalculatedAtUtc,
+        ImmutableDictionary<string, string> Dimensions);
+
+    /// <summary>
+    ///     Strategy contract for KPI calculations.
+    /// </summary>
+    public interface IKpiTransformer
+    {
+        Task<KpiResult> TransformAsync(
+            TransformationContext context,
+            CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    ///     Observer contract, aligned with the classical Observer pattern.
+    /// </summary>
+    public interface ITransformationObserver
+    {
+        Task OnSuccessAsync(KpiResult result, CancellationToken token = default);
+        Task OnErrorAsync(Exception exception, TransformationContext context,
+            CancellationToken token = default);
+    }
+
+    #endregion
+
+    #region Strategy Implementations ─────────────────────────────────────────
+
+    /// <summary>
+    ///     Computes the Focus-Time ratio on a per-day basis, then aggregates
+    ///     to an overall periodic ratio. Focus time is defined as time spent
+    ///     coding / writing / designing, excluding time in any meeting or
+    ///     communication app activity.
+    ///
+    ///     Expected Row Schema (snake_case for cross-lang compatibility):
+    ///     ┌─────────────────────────┬───────────┐
+    ///     │ Column                  │ Type      │
+    ///     ├─────────────────────────┼───────────┤
+    ///     │ utc_timestamp           │ DateTime  │
+    ///     │ focus_minutes           │ double    │
+    ///     │ total_work_minutes      │ double    │
+    ///     └─────────────────────────┴───────────┘
+    /// </summary>
+    public sealed class FocusTimeRatioTransformer : IKpiTransformer
+    {
+        private readonly ILogger<FocusTimeRatioTransformer> _logger;
+
+        public FocusTimeRatioTransformer(ILogger<FocusTimeRatioTransformer> logger)
+        {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        public Task<KpiResult> TransformAsync(
+            TransformationContext context,
+            CancellationToken cancellationToken = default)
+        {
+            if (context.TargetKpi != KpiType.FocusTimeRatio)
+                throw new ArgumentException(
+                    $"{nameof(FocusTimeRatioTransformer)} can only compute " +
+                    $"{KpiType.FocusTimeRatio}", nameof(context));
+
+            // Linq pipeline intentionally synchronous – dataset is already
+            // memory-scoped & filtered for a single user/time window.
+            double totalFocus = 0;
+            double totalWork = 0;
+
+            foreach (var row in context.Rows)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (!TryGetDouble(row, "focus_minutes", out var focus) ||
+                    !TryGetDouble(row, "total_work_minutes", out var work))
+                {
+                    _logger.LogDebug(
+                        "Skipping row due to missing numeric fields: {Row}", row);
+                    continue;
+                }
+
+                totalFocus += focus;
+                totalWork += work;
+            }
+
+            var ratio = totalWork > 0 ? totalFocus / totalWork : 0.0;
+            ratio = Math.Round(ratio, 4);
+
+            var dimensions = context.Metadata
+                .Add("row_count", context.Rows.Count.ToString(CultureInfo.InvariantCulture))
+                .Add("total_focus_minutes", totalFocus.ToString(CultureInfo.InvariantCulture))
+                .Add("total_work_minutes", totalWork.ToString(CultureInfo.InvariantCulture));
+
+            var result = new KpiResult(
+                Kpi: KpiType.FocusTimeRatio,
+                Value: ratio,
+                CalculatedAtUtc: DateTimeOffset.UtcNow,
+                Dimensions: dimensions);
+
+            _logger.LogInformation(
+                "Focus-Time ratio computed: {Ratio:P2} (Rows: {RowCount})",
+                ratio, context.Rows.Count);
+
+            return Task.FromResult(result);
+        }
+
+        private static bool TryGetDouble(
+            IReadOnlyDictionary<string, object> row,
+            string key,
+            out double value)
+        {
+            value = 0;
+            return row.TryGetValue(key, out var raw) &&
+                   raw is IConvertible c &&
+                   double.TryParse(
+                       c.ToString(CultureInfo.InvariantCulture),
+                       NumberStyles.Any,
+                       CultureInfo.InvariantCulture,
+                       out value);
+        }
+    }
+
+    #endregion
+
+    #region Strategy Factory ─────────────────────────────────────────────────
+
+    /// <summary>
+    ///     Resolves an <see cref="IKpiTransformer" /> instance for the
+    ///     specified <see cref="KpiType" />. Uses DI under the covers but
+    ///     keeps a lightweight cache to avoid look-ups on hot paths.
+    /// </summary>
+    public sealed class KpiTransformerFactory
+    {
+        private readonly IServiceProvider _services;
+        private readonly ConcurrentDictionary<KpiType, IKpiTransformer> _cache = new();
+
+        public KpiTransformerFactory(IServiceProvider services)
+            => _services = services ?? throw new ArgumentNullException(nameof(services));
+
+        public IKpiTransformer Resolve(KpiType kpi)
+        {
+            return _cache.GetOrAdd(kpi, static (k, s) =>
+            {
+                // ReSharper disable once SwitchStatementHandlesSomeKnownEnumValuesWithDefault
+                return k switch
+                {
+                    KpiType.FocusTimeRatio =>
+                        (IKpiTransformer)s.GetRequiredService(typeof(FocusTimeRatioTransformer)),
+                    // Additional KPI mappings will be added here.
+                    _ => throw new NotSupportedException(
+                        $"KPI [{k}] does not have a registered transformer.")
+                };
+            }, _services);
+        }
+    }
+
+    #endregion
+
+    #region Orchestrator ─────────────────────────────────────────────────────
+
+    /// <summary>
+    ///     Coordinates the execution of KPI transformations, applying retry
+    ///     policies, structured logging, and Observer fan-out so that the
+    ///     rest of the Warehouse can remain reactive and resilient.
+    /// </summary>
+    public sealed class TransformationEngine
+    {
+        private static readonly AsyncRetryPolicy RetryPolicy =
+            Policy.Handle<Exception>()
+                  .WaitAndRetryAsync(
+                      retryCount: 3,
+                      sleepDurationProvider: attempt =>
+                          TimeSpan.FromMilliseconds(200 * Math.Pow(2, attempt)),
+                      onRetry: (exception, delay, attempt, ctx) =>
+                      {
+                          var logger = ctx["logger"] as ILogger;
+                          logger?.LogWarning(exception,
+                              "Retry {Attempt}/3 after {Delay} ms.",
+                              attempt, delay.TotalMilliseconds);
+                      });
+
+        private readonly KpiTransformerFactory _factory;
+        private readonly ILogger<TransformationEngine> _logger;
+        private readonly IEnumerable<ITransformationObserver> _observers;
+
+        public TransformationEngine(
+            KpiTransformerFactory factory,
+            ILogger<TransformationEngine> logger,
+            IEnumerable<ITransformationObserver> observers)
+        {
+            _factory = factory ?? throw new ArgumentNullException(nameof(factory));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _observers = observers?.ToArray() ??
+                         throw new ArgumentNullException(nameof(observers));
+        }
+
+        /// <summary>
+        ///     Executes a KPI transformation end-to-end. Exceptions are surfaced
+        ///     after retries so that upstream Lambda error handling can route
+        ///     to DLQ, yet observers are still notified of failure.
+        /// </summary>
+        public async Task<KpiResult> ExecuteAsync(
+            TransformationContext context,
+            CancellationToken token = default)
+        {
+            var transformer = _factory.Resolve(context.TargetKpi);
+
+            try
+            {
+                var kpiResult = await RetryPolicy
+                    .WithPolicyKey("transformation.retry")
+                    .ExecuteAsync(
+                        async (ctx, t) =>
+                        {
+                            _logger.LogDebug(
+                                "Executing transformer {Transformer}",
+                                transformer.GetType().Name);
+
+                            return await transformer.TransformAsync(context, t)
+                                .ConfigureAwait(false);
+                        },
+                        new Context { ["logger"] = _logger },
+                        token);
+
+                await NotifySuccessAsync(kpiResult, token).ConfigureAwait(false);
+                return kpiResult;
+            }
+            catch (Exception ex)
+            {
+                await NotifyErrorAsync(ex, context, token).ConfigureAwait(false);
+                _logger.LogError(ex,
+                    "Transformation failed for KPI {Kpi}. Context hash: {Hash}",
+                    context.TargetKpi,
+                    context.GetHashCode());
+
+                // Re-throw so that AWS Lambda or Step Functions
+                // supervisors can route to DLQ automatically.
+                throw;
+            }
+        }
+
+        private Task NotifySuccessAsync(KpiResult result, CancellationToken token)
+        {
+            return Task.WhenAll(_observers.Select(
+                obs => SafeInvokeAsync(() => obs.OnSuccessAsync(result, token))));
+        }
+
+        private Task NotifyErrorAsync(
+            Exception ex, TransformationContext ctx, CancellationToken token)
+        {
+            return Task.WhenAll(_observers.Select(
+                obs => SafeInvokeAsync(() => obs.OnErrorAsync(ex, ctx, token))));
+        }
+
+        private static async Task SafeInvokeAsync(Func<Task> call)
+        {
+            try { await call().ConfigureAwait(false); }
+            catch
+            {
+                // Observers are not allowed to destabilize the engine.
+            }
+        }
+    }
+
+    #endregion
+}
+
+```

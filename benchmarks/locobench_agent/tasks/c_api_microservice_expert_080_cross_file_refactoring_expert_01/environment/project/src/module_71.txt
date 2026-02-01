@@ -1,0 +1,391 @@
+```c
+/*
+ * MercuryMonolith Commerce Hub
+ * ----------------------------------------
+ * Module 71  : In-Memory HTTP Response Cache
+ * File Path  : src/module_71.txt   (compiled as .c)
+ *
+ * The cache is a generic, thread-safe, TTL-aware, byte-size-bounded LRU
+ * implementation meant to be shared by all REST/GraphQL handlers.
+ *
+ * External interfaces:
+ *   mm_cache_init()
+ *   mm_cache_destroy()
+ *   mm_cache_put()
+ *   mm_cache_get()
+ *   mm_cache_invalidate()
+ *   mm_cache_stats()
+ *
+ * The implementation purposefully hides internal details so that it can be
+ * swapped for a sharded or distributed variant without touching call-sites.
+ */
+
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+
+#include "uthash.h"          /* Single-header hash table (public domain)  */
+#include "mm_logging.h"      /* Project-wide structured logging            */
+#include "mm_metrics.h"      /* Prometheus-compatible counters/histograms  */
+#include "mm_status.h"       /* Standardised status / error codes          */
+
+#define MODULE_NAME "response_cache"
+
+/* ---------------------------- Type Definitions --------------------------- */
+
+typedef struct mm_cache_entry {
+    char            *key;       /* full cache key (method|path|query|...) */
+    void            *blob;      /* serialized response payload            */
+    size_t           len;       /* size of blob                           */
+    time_t           expires_at;/* UNIX epoch of expiry (0 = no TTL)      */
+
+    /* LRU doubly linked list */
+    struct mm_cache_entry *prev;
+    struct mm_cache_entry *next;
+
+    /* Hash handle must be last for uthash */
+    UT_hash_handle    hh;
+} mm_cache_entry_t;
+
+typedef struct {
+    mm_cache_entry_t *hash;        /* uthash root                          */
+    mm_cache_entry_t *lru_head;    /* most recently used                   */
+    mm_cache_entry_t *lru_tail;    /* least recently used                  */
+
+    size_t            bytes_used;  /* total bytes currently occupied       */
+    size_t            max_bytes;   /* eviction threshold in bytes          */
+    size_t            max_items;   /* eviction threshold in entries        */
+
+    pthread_mutex_t   mtx;         /* coarse-grained lock (fast enough)    */
+} mm_cache_t;
+
+/* ------------------------------ Prototypes ------------------------------- */
+static void        lru_promote(mm_cache_t *c, mm_cache_entry_t *e);
+static void        evict_if_needed(mm_cache_t *c);
+static void        remove_entry(mm_cache_t *c, mm_cache_entry_t *e);
+static mm_status_t allocate_entry(const char *key,
+                                  const void *blob,
+                                  size_t len,
+                                  int ttl,
+                                  mm_cache_entry_t **out);
+
+/* ---------------------------- Public API --------------------------------- */
+mm_status_t mm_cache_init(mm_cache_t *c,
+                          size_t max_bytes,
+                          size_t max_items);
+
+mm_status_t mm_cache_destroy(mm_cache_t *c);
+
+mm_status_t mm_cache_put(mm_cache_t *c,
+                         const char *key,
+                         const void *blob,
+                         size_t len,
+                         int ttl_seconds);
+
+mm_status_t mm_cache_get(mm_cache_t *c,
+                         const char *key,
+                         void **blob_out,
+                         size_t *len_out);
+
+mm_status_t mm_cache_invalidate(mm_cache_t *c,
+                                const char *key);
+
+void        mm_cache_stats(mm_cache_t *c,
+                           size_t *bytes_used,
+                           size_t *item_count);
+
+
+/* ---------------------------- Implementation ----------------------------- */
+
+mm_status_t mm_cache_init(mm_cache_t *c,
+                          size_t max_bytes,
+                          size_t max_items)
+{
+    if (!c || !max_bytes || !max_items) return MM_E_INVALID_ARG;
+
+    memset(c, 0, sizeof(*c));
+    c->max_bytes = max_bytes;
+    c->max_items = max_items;
+
+    if (pthread_mutex_init(&c->mtx, NULL) != 0) {
+        MM_LOG_ERROR(MODULE_NAME, "pthread_mutex_init failed");
+        return MM_E_OS_ERROR;
+    }
+    MM_LOG_INFO(MODULE_NAME, "Cache initialized (bytes=%zu items=%zu)",
+                max_bytes, max_items);
+    return MM_OK;
+}
+
+mm_status_t mm_cache_destroy(mm_cache_t *c)
+{
+    if (!c) return MM_E_INVALID_ARG;
+
+    pthread_mutex_lock(&c->mtx);
+    mm_cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, c->hash, cur, tmp) {
+        remove_entry(c, cur); /* handles free + hash delete */
+    }
+    pthread_mutex_unlock(&c->mtx);
+    pthread_mutex_destroy(&c->mtx);
+    return MM_OK;
+}
+
+mm_status_t mm_cache_put(mm_cache_t *c,
+                         const char *key,
+                         const void *blob,
+                         size_t len,
+                         int ttl_seconds)
+{
+    if (!c || !key || !blob || !len) return MM_E_INVALID_ARG;
+
+    mm_cache_entry_t *entry = NULL, *existing = NULL;
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&c->mtx);
+
+    HASH_FIND_STR(c->hash, key, existing);
+
+    /* Replace existing */
+    if (existing) {
+        c->bytes_used -= existing->len;
+        free(existing->blob);
+        existing->blob = malloc(len);
+        if (!existing->blob) {
+            pthread_mutex_unlock(&c->mtx);
+            return MM_E_OOM;
+        }
+        memcpy(existing->blob, blob, len);
+        existing->len = len;
+        existing->expires_at = ttl_seconds > 0 ? now + ttl_seconds : 0;
+        c->bytes_used += len;
+        lru_promote(c, existing);
+
+        MM_METRIC_COUNTER_INC("cache_overwrite_total");
+        MM_LOG_DEBUG(MODULE_NAME, "Updated cache entry '%s' (len=%zu)", key, len);
+    }
+    /* New insert */
+    else {
+        mm_status_t rc = allocate_entry(key, blob, len, ttl_seconds, &entry);
+        if (rc != MM_OK) {
+            pthread_mutex_unlock(&c->mtx);
+            return rc;
+        }
+
+        HASH_ADD_KEYPTR(hh, c->hash, entry->key, strlen(entry->key), entry);
+        /* Insert to head of LRU */
+        entry->next = c->lru_head;
+        if (c->lru_head) c->lru_head->prev = entry;
+        c->lru_head = entry;
+        if (!c->lru_tail) c->lru_tail = entry;
+
+        c->bytes_used += len;
+        MM_METRIC_COUNTER_INC("cache_insert_total");
+        MM_LOG_DEBUG(MODULE_NAME, "Added cache entry '%s' (len=%zu)", key, len);
+    }
+
+    /* Honour eviction policy */
+    evict_if_needed(c);
+
+    pthread_mutex_unlock(&c->mtx);
+    return MM_OK;
+}
+
+mm_status_t mm_cache_get(mm_cache_t *c,
+                         const char *key,
+                         void **blob_out,
+                         size_t *len_out)
+{
+    if (!c || !key || !blob_out || !len_out) return MM_E_INVALID_ARG;
+
+    pthread_mutex_lock(&c->mtx);
+    mm_cache_entry_t *entry = NULL;
+    HASH_FIND_STR(c->hash, key, entry);
+
+    if (!entry) {
+        pthread_mutex_unlock(&c->mtx);
+        MM_METRIC_COUNTER_INC("cache_miss_total");
+        return MM_E_NOT_FOUND;
+    }
+
+    time_t now = time(NULL);
+    if (entry->expires_at && entry->expires_at <= now) {
+        /* Expired: remove and treat as miss */
+        MM_LOG_DEBUG(MODULE_NAME, "Cache entry '%s' expired", key);
+        remove_entry(c, entry);
+        pthread_mutex_unlock(&c->mtx);
+        MM_METRIC_COUNTER_INC("cache_expired_total");
+        return MM_E_NOT_FOUND;
+    }
+
+    /* Hit */
+    *blob_out = malloc(entry->len);
+    if (!*blob_out) {
+        pthread_mutex_unlock(&c->mtx);
+        return MM_E_OOM;
+    }
+    memcpy(*blob_out, entry->blob, entry->len);
+    *len_out = entry->len;
+
+    lru_promote(c, entry);
+
+    pthread_mutex_unlock(&c->mtx);
+
+    MM_METRIC_COUNTER_INC("cache_hit_total");
+    return MM_OK;
+}
+
+mm_status_t mm_cache_invalidate(mm_cache_t *c,
+                                const char *key)
+{
+    if (!c || !key) return MM_E_INVALID_ARG;
+
+    pthread_mutex_lock(&c->mtx);
+    mm_cache_entry_t *entry = NULL;
+    HASH_FIND_STR(c->hash, key, entry);
+    if (!entry) {
+        pthread_mutex_unlock(&c->mtx);
+        return MM_E_NOT_FOUND;
+    }
+
+    remove_entry(c, entry);
+    pthread_mutex_unlock(&c->mtx);
+
+    MM_METRIC_COUNTER_INC("cache_invalidate_total");
+    MM_LOG_INFO(MODULE_NAME, "Cache entry '%s' invalidated by request", key);
+    return MM_OK;
+}
+
+void mm_cache_stats(mm_cache_t *c,
+                    size_t *bytes_used,
+                    size_t *item_count)
+{
+    if (!c) return;
+    pthread_mutex_lock(&c->mtx);
+    if (bytes_used)  *bytes_used  = c->bytes_used;
+    if (item_count)  *item_count  = HASH_COUNT(c->hash);
+    pthread_mutex_unlock(&c->mtx);
+}
+
+/* ------------------------- Internal Helpers ------------------------------ */
+
+static void lru_promote(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    /* Already head */
+    if (c->lru_head == e) return;
+
+    /* Detach */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    /* Move to head */
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+static void evict_if_needed(mm_cache_t *c)
+{
+    while ((c->bytes_used > c->max_bytes) ||
+           (HASH_COUNT(c->hash) > c->max_items)) {
+
+        mm_cache_entry_t *victim = c->lru_tail;
+        if (!victim) break; /* Shouldn't happen */
+
+        MM_LOG_TRACE(MODULE_NAME, "Evicting cache entry '%s'", victim->key);
+        MM_METRIC_COUNTER_INC("cache_evict_total");
+        remove_entry(c, victim);
+    }
+}
+
+static void remove_entry(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    /* Hash remove */
+    HASH_DEL(c->hash, e);
+
+    /* LRU detach */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_head == e) c->lru_head = e->next;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    c->bytes_used -= e->len;
+
+    free(e->blob);
+    free(e->key);
+    free(e);
+}
+
+static mm_status_t allocate_entry(const char *key,
+                                  const void *blob,
+                                  size_t len,
+                                  int ttl,
+                                  mm_cache_entry_t **out)
+{
+    *out = calloc(1, sizeof(mm_cache_entry_t));
+    if (!*out) return MM_E_OOM;
+
+    (*out)->key = strdup(key);
+    if (!(*out)->key) {
+        free(*out);
+        *out = NULL;
+        return MM_E_OOM;
+    }
+
+    (*out)->blob = malloc(len);
+    if (!(*out)->blob) {
+        free((*out)->key);
+        free(*out);
+        *out = NULL;
+        return MM_E_OOM;
+    }
+    memcpy((*out)->blob, blob, len);
+    (*out)->len = len;
+    (*out)->expires_at = ttl > 0 ? time(NULL) + ttl : 0;
+    return MM_OK;
+}
+
+/* ---------------------------- Unit Testing -------------------------------
+ * In production builds, MM_ENABLE_TESTS is undefined.  Developers can build
+ * with -DMM_ENABLE_TESTS to run basic sanity checks:
+ *
+ *   $ cc -DMM_ENABLE_TESTS -o cache_test src/module_71.txt -lpthread
+ *   $ ./cache_test
+ */
+#ifdef MM_ENABLE_TESTS
+#include <assert.h>
+#include <stdio.h>
+
+static void self_test(void)
+{
+    mm_cache_t cache;
+    assert(mm_cache_init(&cache, 1024 * 1024, 64) == MM_OK);
+
+    const char *k1 = "GET:/v1/products?id=42";
+    const char *v1 = "{\"id\":42}";
+    assert(mm_cache_put(&cache, k1, v1, strlen(v1) + 1, 1) == MM_OK);
+
+    void *out;
+    size_t len;
+    assert(mm_cache_get(&cache, k1, &out, &len) == MM_OK);
+    assert(len == strlen(v1) + 1);
+    assert(strcmp(out, v1) == 0);
+    free(out);
+
+    sleep(2); /* wait for TTL */
+    assert(mm_cache_get(&cache, k1, &out, &len) == MM_E_NOT_FOUND);
+
+    mm_cache_destroy(&cache);
+}
+
+int main(void)
+{
+    self_test();
+    puts("OK");
+    return 0;
+}
+#endif /* MM_ENABLE_TESTS */
+```

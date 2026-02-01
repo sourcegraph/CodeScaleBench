@@ -1,0 +1,346 @@
+```rust
+//! src/module_66.rs
+//!
+//! Event Store + Publisher infrastructure for EduPulse Live.
+//!
+//! This module is responsible for the durable persistence of domain events and
+//! their subsequent publication onto the platform’s message broker.  Domain
+//! events are the backbone of EduPulse’s decoupled micro-service architecture;
+//! every write-side action on the core API is expressed as an immutable event
+//! that is:
+//!   1. Persisted in an append-only Postgres table (ensuring auditability).
+//!   2. Published to the async message broker so that downstream projections
+//!      (search indexing, achievements, e-mails, etc.) can react.
+//!
+//! The code demonstrates several best-practice techniques:
+//!   * Strongly-typed, versioned event envelopes.
+//!   * JSONB storage with SQLx compile-time checks.
+//!   * An async publisher abstraction that can be swapped out in tests.
+//!   * End-to-end tracing and robust error handling with `anyhow`.
+//!
+//! NOTE: This file compiles in isolation but relies on a Postgres database and
+//! an external NATS server for the concrete publisher implementation.
+//! Replace the DSN/addresses with your environment-specific values.
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use async_nats::{self, Message};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, Pool, Postgres, Row};
+use tokio::sync::Mutex;
+use tracing::{debug, error, info, instrument};
+use uuid::Uuid;
+
+/// Current schema version of an [`EventEnvelope`].
+pub const EVENT_ENVELOPE_VERSION: u16 = 1;
+
+/// High-level enumeration of all domain events emitted by the core API.
+///
+/// To evolve the platform without breaking consumers, *never* mutate the shape
+/// of an existing variant; instead, introduce a new one with a distinct name
+/// (e.g. `BadgeAwardedV2`). Consumers can opt-in at their own pace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+#[non_exhaustive]
+pub enum DomainEvent {
+    LessonPublished {
+        lesson_id: Uuid,
+        author_id: Uuid,
+        title: String,
+    },
+    QuizSubmitted {
+        quiz_id: Uuid,
+        student_id: Uuid,
+        score: f32,
+    },
+    BadgeAwarded {
+        badge_id: Uuid,
+        recipient_id: Uuid,
+    },
+    PaymentProcessed {
+        invoice_id: Uuid,
+        user_id: Uuid,
+        amount_cents: i64,
+    },
+    // Add new events below
+}
+
+/// An immutable wrapper that decorates [`DomainEvent`]s with metadata required
+/// for reliable delivery, ordering, and compliance.
+///
+/// The envelope can be extended transparently while maintaining backwards
+/// compatibility as long as we bump [`EVENT_ENVELOPE_VERSION`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    /// Unique identifier of the envelope itself.
+    pub id: Uuid,
+    /// Optional identifier of the aggregate that emitted the event.
+    pub aggregate_id: Option<Uuid>,
+    /// UTC timestamp at which the event occurred.
+    pub occurred_at: DateTime<Utc>,
+    /// Version of the envelope schema.
+    pub version: u16,
+    /// Arbitrary key/value map for contextual info (e.g. ip, user-agent).
+    pub metadata: serde_json::Value,
+    /// The actual domain event.
+    pub event: DomainEvent,
+}
+
+impl EventEnvelope {
+    /// Convenience helper to wrap a raw `DomainEvent` with sane defaults.
+    pub fn new<E>(event: E) -> Self
+    where
+        E: Into<DomainEvent>,
+    {
+        Self {
+            id: Uuid::new_v4(),
+            aggregate_id: None,
+            occurred_at: Utc::now(),
+            version: EVENT_ENVELOPE_VERSION,
+            metadata: serde_json::json!({}),
+            event: event.into(),
+        }
+    }
+
+    /// Serialize the envelope into a compact JSON byte vector (UTF-8).
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self).context("serialize event envelope")?)
+    }
+}
+
+/// Contract for publishing envelopes to an async message broker.
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<()>;
+}
+
+/// Simple NATS JetStream publisher implementation.
+pub struct NatsPublisher {
+    client: async_nats::Client,
+    subject_prefix: String,
+}
+
+impl NatsPublisher {
+    pub async fn new(nats_url: &str, subject_prefix: &str) -> Result<Self> {
+        let client = async_nats::connect(nats_url).await.context("connect NATS")?;
+        Ok(Self {
+            client,
+            subject_prefix: subject_prefix.to_string(),
+        })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for NatsPublisher {
+    #[instrument(skip_all, fields(event_id = %envelope.id))]
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<()> {
+        let subject = format!(
+            "{}.{}",
+            self.subject_prefix,
+            envelope.event_type_name().replace('.', "_")
+        );
+
+        let bytes = envelope.to_bytes()?;
+        self.client
+            .publish(Message::new(subject.into(), None, bytes.into()))
+            .await
+            .context("NATS publish")?;
+
+        info!("Published event to NATS");
+        Ok(())
+    }
+}
+
+impl EventEnvelope {
+    /// Utility to derive a path-friendly event name, e.g. `LessonPublished`.
+    fn event_type_name(&self) -> &'static str {
+        match &self.event {
+            DomainEvent::LessonPublished { .. } => "LessonPublished",
+            DomainEvent::QuizSubmitted { .. } => "QuizSubmitted",
+            DomainEvent::BadgeAwarded { .. } => "BadgeAwarded",
+            DomainEvent::PaymentProcessed { .. } => "PaymentProcessed",
+        }
+    }
+}
+
+/// EventStore is responsible for persisting envelopes to Postgres.
+///
+/// Table schema (simplified):
+/// ```sql
+/// CREATE TABLE IF NOT EXISTS event_store (
+///   id              UUID PRIMARY KEY,
+///   aggregate_id    UUID NULL,
+///   occurred_at     TIMESTAMP WITH TIME ZONE NOT NULL,
+///   envelope        JSONB NOT NULL
+/// );
+/// ```
+pub struct EventStore {
+    pool: Pool<Postgres>,
+    publisher: Arc<dyn EventPublisher>,
+}
+
+impl EventStore {
+    /// Build a new store with a connection pool and an [`EventPublisher`].
+    pub async fn new(
+        database_url: &str,
+        max_connections: u32,
+        publisher: Arc<dyn EventPublisher>,
+    ) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    // Ensure the events table exists (idempotent).
+                    sqlx::query(
+                        r#"
+                        CREATE TABLE IF NOT EXISTS event_store (
+                            id           UUID PRIMARY KEY,
+                            aggregate_id UUID NULL,
+                            occurred_at  TIMESTAMPTZ NOT NULL,
+                            envelope     JSONB        NOT NULL
+                        );
+                        "#,
+                    )
+                    .execute(conn)
+                    .await
+                    .context("create event_store table")?;
+                    Ok(())
+                })
+            })
+            .connect(database_url)
+            .await
+            .context("connect Postgres")?;
+
+        Ok(Self { pool, publisher })
+    }
+
+    /// Append an envelope atomically and publish it.
+    #[instrument(skip(self, envelope), fields(event_id = %envelope.id))]
+    pub async fn append_and_publish(&self, envelope: &EventEnvelope) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin event store transaction")?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO event_store (id, aggregate_id, occurred_at, envelope)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(envelope.id)
+        .bind(envelope.aggregate_id)
+        .bind(envelope.occurred_at)
+        .bind(serde_json::to_value(envelope).context("serialize envelope for pg")?)
+        .execute(&mut *tx)
+        .await
+        .context("insert event envelope")?;
+
+        tx.commit().await.context("commit event store tx")?;
+        debug!("Persisted event to store");
+
+        // Publish *after* committing to avoid double-delivery on rollback.
+        self.publisher.publish(envelope).await?;
+
+        Ok(())
+    }
+
+    /// Fetch events for a given aggregate, ordered by time.
+    pub async fn stream_by_aggregate(
+        &self,
+        aggregate_id: Uuid,
+    ) -> Result<impl Iterator<Item = Result<EventEnvelope>>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT envelope
+            FROM event_store
+            WHERE aggregate_id = $1
+            ORDER BY occurred_at ASC
+            "#,
+        )
+        .bind(aggregate_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("load events by aggregate")?;
+
+        let events = rows.into_iter().map(|row| {
+            let v: serde_json::Value = row.get("envelope");
+            let env: EventEnvelope =
+                serde_json::from_value(v).context("deserialize event envelope")?;
+            Ok(env)
+        });
+
+        Ok(events)
+    }
+}
+
+/// Mock publisher that records events into memory. Useful for unit tests.
+#[derive(Default)]
+pub struct InMemoryPublisher {
+    events: Mutex<Vec<EventEnvelope>>,
+}
+
+impl InMemoryPublisher {
+    pub fn take(&self) -> Vec<EventEnvelope> {
+        futures::executor::block_on(async {
+            let mut guard = self.events.lock().await;
+            std::mem::take(&mut *guard)
+        })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for InMemoryPublisher {
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<()> {
+        let mut guard = self.events.lock().await;
+        guard.push(envelope.clone());
+        Ok(())
+    }
+}
+
+/* ---------- Integration Tests ---------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[tokio::test]
+    async fn append_and_publish_roundtrip() -> Result<()> {
+        // NOTE: Use a test DB set via `DATABASE_URL_TEST`.
+        let database_url =
+            env::var("DATABASE_URL_TEST").expect("env DATABASE_URL_TEST must be set for tests");
+        // Create an in-memory publisher so we don’t need NATS in CI.
+        let publisher = Arc::new(InMemoryPublisher::default());
+
+        let store = EventStore::new(&database_url, 5, publisher.clone()).await?;
+
+        let evt = DomainEvent::LessonPublished {
+            lesson_id: Uuid::new_v4(),
+            author_id: Uuid::new_v4(),
+            title: "Rust Ownership Deep Dive".into(),
+        };
+        let env = EventEnvelope::new(evt);
+
+        store.append_and_publish(&env).await?;
+
+        // Ensure event was published.
+        let published = publisher.take();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].id, env.id);
+
+        // Ensure round-trip persistence.
+        let mut stream = store
+            .stream_by_aggregate(env.aggregate_id.unwrap_or_default())
+            .await?
+            .collect::<Vec<_>>();
+        assert_eq!(stream.len(), 0); // No aggregate_id set.
+
+        Ok(())
+    }
+}
+```

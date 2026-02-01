@@ -1,0 +1,226 @@
+```rust
+//! tests/test_main.rs
+//! -----------------------------------------------------------
+//! End-to-end & component-level test-suite for the LedgerLink
+//! Nexus API microservice.  The tests spin-up an in-memory
+//! version of the HTTP application (Axum router) backed by
+//! mocked repositories so that we can validate:
+//
+//!   • JWT-style authentication middleware
+//!   • Pagination contract
+//!   • Response-caching headers
+//!   • Input-validation envelopes
+//!   • Structured error handling
+//!
+//! IMPORTANT: these tests assume the existence of the public
+//! `ledgerlink_nexus` crate root *inside* the same workspace.
+//! The crate is expected to expose:
+//!
+//!   • `bootstrap::test_app()`   -> returns (Router, TestContext)
+//!   • `configs::HTTP_PORT`      -> u16 (default port for manual
+//!                                   debugging – not used here)
+//!
+//! The `TestContext` helper is a lightweight handle that allows
+//! individual tests to seed / query the mocked repositories.
+//!
+//! If the application crate does not yet expose these helpers,
+//! generate simple stubs that satisfy the compiler or gate
+//! these tests behind the feature‐flag `e2e_tests`.
+//
+//! -----------------------------------------------------------
+
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+    Router,
+};
+use hyper::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE};
+use ledgerlink_nexus::bootstrap::test_app; // <- test helper
+use serde_json::json;
+use tower::ServiceExt; // for `app.oneshot(req)` style calls
+
+/// Convenience type alias for fallible test results
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Valid bearer token used by the mocked authentication middleware
+const VALID_TOKEN: &str = "Bearer test_super_secret_token";
+
+/// Helper that builds a `GET` request with an Authorization header.
+fn build_get_req(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(AUTHORIZATION, VALID_TOKEN)
+        .body(Body::empty())
+        .expect("failed to build request")
+}
+
+/// Spin-up the application once per test.  
+async fn spawn_app() -> (Router, ledgerlink_nexus::bootstrap::TestContext) {
+    test_app().await
+}
+
+/* ---------------------------------------------------------------- *\
+ *                              TESTS                                *
+\* ---------------------------------------------------------------- */
+
+/// Basic health-check: the `/healthz` probe must return `200 OK`.
+#[tokio::test]
+async fn healthz_works() -> TestResult {
+    let (app, _) = spawn_app().await;
+
+    let req = build_get_req("/healthz");
+    let res = app.oneshot(req).await?;
+
+    assert_eq!(res.status(), StatusCode::OK, "health probe failed");
+
+    Ok(())
+}
+
+/// Integration test that validates:
+///   1. Happy-path pagination contract
+///   2. Presence of `Cache-Control` header
+///   3. Payload shape for ledger entry list
+#[tokio::test]
+async fn list_ledger_entries_pagination_cache() -> TestResult {
+    let (app, ctx) = spawn_app().await;
+
+    // ── Arrange ────────────────────────────────────────────────────
+    // Seed three ledger entries for tenant_id = "acme-inc"
+    ctx.seed_ledgers("acme-inc", 3).await?;
+
+    // ── Act – page #1 (page_size = 2) ──────────────────────────────
+    let req = build_get_req("/v1/tenants/acme-inc/ledger-entries?page=1&page_size=2");
+    let res = app.clone().oneshot(req).await?;
+
+    // ── Assert ─────────────────────────────────────────────────────
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "expected HTTP 200 for first page"
+    );
+
+    // Verify caching contract
+    let cache_header = res
+        .headers()
+        .get(CACHE_CONTROL)
+        .expect("missing Cache-Control header")
+        .to_str()?;
+
+    assert!(
+        cache_header.starts_with("public, max-age="),
+        "unexpected Cache-Control policy: {cache_header}"
+    );
+
+    // Read body
+    let bytes = hyper::body::to_bytes(res.into_body()).await?;
+    let payload: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+    // Contract:
+    // {
+    //   "data": [ ... ],
+    //   "meta": {
+    //     "pagination": {
+    //       "page": 1,
+    //       "page_size": 2,
+    //       "has_more": true
+    //     }
+    //   }
+    // }
+    assert_eq!(
+        payload.pointer("/data").and_then(|v| v.as_array()).map(|a| a.len()),
+        Some(2),
+        "expected exactly 2 ledger-entries in first page"
+    );
+
+    assert_eq!(
+        payload.pointer("/meta/pagination/page").and_then(|v| v.as_u64()),
+        Some(1),
+        "pagination page mismatch"
+    );
+    assert_eq!(
+        payload.pointer("/meta/pagination/has_more").and_then(|v| v.as_bool()),
+        Some(true),
+        "has_more should be true when more records exist"
+    );
+
+    Ok(())
+}
+
+/// Attempt to access the API without an `Authorization` header.  
+/// Should be rejected with `401 Unauthorized` and a typed JSON
+/// error envelope.
+#[tokio::test]
+async fn authentication_missing_header_rejected() -> TestResult {
+    let (app, _) = spawn_app().await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/tenants/foo/ledger-entries")
+        .body(Body::empty())?;
+
+    let res = app.oneshot(req).await?;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    let body = hyper::body::to_bytes(res.into_body()).await?;
+    let error: serde_json::Value = serde_json::from_slice(&body)?;
+
+    assert_eq!(error.pointer("/error/code").and_then(|v| v.as_str()), Some("AUTH_REQUIRED"));
+    assert!(error.pointer("/error/message").is_some(), "error message missing");
+
+    Ok(())
+}
+
+/// Happy-path: create a new ledger entry JSON payload and expect
+/// `201 Created` with Location header pointing to the resource.
+///
+/// This also implicitly tests:
+///   • Payload validation
+///   • Model ↔ DTO conversion
+///   • Idempotent POST behaviour guarded by request hash
+#[tokio::test]
+async fn create_ledger_entry_works() -> TestResult {
+    let (app, _) = spawn_app().await;
+
+    let body_json = json!({
+        "tenant_id": "acme-inc",
+        "external_id": "INV-1001",
+        "currency": "USD",
+        "amount_minor": 150_00,    // 1.50 USD
+        "direction": "credit",
+        "timestamp_utc": "2024-01-25T10:55:00Z",
+        "metadata": {
+            "source": "quickbooks",
+            "batch_id": "b-42"
+        }
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/ledgers")
+        .header(AUTHORIZATION, VALID_TOKEN)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(body_json.to_string()))?;
+
+    let res = app.clone().oneshot(req).await?;
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    // Location header must contain `/v1/ledgers/{uuid}`
+    let location = res
+        .headers()
+        .get("Location")
+        .expect("missing Location header")
+        .to_str()?;
+    assert!(
+        location.starts_with("/v1/ledgers/"),
+        "unexpected Location header: {location}"
+    );
+
+    // Subsequent GET should retrieve the object
+    let req_get = build_get_req(location);
+    let res_get = app.oneshot(req_get).await?;
+    assert_eq!(res_get.status(), StatusCode::OK);
+
+    Ok(())
+}
+```

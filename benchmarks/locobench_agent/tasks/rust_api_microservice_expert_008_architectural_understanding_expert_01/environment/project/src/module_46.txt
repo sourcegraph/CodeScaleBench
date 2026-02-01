@@ -1,0 +1,357 @@
+```rust
+//! src/module_46.rs
+//!
+//! Pagination-aware, type-safe Redis cache for “Query” side of the
+//! Command/Query separation used by LedgerLink Nexus.  The cache is designed
+//! to work in a multi-tenant, horizontally-scaled micro-service and therefore
+//! supports:
+//!   • namespaced keys (tenant isolation)
+//!   • expirations / soft TTL
+//!   • pub/sub-based fan-out invalidation
+//!   • structured tracing and metrics
+//!
+//! The public API intentionally mimics an ordinary repository call so the
+//! surrounding service layer can stay oblivious to the actual caching
+//! strategy.
+//!
+//! # Example
+//! ```no_run
+//! # use uuid::Uuid;
+//! # use ledgerlink_nexus::cache::{PagedCache, Pagination, CacheableQuery};
+//! # use tokio::runtime::Runtime;
+//! #
+//! #[derive(Clone, Debug)]
+//! struct GetLedgerEntryPage {
+//!     pub tenant_id: Uuid,
+//!     pub account_id: Uuid,
+//!     pub pagination: Pagination,
+//! }
+//!
+//! impl CacheableQuery for GetLedgerEntryPage {
+//!     fn tenant_id(&self) -> Uuid { self.tenant_id }
+//!     fn pagination(&self) -> &Pagination { &self.pagination }
+//!     fn cache_hash(&self) -> String {
+//!         format!("account:{}", self.account_id)
+//!     }
+//! }
+//!
+//! # Runtime::new().unwrap().block_on(async move {
+//! let redis_url = "redis://127.0.0.1/";
+//! let cache = PagedCache::<serde_json::Value>::connect(redis_url)
+//!     .await
+//!     .expect("redis must be up");
+//!
+//! let query = GetLedgerEntryPage {
+//!     tenant_id: Uuid::new_v4(),
+//!     account_id: Uuid::new_v4(),
+//!     pagination: Pagination::new(0, 50).unwrap(),
+//! };
+//!
+//! let (_v, from_cache) = cache
+//!     .get_or_query(&query, || async {
+//!         // .. expensive DB call here ..
+//!         Ok(serde_json::json!({"dummy": true }))
+//!     })
+//!     .await
+//!     .unwrap();
+//! # });
+//! ```
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use redis::{aio::ConnectionManager, AsyncCommands};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{sync::broadcast, time};
+use tracing::{debug, instrument, warn};
+use uuid::Uuid;
+
+/// Hard upper-bound for `per_page` to protect Redis payload size and memory
+/// pressure.  A single cached page must never exceed this many items.
+const MAX_PAGE_SIZE: usize = 250;
+
+/// Built-in soft time-to-live for cached pages.
+///
+/// Note: domain services may override this by providing
+/// `PagedCache::with_ttl`.
+const DEFAULT_TTL: Duration = Duration::from_secs(30);
+
+/// Redis channel used for fan-out invalidation events.
+const INVALIDATION_CHANNEL: &str = "ledgerlink:nexus:cache:evict";
+
+/// Common error envelope returned by this module.
+#[derive(Error, Debug)]
+pub enum CacheError {
+    #[error("redis error: {0}")]
+    Redis(#[from] redis::RedisError),
+    #[error("serialization error: {0}")]
+    Bincode(#[from] bincode::Error),
+    #[error("application error: {0}")]
+    Application(#[from] anyhow::Error),
+}
+
+/// Pagination information sent by a caller or deserialized from a request
+/// payload.  It purposely mirrors the GraphQL “Connection” spec as well as the
+/// REST flavour used in our OpenAPI contract.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Pagination {
+    pub page: usize,
+    pub per_page: usize,
+}
+
+impl Pagination {
+    /// Construct a new pagination config while enforcing invariants.
+    pub fn new(page: usize, per_page: usize) -> Result<Self, CacheError> {
+        if per_page == 0 || per_page > MAX_PAGE_SIZE {
+            anyhow::bail!(
+                "per_page must be within 1..={MAX_PAGE_SIZE} (got {per_page})"
+            );
+        }
+        Ok(Self { page, per_page })
+    }
+}
+
+/// Trait implemented by every Query object that wishes to leverage the cache.
+/// Only a handful of methods are required so the domain code remains
+/// decoupled from Redis.
+#[async_trait]
+pub trait CacheableQuery: Send + Sync {
+    /// A tenant-scoped uuid allowing sharding and event fan-out.
+    fn tenant_id(&self) -> Uuid;
+
+    /// Pagination info (page number + page size)
+    fn pagination(&self) -> &Pagination;
+
+    /// Deterministic hash that uniquely identifies the query parameters
+    /// **excluding** pagination (e.g. account, date_range, filters).
+    ///
+    /// Think of this as a stable, human-readable identifier.
+    fn cache_hash(&self) -> String;
+}
+
+/// Envelope stored in Redis.  We prepend a short version tag so we can bump
+/// serialization format without flushing the whole store.
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedEnvelope<T> {
+    v: u8,
+    data: T,
+}
+
+/// A concrete Redis-backed cache aware of pagination and invalidation events.
+pub struct PagedCache<T> {
+    conn: ConnectionManager,
+    ttl: Duration,
+    /// Broadcast channel used locally for best-effort, in-process fan-out.
+    evict_tx: broadcast::Sender<String>,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> PagedCache<T>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    /// Connect to Redis and spawn a small background task listening for
+    /// invalidation events.
+    pub async fn connect(redis_url: &str) -> Result<Self, CacheError> {
+        let client = redis::Client::open(redis_url)?;
+        let manager = ConnectionManager::new(client).await?;
+        let (tx, _rx) = broadcast::channel(64);
+
+        // Spawn invalidation listener
+        Self::spawn_invalidator(redis_url.to_owned(), tx.clone());
+
+        Ok(Self {
+            conn: manager,
+            ttl: DEFAULT_TTL,
+            evict_tx: tx,
+            _phantom: std::marker::PhantomData,
+        })
+    }
+
+    /// Provide a custom TTL.  Fluent-style builder.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    /// Try to fetch from cache or execute `fetch_fn` and then cache the
+    /// outcome.  The second value in the tuple indicates whether it was
+    /// a cache hit.
+    #[instrument(skip_all, fields(cache.key = %self.derive_key(query)))]
+    pub async fn get_or_query<Q, F, E>(
+        &self,
+        query: &Q,
+        fetch_fn: F,
+    ) -> Result<(T, bool), CacheError>
+    where
+        Q: CacheableQuery,
+        F: std::future::Future<Output = Result<T, E>> + Send,
+        E: Into<anyhow::Error> + Send,
+    {
+        let redis_key = self.derive_key(query);
+        // 1. Optimistic local in-process check first
+        if let Ok(value) = self.try_get_local(&redis_key).await {
+            return Ok((value, true));
+        }
+
+        // 2. Grab from Redis
+        let mut conn = self.conn.clone();
+        if let Some(raw): Option<Vec<u8>> = conn.get(&redis_key).await? {
+            let envelope: CachedEnvelope<T> = bincode::deserialize(&raw)?;
+            // No versioning strategy yet, v=0
+            debug!("Cache hit (redis)");
+            self.populate_local(redis_key.clone(), envelope.data.clone())
+                .await;
+            return Ok((envelope.data, true));
+        }
+
+        // 3. Miss – execute provided closure
+        debug!("Cache miss; delegating to fetch_fn");
+        let fresh = fetch_fn.await.map_err(Into::into)?;
+
+        // 4. Save to Redis (fire-and-forget)
+        let save_redis_key = redis_key.clone();
+        let save_ttl = self.ttl;
+        let save_value = fresh.clone();
+        tokio::spawn(async move {
+            let env = CachedEnvelope { v: 0, data: save_value };
+            if let Ok(payload) = bincode::serialize(&env) {
+                let _: Result<(), _> = conn
+                    .set_ex(save_redis_key, payload, save_ttl.as_secs() as usize)
+                    .await;
+            }
+        });
+
+        // 5. Fill local cache
+        self.populate_local(redis_key, fresh.clone()).await;
+        Ok((fresh, false))
+    }
+
+    /// Explicitly evict a query result (all pages) for the given tenant/query
+    /// hash, broadcasting the event to every service instance.
+    ///
+    /// Should be called by the *Command* side whenever a mutation might
+    /// invalidate read models (e.g. posting a new ledger entry).
+    pub async fn evict<Q>(&self, query: &Q) -> Result<(), CacheError>
+    where
+        Q: CacheableQuery,
+    {
+        let pattern = format!("nexus:{}:{}:*", query.tenant_id(), query.cache_hash());
+        let mut conn = self.conn.clone();
+        let _: () = redis::cmd("UNLINK").arg(pattern.clone()).query_async(&mut conn).await?;
+
+        // Broadcast
+        let _ = conn.publish::<_, _, ()>(INVALIDATION_CHANNEL, pattern.clone()).await;
+        // Local channel
+        let _ = self.evict_tx.send(pattern);
+
+        Ok(())
+    }
+
+    /// Assemble the final Redis key
+    fn derive_key<Q: CacheableQuery>(&self, query: &Q) -> String {
+        format!(
+            "nexus:{}:{}:{}:{}",
+            query.tenant_id(),
+            query.cache_hash(),
+            query.pagination().page,
+            query.pagination().per_page
+        )
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Local in-process cache (tiny, bounded, non-blocking)
+    // -------------------------------------------------------------------------
+
+    async fn try_get_local(&self, k: &str) -> Result<T, CacheError> {
+        use moka::future::Cache;
+        static LOCAL: once_cell::sync::Lazy<Cache<String, Bytes>> =
+            once_cell::sync::Lazy::new(|| Cache::builder()
+                .max_capacity(4_096)
+                .time_to_live(DEFAULT_TTL)
+                .build());
+
+        if let Some(bytes) = LOCAL.get(k).await {
+            let env: CachedEnvelope<T> = bincode::deserialize(bytes.as_ref())?;
+            return Ok(env.data);
+        }
+        anyhow::bail!("not in local cache")
+    }
+
+    async fn populate_local(&self, k: String, data: T) {
+        use moka::future::Cache;
+        static LOCAL: once_cell::sync::Lazy<Cache<String, Bytes>> =
+            once_cell::sync::Lazy::new(|| Cache::builder()
+                .max_capacity(4_096)
+                .time_to_live(DEFAULT_TTL)
+                .build());
+
+        if let Ok(payload) = bincode::serialize(&CachedEnvelope { v: 0, data }) {
+            let _ = LOCAL.insert(k, Bytes::from(payload)).await;
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Background Redis pub/sub listener – distribute invalidation events
+    // -------------------------------------------------------------------------
+
+    fn spawn_invalidator(redis_url: String, evict_tx: broadcast::Sender<String>) {
+        tokio::spawn(async move {
+            loop {
+                match redis::Client::open(redis_url.as_str())
+                    .and_then(|c| c.get_async_connection())
+                    .await
+                {
+                    Ok(conn) => {
+                        if let Err(e) = Self::listen_invalidation(conn, evict_tx.clone()).await {
+                            warn!(error = %e, "cache invalidation listener died; restarting");
+                        };
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "cannot connect to redis for invalidation; retrying");
+                        time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        });
+    }
+
+    async fn listen_invalidation(
+        mut conn: redis::aio::Connection,
+        evict_tx: broadcast::Sender<String>,
+    ) -> Result<(), CacheError> {
+        use redis::AsyncCommands;
+
+        let mut pubsub = conn.as_pubsub();
+        pubsub.subscribe(INVALIDATION_CHANNEL).await?;
+
+        loop {
+            let msg = pubsub.on_message().await;
+            let payload: String = msg.get_payload()?;
+            // Re-emit into local broadcast
+            let _ = evict_tx.send(payload.clone());
+
+            // Purge local moka cache entries matching the pattern
+            Self::purge_local_matching(&payload).await;
+        }
+    }
+
+    async fn purge_local_matching(pattern: &str) {
+        use moka::future::Cache;
+        static LOCAL: once_cell::sync::Lazy<Cache<String, Bytes>> =
+            once_cell::sync::Lazy::new(|| Cache::builder()
+                .max_capacity(4_096)
+                .time_to_live(DEFAULT_TTL)
+                .build());
+
+        let keys: Vec<String> = LOCAL.iter().map(|(k, _)| k.clone()).collect();
+        for k in keys {
+            if k.starts_with(pattern) {
+                LOCAL.invalidate(&k).await;
+            }
+        }
+    }
+}
+```

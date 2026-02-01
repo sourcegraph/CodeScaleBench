@@ -1,0 +1,201 @@
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Polly;
+using Polly.Retry;
+using TempoScribePro.Core.Domain;
+using TempoScribePro.Core.Domain.ValueObjects;
+using TempoScribePro.Core.Ports.Repositories;
+using TempoScribePro.Core.Ports.Services;
+using TempoScribePro.SharedKernel;
+
+/// <summary>
+/// Application-level service responsible for picking up
+/// scheduled posts whose publishing window has arrived,
+/// publishing them, warming / invalidating caches, and
+/// sending editor notifications. Any infrastructure
+/// concerns (database, e-mail, cache, background workers)
+/// are abstracted behind ports and injected at runtime.
+/// </summary>
+namespace TempoScribePro.Application.PublishAutomation
+{
+    public interface IScheduledPublishingService
+    {
+        /// <summary>
+        /// Publishes all posts whose scheduled publish-date
+        /// is due. Returns the number of posts successfully
+        /// published.
+        /// </summary>
+        Task<int> PublishDuePostsAsync(CancellationToken ct = default);
+    }
+
+    public sealed class ScheduledPublishingService : IScheduledPublishingService
+    {
+        private readonly IPostRepository                _postRepository;
+        private readonly IUnitOfWork                    _unitOfWork;
+        private readonly ICacheService                  _cache;
+        private readonly INotificationService           _notifications;
+        private readonly IClock                         _clock;
+        private readonly ILogger<ScheduledPublishingService> _logger;
+        private readonly AsyncRetryPolicy               _retryPolicy;
+
+        public ScheduledPublishingService(
+            IPostRepository                   postRepository,
+            IUnitOfWork                       unitOfWork,
+            ICacheService                     cache,
+            INotificationService              notifications,
+            IClock                            clock,
+            ILogger<ScheduledPublishingService> logger)
+        {
+            _postRepository = postRepository  ?? throw new ArgumentNullException(nameof(postRepository));
+            _unitOfWork     = unitOfWork      ?? throw new ArgumentNullException(nameof(unitOfWork));
+            _cache          = cache           ?? throw new ArgumentNullException(nameof(cache));
+            _notifications  = notifications   ?? throw new ArgumentNullException(nameof(notifications));
+            _clock          = clock           ?? throw new ArgumentNullException(nameof(clock));
+            _logger         = logger          ?? throw new ArgumentNullException(nameof(logger));
+
+            // Resilience: three retries with exponential back-off
+            _retryPolicy = Policy
+                .Handle<Exception>()
+                .WaitAndRetryAsync(
+                    retryCount: 3,
+                    sleepDurationProvider: attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)),
+                    onRetry: (ex, ts, attempt, ctx) =>
+                    {
+                        _logger.LogWarning(ex,
+                            "Retry {Attempt} while publishing scheduled posts. Waiting {Delay}.",
+                            attempt, ts);
+                    });
+        }
+
+        /// <inheritdoc />
+        public async Task<int> PublishDuePostsAsync(CancellationToken ct = default)
+        {
+            _logger.LogDebug("Scheduled publishing job started at {StartTime}.", _clock.UtcNow);
+
+            // Retrieve due posts
+            IReadOnlyCollection<Post> duePosts = await _postRepository
+                .FindScheduledDueAsync(_clock.UtcNow, ct)
+                .ConfigureAwait(false);
+
+            if (!duePosts.Any())
+            {
+                _logger.LogInformation("No scheduled posts due for publishing.");
+                return 0;
+            }
+
+            int publishedCount = 0;
+
+            foreach (Post post in duePosts)
+            {
+                if (ct.IsCancellationRequested) break;
+
+                bool success = await PublishSingleAsync(post, ct)
+                    .ConfigureAwait(false);
+
+                if (success)
+                    publishedCount++;
+            }
+
+            _logger.LogInformation("{Count} scheduled posts published.", publishedCount);
+            return publishedCount;
+        }
+
+        private async Task<bool> PublishSingleAsync(Post post, CancellationToken ct)
+        {
+            return await _retryPolicy.ExecuteAsync(async () =>
+            {
+                try
+                {
+                    var validation = PublishingWindowValidator.Validate(post, _clock.UtcNow);
+
+                    if (!validation.IsValid)
+                    {
+                        _logger.LogWarning(
+                            "Skipping post {PostId} – publishing window invalid: {Reason}",
+                            post.Id, validation.Reason);
+
+                        return false;
+                    }
+
+                    post.MarkAsPublished(_clock.UtcNow);
+
+                    await _unitOfWork.SaveChangesAsync(ct)
+                        .ConfigureAwait(false);
+
+                    // Invalidate page caches
+                    await _cache.InvalidateAsync(CacheKeys.Post(post.Id), ct)
+                        .ConfigureAwait(false);
+
+                    await _cache.InvalidateAsync(CacheKeys.HomePage, ct)
+                        .ConfigureAwait(false);
+
+                    // Pre-warm the post page to improve TTFB
+                    await _cache.WarmUpAsync(CacheKeys.Post(post.Id), () =>
+                        _postRepository.RenderHtmlAsync(post.Id, ct), ct);
+
+                    // Notify collaborators
+                    await _notifications.SendAsync(
+                        Notification.Create(
+                            toUserId: post.AuthorId,
+                            subject: "Your scheduled post is now live!",
+                            body:    $"\"{post.Title}\" was published successfully at {_clock.UtcNow:O}."),
+                        ct);
+
+                    _logger.LogInformation("Post {PostId} published successfully.", post.Id);
+
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error publishing post {PostId}.", post.Id);
+                    throw; // Bubble up to Polly for retry
+                }
+            });
+        }
+    }
+
+    /// <summary>
+    /// Simple validation helper to ensure a post is
+    /// eligible for publishing at the given moment.
+    /// </summary>
+    internal static class PublishingWindowValidator
+    {
+        internal static PublishValidationResult Validate(Post post, DateTimeOffset nowUtc)
+        {
+            if (post == null)  return PublishValidationResult.Invalid("Post is null.");
+
+            if (post.Status != PostStatus.Scheduled)
+                return PublishValidationResult.Invalid("Post status is not 'Scheduled'.");
+
+            if (post.ScheduledPublishDate == null)
+                return PublishValidationResult.Invalid("Post does not have a scheduled date.");
+
+            if (post.ScheduledPublishDate > nowUtc)
+                return PublishValidationResult.Invalid("Scheduled date is in the future.");
+
+            return PublishValidationResult.Valid();
+        }
+    }
+
+    internal readonly record struct PublishValidationResult(bool IsValid, string Reason)
+    {
+        public static PublishValidationResult Valid() => new(true, string.Empty);
+        public static PublishValidationResult Invalid(string reason) => new(false, reason);
+    }
+
+    /// <summary>
+    /// Centralised cache-key definitions for the publishing
+    /// module to avoid key mismatches.
+    /// </summary>
+    internal static class CacheKeys
+    {
+        public static string Post(PostId id) => $"post:{id}";
+        public const string HomePage = "home:index";
+    }
+}
+```

@@ -1,0 +1,326 @@
+```rust
+//! # EduPulse Live – Domain Event Bus
+//!
+//! This module encapsulates the **Domain-Event** infrastructure used by the
+//! EduPulse Live platform.  All significant state transitions (e.g.
+//! `LessonPublished`, `QuizSubmitted`, `BadgeAwarded`, …) are emitted through
+//! this bus.  
+//!
+//! Goals:
+//! 1. Persist every event for an audit trail (GDPR-ready).
+//! 2. Publish the event onto a message broker (NATS, RabbitMQ, Kafka, …).
+//! 3. Decouple the core API from slow / heavy side-effects (e-mails, search
+//!    indexing, notifications, analytics, …).
+//!
+//! The code below follows a hexagonal / ports-and-adapters style.  The domain
+//! layer depends only on the **port** (trait) abstractions, while the concrete
+//! broker / storage **adapters** are injected at runtime.
+
+#![allow(clippy::redundant_pub_crate)] // We export many items for integration.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::RwLock;
+use tracing::{instrument, trace, warn};
+use uuid::Uuid;
+
+/// System-wide unique identifier for a user / service account.
+pub type ActorId = Uuid;
+
+/// Correlation id used for cross-service tracing.
+pub type CorrelationId = Uuid;
+
+/// -------------------------------------------------------------------------
+/// Domain-Event Definition
+/// -------------------------------------------------------------------------
+
+/// Marker trait for *all* domain events.
+///
+///     #[derive(Debug, Serialize)]
+///     struct LessonPublished { /* fields */ }
+///
+///     impl DomainEvent for LessonPublished {
+///         const EVENT_NAME: &'static str = "lesson.published";
+///     }
+///
+/// The static `EVENT_NAME` keeps wire formats small (`type` + payload).
+pub trait DomainEvent: Serialize + Send + Sync + 'static {
+    const EVENT_NAME: &'static str;
+}
+
+/// Envelope persisted and published around each [`DomainEvent`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    /// Unique identifier for this *specific* envelope.
+    pub event_id: Uuid,
+    /// Human-readable string for routing on the broker.
+    pub event_name: String,
+    /// Point in time (UTC) when the *event* happened —
+    /// NOT when we persisted or published it.
+    pub occurred_at: DateTime<Utc>,
+    /// Id of the actor (user / service) that triggered the event.
+    pub actor_id: ActorId,
+    /// Cross-service correlation id (e.g. HTTP `X-Correlation-Id`).
+    pub correlation_id: CorrelationId,
+    /// Opaque, JSON-serialized domain event payload.
+    pub payload: serde_json::Value,
+}
+
+impl EventEnvelope {
+    pub fn new<E: DomainEvent>(event: &E, actor_id: ActorId, correlation_id: CorrelationId) -> Self {
+        Self {
+            event_id: Uuid::new_v4(),
+            event_name: E::EVENT_NAME.to_owned(),
+            occurred_at: Utc::now(),
+            actor_id,
+            correlation_id,
+            payload: serde_json::to_value(event).expect("serializing DomainEvent never fails"),
+        }
+    }
+}
+
+/// -------------------------------------------------------------------------
+/// Error Handling
+/// -------------------------------------------------------------------------
+
+#[derive(Error, Debug)]
+pub enum EventBusError {
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("Event store error: {0}")]
+    Store(#[from] StoreError),
+
+    #[error("Broker error: {0}")]
+    Broker(#[from] BrokerError),
+}
+
+/// Error emitted by a concrete [`EventStore`] implementation.
+#[derive(Error, Debug)]
+#[error("Event store failure")]
+pub struct StoreError {
+    #[from]
+    source: anyhow::Error,
+}
+
+/// Error emitted by a concrete [`MessageBrokerPublisher`] implementation.
+#[derive(Error, Debug)]
+#[error("Broker failure")]
+pub struct BrokerError {
+    #[from]
+    source: anyhow::Error,
+}
+
+/// -------------------------------------------------------------------------
+/// Port: Event Store
+/// -------------------------------------------------------------------------
+
+#[async_trait]
+pub trait EventStore: Send + Sync {
+    /// Persist the given event envelope to durable storage.
+    async fn save(&self, envelope: &EventEnvelope) -> Result<(), StoreError>;
+
+    /// Load and deserialize events by name (used for projections / GDPR purge).
+    async fn load<E>(&self, event_name: &str) -> Result<Vec<(EventEnvelope, E)>, StoreError>
+    where
+        E: DomainEvent + DeserializeOwned;
+}
+
+/// In-memory implementation useful for *tests* and *development* shells.
+pub struct InMemoryEventStore {
+    records: RwLock<Vec<EventEnvelope>>,
+}
+
+impl InMemoryEventStore {
+    pub fn new() -> Self {
+        Self {
+            records: RwLock::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl EventStore for InMemoryEventStore {
+    #[instrument(skip_all, fields(event_id=%envelope.event_id))]
+    async fn save(&self, envelope: &EventEnvelope) -> Result<(), StoreError> {
+        self.records.write().await.push(envelope.clone());
+        Ok(())
+    }
+
+    #[instrument(skip_all)]
+    async fn load<E>(&self, event_name: &str) -> Result<Vec<(EventEnvelope, E)>, StoreError>
+    where
+        E: DomainEvent + DeserializeOwned,
+    {
+        let store = self.records.read().await;
+        let mut result = Vec::new();
+
+        for env in store.iter().filter(|e| e.event_name == event_name) {
+            let event: E = serde_json::from_value(env.payload.clone())?;
+            result.push((env.clone(), event));
+        }
+        Ok(result)
+    }
+}
+
+/// -------------------------------------------------------------------------
+/// Port: Message Broker
+/// -------------------------------------------------------------------------
+
+#[async_trait]
+pub trait MessageBrokerPublisher: Send + Sync {
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<(), BrokerError>;
+}
+
+/// Development-time broker that just logs the payload.
+pub struct LoggingBrokerPublisher;
+
+#[async_trait]
+impl MessageBrokerPublisher for LoggingBrokerPublisher {
+    #[instrument(skip_all, fields(event_name=&envelope.event_name))]
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<(), BrokerError> {
+        trace!(?envelope, "Publishing envelope to logging broker");
+        Ok(())
+    }
+}
+
+/// -------------------------------------------------------------------------
+/// Event Bus Orchestration
+/// -------------------------------------------------------------------------
+
+/// Central bus that orchestrates persistence + broker publish.
+pub struct EventBus {
+    store:    Arc<dyn EventStore>,
+    broker:   Arc<dyn MessageBrokerPublisher>,
+}
+
+impl EventBus {
+    /// Construct a new [`EventBus`].
+    pub fn new<S, B>(store: S, broker: B) -> Self
+    where
+        S: EventStore + 'static,
+        B: MessageBrokerPublisher + 'static,
+    {
+        Self {
+            store: Arc::new(store),
+            broker: Arc::new(broker),
+        }
+    }
+
+    /// Persist and publish the event.  
+    /// Returns the generated `event_id` on success.
+    #[instrument(skip_all, fields(event=%E::EVENT_NAME))]
+    pub async fn emit<E>(
+        &self,
+        event: &E,
+        actor_id: ActorId,
+        correlation_id: CorrelationId,
+    ) -> Result<Uuid, EventBusError>
+    where
+        E: DomainEvent,
+    {
+        // Envelope creation is in-memory & infallible.
+        let envelope = EventEnvelope::new(event, actor_id, correlation_id);
+
+        // Durably persist first. If this fails we do **not** publish —
+        // we prefer “at-least-once” semantics over phantom events.
+        self.store.save(&envelope).await?;
+
+        // Best-effort publish to the broker.
+        if let Err(e) = self.broker.publish(&envelope).await {
+            // We still return success because the event **is** stored.
+            // Downstream retries / outbox jobs can re-publish later.
+            warn!(error = %e, "Failed to publish envelope to broker");
+        }
+
+        Ok(envelope.event_id)
+    }
+}
+
+/// Helper to inline `emit` for ergonomics.
+///
+/// Usage:
+/// ```ignore
+/// event_bus.emit_event(
+///     LessonPublished { lesson_id },
+///     actor_id,
+///     correlation_id,
+/// ).await?;
+/// ```
+#[async_trait]
+pub trait EmitEventExt {
+    async fn emit_event<E>(
+        &self,
+        event: E,
+        actor_id: ActorId,
+        correlation_id: CorrelationId,
+    ) -> Result<Uuid, EventBusError>
+    where
+        E: DomainEvent;
+}
+
+#[async_trait]
+impl EmitEventExt for Arc<EventBus> {
+    async fn emit_event<E>(
+        &self,
+        event: E,
+        actor_id: ActorId,
+        correlation_id: CorrelationId,
+    ) -> Result<Uuid, EventBusError>
+    where
+        E: DomainEvent,
+    {
+        self.emit(&event, actor_id, correlation_id).await
+    }
+}
+
+/// -------------------------------------------------------------------------
+/// Example Events (§ Tests / Reference Implementation)
+/// -------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct LessonPublished {
+        lesson_id: Uuid,
+        course_id: Uuid,
+        title:     String,
+    }
+
+    impl DomainEvent for LessonPublished {
+        const EVENT_NAME: &'static str = "lesson.published";
+    }
+
+    #[tokio::test]
+    async fn bus_persists_and_publishes() {
+        let bus = Arc::new(EventBus::new(
+            InMemoryEventStore::new(),
+            LoggingBrokerPublisher,
+        ));
+
+        let actor_id = Uuid::new_v4();
+        let corr_id  = Uuid::new_v4();
+
+        let event_id = bus
+            .emit_event(
+                LessonPublished {
+                    lesson_id: Uuid::new_v4(),
+                    course_id: Uuid::new_v4(),
+                    title:     "Tokio 101".into(),
+                },
+                actor_id,
+                corr_id,
+            )
+            .await
+            .expect("emit succeeds");
+
+        assert_ne!(event_id, Uuid::nil());
+    }
+}
+```

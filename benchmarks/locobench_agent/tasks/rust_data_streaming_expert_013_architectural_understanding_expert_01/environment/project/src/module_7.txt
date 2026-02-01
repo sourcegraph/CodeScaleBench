@@ -1,0 +1,335 @@
+```rust
+//! src/module_7.rs
+//!
+//! Strategy-pattern implementation for hot-swappable, real-time sentiment
+//! analysis.  The module owns three major responsibilities:
+//!
+//! 1.  Define a `SentimentStrategy` trait and a couple of reference
+//!     implementations.
+//! 2.  Provide a lock-free, zero-downtime registry (`StrategyRegistry`) that
+//!     allows producers/consumers to read while another thread atomically
+//!     swaps in a new implementation.
+//! 3.  Showcase a `SentimentProcessor` that plugs the strategy into an
+//!     async Kafka streaming consumer.
+//!
+//! In production, concrete strategies would be moved to their own crates and
+//! loaded dynamically (e.g. with `libloading`).  Here we keep them in-tree for
+//! brevity.
+//!
+//! Compile-time dependencies (recorded in `Cargo.toml`):
+//! ```toml
+//! [dependencies]
+//! arc-swap      = "1"
+//! async-trait   = "0.1"
+//! futures       = "0.3"
+//! log           = "0.4"
+//! rdkafka       = { version = "0.34", features = ["tokio"] }
+//! serde         = { version = "1", features = ["derive"] }
+//! serde_json    = "1"
+//! thiserror     = "1"
+//! tokio         = { version = "1", features = ["macros", "rt-multi-thread"] }
+//! ```
+//!
+//! NOTE: error handling consciously errs on the side of context richness over
+//!       minimalism—real-world systems benefit greatly from it.
+
+use std::{path::Path, sync::Arc, time::Duration};
+
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use futures::StreamExt;
+use log::{debug, error, info};
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    message::{BorrowedMessage, Message},
+    ClientConfig, Offset, TopicPartitionList,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{fs, task};
+
+/// High-level sentiment bucket.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub enum Polarity {
+    Positive,
+    Negative,
+    Neutral,
+}
+
+/// Output produced by a [`SentimentStrategy`].
+#[derive(Debug, Clone, Serialize)]
+pub struct SentimentResult {
+    pub polarity: Polarity,
+    /// Confidence in `[0, 1]`.
+    pub confidence: f32,
+}
+
+/// Trait every sentiment strategy must implement.
+///
+/// The interface is intentionally synchronous—most models run in memory and
+/// finish under a millisecond.  If you have a GPU/remote model, turn this
+/// into an async fn.
+#[async_trait]
+pub trait SentimentStrategy: Send + Sync {
+    /// Human-readable identifier—useful for logs and metrics.
+    fn name(&self) -> &str;
+
+    /// Core inference step.
+    fn analyze(&self, text: &str) -> SentimentResult;
+}
+
+/// A naïve rule-based strategy.
+/// Handy as a fallback when ML models are unavailable.
+#[derive(Default)]
+pub struct VaderStrategy;
+
+impl VaderStrategy {
+    fn score(text: &str) -> f32 {
+        // Extremely simplified for illustration.  Production code would use
+        // a full VADER lexicon.
+        let lower = text.to_lowercase();
+        if lower.contains("love") || lower.contains("great") {
+            0.8
+        } else if lower.contains("hate") || lower.contains("terrible") {
+            -0.8
+        } else {
+            0.0
+        }
+    }
+}
+
+#[async_trait]
+impl SentimentStrategy for VaderStrategy {
+    fn name(&self) -> &str {
+        "vader"
+    }
+
+    fn analyze(&self, text: &str) -> SentimentResult {
+        let score = Self::score(text);
+        let (polarity, confidence) = if score >= 0.05 {
+            (Polarity::Positive, score as f32)
+        } else if score <= -0.05 {
+            (Polarity::Negative, -score as f32)
+        } else {
+            (Polarity::Neutral, 1.0 - score.abs() as f32)
+        };
+        SentimentResult {
+            polarity,
+            confidence: confidence.clamp(0.0, 1.0),
+        }
+    }
+}
+
+/// A placeholder for an advanced transformer-based model.
+pub struct TransformerStrategy;
+
+#[async_trait]
+impl SentimentStrategy for TransformerStrategy {
+    fn name(&self) -> &str {
+        "transformer_v1"
+    }
+
+    fn analyze(&self, text: &str) -> SentimentResult {
+        // Fake heavy compute
+        let hash = seahash::hash(text.as_bytes());
+        let prob = (hash % 100) as f32 / 100.0;
+        let polarity = match hash % 3 {
+            0 => Polarity::Positive,
+            1 => Polarity::Negative,
+            _ => Polarity::Neutral,
+        };
+        SentimentResult {
+            polarity,
+            confidence: prob,
+        }
+    }
+}
+
+/// Errors that can bubble up from this module.
+#[derive(Error, Debug)]
+pub enum StrategyError {
+    #[error("failed to read strategy config: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid strategy type `{0}`")]
+    InvalidStrategy(String),
+    #[error("kafka error: {0}")]
+    Kafka(#[from] rdkafka::error::KafkaError),
+}
+
+/// Thread-safe registry that holds the current strategy implementation.
+///
+/// Internally uses `arc-swap` for lock-free RCU semantics: readers grab an
+/// `Arc` cheaply; writers atomically swap in a new `Arc`, leaving the old
+/// value alive until all readers drop it.
+#[derive(Clone)]
+pub struct StrategyRegistry {
+    current: ArcSwap<dyn SentimentStrategy + Send + Sync>,
+}
+
+impl StrategyRegistry {
+    /// Create a registry, seeding it with the given strategy.
+    pub fn new(initial: Arc<dyn SentimentStrategy + Send + Sync>) -> Self {
+        Self {
+            current: ArcSwap::new(initial),
+        }
+    }
+
+    /// Fetch the active strategy.
+    #[inline]
+    pub fn get(&self) -> Arc<dyn SentimentStrategy + Send + Sync> {
+        self.current.load_full()
+    }
+
+    /// Swap in a replacement and return the old value.
+    pub fn swap(
+        &self,
+        new_strategy: Arc<dyn SentimentStrategy + Send + Sync>,
+    ) -> Arc<dyn SentimentStrategy + Send + Sync> {
+        self.current.swap(new_strategy)
+    }
+
+    /// Utility to load a strategy from a JSON config file and replace the
+    /// current one.
+    pub async fn reload_from_path<P: AsRef<Path>>(&self, path: P) -> Result<(), StrategyError> {
+        let json = fs::read_to_string(path).await?;
+        #[derive(Deserialize)]
+        struct Config {
+            /// E.g. `"vader"` or `"transformer_v1"`.
+            strategy: String,
+        }
+        let cfg: Config = serde_json::from_str(&json)?;
+        let new_strategy: Arc<dyn SentimentStrategy + Send + Sync> = match cfg.strategy.as_str() {
+            "vader" => Arc::new(VaderStrategy::default()),
+            "transformer_v1" => Arc::new(TransformerStrategy),
+            invalid => return Err(StrategyError::InvalidStrategy(invalid.into())),
+        };
+
+        let old = self.swap(new_strategy.clone());
+        info!(
+            "🔄 Swapped sentiment strategy: {} → {}",
+            old.name(),
+            new_strategy.name()
+        );
+        Ok(())
+    }
+}
+
+/// Errors originating from the streaming layer.
+#[derive(Error, Debug)]
+pub enum ProcessorError {
+    #[error("kafka: {0}")]
+    Kafka(#[from] rdkafka::error::KafkaError),
+    #[error("stream unexpectedly ended")]
+    EndOfStream,
+}
+
+/// A task that tail-consumes a Kafka topic and performs sentiment scoring on
+/// every incoming payload.
+///
+/// The worker is intentionally minimal—real deployments would forward the
+/// result to an enrichment topic or database.
+pub struct SentimentProcessor {
+    consumer: StreamConsumer,
+    registry: StrategyRegistry,
+}
+
+impl SentimentProcessor {
+    /// Spawns a new processor.
+    ///
+    /// `brokers`         – Comma-separated list of bootstrap brokers.  
+    /// `input_topic`     – Topic containing raw user messages (tweets, etc.).  
+    /// `group_id`        – Name of the Kafka consumer group.
+    pub async fn spawn(
+        brokers: &str,
+        input_topic: &str,
+        group_id: &str,
+        registry: StrategyRegistry,
+    ) -> Result<(), ProcessorError> {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set("group.id", group_id)
+            .set("enable.auto.commit", "true")
+            .set("auto.offset.reset", "earliest")
+            .create()?;
+
+        // Ensure we start at the head of the topic for new partitions.
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition_offset(input_topic, 0, Offset::Beginning)?;
+        consumer.assign(&tpl)?;
+
+        let processor = Self { consumer, registry };
+        task::spawn(async move {
+            if let Err(e) = processor.run().await {
+                error!("SentimentProcessor crashed: {e}");
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn run(mut self) -> Result<(), ProcessorError> {
+        info!("SentimentProcessor online, waiting for events …");
+        let mut stream = self.consumer.stream();
+        while let Some(res) = stream.next().await {
+            let msg = res?;
+            self.handle_message(&msg).await;
+        }
+        Err(ProcessorError::EndOfStream)
+    }
+
+    async fn handle_message(&self, msg: &BorrowedMessage<'_>) {
+        let payload = match msg.payload_view::<str>() {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
+                error!("UTF-8 error on message: {e}");
+                return;
+            }
+            None => {
+                debug!("skipping message without payload");
+                return;
+            }
+        };
+
+        let strategy = self.registry.get(); // Cheap lock-free clone
+        let res = strategy.analyze(payload);
+        info!(
+            "🔍 [{}] {} → {:?} ({:.2})",
+            strategy.name(),
+            payload,
+            res.polarity,
+            res.confidence
+        );
+        // TODO: publish to another topic / metric system.
+    }
+}
+
+/// Small demonstrator that spins up the processor & live strategy reloader.
+///
+/// Run with:
+/// `RUST_LOG=info cargo run --bin module_7`
+///
+/// Then edit `strategy.json` and watch hot-swap logs.
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> anyhow::Result<()> {
+    env_logger::init();
+
+    let registry = StrategyRegistry::new(Arc::new(VaderStrategy::default()));
+
+    // Spawn the processor (non-blocking).
+    SentimentProcessor::spawn(
+        "localhost:9092",
+        "raw-social-messages",
+        "sentiment-group",
+        registry.clone(),
+    )
+    .await?;
+
+    // Hot-reload loop: check once every 5 s.
+    loop {
+        if let Err(e) = registry.reload_from_path("strategy.json").await {
+            debug!("No strategy reload: {e}");
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+```

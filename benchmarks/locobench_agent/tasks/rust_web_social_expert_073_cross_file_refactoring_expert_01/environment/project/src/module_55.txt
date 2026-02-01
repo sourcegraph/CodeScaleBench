@@ -1,0 +1,364 @@
+```rust
+//! src/module_55.rs
+//!
+//! GDPR-compliant user–data erasure workflow.
+//!
+//! The core API stays lean by persisting the intent to erase a user’s data
+//! and emitting an `DomainEvent::UserErasureApproved { user_id }` event that
+//! asynchronous workers subscribe to (search index removal, cache eviction,
+//! backups scrubbing, etc.).
+//!
+//! 1.  A user creates a deletion ticket (double-opt in).
+//! 2.  The ticket is confirmed (e.g. via e-mail or admin console).
+//! 3.  All downstream consumers receive a single event and perform their part
+//!     of the hard-delete in a time-boxed manner.
+//!
+//! This file focuses on steps 1 & 2 plus event dispatch.
+//!
+//! # Compile Features
+//!
+//! ```toml
+//! [dependencies]
+//! sqlx          = { version = "0.7", features = ["postgres", "runtime-tokio", "uuid"] }
+//! uuid          = { version = "1" }
+//! chrono        = { version = "0.4", features = ["serde"] }
+//! serde         = { version = "1", features = ["derive"] }
+//! async-trait   = "0.1"
+//! thiserror     = "1"
+//! tracing       = "0.1"
+//! ```
+//!
+//! NOTE: Keep the SQL migrations in `migrations/` in sync with the SQL below:
+//!
+//! ```sql
+//! CREATE TYPE erase_request_status AS ENUM ('pending', 'approved', 'rejected');
+//! CREATE TABLE erase_requests (
+//!     id          UUID PRIMARY KEY,
+//!     user_id     UUID NOT NULL,
+//!     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+//!     processed_at TIMESTAMPTZ,
+//!     status      erase_request_status NOT NULL DEFAULT 'pending'
+//! );
+//! ```
+//!
+//! Real brokers like NATS/Kafka/RabbitMQ would live behind `EventBus`.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgRow, PgPool, Row};
+use thiserror::Error;
+use tracing::{error, info, instrument};
+use uuid::Uuid;
+
+/// Domain-level errors surfaced by the service.
+#[derive(Debug, Error)]
+pub enum ErasureError {
+    /// Error originated from the database layer.
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    /// A request with the given id does not exist.
+    #[error("erase request not found: {0}")]
+    NotFound(Uuid),
+
+    /// Invalid state transition attempted, e.g. approving an already approved request.
+    #[error("invalid state transition for request {0}")]
+    InvalidState(Uuid),
+
+    /// Any other error.
+    #[error("internal erasure service error")]
+    Internal,
+}
+
+/// Convenience alias for results returned by the module.
+pub type Result<T> = std::result::Result<T, ErasureError>;
+
+/// The legal state of a GDPR erase request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type, Serialize, Deserialize)]
+#[sqlx(type_name = "erase_request_status", rename_all = "lowercase")]
+pub enum EraseStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+/// Projection of the `erase_requests` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EraseRequest {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub processed_at: Option<DateTime<Utc>>,
+    pub status: EraseStatus,
+}
+
+impl<'r> sqlx::FromRow<'r, PgRow> for EraseRequest {
+    fn from_row(row: &PgRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            user_id: row.try_get("user_id")?,
+            created_at: row.try_get("created_at")?,
+            processed_at: row.try_get("processed_at")?,
+            status: row.try_get("status")?,
+        })
+    }
+}
+
+/// Events published onto the broker.
+///
+/// Downstream micro-services can listen for those and perform any expensive,
+/// potentially long-running tasks (e.g. search index removal, email revocation,
+/// push-notification unsubscriptions, backups purge, etc.).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DomainEvent {
+    /// Signals that a user’s data must be removed from all storages.
+    UserErasureApproved { user_id: Uuid },
+}
+
+/// Abstraction over an async event bus.
+#[async_trait]
+pub trait EventBus: Send + Sync {
+    async fn publish(&self, event: DomainEvent);
+}
+
+/// No-op bus useful in tests or for local single-process deployments.
+pub struct LogEventBus;
+
+#[async_trait]
+impl EventBus for LogEventBus {
+    async fn publish(&self, event: DomainEvent) {
+        info!(?event, "publishing event (stdout)");
+    }
+}
+
+/// Service responsible for GDPR erase requests.
+///
+/// Implements the repository & service layer for better testability.
+#[derive(Clone)]
+pub struct ErasureService<E: EventBus> {
+    pool: PgPool,
+    bus: Arc<E>,
+}
+
+impl<E: EventBus> ErasureService<E> {
+    /// Construct a new service given a DB connection pool and an event bus.
+    pub fn new(pool: PgPool, bus: Arc<E>) -> Self {
+        Self { pool, bus }
+    }
+
+    /// A learner requests full removal of their personal data.
+    ///
+    /// Returns the freshly persisted `EraseRequest`.
+    #[instrument(skip(self))]
+    pub async fn submit_request(&self, user_id: Uuid) -> Result<EraseRequest> {
+        let request_id = Uuid::new_v4();
+        let rec = sqlx::query_as::<_, EraseRequest>(
+            r#"
+            INSERT INTO erase_requests (id, user_id)
+            VALUES ($1, $2)
+            RETURNING *
+            "#,
+        )
+        .bind(request_id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(rec)
+    }
+
+    /// Approve a pending request. Downstream hard-delete kicks in via event.
+    ///
+    /// Emits `DomainEvent::UserErasureApproved { user_id }`.
+    #[instrument(skip(self))]
+    pub async fn approve_request(&self, request_id: Uuid) -> Result<EraseRequest> {
+        let mut tx = self.pool.begin().await?;
+
+        // Validate state & transition.
+        let current: Option<EraseRequest> = sqlx::query_as(
+            r#"
+            SELECT * FROM erase_requests
+            WHERE id = $1 FOR UPDATE
+            "#,
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let mut current = match current {
+            Some(rec) => rec,
+            None => return Err(ErasureError::NotFound(request_id)),
+        };
+
+        if current.status != EraseStatus::Pending {
+            return Err(ErasureError::InvalidState(request_id));
+        }
+
+        current.status = EraseStatus::Approved;
+        current.processed_at = Some(Utc::now());
+
+        // Persist changes.
+        let updated: EraseRequest = sqlx::query_as(
+            r#"
+            UPDATE erase_requests
+            SET status = 'approved', processed_at = NOW()
+            WHERE id = $1
+            RETURNING *
+            "#,
+        )
+        .bind(request_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        // Fire-and-forget event. We do not propagate bus errors upwards to keep
+        // transactional guarantees on DB independent of broker availability.
+        let user_id = updated.user_id;
+        let event = DomainEvent::UserErasureApproved { user_id };
+        self.bus.publish(event).await;
+
+        Ok(updated)
+    }
+
+    /// Reject a request (e.g. user revokes the deletion or legal reasons).
+    #[instrument(skip(self))]
+    pub async fn reject_request(&self, request_id: Uuid) -> Result<EraseRequest> {
+        let mut tx = self.pool.begin().await?;
+
+        let current: Option<EraseRequest> = sqlx::query_as(
+            r#"
+            SELECT * FROM erase_requests
+            WHERE id = $1 FOR UPDATE
+            "#,
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let mut current = match current {
+            Some(rec) => rec,
+            None => return Err(ErasureError::NotFound(request_id)),
+        };
+
+        if current.status != EraseStatus::Pending {
+            return Err(ErasureError::InvalidState(request_id));
+        }
+
+        current.status = EraseStatus::Rejected;
+        current.processed_at = Some(Utc::now());
+
+        let updated: EraseRequest = sqlx::query_as(
+            r#"
+            UPDATE erase_requests
+            SET status = 'rejected', processed_at = NOW()
+            WHERE id = $1
+            RETURNING *
+            "#,
+        )
+        .bind(request_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(updated)
+    }
+
+    /// Retrieve a single request or `None` if it does not exist.
+    pub async fn get_request(&self, request_id: Uuid) -> std::result::Result<Option<EraseRequest>, sqlx::Error> {
+        let rec = sqlx::query_as::<_, EraseRequest>(
+            "SELECT * FROM erase_requests WHERE id = $1",
+        )
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(rec)
+    }
+
+    /// List requests, optionally filtered by `status`.
+    pub async fn list_requests(
+        &self,
+        status: Option<EraseStatus>,
+        limit: i64,
+        offset: i64,
+    ) -> std::result::Result<Vec<EraseRequest>, sqlx::Error> {
+        let query = match status {
+            Some(_) => "
+                SELECT * FROM erase_requests
+                WHERE status = $1
+                ORDER BY created_at DESC
+                LIMIT $2 OFFSET $3",
+            None => "
+                SELECT * FROM erase_requests
+                ORDER BY created_at DESC
+                LIMIT $1 OFFSET $2",
+        };
+
+        let rows = if let Some(status) = status {
+            sqlx::query_as::<_, EraseRequest>(query)
+                .bind(status)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            sqlx::query_as::<_, EraseRequest>(query)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+        };
+
+        Ok(rows)
+    }
+}
+
+/// Example of wiring the service into the outer application layer.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::{Connection, Executor, PgConnection};
+
+    struct TestBus;
+    #[async_trait]
+    impl EventBus for TestBus {
+        async fn publish(&self, event: DomainEvent) {
+            info!("test bus published: {:?}", event);
+        }
+    }
+
+    async fn setup_db() -> PgPool {
+        // Spin up a temporary in-memory Postgres or use a test container.
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/edupulse_test".into());
+
+        let mut conn = PgConnection::connect(&url).await.unwrap();
+        // Clean table between tests.
+        conn.execute("TRUNCATE TABLE erase_requests").await.unwrap();
+        drop(conn);
+
+        PgPool::connect(&url).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn roundtrip_submit_and_approve() {
+        let pool = setup_db().await;
+        let bus = Arc::new(TestBus);
+        let service = ErasureService::new(pool, bus);
+
+        let user_id = Uuid::new_v4();
+        let req = service.submit_request(user_id).await.unwrap();
+        assert_eq!(req.status, EraseStatus::Pending);
+
+        let approved = service.approve_request(req.id).await.unwrap();
+        assert_eq!(approved.status, EraseStatus::Approved);
+        assert!(approved.processed_at.is_some());
+    }
+}
+```

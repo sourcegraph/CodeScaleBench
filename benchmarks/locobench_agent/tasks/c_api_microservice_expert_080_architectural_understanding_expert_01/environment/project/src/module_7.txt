@@ -1,0 +1,474 @@
+```c
+/***********************************************************************
+ * MercuryMonolith Commerce Hub
+ * Module: Response Cache (In-Memory LRU with TTL)
+ *
+ * File:    src/module_7.txt   (built as part of libmmcache.a)
+ * Language: C11
+ *
+ * Description:
+ *   Shared, thread-safe response cache used by REST/GraphQL gateway
+ *   handlers.  Provides:
+ *     • O(1) get/put via hash map (uthash)
+ *     • LRU eviction & per-entry TTL
+ *     • Event-bus subscription for transparent invalidation
+ *     • Prometheus-compatible statistics
+ *
+ *   All public symbols are prefixed with ‘mm_cache_’ to avoid clashes.
+ *
+ * Build:
+ *   Requires ‑pthread and uthash.h in include path.
+ ***********************************************************************/
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <pthread.h>
+#include <time.h>
+#include "uthash.h"          /* https://troydhanson.github.io/uthash/ */
+#include "mm_logger.h"       /* project logging abstraction           */
+#include "mm_monitor.h"      /* metrics registry                      */
+#include "mm_event_bus.h"    /* pub/sub event bus                     */
+
+#define MM_CACHE_KEY_MAX          256
+#define MM_CACHE_DEFAULT_CAPACITY 1024U
+#define MM_CACHE_DEFAULT_TTL_MS   (60 * 1000U) /* 1 minute */
+
+/* -------------------- Internal helpers ---------------------------------- */
+
+static uint64_t
+epoch_millis(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+static inline void
+sleep_millis(uint32_t ms)
+{
+    struct timespec ts = {
+        .tv_sec  = ms / 1000,
+        .tv_nsec = (ms % 1000) * 1000000UL
+    };
+    nanosleep(&ts, NULL);
+}
+
+/* -------------------- Cache Entry / Container --------------------------- */
+
+typedef struct mm_cache_entry
+{
+    char            key[MM_CACHE_KEY_MAX];
+    void           *data;           /* deep-copied opaque payload          */
+    size_t          size;
+    uint64_t        expire_at;      /* epoch millis                        */
+
+    /* LRU doubly-linked list */
+    struct mm_cache_entry *prev;
+    struct mm_cache_entry *next;
+
+    UT_hash_handle   hh;            /* makes this structure hashable       */
+} mm_cache_entry_t;
+
+typedef struct mm_cache_stats
+{
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    uint64_t expirations;
+} mm_cache_stats_t;
+
+typedef struct mm_cache
+{
+    mm_cache_entry_t *map;      /* uthash hash table root                */
+    mm_cache_entry_t *head;     /* most recently used                    */
+    mm_cache_entry_t *tail;     /* least recently used                   */
+
+    size_t            capacity; /* max #entries                          */
+    uint32_t          default_ttl_ms;
+
+    mm_cache_stats_t  stats;
+
+    pthread_rwlock_t  rwlock;   /* writer: put/invalidate; reader: get   */
+
+    /* Prometheus handles (opaque to us) */
+    mm_metric_t *metrics_hits;
+    mm_metric_t *metrics_misses;
+    mm_metric_t *metrics_evictions;
+    mm_metric_t *metrics_size;
+
+    /* Event-bus subscription token */
+    mm_subscription_t sub;
+} mm_cache_t;
+
+/* -------------------- Forward declarations ------------------------------ */
+
+static void mm_cache_evict_lru(mm_cache_t *c);
+static void mm_cache_prom_update(mm_cache_t *c);
+
+/* -------------------- API ------------------------------------------------ */
+
+mm_cache_t *
+mm_cache_create(size_t capacity, uint32_t default_ttl_ms)
+{
+    mm_cache_t *c = calloc(1, sizeof(*c));
+    if (!c) {
+        mm_log_error("cache: allocation failure");
+        return NULL;
+    }
+
+    c->capacity        = capacity     ? capacity     : MM_CACHE_DEFAULT_CAPACITY;
+    c->default_ttl_ms  = default_ttl_ms ? default_ttl_ms : MM_CACHE_DEFAULT_TTL_MS;
+    pthread_rwlock_init(&c->rwlock, NULL);
+
+    /* Register Prometheus counters */
+    c->metrics_hits      = mm_monitor_counter("response_cache_hits_total",
+                                              "Total number of cache hits");
+    c->metrics_misses    = mm_monitor_counter("response_cache_misses_total",
+                                              "Total number of cache misses");
+    c->metrics_evictions = mm_monitor_counter("response_cache_evictions_total",
+                                              "Total number of cache evictions");
+    c->metrics_size      = mm_monitor_gauge("response_cache_entries",
+                                            "Current number of cache entries");
+
+    /* Subscribe to invalidation events */
+    c->sub = mm_event_bus_subscribe("ENTITY_UPDATED", /* wildcard topic */
+                                    (mm_event_cb_t)mm_cache_invalidate,
+                                    c /* user data */);
+
+    mm_log_info("cache: initialized (capacity=%zu, default_ttl=%ums)",
+                c->capacity, c->default_ttl_ms);
+
+    return c;
+}
+
+void
+mm_cache_destroy(mm_cache_t *c)
+{
+    if (!c) return;
+
+    mm_event_bus_unsubscribe(c->sub);
+
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    mm_cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, c->map, cur, tmp) {
+        HASH_DEL(c->map, cur);
+        free(cur->data);
+        free(cur);
+    }
+
+    pthread_rwlock_unlock(&c->rwlock);
+    pthread_rwlock_destroy(&c->rwlock);
+
+    mm_log_info("cache: destroyed");
+    free(c);
+}
+
+static void
+lru_move_to_front(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    if (c->head == e) return;            /* already front */
+
+    /* Detach from list */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->tail == e) c->tail  = e->prev;
+
+    /* Insert at front */
+    e->prev  = NULL;
+    e->next  = c->head;
+    if (c->head) c->head->prev = e;
+    c->head = e;
+
+    if (!c->tail) c->tail = e;
+}
+
+static void
+lru_append_front(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    e->prev = NULL;
+    e->next = c->head;
+    if (c->head) c->head->prev = e;
+    c->head = e;
+    if (!c->tail) c->tail = e;
+}
+
+static int
+internal_put(mm_cache_t     *c,
+             const char     *key,
+             const void     *data,
+             size_t          size,
+             uint32_t        ttl_ms)
+{
+    mm_cache_entry_t *e;
+
+    HASH_FIND_STR(c->map, key, e);
+    if (e) {
+        /* Replace existing entry */
+        free(e->data);
+        e->data      = malloc(size);
+        if (!e->data) return -1;
+        memcpy(e->data, data, size);
+        e->size      = size;
+        e->expire_at = epoch_millis() + ttl_ms;
+        lru_move_to_front(c, e);
+        return 0;
+    }
+
+    if (HASH_COUNT(c->map) >= c->capacity) {
+        mm_cache_evict_lru(c);
+    }
+
+    e = calloc(1, sizeof(*e));
+    if (!e) return -1;
+
+    strlcpy(e->key, key, sizeof(e->key));
+    e->data      = malloc(size);
+    if (!e->data) { free(e); return -1; }
+    memcpy(e->data, data, size);
+    e->size      = size;
+    e->expire_at = epoch_millis() + ttl_ms;
+
+    HASH_ADD_STR(c->map, key, e);
+    lru_append_front(c, e);
+    return 0;
+}
+
+int
+mm_cache_put(mm_cache_t      *c,
+             const char      *key,
+             const void      *data,
+             size_t           size,
+             uint32_t         ttl_ms)     /* 0 => use default */
+{
+    if (!c || !key || !data || size == 0) return -1;
+    if (strlen(key) >= MM_CACHE_KEY_MAX)  return -1;
+
+    pthread_rwlock_wrlock(&c->rwlock);
+    int rc = internal_put(c, key, data, size,
+                          ttl_ms ? ttl_ms : c->default_ttl_ms);
+    pthread_rwlock_unlock(&c->rwlock);
+
+    mm_cache_prom_update(c);
+    return rc;
+}
+
+int
+mm_cache_get(mm_cache_t   *c,
+             const char   *key,
+             void        **data_out,
+             size_t       *size_out)
+{
+    if (!c || !key || !data_out || !size_out) return -1;
+
+    pthread_rwlock_rdlock(&c->rwlock);
+
+    mm_cache_entry_t *e;
+    HASH_FIND_STR(c->map, key, e);
+    if (!e) {
+        c->stats.misses++;
+        mm_monitor_inc(c->metrics_misses, 1);
+        pthread_rwlock_unlock(&c->rwlock);
+        return 1; /* not found */
+    }
+
+    uint64_t now = epoch_millis();
+    if (e->expire_at <= now) {
+        /* stale; promote to writer lock for eviction */
+        pthread_rwlock_unlock(&c->rwlock);
+        pthread_rwlock_wrlock(&c->rwlock);
+
+        HASH_FIND_STR(c->map, key, e);   /* re-validate after lock upgrade */
+        if (e) {                         /* still exists? */
+            c->stats.expirations++;
+            HASH_DEL(c->map, e);
+            if (e->prev) e->prev->next = e->next;
+            if (e->next) e->next->prev = e->prev;
+            if (c->head == e) c->head = e->next;
+            if (c->tail == e) c->tail = e->prev;
+            free(e->data);
+            free(e);
+        }
+        pthread_rwlock_unlock(&c->rwlock);
+        mm_cache_prom_update(c);
+        return 1; /* treat as miss */
+    }
+
+    /* Hit */
+    *data_out = malloc(e->size);
+    if (!*data_out) {
+        pthread_rwlock_unlock(&c->rwlock);
+        return -1;
+    }
+    memcpy(*data_out, e->data, e->size);
+    *size_out = e->size;
+
+    c->stats.hits++;
+    mm_monitor_inc(c->metrics_hits, 1);
+
+    /* Need writer lock to update LRU order */
+    pthread_rwlock_unlock(&c->rwlock);
+    pthread_rwlock_wrlock(&c->rwlock);
+    HASH_FIND_STR(c->map, key, e); /* re-locate */
+    if (e) lru_move_to_front(c, e);
+    pthread_rwlock_unlock(&c->rwlock);
+
+    return 0;
+}
+
+void
+mm_cache_invalidate(mm_cache_t *c, const char *key /* may be NULL */)
+{
+    if (!c) return;
+
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    if (!key) {
+        /* flush entire cache */
+        mm_cache_entry_t *cur, *tmp;
+        HASH_ITER(hh, c->map, cur, tmp) {
+            HASH_DEL(c->map, cur);
+            free(cur->data);
+            free(cur);
+        }
+        c->head = c->tail = NULL;
+        mm_log_debug("cache: flushed by event");
+    } else {
+        mm_cache_entry_t *e;
+        HASH_FIND_STR(c->map, key, e);
+        if (e) {
+            HASH_DEL(c->map, e);
+            if (e->prev) e->prev->next = e->next;
+            if (e->next) e->next->prev = e->prev;
+            if (c->head == e) c->head = e->next;
+            if (c->tail == e) c->tail = e->prev;
+            free(e->data);
+            free(e);
+            mm_log_debug("cache: invalidated key=%s", key);
+        }
+    }
+
+    pthread_rwlock_unlock(&c->rwlock);
+    mm_cache_prom_update(c);
+}
+
+void
+mm_cache_clear(mm_cache_t *c)
+{
+    mm_cache_invalidate(c, NULL);
+}
+
+mm_cache_stats_t
+mm_cache_stats(mm_cache_t *c)
+{
+    pthread_rwlock_rdlock(&c->rwlock);
+    mm_cache_stats_t s = c->stats;
+    pthread_rwlock_unlock(&c->rwlock);
+    return s;
+}
+
+/* -------------------- Internal impl ------------------------------------- */
+
+static void
+mm_cache_evict_lru(mm_cache_t *c)
+{
+    if (!c || !c->tail) return;
+
+    mm_cache_entry_t *victim = c->tail;
+    HASH_DEL(c->map, victim);
+
+    if (victim->prev) victim->prev->next = NULL;
+    c->tail = victim->prev;
+    if (c->head == victim) c->head = NULL;
+
+    free(victim->data);
+    free(victim);
+
+    c->stats.evictions++;
+    mm_monitor_inc(c->metrics_evictions, 1);
+
+    mm_log_debug("cache: lru eviction performed");
+}
+
+static void
+mm_cache_prom_update(mm_cache_t *c)
+{
+    mm_monitor_set(c->metrics_size, (double)HASH_COUNT(c->map));
+}
+
+/* -------------------- Background janitor thread ------------------------- */
+
+#define SWEEP_INTERVAL_MS 5000U
+
+static void *
+janitor_thread(void *arg)
+{
+    mm_cache_t *c = arg;
+    while (true) {
+        sleep_millis(SWEEP_INTERVAL_MS);
+
+        pthread_rwlock_wrlock(&c->rwlock);
+
+        uint64_t now = epoch_millis();
+        mm_cache_entry_t *cur, *tmp;
+        HASH_ITER(hh, c->map, cur, tmp) {
+            if (cur->expire_at <= now) {
+                HASH_DEL(c->map, cur);
+                if (cur->prev) cur->prev->next = cur->next;
+                if (cur->next) cur->next->prev = cur->prev;
+                if (c->head == cur) c->head = cur->next;
+                if (c->tail == cur) c->tail = cur->prev;
+                free(cur->data);
+                free(cur);
+                c->stats.expirations++;
+            }
+        }
+        pthread_rwlock_unlock(&c->rwlock);
+        mm_cache_prom_update(c);
+    }
+    return NULL;
+}
+
+void
+mm_cache_start_janitor(mm_cache_t *c)
+{
+    pthread_t tid;
+    int rc = pthread_create(&tid, NULL, janitor_thread, c);
+    if (rc == 0) {
+        pthread_detach(tid);
+        mm_log_info("cache: janitor thread started");
+    } else {
+        mm_log_error("cache: failed to start janitor (%d)", rc);
+    }
+}
+
+/* -------------------- strlcpy shim (BSD) -------------------------------- */
+
+#ifndef HAVE_STRLCPY
+static size_t
+strlcpy(char *dst, const char *src, size_t dsize)
+{
+    const char *osrc = src;
+    size_t nleft = dsize;
+
+    if (nleft != 0) {
+        while (--nleft != 0) {
+            if ((*dst++ = *src++) == '\0')
+                break;
+        }
+    }
+
+    if (nleft == 0) {
+        if (dsize != 0)
+            *dst = '\0';
+        while (*src++)
+            ;
+    }
+
+    return (size_t)(src - osrc - 1);
+}
+#endif /* HAVE_STRLCPY */
+```

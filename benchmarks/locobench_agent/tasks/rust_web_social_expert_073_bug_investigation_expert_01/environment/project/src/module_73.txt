@@ -1,0 +1,279 @@
+```rust
+//! src/module_73.rs  –  Event abstractions + NATS implementation
+//!
+//! This module contains a small, but production-ready event framework used by
+//! EduPulse Live.  It defines
+//!   • a canonical metadata envelope (`EventEnvelope<T>`)
+//!   • traits for publish / subscribe
+//!   • a NATS streaming implementation that is used by multiple micro-services
+//!
+//! Rationale
+//! ---------
+//! Centralising this logic keeps all services consistent with respect to
+//!   • event naming
+//!   • correlation / causation IDs
+//!   • tenant scoping
+//!   • (de)serialisation contracts
+//!
+//! Dependencies (Cargo.toml excerpt)
+//! ---------------------------------
+//! [dependencies]
+//! async-nats = "0.34"
+//! async-trait = "0.1"
+//! chrono = { version = "0.4", features = ["serde"] }
+//! serde = { version = "1.0", features = ["derive"] }
+//! serde_json = "1.0"
+//! thiserror = "1.0"
+//! tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }
+//! tracing = "0.1"
+//! uuid = { version = "1", features = ["serde", "v4"] }
+
+use async_nats::{Client, ConnectOptions};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::value::RawValue;
+use std::{fmt::Debug, sync::Arc};
+use thiserror::Error;
+use tracing::{error, info};
+use uuid::Uuid;
+
+/// Domain events emitted by the EduPulse Live core must implement this marker trait.
+///
+/// The trait purposefully uses blanket implementations—any serialisable struct that
+/// exposes a static event name/ version qualifies.
+pub trait DomainEvent: Serialize + DeserializeOwned + Send + Sync + Debug + 'static {
+    /// Human-readable name, e.g. `"student.quiz_submitted"`.
+    const EVENT_NAME: &'static str;
+
+    /// Semver-compatible version string, incremented on breaking payload changes.
+    const EVENT_VERSION: &'static str = "1.0.0";
+}
+
+/// Metadata attached to every envelope to guarantee traceability & multi-tenancy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventMeta {
+    /// UUID v4 random identifier for at-least-once de-duplication.
+    pub id: Uuid,
+    /// Correlates multiple events caused by the same end-user interaction.
+    pub correlation_id: Option<Uuid>,
+    /// Identifies the concrete operation that triggered this event.
+    pub causation_id: Option<Uuid>,
+    /// Multi-tenant isolation – `None` for public / system events.
+    pub tenant_id: Option<String>,
+    /// UTC timestamp when the event was created.
+    pub occurred_at: DateTime<Utc>,
+}
+
+impl Default for EventMeta {
+    fn default() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            correlation_id: None,
+            causation_id: None,
+            tenant_id: None,
+            occurred_at: Utc::now(),
+        }
+    }
+}
+
+/// An envelope combines meta information with an arbitrary, strongly-typed payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope<T: DomainEvent> {
+    /// Meta information required by the platform infrastructure.
+    pub meta: EventMeta,
+    /// The actual domain payload (lesson published, quiz submitted, …).
+    pub payload: T,
+}
+
+impl<T> EventEnvelope<T>
+where
+    T: DomainEvent,
+{
+    /// Convert envelope into wire format (JSON).
+    pub fn to_bytes(&self) -> Result<Vec<u8>, EventError> {
+        serde_json::to_vec(self).map_err(EventError::serialization)
+    }
+
+    /// Reverse operation of [`Self::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, EventError> {
+        serde_json::from_slice(bytes).map_err(EventError::deserialization)
+    }
+
+    /// Returns a composite subject string for topic-based routing in NATS:
+    /// `tenant.<tenant>|public.EVENT_NAME.EVENT_VERSION`
+    pub fn subject(&self) -> String {
+        match &self.meta.tenant_id {
+            Some(tenant) => format!(
+                "tenant.{}.{}.{}",
+                tenant,
+                T::EVENT_NAME,
+                T::EVENT_VERSION.replace('.', "_")
+            ),
+            None => format!("public.{}.{}", T::EVENT_NAME, T::EVENT_VERSION.replace('.', "_")),
+        }
+    }
+}
+
+/// Runtime errors originating from the event layer.
+#[derive(Debug, Error)]
+pub enum EventError {
+    #[error("serialization failure: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("NATS I/O error: {0}")]
+    Nats(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl EventError {
+    fn serialization(err: serde_json::Error) -> Self {
+        EventError::Serialization(err)
+    }
+
+    fn deserialization(err: serde_json::Error) -> Self {
+        EventError::Serialization(err)
+    }
+}
+
+/// Contract for publishing events to a broker.
+/// Use an async trait for ease-of-use inside `tokio` heavy services.
+#[async_trait]
+pub trait EventPublisher: Send + Sync + 'static {
+    /// Publishes a single envelope to its natural subject.
+    async fn publish<T>(&self, envelope: &EventEnvelope<T>) -> Result<(), EventError>
+    where
+        T: DomainEvent;
+
+    /// Convenience wrapper that builds envelope with default meta.
+    async fn publish_event<T>(&self, payload: T, tenant_id: Option<String>) -> Result<(), EventError>
+    where
+        T: DomainEvent,
+    {
+        let envelope = EventEnvelope {
+            meta: EventMeta {
+                tenant_id,
+                ..Default::default()
+            },
+            payload,
+        };
+        self.publish(&envelope).await
+    }
+}
+
+/// NATS.io implementation for the `EventPublisher` trait.
+/// Internally uses `async-nats` (core) without JetStream. If JetStream is
+/// preferred, the code can be adjusted with minimal effort.
+#[derive(Clone)]
+pub struct NatsEventPublisher {
+    nats: Arc<Client>,
+}
+
+impl NatsEventPublisher {
+    /// Connects to the cluster with basic TLS & auth. Connection pooling is managed by the
+    /// underlying `async-nats` client (cheap `Arc` clones).
+    pub async fn connect_with_options(
+        nats_uri: &str,
+        opts: ConnectOptions,
+    ) -> Result<Self, EventError> {
+        let client = opts.connect(nats_uri).await.map_err(|e| EventError::Nats(e.into()))?;
+        Ok(Self {
+            nats: Arc::new(client),
+        })
+    }
+
+    /// Convenience helper for anonymous local dev.
+    pub async fn connect(nats_uri: &str) -> Result<Self, EventError> {
+        Self::connect_with_options(nats_uri, ConnectOptions::new()).await
+    }
+}
+
+#[async_trait]
+impl EventPublisher for NatsEventPublisher {
+    async fn publish<T>(&self, envelope: &EventEnvelope<T>) -> Result<(), EventError>
+    where
+        T: DomainEvent,
+    {
+        let subject = envelope.subject();
+        let bytes = envelope.to_bytes()?;
+        self.nats
+            .publish(subject.clone(), bytes.into())
+            .await
+            .map_err(|e| EventError::Nats(e.into()))?;
+
+        info!(
+            event_id = %envelope.meta.id,
+            event = T::EVENT_NAME,
+            subject = %subject,
+            "event published"
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Example domain payloads
+// ---------------------------------------------------------------------------
+
+/// Event emitted whenever a teacher publishes a new lesson into a course.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LessonPublished {
+    pub lesson_id: Uuid,
+    pub course_id: Uuid,
+    pub teacher_id: Uuid,
+    pub title: String,
+    pub slug: String,
+}
+
+impl DomainEvent for LessonPublished {
+    const EVENT_NAME: &'static str = "lesson.published";
+    const EVENT_VERSION: &'static str = "1.0.0";
+}
+
+/// Event emitted when a student replies to a "learning pulse".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseResponded {
+    pub pulse_id: Uuid,
+    pub student_id: Uuid,
+    pub attached_file_urls: Vec<String>,
+    pub textual_answer: Option<String>,
+}
+
+impl DomainEvent for PulseResponded {
+    const EVENT_NAME: &'static str = "pulse.responded";
+    const EVENT_VERSION: &'static str = "1.2.0";
+}
+
+// ---------------------------------------------------------------------------
+// Integration test (requires running NATS server on localhost:4222)
+// To run: `cargo test -p web_social -- module_73::it_publish_roundtrip`
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{sleep, Duration};
+
+    #[tokio::test]
+    #[ignore = "requires local nats server"]
+    async fn it_publish_roundtrip() -> anyhow::Result<()> {
+        let publisher = NatsEventPublisher::connect("nats://127.0.0.1:4222").await?;
+
+        // Build a simple payload
+        let payload = LessonPublished {
+            lesson_id: Uuid::new_v4(),
+            course_id: Uuid::new_v4(),
+            teacher_id: Uuid::new_v4(),
+            title: "Rust Advanced Lifetimes".into(),
+            slug: "rust-advanced-lifetimes".into(),
+        };
+
+        // Publish the event
+        publisher
+            .publish_event(payload, Some("acme_university".into()))
+            .await?;
+
+        // Allow I/O to flush (only needed for tests)
+        sleep(Duration::from_millis(200)).await;
+        Ok(())
+    }
+}
+```

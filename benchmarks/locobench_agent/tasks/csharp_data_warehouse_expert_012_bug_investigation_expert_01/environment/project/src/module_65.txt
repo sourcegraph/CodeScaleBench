@@ -1,0 +1,494 @@
+```csharp
+// -----------------------------------------------------------------------------
+//  File:        module_65.txt  (logical C# source file)
+//  Project:     PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//  Description: Shared transformation engine & strategies for converting raw
+//               WorkActivityEvent records into normalized MetricDataPoint(s).
+//               Demonstrates Strategy-, Pipeline- and Observer-Patterns,
+//               asynchronous data-flow, structured logging, and resilience.
+//  -----------------------------------------------------------------------------
+//  NOTE: This is a single-file delivery for brevity.  In the real repository
+//        the types would be split into discrete files/namespaces.
+//
+//  External NuGet dependencies assumed:
+//
+//      <PackageReference Include="Serilog" Version="2.*" />
+//      <PackageReference Include="Serilog.Sinks.Console" Version="4.*" />
+//      <PackageReference Include="System.Threading.Tasks.Dataflow" Version="6.*" />
+//      <PackageReference Include="System.Text.Json" Version="7.*" />
+//
+// -----------------------------------------------------------------------------
+
+#nullable enable
+using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Threading.Tasks.Dataflow;
+using Serilog;
+
+namespace PulseOps.Warehouse.Transformations
+{
+    // -------------------------------------------------------------------------
+    //  Domain primitives
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Logical activity categories arriving from the ingestion layer.
+    /// </summary>
+    public enum ActivityType
+    {
+        Unknown  = 0,
+        Meeting  = 1,
+        Focus    = 2,
+        Break    = 3,
+        Coding   = 4,
+        Review   = 5
+    }
+
+    /// <summary>
+    /// Canonical event record produced by the ingestion Lambda(s).
+    /// Represents a single contiguous block of work a user performed.
+    /// </summary>
+    /// <param name="UserId">Opaque identifier for the user (hashed e-mail).</param>
+    /// <param name="StartUtc">Inclusive start timestamp.</param>
+    /// <param name="EndUtc">Exclusive end timestamp.</param>
+    /// <param name="Activity">High-level category of activity.</param>
+    /// <param name="Metadata">
+    /// Additional JSON metadata produced by the source system
+    /// (e.g. Zoom/Teams meeting payload, GitHub commit info, etc.).
+    /// </param>
+    public sealed record WorkActivityEvent(
+        string                  UserId,
+        DateTimeOffset          StartUtc,
+        DateTimeOffset          EndUtc,
+        ActivityType            Activity,
+        string?                 Metadata = null)
+    {
+        public TimeSpan Duration => EndUtc - StartUtc;
+    }
+
+    /// <summary>
+    /// Normalized metric datapoint emitted by transformation strategies.
+    /// </summary>
+    public sealed record MetricDataPoint(
+        string                      UserId,
+        string                      MetricName,
+        double                      Value,
+        DateTimeOffset              Timestamp,
+        IReadOnlyDictionary<string, string> Dimensions);
+
+    // -------------------------------------------------------------------------
+    //  Contracts for transformation pipeline
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Computes metrics from a WorkActivityEvent.
+    /// Adheres to the Strategy pattern for plug-n-play business logic.
+    /// </summary>
+    public interface IMetricComputationStrategy
+    {
+        /// <summary>
+        /// Returns <c>true</c> if this strategy can handle the given event.
+        /// </summary>
+        bool CanHandle(in WorkActivityEvent workEvent);
+
+        /// <summary>
+        /// Performs the metric computation.
+        /// May emit zero or more MetricDataPoint records.
+        /// </summary>
+        ValueTask<IReadOnlyCollection<MetricDataPoint>> ComputeAsync(
+            WorkActivityEvent workEvent,
+            CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Consumer of computed metrics — e.g. Kinesis Firehose, CloudWatch, Prometheus.
+    /// </summary>
+    public interface IMetricSink
+    {
+        Task WriteAsync(
+            IReadOnlyCollection<MetricDataPoint> metrics,
+            CancellationToken                    cancellationToken = default);
+    }
+
+    // -------------------------------------------------------------------------
+    //  Concrete strategies
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Strategy that emits raw focus-time minutes for Focus activities.
+    /// Additional ratio aggregation is done downstream in Athena/QuickSight.
+    /// </summary>
+    public sealed class FocusTimeStrategy : IMetricComputationStrategy
+    {
+        private static readonly MetricDataPoint[] Empty = Array.Empty<MetricDataPoint>();
+
+        public bool CanHandle(in WorkActivityEvent workEvent)
+            => workEvent.Activity == ActivityType.Focus;
+
+        public ValueTask<IReadOnlyCollection<MetricDataPoint>> ComputeAsync(
+            WorkActivityEvent workEvent,
+            CancellationToken cancellationToken = default)
+        {
+            double minutes = workEvent.Duration.TotalMinutes;
+
+            if (minutes <= 0)
+            {
+                return ValueTask.FromResult<IReadOnlyCollection<MetricDataPoint>>(Empty);
+            }
+
+            var dp = new MetricDataPoint(
+                workEvent.UserId,
+                MetricName: "focus_time_minutes",
+                Value: Math.Round(minutes, 2, MidpointRounding.AwayFromZero),
+                Timestamp: workEvent.EndUtc,
+                Dimensions: new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["activity_type"] = workEvent.Activity.ToString()
+                });
+
+            return ValueTask.FromResult<IReadOnlyCollection<MetricDataPoint>>(
+                new[] { dp });
+        }
+    }
+
+    /// <summary>
+    /// Strategy that calculates the total cost of a meeting based on its
+    /// duration and participants’ assumed hourly rate injected through metadata.
+    /// </summary>
+    public sealed class MeetingCostIndexStrategy : IMetricComputationStrategy
+    {
+        private static readonly MetricDataPoint[] Empty = Array.Empty<MetricDataPoint>();
+
+        private readonly double _defaultHourlyRateUsd;
+
+        public MeetingCostIndexStrategy(double defaultHourlyRateUsd = 75)
+        {
+            if (defaultHourlyRateUsd <= 0)
+                throw new ArgumentOutOfRangeException(
+                    nameof(defaultHourlyRateUsd),
+                    "Hourly rate must be positive.");
+
+            _defaultHourlyRateUsd = defaultHourlyRateUsd;
+        }
+
+        public bool CanHandle(in WorkActivityEvent workEvent)
+            => workEvent.Activity == ActivityType.Meeting;
+
+        public async ValueTask<IReadOnlyCollection<MetricDataPoint>> ComputeAsync(
+            WorkActivityEvent workEvent,
+            CancellationToken cancellationToken = default)
+        {
+            // Guard against malformed events early; no metrics emitted.
+            if (workEvent.Duration <= TimeSpan.Zero)
+                return Empty;
+
+            // Extract meeting metadata (participants, rate override, etc.)
+            int participantCount = 0;
+            double? hourlyRateOverride = null;
+
+            if (!string.IsNullOrWhiteSpace(workEvent.Metadata))
+            {
+                try
+                {
+                    var meetingMeta = JsonSerializer.Deserialize<MeetingMetadata>(
+                        workEvent.Metadata,
+                        SerializerOptions.Default);
+
+                    if (meetingMeta is not null)
+                    {
+                        participantCount   = meetingMeta.ParticipantCount ?? participantCount;
+                        hourlyRateOverride = meetingMeta.HourlyRateUsd;
+                    }
+                }
+                catch (JsonException ex)
+                {
+                    Log.Warning(
+                        ex,
+                        "Failed to deserialize meeting metadata for event {EventId}. Raw: {Raw}",
+                        workEvent.GetHashCode(),
+                        workEvent.Metadata);
+                }
+            }
+
+            participantCount = Math.Max(participantCount, 1); // At least one person.
+            double hourlyRate = hourlyRateOverride ?? _defaultHourlyRateUsd;
+
+            double costUsd = participantCount *
+                             hourlyRate *
+                             workEvent.Duration.TotalHours;
+
+            var dp = new MetricDataPoint(
+                workEvent.UserId,
+                MetricName: "meeting_cost_usd",
+                Value: Math.Round(costUsd, 2, MidpointRounding.AwayFromZero),
+                Timestamp: workEvent.EndUtc,
+                Dimensions: new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["participant_count"] = participantCount.ToString(CultureInfo.InvariantCulture),
+                    ["hourly_rate"]       = hourlyRate.ToString("F2", CultureInfo.InvariantCulture)
+                });
+
+            return new[] { dp };
+        }
+
+        // Internal DTO to map metadata JSON.
+        private sealed record MeetingMetadata
+        {
+            [JsonPropertyName("participantCount")]
+            public int?   ParticipantCount { get; init; }
+
+            [JsonPropertyName("hourlyRateUsd")]
+            public double? HourlyRateUsd   { get; init; }
+        }
+
+        // Re-usable serializer options.
+        private static class SerializerOptions
+        {
+            public static readonly JsonSerializerOptions Default = new()
+            {
+                PropertyNameCaseInsensitive = true,
+                AllowTrailingCommas         = true,
+                ReadCommentHandling         = JsonCommentHandling.Skip
+            };
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    //  Utilities
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Registry for fast lookup of the first matching strategy.
+    /// </summary>
+    public sealed class StrategyRegistry
+    {
+        private readonly ImmutableArray<IMetricComputationStrategy> _strategies;
+
+        public StrategyRegistry(IEnumerable<IMetricComputationStrategy> strategies)
+        {
+            _strategies = strategies is ImmutableArray<IMetricComputationStrategy> arr
+                        ? arr
+                        : strategies.ToImmutableArray();
+
+            if (_strategies.IsDefaultOrEmpty)
+                throw new ArgumentException(
+                    "Strategy collection cannot be empty.",
+                    nameof(strategies));
+        }
+
+        public bool TryResolve(
+            WorkActivityEvent            workEvent,
+            [NotNullWhen(true)]
+            out IMetricComputationStrategy? strategy)
+        {
+            foreach (var strat in _strategies)
+            {
+                if (strat.CanHandle(workEvent))
+                {
+                    strategy = strat;
+                    return true;
+                }
+            }
+
+            strategy = null;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// In-memory metric sink (primarily for unit tests and local debugging).
+    /// </summary>
+    public sealed class MemoryMetricSink : IMetricSink
+    {
+        private readonly List<MetricDataPoint> _buffer = new();
+
+        public Task WriteAsync(
+            IReadOnlyCollection<MetricDataPoint> metrics,
+            CancellationToken                     cancellationToken = default)
+        {
+            _buffer.AddRange(metrics);
+            return Task.CompletedTask;
+        }
+
+        public IReadOnlyList<MetricDataPoint> Snapshot()
+            => _buffer.ToImmutableArray();
+    }
+
+    // -------------------------------------------------------------------------
+    //  Transformation pipeline (Dataflow) — high throughput, back-pressure aware
+    // -------------------------------------------------------------------------
+
+    public sealed class EventTransformationPipeline : IAsyncDisposable
+    {
+        private readonly BufferBlock<WorkActivityEvent>                _input;
+        private readonly TransformManyBlock<WorkActivityEvent, MetricDataPoint> _compute;
+        private readonly ActionBlock<MetricDataPoint>                  _sink;
+        private readonly ILogger                                       _log = Log.ForContext<EventTransformationPipeline>();
+        private readonly CancellationTokenSource                        _cts = new();
+
+        public EventTransformationPipeline(
+            StrategyRegistry strategyRegistry,
+            IMetricSink      metricSink,
+            int              maxDegreeOfParallelism = 4,
+            int              boundedCapacity        = 1_024)
+        {
+            ArgumentNullException.ThrowIfNull(strategyRegistry);
+            ArgumentNullException.ThrowIfNull(metricSink);
+
+            // Configure blocks
+            _input = new BufferBlock<WorkActivityEvent>(
+                new DataflowBlockOptions
+                {
+                    BoundedCapacity = boundedCapacity
+                });
+
+            _compute = new TransformManyBlock<WorkActivityEvent, MetricDataPoint>(
+                async (workEvent) =>
+                {
+                    try
+                    {
+                        if (strategyRegistry.TryResolve(workEvent, out var strategy))
+                        {
+                            return await strategy.ComputeAsync(
+                                workEvent,
+                                _cts.Token);
+                        }
+
+                        _log.Debug("No strategy matched event {@Event}", workEvent);
+                        return Array.Empty<MetricDataPoint>();
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Error(
+                            ex,
+                            "Metric computation failed for event {@Event}",
+                            workEvent);
+                        return Array.Empty<MetricDataPoint>();
+                    }
+                },
+                new ExecutionDataflowBlockOptions
+                {
+                    MaxDegreeOfParallelism = maxDegreeOfParallelism,
+                    BoundedCapacity        = boundedCapacity,
+                    CancellationToken      = _cts.Token,
+                    EnsureOrdered          = false
+                });
+
+            _sink = new ActionBlock<MetricDataPoint>(
+                async (metric) =>
+                {
+                    try
+                    {
+                        await metricSink.WriteAsync(
+                            new[] { metric },
+                            _cts.Token);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Error(
+                            ex,
+                            "Failed to write metric {@Metric}",
+                            metric);
+                        // In production, failed metrics would be forwarded to a DLQ.
+                    }
+                },
+                new ExecutionDataflowBlockOptions
+                {
+                    MaxDegreeOfParallelism = maxDegreeOfParallelism,
+                    BoundedCapacity        = boundedCapacity,
+                    CancellationToken      = _cts.Token,
+                    EnsureOrdered          = false
+                });
+
+            // Wire-up blocks
+            _input.LinkTo(_compute,                    new DataflowLinkOptions { PropagateCompletion = true });
+            _compute.LinkTo(_sink,                     new DataflowLinkOptions { PropagateCompletion = true });
+        }
+
+        /// <summary>
+        /// Enqueues a new event for processing.  Respects back-pressure.
+        /// </summary>
+        public async Task SubmitAsync(
+            WorkActivityEvent  workEvent,
+            CancellationToken  cancellationToken = default)
+        {
+            if (!_input.Post(workEvent))
+            {
+                await _input.SendAsync(workEvent, cancellationToken);
+            }
+        }
+
+        /// <summary>
+        /// Signals graceful shutdown and waits until all buffered work completes.
+        /// </summary>
+        public async Task CompleteAsync(CancellationToken cancellationToken = default)
+        {
+            _input.Complete();
+            try
+            {
+                await _sink.Completion.WaitAsync(cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                _cts.Cancel();
+                throw;
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _cts.Cancel();
+            _input.Complete();
+
+            try
+            {
+                await _sink.Completion;
+            }
+            catch
+            {
+                // Swallow any in-flight exceptions on dispose.
+            }
+
+            _cts.Dispose();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    //  Example bootstrapping (would live in Lambda entrypoint or ASP.NET Startup)
+    // -------------------------------------------------------------------------
+
+    public static class TransformationBootstrap
+    {
+        /// <summary>
+        /// Configures Serilog and returns a ready-to-use pipeline for ad-hoc demos.
+        /// </summary>
+        public static EventTransformationPipeline CreateDemoPipeline()
+        {
+            Log.Logger = new LoggerConfiguration()
+                .Enrich.FromLogContext()
+                .MinimumLevel.Debug()
+                .WriteTo.Console()
+                .CreateLogger();
+
+            var strategies = new IMetricComputationStrategy[]
+            {
+                new FocusTimeStrategy(),
+                new MeetingCostIndexStrategy(defaultHourlyRateUsd: 90)
+            };
+
+            var registry   = new StrategyRegistry(strategies);
+            var sink       = new MemoryMetricSink();
+            var pipeline   = new EventTransformationPipeline(registry, sink);
+
+            return pipeline;
+        }
+    }
+}
+```

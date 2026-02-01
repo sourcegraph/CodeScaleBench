@@ -1,0 +1,329 @@
+```csharp
+// -----------------------------------------------------------------------------
+//  UtilityChain Core Suite (blockchain_defi) – License Sub-System
+//  ---------------------------------------------------------------------------
+//  Copyright © 2024 UtilityChain Contributors
+//  SPDX-License-Identifier: BSL-1.1
+//  ---------------------------------------------------------------------------
+//
+//  This file implements the run-time license handling required to activate
+//  UtilityChain Core Suite.  It provides the following capabilities:
+//
+//    • Strong cryptographic validation of license payloads (ECDSA-P256).
+//    • In-memory caching and thread-safe lazy initialization.
+//    • Observer pattern for broadcasting license state changes.
+//    • Extensible strategy for custom license stores (file, environment, etc.).
+//
+//  NOTE: A plain-text copy of the Business Source License (BSL-1.1)
+//  resides in /LICENSE.txt at the repository root.  The code here is strictly
+//  for programmatic license enforcement and telemetry.
+//
+// -----------------------------------------------------------------------------
+
+#pragma warning disable CA1031 // We aggregate exceptions intentionally
+
+using System;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace UtilityChainCoreSuite.Licensing;
+
+/// <summary>
+///     Indicates the current validation state of the running license.
+/// </summary>
+public enum LicenseStatus
+{
+    Uninitialized,
+    Valid,
+    Invalid,
+    Expired,
+    Revoked
+}
+
+/// <summary>
+///     Immutable, deserialized representation of a signed license.
+/// </summary>
+public sealed record LicensePayload
+{
+    public required string Product { get; init; }
+    public required string Licensee { get; init; }
+    public required DateTimeOffset IssuedUtc { get; init; }
+    public required DateTimeOffset ExpiresUtc { get; init; }
+    public required string[] Features { get; init; } = Array.Empty<string>();
+    public required byte[] Signature { get; init; }
+
+    /// <summary>Computes the canonical string (without signature) over which the signature is verified.</summary>
+    public string Canonicalize() =>
+        $"{Product}|{Licensee}|{IssuedUtc.ToUnixTimeSeconds()}|{ExpiresUtc.ToUnixTimeSeconds()}|{string.Join(',', Features)}";
+}
+
+/// <summary>
+///     Exception representing an invalid or expired license.
+/// </summary>
+public sealed class LicenseException : Exception
+{
+    public LicenseException(string message) : base(message) { }
+    public LicenseException(string message, Exception inner) : base(message, inner) { }
+}
+
+/// <summary>
+///     Strategy abstraction for retrieving the license blob.
+/// </summary>
+public interface ILicenseStore
+{
+    ValueTask<ReadOnlyMemory<char>> GetLicenseAsync(CancellationToken ct = default);
+}
+
+/// <summary>
+///     Default implementation loading from an encrypted file on disk.
+/// </summary>
+public sealed class FileLicenseStore(string licensePath) : ILicenseStore
+{
+    private readonly string _licensePath = licensePath;
+
+    public async ValueTask<ReadOnlyMemory<char>> GetLicenseAsync(CancellationToken ct = default)
+    {
+        if (!File.Exists(_licensePath))
+            throw new FileNotFoundException($"License file not found at path '{_licensePath}'.");
+
+        using var fs = File.OpenRead(_licensePath);
+        using var sr = new StreamReader(fs, Encoding.UTF8, true);
+        var text = await sr.ReadToEndAsync(ct).ConfigureAwait(false);
+        return text.AsMemory();
+    }
+}
+
+/// <summary>
+///     Core class responsible for license validation, caching, and event dispatch.
+/// </summary>
+public sealed class LicenseManager : IObservable<LicenseStatus>, IDisposable
+{
+    private static readonly Lazy<LicenseManager> _current = new(() => new(), LazyThreadSafetyMode.ExecutionAndPublication);
+    public static LicenseManager Current => _current.Value;
+
+    private readonly ConcurrentDictionary<IObserver<LicenseStatus>, byte> _observers = new();
+    private readonly object _sync = new();
+
+    private ILicenseStore _store = new FileLicenseStore(Path.Combine(AppContext.BaseDirectory, "license.lic"));
+    private LicenseStatus _status;
+    private LicensePayload? _payload;
+    private bool _disposed;
+
+    /// <summary>
+    ///     The public key used for verifying licenses (PEM encoded).
+    ///     This key must correspond to the private key used by UtilityChain issuance servers.
+    /// </summary>
+    private const string PublicKeyPem = """
+        -----BEGIN PUBLIC KEY-----
+        MFYwEAYHKoZIzj0CAQYFK4EEAAoDQgAE8k47sbVWuJx+A3LT4YLlkuVXsxN8U3uL
+        QvM2g3FVI7IhN0Vm6i/4wI0Vw8tGbs7jIk4GwtCQOHFDAqO+RW6V0Q==
+        -----END PUBLIC KEY-----
+        """;
+
+    /// <summary>
+    ///     Gets the last loaded payload (may be null when status != Valid).
+    /// </summary>
+    public LicensePayload? Payload => Volatile.Read(ref _payload);
+
+    /// <summary>
+    ///     Gets the current status.
+    /// </summary>
+    public LicenseStatus Status => (LicenseStatus)Volatile.Read(ref Unsafe.AsRef(_status));
+
+    private LicenseManager() { }
+
+    /// <summary>
+    ///     Replaces the default store with a custom implementation.
+    ///     Must be called before first validation to be effective.
+    /// </summary>
+    public LicenseManager WithStore(ILicenseStore store)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        _store = store;
+        return this;
+    }
+
+    /// <summary>
+    ///     Performs validation and notifies observers when status changes.
+    /// </summary>
+    public async ValueTask ValidateAsync(CancellationToken ct = default)
+    {
+        _ = EnsureNotDisposed();
+
+        LicensePayload? newPayload = null;
+        LicenseStatus newStatus = LicenseStatus.Invalid;
+
+        try
+        {
+            var json = await _store.GetLicenseAsync(ct).ConfigureAwait(false);
+            newPayload = Deserialize(json);
+            VerifySignature(newPayload);
+            newStatus = EvaluateExpiration(newPayload);
+        }
+        catch (LicenseException lex)
+        {
+            Debug.Fail(lex.ToString());
+            newStatus = LicenseStatus.Invalid;
+        }
+        catch (Exception ex)
+        {
+            Debug.Fail(ex.ToString());
+            newStatus = LicenseStatus.Invalid;
+        }
+
+        // Atomically update status/payload
+        lock (_sync)
+        {
+            if (_status != newStatus || _payload != newPayload)
+            {
+                _status = newStatus;
+                _payload = newPayload;
+                Publish(_status);
+            }
+        }
+    }
+
+    /// <summary>
+    ///     Blocking convenience wrapper around <see cref="ValidateAsync"/>.
+    /// </summary>
+    public void Validate() => ValidateAsync().AsTask().GetAwaiter().GetResult();
+
+    // -------------------------------------------------------------------------
+    //  IObservable implementation
+    // -------------------------------------------------------------------------
+
+    public IDisposable Subscribe(IObserver<LicenseStatus> observer)
+    {
+        _ = EnsureNotDisposed();
+        ArgumentNullException.ThrowIfNull(observer);
+
+        _observers.TryAdd(observer, 0);
+        observer.OnNext(Status); // push current
+
+        return new Unsubscriber(_observers, observer);
+    }
+
+    private void Publish(LicenseStatus s)
+    {
+        foreach (var observer in _observers.Keys)
+        {
+            try
+            {
+                observer.OnNext(s);
+            }
+            catch
+            {
+                // Intentionally swallow; observers are responsible for their errors.
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    //  Helpers
+    // -------------------------------------------------------------------------
+
+    private static LicensePayload Deserialize(ReadOnlyMemory<char> json)
+    {
+        try
+        {
+            var payload = JsonSerializer.Deserialize<LicensePayload>(json.Span, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
+
+            if (payload is null)
+                throw new LicenseException("Failed to deserialize license.");
+
+            return payload;
+        }
+        catch (JsonException jex)
+        {
+            throw new LicenseException("License file contains invalid JSON.", jex);
+        }
+    }
+
+    private static void VerifySignature(LicensePayload payload)
+    {
+        using var ecdsa = ECDsa.Create();
+        ecdsa.ImportFromPem(PublicKeyPem);
+
+        var data = Encoding.UTF8.GetBytes(payload.Canonicalize());
+        var valid = ecdsa.VerifyData(data, payload.Signature, HashAlgorithmName.SHA256);
+
+        if (!valid)
+            throw new LicenseException("License signature verification failed.");
+    }
+
+    private static LicenseStatus EvaluateExpiration(LicensePayload payload)
+    {
+        var now = DateTimeOffset.UtcNow;
+
+        if (payload.ExpiresUtc < now)
+            return LicenseStatus.Expired;
+
+        return LicenseStatus.Valid;
+    }
+
+    private LicenseManager EnsureNotDisposed()
+    {
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(LicenseManager));
+        return this;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        foreach (var o in _observers.Keys)
+        {
+            try
+            {
+                o.OnCompleted();
+            }
+            catch { /* ignored */ }
+        }
+
+        _observers.Clear();
+    }
+
+    // -------------------------------------------------------------------------
+    //  Nested types
+    // -------------------------------------------------------------------------
+
+    private sealed class Unsubscriber(ConcurrentDictionary<IObserver<LicenseStatus>, byte> dict,
+                                      IObserver<LicenseStatus> obs) : IDisposable
+    {
+        public void Dispose() => dict.TryRemove(obs, out _);
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  Extension methods for convenient license gating
+// -----------------------------------------------------------------------------
+public static class LicenseExtensions
+{
+    /// <summary>
+    ///     Throws <see cref="LicenseException" /> unless the specified feature is licensed.
+    /// </summary>
+    public static void DemandFeature(this LicenseManager manager, string feature)
+    {
+        ArgumentNullException.ThrowIfNull(manager);
+        ArgumentException.ThrowIfNullOrWhiteSpace(feature);
+
+        var payload = manager.Payload ?? throw new LicenseException("No valid license loaded.");
+
+        if (Array.IndexOf(payload.Features, feature) < 0)
+            throw new LicenseException($"Feature '{feature}' is not permitted by the current license.");
+    }
+}
+```

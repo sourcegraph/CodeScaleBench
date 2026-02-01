@@ -1,0 +1,442 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformations
+{
+    #region Domain Models
+
+    /// <summary>
+    /// Raw envelope received from the ingestion layer (Kinesis / SQS / EventBridge).
+    /// </summary>
+    public sealed record RawRecord(
+        string Payload,
+        string ContentType,
+        string Source,
+        DateTimeOffset ReceivedAt,
+        IReadOnlyDictionary<string, string>? Metadata = null);
+
+    /// <summary>
+    /// Normalised & enriched record ready for downstream consumers (Lake-Formation, Redshift, QuickSight, etc.).
+    /// </summary>
+    public sealed record TransformedRecord(
+        string PartitionKey,
+        string SortKey,
+        string JsonPayload,
+        IReadOnlyDictionary<string, string>? Attributes = null);
+
+    /// <summary>
+    /// Result wrapper returned by the orchestrator so that upstream can act upon success/failure.
+    /// </summary>
+    public sealed record TransformationResult(
+        bool IsSuccess,
+        TransformedRecord? Record,
+        Exception? Exception,
+        TimeSpan Duration);
+
+    #endregion
+
+    #region Strategy Pattern — Contracts
+
+    /// <summary>
+    /// Contract for record transformation strategies.
+    /// Implementations must be pure / stateless so they can be reused across Lambda invocations.
+    /// </summary>
+    internal interface ITransformationStrategy
+    {
+        string Name { get; }
+
+        bool CanHandle(RawRecord record);
+
+        ValueTask<TransformedRecord> TransformAsync(RawRecord record, CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Abstract base that provides helper methods & common validation logic.
+    /// </summary>
+    internal abstract class TransformationStrategyBase : ITransformationStrategy
+    {
+        protected readonly JsonSerializerOptions JsonOptions =
+            new() { PropertyNameCaseInsensitive = true, WriteIndented = false };
+
+        public abstract string Name { get; }
+
+        public abstract bool CanHandle(RawRecord record);
+
+        public async ValueTask<TransformedRecord> TransformAsync(RawRecord record, CancellationToken cancellationToken = default)
+        {
+            if (record is null) throw new ArgumentNullException(nameof(record));
+
+            var stopwatch = Stopwatch.StartNew();
+            var transformed = await PerformTransformationAsync(record, cancellationToken).ConfigureAwait(false);
+            stopwatch.Stop();
+
+            // Add execution metadata
+            var duration = stopwatch.ElapsedMilliseconds.ToString();
+            var attributes = new Dictionary<string, string>(transformed.Attributes ?? new Dictionary<string, string>())
+            {
+                ["x-transformer"] = Name,
+                ["x-transform-duration-ms"] = duration
+            };
+
+            return transformed with { Attributes = attributes };
+        }
+
+        protected abstract ValueTask<TransformedRecord> PerformTransformationAsync(RawRecord record, CancellationToken cancellationToken);
+    }
+
+    #endregion
+
+    #region Concrete Strategies
+
+    /// <summary>
+    /// Flattens arbitrarily nested JSON payloads into a single-level object suitable for Athena/Parquet.
+    /// </summary>
+    internal sealed class JsonFlattenStrategy : TransformationStrategyBase
+    {
+        public override string Name => "json_flatten:v1";
+
+        public override bool CanHandle(RawRecord record) =>
+            string.Equals(record.ContentType, "application/json", StringComparison.OrdinalIgnoreCase);
+
+        protected override ValueTask<TransformedRecord> PerformTransformationAsync(RawRecord record, CancellationToken cancellationToken)
+        {
+            var root = JsonNode.Parse(record.Payload)?.AsObject()
+                       ?? throw new InvalidOperationException("Unable to parse payload as JSON.");
+
+            var flat = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            Flatten(root, string.Empty, flat);
+
+            var flattenedJson = JsonSerializer.Serialize(flat, JsonOptions);
+
+            var transformed = new TransformedRecord(
+                PartitionKey: record.ReceivedAt.UtcDateTime.ToString("yyyyMMdd"),
+                SortKey: $"{record.Source}#{Guid.NewGuid():N}",
+                JsonPayload: flattenedJson);
+
+            return ValueTask.FromResult(transformed);
+        }
+
+        private static void Flatten(JsonObject node, string prefix, IDictionary<string, object?> output)
+        {
+            foreach (var (key, value) in node)
+            {
+                var path = string.IsNullOrEmpty(prefix) ? key : $"{prefix}_{key}";
+
+                switch (value)
+                {
+                    case JsonValue jsonValue:
+                        output[path] = jsonValue.GetValue<object?>();
+                        break;
+
+                    case JsonObject childObj:
+                        Flatten(childObj, path, output);
+                        break;
+
+                    case JsonArray jsonArray:
+                        output[path] = jsonArray.ToJsonString();
+                        break;
+
+                    default:
+                        output[path] = value?.ToJsonString();
+                        break;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Extracts business KPIs from calendar events.
+    /// </summary>
+    internal sealed class CalendarEventStrategy : TransformationStrategyBase
+    {
+        public override string Name => "calendar_event:v2";
+
+        public override bool CanHandle(RawRecord record) =>
+            string.Equals(record.ContentType, "application/x-calendar-event", StringComparison.OrdinalIgnoreCase);
+
+        protected override ValueTask<TransformedRecord> PerformTransformationAsync(RawRecord record, CancellationToken cancellationToken)
+        {
+            var calendarEvent = JsonSerializer.Deserialize<CalendarEventDto>(record.Payload, JsonOptions)
+                               ?? throw new InvalidOperationException("Invalid calendar event payload.");
+
+            var focusTime = calendarEvent.EndUtc - calendarEvent.StartUtc;
+            var isMeeting = calendarEvent.Attendees?.Count > 1;
+
+            var kpi = new
+            {
+                calendarEvent.EventId,
+                calendarEvent.Subject,
+                calendarEvent.HostEmail,
+                DurationMinutes = focusTime.TotalMinutes,
+                Participants = calendarEvent.Attendees,
+                IsMeeting = isMeeting,
+                calendarEvent.Location
+            };
+
+            var transformed = new TransformedRecord(
+                PartitionKey: calendarEvent.StartUtc.ToString("yyyyMMdd"),
+                SortKey: $"cal#{calendarEvent.EventId}",
+                JsonPayload: JsonSerializer.Serialize(kpi, JsonOptions));
+
+            return ValueTask.FromResult(transformed);
+        }
+
+        private sealed record CalendarEventDto(
+            string EventId,
+            string Subject,
+            string HostEmail,
+            DateTime StartUtc,
+            DateTime EndUtc,
+            string? Location,
+            List<string>? Attendees);
+    }
+
+    /// <summary>
+    /// Fallback strategy that passes the payload through unmodified.
+    /// </summary>
+    internal sealed class PassThroughStrategy : TransformationStrategyBase
+    {
+        public override string Name => "passthrough:v1";
+
+        public override bool CanHandle(RawRecord record) => true;
+
+        protected override ValueTask<TransformedRecord> PerformTransformationAsync(RawRecord record, CancellationToken cancellationToken)
+        {
+            var transformed = new TransformedRecord(
+                PartitionKey: record.ReceivedAt.UtcDateTime.ToString("yyyyMMdd"),
+                SortKey: $"{record.Source}#{Guid.NewGuid():N}",
+                JsonPayload: record.Payload,
+                Attributes: record.Metadata);
+
+            return ValueTask.FromResult(transformed);
+        }
+    }
+
+    #endregion
+
+    #region Observer Pattern — Notifications
+
+    internal interface ITransformationObserver
+    {
+        Task OnSuccessAsync(TransformedRecord record, CancellationToken token = default);
+
+        Task OnFailureAsync(RawRecord record, Exception exception, CancellationToken token = default);
+    }
+
+    /// <summary>
+    /// Emits JSON logs with structured context.
+    /// </summary>
+    internal sealed class LoggingObserver : ITransformationObserver
+    {
+        private readonly ILogger _logger;
+
+        public LoggingObserver(ILogger logger) => _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+        public Task OnSuccessAsync(TransformedRecord record, CancellationToken token = default)
+        {
+            _logger.LogInformation(
+                "Transformation succeeded | Partition={Partition} | SortKey={SortKey} | Transformer={Transformer}",
+                record.PartitionKey,
+                record.SortKey,
+                record.Attributes?["x-transformer"]);
+
+            return Task.CompletedTask;
+        }
+
+        public Task OnFailureAsync(RawRecord record, Exception exception, CancellationToken token = default)
+        {
+            _logger.LogError(
+                exception,
+                "Transformation failed | Source={Source} | ContentType={ContentType}",
+                record.Source,
+                record.ContentType);
+
+            return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// Routes failed messages to a DLQ (SQS/Firehose). Implementation shown as stub.
+    /// </summary>
+    internal sealed class DeadLetterObserver : ITransformationObserver
+    {
+        public Task OnSuccessAsync(TransformedRecord record, CancellationToken token = default) =>
+            Task.CompletedTask;
+
+        public Task OnFailureAsync(RawRecord record, Exception exception, CancellationToken token = default)
+        {
+            // TODO: Inject & use IAmazonSQS to publish to DLQ queue
+            Console.Error.WriteLine($"[DLQ] Routing message from {record.Source} to dead letter queue. Reason: {exception.Message}");
+            return Task.CompletedTask;
+        }
+    }
+
+    #endregion
+
+    #region Orchestrator
+
+    /// <summary>
+    /// Entry-point used by Lambda handler to transform raw records.
+    /// </summary>
+    public sealed class TransformationOrchestrator
+    {
+        private readonly IReadOnlyList<ITransformationStrategy> _strategies;
+        private readonly IReadOnlyList<ITransformationObserver> _observers;
+        private readonly ILogger _logger;
+        private readonly ConcurrentDictionary<string, ITransformationStrategy> _cache = new();
+
+        public TransformationOrchestrator(
+            IEnumerable<ITransformationStrategy>? strategies = null,
+            IEnumerable<ITransformationObserver>? observers = null,
+            ILogger? logger = null)
+        {
+            _strategies = (strategies ?? GetDefaultStrategies()).ToReadOnlyList();
+            _observers = (observers ?? GetDefaultObservers(logger)).ToReadOnlyList();
+            _logger = logger ?? NullLogger.Instance;
+        }
+
+        public async Task<TransformationResult> ProcessAsync(RawRecord record, CancellationToken cancellationToken = default)
+        {
+            if (record is null) throw new ArgumentNullException(nameof(record));
+
+            var stopwatch = Stopwatch.StartNew();
+
+            try
+            {
+                var strategy = SelectStrategy(record);
+                _logger.LogDebug("Selected strategy {Strategy} for content-type {ContentType}", strategy.Name, record.ContentType);
+
+                var transformed = await strategy.TransformAsync(record, cancellationToken).ConfigureAwait(false);
+
+                await NotifySuccessAsync(transformed, cancellationToken).ConfigureAwait(false);
+
+                stopwatch.Stop();
+                return new TransformationResult(
+                    IsSuccess: true,
+                    Record: transformed,
+                    Exception: null,
+                    Duration: stopwatch.Elapsed);
+            }
+            catch (Exception ex)
+            {
+                await NotifyFailureAsync(record, ex, cancellationToken).ConfigureAwait(false);
+                stopwatch.Stop();
+
+                return new TransformationResult(
+                    IsSuccess: false,
+                    Record: null,
+                    Exception: ex,
+                    Duration: stopwatch.Elapsed);
+            }
+        }
+
+        #region Private Helpers
+
+        private ITransformationStrategy SelectStrategy(RawRecord record)
+        {
+            if (_cache.TryGetValue(record.ContentType, out var cached))
+            {
+                return cached;
+            }
+
+            foreach (var strategy in _strategies)
+            {
+                if (strategy.CanHandle(record))
+                {
+                    _cache[record.ContentType] = strategy;
+                    return strategy;
+                }
+            }
+
+            // Fallback to passthrough if nobody can handle
+            var fallback = new PassThroughStrategy();
+            _cache[record.ContentType] = fallback;
+            return fallback;
+        }
+
+        private async Task NotifySuccessAsync(TransformedRecord record, CancellationToken token)
+        {
+            foreach (var obs in _observers)
+            {
+                try { await obs.OnSuccessAsync(record, token).ConfigureAwait(false); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Observer {Observer} threw during OnSuccess", obs.GetType().Name); }
+            }
+        }
+
+        private async Task NotifyFailureAsync(RawRecord record, Exception exception, CancellationToken token)
+        {
+            foreach (var obs in _observers)
+            {
+                try { await obs.OnFailureAsync(record, exception, token).ConfigureAwait(false); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Observer {Observer} threw during OnFailure", obs.GetType().Name); }
+            }
+        }
+
+        private static IReadOnlyList<ITransformationStrategy> GetDefaultStrategies() =>
+            new ITransformationStrategy[]
+            {
+                new CalendarEventStrategy(),
+                new JsonFlattenStrategy(),
+                new PassThroughStrategy()
+            };
+
+        private static IReadOnlyList<ITransformationObserver> GetDefaultObservers(ILogger? logger) =>
+            new ITransformationObserver[]
+            {
+                new LoggingObserver(logger ?? NullLogger.Instance),
+                new DeadLetterObserver()
+            };
+
+        #endregion
+    }
+
+    #endregion
+
+    #region Utilities
+
+    /// <summary>
+    /// Simple logger that discards all messages.
+    /// Helps keeping the core library free from ILogger implementation concerns.
+    /// </summary>
+    internal sealed class NullLogger : ILogger
+    {
+        public static readonly NullLogger Instance = new();
+
+        private NullLogger() { }
+
+        public IDisposable BeginScope<TState>(TState state) => NullScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => false;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            /* intentionally suppressed */
+        }
+
+        private sealed class NullScope : IDisposable
+        {
+            public static readonly NullScope Instance = new();
+            public void Dispose() { }
+        }
+    }
+
+    internal static class EnumerableExtensions
+    {
+        public static IReadOnlyList<T> ToReadOnlyList<T>(this IEnumerable<T> source) =>
+            source is IReadOnlyList<T> list ? list : new List<T>(source);
+    }
+
+    #endregion
+}

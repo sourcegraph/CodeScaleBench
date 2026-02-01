@@ -1,0 +1,496 @@
+```rust
+//! VisuTility Orchestrator – Utility-Ops: Monitoring & Hyperparameter Tuning
+//!
+//! This module implements two orthogonal but often-paired concerns
+//! in a computer-vision MLOps stack:
+//!
+//! 1. Model-monitoring via an asynchronous Observer pattern.
+//! 2. Pluggable hyper-parameter tuning strategies via a Strategy pattern.
+//!
+//! The implementation is **self-contained** so that it can be imported by
+//! higher-level layers (Model-Ops, Serving-Ops, etc.) without additional
+//! glue code.  In production builds, concrete observers or tuners can be
+//! swapped out through dependency-injection/factory registries defined
+//! elsewhere in the workspace.
+
+// ──────────────────────────────────────────────────────────────────────────
+// External crates
+// ──────────────────────────────────────────────────────────────────────────
+use std::{
+    collections::HashMap,
+    fmt::{self, Display},
+    sync::Arc,
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use rand::prelude::*;
+use rand_distr::{Distribution, Uniform};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc, RwLock},
+    task::JoinHandle,
+    time,
+};
+
+// ──────────────────────────────────────────────────────────────────────────
+// Error Handling
+// ──────────────────────────────────────────────────────────────────────────
+
+/// All errors that can be emitted from the Utility-Ops layer.
+#[derive(Debug, Error)]
+pub enum UtilityOpsError {
+    #[error("channel closed: {0}")]
+    ChannelClosed(&'static str),
+
+    #[error("serialization error: {0}")]
+    SerdeError(#[from] serde_json::Error),
+
+    #[error("random generator error: {0}")]
+    RandError(String),
+
+    #[error("model registry error: {0}")]
+    ModelRegistry(String),
+
+    #[error("tuner strategy error: {0}")]
+    Tuner(String),
+
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Monitoring Layer (Observer pattern)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// An event that can originate from a running ML model in production.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MonitorEvent {
+    ValidationScoreUpdated { model_id: String, score: f32 },
+    DriftDetected { model_id: String, p_value: f32 },
+    InferenceFailure { model_id: String, error_msg: String },
+    Heartbeat { model_id: String },
+}
+
+/// Trait defining a subscriber that can react to [`MonitorEvent`]s.
+#[async_trait]
+pub trait MonitorSubscriber: Send + Sync + 'static {
+    async fn on_event(&self, event: MonitorEvent) -> Result<(), UtilityOpsError>;
+}
+
+/// Non-blocking handle returned to publishers to emit events.
+#[derive(Clone)]
+pub struct MonitorPublisher {
+    tx: broadcast::Sender<MonitorEvent>,
+}
+
+impl MonitorPublisher {
+    pub fn emit(&self, event: MonitorEvent) -> Result<(), UtilityOpsError> {
+        self.tx
+            .send(event)
+            .map_err(|_| UtilityOpsError::ChannelClosed("broadcast::Sender"))
+            .map(|_| ())
+    }
+}
+
+/// Central type that wires publishers and subscribers.
+/// Internally it runs a fan-out task that forwards events
+/// from the broadcast channel to each subscriber concurrently.
+pub struct ModelMonitor {
+    /// broadcast channel for publishers
+    tx: broadcast::Sender<MonitorEvent>,
+    /// Internal list of subscribers
+    subscribers: Arc<RwLock<Vec<Arc<dyn MonitorSubscriber>>>>,
+    /// Shutdown handle
+    shutdown_tx: mpsc::Sender<()>,
+    /// Background task join handle
+    _worker: JoinHandle<()>,
+}
+
+impl ModelMonitor {
+    /// Capacity indicates the broadcast buffer length.
+    pub fn new(capacity: usize) -> Self {
+        let (tx, mut rx) = broadcast::channel::<MonitorEvent>(capacity);
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        let subscribers: Arc<RwLock<Vec<Arc<dyn MonitorSubscriber>>>> =
+            Arc::new(RwLock::new(Vec::new()));
+        let subs_clone = subscribers.clone();
+
+        let _worker: JoinHandle<()> = tokio::spawn(async move {
+            loop {
+                select! {
+                    biased;
+
+                    _ = shutdown_rx.recv() => {
+                        tracing::info!("ModelMonitor received shutdown signal");
+                        break;
+                    }
+
+                    maybe_evt = rx.recv() => {
+                        match maybe_evt {
+                            Ok(evt) => {
+                                let subs = subs_clone.read().await;
+                                for sub in subs.iter() {
+                                    let evt_clone = evt.clone();
+                                    // Fire & forget; individual observers
+                                    // are responsible for their own error handling/logging.
+                                    let sub_clone = sub.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = sub_clone.on_event(evt_clone).await {
+                                            tracing::error!("subscriber error: {e}");
+                                        }
+                                    });
+                                }
+                            },
+                            Err(broadcast::error::RecvError::Closed) => {
+                                tracing::warn!("ModelMonitor event channel closed");
+                                break;
+                            },
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!("Monitor lagged, skipped {skipped} events");
+                            }
+                        }
+                    }
+                }
+            }
+            tracing::info!("ModelMonitor worker terminated");
+        });
+
+        Self {
+            tx,
+            subscribers,
+            shutdown_tx,
+            _worker,
+        }
+    }
+
+    /// Get a publisher handle that can be cloned freely.
+    pub fn publisher(&self) -> MonitorPublisher {
+        MonitorPublisher {
+            tx: self.tx.clone(),
+        }
+    }
+
+    /// Attach a new subscriber.
+    pub async fn add_subscriber<T>(&self, sub: T)
+    where
+        T: MonitorSubscriber,
+    {
+        self.subscribers.write().await.push(Arc::new(sub));
+    }
+}
+
+impl Drop for ModelMonitor {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.try_send(());
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Concrete Subscribers
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Simply emits the event to the tracing system.
+pub struct MetricsLogger;
+
+#[async_trait]
+impl MonitorSubscriber for MetricsLogger {
+    async fn on_event(&self, event: MonitorEvent) -> Result<(), UtilityOpsError> {
+        match &event {
+            MonitorEvent::ValidationScoreUpdated { model_id, score } => {
+                tracing::info!(%model_id, %score, "validation score updated");
+            }
+            MonitorEvent::DriftDetected { model_id, p_value } => {
+                tracing::warn!(%model_id, %p_value, "drift detected");
+            }
+            MonitorEvent::InferenceFailure { model_id, error_msg } => {
+                tracing::error!(%model_id, %error_msg, "inference failure");
+            }
+            MonitorEvent::Heartbeat { model_id } => {
+                tracing::debug!(%model_id, "heartbeat");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A subscriber that triggers automated retraining when certain thresholds are hit.
+pub struct RetrainTrigger {
+    /// Notify Model-Ops layer via an mpsc channel.
+    retrain_tx: mpsc::Sender<String>,
+    /// threshold below which validation score is considered degraded
+    min_val_score: f32,
+    /// p-value above which drift is flagged
+    max_drift_p_value: f32,
+}
+
+impl RetrainTrigger {
+    pub fn new(
+        retrain_tx: mpsc::Sender<String>,
+        min_val_score: f32,
+        max_drift_p_value: f32,
+    ) -> Self {
+        Self {
+            retrain_tx,
+            min_val_score,
+            max_drift_p_value,
+        }
+    }
+}
+
+#[async_trait]
+impl MonitorSubscriber for RetrainTrigger {
+    async fn on_event(&self, event: MonitorEvent) -> Result<(), UtilityOpsError> {
+        match event {
+            MonitorEvent::ValidationScoreUpdated { model_id, score }
+                if score < self.min_val_score =>
+            {
+                self.retrain_tx
+                    .send(model_id.clone())
+                    .await
+                    .map_err(|_| UtilityOpsError::ChannelClosed("RetrainTrigger"))?;
+                tracing::info!(%model_id, %score, "triggering retraining (low score)");
+            }
+
+            MonitorEvent::DriftDetected { model_id, p_value } if p_value > self.max_drift_p_value => {
+                self.retrain_tx
+                    .send(model_id.clone())
+                    .await
+                    .map_err(|_| UtilityOpsError::ChannelClosed("RetrainTrigger"))?;
+                tracing::info!(%model_id, %p_value, "triggering retraining (drift)");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Hyperparameter Tuning (Strategy pattern)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Dummy trait representing a trainable model within the platform.
+pub trait TrainableModel: Send + Sync + 'static {
+    /// Fit the model with the provided hyper-parameters and return a validation score.
+    fn fit(&mut self, hyperparams: &HyperParams) -> Result<f32, UtilityOpsError>;
+}
+
+/// Hyper-parameter space representation.
+/// For simplicity we only support numeric parameters `[f64; 2]` representing `(min, max)`.
+pub type HyperParamRange = [f64; 2];
+
+#[derive(Debug, Clone)]
+pub struct HyperParamSpec {
+    pub space: HashMap<String, HyperParamRange>,
+}
+
+impl HyperParamSpec {
+    pub fn get_range(&self, key: &str) -> Option<&HyperParamRange> {
+        self.space.get(key)
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.space.keys()
+    }
+}
+
+/// Concrete set of parameter assignments that can be passed to a model.
+pub type HyperParams = HashMap<String, f64>;
+
+/// Evaluation summary produced for each trial.
+#[derive(Debug, Clone)]
+pub struct TrialResult {
+    pub trial_id: usize,
+    pub params: HyperParams,
+    pub score: f32,
+}
+
+/// Strategy interface for any tuner.
+#[async_trait]
+pub trait HyperParamTuner<M>
+where
+    M: TrainableModel,
+{
+    async fn tune(
+        &self,
+        model: &mut M,
+        spec: &HyperParamSpec,
+        budget: usize,
+    ) -> Result<Vec<TrialResult>, UtilityOpsError>;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Random Search Strategy
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Random-search hyper-parameter tuner.
+pub struct RandomSearchTuner {
+    rng: RngLock,
+}
+
+type RngLock = Arc<RwLock<StdRng>>;
+
+impl RandomSearchTuner {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            rng: Arc::new(RwLock::new(StdRng::seed_from_u64(seed))),
+        }
+    }
+
+    async fn sample_params(
+        &self,
+        spec: &HyperParamSpec,
+    ) -> Result<HyperParams, UtilityOpsError> {
+        let mut params = HyperParams::with_capacity(spec.space.len());
+        for key in spec.keys() {
+            let range = spec
+                .get_range(key)
+                .ok_or_else(|| UtilityOpsError::Tuner(format!("missing range for {key}")))?;
+
+            let dist = Uniform::new_inclusive(range[0], range[1]);
+            let value = dist.sample(&mut *self.rng.write().await);
+            params.insert(key.clone(), value);
+        }
+        Ok(params)
+    }
+}
+
+#[async_trait]
+impl<M> HyperParamTuner<M> for RandomSearchTuner
+where
+    M: TrainableModel,
+{
+    async fn tune(
+        &self,
+        model: &mut M,
+        spec: &HyperParamSpec,
+        budget: usize,
+    ) -> Result<Vec<TrialResult>, UtilityOpsError> {
+        let mut trials = Vec::with_capacity(budget);
+        for trial_id in 0..budget {
+            let params = self.sample_params(spec).await?;
+            let score = model.fit(&params)?;
+            trials.push(TrialResult {
+                trial_id,
+                params,
+                score,
+            });
+        }
+        Ok(trials)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Mock Implementations (for demonstration & unit testing)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Naïve model whose performance is correlated to `learning_rate` and noise.
+pub struct DummyModel {
+    rng: StdRng,
+}
+
+impl DummyModel {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            rng: StdRng::seed_from_u64(seed),
+        }
+    }
+}
+
+impl Default for DummyModel {
+    fn default() -> Self {
+        Self::new(42)
+    }
+}
+
+impl TrainableModel for DummyModel {
+    fn fit(&mut self, hyperparams: &HyperParams) -> Result<f32, UtilityOpsError> {
+        let lr = *hyperparams
+            .get("learning_rate")
+            .ok_or_else(|| UtilityOpsError::Tuner("missing learning_rate".into()))?;
+
+        // Fake metric: peak performance near learning_rate = 0.05
+        let base = (-(lr - 0.05).powi(2) * 500.0).exp() as f32;
+        let noise: f32 = self.rng.gen_range(0.0..0.05);
+        Ok(base + noise)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Re-export utilities
+// ──────────────────────────────────────────────────────────────────────────
+pub mod prelude {
+    pub use super::{
+        HyperParamSpec, HyperParamTuner, HyperParams, ModelMonitor, MonitorEvent, MonitorPublisher,
+        MonitorSubscriber, RandomSearchTuner, RetrainTrigger, TrainableModel,
+    };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Example & Integration Tests
+// ──────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn test_monitor_retrain_trigger() {
+        tracing_subscriber::fmt::try_init().ok();
+
+        let monitor = ModelMonitor::new(16);
+        let publisher = monitor.publisher();
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let retrain_trigger = RetrainTrigger::new(tx, 0.8, 0.3);
+        monitor.add_subscriber(retrain_trigger).await;
+
+        // below threshold score
+        publisher
+            .emit(MonitorEvent::ValidationScoreUpdated {
+                model_id: "model_A".into(),
+                score: 0.7,
+            })
+            .unwrap();
+
+        // wait for retrain message
+        let id = rx.recv().await.unwrap();
+        assert_eq!(id, "model_A");
+    }
+
+    #[tokio::test]
+    async fn test_random_search_tuner() {
+        let mut model = DummyModel::default();
+        let spec = HyperParamSpec {
+            space: HashMap::from([("learning_rate".into(), [0.0001, 0.1])]),
+        };
+        let tuner = RandomSearchTuner::new(1337);
+        let trials = tuner.tune(&mut model, &spec, 10).await.unwrap();
+
+        assert_eq!(trials.len(), 10);
+        // Ensure scores are between 0 and 1 roughly.
+        for t in trials {
+            assert!(t.score >= 0.0 && t.score <= 1.5);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_monitor_heartbeat() {
+        let monitor = ModelMonitor::new(16);
+        let publisher = monitor.publisher();
+        monitor.add_subscriber(MetricsLogger).await;
+
+        for _ in 0..3 {
+            publisher
+                .emit(MonitorEvent::Heartbeat {
+                    model_id: "cam_01".into(),
+                })
+                .unwrap();
+        }
+
+        // allow tasks to run
+        time::sleep(Duration::from_millis(50)).await;
+    }
+}
+```

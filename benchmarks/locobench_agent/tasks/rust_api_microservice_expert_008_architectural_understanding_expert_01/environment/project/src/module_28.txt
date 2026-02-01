@@ -1,0 +1,403 @@
+```rust
+//! module_28 – LedgerEntry VM glue, pagination helpers & cache-control
+//! ------------------------------------------------------------------
+//! This module belongs to the “View <-> ViewModel” layer of the
+//! LedgerLink Nexus micro-service.  A View is an *untrusted* payload
+//! travelling across process boundaries (JSON body, GraphQL variables,
+//! URL query parameters, …).  The corresponding ViewModel (DTO) is the
+//! *trusted* representation used inside the service layer.
+//!
+//! Key responsibilities fulfilled here:
+//!   • Deserialize external payloads and perform defensive validation.
+//!   • Expose pagination helpers that play nicely with SQL LIMIT/OFFSET
+//!     and GraphQL connections.
+//!   • Offer a small ‘CacheHint’ helper enabling fine-grained control
+//!     over HTTP Cache-Control headers.
+//!
+//! NOTE: The code purposefully avoids coupling with any persistence/
+//! business-logic concerns – those live in the service & repository
+//! crates.
+
+#![allow(dead_code)]
+
+use std::{
+    convert::TryFrom,
+    fmt,
+    time::{Duration, SystemTime},
+};
+
+use actix_web::{
+    error::ResponseError,
+    http::header::{CacheControl, CacheDirective, HeaderName, HeaderValue},
+    HttpResponse,
+};
+use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, Utc};
+use derive_more::{Display, Error, From};
+use log::{debug, trace};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use validator::{Validate, ValidationError, ValidationErrors};
+
+// ---------- Re-usable value objects -------------------------------------------------------------
+
+/// Tenant isolation layer – every endpoint MUST be scoped by a `TenantId`
+#[derive(
+    Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Display, From, Default,
+)]
+#[display(fmt = "{}", _0)]
+pub struct TenantId(Uuid);
+
+impl TenantId {
+    pub fn new() -> Self {
+        TenantId(Uuid::new_v4())
+    }
+}
+
+/// LedgerEntry identifier – globally unique, unordered.
+#[derive(
+    Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Display, From, Default,
+)]
+#[display(fmt = "{}", _0)]
+pub struct LedgerEntryId(Uuid);
+
+impl LedgerEntryId {
+    pub fn new() -> Self {
+        LedgerEntryId(Uuid::new_v4())
+    }
+}
+
+/// ISO-4217 currency enumeration (simplified – extend as needed).
+#[derive(
+    Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Display,
+)]
+pub enum Currency {
+    #[serde(rename = "USD")]
+    #[display(fmt = "USD")]
+    Usd,
+    #[serde(rename = "EUR")]
+    #[display(fmt = "EUR")]
+    Eur,
+    #[serde(rename = "GBP")]
+    #[display(fmt = "GBP")]
+    Gbp,
+}
+
+/// Monetary value wrapper preventing currency/amount mismatches.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Money {
+    pub amount: f64,
+    pub currency: Currency,
+}
+
+impl Money {
+    pub fn zero(currency: Currency) -> Self {
+        Money { amount: 0.0, currency }
+    }
+
+    pub fn is_positive(&self) -> bool {
+        self.amount > 0.0
+    }
+}
+
+// ---------- Pagination helpers ------------------------------------------------------------------
+
+/// Typical pagination payload coming from a query string or GraphQL arguments.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct Pagination {
+    /// 1-based page index
+    #[serde(default = "Pagination::default_page")]
+    pub page: u32,
+    /// Number of entries per page
+    #[serde(default = "Pagination::default_per_page")]
+    pub per_page: u32,
+    /// Optional hard limit enforced by the API layer
+    #[serde(skip)]
+    pub max_per_page: u32,
+}
+
+impl Pagination {
+    const fn default_page() -> u32 {
+        1
+    }
+    const fn default_per_page() -> u32 {
+        50
+    }
+
+    /// Calculates SQL-friendly `(offset, limit)` tuple.
+    pub fn offset_limit(&self) -> (u32, u32) {
+        let limit = self.per_page.min(self.max_per_page);
+        let offset = (self.page.saturating_sub(1)).saturating_mul(limit);
+        (offset, limit)
+    }
+}
+
+/// A generic ‘page’ container that will be serialized back to the client.
+#[derive(Debug, Serialize)]
+pub struct Paginated<T> {
+    pub items: Vec<T>,
+    pub page: u32,
+    pub per_page: u32,
+    pub total: u64,
+}
+
+// ---------- Cache-Control helper ----------------------------------------------------------------
+
+/// Visibility scope for HTTP cache storage.
+#[derive(Clone, Copy, Debug)]
+pub enum CacheScope {
+    Public,
+    Private,
+}
+
+impl fmt::Display for CacheScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CacheScope::Public => write!(f, "public"),
+            CacheScope::Private => write!(f, "private"),
+        }
+    }
+}
+
+/// Lightweight helper to attach `Cache-Control` header to an `HttpResponse`.
+#[derive(Clone, Copy, Debug)]
+pub struct CacheHint {
+    pub ttl: Duration,
+    pub scope: CacheScope,
+}
+
+impl CacheHint {
+    pub fn new(ttl: Duration, scope: CacheScope) -> Self {
+        CacheHint { ttl, scope }
+    }
+
+    /// Inserts the header on the provided response builder.
+    pub fn apply(self, mut resp: HttpResponse) -> HttpResponse {
+        let directives = vec![
+            CacheDirective::Extension(
+                self.scope.to_string(),
+                None, /*=value*/
+            ),
+            CacheDirective::MaxAge(self.ttl.as_secs() as u32),
+        ];
+        let val = CacheControl(directives);
+        // Converts `CacheControl` into HeaderValue – safe because we control input.
+        let val_string = val.to_string();
+        resp.headers_mut().insert(
+            HeaderName::from_static("cache-control"),
+            HeaderValue::from_str(&val_string).expect("header value never fails"),
+        );
+        resp
+    }
+}
+
+// ---------- Error envelopes ---------------------------------------------------------------------
+
+#[derive(Debug, Display, Error)]
+pub enum ServiceError {
+    #[display(fmt = "validation error")]
+    Validation(ValidationErrors),
+    #[display(fmt = "repository error: {_0}")]
+    Repository(anyhow::Error),
+    #[display(fmt = "unknown internal error")]
+    Internal,
+}
+
+impl ResponseError for ServiceError {
+    fn error_response(&self) -> HttpResponse {
+        match self {
+            ServiceError::Validation(e) => {
+                HttpResponse::BadRequest().json(e)
+            }
+            ServiceError::Repository(_) | ServiceError::Internal => {
+                // Mask internal errors behind 500 to avoid leaking details.
+                HttpResponse::InternalServerError().finish()
+            }
+        }
+    }
+}
+
+// ---------- View / DTO mapping ------------------------------------------------------------------
+
+/// Untrusted payload coming from external clients.
+#[derive(Debug, Deserialize)]
+pub struct LedgerEntryView {
+    pub id: Option<Uuid>,
+    pub timestamp: Option<String>,
+    pub amount: f64,
+    pub currency: Currency,
+    pub memo: Option<String>,
+}
+
+/// Internal DTO with strong typing & validation logic.
+#[derive(Debug, Validate)]
+pub struct LedgerEntryDto {
+    pub id: LedgerEntryId,
+    pub tenant_id: TenantId,
+    pub timestamp: DateTime<Utc>,
+
+    #[validate(custom = "validate_positive_money")]
+    pub money: Money,
+
+    #[validate(length(max = 255))]
+    pub memo: Option<String>,
+}
+
+fn validate_positive_money(money: &Money) -> Result<(), ValidationError> {
+    if money.is_positive() {
+        Ok(())
+    } else {
+        Err(ValidationError::new("amount_must_be_positive"))
+    }
+}
+
+/// Conversion from external View → internal validated DTO
+impl TryFrom<(LedgerEntryView, TenantId)> for LedgerEntryDto {
+    type Error = ServiceError;
+
+    fn try_from((view, tenant_id): (LedgerEntryView, TenantId)) -> Result<Self, Self::Error> {
+        let id = view
+            .id
+            .map(LedgerEntryId)
+            .unwrap_or_else(LedgerEntryId::new);
+
+        // Parse timestamp or fallback to now.
+        let timestamp = view
+            .timestamp
+            .as_deref()
+            .map(|ts| DateTime::parse_from_rfc3339(ts))
+            .transpose()
+            .map_err(|e| ServiceError::Validation(
+                ValidationErrors::from_error("timestamp", ValidationError::new(e.to_string().as_str())),
+            ))?
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+
+        let money = Money {
+            amount: view.amount,
+            currency: view.currency,
+        };
+
+        let dto = LedgerEntryDto {
+            id,
+            tenant_id,
+            timestamp,
+            money,
+            memo: view.memo,
+        };
+
+        dto.validate().map_err(ServiceError::Validation)?;
+        Ok(dto)
+    }
+}
+
+// ---------- Repository contract -----------------------------------------------------------------
+
+/// Port-style async trait used by service layer.
+/// Keeps this VM module free of concrete database drivers.
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    async fn list(
+        &self,
+        tenant: &TenantId,
+        pagination: Pagination,
+    ) -> Result<(Vec<LedgerEntryDto>, u64 /*total*/), anyhow::Error>;
+}
+
+// ---------- Service façade ----------------------------------------------------------------------
+
+/// Highest-level API function exposed by this module – *maps* repo DTOs back
+/// into wire-ready Views and attaches pagination metadata & optional caching.
+pub async fn list_ledger_entries<R>(
+    repo: &R,
+    tenant: TenantId,
+    pagination: Pagination,
+    cache_hint: Option<CacheHint>,
+) -> Result<HttpResponse, ServiceError>
+where
+    R: LedgerEntryRepository,
+{
+    trace!(
+        "Listing ledger entries tenant={} page={} per_page={}",
+        tenant,
+        pagination.page,
+        pagination.per_page
+    );
+
+    let (dtos, total) = repo
+        .list(&tenant, pagination)
+        .await
+        .map_err(ServiceError::Repository)?;
+
+    // Map back to View struct (the DTO → View transformation is infallible).
+    let items: Vec<LedgerEntryView> = dtos
+        .into_iter()
+        .map(|dto| LedgerEntryView {
+            id: Some(dto.id.0),
+            timestamp: Some(dto.timestamp.to_rfc3339()),
+            amount: dto.money.amount,
+            currency: dto.money.currency,
+            memo: dto.memo,
+        })
+        .collect();
+
+    let body = Paginated {
+        items,
+        page: pagination.page,
+        per_page: pagination.per_page,
+        total,
+    };
+
+    let mut resp = HttpResponse::Ok().json(body);
+
+    if let Some(hint) = cache_hint {
+        resp = hint.apply(resp);
+    }
+
+    Ok(resp)
+}
+
+// ---------- Unit tests --------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pagination_offset_limit() {
+        let p = Pagination {
+            page: 3,
+            per_page: 20,
+            max_per_page: 50,
+        };
+        let (offset, limit) = p.offset_limit();
+        assert_eq!((offset, limit), (40, 20));
+    }
+
+    #[test]
+    fn money_validation() {
+        let positive = Money {
+            amount: 10.5,
+            currency: Currency::Usd,
+        };
+        assert!(validate_positive_money(&positive).is_ok());
+
+        let negative = Money {
+            amount: -1.0,
+            currency: Currency::Usd,
+        };
+        assert!(validate_positive_money(&negative).is_err());
+    }
+
+    #[actix_rt::test]
+    async fn cache_control_header() {
+        let hint = CacheHint::new(Duration::from_secs(30), CacheScope::Public);
+        let resp = hint.apply(HttpResponse::Ok().finish());
+        let hdr = resp
+            .headers()
+            .get("cache-control")
+            .expect("header must exist");
+        assert_eq!(hdr.to_str().unwrap(), "public, max-age=30");
+    }
+}
+```

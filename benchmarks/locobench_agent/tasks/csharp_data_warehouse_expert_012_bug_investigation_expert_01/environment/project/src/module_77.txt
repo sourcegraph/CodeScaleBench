@@ -1,0 +1,377 @@
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.Lambda.Core;
+using Amazon.Lambda.KinesisEvents;
+using Amazon.CloudWatchLogs;
+using Amazon.CloudWatchLogs.Model;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+
+// Assembly attribute to enable the Lambda function's JSON input to be converted into a .NET class.
+[assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
+
+namespace PulseOps.Warehouse.Transformation
+{
+    /// <summary>
+    /// Lambda handler that receives raw telemetry events from a Kinesis stream,
+    /// transforms each record into a KPI representation via the Strategy Pattern,
+    /// and dispatches structured logs to CloudWatch for downstream consumers
+    /// (e.g., Firehose → S3, QuickSight).
+    /// </summary>
+    public sealed class TransformEventLambda
+    {
+        private readonly IServiceProvider _serviceProvider;
+        private readonly ITransformationEngine _engine;
+        private readonly ILogger<TransformEventLambda> _logger;
+        private readonly IAmazonCloudWatchLogs _logsClient;
+
+        public TransformEventLambda()
+        {
+            // Bootstrap DI so unit tests can new-up TransformEventLambda()
+            _serviceProvider = ConfigureServices();
+            _engine = _serviceProvider.GetRequiredService<ITransformationEngine>();
+            _logger = _serviceProvider.GetRequiredService<ILogger<TransformEventLambda>>();
+            _logsClient = _serviceProvider.GetRequiredService<IAmazonCloudWatchLogs>();
+        }
+
+        /// <summary>
+        /// Primary Lambda entry-point when hooked up to a Kinesis Data Stream.
+        /// </summary>
+        public async Task Handler(KinesisEvent kinesisEvent, ILambdaContext context)
+        {
+            if (kinesisEvent == null || kinesisEvent.Records == null)
+            {
+                _logger.LogWarning("Received empty KinesisEvent.");
+                return;
+            }
+
+            _logger.LogInformation("Received {RecordCount} Kinesis records.", kinesisEvent.Records.Count);
+
+            var tasks = kinesisEvent.Records.Select(record =>
+            {
+                return Task.Run(async () =>
+                {
+                    try
+                    {
+                        var payload = record.Kinesis.Data.ToArray();
+                        var json = System.Text.Encoding.UTF8.GetString(payload);
+                        var envelope = JsonSerializer.Deserialize<EventEnvelope>(json);
+
+                        if (envelope == null)
+                        {
+                            _logger.LogWarning("Unable to deserialize envelope: {Json}", json);
+                            return;
+                        }
+
+                        var kpi = _engine.Transform(envelope);
+                        if (kpi == null)
+                        {
+                            _logger.LogWarning("No strategy claimed event {@Envelope}.", envelope);
+                            return;
+                        }
+
+                        await EmitStructuredLogAsync(kpi, context.AwsRequestId, envelope.EventId, context.RemainingTime);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error processing Kinesis record (SequenceNumber: {Seq}).", record.Kinesis.SequenceNumber);
+                        // Swallow exception to avoid Lambda re-invocation / throttling.
+                        // Business requirement: errors are forwarded via DLQ in separate process.
+                    }
+                });
+            });
+
+            await Task.WhenAll(tasks);
+        }
+
+        #region Private helpers
+
+        private async Task EmitStructuredLogAsync(KpiRecord kpi, string requestId, string sourceEventId, TimeSpan remainingTime)
+        {
+            // For demo only: write to CloudWatch Logs directly.
+            // Production code could use Firehose, OpenSearch, or EventBridge.
+            var logGroup = "/pulseops/warehouse/kpi";
+            var logStream = DateTime.UtcNow.ToString("yyyy/MM/dd/HH");
+
+            try
+            {
+                await EnsureLogStreamAsync(logGroup, logStream);
+
+                var putRequest = new PutLogEventsRequest
+                {
+                    LogEvents = new List<InputLogEvent>
+                    {
+                        new()
+                        {
+                            Message = JsonSerializer.Serialize(new
+                            {
+                                kpi.KpiName,
+                                kpi.Value,
+                                kpi.Dimension,
+                                kpi.Timestamp,
+                                RequestId = requestId,
+                                SourceEventId = sourceEventId
+                            }),
+                            Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                        }
+                    },
+                    LogGroupName = logGroup,
+                    LogStreamName = logStream
+                };
+
+                await _logsClient.PutLogEventsAsync(putRequest);
+                _logger.LogDebug("Emitted KPI {KpiName} to CloudWatch Logs.", kpi.KpiName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to emit structured log for KPI {KpiName}. Time remaining: {RemainingMs}ms",
+                    kpi.KpiName, remainingTime.TotalMilliseconds);
+            }
+        }
+
+        private async Task EnsureLogStreamAsync(string logGroup, string logStream)
+        {
+            // Log group creation is idempotent and sits well within CW limits for infrequent calls
+            if (!await _logsClient.LogGroupExistsAsync(logGroup))
+            {
+                await _logsClient.CreateLogGroupAsync(new CreateLogGroupRequest { LogGroupName = logGroup });
+            }
+
+            var describe = await _logsClient.DescribeLogStreamsAsync(new DescribeLogStreamsRequest
+            {
+                LogGroupName = logGroup,
+                LogStreamNamePrefix = logStream
+            });
+
+            if (!describe.LogStreams.Any())
+            {
+                await _logsClient.CreateLogStreamAsync(new CreateLogStreamRequest
+                {
+                    LogGroupName = logGroup,
+                    LogStreamName = logStream
+                });
+            }
+        }
+
+        private static IServiceProvider ConfigureServices()
+        {
+            var services = new ServiceCollection();
+
+            // AWS SDK clients
+            services.AddAWSService<IAmazonCloudWatchLogs>();
+
+            // Logging
+            services.AddLogging(builder =>
+            {
+                builder.AddSystemdConsole();
+                builder.SetMinimumLevel(LogLevel.Information);
+            });
+
+            // Transformation strategies
+            services.AddSingleton<ITransformationStrategy, FocusTimeRatioStrategy>();
+            services.AddSingleton<ITransformationStrategy, DeploymentLeadTimeStrategy>();
+            services.AddSingleton<ITransformationStrategy, MeetingCostIndexStrategy>();
+
+            // Engine
+            services.AddSingleton<ITransformationEngine, TransformationEngine>();
+
+            return services.BuildServiceProvider();
+        }
+
+        #endregion
+    }
+
+    #region Engine + Strategy Pattern
+
+    public interface ITransformationEngine
+    {
+        KpiRecord? Transform(EventEnvelope envelope);
+    }
+
+    internal sealed class TransformationEngine : ITransformationEngine
+    {
+        private readonly IReadOnlyCollection<ITransformationStrategy> _strategies;
+        private readonly ILogger<TransformationEngine> _logger;
+
+        public TransformationEngine(IEnumerable<ITransformationStrategy> strategies,
+                                    ILogger<TransformationEngine> logger)
+        {
+            _strategies = strategies.ToList().AsReadOnly();
+            _logger = logger;
+        }
+
+        public KpiRecord? Transform(EventEnvelope envelope)
+        {
+            var strategy = _strategies.FirstOrDefault(s => s.CanHandle(envelope));
+
+            if (strategy == null)
+            {
+                _logger.LogDebug("No strategy matched event type {EventType}.", envelope.EventType);
+                return null;
+            }
+
+            try
+            {
+                return strategy.Transform(envelope);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Strategy {StrategyName} threw while processing EventId {EventId}.",
+                    strategy.GetType().Name, envelope.EventId);
+                return null;
+            }
+        }
+    }
+
+    public interface ITransformationStrategy
+    {
+        bool CanHandle(EventEnvelope envelope);
+        KpiRecord Transform(EventEnvelope envelope);
+    }
+
+    #endregion
+
+    #region Strategy Implementations
+
+    /// <summary>
+    /// Focus time ratio = (Deep work minutes) / (Total work minutes)
+    /// </summary>
+    internal sealed class FocusTimeRatioStrategy : BaseStrategy
+    {
+        public FocusTimeRatioStrategy(ILogger<FocusTimeRatioStrategy> logger) : base(logger) { }
+
+        public override bool CanHandle(EventEnvelope envelope)
+            => envelope.EventType.Equals("calendar.summary", StringComparison.OrdinalIgnoreCase);
+
+        public override KpiRecord Transform(EventEnvelope envelope)
+        {
+            var summary = envelope.Payload.GetProperty("summary").GetString() ?? string.Empty;
+            var deepWork = envelope.Payload.GetProperty("deepMinutes").GetInt32();
+            var total = envelope.Payload.GetProperty("totalMinutes").GetInt32();
+
+            var ratio = total == 0 ? 0 : Math.Round((double)deepWork / total, 2);
+
+            return CreateKpi("focus_time_ratio", ratio, summary, envelope);
+        }
+    }
+
+    /// <summary>
+    /// Deployment lead time = (DeployedAt - FirstCommitAt)
+    /// </summary>
+    internal sealed class DeploymentLeadTimeStrategy : BaseStrategy
+    {
+        public DeploymentLeadTimeStrategy(ILogger<DeploymentLeadTimeStrategy> logger) : base(logger) { }
+
+        public override bool CanHandle(EventEnvelope envelope)
+            => envelope.EventType.Equals("github.deployment", StringComparison.OrdinalIgnoreCase);
+
+        public override KpiRecord Transform(EventEnvelope envelope)
+        {
+            var firstCommitAt = envelope.Payload.GetProperty("firstCommitAt").GetDateTime();
+            var deployedAt = envelope.Payload.GetProperty("deployedAt").GetDateTime();
+
+            var leadTimeHours = (deployedAt - firstCommitAt).TotalHours;
+
+            return CreateKpi("deployment_lead_time_hours", leadTimeHours, envelope.Payload.GetProperty("repo").GetString(), envelope);
+        }
+    }
+
+    /// <summary>
+    /// Meeting cost index = (Attendees × Meeting Duration (hrs)) × AvgHourlyRate
+    /// </summary>
+    internal sealed class MeetingCostIndexStrategy : BaseStrategy
+    {
+        public MeetingCostIndexStrategy(ILogger<MeetingCostIndexStrategy> logger) : base(logger) { }
+
+        private const double AvgHourlyRate = 85.0; // USD
+
+        public override bool CanHandle(EventEnvelope envelope)
+            => envelope.EventType.Equals("calendar.invite", StringComparison.OrdinalIgnoreCase);
+
+        public override KpiRecord Transform(EventEnvelope envelope)
+        {
+            var attendeeCount = envelope.Payload.GetProperty("attendees").GetArrayLength();
+            var durationHrs = envelope.Payload.GetProperty("durationMinutes").GetInt32() / 60.0;
+
+            var cost = Math.Round(attendeeCount * durationHrs * AvgHourlyRate, 2);
+
+            return CreateKpi("meeting_cost_usd", cost, attendeeCount.ToString(), envelope);
+        }
+    }
+
+    internal abstract class BaseStrategy : ITransformationStrategy
+    {
+        protected readonly ILogger _logger;
+
+        protected BaseStrategy(ILogger logger)
+        {
+            _logger = logger;
+        }
+
+        public abstract bool CanHandle(EventEnvelope envelope);
+        public abstract KpiRecord Transform(EventEnvelope envelope);
+
+        protected KpiRecord CreateKpi(string name, double value, string? dimension, EventEnvelope envelope)
+        {
+            _logger.LogInformation("Computed KPI {Name}={Value} for EventId {EventId}.", name, value, envelope.EventId);
+
+            return new KpiRecord
+            (
+                KpiName: name,
+                Value: value,
+                Dimension: dimension,
+                Timestamp: envelope.Timestamp
+            );
+        }
+    }
+
+    #endregion
+
+    #region POCOs
+
+    /// <summary>
+    /// Standard envelope wrapping all raw telemetry events.
+    /// </summary>
+    public sealed record EventEnvelope(
+        string EventId,
+        string EventType,
+        DateTime Timestamp,
+        JsonElement Payload);
+
+    /// <summary>
+    /// Resulting KPI record emitted downstream.
+    /// </summary>
+    public sealed record KpiRecord(
+        string KpiName,
+        double Value,
+        string? Dimension,
+        DateTime Timestamp);
+
+    #endregion
+}
+
+#region Extension methods
+
+internal static class CloudWatchLogExtensions
+{
+    /// <summary>
+    /// Cheap helper to check if a log group exists without incurring a DescribeLogGroups call on every Lambda cold-start.
+    /// </summary>
+    public static async Task<bool> LogGroupExistsAsync(this IAmazonCloudWatchLogs logs, string logGroupName)
+    {
+        var response = await logs.DescribeLogGroupsAsync(new DescribeLogGroupsRequest
+        {
+            LogGroupNamePrefix = logGroupName
+        });
+
+        return response.LogGroups.Any(lg => lg.LogGroupName.Equals(logGroupName, StringComparison.Ordinal));
+    }
+}
+
+#endregion
+```

@@ -1,0 +1,261 @@
+```csharp
+// File: src/module_2.txt
+// Project: TempoScribe Pro – Hexagonal Productivity Blog Suite
+// Layer: Application / Service
+//
+// This module contains the core orchestration logic that publishes all Posts
+// whose scheduled publish date has elapsed.  The service is technology-agnostic
+// and utilizes Ports (interfaces) exclusively, so adapters can be provided for
+// EF Core, Dapper, RavenDb, MongoDb, or any other infrastructure without
+// touching this code.
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Polly;
+using Polly.Retry;
+
+namespace TempoScribePro.Core.Publishing
+{
+    #region Ports (Hexagonal Interfaces)
+
+    /// <summary>
+    /// Abstraction for retrieving and persisting Post aggregates.
+    /// </summary>
+    public interface IPostRepository
+    {
+        Task<IReadOnlyList<Post>> GetPostsScheduledUntilAsync(
+            DateTimeOffset executeUntil,
+            CancellationToken cancellationToken = default);
+
+        Task UpdateAsync(Post post, CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Provides a consistent, injectable source of 'current time' for easy testing.
+    /// </summary>
+    public interface IDateTimeProvider
+    {
+        DateTimeOffset UtcNow { get; }
+    }
+
+    /// <summary>
+    /// Sends notifications to subscribers, editors, or external systems whenever a post changes state.
+    /// </summary>
+    public interface INotificationPort
+    {
+        Task NotifyPostPublishedAsync(Post post, CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Emits metric counters, histograms, or traces to Application Insights, Prometheus, etc.
+    /// </summary>
+    public interface IMetricsPort
+    {
+        void Increment(string metricName);
+        void RecordTiming(string metricName, TimeSpan elapsed);
+    }
+
+    /// <summary>
+    /// Provides distributed locking semantics so that only one service instance publishes a specific
+    /// post at a time. Implementation can be based on Redis, SQL 'sp_getapplock', etc.
+    /// </summary>
+    public interface IDistributedLockProvider
+    {
+        Task<IDistributedLock> AcquireAsync(
+            string resource,
+            TimeSpan timeout,
+            CancellationToken cancellationToken = default);
+    }
+
+    public interface IDistributedLock : IAsyncDisposable
+    {
+        string Resource { get; }
+    }
+
+    #endregion
+
+    #region Domain Model (simplified)
+
+    /// <summary>
+    /// Aggregate root representing a blog post.
+    /// </summary>
+    public sealed class Post
+    {
+        public Guid Id { get; init; }
+        public string Title { get; private set; } = default!;
+        public PostStatus Status { get; private set; }
+        public DateTimeOffset? ScheduledPublishUtc { get; private set; }
+        public DateTimeOffset? PublishedUtc { get; private set; }
+
+        public bool IsReadyForPublication(IDateTimeProvider clock) =>
+            Status == PostStatus.Scheduled &&
+            ScheduledPublishUtc.HasValue &&
+            ScheduledPublishUtc.Value <= clock.UtcNow;
+
+        public void Publish(IDateTimeProvider clock)
+        {
+            if (!IsReadyForPublication(clock))
+                throw new InvalidOperationException(
+                    $"Cannot publish post {Id} because scheduled date is in the future.");
+
+            Status        = PostStatus.Published;
+            PublishedUtc  = clock.UtcNow;
+            ScheduledPublishUtc = null; // clear schedule
+        }
+    }
+
+    public enum PostStatus
+    {
+        Draft = 0,
+        Scheduled = 1,
+        Published = 2
+    }
+
+    #endregion
+
+    #region Service
+
+    /// <summary>
+    /// Periodically invoked service that publishes all posts whose scheduled date
+    /// has elapsed, ensuring idempotency and robustness through distributed locking.
+    /// </summary>
+    public interface IScheduledPublishingService
+    {
+        Task RunPublishingCycleAsync(CancellationToken cancellationToken = default);
+    }
+
+    /// <inheritdoc />
+    public sealed class ScheduledPublishingService : IScheduledPublishingService
+    {
+        private const string PublishMetric            = "tempo.posts.published.count";
+        private const string PublishDurationMetric    = "tempo.posts.publish.duration_ms";
+        private static readonly TimeSpan LockTimeout  = TimeSpan.FromSeconds(5);
+
+        private readonly IPostRepository _postRepository;
+        private readonly IDateTimeProvider _clock;
+        private readonly INotificationPort _notificationPort;
+        private readonly IMetricsPort _metrics;
+        private readonly IDistributedLockProvider _lockProvider;
+        private readonly ILogger<ScheduledPublishingService> _logger;
+        private readonly AsyncRetryPolicy _retryPolicy;
+
+        public ScheduledPublishingService(
+            IPostRepository postRepository,
+            IDateTimeProvider clock,
+            INotificationPort notificationPort,
+            IMetricsPort metrics,
+            IDistributedLockProvider lockProvider,
+            ILogger<ScheduledPublishingService> logger)
+        {
+            _postRepository     = postRepository ?? throw new ArgumentNullException(nameof(postRepository));
+            _clock              = clock ?? throw new ArgumentNullException(nameof(clock));
+            _notificationPort   = notificationPort ?? throw new ArgumentNullException(nameof(notificationPort));
+            _metrics            = metrics ?? throw new ArgumentNullException(nameof(metrics));
+            _lockProvider       = lockProvider ?? throw new ArgumentNullException(nameof(lockProvider));
+            _logger             = logger ?? throw new ArgumentNullException(nameof(logger));
+
+            // Exponential back-off:  2 retries after 200ms, 800ms
+            _retryPolicy = Policy
+                .Handle<Exception>()
+                .WaitAndRetryAsync(
+                    retryCount: 2,
+                    sleepDurationProvider: attempt => TimeSpan.FromMilliseconds(200 * Math.Pow(2, attempt)),
+                    onRetry: (ex, delay, attempt, ctx) =>
+                    {
+                        _logger.LogWarning(ex, "Retrying post publication (attempt {Attempt}) after {Delay}", attempt, delay);
+                    });
+        }
+
+        /// <summary>
+        /// Executes a full publishing pass. Safe to call concurrently; a distributed
+        /// lock is taken per post to avoid duplicate work across clustered nodes.
+        /// </summary>
+        public async Task RunPublishingCycleAsync(CancellationToken cancellationToken = default)
+        {
+            DateTimeOffset now = _clock.UtcNow;
+
+            _logger.LogInformation("Running scheduled publishing cycle at {UtcNow}", now);
+
+            IReadOnlyList<Post> duePosts =
+                await _postRepository.GetPostsScheduledUntilAsync(now, cancellationToken)
+                                     .ConfigureAwait(false);
+
+            if (!duePosts.Any())
+            {
+                _logger.LogDebug("No posts eligible for publication.");
+                return;
+            }
+
+            _logger.LogInformation("Found {PostCount} post(s) ready to publish", duePosts.Count);
+
+            foreach (var post in duePosts)
+            {
+                // Each post works in its own retry scope to isolate failures
+                await _retryPolicy.ExecuteAsync(
+                    ct => PublishPostAsync(post, ct),
+                    cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            _logger.LogInformation("Scheduled publishing cycle completed.");
+        }
+
+        private async Task PublishPostAsync(Post post, CancellationToken cancellationToken)
+        {
+            string lockResource = $"tempo.post.publish.{post.Id}";
+
+            await using IDistributedLock theLock =
+                await _lockProvider.AcquireAsync(lockResource, LockTimeout, cancellationToken)
+                                   .ConfigureAwait(false);
+
+            if (theLock is null)
+            {
+                _logger.LogWarning("Skipped publishing post {PostId} because lock '{Lock}' is held by another instance.",
+                    post.Id, lockResource);
+                return;
+            }
+
+            if (!post.IsReadyForPublication(_clock))
+            {
+                _logger.LogDebug("Post {PostId} is not eligible for publication anymore. Maybe processed in prior pass.",
+                    post.Id);
+                return;
+            }
+
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+            try
+            {
+                _logger.LogInformation("Publishing post {PostId}", post.Id);
+
+                post.Publish(_clock);
+
+                await _postRepository.UpdateAsync(post, cancellationToken)
+                                     .ConfigureAwait(false);
+
+                await _notificationPort.NotifyPostPublishedAsync(post, cancellationToken)
+                                       .ConfigureAwait(false);
+
+                _metrics.Increment(PublishMetric);
+
+                stopwatch.Stop();
+                _metrics.RecordTiming(PublishDurationMetric, stopwatch.Elapsed);
+
+                _logger.LogInformation("Successfully published post {PostId} in {ElapsedMs} ms",
+                    post.Id, stopwatch.ElapsedMilliseconds);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error while publishing post {PostId}", post.Id);
+                throw; // let Polly decide on retry
+            }
+        }
+    }
+
+    #endregion
+}
+```

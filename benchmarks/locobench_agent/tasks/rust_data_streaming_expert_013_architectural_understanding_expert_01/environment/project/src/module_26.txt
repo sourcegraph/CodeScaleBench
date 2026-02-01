@@ -1,0 +1,367 @@
+```rust
+//! ChirpPulse – Strategy Runtime (module 26)
+//!
+//! This module implements the “hot-swappable” strategy runtime used by the
+//! stream-processing jobs.  Data scientists can promote a new sentiment-analysis
+//! algorithm by publishing a message on the `strategy-updates` Kafka topic.  The
+//! manager below will pick it up and atomically replace the running strategy
+//! without disrupting the ingest pipeline.
+//!
+//! Compile-time features
+//! ---------------------
+//! - `parallel_processing`    – Enables rayon-based CPU parallelism inside some
+//!                              strategies.
+//! - `monitoring`             – Exports Prometheus metrics.
+//!
+//! The code is `no_std`-friendly except for the `tokio` runtime and the Kafka
+//! driver, which both rely on `std`.  It is written under the assumption that
+//! it will be compiled as part of a larger workspace with the following
+//! dependencies in `Cargo.toml`:
+//!
+//! ```toml
+//! [dependencies]
+//! async-trait   = "0.1"
+//! rdkafka       = { version = "0.34", features = ["tokio-runtime"] }
+//! serde         = { version = "1", features = ["derive"] }
+//! serde_json    = "1"
+//! thiserror     = "1"
+//! log           = "0.4"
+//! prometheus    = { version = "0.13", optional = true }
+//! rayon         = { version = "1.8", optional = true }
+//! tokio         = { version = "1", features = ["macros", "rt-multi-thread"] }
+//! ```
+//!
+//! The public API surface is intentionally narrow: real-time operators only
+//! care about `analyze()` and `install_listener()`.
+//
+
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
+    time::Instant,
+};
+
+use async_trait::async_trait;
+use log::{debug, error, info, warn};
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    message::BorrowedMessage,
+    ClientConfig, Message,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[cfg(feature = "monitoring")]
+use prometheus::{opts, HistogramVec, IntCounterVec, Registry};
+
+/// A single sentiment-analysis result.
+#[derive(Debug, Clone, Serialize)]
+pub struct SentimentScore {
+    /// Polarity on [-1.0, 1.0].
+    pub score: f32,
+    /// Absolute strength.  0 = neutral, 1 = extremely emotional.
+    pub magnitude: f32,
+}
+
+/// Errors propagated by strategy operations.
+#[derive(Error, Debug)]
+pub enum StrategyError {
+    #[error("Failed to parse strategy configuration: {0}")]
+    ConfigParse(#[from] serde_json::Error),
+    #[error("Attempted to install an unknown strategy '{0}'")]
+    UnknownStrategy(String),
+    #[error("Underlying strategy error: {0}")]
+    StrategyFailed(String),
+}
+
+/// Trait implemented by every online sentiment strategy.
+#[async_trait]
+pub trait SentimentStrategy: Send + Sync {
+    /// A human-readable name (used for metrics & logging).
+    fn name(&self) -> &'static str;
+
+    /// Analyze a chunk of text in real time.
+    async fn analyze(&self, text: &str) -> Result<SentimentScore, StrategyError>;
+}
+
+/// Naïve‐Bayes baseline strategy (cheap & cheerful).
+pub struct NaiveBayesStrategy;
+
+#[async_trait]
+impl SentimentStrategy for NaiveBayesStrategy {
+    fn name(&self) -> &'static str {
+        "naive_bayes"
+    }
+
+    // A highly simplified toy model.  Replace with a real Bayesian classifier.
+    async fn analyze(&self, text: &str) -> Result<SentimentScore, StrategyError> {
+        let p_positive = text.matches("good").count() as f32 + 1.0;
+        let p_negative = text.matches("bad").count() as f32 + 1.0;
+        let total = p_positive + p_negative;
+
+        Ok(SentimentScore {
+            score: (p_positive - p_negative) / total,
+            magnitude: total.log10().min(1.0),
+        })
+    }
+}
+
+/// Transformer-based strategy (heavyweight, but more accurate).
+pub struct TransformerStrategy {
+    // In a real system this would hold the loaded ONNX/Torch model.
+    #[allow(dead_code)]
+    model_id: String,
+}
+
+impl TransformerStrategy {
+    fn new(model_id: String) -> Self {
+        Self { model_id }
+    }
+}
+
+#[async_trait]
+impl SentimentStrategy for TransformerStrategy {
+    fn name(&self) -> &'static str {
+        "transformer"
+    }
+
+    async fn analyze(&self, text: &str) -> Result<SentimentScore, StrategyError> {
+        // Dummy stand-in for an actual neural inference.
+        let hash = fxhash::hash32(text.as_bytes());
+        let score = (hash as i32 % 2000 - 1000) as f32 / 1000.0;
+        let magnitude = 0.6;
+
+        Ok(SentimentScore { score, magnitude })
+    }
+}
+
+/// Runtime manager responsible for holding the current strategy and swapping it
+/// atomically when a new implementation is promoted.
+pub struct StrategyManager {
+    inner: Arc<RwLock<Box<dyn SentimentStrategy>>>,
+    version: AtomicU64,
+
+    #[cfg(feature = "monitoring")]
+    metrics: Metrics,
+}
+
+impl StrategyManager {
+    /// Create a new manager with the supplied default strategy.
+    pub fn new(default: Box<dyn SentimentStrategy>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(default)),
+            version: AtomicU64::new(1),
+            #[cfg(feature = "monitoring")]
+            metrics: Metrics::default(),
+        }
+    }
+
+    /// Execute real-time analysis through the current strategy.
+    pub async fn analyze(&self, text: &str) -> Result<SentimentScore, StrategyError> {
+        let version = self.version.load(Ordering::Acquire);
+        let start = Instant::now();
+
+        let strategy = { self.inner.read().unwrap().name() };
+        let res = {
+            let guard = self.inner.read().unwrap();
+            guard.analyze(text).await
+        };
+
+        #[cfg(feature = "monitoring")]
+        {
+            let elapsed = start.elapsed().as_secs_f64();
+            self.metrics
+                .latency
+                .with_label_values(&[strategy])
+                .observe(elapsed);
+
+            match &res {
+                Ok(_) => self.metrics.ok_counter.with_label_values(&[strategy]).inc(),
+                Err(_) => self.metrics.err_counter.with_label_values(&[strategy]).inc(),
+            }
+        }
+
+        debug!(
+            target: "strategy",
+            "Strategy v{} ({}) analyzed '{}' in {:.3}ms",
+            version,
+            strategy,
+            text,
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+
+        res
+    }
+
+    /// Start a background listener on the `strategy-updates` Kafka topic.
+    ///
+    /// The expected payload is a UTF-8 JSON object:
+    ///
+    /// ```json
+    /// { "strategy": "transformer", "params": { "model_id": "distilbert_v4" } }
+    /// ```
+    ///
+    /// Unknown strategies will be rejected with an error log while valid ones
+    /// will be installed atomically.
+    pub async fn install_listener(
+        self: Arc<Self>,
+        brokers: &str,
+        group_id: &str,
+        topic: &str,
+    ) -> Result<(), anyhow::Error> {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("group.id", group_id)
+            .set("bootstrap.servers", brokers)
+            .set("enable.partition.eof", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()?;
+
+        consumer.subscribe(&[topic])?;
+        info!("Strategy listener subscribed to topic '{}'", topic);
+
+        let manager = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match consumer.recv().await {
+                    Err(e) => error!("Kafka error in strategy listener: {}", e),
+                    Ok(m) => {
+                        if let Err(e) = manager.handle_message(&m).await {
+                            error!(
+                                "Failed to update strategy from message {:?}: {}",
+                                m.offset(),
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn handle_message(
+        &self,
+        msg: &BorrowedMessage<'_>,
+    ) -> Result<(), StrategyError> {
+        let payload = match msg.payload_view::<str>() {
+            None | Some(Err(_)) => {
+                warn!("Strategy update message has no valid payload, skipping");
+                return Ok(());
+            }
+            Some(Ok(s)) => s,
+        };
+
+        let update: StrategyUpdate = serde_json::from_str(payload)?;
+        info!("Received strategy-update message: {:?}", update);
+
+        let new_strategy: Box<dyn SentimentStrategy> = match update.strategy.as_str() {
+            "naive_bayes" => Box::new(NaiveBayesStrategy),
+            "transformer" => {
+                let model_id = update
+                    .params
+                    .get("model_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default")
+                    .to_owned();
+                Box::new(TransformerStrategy::new(model_id))
+            }
+            other => return Err(StrategyError::UnknownStrategy(other.to_owned())),
+        };
+
+        {
+            let mut guard = self.inner.write().unwrap();
+            *guard = new_strategy;
+        }
+        let new_version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
+        info!(
+            "Swapped in new strategy '{}'; version={}",
+            update.strategy, new_version
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StrategyUpdate {
+    strategy: String,
+    #[serde(default)]
+    params: HashMap<String, serde_json::Value>,
+}
+
+#[cfg(feature = "monitoring")]
+#[derive(Default)]
+struct Metrics {
+    latency: HistogramVec,
+    ok_counter: IntCounterVec,
+    err_counter: IntCounterVec,
+}
+
+#[cfg(feature = "monitoring")]
+impl Metrics {
+    fn default() -> Self {
+        let registry = Registry::default();
+
+        let latency = HistogramVec::new(
+            opts!(
+                "chirp_strategy_latency_seconds",
+                "Latency for sentiment strategy"
+            ),
+            &["strategy"],
+        )
+        .expect("Unable to create histogram");
+        registry.register(Box::new(latency.clone())).unwrap();
+
+        let ok_counter = IntCounterVec::new(
+            opts!("chirp_strategy_ok_total", "Successful analyses"),
+            &["strategy"],
+        )
+        .unwrap();
+        registry.register(Box::new(ok_counter.clone())).unwrap();
+
+        let err_counter = IntCounterVec::new(
+            opts!("chirp_strategy_err_total", "Failed analyses"),
+            &["strategy"],
+        )
+        .unwrap();
+        registry.register(Box::new(err_counter.clone())).unwrap();
+
+        Self {
+            latency,
+            ok_counter,
+            err_counter,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Simple demonstration executable (only compiled with the `bin-example` flag)
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "bin-example"))]
+mod example_bin {
+    use super::*;
+
+    #[tokio::main]
+    async fn main() {
+        env_logger::init();
+
+        let mgr = Arc::new(StrategyManager::new(Box::new(NaiveBayesStrategy)));
+
+        // Start listener (will run forever)
+        mgr.clone()
+            .install_listener("localhost:9092", "chirp-strategy", "strategy-updates")
+            .await
+            .unwrap();
+
+        // Example usage
+        loop {
+            let score = mgr.analyze("Rust is good, but unsafe can be bad").await.unwrap();
+            println!("Sentiment: {:?}", score);
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
+    }
+}
+```

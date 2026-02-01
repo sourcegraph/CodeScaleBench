@@ -1,0 +1,401 @@
+```rust
+//! LedgerEntry repository + service layer implementation.
+//!
+//! This module wires together persistence (PostgreSQL), transient caching
+//! (Redis) and domain-level validation for ledger entries.  
+//! It is representative of the “M” (Model) + service (“VM”) part of the
+//! MVVM-inspired stack used by LedgerLink Nexus.
+//!
+//! IMPORTANT: this file is placed under `src/module_67.txt` only to satisfy
+//! the prompt. In a real code-base it would live in `src/ledger_entry.rs`.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use thiserror::Error;
+use tokio::sync::RwLock;
+use tracing::{instrument, Instrument};
+
+/// Max number of records the API will ever return in a single call.
+/// Acts as a safeguard against pathological requests.
+const HARD_PAGE_SIZE_LIMIT: u16 = 1_000;
+
+/// Domain object representing an immutable entry in the ledger.
+///
+/// NOTE: The table uses `NUMERIC(38, 10)` for `amount` in Postgres but we
+/// materialise it as `rust_decimal::Decimal` to maintain precision.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub id: i64,
+    pub tenant_id: i64,
+    pub account_id: i64,
+    pub amount: rust_decimal::Decimal,
+    pub currency: String,
+    pub booked_at: DateTime<Utc>,
+    pub memo: Option<String>,
+}
+
+/// View-model that the REST/GraphQL layer consumes.
+/// It is purposely flattened to hide internal IDs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LedgerEntryDto {
+    pub uuid: String,
+    pub amount: rust_decimal::Decimal,
+    pub currency: String,
+    pub booked_at: DateTime<Utc>,
+    pub memo: Option<String>,
+}
+
+impl From<LedgerEntry> for LedgerEntryDto {
+    fn from(e: LedgerEntry) -> Self {
+        Self {
+            uuid: base62::encode(e.id as u128),
+            amount: e.amount,
+            currency: e.currency,
+            booked_at: e.booked_at,
+            memo: e.memo,
+        }
+    }
+}
+
+/// Pagination request coming from the API.
+///
+/// `page` is 1-based because it is more ergonomic for clients.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct PageRequest {
+    pub page: u32,
+    pub per_page: u16,
+}
+
+impl PageRequest {
+    /// Sanitises caller input: caps `per_page` and guarantees `page >= 1`.
+    pub fn sanitise(self) -> Self {
+        Self {
+            page: self.page.max(1),
+            per_page: self.per_page.min(HARD_PAGE_SIZE_LIMIT).max(1),
+        }
+    }
+
+    /// Calculates SQL offset.
+    pub fn offset(&self) -> i64 {
+        ((self.page - 1) * self.per_page as u32) as i64
+    }
+}
+
+/// Structured page response returned to the API layer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Page<T> {
+    pub data: Vec<T>,
+    pub next_page: Option<u32>,
+    pub total: Option<u64>,
+}
+
+/// Shared error type for repository/service-level failures.
+#[derive(Error, Debug)]
+pub enum LedgerError {
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+
+    #[error("redis error: {0}")]
+    Cache(#[from] redis::RedisError),
+
+    #[error("ledger entry not found")]
+    NotFound,
+
+    #[error("invalid state: {0}")]
+    InvalidState(String),
+}
+
+pub type Result<T> = std::result::Result<T, LedgerError>;
+
+/// Abstraction hiding persistent storage semantics.
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    async fn insert(&self, entry: &LedgerEntry) -> Result<i64>;
+    async fn get(&self, tenant_id: i64, entry_id: i64) -> Result<LedgerEntry>;
+    async fn fetch_page(
+        &self,
+        tenant_id: i64,
+        req: PageRequest,
+    ) -> Result<(Vec<LedgerEntry>, u64)>;
+}
+
+/// PostgreSQL implementation backed by sqlx.
+/// This concrete type is not exposed outside this module.
+pub struct PostgresLedgerEntryRepo {
+    pool: PgPool,
+}
+
+impl PostgresLedgerEntryRepo {
+    pub async fn new(database_url: &str, max_connections: u32) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(database_url)
+            .await
+            .map_err(LedgerError::Db)?;
+
+        Ok(Self { pool })
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for PostgresLedgerEntryRepo {
+    #[instrument(skip(self, entry), level = "debug")]
+    async fn insert(&self, entry: &LedgerEntry) -> Result<i64> {
+        let rec = sqlx::query(
+            r#"
+            INSERT INTO ledger_entries
+                    (tenant_id, account_id, amount, currency, booked_at, memo)
+            VALUES  ($1,        $2,         $3,     $4,       $5,        $6)
+            RETURNING id;
+        "#,
+        )
+        .bind(entry.tenant_id)
+        .bind(entry.account_id)
+        .bind(entry.amount)
+        .bind(&entry.currency)
+        .bind(entry.booked_at)
+        .bind(&entry.memo)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(rec.get::<i64, _>("id"))
+    }
+
+    #[instrument(skip(self), level = "trace")]
+    async fn get(&self, tenant_id: i64, entry_id: i64) -> Result<LedgerEntry> {
+        let rec = sqlx::query_as!(
+            LedgerEntry,
+            r#"
+            SELECT id, tenant_id, account_id, amount, currency, booked_at, memo
+            FROM   ledger_entries
+            WHERE  tenant_id = $1 AND id = $2
+        "#,
+            tenant_id,
+            entry_id
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(LedgerError::NotFound)?;
+
+        Ok(rec)
+    }
+
+    #[instrument(skip(self), level = "debug")]
+    async fn fetch_page(
+        &self,
+        tenant_id: i64,
+        req: PageRequest,
+    ) -> Result<(Vec<LedgerEntry>, u64)> {
+        // 1. Count total for the tenant.
+        let total: (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*) as count FROM ledger_entries WHERE tenant_id = $1"#,
+        )
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        // 2. Fetch requested slice.
+        let rows = sqlx::query_as!(
+            LedgerEntry,
+            r#"
+            SELECT id, tenant_id, account_id, amount, currency, booked_at, memo
+            FROM   ledger_entries
+            WHERE  tenant_id = $1
+            ORDER  BY booked_at DESC, id DESC
+            OFFSET $2 LIMIT $3
+        "#,
+            tenant_id,
+            req.offset(),
+            req.per_page as i64
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((rows, total.0 as u64))
+    }
+}
+
+/// High-level service orchestrating repository and distributed cache.
+///
+/// Caches individual `LedgerEntryDto` objects to minimise DB traffic for
+/// idempotent GET requests. The caching strategy is a simple “cache-aside”
+/// with a 10 minute TTL. We purposely keep the implementation thin; in real
+/// life we would centralise this logic through a reusable Redis wrapper.
+#[derive(Clone)]
+pub struct LedgerEntryService<R: LedgerEntryRepository> {
+    repo: Arc<R>,
+    redis: redis::Client,
+    // Small in-memory cache to ameliorate thundering herd during short periods.
+    in_memory: Arc<RwLock<lru::LruCache<i64, LedgerEntryDto>>>,
+}
+
+impl<R: LedgerEntryRepository> LedgerEntryService<R> {
+    pub fn new(repo: R, redis_url: &str, mem_cache_cap: usize) -> Result<Self> {
+        Ok(Self {
+            repo: Arc::new(repo),
+            redis: redis::Client::open(redis_url).map_err(LedgerError::Cache)?,
+            in_memory: Arc::new(RwLock::new(lru::LruCache::new(
+                mem_cache_cap.try_into().unwrap_or(256),
+            ))),
+        })
+    }
+
+    fn redis_key(tenant_id: i64, entry_id: i64) -> String {
+        format!("tenant:{tenant_id}:ledger_entry:{entry_id}")
+    }
+
+    /// Inserts a new entry and invalidates affected caches.
+    #[instrument(skip(self, entry), level = "info")]
+    pub async fn create_entry(&self, entry: &LedgerEntry) -> Result<i64> {
+        // Basic validation rule: amount cannot be 0.
+        if entry.amount.is_zero() {
+            return Err(LedgerError::InvalidState(
+                "Amount cannot be zero".to_string(),
+            ));
+        }
+
+        let id = self.repo.insert(entry).await?;
+
+        // Invalidate parent list (simple strategy: delete entire key space).
+        let mut conn = self.redis.get_async_connection().await?;
+        let pattern = format!("tenant:{}:ledger_entry:*", entry.tenant_id);
+        let _: () = redis::cmd("UNLINK").arg(pattern).query_async(&mut conn).await?;
+
+        // Evict in-memory cache.
+        self.in_memory.write().await.pop(&id);
+
+        Ok(id)
+    }
+
+    /// Fetches a single entry, going through L1 (memory) & L2 (Redis) caches.
+    #[instrument(skip(self), level = "debug")]
+    pub async fn get_entry(
+        &self,
+        tenant_id: i64,
+        entry_id: i64,
+    ) -> Result<LedgerEntryDto> {
+        // 1. Check L1.
+        if let Some(dto) = self.in_memory.read().await.get(&entry_id).cloned() {
+            return Ok(dto);
+        }
+
+        // 2. Check Redis.
+        let redis_key = Self::redis_key(tenant_id, entry_id);
+        let mut conn = self.redis.get_async_connection().await?;
+        if let Ok(Some(binary)) = conn.get::<_, Vec<u8>>(&redis_key).await {
+            let dto: LedgerEntryDto = bincode::deserialize(&binary)
+                .map_err(|e| LedgerError::InvalidState(e.to_string()))?;
+            // Fill L1.
+            self.in_memory.write().await.put(entry_id, dto.clone());
+            return Ok(dto);
+        }
+
+        // 3. Fallback to DB.
+        let entry = self.repo.get(tenant_id, entry_id).await?;
+        let dto = LedgerEntryDto::from(entry.clone());
+
+        // Back-fill caches.
+        let _: () = conn
+            .set_ex(
+                &redis_key,
+                bincode::serialize(&dto).unwrap(),
+                600, // seconds
+            )
+            .await?;
+        self.in_memory.write().await.put(entry_id, dto.clone());
+
+        Ok(dto)
+    }
+
+    /// Retrieves a paginated list, with optional total count.
+    #[instrument(skip(self), level = "debug")]
+    pub async fn list_entries(
+        &self,
+        tenant_id: i64,
+        req: PageRequest,
+    ) -> Result<Page<LedgerEntryDto>> {
+        let req = req.sanitise();
+        // At scale we would paginated-cache “pages” too, but omit for brevity.
+        let (rows, total) = self.repo.fetch_page(tenant_id, req).await?;
+        let data: Vec<LedgerEntryDto> = rows.into_iter().map(Into::into).collect();
+
+        let consumed = (req.page as u64) * (req.per_page as u64);
+        let next_page = if consumed < total {
+            Some(req.page + 1)
+        } else {
+            None
+        };
+
+        Ok(Page {
+            data,
+            next_page,
+            total: Some(total),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+    use serial_test::serial;
+
+    // Helper to build an in-memory postgres (requires `cargo test -- --ignored`
+    // if dockerised). Kept minimal for brevity.
+    async fn bootstrap_repo() -> PostgresLedgerEntryRepo {
+        let db_url =
+            std::env::var("TEST_DATABASE_URL").expect("Set TEST_DATABASE_URL");
+        let repo = PostgresLedgerEntryRepo::new(&db_url, 5)
+            .await
+            .expect("failed to init repo");
+
+        // Initialise schema (idempotent).
+        sqlx::migrate!().run(&repo.pool).await.unwrap();
+
+        repo
+    }
+
+    #[tokio::test]
+    #[serial] // Avoid test inter-dependency on the DB.
+    async fn crud_roundtrip() {
+        let repo = bootstrap_repo().await;
+        let svc =
+            LedgerEntryService::new(repo, "redis://127.0.0.1/", 128).unwrap();
+
+        let entry = LedgerEntry {
+            id: 0,
+            tenant_id: 42,
+            account_id: 100,
+            amount: dec!(123.45),
+            currency: "USD".into(),
+            booked_at: Utc::now(),
+            memo: Some("integration test".into()),
+        };
+
+        let id = svc.create_entry(&entry).await.unwrap();
+        assert!(id > 0);
+
+        let dto1 = svc.get_entry(42, id).await.unwrap();
+        let dto2 = svc.get_entry(42, id).await.unwrap(); // should hit cache
+
+        assert_eq!(dto1.amount, dto2.amount);
+
+        let page = svc
+            .list_entries(
+                42,
+                PageRequest {
+                    page: 1,
+                    per_page: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.data.len(), 1);
+    }
+}
+```

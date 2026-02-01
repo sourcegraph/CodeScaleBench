@@ -1,0 +1,377 @@
+```csharp
+// File: src/module_66.txt
+//
+// NOTE: .txt extension is intentional to reduce cold-start penalties caused by
+//       reflection-based assembly scanning in the Lambda white-box build step.
+//       The file is compiled as part of the csproj via <Compile Include="src\**\*.txt" />.
+//
+// Production-quality Lambda that transforms “focus-time ratio” metrics emitted
+// from upstream enrichment Lambdas.  Implements Strategy & Observer patterns
+// so that new KPI calculations or post-processing hooks can be registered
+// without touching this file.
+//
+// ──────────────────────────────────────────────────────────────────────────────
+// NuGet dependencies (declared in csproj):
+//   <PackageReference Include="AWSSDK.Lambda" Version="3.*" />
+//   <PackageReference Include="AWSSDK.SQS" Version="3.*" />
+//   <PackageReference Include="Serilog"  Version="2.*" />
+//   <PackageReference Include="Serilog.Sinks.SystemConsole" Version="4.*" />
+//   <PackageReference Include="Amazon.Lambda.Core" Version="2.*" />
+//   <PackageReference Include="Amazon.Lambda.Serialization.SystemTextJson" Version="2.*" />
+// ──────────────────────────────────────────────────────────────────────────────
+
+using System;
+using System.Buffers.Text;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.Lambda.Core;
+using Amazon.Lambda.KinesisEvents;
+using Amazon.SQS;
+using Amazon.SQS.Model;
+using Serilog;
+
+// ReSharper disable MemberCanBePrivate.Global
+
+namespace PulseOps.Warehouse.Transformations;
+
+/// <summary>
+/// AWS Lambda entry-point.  Consumes Kinesis records that each represent an
+/// <see cref="UpstreamFocusSession"/> produced by calendar/e-mail correlators
+/// and transforms them into a <see cref="FocusTimeRatioMetric"/> row that is
+/// shipped downstream (e.g., to AWS Glue tables via Firehose).  Transformation
+/// logic is pluggable through <see cref="ITransformationStrategy"/>.
+/// </summary>
+public sealed class FocusTimeTransformerLambda : IObservable<MetricTransformedEvent>
+{
+    private const string FocusTimeRatioMetricName = "focus_time_ratio";
+
+    // ---------- Observer Pattern plumbing ----------
+    private readonly ConcurrentBag<IObserver<MetricTransformedEvent>> _observers = new();
+
+    // ---------- AWS clients / services ----------
+    private readonly IAmazonSQS _sqs;
+    private readonly string _dlqUrl;
+
+    // ---------- Transformation Strategy Registry ----------
+    private readonly IReadOnlyDictionary<string, ITransformationStrategy> _strategies;
+
+    // ---------- Serialization ----------
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true,
+        WriteIndented = false
+    };
+
+    // ---------- Logger ----------
+    static FocusTimeTransformerLambda()
+    {
+        // Configure global Serilog logger once
+        Log.Logger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .WriteTo.Console()
+            .CreateLogger();
+    }
+
+    /// <summary>
+    /// Constructs the Lambda, optionally passing mocks for unit testing.
+    /// </summary>
+    public FocusTimeTransformerLambda(IAmazonSQS? sqs = null, string? dlqUrl = null,
+        IEnumerable<ITransformationStrategy>? additionalStrategies = null)
+    {
+        _sqs = sqs ?? new AmazonSQSClient();
+        _dlqUrl = dlqUrl ?? Environment.GetEnvironmentVariable("DLQ_URL")
+                    ?? throw new InvalidOperationException("DLQ_URL env var must be specified.");
+
+        // register built-ins and any ad-hoc injected strategies
+        var strategist = new Dictionary<string, ITransformationStrategy>(StringComparer.OrdinalIgnoreCase)
+        {
+            [FocusTimeRatioMetricName] = new FocusTimeRatioStrategy()
+        };
+
+        if (additionalStrategies != null)
+        {
+            foreach (var s in additionalStrategies)
+            {
+                strategist[s.Name] = s;
+            }
+        }
+
+        _strategies = strategist;
+    }
+
+    // The AWS Lambda handler signature
+    [LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
+    public async Task HandleAsync(KinesisEvent kinesisEvent, ILambdaContext context)
+    {
+        var cancellationToken = CancellationToken.None;
+
+        if (kinesisEvent.Records == null || kinesisEvent.Records.Count == 0)
+        {
+            Log.Information("No records to process – Lambda invoked as heartbeat?");
+            return;
+        }
+
+        Log.Information("Received {RecordCount} Kinesis records", kinesisEvent.Records.Count);
+
+        // parallel processing to maximize shard throughput
+        var tasks = kinesisEvent.Records.Select(record =>
+            ProcessRecordAsync(record, cancellationToken));
+
+        await Task.WhenAll(tasks);
+    }
+
+    private async Task ProcessRecordAsync(KinesisEvent.KinesisEventRecord record,
+        CancellationToken cancellationToken)
+    {
+        // 1. Decode payload
+        var payloadJson = Encoding.UTF8.GetString(record.Kinesis.Data.Span);
+
+        // 2. Deserialize upstream session
+        UpstreamFocusSession? session;
+        try
+        {
+            session = JsonSerializer.Deserialize<UpstreamFocusSession>(payloadJson, JsonOptions);
+            if (session == null)
+            {
+                throw new JsonException("Deserialized session is null");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Deserialization failure – base64: {Payload}", payloadJson);
+            await SendToDlqAsync(payloadJson, "DeserializationFailure", ex.Message, cancellationToken);
+            return;
+        }
+
+        // 3. Resolve strategy
+        if (!_strategies.TryGetValue(FocusTimeRatioMetricName, out var strategy))
+        {
+            var err = $"Strategy '{FocusTimeRatioMetricName}' not registered";
+            Log.Error(err);
+            await SendToDlqAsync(payloadJson, "StrategyResolutionFailure", err, cancellationToken);
+            return;
+        }
+
+        // 4. Transform
+        FocusTimeRatioMetric metric;
+        try
+        {
+            metric = await strategy.TransformAsync<UpstreamFocusSession, FocusTimeRatioMetric>(session,
+                JsonOptions, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Transformation failed for session {SessionId}", session.SessionId);
+            await SendToDlqAsync(payloadJson, "TransformationFailure", ex.Message, cancellationToken);
+            return;
+        }
+
+        // 5. Publish event for observers
+        var evt = new MetricTransformedEvent(metric, session);
+        NotifyObservers(evt);
+
+        // 6. Persist to downstream (omitted for brevity – normally Firehose/BQ).
+        Log.Information("Transformed metric: {@Metric}", metric);
+    }
+
+    private async Task SendToDlqAsync(string rawPayload, string reason, string detail,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var body = JsonSerializer.Serialize(new DeadLetterMessage
+            {
+                Reason = reason,
+                Detail = detail,
+                RawPayload = rawPayload,
+                TimestampUtc = DateTime.UtcNow
+            }, JsonOptions);
+
+            await _sqs.SendMessageAsync(new SendMessageRequest
+            {
+                QueueUrl = _dlqUrl,
+                MessageBody = body
+            }, cancellationToken);
+
+            Log.Information("Sent message to DLQ with reason {Reason}", reason);
+        }
+        catch (Exception ex)
+        {
+            Log.Fatal(ex, "Failed to write to DLQ – potential data loss!");
+            throw; // bubble to Lambda so that the entire batch is retried
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Observer Pattern – subscription management
+    // ───────────────────────────────────────────────────────────
+
+    public IDisposable Subscribe(IObserver<MetricTransformedEvent> observer)
+    {
+        if (!_observers.Contains(observer))
+        {
+            _observers.Add(observer);
+        }
+
+        return new Unsubscriber(_observers, observer);
+    }
+
+    private void NotifyObservers(MetricTransformedEvent evt)
+    {
+        foreach (var observer in _observers)
+        {
+            try
+            {
+                observer.OnNext(evt);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Observer {Observer} threw exception – continuing", observer);
+            }
+        }
+    }
+
+    private sealed class Unsubscriber : IDisposable
+    {
+        private readonly ConcurrentBag<IObserver<MetricTransformedEvent>> _list;
+        private readonly IObserver<MetricTransformedEvent> _observer;
+
+        public Unsubscriber(ConcurrentBag<IObserver<MetricTransformedEvent>> list,
+            IObserver<MetricTransformedEvent> observer)
+        {
+            _list = list;
+            _observer = observer;
+        }
+
+        public void Dispose()
+        {
+            _list.TryTake(out var _);
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Domain contracts
+// ──────────────────────────────────────────────────────────────
+
+/// <summary>Context model passed down by upstream enrichers.</summary>
+public sealed record UpstreamFocusSession
+{
+    public required string SessionId { get; init; }
+    public required string TenantId { get; init; }
+
+    /// <summary>ISO-8601 timestamp defining session start.</summary>
+    public required DateTimeOffset StartUtc { get; init; }
+
+    /// <summary>ISO-8601 timestamp defining session end.</summary>
+    public required DateTimeOffset EndUtc { get; init; }
+
+    /// <summary>Total meeting minutes overlapping the session window.</summary>
+    public required int MeetingMinutes { get; init; }
+
+    /// <summary>Total minutes developer spent coding in IDE during session.</summary>
+    public required int CodingMinutes { get; init; }
+}
+
+/// <summary>Downstream metric ready for tabular ingestion.</summary>
+public sealed record FocusTimeRatioMetric
+{
+    public required string TenantId { get; init; }
+    public required DateTimeOffset Date { get; init; }
+    public required double Ratio { get; init; }
+}
+
+/// <summary>Envelope passed to observers post-transformation.</summary>
+public sealed record MetricTransformedEvent(FocusTimeRatioMetric Metric, UpstreamFocusSession SourceSession);
+
+// ──────────────────────────────────────────────────────────────
+// Strategy Pattern – transform variants
+// ──────────────────────────────────────────────────────────────
+
+/// <summary>Abstraction that maps an upstream payload to a downstream metric type.</summary>
+public interface ITransformationStrategy
+{
+    string Name { get; }
+
+    /// <summary>Executes transformation.</summary>
+    /// <typeparam name="TIn">Incoming model type</typeparam>
+    /// <typeparam name="TOut">Outgoing metric type</typeparam>
+    /// <returns>Transformed model</returns>
+    Task<TOut> TransformAsync<TIn, TOut>(TIn input,
+        JsonSerializerOptions? serializerOptions = null,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>Default strategy computing focus-time ratio.</summary>
+public sealed class FocusTimeRatioStrategy : ITransformationStrategy
+{
+    public string Name => "focus_time_ratio";
+
+    public Task<TOut> TransformAsync<TIn, TOut>(TIn input, JsonSerializerOptions? serializerOptions = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (input is not UpstreamFocusSession session)
+        {
+            throw new ArgumentException("Input must be UpstreamFocusSession", nameof(input));
+        }
+
+        var sessionDurationMinutes = (session.EndUtc - session.StartUtc).TotalMinutes;
+
+        if (sessionDurationMinutes <= 0)
+        {
+            throw new InvalidOperationException("Session duration must be positive");
+        }
+
+        var focusMinutes = sessionDurationMinutes - session.MeetingMinutes;
+        var ratio = focusMinutes / sessionDurationMinutes;
+
+        // Bound between 0 and 1
+        ratio = Math.Max(0, Math.Min(1, ratio));
+
+        var metric = new FocusTimeRatioMetric
+        {
+            TenantId = session.TenantId,
+            Date     = session.StartUtc.Date,
+            Ratio    = Math.Round(ratio, 4)
+        };
+
+        return Task.FromResult((TOut)(object)metric);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// DLQ Contract
+// ──────────────────────────────────────────────────────────────
+
+public sealed record DeadLetterMessage
+{
+    public required string Reason { get; init; }
+    public required string Detail { get; init; }
+    public required string RawPayload { get; init; }
+    public required DateTime TimestampUtc { get; init; }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Example Observer – writes metric to console (plug-and-play).
+// In production we might push to CloudWatch or emit custom EMF.
+// ──────────────────────────────────────────────────────────────
+
+public sealed class ConsoleObserver : IObserver<MetricTransformedEvent>
+{
+    public void OnCompleted() => Log.Information("Observer stream completed");
+
+    public void OnError(Exception error) => Log.Error(error, "Observer encountered error");
+
+    public void OnNext(MetricTransformedEvent value)
+    {
+        Log.Information("Observer received metric for tenant {TenantId}: {Ratio:P2}",
+            value.Metric.TenantId, value.Metric.Ratio);
+    }
+}
+```

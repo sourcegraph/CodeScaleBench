@@ -1,0 +1,513 @@
+```c
+/**************************************************************************************************
+ *  MercuryMonolith Commerce Hub – Response Cache
+ *  ------------------------------------------------
+ *  File:        src/module_54.txt   (compiled as mm_response_cache.c)
+ *  Author:      MercuryMonolith Core Team
+ *  Description: Thread-safe, size-bounded, time-aware LRU cache for HTTP/GraphQL responses.
+ *
+ *  The cache is used by the API-Gateway layer to short-circuit execution when an identical request
+ *  (method + URL + headers influencing representation) arrives within a configurable TTL horizon.
+ *
+ *  It relies on:
+ *      • uthash  – single-file hash-table implementation (https://troydhanson.github.io/uthash/)
+ *      • pthread  – synchronization primitives & background janitor thread
+ *
+ *  External API (see bottom of file for declarations):
+ *      mm_cache_t *mm_cache_create   (size_t max_bytes, uint32_t default_ttl_sec);
+ *      void        mm_cache_destroy  (mm_cache_t *cache);
+ *      int         mm_cache_put      (mm_cache_t *cache, const char *key,
+ *                                     const void *payload, size_t payload_sz,
+ *                                     uint32_t ttl_override_sec);
+ *      int         mm_cache_get      (mm_cache_t *cache, const char *key,
+ *                                     const void **payload_out, size_t *payload_sz_out);
+ *      void        mm_cache_invalidate(mm_cache_t *cache, const char *key);
+ *
+ *  Build flags example:
+ *      cc -std=c11 -O2 -Wall -Wextra -pedantic -pthread \
+ *         -Ithird_party -c src/module_54.txt -o build/mm_response_cache.o
+ *************************************************************************************************/
+#define _POSIX_C_SOURCE 200809L
+
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdatomic.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+/* uthash is assumed to live in third_party/uthash.h relative to the project root. */
+#include "third_party/uthash.h"
+
+/* ================================  Data Structures  ========================================== */
+
+typedef struct mm_cache_entry
+{
+    char               *key;         /* heap-allocated, null-terminated */
+    void               *blob;        /* cached payload (opaque)         */
+    size_t              blob_sz;
+    time_t              expires_at;  /* epoch seconds                   */
+
+    /* LRU doubly-linked list */
+    struct mm_cache_entry *prev;
+    struct mm_cache_entry *next;
+
+    /* uthash handle for O(1) key lookup */
+    UT_hash_handle      hh;
+} mm_cache_entry_t;
+
+typedef struct mm_cache
+{
+    /* Size policy */
+    size_t              bytes_max;
+    _Atomic size_t      bytes_in_use;
+
+    uint32_t            default_ttl_sec;
+
+    /* Hash map anchor */
+    mm_cache_entry_t   *entries;
+
+    /* LRU book-keeping (most recently used at HEAD) */
+    mm_cache_entry_t   *lru_head;
+    mm_cache_entry_t   *lru_tail;
+
+    /* Threading */
+    pthread_rwlock_t    rwlock;          /* protects map + LRU + sizes */
+    pthread_t           janitor_tid;     /* background expiry sweeper  */
+    _Atomic int         janitor_running;
+} mm_cache_t;
+
+/* ================================  Utilities  ================================================= */
+
+/* Return epoch seconds using CLOCK_REALTIME; caller decides time source fidelity. */
+static inline time_t
+now_epoch_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ts.tv_sec;
+}
+
+/* Move entry to the head of LRU list. Must be done with write lock. */
+static inline void
+lru_move_to_head(mm_cache_t *cache, mm_cache_entry_t *e)
+{
+    if (cache->lru_head == e) return;
+
+    /* Detach */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (cache->lru_tail == e) cache->lru_tail = e->prev;
+
+    /* Insert at head */
+    e->prev = NULL;
+    e->next = cache->lru_head;
+    if (cache->lru_head) cache->lru_head->prev = e;
+    cache->lru_head = e;
+
+    if (!cache->lru_tail) cache->lru_tail = e;
+}
+
+static inline void
+lru_append_head(mm_cache_t *cache, mm_cache_entry_t *e)
+{
+    e->prev = NULL;
+    e->next = cache->lru_head;
+    if (cache->lru_head) cache->lru_head->prev = e;
+    cache->lru_head = e;
+    if (!cache->lru_tail) cache->lru_tail = e;
+}
+
+static void
+lru_remove(mm_cache_t *cache, mm_cache_entry_t *e)
+{
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+
+    if (cache->lru_head == e) cache->lru_head = e->next;
+    if (cache->lru_tail == e) cache->lru_tail = e->prev;
+
+    e->prev = e->next = NULL;
+}
+
+/* Free entry memory and update cache memory usage (caller holds write lock). */
+static void
+free_entry(mm_cache_t *cache, mm_cache_entry_t *e)
+{
+    if (!e) return;
+    cache->bytes_in_use -= e->blob_sz;
+    free(e->key);
+    free(e->blob);
+    free(e);
+}
+
+/* Evict from tail until usage <= bytes_max; write lock held. */
+static void
+evict_if_necessary(mm_cache_t *cache)
+{
+    while (cache->bytes_in_use > cache->bytes_max && cache->lru_tail)
+    {
+        mm_cache_entry_t *victim = cache->lru_tail;
+
+        /* Remove from structures */
+        HASH_DEL(cache->entries, victim);
+        lru_remove(cache, victim);
+
+        free_entry(cache, victim);
+    }
+}
+
+/* Purge expired entries; write lock held. */
+static void
+purge_expired_locked(mm_cache_t *cache, time_t now)
+{
+    mm_cache_entry_t *iter, *tmp;
+    HASH_ITER(hh, cache->entries, iter, tmp)
+    {
+        if (iter->expires_at <= now)
+        {
+            HASH_DEL(cache->entries, iter);
+            lru_remove(cache, iter);
+            free_entry(cache, iter);
+        }
+    }
+}
+
+/* Janitor thread procedure */
+static void *
+janitor_loop(void *arg)
+{
+    mm_cache_t *cache = (mm_cache_t *)arg;
+    const struct timespec nap = {.tv_sec = 1, .tv_nsec = 0}; /* 1 second cadence */
+
+    while (atomic_load(&cache->janitor_running))
+    {
+        nanosleep(&nap, NULL);
+
+        if (!atomic_load(&cache->janitor_running))
+            break;
+
+        pthread_rwlock_wrlock(&cache->rwlock);
+
+        time_t now = now_epoch_sec();
+        purge_expired_locked(cache, now);
+        evict_if_necessary(cache); /* In case user shrunk bytes_max elsewhere */
+
+        pthread_rwlock_unlock(&cache->rwlock);
+    }
+    return NULL;
+}
+
+/* ================================  Public API  ================================================ */
+
+mm_cache_t *
+mm_cache_create(size_t max_bytes, uint32_t default_ttl_sec)
+{
+    if (max_bytes == 0)
+    {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    mm_cache_t *cache = calloc(1, sizeof(*cache));
+    if (!cache) return NULL;
+
+    cache->bytes_max         = max_bytes;
+    cache->bytes_in_use      = 0;
+    cache->default_ttl_sec   = default_ttl_sec ? default_ttl_sec : 60; /* sensible default */
+    cache->entries           = NULL;
+    cache->lru_head          = NULL;
+    cache->lru_tail          = NULL;
+    atomic_init(&cache->janitor_running, 1);
+
+    if (pthread_rwlock_init(&cache->rwlock, NULL) != 0)
+    {
+        free(cache);
+        return NULL;
+    }
+
+    /* Spawn janitor thread */
+    if (pthread_create(&cache->janitor_tid, NULL, janitor_loop, cache) != 0)
+    {
+        pthread_rwlock_destroy(&cache->rwlock);
+        free(cache);
+        return NULL;
+    }
+
+    return cache;
+}
+
+void
+mm_cache_destroy(mm_cache_t *cache)
+{
+    if (!cache) return;
+
+    /* Stop janitor */
+    atomic_store(&cache->janitor_running, 0);
+    pthread_join(cache->janitor_tid, NULL);
+
+    pthread_rwlock_wrlock(&cache->rwlock);
+
+    /* Free remaining entries */
+    mm_cache_entry_t *e, *tmp;
+    HASH_ITER(hh, cache->entries, e, tmp)
+    {
+        HASH_DEL(cache->entries, e);
+        free_entry(cache, e);
+    }
+
+    pthread_rwlock_unlock(&cache->rwlock);
+    pthread_rwlock_destroy(&cache->rwlock);
+    free(cache);
+}
+
+/*
+ * Insert or update an entry.
+ *  • ttl_override_sec == 0    → use cache->default_ttl_sec
+ *  • Returns 0 on success, or an errno-compatible positive value.
+ */
+int
+mm_cache_put(mm_cache_t *cache, const char *key,
+             const void *payload, size_t payload_sz,
+             uint32_t ttl_override_sec)
+{
+    if (!cache || !key || !payload || payload_sz == 0)
+        return EINVAL;
+
+    if (payload_sz > cache->bytes_max)
+        /* Single item too large – cannot fit by design. */
+        return EFBIG;
+
+    const uint32_t ttl = ttl_override_sec ? ttl_override_sec : cache->default_ttl_sec;
+    const time_t   expiry_ts = now_epoch_sec() + ttl;
+
+    pthread_rwlock_wrlock(&cache->rwlock);
+
+    /* If exists → update in place (size may change) */
+    mm_cache_entry_t *e = NULL;
+    HASH_FIND_STR(cache->entries, key, e);
+
+    if (e)
+    {
+        /* Adjust size counters */
+        cache->bytes_in_use -= e->blob_sz;
+
+        void *blob_new = malloc(payload_sz);
+        if (!blob_new)
+        {
+            /* Restore size counter */
+            cache->bytes_in_use += e->blob_sz;
+            pthread_rwlock_unlock(&cache->rwlock);
+            return ENOMEM;
+        }
+
+        memcpy(blob_new, payload, payload_sz);
+        free(e->blob);
+
+        e->blob       = blob_new;
+        e->blob_sz    = payload_sz;
+        e->expires_at = expiry_ts;
+
+        cache->bytes_in_use += payload_sz;
+
+        /* Touch for LRU */
+        lru_move_to_head(cache, e);
+
+        /* Evict if above capacity */
+        evict_if_necessary(cache);
+
+        pthread_rwlock_unlock(&cache->rwlock);
+        return 0;
+    }
+
+    /* Otherwise allocate new */
+    char *key_copy = strdup(key);
+    void *blob     = malloc(payload_sz);
+    if (!key_copy || !blob)
+    {
+        free(key_copy);
+        free(blob);
+        pthread_rwlock_unlock(&cache->rwlock);
+        return ENOMEM;
+    }
+    memcpy(blob, payload, payload_sz);
+
+    e = calloc(1, sizeof(*e));
+    if (!e)
+    {
+        free(key_copy);
+        free(blob);
+        pthread_rwlock_unlock(&cache->rwlock);
+        return ENOMEM;
+    }
+
+    e->key        = key_copy;
+    e->blob       = blob;
+    e->blob_sz    = payload_sz;
+    e->expires_at = expiry_ts;
+
+    lru_append_head(cache, e);
+    HASH_ADD_KEYPTR(hh, cache->entries, e->key, strlen(e->key), e);
+
+    cache->bytes_in_use += payload_sz;
+
+    evict_if_necessary(cache);
+
+    pthread_rwlock_unlock(&cache->rwlock);
+    return 0;
+}
+
+/*
+ * Retrieve entry. Caller must not mutate returned payload pointer and must
+ * copy it before cache invalidation can occur. The pointer remains valid until next
+ * cache_put/ invalidate/ destroy etc.
+ *
+ * Returns:
+ *      0   → hit (payload_out & payload_sz_out populated)
+ *      ENOENT / EPERM (expired) / others
+ */
+int
+mm_cache_get(mm_cache_t *cache, const char *key,
+             const void **payload_out, size_t *payload_sz_out)
+{
+    if (!cache || !key || !payload_out || !payload_sz_out)
+        return EINVAL;
+
+    pthread_rwlock_rdlock(&cache->rwlock);
+
+    mm_cache_entry_t *e = NULL;
+    HASH_FIND_STR(cache->entries, key, e);
+
+    if (!e)
+    {
+        pthread_rwlock_unlock(&cache->rwlock);
+        return ENOENT;
+    }
+
+    time_t now = now_epoch_sec();
+    if (e->expires_at <= now)
+    {
+        pthread_rwlock_unlock(&cache->rwlock);
+
+        /* Upgrade to write lock to purge expired entry */
+        pthread_rwlock_wrlock(&cache->rwlock);
+        HASH_DEL(cache->entries, e);
+        lru_remove(cache, e);
+        free_entry(cache, e);
+        pthread_rwlock_unlock(&cache->rwlock);
+
+        return EPERM; /* treat expired as permission denied */
+    }
+
+    /* Snapshot payload; after unlock it's still valid due to design promise. */
+    *payload_out     = e->blob;
+    *payload_sz_out  = e->blob_sz;
+
+    /* Touch LRU – need write lock */
+    pthread_rwlock_unlock(&cache->rwlock);
+    pthread_rwlock_wrlock(&cache->rwlock);
+    lru_move_to_head(cache, e);
+    pthread_rwlock_unlock(&cache->rwlock);
+
+    return 0;
+}
+
+void
+mm_cache_invalidate(mm_cache_t *cache, const char *key)
+{
+    if (!cache || !key) return;
+
+    pthread_rwlock_wrlock(&cache->rwlock);
+
+    mm_cache_entry_t *e = NULL;
+    HASH_FIND_STR(cache->entries, key, e);
+    if (e)
+    {
+        HASH_DEL(cache->entries, e);
+        lru_remove(cache, e);
+        free_entry(cache, e);
+    }
+
+    pthread_rwlock_unlock(&cache->rwlock);
+}
+
+/* ================================  Self-test (optional)  ===================================== */
+#ifdef MM_CACHE_SELFTEST
+#include <inttypes.h>
+
+static void
+hexdump(const void *buf, size_t sz)
+{
+    const uint8_t *p = buf;
+    for (size_t i = 0; i < sz; ++i)
+    {
+        printf("%02X ", p[i]);
+        if (i % 16 == 15) puts("");
+    }
+    puts("");
+}
+
+int main(void)
+{
+    mm_cache_t *cache = mm_cache_create(16 * 1024, 2); /* 16 KiB, TTL=2s */
+
+    const char key[] = "GET:/api/v1/ping";
+    const char val[] = "pong";
+
+    if (mm_cache_put(cache, key, val, sizeof(val), 0) != 0)
+    {
+        perror("put");
+        return 1;
+    }
+
+    const void *out;
+    size_t      out_sz;
+
+    if (mm_cache_get(cache, key, &out, &out_sz) == 0)
+    {
+        printf("Cache hit: (%zu bytes)\n", out_sz);
+        hexdump(out, out_sz);
+    }
+    else
+    {
+        puts("Cache miss!");
+    }
+
+    sleep(3); /* wait for TTL to expire */
+
+    if (mm_cache_get(cache, key, &out, &out_sz) == 0)
+        puts("Unexpected hit after expiry!");
+    else
+        puts("Correctly expired.");
+
+    mm_cache_destroy(cache);
+    return 0;
+}
+#endif /* MM_CACHE_SELFTEST */
+
+/* ================================  Public Header (inline)  =================================== */
+/* The following declarations are typically placed in 'include/mm_response_cache.h', but are
+ * provided here to make this single compilation unit self-contained. Guard macros are used to
+ * allow regular header inclusion by other translation units.
+ */
+#ifndef MM_RESPONSE_CACHE_H
+#define MM_RESPONSE_CACHE_H
+
+/* Opaque forward declaration for encapsulation */
+typedef struct mm_cache mm_cache_t;
+
+mm_cache_t *mm_cache_create  (size_t max_bytes, uint32_t default_ttl_sec);
+void        mm_cache_destroy (mm_cache_t *cache);
+int         mm_cache_put     (mm_cache_t *cache, const char *key,
+                              const void *payload, size_t payload_sz,
+                              uint32_t ttl_override_sec);
+int         mm_cache_get     (mm_cache_t *cache, const char *key,
+                              const void **payload_out, size_t *payload_sz_out);
+void        mm_cache_invalidate(mm_cache_t *cache, const char *key);
+
+#endif /* MM_RESPONSE_CACHE_H */
+```

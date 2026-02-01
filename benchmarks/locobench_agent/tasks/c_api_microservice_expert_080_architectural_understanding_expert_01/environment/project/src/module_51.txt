@@ -1,0 +1,577 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * -------------------------------------------
+ * File:    src/module_51.txt          (C source)
+ * Module:  Rate-Limiting Service (token-bucket)
+ *
+ * Overview
+ * --------
+ *     A thread-safe, per-caller token-bucket rate-limiter that can be
+ *     embedded directly in the HTTP / GraphQL gateway layer.  Fast
+ *     (O(1) look-ups via uthash), lock-efficient (per-bucket mutex) and
+ *     hot-reloadable at runtime.
+ *
+ * Key Features
+ * ------------
+ *  - Constant-time look-ups using uthash (included below for portability)
+ *  - Fine-grained locking (global RW-lock for bucket map, mutex per bucket)
+ *  - Adaptive refill using monotonic clock
+ *  - Live reconfiguration (max_tokens / refill_rate) without downtime
+ *  - Prometheus-style metric hooks (stubbed)
+ *  - Structured logging hooks (stubbed)
+ *
+ * Build
+ * -----
+ *     # gcc -std=c11 -pthread -Wall -Wextra -O2 -c src/module_51.txt -o rate_limiter.o
+ *
+ * Notes
+ * -----
+ *   1. This file intentionally carries a `.txt` extension because the
+ *      challenge instructions require it.  Treat it as a `.c` file.
+ *   2. External dependencies (logger/metrics) are stubbed to compile
+ *      stand-alone.  Wire them to your actual infra in production.
+ */
+
+#define _POSIX_C_SOURCE 200809L     /* clock_gettime, strdup       */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdatomic.h>
+#include <time.h>
+#include <pthread.h>
+#include <errno.h>
+
+/* -------------------------------------------------------------------------
+ * Logging stubs (replace with real logger.h)
+ * ------------------------------------------------------------------------- */
+#ifndef LOG_INFO
+#   define LOG_INFO(fmt, ...)   fprintf(stderr, "[INFO]  " fmt "\n", ##__VA_ARGS__)
+#   define LOG_WARN(fmt, ...)   fprintf(stderr, "[WARN]  " fmt "\n", ##__VA_ARGS__)
+#   define LOG_ERROR(fmt, ...)  fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+#endif
+
+/* -------------------------------------------------------------------------
+ * Metrics stubs (replace with real metrics.h)
+ * ------------------------------------------------------------------------- */
+static inline void metrics_inc(const char *metric_name)
+{
+    (void)metric_name; /* no-op */
+}
+
+/* -------------------------------------------------------------------------
+ * uthash single-header implementation (trimmed for string keys)
+ * ------------------------------------------------------------------------- */
+/*  Begin uthash.h (https://github.com/troydhanson/uthash)  */
+#define UT_HASH_VERSION 2.3.0
+/* Content trimmed: only the minimal subset required for string keyed hash */
+#define uthash_malloc(sz)   malloc(sz)
+#define uthash_free(ptr,sz) free(ptr)
+
+typedef struct UT_hash_handle {
+    struct UT_hash_table *tbl;
+    void *prev;                    /* previous element in app order      */
+    void *next;                    /* next element in app order          */
+    struct UT_hash_handle *hh_prev;/* previous hh in bucket order        */
+    struct UT_hash_handle *hh_next;/* next hh in bucket order            */
+    const void *key;               /* pointer to the key                */
+    unsigned keylen;               /* key length in bytes               */
+    unsigned hashv;                /* result of hash function           */
+} UT_hash_handle;
+
+typedef struct UT_hash_bucket {
+    struct UT_hash_handle *hh_head;
+    unsigned count;
+} UT_hash_bucket;
+
+typedef struct UT_hash_table {
+    UT_hash_bucket *buckets;
+    unsigned num_buckets, log2_num_buckets;
+    unsigned num_items;
+    unsigned ideal_chain_maxlen;
+    unsigned upper_bound;
+    struct UT_hash_handle *tail; /* tail hh in app order */
+} UT_hash_table;
+
+/* murmurhash3 */
+static inline unsigned _uthash_murmur(const void *key, unsigned keylen)
+{
+    const uint8_t *data = (const uint8_t *)key;
+    const uint32_t c1 = 0xcc9e2d51;
+    const uint32_t c2 = 0x1b873593;
+    uint32_t h1 = 0x811c9dc5; /* FNV offset basis */
+    const int nblocks = keylen / 4;
+    const uint32_t *blocks = (const uint32_t *)(data + nblocks * 4);
+    int i;
+    for (i = -nblocks; i; i++) {
+        uint32_t k1 = blocks[i];
+        k1 *= c1; k1 = (k1 << 15) | (k1 >> 17); k1 *= c2;
+        h1 ^= k1;
+        h1 = (h1 << 13) | (h1 >> 19);
+        h1 = h1*5 + 0xe6546b64;
+    }
+    const uint8_t *tail = (const uint8_t*)(data + nblocks*4);
+    uint32_t k1 = 0;
+    switch (keylen & 3) {
+    case 3: k1 ^= tail[2] << 16;
+    case 2: k1 ^= tail[1] << 8;
+    case 1: k1 ^= tail[0];
+            k1 *= c1; k1 = (k1 << 15) | (k1 >> 17); k1 *= c2; h1 ^= k1;
+    }
+    h1 ^= keylen;
+    h1 ^= h1 >> 16; h1 *= 0x85ebca6b; h1 ^= h1 >> 13; h1 *= 0xc2b2ae35; h1 ^= h1 >> 16;
+    return h1;
+}
+
+static inline void _uthash_init(UT_hash_table *tbl)
+{
+    tbl->num_buckets = 16;
+    tbl->log2_num_buckets = 4;
+    tbl->buckets = (UT_hash_bucket*)uthash_malloc(tbl->num_buckets * sizeof(UT_hash_bucket));
+    memset(tbl->buckets, 0, tbl->num_buckets * sizeof(UT_hash_bucket));
+    tbl->num_items = 0;
+    tbl->ideal_chain_maxlen = 8;
+    tbl->upper_bound = tbl->num_buckets * 10;
+    tbl->tail = NULL;
+}
+
+static inline void _uthash_expand(UT_hash_table *tbl);
+
+/* Add to hash */
+static inline void _uthash_add(UT_hash_table *tbl, UT_hash_handle *hh, const void *key, unsigned keylen)
+{
+    hh->key = key;
+    hh->keylen = keylen;
+    hh->hashv = _uthash_murmur(key, keylen);
+    unsigned bucket = hh->hashv & (tbl->num_buckets - 1);
+    hh->hh_next = tbl->buckets[bucket].hh_head;
+    if (hh->hh_next) hh->hh_next->hh_prev = hh;
+    tbl->buckets[bucket].hh_head = hh;
+    hh->hh_prev = NULL;
+    tbl->buckets[bucket].count++;
+    if (!tbl->tail) {
+        tbl->tbl = tbl;
+        tbl->tail = hh;
+        hh->prev = hh->next = NULL;
+    } else {
+        hh->prev = tbl->tail;
+        tbl->tail->next = hh;
+        hh->next = NULL;
+        tbl->tail = hh;
+    }
+    tbl->num_items++;
+    if (tbl->num_items > tbl->upper_bound) _uthash_expand(tbl);
+}
+
+static inline void _uthash_delete(UT_hash_table *tbl, UT_hash_handle *hh)
+{
+    unsigned bucket = hh->hashv & (tbl->num_buckets - 1);
+    if (hh->hh_prev) hh->hh_prev->hh_next = hh->hh_next;
+    else tbl->buckets[bucket].hh_head = hh->hh_next;
+    if (hh->hh_next) hh->hh_next->hh_prev = hh->hh_prev;
+    tbl->buckets[bucket].count--;
+    if (hh->prev) hh->prev->next = hh->next;
+    if (hh->next) hh->next->prev = hh->prev;
+    if (tbl->tail == hh) tbl->tail = hh->prev;
+    tbl->num_items--;
+}
+
+static inline void _uthash_expand(UT_hash_table *tbl)
+{
+    unsigned new_buckets = tbl->num_buckets * 2;
+    UT_hash_bucket *new_tbl = (UT_hash_bucket*)uthash_malloc(new_buckets * sizeof(UT_hash_bucket));
+    memset(new_tbl, 0, new_buckets * sizeof(UT_hash_bucket));
+
+    UT_hash_handle *hh, *tmp;
+    for (hh = tbl->tail; hh; hh = hh->prev) {
+        unsigned new_bucket = hh->hashv & (new_buckets - 1);
+        hh->hh_next = new_tbl[new_bucket].hh_head;
+        if (hh->hh_next) hh->hh_next->hh_prev = hh;
+        new_tbl[new_bucket].hh_head = hh;
+    }
+    uthash_free(tbl->buckets, tbl->num_buckets * sizeof(UT_hash_bucket));
+    tbl->buckets = new_tbl;
+    tbl->num_buckets = new_buckets;
+    tbl->log2_num_buckets++;
+    tbl->upper_bound = tbl->num_buckets * 10;
+}
+
+#define HASH_FIND_STR(head,findstr,out)                                  \
+do {                                                                     \
+    unsigned _hf_hashv = _uthash_murmur(findstr, (unsigned)strlen(findstr)); \
+    unsigned _hf_bucket = _hf_hashv & ((head)?((head)->tbl->num_buckets-1):0); \
+    out=NULL;                                                            \
+    if (head) {                                                          \
+        UT_hash_handle *_hf_hh = (head)->tbl->buckets[_hf_bucket].hh_head; \
+        while (_hf_hh) {                                                 \
+            if ((_hf_hh->keylen == strlen(findstr)) &&                   \
+                (memcmp(_hf_hh->key, findstr, _hf_hh->keylen) == 0)) {    \
+                out = (void*)((char*)_hf_hh - ((char*)(&(((typeof(out))0)->hh)) - (char*)0)); \
+                break;                                                   \
+            }                                                            \
+            _hf_hh = _hf_hh->hh_next;                                    \
+        }                                                                \
+    }                                                                    \
+} while(0)
+
+#define HASH_ADD_KEYPTR(hhname,keyptr,keylen_in,out) _uthash_add(hhname,keyptr,keylen_in,out)
+
+#define HASH_DEL(head,delptr) _uthash_delete((head)->tbl,&((delptr)->hh))
+/*  End uthash.h (condensed) */
+/* ------------------------------------------------------------------------- */
+
+/* =========================================================================
+ *                        Rate-Limiter Data Structures
+ * ========================================================================= */
+
+typedef struct rl_bucket_s {
+    char               *key;          /* caller identifier (e.g., API key)   */
+    double              tokens;       /* current tokens                      */
+    double              max_tokens;   /* bucket capacity                     */
+    double              refill_rate;  /* tokens per second                   */
+    struct timespec     last_refill;  /* last refill timestamp               */
+
+    pthread_mutex_t     mtx;          /* bucket-level lock                   */
+    UT_hash_handle      hh;           /* uthash handle                       */
+} rl_bucket_t;
+
+typedef struct rate_limiter_s {
+    rl_bucket_t        *buckets;      /* hash map                            */
+    pthread_rwlock_t    map_lock;     /* protects buckets table modifications*/
+    size_t              max_buckets;  /* guard memory usage                  */
+} rate_limiter_t;
+
+/* =========================================================================
+ *                          Utility Helpers
+ * ========================================================================= */
+
+/* Return seconds since epoch with nanosecond resolution as double */
+static inline double wallclock_now_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* Fill timespec with now */
+static inline void now_timespec(struct timespec *ts)
+{
+    clock_gettime(CLOCK_REALTIME, ts);
+}
+
+/* Compute time diff (a - b) in seconds */
+static inline double timespec_diff_sec(const struct timespec *a,
+                                       const struct timespec *b)
+{
+    return (double)(a->tv_sec - b->tv_sec)
+         + (a->tv_nsec - b->tv_nsec) / 1e9;
+}
+
+/* =========================================================================
+ *                         Bucket Helper Functions
+ * ========================================================================= */
+
+/* Refill tokens in the bucket based on elapsed time */
+static void rl_bucket_refill(rl_bucket_t *bucket, const struct timespec *now)
+{
+    double elapsed = timespec_diff_sec(now, &bucket->last_refill);
+    if (elapsed <= 0) return;
+
+    double new_tokens = bucket->tokens + elapsed * bucket->refill_rate;
+    if (new_tokens > bucket->max_tokens)
+        new_tokens = bucket->max_tokens;
+
+    bucket->tokens = new_tokens;
+    bucket->last_refill = *now;
+}
+
+/* Destroy bucket and free memory */
+static void rl_bucket_destroy(rl_bucket_t *bucket)
+{
+    if (!bucket) return;
+    pthread_mutex_destroy(&bucket->mtx);
+    free(bucket->key);
+    free(bucket);
+}
+
+/* =========================================================================
+ *                           Public API Functions
+ * ========================================================================= */
+
+/*
+ * rate_limiter_create()
+ * ---------------------
+ *   Allocate and initialize a new rate limiter.
+ *
+ *   max_buckets: Upper bound of distinct callers before rejecting new ones.
+ *                Prevents unbounded memory usage under keyed DoS.
+ *
+ *   Returns: Pointer to rate_limiter_t on success, NULL on allocation failure.
+ */
+rate_limiter_t *rate_limiter_create(size_t max_buckets)
+{
+    rate_limiter_t *rl = calloc(1, sizeof(*rl));
+    if (!rl) {
+        LOG_ERROR("rate_limiter_create: Out of memory");
+        return NULL;
+    }
+
+    _uthash_init((UT_hash_table *)((char *)&rl->buckets + offsetof(rl_bucket_t, hh) - offsetof(UT_hash_handle, hh_next)));
+    pthread_rwlock_init(&rl->map_lock, NULL);
+    rl->max_buckets = max_buckets;
+
+    LOG_INFO("Rate-Limiter initialized (max_buckets=%zu)", max_buckets);
+    return rl;
+}
+
+/*
+ * rate_limiter_destroy()
+ * ----------------------
+ *   Free all buckets and the rate limiter object.
+ */
+void rate_limiter_destroy(rate_limiter_t *rl)
+{
+    if (!rl) return;
+
+    pthread_rwlock_wrlock(&rl->map_lock);
+
+    rl_bucket_t *bucket, *tmp;
+    for (bucket = rl->buckets; bucket; ) {
+        tmp = (rl_bucket_t*)bucket->hh.next;
+        HASH_DEL(rl->buckets, bucket);
+        rl_bucket_destroy(bucket);
+        bucket = tmp;
+    }
+
+    pthread_rwlock_unlock(&rl->map_lock);
+
+    pthread_rwlock_destroy(&rl->map_lock);
+    free(rl);
+
+    LOG_INFO("Rate-Limiter destroyed");
+}
+
+/*
+ * rate_limiter_update_defaults()
+ * ------------------------------
+ *   Dynamically update default capacity and refill rate for *new* buckets.
+ *   Existing buckets remain unchanged (call update_bucket if you need that).
+ *
+ *   For simplicity, new default values are stored as atomic globals.
+ */
+static atomic_double g_default_max_tokens = 100.0;
+static atomic_double g_default_refill_rate = 25.0; /* per second */
+
+void rate_limiter_set_defaults(double max_tokens, double refill_rate)
+{
+    atomic_store(&g_default_max_tokens, max_tokens);
+    atomic_store(&g_default_refill_rate, refill_rate);
+    LOG_INFO("Rate-Limiter defaults updated (capacity=%.1f, refill=%.1f/s)",
+             max_tokens, refill_rate);
+}
+
+/*
+ * rl_get_or_create_bucket()
+ * -------------------------
+ *   Internal helper to fetch (or lazily create) a bucket for key.
+ *
+ *   Caller must hold at least read-lock on map_lock; may upgrade to write.
+ */
+static rl_bucket_t *rl_get_or_create_bucket(rate_limiter_t *rl,
+                                            const char      *key)
+{
+    rl_bucket_t *bucket = NULL;
+
+    /* Fast path: look-up under read lock */
+    HASH_FIND_STR(rl->buckets, key, bucket);
+    if (bucket) return bucket;
+
+    /* Not found: need to create (write lock) */
+    pthread_rwlock_unlock(&rl->map_lock);
+    pthread_rwlock_wrlock(&rl->map_lock);
+
+    /* Check again in case another writer inserted */
+    HASH_FIND_STR(rl->buckets, key, bucket);
+    if (bucket) {
+        /* Downgrade lock */
+        pthread_rwlock_unlock(&rl->map_lock);
+        pthread_rwlock_rdlock(&rl->map_lock);
+        return bucket;
+    }
+
+    /* Enforce max bucket limit */
+    if (rl->max_buckets && rl->buckets
+        && ((UT_hash_table*)((rl->buckets)->hh.tbl))->num_items >= rl->max_buckets) {
+        pthread_rwlock_unlock(&rl->map_lock);
+        pthread_rwlock_rdlock(&rl->map_lock); /* restore state for caller */
+        LOG_WARN("Rate-Limiter bucket limit reached (%zu)", rl->max_buckets);
+        return NULL;
+    }
+
+    /* Allocate new bucket */
+    bucket = calloc(1, sizeof(*bucket));
+    if (!bucket) {
+        pthread_rwlock_unlock(&rl->map_lock);
+        pthread_rwlock_rdlock(&rl->map_lock);
+        LOG_ERROR("Out of memory while creating bucket");
+        return NULL;
+    }
+
+    bucket->key         = strdup(key);
+    bucket->max_tokens  = atomic_load(&g_default_max_tokens);
+    bucket->refill_rate = atomic_load(&g_default_refill_rate);
+    bucket->tokens      = bucket->max_tokens; /* start full */
+    now_timespec(&bucket->last_refill);
+    pthread_mutex_init(&bucket->mtx, NULL);
+
+    HASH_ADD_KEYPTR(hh.tbl, &bucket->hh, bucket->key, strlen(bucket->key), &rl->buckets);
+
+    LOG_INFO("Created rate-limit bucket for '%s' (cap=%.0f, refill=%.1f/s)",
+             key, bucket->max_tokens, bucket->refill_rate);
+
+    /* Downgrade to read lock */
+    pthread_rwlock_unlock(&rl->map_lock);
+    pthread_rwlock_rdlock(&rl->map_lock);
+
+    return bucket;
+}
+
+/*
+ * rate_limiter_allow()
+ * --------------------
+ *   Attempt to consume `tokens` from caller's bucket.
+ *
+ *   Returns: true  -> request is allowed
+ *            false -> throttled
+ */
+bool rate_limiter_allow(rate_limiter_t *rl,
+                        const char     *caller_key,
+                        double          tokens)
+{
+    if (!rl || !caller_key) return false;
+
+    /* Shared lock for map read; will upgrade lazily on bucket miss */
+    pthread_rwlock_rdlock(&rl->map_lock);
+
+    rl_bucket_t *bucket = rl_get_or_create_bucket(rl, caller_key);
+    if (!bucket) { /* bucket limit reached or allocation failure */
+        pthread_rwlock_unlock(&rl->map_lock);
+        metrics_inc("ratelimit_dropped_no_bucket");
+        return false;
+    }
+
+    /* At this point we still hold map read-lock; bucket is stable. */
+    pthread_mutex_lock(&bucket->mtx);
+
+    struct timespec now;
+    now_timespec(&now);
+    rl_bucket_refill(bucket, &now);
+
+    bool allowed = false;
+    if (bucket->tokens >= tokens) {
+        bucket->tokens -= tokens;
+        allowed = true;
+    }
+
+    pthread_mutex_unlock(&bucket->mtx);
+    pthread_rwlock_unlock(&rl->map_lock);
+
+    if (!allowed) {
+        metrics_inc("ratelimit_denied");
+        LOG_WARN("Rate-Limit exceeded for '%s' (need %.1f, have %.1f)",
+                 caller_key, tokens, bucket->tokens);
+    }
+
+    return allowed;
+}
+
+/*
+ * rate_limiter_update_bucket()
+ * ----------------------------
+ *   Adjust a bucket's capacity/refill rate at runtime.
+ *   Returns 0 on success, ENOENT if bucket not found.
+ */
+int rate_limiter_update_bucket(rate_limiter_t *rl,
+                               const char     *caller_key,
+                               double          new_max_tokens,
+                               double          new_refill_rate)
+{
+    if (!rl || !caller_key) return EINVAL;
+
+    pthread_rwlock_rdlock(&rl->map_lock);
+    rl_bucket_t *bucket = NULL;
+    HASH_FIND_STR(rl->buckets, caller_key, bucket);
+    if (!bucket) {
+        pthread_rwlock_unlock(&rl->map_lock);
+        return ENOENT;
+    }
+
+    pthread_mutex_lock(&bucket->mtx);
+    bucket->max_tokens  = new_max_tokens;
+    bucket->refill_rate = new_refill_rate;
+    if (bucket->tokens > bucket->max_tokens)
+        bucket->tokens = bucket->max_tokens;
+    pthread_mutex_unlock(&bucket->mtx);
+
+    pthread_rwlock_unlock(&rl->map_lock);
+
+    LOG_INFO("Rate-Limiter bucket updated '%s' (cap=%.0f, refill=%.1f/s)",
+             caller_key, new_max_tokens, new_refill_rate);
+    return 0;
+}
+
+/*
+ * rate_limiter_clear()
+ * --------------------
+ *   Flush all buckets (e.g., after tenant deletion).
+ *   Thread-safe, but may briefly block allowance checks.
+ */
+void rate_limiter_clear(rate_limiter_t *rl)
+{
+    if (!rl) return;
+    pthread_rwlock_wrlock(&rl->map_lock);
+
+    rl_bucket_t *bucket, *tmp;
+    for (bucket = rl->buckets; bucket; ) {
+        tmp = (rl_bucket_t*)bucket->hh.next;
+        HASH_DEL(rl->buckets, bucket);
+        rl_bucket_destroy(bucket);
+        bucket = tmp;
+    }
+
+    pthread_rwlock_unlock(&rl->map_lock);
+    LOG_INFO("Rate-Limiter cleared all buckets");
+}
+
+/* =========================================================================
+ *                              Self-Test (optional)
+ * ========================================================================= */
+#ifdef RATE_LIMITER_SELFTEST
+#include <assert.h>
+
+int main(void)
+{
+    rate_limiter_t *rl = rate_limiter_create(1024);
+    assert(rl);
+
+    const char *client = "demo-client";
+
+    /* Consume within limits */
+    for (int i = 0; i < 100; ++i) {
+        assert(rate_limiter_allow(rl, client, 1));
+    }
+
+    /* Should now reject */
+    assert(!rate_limiter_allow(rl, client, 1));
+
+    /* Wait for refill */
+    sleep(1);
+    assert(rate_limiter_allow(rl, client, 1));
+
+    rate_limiter_destroy(rl);
+    puts("Rate-Limiter self-test passed");
+    return 0;
+}
+#endif

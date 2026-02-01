@@ -1,0 +1,300 @@
+```rust
+//! src/module_3.rs
+//!
+//! Strategy façade and hot-swapping implementation for runtime-pluggable
+//! analytics.  This module exposes a lock-free manager that allows every
+//! worker thread in the pipeline to read from the current analysis
+//! strategy **without** paying a locking penalty, while still enabling
+//! operators (or an automated job) to push a *new* strategy into
+//! production in constant time.
+//!
+//! It relies on:
+//!   • `arc-swap`   —  for lock-free, wait-free `Arc` replacement  
+//!   • `tokio`      —  async timers & task management  
+//!   • `tracing`    —  structured logging  
+//!   • `serde_json` —  example configuration format
+//!
+//! The public surface area is intentionally small—`StrategyManager` is
+//! the single entry point used by downstream ETL jobs.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+use arc_swap::ArcSwap;
+use chrono::{DateTime, Utc};
+use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::Deserialize;
+use tokio::sync::{broadcast, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time;
+use tracing::{debug, error, info, instrument};
+
+/// Lightweight domain entity for demonstration.
+/// In the real project this would be defined by the shared `chirp-models` crate.
+#[derive(Debug, Clone)]
+pub struct SocialEvent {
+    pub id: String,
+    pub text: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Result returned by any analysis strategy.
+#[derive(Debug, Clone)]
+pub struct AnalysisResult {
+    pub score: f32,
+    pub model: String,
+    pub processed_at: DateTime<Utc>,
+}
+
+/// Trait that every realtime analysis implementation must satisfy.
+///
+/// The interface is intentionally *minimal* to keep the example focused.
+pub trait AnalysisStrategy: Send + Sync + 'static {
+    /// A short, human-readable identifier.
+    fn name(&self) -> &'static str;
+
+    /// Compute whatever metric the strategy is responsible for.
+    fn analyze(&self, event: &SocialEvent) -> AnalysisResult;
+}
+
+/// A simplistic sentiment analyzer (v1).  Illustrative only.
+pub struct SentimentV1;
+
+impl AnalysisStrategy for SentimentV1 {
+    fn name(&self) -> &'static str {
+        "sentiment_v1"
+    }
+
+    fn analyze(&self, event: &SocialEvent) -> AnalysisResult {
+        // Fake implementation: positive if even id length
+        let positive = event.id.len() % 2 == 0;
+        AnalysisResult {
+            score: if positive { 0.8 } else { -0.6 },
+            model: self.name().to_string(),
+            processed_at: Utc::now(),
+        }
+    }
+}
+
+/// A more advanced sentiment implementation (v2).
+pub struct SentimentV2;
+
+impl AnalysisStrategy for SentimentV2 {
+    fn name(&self) -> &'static str {
+        "sentiment_v2"
+    }
+
+    fn analyze(&self, event: &SocialEvent) -> AnalysisResult {
+        // Slightly less fake: score is normalized tweet length
+        let len = event.text.len() as f32;
+        let score = ((len % 240.0) / 240.0) * 2.0 - 1.0; // map to [-1, 1]
+        AnalysisResult {
+            score,
+            model: self.name().to_string(),
+            processed_at: Utc::now(),
+        }
+    }
+}
+
+/// Configuration payload used to load a strategy from disk.
+///
+/// For a real project we might have a richer set of knobs.
+#[derive(Debug, Deserialize)]
+struct StrategyConfig {
+    /// `"v1"` or `"v2"`, later could be a full URL or crate name.
+    variant: String,
+}
+
+/// Load a strategy based on the provided raw config bytes.
+fn build_strategy(raw: &[u8]) -> Result<Arc<dyn AnalysisStrategy>> {
+    let conf: StrategyConfig =
+        serde_json::from_slice(raw).context("failed to deserialize strategy config")?;
+
+    let strat: Arc<dyn AnalysisStrategy> = match conf.variant.as_str() {
+        "v1" => Arc::new(SentimentV1),
+        "v2" => Arc::new(SentimentV2),
+        other => return Err(anyhow!("unknown strategy variant `{other}`")),
+    };
+
+    Ok(strat)
+}
+
+/// Thread-safe strategy manager.
+///
+/// Internally this is an `ArcSwap`, giving *wait-free* reads via simple
+/// pointer dereference.  Writers (e.g., a watcher detecting a new
+/// config file) perform an atomic swap that instantly makes the new
+/// strategy visible to all concurrent readers.
+pub struct StrategyManager {
+    current: ArcSwap<dyn AnalysisStrategy>,
+    /// Broadcast channel used purely for observability—downstream tasks
+    /// may subscribe to learn when a new strategy is deployed.
+    broadcaster: broadcast::Sender<String>,
+
+    /// Handle to the background watcher task; used for graceful shut-down.
+    watcher_handle: Option<JoinHandle<()>>,
+    /// Shutdown trigger for the watcher.
+    shutdown_tx: Option<oneshot::Sender<()>>,
+}
+
+impl StrategyManager {
+    /// Instantiate a manager from an *initial* strategy instance.
+    pub fn new(initial: Arc<dyn AnalysisStrategy>) -> Self {
+        let (tx, _) = broadcast::channel(8);
+        Self {
+            current: ArcSwap::from(initial),
+            broadcaster: tx,
+            watcher_handle: None,
+            shutdown_tx: None,
+        }
+    }
+
+    /// Retrieve a reference to the currently-active strategy in a
+    /// lock-free fashion.
+    pub fn strategy(&self) -> &dyn AnalysisStrategy {
+        &*self.current.load()
+    }
+
+    /// Subscribe to deployment events.  Each message is the name of the
+    /// newly-activated strategy.
+    pub fn subscribe(&self) -> broadcast::Receiver<String> {
+        self.broadcaster.subscribe()
+    }
+
+    /// Spawn a file-system watcher that hot-swaps the strategy whenever
+    /// the supplied config file is modified.
+    ///
+    /// This method is *idempotent*—calling it multiple times without
+    /// stopping the previous watcher will be a no-op.
+    #[instrument(skip_all, fields(path = %config_path.display()))]
+    pub fn start_hot_swapper<P>(&mut self, config_path: P, poll_interval: Duration) -> Result<()>
+    where
+        P: Into<std::path::PathBuf>,
+    {
+        if self.watcher_handle.is_some() {
+            return Ok(()); // Already running
+        }
+
+        let path = config_path.into();
+        let swap = self.current.clone();
+        let tx = self.broadcaster.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let handle = tokio::spawn(async move {
+            // Simple polling loop + notify watcher for quick responsiveness.
+            let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+            // Set up notify-rs to trigger `notify_tx.send(())` on changes.
+            let mut watcher: RecommendedWatcher =
+                Watcher::new_immediate(move |_res| {
+                    let _ = notify_tx.send(());
+                })
+                .expect("failed to construct watcher");
+            watcher
+                .watch(&path, RecursiveMode::NonRecursive)
+                .expect("failed to watch config file");
+            watcher.configure(NotifyConfig::PreciseEvents(true)).ok();
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx => {
+                        debug!("hot-swap watcher received shutdown signal");
+                        break;
+                    }
+                    _ = notify_rx.recv() => {
+                        if let Err(e) = Self::reload_strategy(&path, &swap, &tx).await {
+                            error!(error = %e, "automatic strategy reload failed");
+                        }
+                    }
+                    _ = time::sleep(poll_interval) => {
+                        if let Err(e) = Self::reload_strategy(&path, &swap, &tx).await {
+                            error!(error = %e, "automatic strategy reload failed");
+                        }
+                    }
+                }
+            }
+        });
+
+        self.watcher_handle = Some(handle);
+        self.shutdown_tx = Some(shutdown_tx);
+        Ok(())
+    }
+
+    /// Stop the background hot-swapper task, waiting up to `timeout` for
+    /// a graceful exit.
+    pub async fn stop_hot_swapper(&mut self, timeout: Duration) -> Result<()> {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.watcher_handle.take() {
+            match time::timeout(timeout, handle).await {
+                Ok(join) => join?,
+                Err(_) => return Err(anyhow!("hot-swap task did not shut down in time")),
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the config, build a new strategy, and atomically publish it.
+    #[instrument(skip_all)]
+    async fn reload_strategy(
+        path: &std::path::Path,
+        swap: &ArcSwap<dyn AnalysisStrategy>,
+        broadcast: &broadcast::Sender<String>,
+    ) -> Result<()> {
+        let raw = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("reading config file {}", path.display()))?;
+        let new_strategy = build_strategy(&raw)?;
+        let new_name = new_strategy.name();
+
+        // Early-exit: don't swap if the new strategy is identical.
+        if swap.load().name() == new_name {
+            return Ok(());
+        }
+
+        swap.store(new_strategy);
+        let _ = broadcast.send(new_name.to_owned());
+
+        info!(name = new_name, "activated new analysis strategy");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[tokio::test]
+    async fn test_strategy_hot_swap() -> Result<()> {
+        // Create temp directory & file
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("strategy.json");
+
+        // Write initial config
+        fs::write(&cfg_path, r#"{ "variant": "v1" }"#)?;
+
+        // Manager with dummy initial strategy
+        let initial: Arc<dyn AnalysisStrategy> = Arc::new(SentimentV1);
+        let mut mgr = StrategyManager::new(initial);
+        mgr.start_hot_swapper(&cfg_path, Duration::from_millis(100))?;
+
+        // Let watcher pick up
+        time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(mgr.strategy().name(), "sentiment_v1");
+
+        // Swap to v2
+        fs::write(&cfg_path, r#"{ "variant": "v2" }"#)?;
+
+        // Wait for reload
+        time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(mgr.strategy().name(), "sentiment_v2");
+
+        // Shutdown
+        mgr.stop_hot_swapper(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+}
+```

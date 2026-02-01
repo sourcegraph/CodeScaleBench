@@ -1,0 +1,364 @@
+```rust
+//! src/module_32.rs
+//!
+//! Automated Retraining & Model Monitoring
+//! =======================================
+//! This module glues together the Observer & Strategy patterns that power
+//! *automated* model retraining.  It is intentionally **self-contained** so it
+//! can be embedded into other services without dragging half the dependency
+//! graph with it.  All public types live behind trait objects so that the
+//! surrounding pipeline can treat them as dynamic plugins.
+//
+//  ────────────────────────────────────────────────────────────────────────────
+//  External Crates
+//  ────────────────────────────────────────────────────────────────────────────
+use chrono::{DateTime, Duration, Utc};
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use thiserror::Error;
+
+//  ────────────────────────────────────────────────────────────────────────────
+//  Domain Types
+//  ────────────────────────────────────────────────────────────────────────────
+/// Metrics emitted by the Serving Ops layer and consumed by the monitor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPerformanceMetrics {
+    pub model_version: String,
+    pub accuracy: f32,
+    pub precision: f32,
+    pub recall: f32,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Lightweight container for hyperparameters.  We treat them as JSON maps so
+/// that arbitrary model families can encode their custom parameters while still
+/// enabling auditing & version control downstream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HyperparameterConfig(pub serde_json::Value);
+
+/// Reasons for triggering a retraining session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RetrainingReason {
+    Scheduled(DateTime<Utc>),
+    ConceptDrift {
+        detected_at: DateTime<Utc>,
+        dropped_metric: String,
+        current_value: f32,
+        threshold: f32,
+    },
+    Manual(String),
+}
+
+//  ────────────────────────────────────────────────────────────────────────────
+//  Error Handling
+//  ────────────────────────────────────────────────────────────────────────────
+#[derive(Debug, Error)]
+pub enum RetrainingError {
+    #[error("Failed to submit retraining job to executor: {0}")]
+    JobSubmission(String),
+
+    #[error("Configuration error: {0}")]
+    Configuration(String),
+
+    #[error("Unknown error: {0}")]
+    Unknown(String),
+}
+
+//  ────────────────────────────────────────────────────────────────────────────
+//  Observer Pattern — Metric Publisher / Subscriber
+//  ────────────────────────────────────────────────────────────────────────────
+/// Publisher of real-time serving metrics.
+#[derive(Clone)]
+pub struct MetricsPublisher {
+    tx: Sender<ModelPerformanceMetrics>,
+}
+
+impl MetricsPublisher {
+    pub fn new() -> (Self, Receiver<ModelPerformanceMetrics>) {
+        let (tx, rx) = unbounded();
+        (Self { tx }, rx)
+    }
+
+    pub fn publish(&self, metrics: ModelPerformanceMetrics) {
+        // Non-blocking.  Drop if no one is interested.
+        if let Err(err) = self.tx.try_send(metrics) {
+            debug!("No metrics consumer registered: {}", err);
+        }
+    }
+}
+
+/// Consumers interested in metric updates implement this trait.
+pub trait MetricObserver: Send + Sync + 'static {
+    fn on_metric(&self, metric: &ModelPerformanceMetrics);
+}
+
+//  ────────────────────────────────────────────────────────────────────────────
+//  Strategy Pattern — Retraining Decision Logic
+//  ────────────────────────────────────────────────────────────────────────────
+pub trait RetrainingStrategy: Send + Sync {
+    /// Called for every metric event; returns Some(reason) when retraining
+    /// should be triggered.
+    fn evaluate(&self, metric: &ModelPerformanceMetrics) -> Option<RetrainingReason>;
+
+    /// Optional: hook executed *after* a successful retrain cycle.
+    fn on_retrain_complete(&self) {}
+}
+
+/// Simple strategy: retrain every N hours regardless of performance.
+pub struct TimeBasedRetraining {
+    cadence: Duration,
+    last_retrain: Mutex<DateTime<Utc>>,
+}
+
+impl TimeBasedRetraining {
+    pub fn new(cadence_hours: i64) -> Self {
+        Self {
+            cadence: Duration::hours(cadence_hours),
+            last_retrain: Mutex::new(Utc::now()),
+        }
+    }
+}
+
+impl RetrainingStrategy for TimeBasedRetraining {
+    fn evaluate(&self, _metric: &ModelPerformanceMetrics) -> Option<RetrainingReason> {
+        let mut guard = self
+            .last_retrain
+            .lock()
+            .expect("TimeBasedRetraining mutex poisoned");
+        if Utc::now().signed_duration_since(*guard) >= self.cadence {
+            *guard = Utc::now();
+            Some(RetrainingReason::Scheduled(*guard))
+        } else {
+            None
+        }
+    }
+}
+
+/// Strategy: trigger retraining when accuracy falls below a threshold for a
+/// sustained window.
+pub struct DriftBasedRetraining {
+    accuracy_threshold: f32,
+    patience: usize,
+    buffer: Mutex<Vec<ModelPerformanceMetrics>>,
+}
+
+impl DriftBasedRetraining {
+    pub fn new(accuracy_threshold: f32, patience: usize) -> Self {
+        Self {
+            accuracy_threshold,
+            patience,
+            buffer: Mutex::new(Vec::with_capacity(patience + 1)),
+        }
+    }
+}
+
+impl RetrainingStrategy for DriftBasedRetraining {
+    fn evaluate(&self, metric: &ModelPerformanceMetrics) -> Option<RetrainingReason> {
+        let mut buf = self.buffer.lock().expect("buffer poisoned");
+        buf.push(metric.clone());
+        if buf.len() > self.patience {
+            buf.remove(0);
+        }
+
+        let below_threshold = buf
+            .iter()
+            .all(|m| m.accuracy < self.accuracy_threshold);
+
+        if below_threshold && buf.len() == self.patience {
+            buf.clear(); // reset window
+            Some(RetrainingReason::ConceptDrift {
+                detected_at: metric.timestamp,
+                dropped_metric: "accuracy".into(),
+                current_value: metric.accuracy,
+                threshold: self.accuracy_threshold,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+//  ────────────────────────────────────────────────────────────────────────────
+//  Model Retraining Executor (Facade)
+//  ────────────────────────────────────────────────────────────────────────────
+pub trait ModelTrainingService: Send + Sync {
+    fn submit_retraining_job(
+        &self,
+        reason: RetrainingReason,
+        latest_hparams: HyperparameterConfig,
+    ) -> Result<(), RetrainingError>;
+}
+
+/// Default implementation that logs instead of performing actual work.
+/// In production, this would enqueue a job into the Model Ops layer.
+pub struct LoggingTrainingService;
+
+impl ModelTrainingService for LoggingTrainingService {
+    fn submit_retraining_job(
+        &self,
+        reason: RetrainingReason,
+        latest_hparams: HyperparameterConfig,
+    ) -> Result<(), RetrainingError> {
+        info!(
+            "Pretending to submit retraining job. Reason: {:?}, Params: {:?}",
+            reason, latest_hparams
+        );
+        Ok(())
+    }
+}
+
+//  ────────────────────────────────────────────────────────────────────────────
+//  Monitor Orchestrator
+//  ────────────────────────────────────────────────────────────────────────────
+pub struct PerformanceMonitor {
+    observers: Vec<Arc<dyn MetricObserver>>,
+    strategies: Vec<Arc<dyn RetrainingStrategy>>,
+    training_service: Arc<dyn ModelTrainingService>,
+}
+
+impl PerformanceMonitor {
+    pub fn builder() -> PerformanceMonitorBuilder {
+        PerformanceMonitorBuilder::default()
+    }
+
+    fn run(self, rx: Receiver<ModelPerformanceMetrics>) {
+        thread::spawn(move || {
+            for metric in rx.iter() {
+                // Notify observers
+                for obs in &self.observers {
+                    obs.on_metric(&metric);
+                }
+
+                // Evaluate strategies
+                for strat in &self.strategies {
+                    if let Some(reason) = strat.evaluate(&metric) {
+                        // In a real system we'd pull the latest hyperparams from the registry
+                        let default_hparams = HyperparameterConfig(serde_json::json!({}));
+                        match self
+                            .training_service
+                            .submit_retraining_job(reason.clone(), default_hparams)
+                        {
+                            Ok(_) => {
+                                info!("Retraining triggered successfully: {:?}", reason);
+                                strat.on_retrain_complete();
+                            }
+                            Err(err) => {
+                                error!("Retraining submission failed: {}", err);
+                            }
+                        }
+                    }
+                }
+            }
+            warn!("Metrics channel closed; monitor loop exiting");
+        });
+    }
+}
+
+//  ────────────────────────────────────────────────────────────────────────────
+//  Builder — ergonomic API for assembling the monitor
+//  ────────────────────────────────────────────────────────────────────────────
+#[derive(Default)]
+pub struct PerformanceMonitorBuilder {
+    observers: Vec<Arc<dyn MetricObserver>>,
+    strategies: Vec<Arc<dyn RetrainingStrategy>>,
+    training_service: Option<Arc<dyn ModelTrainingService>>,
+}
+
+impl PerformanceMonitorBuilder {
+    pub fn with_observer<T: MetricObserver>(mut self, obs: T) -> Self {
+        self.observers.push(Arc::new(obs));
+        self
+    }
+
+    pub fn with_strategy<T: RetrainingStrategy>(mut self, strat: T) -> Self {
+        self.strategies.push(Arc::new(strat));
+        self
+    }
+
+    pub fn with_training_service<T: ModelTrainingService>(mut self, svc: T) -> Self {
+        self.training_service = Some(Arc::new(svc));
+        self
+    }
+
+    /// Finalizes the builder and spawns the monitor thread.  Returns a
+    /// [`MetricsPublisher`] so the caller can push metrics into the system.
+    pub fn start(self) -> MetricsPublisher {
+        let training_service = self
+            .training_service
+            .unwrap_or_else(|| Arc::new(LoggingTrainingService));
+
+        let (publisher, rx) = MetricsPublisher::new();
+
+        let monitor = PerformanceMonitor {
+            observers: self.observers,
+            strategies: self.strategies,
+            training_service,
+        };
+        monitor.run(rx);
+        publisher
+    }
+}
+
+//  ────────────────────────────────────────────────────────────────────────────
+//  Example Observer Implementation
+//  ────────────────────────────────────────────────────────────────────────────
+/// Simple observer that dumps metrics to the `log` crate.
+pub struct LoggingObserver;
+
+impl MetricObserver for LoggingObserver {
+    fn on_metric(&self, metric: &ModelPerformanceMetrics) {
+        debug!("Metric observed: {:?}", metric);
+    }
+}
+
+//  ────────────────────────────────────────────────────────────────────────────
+//  Unit Tests
+//  ────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_time_based_triggers() {
+        let publisher = PerformanceMonitor::builder()
+            .with_strategy(TimeBasedRetraining::new(0)) // zero hours => immediate
+            .start();
+
+        // Our monitor lives in a background thread; push a single metric and
+        // sleep briefly so the thread gets CPU time.
+        publisher.publish(ModelPerformanceMetrics {
+            model_version: "v1".into(),
+            accuracy: 0.95,
+            precision: 0.94,
+            recall: 0.93,
+            timestamp: Utc::now(),
+        });
+
+        // There's no deterministic way to assert the retrain call without
+        // instrumentation; instead we ensure the thread is alive & panic-free.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_drift_based_triggers() {
+        let publisher = PerformanceMonitor::builder()
+            .with_strategy(DriftBasedRetraining::new(0.90, 3))
+            .start();
+
+        // Feed three low-accuracy metrics to trigger drift retraining.
+        for _ in 0..3 {
+            publisher.publish(ModelPerformanceMetrics {
+                model_version: "v1".into(),
+                accuracy: 0.80,
+                precision: 0.80,
+                recall: 0.80,
+                timestamp: Utc::now(),
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+```

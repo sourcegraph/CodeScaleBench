@@ -1,0 +1,341 @@
+```rust
+//! LedgerLink Nexus – Module 13
+//!
+//! This module implements a production-grade, paginated query service for
+//! `LedgerEntry` resources with built-in request validation, structured
+//! logging, cache hints and a repository abstraction.  
+//!
+//! It demonstrates how the *Command/Query* service layer orchestrates domain
+//! models through repositories while remaining storage-agnostic.  
+//!
+//! ┌─  High-level flow
+//! │   1. Incoming REST/GraphQL query is deserialized into a
+//! │      `LedgerEntryQueryRequest` (View).
+//! │   2. The request is validated (page size limits, date ranges, etc.).
+//! │   3. Service layer (`LedgerEntryQueryService`) calls the injected
+//! │      `LedgerEntryRepository` to fetch data.
+//! │   4. Results are wrapped into a `Paginated` View-Model that carries
+//! │      cache directives and pagination metadata.
+//! └──────────────────────────────────────────────────────────────────────────
+
+#![allow(clippy::missing_errors_doc)] // ← Service errors are re-exported.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tracing::{debug, instrument};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+/// Maximum items allowed per page to protect system resources.
+const MAX_PAGE_SIZE: u32 = 250;
+
+/// REST/GQL filter & pagination request for ledger entries (View).
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct LedgerEntryQueryRequest {
+    /// Tenant isolation id (parsed from auth token, but clients may override
+    /// for delegated admin scenarios).
+    #[validate(length(min = 1))]
+    pub tenant_id: String,
+
+    /// 1-based page index.
+    #[validate(range(min = 1))]
+    pub page: u32,
+
+    /// Items per page.
+    #[validate(custom(function = "validate_page_size"))]
+    pub per_page: u32,
+
+    /// Optional inclusive lower bound.
+    pub from: Option<DateTime<Utc>>,
+
+    /// Optional inclusive upper bound.
+    pub to: Option<DateTime<Utc>>,
+}
+
+/// Custom page size validation function.
+fn validate_page_size(size: &u32) -> Result<(), ValidationError> {
+    if *size == 0 || *size > MAX_PAGE_SIZE {
+        return Err(ValidationError::new("invalid_page_size"));
+    }
+    Ok(())
+}
+
+/// View-Model returned to API consumers with pagination metadata and
+/// cache hints.
+#[derive(Debug, Clone, Serialize)]
+pub struct Paginated<T> {
+    pub data: Vec<T>,
+    pub page: u32,
+    pub per_page: u32,
+    pub total_items: u64,
+    pub total_pages: u32,
+    /// HTTP `Cache-Control` max-age seconds; 0 = no-cache.
+    pub cache_max_age: u32,
+}
+
+impl<T> Paginated<T> {
+    fn new(
+        data: Vec<T>,
+        page: u32,
+        per_page: u32,
+        total_items: u64,
+        cache_max_age: u32,
+    ) -> Self {
+        let total_pages = if total_items == 0 {
+            0
+        } else {
+            ((total_items as f64) / per_page as f64).ceil() as u32
+        };
+        Self {
+            data,
+            page,
+            per_page,
+            total_items,
+            total_pages,
+            cache_max_age,
+        }
+    }
+}
+
+/// Domain model – represents a single ledger entry persisted in Postgres.
+///
+/// In a real application this would live in the `domain` crate; duplicated
+/// here for brevity.
+#[derive(Debug, Clone)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub tenant_id: String,
+    pub booked_at: DateTime<Utc>,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub description: String,
+}
+
+/// Repository abstraction – hides persistence details from service layer.
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    /// Fetch paginated (total, rows) ledger entries for the requested tenant.
+    async fn fetch_entries(
+        &self,
+        tenant_id: &str,
+        page: u32,
+        per_page: u32,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> Result<(u64, Vec<LedgerEntry>), QueryError>;
+}
+
+/// Service error envelope (returned to controllers → HTTP/GraphQL layer).
+#[derive(Debug, Error)]
+pub enum QueryError {
+    #[error("validation failed: {0}")]
+    Validation(String),
+
+    #[error("storage error: {0}")]
+    Repository(String),
+
+    #[error("internal processing error: {0}")]
+    Internal(String),
+}
+
+impl From<validator::ValidationErrors> for QueryError {
+    fn from(err: validator::ValidationErrors) -> Self {
+        QueryError::Validation(err.to_string())
+    }
+}
+
+/// Query service implementing business policies.
+#[derive(Clone)]
+pub struct LedgerEntryQueryService<R: LedgerEntryRepository> {
+    repo: Arc<R>,
+}
+
+impl<R> LedgerEntryQueryService<R>
+where
+    R: LedgerEntryRepository + 'static,
+{
+    pub fn new(repo: Arc<R>) -> Self {
+        Self { repo }
+    }
+
+    /// Main entry point used by controllers/handlers.
+    #[instrument(skip(self), fields(tenant = %request.tenant_id))]
+    pub async fn execute(
+        &self,
+        request: LedgerEntryQueryRequest,
+    ) -> Result<Paginated<LedgerEntryDto>, QueryError> {
+        // ----- 1. Validate external payload --------------------------------
+        request.validate()?;
+
+        debug!(
+            "Fetching ledger entries | page={} per_page={} tenant={}",
+            request.page, request.per_page, request.tenant_id
+        );
+
+        // ----- 2. Call repository ------------------------------------------
+        let (total, rows) = self
+            .repo
+            .fetch_entries(
+                &request.tenant_id,
+                request.page,
+                request.per_page,
+                request.from,
+                request.to,
+            )
+            .await
+            .map_err(|e| QueryError::Repository(e.to_string()))?;
+
+        // ----- 3. Convert to DTOs ------------------------------------------
+        let data = rows.into_iter().map(LedgerEntryDto::from).collect::<Vec<_>>();
+
+        // TTL heuristic: snapshot queries older than 24h are immutable.
+        let cache_max_age = if request.to
+            .map(|to| Utc::now().signed_duration_since(to).num_hours() >= 24)
+            .unwrap_or(false)
+        {
+            60 * 60 * 24 // 1 day
+        } else {
+            0 // no-cache
+        };
+
+        Ok(Paginated::new(
+            data,
+            request.page,
+            request.per_page,
+            total,
+            cache_max_age,
+        ))
+    }
+}
+
+/// Public Data Transfer Object (View-Model) with ISO-8601 formatting.
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerEntryDto {
+    pub id: Uuid,
+    pub booked_at: DateTime<Utc>,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub description: String,
+}
+
+impl From<LedgerEntry> for LedgerEntryDto {
+    fn from(e: LedgerEntry) -> Self {
+        Self {
+            id: e.id,
+            booked_at: e.booked_at,
+            amount_minor: e.amount_minor,
+            currency: e.currency,
+            description: e.description,
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------
+   Mock implementation & unit tests
+   --------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use std::collections::HashMap;
+    use tokio::sync::RwLock;
+
+    /// Simple in-memory mock to validate service logic independently from DB.
+    pub struct InMemoryRepo {
+        storage: RwLock<HashMap<String, Vec<LedgerEntry>>>,
+    }
+
+    impl InMemoryRepo {
+        fn new() -> Self {
+            Self {
+                storage: RwLock::new(HashMap::new()),
+            }
+        }
+
+        /// Helper seeded with a given tenant & count.
+        fn seeded(tenant: &str, count: usize) -> Self {
+            let mut repo = Self::new();
+            let mut entries = Vec::with_capacity(count);
+
+            for i in 0..count {
+                entries.push(LedgerEntry {
+                    id: Uuid::new_v4(),
+                    tenant_id: tenant.to_string(),
+                    booked_at: Utc::now() - Duration::days(i as i64),
+                    amount_minor: (i as i64 + 1) * 100,
+                    currency: "USD".into(),
+                    description: format!("entry #{i}"),
+                });
+            }
+
+            repo.storage
+                .blocking_write()
+                .insert(tenant.to_string(), entries);
+            repo
+        }
+    }
+
+    #[async_trait]
+    impl LedgerEntryRepository for InMemoryRepo {
+        async fn fetch_entries(
+            &self,
+            tenant_id: &str,
+            page: u32,
+            per_page: u32,
+            _from: Option<DateTime<Utc>>,
+            _to: Option<DateTime<Utc>>,
+        ) -> Result<(u64, Vec<LedgerEntry>), QueryError> {
+            let storage = self.storage.read().await;
+            let tenant_rows = storage.get(tenant_id).cloned().unwrap_or_default();
+            let total = tenant_rows.len() as u64;
+
+            let start = ((page - 1) * per_page) as usize;
+            let end = usize::min(start + per_page as usize, tenant_rows.len());
+            Ok((total, tenant_rows[start..end].to_vec()))
+        }
+    }
+
+    #[tokio::test]
+    async fn paginated_query_success() {
+        let repo = Arc::new(InMemoryRepo::seeded("tenant_1", 60));
+        let service = LedgerEntryQueryService::new(repo);
+
+        let request = LedgerEntryQueryRequest {
+            tenant_id: "tenant_1".into(),
+            page: 2,
+            per_page: 25,
+            from: None,
+            to: None,
+        };
+
+        let resp = service.execute(request).await.unwrap();
+        assert_eq!(resp.page, 2);
+        assert_eq!(resp.per_page, 25);
+        assert_eq!(resp.total_items, 60);
+        assert_eq!(resp.data.len(), 25);
+        assert_eq!(resp.total_pages, 3);
+    }
+
+    #[tokio::test]
+    async fn validation_fails_on_large_page() {
+        let repo = Arc::new(InMemoryRepo::new());
+        let service = LedgerEntryQueryService::new(repo);
+
+        let bad_req = LedgerEntryQueryRequest {
+            tenant_id: "t".into(),
+            page: 1,
+            per_page: MAX_PAGE_SIZE + 1,
+            from: None,
+            to: None,
+        };
+
+        let err = service.execute(bad_req).await.unwrap_err();
+        matches!(err, QueryError::Validation(_));
+    }
+}
+```

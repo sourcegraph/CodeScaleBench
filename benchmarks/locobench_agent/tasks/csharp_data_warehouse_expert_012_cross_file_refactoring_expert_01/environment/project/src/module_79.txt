@@ -1,0 +1,354 @@
+```csharp
+// File: src/module_79.txt
+// Project: PulseOps Warehouse — Serverless Productivity Intelligence Fabric (data_warehouse)
+// Language: C#
+
+/*
+ *  TransformationStrategyRegistry.cs
+ *
+ *  This source file provides a thread-safe, runtime-discoverable registry for
+ *  ITransformationStrategy implementations.  Strategies can be discovered via
+ *  reflection, explicitly registered, or hot-reloaded when new assemblies are
+ *  introduced (e.g., by an AWS Lambda Layer update).  The registry is the central
+ *  dispatch mechanism used by the event-driven micro-components to obtain the
+ *  correct transformation logic for a given data stream.
+ *
+ *  The code purposely lives in its own compilation unit so that downstream
+ *  services (Lambdas, Glue jobs, Step-Functions, etc.) can depend on it without
+ *  pulling in heavier dependencies from the ingestion or storage layers.
+ */
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.Loader;
+using System.Threading;
+using System.Threading.Tasks;
+
+// NOTE: External dependencies shipped via Lambda Layer or NuGet.
+// using Amazon.CloudWatch.EMF; // Embedded Metric Format (optional telemetry)
+
+namespace PulseOps.Warehouse.Transformation
+{
+    #region Public Contracts ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Identifies the upstream domain/source of a raw event stream.
+    /// </summary>
+    public enum DataStreamType
+    {
+        Unknown = 0,
+        Calendar     = 1,
+        CodeRepo     = 2,
+        CiCd         = 3,
+        Email        = 4,
+        SaasTelemetry= 5
+    }
+
+    /// <summary>
+    /// Represents the canonical raw record emitted by an ingestion Lambda.  The
+    /// schema is highly simplified here – real implementations are located in
+    /// the PulseOps.Warehouse.Events namespace.
+    /// </summary>
+    public readonly struct RawRecord
+    {
+        public RawRecord(DataStreamType stream, string payload, DateTime timestampUtc)
+        {
+            StreamType    = stream;
+            Payload       = payload ?? throw new ArgumentNullException(nameof(payload));
+            TimestampUtc  = timestampUtc;
+        }
+
+        public DataStreamType StreamType { get; }
+        public string         Payload    { get; }
+        public DateTime       TimestampUtc { get; }
+    }
+
+    /// <summary>
+    /// Canonical output after transformation and domain enrichment.
+    /// </summary>
+    public sealed class TransformedRecord
+    {
+        public required DataStreamType StreamType { get; init; }
+        public required string         NormalizedPayload { get; init; }
+        public required DateTime       ObservedAtUtc     { get; init; }
+        public IDictionary<string, string>? Attributes   { get; init; }
+    }
+
+    /// <summary>
+    /// Strategy interface implemented by all transformation plug-ins.
+    /// Implementations must be stateless or otherwise thread-safe, as a single
+    /// instance may be shared across concurrent Lambda invocations.
+    /// </summary>
+    public interface ITransformationStrategy
+    {
+        /// <summary>Human-friendly name (e.g., "Outlook Calendar → FocusTime").</summary>
+        string Name { get; }
+
+        /// <summary>Indicates which upstream stream type this strategy supports.</summary>
+        DataStreamType StreamType { get; }
+
+        /// <summary>Transforms an incoming raw record into the warehouse schema.</summary>
+        Task<TransformedRecord> TransformAsync(RawRecord record, CancellationToken ct = default);
+    }
+
+    #endregion
+
+    #region Registry Implementation ────────────────────────────────────────────
+
+    /// <summary>
+    /// Discovers, registers, and dispenses <see cref="ITransformationStrategy"/>
+    /// instances at runtime.  The registry is explicitly designed for:
+    ///   • Lambda cold-start performance (caches reflection results)
+    ///   • Thread-safety (lock-free read path)
+    ///   • Hot-reloading (AssemblyLoadContext) for zero-downtime deploys
+    /// </summary>
+    public sealed class TransformationStrategyRegistry : IDisposable
+    {
+        private const string ENV_STRATEGY_OVERRIDE = "PULSEOPS_STRATEGY_OVERRIDE"; // "Calendar=CustomCalStrategy;Email=Foo"
+        private readonly ConcurrentDictionary<DataStreamType, ITransformationStrategy> _byStream
+            = new();
+        private readonly ConcurrentDictionary<string, ITransformationStrategy> _byName
+            = new(StringComparer.OrdinalIgnoreCase);
+        private readonly IDisposable? _assemblyLoadToken;
+        private bool _disposed;
+
+        #region Singleton Access ───────────────────────────────────────────────
+
+        private static readonly Lazy<TransformationStrategyRegistry> _lazy
+            = new(() => new TransformationStrategyRegistry());
+
+        /// <summary>Global singleton (lazy-initialized, thread-safe).</summary>
+        public static TransformationStrategyRegistry Instance => _lazy.Value;
+
+        /// <summary>Private ctor performs reflection-based discovery.</summary>
+        private TransformationStrategyRegistry()
+        {
+            DiscoverAndRegisterStrategies();
+
+            // Support hot-reload in Lambda: when a new AssemblyLoadContext is
+            // created for a version-ed layer, subscribe and re-discover.
+            _assemblyLoadToken = AssemblyLoadContext.Default.Resolving += OnAssemblyResolve;
+
+            ApplyEnvironmentOverrides();
+        }
+
+        #endregion
+
+        #region Strategy Discovery & Registration ──────────────────────────────
+
+        private void DiscoverAndRegisterStrategies()
+        {
+            var sw = Stopwatch.StartNew();
+
+            IEnumerable<ITransformationStrategy> strategies = AppDomain.CurrentDomain
+                .GetAssemblies()
+                .SelectMany(asm =>
+                {
+                    try
+                    {
+                        return asm.DefinedTypes;
+                    }
+                    catch (ReflectionTypeLoadException ex)
+                    {
+                        // Log and continue – some assemblies may fail to load.
+                        Console.Error.WriteLine($"[WARN] ReflectionTypeLoadException for {asm.FullName}: {ex.Message}");
+                        return ex.Types.Where(t => t != null).Cast<TypeInfo>();
+                    }
+                })
+                .Where(ti => ti is { IsClass: true, IsAbstract: false })
+                .Where(ti => typeof(ITransformationStrategy).IsAssignableFrom(ti))
+                .Select(ti =>
+                {
+                    try
+                    {
+                        return (ITransformationStrategy)Activator.CreateInstance(ti)!;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"[ERROR] Failed to instantiate strategy {ti.FullName}: {ex}");
+                        return null;
+                    }
+                })
+                .Where(instance => instance != null)!;
+
+            foreach (var strat in strategies)
+            {
+                RegisterStrategy(strat);
+            }
+
+            Console.WriteLine($"[INFO] TransformationStrategyRegistry discovered {_byStream.Count} strategies in {sw.ElapsedMilliseconds} ms.");
+        }
+
+        /// <summary>
+        /// Registers a strategy instance for runtime lookup.  If another strategy
+        /// for the same <see cref="DataStreamType"/> already exists, the new one
+        /// will overwrite it (allowing environment overrides).
+        /// </summary>
+        public void RegisterStrategy(ITransformationStrategy strategy)
+        {
+            if (strategy == null)
+                throw new ArgumentNullException(nameof(strategy));
+
+            _byStream.AddOrUpdate(strategy.StreamType, strategy, (_, _) => strategy);
+            _byName  .AddOrUpdate(strategy.Name, strategy, (_, _) => strategy);
+        }
+
+        #endregion
+
+        #region Lookup Operations ──────────────────────────────────────────────
+
+        /// <summary>
+        /// Retrieves the strategy responsible for the specified <paramref name="streamType"/>.
+        /// Throws a descriptive exception if no strategy is registered.
+        /// </summary>
+        public ITransformationStrategy Get(DataStreamType streamType)
+        {
+            if (_byStream.TryGetValue(streamType, out var strat))
+            {
+                return strat;
+            }
+
+            throw new InvalidOperationException(
+                $"No transformation strategy registered for stream '{streamType}'.  " +
+                "Ensure a plug-in implementing ITransformationStrategy is deployed " +
+                "and that its assembly is loaded.");
+        }
+
+        /// <summary>
+        /// Attempts to retrieve a strategy by its <see cref="ITransformationStrategy.Name"/>.
+        /// Returns null on failure.
+        /// </summary>
+        public ITransformationStrategy? TryGet(string strategyName)
+            => _byName.TryGetValue(strategyName, out var strat) ? strat : null;
+
+        #endregion
+
+        #region Environment-Driven Overrides ───────────────────────────────────
+
+        private void ApplyEnvironmentOverrides()
+        {
+            string? overrideSpec = Environment.GetEnvironmentVariable(ENV_STRATEGY_OVERRIDE);
+            if (string.IsNullOrWhiteSpace(overrideSpec))
+                return;
+
+            // Format: "Calendar=CustomCalStrategy;Email=FooBarStrategy"
+            var kvps = overrideSpec.Split(';', StringSplitOptions.RemoveEmptyEntries);
+            foreach (var kvp in kvps)
+            {
+                var pair = kvp.Split('=', StringSplitOptions.RemoveEmptyEntries);
+                if (pair.Length != 2)
+                    continue;
+
+                if (!Enum.TryParse<DataStreamType>(pair[0], ignoreCase: true, out var stream))
+                    continue;
+
+                var stratName = pair[1];
+
+                var strat = TryGet(stratName);
+                if (strat == null)
+                {
+                    Console.Error.WriteLine($"[WARN] Strategy override '{stratName}' not found; skipping.");
+                    continue;
+                }
+
+                RegisterStrategy(strat);
+                Console.WriteLine($"[INFO] Applied strategy override: {stream} → {strat.Name}");
+            }
+        }
+
+        #endregion
+
+        #region Hot-Reload Support ─────────────────────────────────────────────
+
+        // Re-discover strategies whenever a new assembly is loaded.
+        private Assembly? OnAssemblyResolve(AssemblyLoadContext ctx, AssemblyName name)
+        {
+            // After the assembly successfully loads, re-run discovery.
+            DiscoverAndRegisterStrategies();
+            return null;
+        }
+
+        #endregion
+
+        #region IDisposable Implementation ────────────────────────────────────
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+
+            if (_assemblyLoadToken != null)
+            {
+                AssemblyLoadContext.Default.Resolving -= OnAssemblyResolve;
+            }
+
+            _disposed = true;
+            GC.SuppressFinalize(this);
+        }
+
+        #endregion
+    }
+
+    #endregion
+
+    #region Example Default Strategies ────────────────────────────────────────
+    // NOTE: In the real codebase, these would live in separate files/assemblies.
+    // They are included here to make this compilation unit self-contained.
+
+    /// <summary>A very naive transformation for calendar events.</summary>
+    internal sealed class CalendarDefaultStrategy : ITransformationStrategy
+    {
+        public string Name => nameof(CalendarDefaultStrategy);
+        public DataStreamType StreamType => DataStreamType.Calendar;
+
+        public Task<TransformedRecord> TransformAsync(RawRecord record, CancellationToken ct = default)
+        {
+            // In reality, JSON parse + domain enrichment occurs here.
+            var transformed = new TransformedRecord
+            {
+                StreamType        = record.StreamType,
+                NormalizedPayload = record.Payload.ToUpperInvariant(),
+                ObservedAtUtc     = record.TimestampUtc,
+                Attributes = new Dictionary<string, string>
+                {
+                    ["DummyAttribute"] = "CalendarTransformed"
+                }
+            };
+
+            return Task.FromResult(transformed);
+        }
+    }
+
+    /// <summary>Baseline strategy for CI/CD telemetry.</summary>
+    internal sealed class CiCdDefaultStrategy : ITransformationStrategy
+    {
+        public string Name => nameof(CiCdDefaultStrategy);
+        public DataStreamType StreamType => DataStreamType.CiCd;
+
+        public Task<TransformedRecord> TransformAsync(RawRecord record, CancellationToken ct = default)
+        {
+            var normalized = record.Payload
+                .Replace("BUILD", "🛠️ ") // Example transformation
+                .Trim();
+
+            var transformed = new TransformedRecord
+            {
+                StreamType        = record.StreamType,
+                NormalizedPayload = normalized,
+                ObservedAtUtc     = record.TimestampUtc,
+                Attributes = new Dictionary<string, string>
+                {
+                    ["BuildId"] = Guid.NewGuid().ToString("N")
+                }
+            };
+
+            return Task.FromResult(transformed);
+        }
+    }
+
+    #endregion
+}
+```

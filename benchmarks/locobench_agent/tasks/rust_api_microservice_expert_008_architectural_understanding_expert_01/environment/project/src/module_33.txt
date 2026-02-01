@@ -1,0 +1,280 @@
+```rust
+//! src/module_33.rs
+//! -----------------------------------------------------------------------------
+//! Redis-backed response–caching layer for LedgerLink Nexus
+//! -----------------------------------------------------------------------------
+//!   • Generic, type-safe cache abstraction based on serde JSON encoding
+//!   • Async/await ready, built on `tokio` and `redis::aio::ConnectionManager`
+//!   • Observability through `tracing` spans and structured error envelopes
+//!   • Fine-grained TTL control with per-entry or global default expiration
+//!   • Multi-tenant isolation by automatic cache-key namespacing
+//!
+//! This module is wired by the service layer. All high-volume read queries
+//! (e.g. ledger snapshots, cash-flow forecasts) go through this cache façade
+//! before hitting Postgres. The cache is *write-through*: mutations trigger
+//! invalidations so we never serve stale financial data.
+//
+//  © 2024 LedgerLink. MIT-licensed. All rights reserved.
+
+use std::{fmt, sync::Arc, time::Duration};
+
+use async_trait::async_trait;
+use redis::{
+    aio::{Connection, ConnectionManager},
+    AsyncCommands, FromRedisValue, RedisError, RedisResult, ToRedisArgs,
+};
+use serde::{de::DeserializeOwned, Serialize};
+use thiserror::Error;
+use tokio::sync::RwLock;
+use tracing::{debug, error, instrument};
+
+/// Represents environment-specific cache parameters.
+///
+/// Values are loaded through the global configuration system and injected
+/// when building the service graph.
+#[derive(Clone, Debug)]
+pub struct CacheConfig {
+    /// Redis URI, e.g. `redis://user:pass@redis-cache:6379/0`
+    pub redis_dsn: String,
+    /// Default time-to-live for generic entries
+    pub default_ttl: Duration,
+    /// Optional key prefix to enforce tenant isolation
+    pub tenant_prefix: Option<String>,
+}
+
+/// Domain-level errors exposed by the cache façade.
+///
+/// Errors are intentionally opaque to avoid leaking internal topology details
+/// to higher layers.
+#[derive(Error, Debug)]
+pub enum CacheError {
+    #[error("cache connection error: {0}")]
+    Connection(#[from] RedisError),
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("unexpected cache miss")]
+    CacheMiss,
+}
+
+/// Convenience result type alias.
+type CacheResult<T> = std::result::Result<T, CacheError>;
+
+/// Contract for objects that can be mapped to a stable cache key.
+///
+/// For complex query arguments, create a DTO and implement `CacheKey` rather
+/// than concatenating raw strings.
+pub trait CacheKey {
+    fn cache_key(&self) -> String;
+}
+
+/// Blanket implementation for &str ‑ quick and dirty keys.
+impl CacheKey for &str {
+    fn cache_key(&self) -> String {
+        self.to_string()
+    }
+}
+
+/// Asynchronous cache interface.
+///
+/// Services depend on this trait exclusively, enabling us to swap the backing
+/// store during unit tests or move to a distributed cache cluster without
+/// touching business code.
+#[async_trait]
+pub trait ResponseCache: Send + Sync {
+    /// Fetch, returning `None` on cache miss.
+    async fn get<V>(&self, key: &impl CacheKey) -> CacheResult<Option<V>>
+    where
+        V: DeserializeOwned + Send;
+
+    /// Insert or overwrite the value, applying the supplied TTL; when `None`,
+    /// the global default TTL applies.
+    async fn set<V>(&self, key: &impl CacheKey, value: &V, ttl: Option<Duration>) -> CacheResult<()>
+    where
+        V: Serialize + Send + Sync;
+
+    /// Remove an entry. No-op if key does not exist.
+    async fn invalidate(&self, key: &impl CacheKey) -> CacheResult<()>;
+}
+
+/// Concrete Redis implementation.
+///
+/// A tiny connection pool is established via `ConnectionManager` inside an
+/// `Arc<RwLock<_>>` to share across tasks cheaply.
+#[derive(Clone)]
+pub struct RedisCache {
+    cfg: CacheConfig,
+    /// Lazy-initialised connection manager
+    conn: Arc<RwLock<Option<ConnectionManager>>>,
+}
+
+impl RedisCache {
+    /// Build a new instance. Call `ensure_connected()` before first use in
+    /// performance-sensitive paths to avoid initial latency.
+    pub fn new(cfg: CacheConfig) -> Self {
+        Self {
+            cfg,
+            conn: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    #[instrument(skip(self), level = "debug", err)]
+    async fn ensure_connected(&self) -> CacheResult<()> {
+        {
+            // Fast path: already connected
+            if self.conn.read().await.is_some() {
+                return Ok(());
+            }
+        }
+
+        let mut writer = self.conn.write().await;
+        if writer.is_none() {
+            let client = redis::Client::open(self.cfg.redis_dsn.as_str())?;
+            let conn = client.get_tokio_connection_manager().await?;
+            *writer = Some(conn);
+            debug!("redis cache connected");
+        }
+        Ok(())
+    }
+
+    async fn with_connection<F, T>(&self, f: F) -> CacheResult<T>
+    where
+        F: FnOnce(&mut ConnectionManager) -> RedisResult<T> + Send,
+        T: Send,
+    {
+        self.ensure_connected().await?;
+        let mut guard = self.conn.write().await;
+        let conn = guard
+            .as_mut()
+            .ok_or_else(|| RedisError::from((redis::ErrorKind::IoError, "uninitialised connection")))?;
+        Ok(f(conn)?)
+    }
+
+    fn scoped_key(&self, key: &impl CacheKey) -> String {
+        match &self.cfg.tenant_prefix {
+            Some(prefix) => format!("{}:{}", prefix, key.cache_key()),
+            None => key.cache_key(),
+        }
+    }
+}
+
+#[async_trait]
+impl ResponseCache for RedisCache {
+    #[instrument(skip(self), level = "trace", err)]
+    async fn get<V>(&self, key: &impl CacheKey) -> CacheResult<Option<V>>
+    where
+        V: DeserializeOwned + Send,
+    {
+        let full_key = self.scoped_key(key);
+        let raw: Option<String> = self
+            .with_connection(|conn| conn.get(full_key))
+            .await?;
+
+        match raw {
+            Some(json) => {
+                let parsed = serde_json::from_str::<V>(&json)?;
+                Ok(Some(parsed))
+            }
+            None => Ok(None),
+        }
+    }
+
+    #[instrument(skip(self, value), level = "trace", err)]
+    async fn set<V>(&self, key: &impl CacheKey, value: &V, ttl: Option<Duration>) -> CacheResult<()>
+    where
+        V: Serialize + Send + Sync,
+    {
+        let full_key = self.scoped_key(key);
+        let json = serde_json::to_string(value)?;
+
+        self.with_connection(|conn| {
+            let mut pipe = redis::pipe();
+            pipe.set(full_key.clone(), json);
+
+            // Expire
+            let expire_dur = ttl.unwrap_or(self.cfg.default_ttl).as_secs() as usize;
+            pipe.expire(full_key, expire_dur);
+            pipe.query(conn)
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    #[instrument(skip(self), level = "trace", err)]
+    async fn invalidate(&self, key: &impl CacheKey) -> CacheResult<()> {
+        let full_key = self.scoped_key(key);
+        self.with_connection(|conn| conn.del(full_key)).await?;
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Example: Composite cache key for ledger snapshots
+// -----------------------------------------------------------------------------
+
+/// Snapshot filters can be high-cardinality. A stable key ensures we index
+/// correctly without collisions.
+#[derive(Debug, Clone, Hash)]
+pub struct SnapshotKey {
+    pub tenant_id: uuid::Uuid,
+    pub account_id: uuid::Uuid,
+    pub currency: String,
+    pub as_of: chrono::NaiveDate,
+}
+
+impl CacheKey for SnapshotKey {
+    fn cache_key(&self) -> String {
+        format!(
+            "snapshot:{}:{}:{}:{}",
+            self.tenant_id, self.account_id, self.currency, self.as_of
+        )
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Integration test (requires running Redis locally)
+// To prevent bloating production binaries, behind `test` cfg only.
+// -----------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn roundtrip_cache() {
+        let cfg = CacheConfig {
+            redis_dsn: "redis://127.0.0.1/".into(),
+            default_ttl: Duration::from_secs(30),
+            tenant_prefix: Some("test-suite".into()),
+        };
+        let cache = RedisCache::new(cfg);
+
+        let key = SnapshotKey {
+            tenant_id: Uuid::new_v4(),
+            account_id: Uuid::new_v4(),
+            currency: "USD".into(),
+            as_of: chrono::NaiveDate::from_ymd_opt(2024, 3, 19).unwrap(),
+        };
+
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Dummy {
+            amount: f64,
+        }
+
+        // Miss
+        assert!(matches!(cache.get::<Dummy>(&key).await, Ok(None)));
+
+        // Set
+        let payload = Dummy { amount: 42.0 };
+        cache.set(&key, &payload, Some(Duration::from_secs(10))).await.unwrap();
+
+        // Hit
+        let got = cache.get::<Dummy>(&key).await.unwrap().unwrap();
+        assert_eq!(got, payload);
+
+        // Invalidate
+        cache.invalidate(&key).await.unwrap();
+        assert!(matches!(cache.get::<Dummy>(&key).await, Ok(None)));
+    }
+}
+```

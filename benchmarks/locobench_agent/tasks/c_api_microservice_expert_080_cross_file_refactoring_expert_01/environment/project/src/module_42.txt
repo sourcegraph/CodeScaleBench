@@ -1,0 +1,393 @@
+```c
+/*
+ * MercuryMonolith Commerce Hub
+ * --------------------------------------
+ * Module:    Response Cache (module_42)
+ * File:      src/module_42.txt   (compiled as .c)
+ * Author:    MercuryMonolith Core Team
+ *
+ * Synopsis:
+ *   A thread-safe, in-memory, TTL-aware LRU cache for HTTP/GraphQL
+ *   responses. Intended to sit in the presentation layer just behind the
+ *   routing gateway, providing fast path look-ups for idempotent queries.
+ *
+ *   Features:
+ *     • Configurable maximum entry count
+ *     • Per-entry TTL with lazy expiration
+ *     • O(1) average get/put using hash map + doubly-linked LRU list
+ *     • Atomic Prometheus-style metrics (hits, misses, evictions, size)
+ *     • Structured logging hooks
+ *
+ *   External dependencies:
+ *     • uthash.h  – included below (public domain)
+ *     • mm_logging.h         (project-local)
+ *     • mm_metrics.h         (project-local)
+ *     • mm_http_types.h      (project-local)
+ *
+ *   Build:
+ *     # (part of omnibus build, but standalone)
+ *     cc -std=c11 -Wall -Wextra -pedantic -pthread -c src/module_42.txt -o response_cache.o
+ *
+ *   Version: 1.2.0
+ */
+
+#define _POSIX_C_SOURCE 200809L  /* clock_gettime */
+
+#include <assert.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* ───────── Project-local headers ───────── */
+#include "mm_logging.h"
+#include "mm_metrics.h"
+#include "mm_http_types.h"
+
+/* ───────── Third-party: uthash (single-file) ───────── */
+#define uthash_malloc(sz)       malloc(sz)
+#define uthash_free(ptr,sz)     free(ptr)
+/* clang-format off */
+#include "uthash.h"
+/* clang-format on */
+
+/* ───────── Public API ───────── */
+#include "response_cache.h"
+
+/* ───────── Constants ───────── */
+#define MODULE_NAME              "response_cache"
+#define CACHE_VERSION            "1.2.0"
+#define DEFAULT_MAX_ENTRIES      4096
+#define DEFAULT_TTL_SECONDS      60
+
+/* ───────── Internal Structures ───────── */
+
+typedef struct cache_entry_s {
+    char                    *key;           /* hash key */
+    size_t                   key_len;
+    struct mm_http_response *resp;          /* deep copy of response */
+    int64_t                  expire_epoch;  /* in seconds */
+    /* LRU bookkeeping */
+    struct cache_entry_s    *prev;
+    struct cache_entry_s    *next;
+    UT_hash_handle           hh;            /* makes this struct hashable */
+} cache_entry_t;
+
+typedef struct response_cache_s {
+    size_t          max_entries;
+    int             default_ttl;
+    size_t          size;                   /* # elements currently present */
+    cache_entry_t  *table;                  /* uthash hash table */
+    cache_entry_t  *lru_head;               /* most recently used */
+    cache_entry_t  *lru_tail;               /* least recently used */
+    pthread_mutex_t mtx;                    /* global lock */
+    /* metrics */
+    atomic_uint_fast64_t hits;
+    atomic_uint_fast64_t misses;
+    atomic_uint_fast64_t evictions;
+} response_cache_t;
+
+/* ───────── Static Globals ───────── */
+static response_cache_t g_cache = {
+    .max_entries   = DEFAULT_MAX_ENTRIES,
+    .default_ttl   = DEFAULT_TTL_SECONDS,
+    .table         = NULL,
+    .lru_head      = NULL,
+    .lru_tail      = NULL,
+    .mtx           = PTHREAD_MUTEX_INITIALIZER,
+    .hits          = 0,
+    .misses        = 0,
+    .evictions     = 0,
+};
+
+/* ───────── Utility ───────── */
+
+static inline int64_t
+now_epoch_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec;
+}
+
+/* Deep copy of HTTP response (headers + body). */
+static struct mm_http_response *
+resp_clone(const struct mm_http_response *src)
+{
+    if (!src) return NULL;
+
+    struct mm_http_response *dst = malloc(sizeof *dst);
+    if (!dst) return NULL;
+    memcpy(dst, src, sizeof *dst);
+
+    /* duplicate body */
+    if (src->body && src->body_len) {
+        dst->body = malloc(src->body_len);
+        if (!dst->body) {
+            free(dst);
+            return NULL;
+        }
+        memcpy(dst->body, src->body, src->body_len);
+    }
+
+    /* duplicate headers array of char * (NULL-terminated) */
+    if (src->headers) {
+        size_t i;
+        for (i = 0; src->headers[i]; ++i)
+            ;
+        dst->headers = calloc(i + 1, sizeof(char *));
+        if (!dst->headers) {
+            free(dst->body);
+            free(dst);
+            return NULL;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            dst->headers[j] = strdup(src->headers[j]);
+        }
+        dst->headers[i] = NULL;
+    }
+    return dst;
+}
+
+/* Free a cloned response. */
+static void
+resp_destroy(struct mm_http_response *r)
+{
+    if (!r) return;
+    if (r->body) free(r->body);
+    if (r->headers) {
+        for (size_t i = 0; r->headers[i]; ++i) {
+            free(r->headers[i]);
+        }
+        free(r->headers);
+    }
+    free(r);
+}
+
+/* Remove entry from LRU list. */
+static void
+lru_detach(response_cache_t *c, cache_entry_t *e)
+{
+    if (!e) return;
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+
+    if (c->lru_head == e) c->lru_head = e->next;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    e->prev = e->next = NULL;
+}
+
+/* Push entry to head (MRU). */
+static void
+lru_push_head(response_cache_t *c, cache_entry_t *e)
+{
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+/* Prune expired entries lazily (O(n) worst), but bounded because we stop
+ * after first n_expire deletions to avoid long pauses. */
+static void
+prune_expired_locked(response_cache_t *c, size_t n_expire)
+{
+    cache_entry_t *iter, *tmp;
+    size_t removed = 0;
+    int64_t now = now_epoch_sec();
+
+    HASH_ITER(hh, c->table, iter, tmp)
+    {
+        if (iter->expire_epoch <= now) {
+            /* Remove from hash and LRU */
+            HASH_DEL(c->table, iter);
+            lru_detach(c, iter);
+
+            resp_destroy(iter->resp);
+            free(iter->key);
+            free(iter);
+
+            c->size--;
+            atomic_fetch_add_explicit(&c->evictions, 1, memory_order_relaxed);
+            if (++removed >= n_expire) break;
+        }
+    }
+}
+
+/* Evict LRU until under capacity. */
+static void
+evict_if_needed_locked(response_cache_t *c)
+{
+    while (c->size > c->max_entries && c->lru_tail) {
+        cache_entry_t *victim = c->lru_tail;
+        HASH_DEL(c->table, victim);
+        lru_detach(c, victim);
+
+        resp_destroy(victim->resp);
+        free(victim->key);
+        free(victim);
+
+        c->size--;
+        atomic_fetch_add_explicit(&c->evictions, 1, memory_order_relaxed);
+    }
+}
+
+/* ───────── Public API Implementation ───────── */
+
+bool
+rc_initialize(size_t max_entries, int default_ttl_seconds)
+{
+    if (max_entries == 0) max_entries = DEFAULT_MAX_ENTRIES;
+    if (default_ttl_seconds <= 0) default_ttl_seconds = DEFAULT_TTL_SECONDS;
+
+    pthread_mutex_lock(&g_cache.mtx);
+    bool already_init = (g_cache.table != NULL || g_cache.size != 0);
+    if (already_init) {
+        pthread_mutex_unlock(&g_cache.mtx);
+        MM_LOGW(MODULE_NAME ": attempted double initialization; ignored");
+        return true;
+    }
+
+    g_cache.max_entries = max_entries;
+    g_cache.default_ttl = default_ttl_seconds;
+
+    /* The rest of the struct fields are already zero-initialized. */
+    pthread_mutex_unlock(&g_cache.mtx);
+
+    MM_LOGI(MODULE_NAME ": initialized (max=%zu, ttl=%ds)", max_entries,
+            default_ttl_seconds);
+    return true;
+}
+
+void
+rc_shutdown(void)
+{
+    pthread_mutex_lock(&g_cache.mtx);
+    cache_entry_t *iter, *tmp;
+    HASH_ITER(hh, g_cache.table, iter, tmp)
+    {
+        HASH_DEL(g_cache.table, iter);
+        resp_destroy(iter->resp);
+        free(iter->key);
+        free(iter);
+    }
+    g_cache.table    = NULL;
+    g_cache.size     = 0;
+    g_cache.lru_head = g_cache.lru_tail = NULL;
+    pthread_mutex_unlock(&g_cache.mtx);
+
+    MM_LOGI(MODULE_NAME ": shutdown complete");
+}
+
+bool
+rc_get(const char *key, struct mm_http_response **out_resp)
+{
+    if (!key || !out_resp) return false;
+
+    bool found = false;
+    *out_resp  = NULL;
+
+    pthread_mutex_lock(&g_cache.mtx);
+
+    prune_expired_locked(&g_cache, 4); /* opportunistic */
+
+    cache_entry_t *entry = NULL;
+    HASH_FIND(hh, g_cache.table, key, strlen(key), entry);
+    if (entry) {
+        if (entry->expire_epoch > now_epoch_sec()) {
+            /* Move to head */
+            lru_detach(&g_cache, entry);
+            lru_push_head(&g_cache, entry);
+
+            *out_resp = resp_clone(entry->resp);
+            if (*out_resp) found = true;
+        } else {
+            /* expired, treat as miss */
+            lru_detach(&g_cache, entry);
+            HASH_DEL(g_cache.table, entry);
+            resp_destroy(entry->resp);
+            free(entry->key);
+            free(entry);
+            g_cache.size--;
+            atomic_fetch_add_explicit(&g_cache.evictions, 1,
+                                      memory_order_relaxed);
+        }
+    }
+
+    atomic_fetch_add_explicit(found ? &g_cache.hits : &g_cache.misses, 1,
+                              memory_order_relaxed);
+
+    pthread_mutex_unlock(&g_cache.mtx);
+
+    return found;
+}
+
+bool
+rc_put(const char *key, const struct mm_http_response *resp, int ttl_seconds)
+{
+    if (!key || !resp) return false;
+    if (ttl_seconds <= 0) ttl_seconds = g_cache.default_ttl;
+
+    int64_t exp = now_epoch_sec() + ttl_seconds;
+
+    pthread_mutex_lock(&g_cache.mtx);
+
+    cache_entry_t *entry = NULL;
+    HASH_FIND(hh, g_cache.table, key, strlen(key), entry);
+    if (entry) {
+        /* Update existing entry in place. */
+        lru_detach(&g_cache, entry);
+        resp_destroy(entry->resp);
+    } else {
+        entry = calloc(1, sizeof *entry);
+        if (!entry) {
+            pthread_mutex_unlock(&g_cache.mtx);
+            MM_LOGE(MODULE_NAME ": OOM while adding key '%s'", key);
+            return false;
+        }
+        entry->key     = strdup(key);
+        entry->key_len = strlen(key);
+        HASH_ADD_KEYPTR(hh, g_cache.table, entry->key, entry->key_len, entry);
+        g_cache.size++;
+    }
+
+    entry->resp         = resp_clone(resp);
+    entry->expire_epoch = exp;
+    lru_push_head(&g_cache, entry);
+
+    evict_if_needed_locked(&g_cache);
+
+    pthread_mutex_unlock(&g_cache.mtx);
+    return true;
+}
+
+void
+rc_metrics_snapshot(struct rc_metrics *out)
+{
+    if (!out) return;
+    out->hits      = atomic_load_explicit(&g_cache.hits, memory_order_relaxed);
+    out->misses    = atomic_load_explicit(&g_cache.misses, memory_order_relaxed);
+    out->evictions = atomic_load_explicit(&g_cache.evictions,
+                                          memory_order_relaxed);
+    pthread_mutex_lock(&g_cache.mtx);
+    out->current_size = g_cache.size;
+    out->capacity     = g_cache.max_entries;
+    pthread_mutex_unlock(&g_cache.mtx);
+}
+
+const char *
+rc_version(void)
+{
+    return CACHE_VERSION;
+}
+
+/* ───────── Interface header shared ───────── */
+#ifdef RESPONSE_CACHE_IMPLEMENTATION
+/* This block can be empty if header is in separate file. */
+#endif
+```

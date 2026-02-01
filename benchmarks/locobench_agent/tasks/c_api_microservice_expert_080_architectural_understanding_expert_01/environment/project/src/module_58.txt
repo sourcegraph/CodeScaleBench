@@ -1,0 +1,360 @@
+/*
+ * src/module_58.c
+ *
+ * MercuryMonolith Commerce Hub – Response Cache (LRU, TTL aware)
+ *
+ * This module provides a thread–safe, in-memory LRU cache that stores fully
+ * rendered HTTP/GraphQL responses.  It is designed to be embedded in the
+ * gateway layer to accelerate highly repeatable, read-heavy workloads such as
+ * product catalog look-ups or report downloads.
+ *
+ * Key characteristics
+ *   • O(1) get/put/remove based on hash table (uthash) + doubly-linked LRU list
+ *   • Per-item TTL with lazy & explicit eviction
+ *   • Strict upper bound on number of cached objects (max_entries)
+ *   • Thread safety via single pthread_mutex (coarse grain for simplicity)
+ *   • Zero allocation on hot path when re-using existing entry buffers
+ *
+ * Copyright © 2024 MercuryMonolith.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <time.h>
+#include <errno.h>
+#include <pthread.h>
+
+#include "uthash.h"          /* single-header hash map – https://troydhanson.github.io/uthash/ */
+#include "mm_logging.h"      /* project-wide structured logger              */
+#include "mm_metrics.h"      /* Prometheus-style counter & histogram macros */
+#include "mm_memory.h"       /* wrappers around malloc/free w/ OOM hooks    */
+#include "mm_response_cache.h" /* public header for this implementation     */
+
+/*---------------------------------------------------------------------*/
+/*                         internal data types                         */
+/*---------------------------------------------------------------------*/
+
+typedef struct cache_entry
+{
+    char                *key;          /* UTF-8 request signature */
+    uint8_t             *payload;      /* wire format output       */
+    size_t               payload_len;  /* …and its length          */
+    char                *content_type; /* e.g. "application/json"  */
+
+    uint64_t             ttl_ms;       /* time-to-live in ms       */
+    struct timespec      born;         /* entry creation time      */
+
+    /* LRU bookkeeping */
+    struct cache_entry  *prev;
+    struct cache_entry  *next;
+
+    UT_hash_handle       hh;           /* uthash handle            */
+} cache_entry_t;
+
+
+struct mm_response_cache
+{
+    size_t               max_entries;
+    size_t               size;
+
+    cache_entry_t       *table;        /* hash table root          */
+    cache_entry_t       *lru_head;     /* most recently used       */
+    cache_entry_t       *lru_tail;     /* least recently used      */
+
+    pthread_mutex_t      lock;         /* coarse-grained mutex     */
+};
+
+/*---------------------------------------------------------------------*/
+/*                        forward declarations                         */
+/*---------------------------------------------------------------------*/
+static inline uint64_t millis_now(void);
+static void            detach_entry(mm_response_cache_t *c, cache_entry_t *e);
+static void            attach_front(mm_response_cache_t *c, cache_entry_t *e);
+static void            evict_tail(mm_response_cache_t *c);
+static void            free_entry(cache_entry_t *e);
+
+/*---------------------------------------------------------------------*/
+/*                    public API implementation                        */
+/*---------------------------------------------------------------------*/
+
+mm_response_cache_t *
+mm_response_cache_create(size_t max_entries)
+{
+    mm_response_cache_t *c = mm_calloc(1, sizeof(*c));
+    if (!c) { return NULL; }
+
+    c->max_entries = max_entries;
+    pthread_mutex_init(&c->lock, NULL);
+
+    MM_METRIC_COUNTER_INC(cache_instance_created_total);
+    return c;
+}
+
+void
+mm_response_cache_destroy(mm_response_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_mutex_lock(&c->lock);
+
+    cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, c->table, cur, tmp)
+    {
+        HASH_DEL(c->table, cur);
+        free_entry(cur);
+    }
+
+    pthread_mutex_unlock(&c->lock);
+    pthread_mutex_destroy(&c->lock);
+    mm_free(c);
+    MM_METRIC_COUNTER_INC(cache_instance_destroyed_total);
+}
+
+bool
+mm_response_cache_get(mm_response_cache_t *c,
+                      const char          *key,
+                      uint8_t            **out_payload,
+                      size_t              *out_len,
+                      const char         **out_content_type)
+{
+    bool hit = false;
+
+    pthread_mutex_lock(&c->lock);
+
+    cache_entry_t *e;
+    HASH_FIND_STR(c->table, key, e);
+    if (e)
+    {
+        /* Check TTL */
+        const uint64_t born_ms = (e->born.tv_sec * 1000ULL) + (e->born.tv_nsec / 1000000ULL);
+        const uint64_t now_ms  = millis_now();
+        if (e->ttl_ms && (now_ms - born_ms >= e->ttl_ms))
+        {
+            /* Expired – remove */
+            detach_entry(c, e);
+            HASH_DEL(c->table, e);
+            free_entry(e);
+            MM_LOG_DEBUG("cache: evicted expired entry '%s'", key);
+            MM_METRIC_COUNTER_INC(cache_entry_expired_total);
+        }
+        else
+        {
+            /* Cache hit */
+            detach_entry(c, e);
+            attach_front(c, e);
+            *out_payload      = e->payload;
+            *out_len          = e->payload_len;
+            *out_content_type = e->content_type;
+            hit = true;
+            MM_METRIC_COUNTER_INC(cache_hit_total);
+        }
+    }
+
+    if (!hit)
+        MM_METRIC_COUNTER_INC(cache_miss_total);
+
+    pthread_mutex_unlock(&c->lock);
+    return hit;
+}
+
+int
+mm_response_cache_put(mm_response_cache_t *c,
+                      const char          *key,
+                      const uint8_t       *payload,
+                      size_t               payload_len,
+                      const char          *content_type,
+                      uint64_t             ttl_ms)
+{
+    int rc = 0;
+
+    pthread_mutex_lock(&c->lock);
+
+    /* Replace existing entry if present */
+    cache_entry_t *e;
+    HASH_FIND_STR(c->table, key, e);
+    if (e)
+    {
+        /* Update payload */
+        mm_free(e->payload);
+        e->payload = mm_malloc(payload_len);
+        memcpy(e->payload, payload, payload_len);
+        e->payload_len = payload_len;
+
+        mm_free(e->content_type);
+        e->content_type = mm_strdup(content_type);
+
+        clock_gettime(CLOCK_REALTIME, &e->born);
+        e->ttl_ms = ttl_ms;
+
+        detach_entry(c, e);
+        attach_front(c, e);
+
+        MM_METRIC_COUNTER_INC(cache_entry_updated_total);
+    }
+    else
+    {
+        /* Insert new entry */
+        e = mm_calloc(1, sizeof(*e));
+        if (!e)
+        {
+            rc = ENOMEM;
+            goto done;
+        }
+
+        e->key          = mm_strdup(key);
+        e->payload      = mm_malloc(payload_len);
+        memcpy(e->payload, payload, payload_len);
+        e->payload_len  = payload_len;
+        e->content_type = mm_strdup(content_type);
+        e->ttl_ms       = ttl_ms;
+        clock_gettime(CLOCK_REALTIME, &e->born);
+
+        HASH_ADD_KEYPTR(hh, c->table, e->key, strlen(e->key), e);
+        attach_front(c, e);
+        c->size++;
+
+        MM_METRIC_COUNTER_INC(cache_entry_created_total);
+
+        /* Evict if we exceed size */
+        if (c->size > c->max_entries)
+            evict_tail(c);
+    }
+
+done:
+    pthread_mutex_unlock(&c->lock);
+    return rc;
+}
+
+size_t
+mm_response_cache_prune(mm_response_cache_t *c)
+{
+    size_t removed = 0;
+    const uint64_t now_ms = millis_now();
+
+    pthread_mutex_lock(&c->lock);
+
+    cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, c->table, cur, tmp)
+    {
+        if (cur->ttl_ms == 0)
+            continue;
+
+        const uint64_t born_ms = (cur->born.tv_sec * 1000ULL) + (cur->born.tv_nsec / 1000000ULL);
+        if (now_ms - born_ms >= cur->ttl_ms)
+        {
+            detach_entry(c, cur);
+            HASH_DEL(c->table, cur);
+            free_entry(cur);
+            removed++;
+            c->size--;
+        }
+    }
+
+    pthread_mutex_unlock(&c->lock);
+
+    if (removed)
+        MM_LOG_INFO("cache: pruned %zu expired entries", removed);
+
+    return removed;
+}
+
+/*---------------------------------------------------------------------*/
+/*                      internal utility routines                      */
+/*---------------------------------------------------------------------*/
+
+static inline uint64_t millis_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (ts.tv_sec * 1000ULL) + (ts.tv_nsec / 1000000ULL);
+}
+
+static void detach_entry(mm_response_cache_t *c, cache_entry_t *e)
+{
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_head == e) c->lru_head = e->next;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+    e->prev = e->next = NULL;
+}
+
+static void attach_front(mm_response_cache_t *c, cache_entry_t *e)
+{
+    e->next = c->lru_head;
+    if (c->lru_head)
+        c->lru_head->prev = e;
+    e->prev = NULL;
+    c->lru_head = e;
+    if (!c->lru_tail)
+        c->lru_tail = e;
+}
+
+static void evict_tail(mm_response_cache_t *c)
+{
+    if (!c->lru_tail)
+        return;
+
+    cache_entry_t *victim = c->lru_tail;
+    detach_entry(c, victim);
+    HASH_DEL(c->table, victim);
+    free_entry(victim);
+    c->size--;
+
+    MM_METRIC_COUNTER_INC(cache_entry_evicted_total);
+    MM_LOG_DEBUG("cache: LRU eviction triggered");
+}
+
+static void free_entry(cache_entry_t *e)
+{
+    if (!e) return;
+    mm_free(e->key);
+    mm_free(e->payload);
+    mm_free(e->content_type);
+    mm_free(e);
+}
+
+/*---------------------------------------------------------------------*/
+/*                        unit test (optional)                         */
+/*---------------------------------------------------------------------*/
+#ifdef MM_CACHE_TEST
+
+#include <assert.h>
+
+static void basic_test(void)
+{
+    mm_response_cache_t *c = mm_response_cache_create(2);
+
+    const char *key1 = "/v1/products?sku=123";
+    const char *key2 = "/v1/products?sku=456";
+    const char *key3 = "/v1/products?sku=789";
+
+    uint8_t payload1[] = {1,2,3};
+    uint8_t payload2[] = {4,5,6};
+    uint8_t payload3[] = {7,8,9};
+
+    assert(mm_response_cache_put(c, key1, payload1, sizeof(payload1), "application/octet-stream", 0) == 0);
+    assert(mm_response_cache_put(c, key2, payload2, sizeof(payload2), "application/octet-stream", 0) == 0);
+
+    uint8_t *out;
+    size_t len;
+    const char *ctype;
+    assert(mm_response_cache_get(c, key1, &out, &len, &ctype) == true);
+
+    /* Insert third entry -> should evict key2 (LRU) */
+    assert(mm_response_cache_put(c, key3, payload3, sizeof(payload3), "application/octet-stream", 0) == 0);
+
+    assert(mm_response_cache_get(c, key2, &out, &len, &ctype) == false);
+    assert(mm_response_cache_get(c, key3, &out, &len, &ctype) == true);
+
+    mm_response_cache_destroy(c);
+}
+
+int main(void)
+{
+    basic_test();
+    puts("mm_response_cache tests passed.");
+    return 0;
+}
+#endif /* MM_CACHE_TEST */

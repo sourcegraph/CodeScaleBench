@@ -1,0 +1,296 @@
+```csharp
+// -------------------------------------------------------------------------------------------------
+// File: src/module_14.txt   (compiled as .cs within the project build)
+// Project: PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//
+// Description:
+//     Implements the “Focus-Time KPI” transformation strategy.  The class plugs into the Strategy
+//     Registry used by the ETL pipeline’s Transformation Lambda.  Given a set of heterogeneous
+//     activity events (calendar, IDE telemetry, meeting recordings, etc), the strategy aggregates
+//     “deep-work” intervals and computes the Focus-Time Ratio per user.
+//
+//     The ratio is defined as:  Σ(FocusMinutes) / Σ(WorkdayMinutes)
+//
+//     Designed for parallel invocation inside AWS Lambda where each shard handles a
+//     (userId, date) tuple.
+//
+// -------------------------------------------------------------------------------------------------
+using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.Lambda.Core;
+using PulseOps.Warehouse.Shared;
+using Serilog;
+
+[assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
+
+namespace PulseOps.Warehouse.Transformations;
+
+/// <summary>
+/// Enumeration of supported raw event sources.
+/// NOTE: Additional event sources can be added without changing the strategy logic.
+/// </summary>
+public enum EventSource
+{
+    Unknown            = 0,
+    Calendar           = 1,
+    IdeActivity        = 2,
+    MeetingRecording   = 3,
+    CollaborationTool  = 4
+}
+
+/// <summary>
+/// Lightweight DTO representing a single fact streamed into the data-lake.
+/// The canonical version lives in ‘Shared/EventContracts.cs’, but a private
+/// slimmed-down replica is kept here to avoid circular references in the sample.
+/// </summary>
+public sealed record EventRecord(
+    string            EventId,
+    string            UserId,
+    EventSource       Source,
+    DateTimeOffset    StartUtc,
+    DateTimeOffset    EndUtc,
+    JsonElement       Metadata);
+
+/// <summary>
+/// Immutable result emitted by a KPI strategy.
+/// </summary>
+public sealed record KpiResult(
+    string              KpiName,
+    string              UserId,
+    DateOnly            WorkDate,
+    decimal             FocusMinutes,
+    decimal             WorkdayMinutes,
+    decimal             FocusRatio,
+    DateTimeOffset      CalculatedAtUtc);
+
+/// <summary>
+/// Base contract every KPI strategy must implement.
+/// Registered via DI into the transformation microservice.
+/// </summary>
+public interface IKpiStrategy
+{
+    string KpiName { get; }
+
+    /// <summary>
+    /// Executes the transformation.
+    /// </summary>
+    Task<IReadOnlyCollection<KpiResult>> ExecuteAsync(
+        ImmutableArray<EventRecord> events,
+        CancellationToken           cancellationToken = default);
+}
+
+/// <summary>
+/// Strategy that calculates the Focus-Time KPI.
+/// </summary>
+public sealed class FocusTimeKpiStrategy : IKpiStrategy
+{
+    // --------------------------------------------------------------------------------------------
+    // Constants & Fields
+    // --------------------------------------------------------------------------------------------
+    private const string FocusEventFlag = "isFocusTime";
+    private readonly ILogger _logger;
+
+    // --------------------------------------------------------------------------------------------
+    // Construction
+    // --------------------------------------------------------------------------------------------
+    public FocusTimeKpiStrategy(ILogger logger)
+    {
+        _logger = logger.ForContext<FocusTimeKpiStrategy>()
+                        ?? throw new ArgumentNullException(nameof(logger));
+    }
+
+    public string KpiName => "focus_time_ratio";
+
+    // --------------------------------------------------------------------------------------------
+    // Execution
+    // --------------------------------------------------------------------------------------------
+    public async Task<IReadOnlyCollection<KpiResult>> ExecuteAsync(
+        ImmutableArray<EventRecord> events,
+        CancellationToken           cancellationToken = default)
+    {
+        if (events.IsDefaultOrEmpty)
+        {
+            _logger.Warning("FocusTimeKpiStrategy received empty event collection.");
+            return Array.Empty<KpiResult>();
+        }
+
+        // Group by user & date to support batch processing by the upstream orchestrator.
+        var grouped = events.GroupBy(e => (e.UserId, DateOnly.FromDateTime(e.StartUtc.UtcDateTime)));
+
+        var resultChannel = ChannelFactory<KpiResult>.Create(events.Length);
+
+        // Parallelize aggregation per user/date bucket.
+        var tasks = grouped.Select(group =>
+            Task.Run(() => AggregateBucketAsync(group.Key, group, resultChannel.Writer, cancellationToken),
+                     cancellationToken)).ToArray();
+
+        // Pump results to in-memory collection.
+        var materializeTask = Task.Run(async () =>
+        {
+            var list = new List<KpiResult>(events.Length);
+            await foreach (var kpi in resultChannel.Reader.ReadAllAsync(cancellationToken))
+            {
+                list.Add(kpi);
+            }
+            return list.AsReadOnly();
+        }, cancellationToken);
+
+        await Task.WhenAll(tasks);
+        resultChannel.Writer.TryComplete();
+
+        return await materializeTask;
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Helpers
+    // --------------------------------------------------------------------------------------------
+    private async Task AggregateBucketAsync(
+        (string UserId, DateOnly WorkDate)            key,
+        IEnumerable<EventRecord>                      bucket,
+        ChannelWriter<KpiResult>                      writer,
+        CancellationToken                             ct)
+    {
+        var (userId, workDate) = key;
+
+        try
+        {
+            // 1. Filter overlapping intervals and collapse contiguous “focus” intervals.
+            var intervals = bucket.Select(ToInterval)
+                                  .Where(i => i.DurationMinutes > 0) // Safeguard against corrupted rows.
+                                  .OrderBy(i => i.StartUtc)
+                                  .ToList();
+
+            if (intervals.Count == 0)
+            {
+                _logger.Debug("No valid intervals found for user {UserId} on {Date}.", userId, workDate);
+                return;
+            }
+
+            // 2. Build workday & focus sets using interval-tree like sweep.
+            decimal workdayMinutes = 0;
+            decimal focusMinutes   = 0;
+
+            DateTimeOffset? currentStart = null;
+            DateTimeOffset? currentEnd   = null;
+            bool            inFocus      = false;
+
+            foreach (var @event in intervals)
+            {
+                if (currentStart == null)
+                {
+                    currentStart = @event.StartUtc;
+                    currentEnd   = @event.EndUtc;
+                    inFocus      = @event.IsFocus;
+                    continue;
+                }
+
+                // Overlap with existing range?
+                if (@event.StartUtc <= currentEnd)
+                {
+                    // Extend range
+                    currentEnd = Max(currentEnd.Value, @event.EndUtc);
+                    inFocus    = inFocus || @event.IsFocus;
+                }
+                else
+                {
+                    // Flush previous segment
+                    var minutes = (decimal)(currentEnd.Value - currentStart.Value).TotalMinutes;
+                    workdayMinutes += minutes;
+                    if (inFocus) focusMinutes += minutes;
+
+                    // Start new segment
+                    currentStart = @event.StartUtc;
+                    currentEnd   = @event.EndUtc;
+                    inFocus      = @event.IsFocus;
+                }
+            }
+
+            // Flush last segment
+            if (currentStart.HasValue)
+            {
+                var minutes = (decimal)(currentEnd!.Value - currentStart.Value).TotalMinutes;
+                workdayMinutes += minutes;
+                if (inFocus) focusMinutes += minutes;
+            }
+
+            // Defensive guard
+            if (workdayMinutes <= 0)
+            {
+                _logger.Warning("Zero workday minutes for {UserId} on {Date}. Skipping KPI.", userId, workDate);
+                return;
+            }
+
+            var ratio = Decimal.Round(focusMinutes / workdayMinutes, 4, MidpointRounding.AwayFromZero);
+
+            var result = new KpiResult(
+                KpiName,
+                userId,
+                workDate,
+                focusMinutes,
+                workdayMinutes,
+                ratio,
+                DateTimeOffset.UtcNow);
+
+            await writer.WriteAsync(result, ct);
+            _logger.Information("FocusTime KPI calculated for {UserId} on {Date}: {Ratio:P2}",
+                                userId, workDate, ratio);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(ex, "Failed to aggregate FocusTime KPI for {UserId} on {Date}.", userId, workDate);
+            throw; // Let upstream DLQ capture the failure.
+        }
+    }
+
+    private static Interval ToInterval(EventRecord record)
+    {
+        bool isFocus = record.Metadata.TryGetProperty(FocusEventFlag, out var jsonValue)
+                       && jsonValue.GetBoolean();
+
+        return new Interval(record.StartUtc, record.EndUtc, isFocus);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static DateTimeOffset Max(DateTimeOffset a, DateTimeOffset b) => a > b ? a : b;
+
+    // --------------------------------------------------------------------------------------------
+    // Local Helper Types
+    // --------------------------------------------------------------------------------------------
+    /// <summary>
+    /// Compact representation of a time interval.
+    /// </summary>
+    private readonly record struct Interval(DateTimeOffset StartUtc, DateTimeOffset EndUtc, bool IsFocus)
+    {
+        public decimal DurationMinutes => (decimal)(EndUtc - StartUtc).TotalMinutes;
+    }
+
+    /// <summary>
+    /// Simple bounded in-memory channel factory to facilitate producer/consumer patterns
+    /// when running inside the single-threaded Lambda runtime.
+    /// </summary>
+    private static class ChannelFactory<T>
+    {
+        public static Channel<T> Create(int estimatedCapacity)
+        {
+            // Ensure we don’t block the Lambda thread in case of skewed producer/consumer rates.
+            var capacity = Math.Clamp(estimatedCapacity, 64, 10_000);
+
+            return Channel.CreateBounded<T>(new BoundedChannelOptions(capacity)
+            {
+                AllowSynchronousContinuations = false,
+                SingleReader                  = false,
+                SingleWriter                  = false,
+                FullMode                      = BoundedChannelFullMode.Wait
+            });
+        }
+    }
+}
+```

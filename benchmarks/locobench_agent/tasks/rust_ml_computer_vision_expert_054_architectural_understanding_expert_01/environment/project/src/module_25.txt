@@ -1,0 +1,433 @@
+```rust
+//! src/module_25.rs
+//!
+//! Experiment-tracking and hyper-parameter tuning utilities used by
+//! VisuTility Orchestrator’s Model-Ops layer.
+//!
+//! The module demonstrates a concrete implementation of several of the
+//! architectural patterns mentioned in the project documentation:
+//!   • Strategy Pattern: `HyperParamTuner` selects among tuning strategies
+//!     (`GridSearchTuner`, `RandomSearchTuner`, …).
+//!   • Observer Pattern: `TuningSubject` notifies `TuningObserver`s about new
+//!     trial results so that other subsystems (alerting, dashboards, etc.)
+//!     can react in real-time.
+//!   • Factory Pattern: `TrackerFactory` picks the correct
+//!     `ExperimentTracker` backend.
+//!
+//! All public types are designed to remain stable across minor releases so
+//! that external micro-services can rely on them via semantic versioning.
+
+use async_trait::async_trait;
+use rand::{seq::SliceRandom, Rng};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::{
+    collections::HashMap,
+    fs::{File, OpenOptions},
+    io::{BufWriter, Write},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
+use thiserror::Error;
+use tokio::sync::broadcast;
+
+/// Domain-level error type.
+#[derive(Debug, Error)]
+pub enum OrchestratorError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
+
+    #[error("Serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("Broadcast channel error: {0}")]
+    BroadcastRecv(#[from] broadcast::error::RecvError),
+
+    #[error("Unknown error: {0}")]
+    Other(String),
+}
+
+/// Represents a concrete hyper-parameter value.
+///
+/// We purposefully remain JSON-compatible so that values can be directly
+/// serialized for experiment tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HyperParamValue {
+    Int(i64),
+    Float(f64),
+    Text(String),
+    Bool(bool),
+}
+
+/// Full specification of a single trial.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Trial {
+    pub id: u64,
+    pub params: HashMap<String, HyperParamValue>,
+    pub metrics: HashMap<String, f64>,
+}
+
+/// Trait describing the capabilities of an experiment-tracker backend.
+///
+/// Implementations must be easy to swap at runtime.
+///
+/// NOTE: This trait is async because some backends perform network IO.
+#[async_trait]
+pub trait ExperimentTracker: Send + Sync {
+    async fn log_trial(&self, trial: &Trial) -> Result<(), OrchestratorError>;
+}
+
+/// Simple JSON-Lines file tracker.
+///
+/// Each trial is appended as a single JSON object on its own line.
+pub struct FileTracker {
+    /// Lazily-opened file handle wrapped in a Mutex for thread-safety.
+    file: Arc<Mutex<BufWriter<File>>>,
+}
+
+impl FileTracker {
+    pub fn new<P: Into<PathBuf>>(path: P) -> Result<Self, OrchestratorError> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.into())?;
+        Ok(Self {
+            file: Arc::new(Mutex::new(BufWriter::new(file))),
+        })
+    }
+}
+
+#[async_trait]
+impl ExperimentTracker for FileTracker {
+    async fn log_trial(&self, trial: &Trial) -> Result<(), OrchestratorError> {
+        let mut writer = self.file.lock().unwrap();
+        serde_json::to_writer(&mut *writer, trial)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        Ok(())
+    }
+}
+
+/// HTTP tracker that POSTs a JSON payload to a remote endpoint.
+pub struct HttpTracker {
+    endpoint: String,
+    client: Client,
+}
+
+impl HttpTracker {
+    pub fn new<S: Into<String>>(endpoint: S) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            client: Client::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl ExperimentTracker for HttpTracker {
+    async fn log_trial(&self, trial: &Trial) -> Result<(), OrchestratorError> {
+        self.client
+            .post(&self.endpoint)
+            .json(trial)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+}
+
+/// Factory pattern: pick an `ExperimentTracker` based on a declarative config.
+pub enum TrackerFactory {}
+
+impl TrackerFactory {
+    pub fn build(config: &TrackerConfig) -> Result<Arc<dyn ExperimentTracker>, OrchestratorError> {
+        match config {
+            TrackerConfig::File { path } => Ok(Arc::new(FileTracker::new(path)?)),
+            TrackerConfig::Http { endpoint } => Ok(Arc::new(HttpTracker::new(endpoint))),
+        }
+    }
+}
+
+/// Minimal config enum that can be deserialized from JSON/YAML/TOML.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TrackerConfig {
+    File { path: PathBuf },
+    Http { endpoint: String },
+}
+
+/// Observer pattern: observers react to new trial events.
+#[async_trait]
+pub trait TuningObserver: Send + Sync {
+    async fn on_new_trial(&self, trial: &Trial) -> Result<(), OrchestratorError>;
+}
+
+/// The subject that notifies all registered observers.
+pub struct TuningSubject {
+    tx: broadcast::Sender<Trial>,
+}
+
+impl TuningSubject {
+    pub fn new(buffer: usize) -> Self {
+        let (tx, _) = broadcast::channel(buffer);
+        Self { tx }
+    }
+
+    pub fn observer_stream(&self) -> broadcast::Receiver<Trial> {
+        self.tx.subscribe()
+    }
+
+    pub fn notify(&self, trial: Trial) -> Result<(), OrchestratorError> {
+        // If there are no observers, we ignore the error.
+        let _ = self.tx.send(trial);
+        Ok(())
+    }
+}
+
+/// Any hyper-parameter tuner must implement this trait.
+/// Strategies (grid search, random search, Bayesian, …) can be hot-swapped.
+#[async_trait]
+pub trait HyperParamTuner {
+    async fn run(
+        &mut self,
+        tracker: Arc<dyn ExperimentTracker>,
+        subject: Arc<TuningSubject>,
+    ) -> Result<(), OrchestratorError>;
+}
+
+/// Deterministic grid-search tuner.
+pub struct GridSearchTuner {
+    /// Each parameter maps to a list of possible discrete values.
+    /// Example: {"lr": [0.1, 0.01], "batch": [16, 32]}
+    param_grid: HashMap<String, Vec<HyperParamValue>>,
+    max_trials: Option<usize>,
+    current_trial_id: u64,
+}
+
+impl GridSearchTuner {
+    pub fn new(
+        param_grid: HashMap<String, Vec<HyperParamValue>>,
+        max_trials: Option<usize>,
+    ) -> Self {
+        Self {
+            param_grid,
+            max_trials,
+            current_trial_id: 0,
+        }
+    }
+
+    /// Helper that expands the grid into the Cartesian product.
+    fn expand_grid(
+        &self,
+    ) -> Vec<HashMap<String, HyperParamValue>> {
+        fn helper(
+            keys: &[String],
+            idx: usize,
+            grid: &HashMap<String, Vec<HyperParamValue>>,
+            acc: &mut HashMap<String, HyperParamValue>,
+            out: &mut Vec<HashMap<String, HyperParamValue>>,
+        ) {
+            if idx == keys.len() {
+                out.push(acc.clone());
+                return;
+            }
+            let key = &keys[idx];
+            if let Some(values) = grid.get(key) {
+                for val in values {
+                    acc.insert(key.clone(), val.clone());
+                    helper(keys, idx + 1, grid, acc, out);
+                    acc.remove(key);
+                }
+            }
+        }
+
+        let keys: Vec<String> = self.param_grid.keys().cloned().collect();
+        let mut out = Vec::new();
+        helper(&keys, 0, &self.param_grid, &mut HashMap::new(), &mut out);
+        out
+    }
+
+    /// Fake metric evaluator. In reality, this would invoke a real training
+    /// job and return its validation score. For demo purposes we sample a
+    /// random metric to keep the code fully functional without dependencies
+    /// on heavy ML frameworks.
+    async fn evaluate(
+        &mut self,
+        params: &HashMap<String, HyperParamValue>,
+    ) -> Result<HashMap<String, f64>, OrchestratorError> {
+        let mut rng = rand::thread_rng();
+        // Pretend lower is better for "loss".
+        Ok(HashMap::from([("loss".to_string(), rng.gen::<f64>())]))
+    }
+}
+
+#[async_trait]
+impl HyperParamTuner for GridSearchTuner {
+    async fn run(
+        &mut self,
+        tracker: Arc<dyn ExperimentTracker>,
+        subject: Arc<TuningSubject>,
+    ) -> Result<(), OrchestratorError> {
+        let combos = self.expand_grid();
+        let limit = self.max_trials.unwrap_or(combos.len());
+        for params in combos.into_iter().take(limit) {
+            let metrics = self.evaluate(&params).await?;
+            let trial = Trial {
+                id: self.current_trial_id,
+                params,
+                metrics,
+            };
+            self.current_trial_id += 1;
+
+            tracker.log_trial(&trial).await?;
+            subject.notify(trial)?;
+        }
+        Ok(())
+    }
+}
+
+/// Non-deterministic random-search tuner.
+pub struct RandomSearchTuner {
+    param_space: HashMap<String, Vec<HyperParamValue>>,
+    num_trials: usize,
+    current_trial_id: u64,
+}
+
+impl RandomSearchTuner {
+    pub fn new(param_space: HashMap<String, Vec<HyperParamValue>>, num_trials: usize) -> Self {
+        Self {
+            param_space,
+            num_trials,
+            current_trial_id: 0,
+        }
+    }
+
+    fn sample_params(&self) -> HashMap<String, HyperParamValue> {
+        let mut rng = rand::thread_rng();
+        self.param_space
+            .iter()
+            .map(|(k, v)| {
+                let choice = v.choose(&mut rng).unwrap().clone();
+                (k.clone(), choice)
+            })
+            .collect()
+    }
+
+    async fn evaluate(
+        &mut self,
+        params: &HashMap<String, HyperParamValue>,
+    ) -> Result<HashMap<String, f64>, OrchestratorError> {
+        let mut rng = rand::thread_rng();
+        Ok(HashMap::from([("accuracy".to_string(), rng.gen::<f64>())]))
+    }
+}
+
+#[async_trait]
+impl HyperParamTuner for RandomSearchTuner {
+    async fn run(
+        &mut self,
+        tracker: Arc<dyn ExperimentTracker>,
+        subject: Arc<TuningSubject>,
+    ) -> Result<(), OrchestratorError> {
+        for _ in 0..self.num_trials {
+            let params = self.sample_params();
+            let metrics = self.evaluate(&params).await?;
+            let trial = Trial {
+                id: self.current_trial_id,
+                params,
+                metrics,
+            };
+            self.current_trial_id += 1;
+
+            tracker.log_trial(&trial).await?;
+            subject.notify(trial)?;
+        }
+        Ok(())
+    }
+}
+
+/// Example observer that prints new trials to stdout.
+/// In production this could push to Prometheus, GUI dashboards, etc.
+pub struct StdoutObserver;
+
+#[async_trait]
+impl TuningObserver for StdoutObserver {
+    async fn on_new_trial(&self, trial: &Trial) -> Result<(), OrchestratorError> {
+        println!(
+            "🧪 New trial #{} | params={} | metrics={}",
+            trial.id,
+            json!(trial.params),
+            json!(trial.metrics)
+        );
+        Ok(())
+    }
+}
+
+/// Spawns an asynchronous task that subscribes to a `TuningSubject` and feeds
+/// events into a `TuningObserver`.
+pub fn spawn_observer_task<O: 'static + TuningObserver>(
+    subject: Arc<TuningSubject>,
+    observer: Arc<O>,
+) {
+    tokio::spawn(async move {
+        let mut rx = subject.observer_stream();
+        loop {
+            match rx.recv().await {
+                Ok(trial) => {
+                    if let Err(e) = observer.on_new_trial(&trial).await {
+                        eprintln!("Observer error: {e}");
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    });
+}
+
+/// Entrypoint used by integration tests or CLIs.
+///
+/// NOT called automatically by library consumers.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env::temp_dir;
+
+    #[tokio::test]
+    async fn smoke_grid_search() -> Result<(), OrchestratorError> {
+        // Build tracker.
+        let file_path = temp_dir().join("grid_search_trials.jsonl");
+        let tracker_cfg = TrackerConfig::File { path: file_path };
+        let tracker = TrackerFactory::build(&tracker_cfg)?;
+
+        // Subject & observer wiring.
+        let subject = Arc::new(TuningSubject::new(16));
+        let observer = Arc::new(StdoutObserver);
+        spawn_observer_task(subject.clone(), observer);
+
+        // Define grid.
+        let grid = HashMap::from([
+            (
+                "lr".to_string(),
+                vec![
+                    HyperParamValue::Float(0.1),
+                    HyperParamValue::Float(0.01),
+                ],
+            ),
+            (
+                "batch_size".to_string(),
+                vec![HyperParamValue::Int(16), HyperParamValue::Int(32)],
+            ),
+        ]);
+
+        let mut tuner = GridSearchTuner::new(grid, None);
+        tuner.run(tracker, subject).await?;
+        Ok(())
+    }
+}
+```

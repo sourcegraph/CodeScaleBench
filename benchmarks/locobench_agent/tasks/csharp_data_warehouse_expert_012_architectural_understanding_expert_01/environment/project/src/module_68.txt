@@ -1,0 +1,440 @@
+```csharp
+// File: src/module_68.txt
+// Language: C#
+// Description:
+//   Lambda entry-point that transforms raw telemetry events into higher-level
+//   productivity insights.  Demonstrates Strategy, Observer, and Pipeline
+//   patterns while integrating with AWS managed services for downstream fan-out.
+//
+//   This module is intentionally self-contained so that it can be dropped into
+//   a unit-test project without additional scaffolding.  In the real
+//   code-base, these types live in discrete files/namespaces.
+//
+// Note: Namespace prefixes shortened for brevity.
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.EventBridge;
+using Amazon.EventBridge.Model;
+using Amazon.Lambda.Core;
+using Amazon.Lambda.KinesisEvents;
+using Amazon.Runtime;
+using Amazon.SQS;
+using Amazon.SQS.Model;
+using Microsoft.Extensions.Logging;
+using Polly;
+using Polly.Retry;
+
+// ReSharper disable MemberCanBePrivate.Global — File is flattened for demo purposes.
+[assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
+
+namespace PulseOps.Warehouse.Lambda.Transform
+{
+    #region Lambda Entry-Point --------------------------------------------------
+
+    /// <summary>
+    /// Serverless transformation Lambda — invoked by a Kinesis Stream containing raw
+    /// telemetry events.  Delegates business logic to pluggable <see cref="ITransformationStrategy"/>s
+    /// discovered at runtime via <see cref="TransformationStrategyFactory"/>.
+    /// </summary>
+    public sealed class TransformationLambda
+    {
+        private readonly ITransformationStrategyFactory _strategyFactory;
+        private readonly ITelemetryDispatcher            _dispatcher;
+        private readonly ILogger<TransformationLambda>   _logger;
+        private readonly AsyncRetryPolicy                _retryPolicy;
+
+        public TransformationLambda()
+            : this(new TransformationStrategyFactory(),
+                   new EventBridgeDispatcher(),
+                   LambdaLoggerWrapper.Create<TransformationLambda>())
+        { }
+
+        // DI-friendly constructor (used in unit tests)
+        public TransformationLambda(ITransformationStrategyFactory strategyFactory,
+                                    ITelemetryDispatcher dispatcher,
+                                    ILogger<TransformationLambda> logger)
+        {
+            _strategyFactory = strategyFactory ?? throw new ArgumentNullException(nameof(strategyFactory));
+            _dispatcher      = dispatcher      ?? throw new ArgumentNullException(nameof(dispatcher));
+            _logger          = logger          ?? throw new ArgumentNullException(nameof(logger));
+
+            // Standard exponential back-off for transient AWS failures.
+            _retryPolicy = Policy
+                .Handle<Exception>(ex => ex is AmazonServiceException or TaskCanceledException)
+                .WaitAndRetryAsync(
+                    retryCount: 3,
+                    sleepDurationProvider: attempt => TimeSpan.FromMilliseconds(200 * Math.Pow(2, attempt)),
+                    onRetry: (ex, span, attempt, _) =>
+                        _logger.LogWarning(ex,
+                            "Transient failure when dispatching insight (attempt {Attempt}). Retrying in {Delay}…",
+                            attempt, span));
+        }
+
+        #region Handler ---------------------------------------------------------
+
+        /// <summary>
+        /// Lambda function handler.
+        /// </summary>
+        /// <param name="kinesisEvent">Batch of Kinesis records.</param>
+        /// <param name="context">Lambda context.</param>
+        public async Task HandlerAsync(KinesisEvent kinesisEvent, ILambdaContext context)
+        {
+            _logger.LogInformation("Processing batch with {RecordCount} record(s)…", kinesisEvent?.Records?.Count);
+
+            var dispatchTasks = new List<Task>();
+
+            foreach (var rec in kinesisEvent.Records)
+            {
+                if (TryParseEvent(rec, out var telemetryEvent))
+                {
+                    var strategy = _strategyFactory.GetStrategy(telemetryEvent.EventType);
+                    if (strategy == null)
+                    {
+                        _logger.LogWarning("No strategy registered for event type '{EventType}'. Record skipped.",
+                            telemetryEvent.EventType);
+                        continue;
+                    }
+
+                    try
+                    {
+                        var insights = await strategy.TransformAsync(telemetryEvent, context.CancellationToken)
+                                                     .ConfigureAwait(false);
+
+                        // Fan-out each insight asynchronously with retry.
+                        foreach (var insight in insights)
+                        {
+                            dispatchTasks.Add(
+                                _retryPolicy.ExecuteAsync(ct => _dispatcher.DispatchAsync(insight, ct),
+                                                          context.CancellationToken));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex,
+                            "Error while applying strategy '{Strategy}' to eventType '{EventType}'.",
+                            strategy.GetType().Name,
+                            telemetryEvent.EventType);
+                        await SendToDlqAsync(rec).ConfigureAwait(false);
+                    }
+                }
+                else
+                {
+                    await SendToDlqAsync(rec).ConfigureAwait(false);
+                }
+            }
+
+            await Task.WhenAll(dispatchTasks).ConfigureAwait(false);
+            _logger.LogInformation("Batch processing complete.");
+        }
+
+        #endregion
+
+        #region Helpers ---------------------------------------------------------
+
+        private bool TryParseEvent(KinesisEvent.KinesisEventRecord record, out TelemetryEvent telemetryEvent)
+        {
+            telemetryEvent = null!;
+            try
+            {
+                var json = Encoding.UTF8.GetString(record.Kinesis.Data.Span);
+                telemetryEvent = JsonSerializer.Deserialize<TelemetryEvent>(json, JsonOptions.Options);
+
+                if (telemetryEvent?.EventType == null)
+                    throw new JsonException("Missing mandatory 'eventType' property.");
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to deserialize record into TelemetryEvent.");
+                return false;
+            }
+        }
+
+        private async Task SendToDlqAsync(KinesisEvent.KinesisEventRecord record)
+        {
+            try
+            {
+                var queueUrl   = Environment.GetEnvironmentVariable("DLQ_URL") ?? string.Empty;
+                var sqsClient  = SqsClientSingleton.Instance;
+
+                // Send raw payload to DLQ for triage.
+                await sqsClient.SendMessageAsync(new SendMessageRequest
+                {
+                    QueueUrl    = queueUrl,
+                    MessageBody = Convert.ToBase64String(record.Kinesis.Data.Span)
+                });
+            }
+            catch (Exception ex)
+            {
+                // Log but swallow — we never want to fail the entire batch because DLQ write failed.
+                _logger.LogError(ex, "Unable to push faulty record to DLQ.");
+            }
+        }
+
+        #endregion
+    }
+
+    #endregion
+
+    #region DTOs ---------------------------------------------------------------
+
+    public sealed record TelemetryEvent(
+        [property: JsonPropertyName("eventType")] string EventType,
+        [property: JsonPropertyName("timestamp")] DateTime Timestamp,
+        [property: JsonPropertyName("payload")]   JsonElement Payload);
+
+    public sealed record ProductivityInsight(
+        string InsightType,
+        DateTime ObservedAtUtc,
+        IDictionary<string, object> Metrics);
+
+    #endregion
+
+    #region Strategy Pattern ---------------------------------------------------
+
+    public interface ITransformationStrategy
+    {
+        string EventType { get; }
+
+        /// <summary>
+        /// Transforms a raw telemetry event into one or more <see cref="ProductivityInsight"/>s.
+        /// </summary>
+        Task<IReadOnlyCollection<ProductivityInsight>> TransformAsync(
+            TelemetryEvent telemetryEvent,
+            CancellationToken cancellationToken);
+    }
+
+    public interface ITransformationStrategyFactory
+    {
+        ITransformationStrategy? GetStrategy(string eventType);
+    }
+
+    public sealed class TransformationStrategyFactory : ITransformationStrategyFactory
+    {
+        private static readonly IReadOnlyDictionary<string, Func<ITransformationStrategy>> StrategyMap =
+            new Dictionary<string, Func<ITransformationStrategy>>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["calendar.focus-time"]    = () => new FocusTimeStrategy(),
+                ["deployment.lifecycle"]   = () => new DeploymentLeadTimeStrategy()
+            };
+
+        private readonly ConcurrentDictionary<string, ITransformationStrategy> _cache = new();
+
+        public ITransformationStrategy? GetStrategy(string eventType)
+        {
+            return _cache.GetOrAdd(eventType, key =>
+            {
+                return StrategyMap.TryGetValue(key, out var ctor) ? ctor() : null!;
+            });
+        }
+    }
+
+    #endregion
+
+    #region Concrete Strategies ------------------------------------------------
+
+    /// <summary>
+    /// Calculates focus-time ratio from calendar events.
+    /// </summary>
+    public sealed class FocusTimeStrategy : ITransformationStrategy
+    {
+        public string EventType => "calendar.focus-time";
+
+        public Task<IReadOnlyCollection<ProductivityInsight>> TransformAsync(
+            TelemetryEvent telemetryEvent,
+            CancellationToken cancellationToken)
+        {
+            /*
+             * Expected payload:
+             * {
+             *   "attendee": "john@example.com",
+             *   "durationMinutes": 60,
+             *   "isFocusTime": true
+             * }
+             */
+
+            var payload = telemetryEvent.Payload;
+            var durationMinutes = payload.GetProperty("durationMinutes").GetInt32();
+            var isFocusTime     = payload.GetProperty("isFocusTime").GetBoolean();
+
+            var metricKey   = isFocusTime ? "FocusMinutes" : "MeetingMinutes";
+            var metricsDict = new Dictionary<string, object>
+            {
+                [metricKey] = durationMinutes
+            };
+
+            var insight = new ProductivityInsight(
+                InsightType: "focus-time.ratio",
+                ObservedAtUtc: telemetryEvent.Timestamp,
+                Metrics: metricsDict);
+
+            return Task.FromResult<IReadOnlyCollection<ProductivityInsight>>(new[] { insight });
+        }
+    }
+
+    /// <summary>
+    /// Calculates deployment lead-time from CI/CD lifecycle events.
+    /// </summary>
+    public sealed class DeploymentLeadTimeStrategy : ITransformationStrategy
+    {
+        public string EventType => "deployment.lifecycle";
+
+        public Task<IReadOnlyCollection<ProductivityInsight>> TransformAsync(
+            TelemetryEvent telemetryEvent,
+            CancellationToken cancellationToken)
+        {
+            /*
+             * Expected payload:
+             * {
+             *   "commitSha": "abc123",
+             *   "committedAt": "2023-10-02T13:00:00Z",
+             *   "deployedAt": "2023-10-03T15:23:00Z"
+             * }
+             */
+
+            var payload       = telemetryEvent.Payload;
+            var committedAt   = payload.GetProperty("committedAt").GetDateTime();
+            var deployedAt    = payload.GetProperty("deployedAt").GetDateTime();
+
+            var leadTimeHours = (deployedAt - committedAt).TotalHours;
+
+            var metricsDict = new Dictionary<string, object>
+            {
+                ["LeadTimeHours"] = leadTimeHours
+            };
+
+            var insight = new ProductivityInsight(
+                InsightType: "deployment.lead-time",
+                ObservedAtUtc: deployedAt,
+                Metrics: metricsDict);
+
+            return Task.FromResult<IReadOnlyCollection<ProductivityInsight>>(new[] { insight });
+        }
+    }
+
+    #endregion
+
+    #region Observer Pattern: Dispatcher --------------------------------------
+
+    public interface ITelemetryDispatcher
+    {
+        Task DispatchAsync(ProductivityInsight insight, CancellationToken token = default);
+    }
+
+    /// <summary>
+    /// Emits insights to EventBridge, enabling downstream consumers (e.g. Glue, QuickSight)
+    /// to subscribe without tight coupling.
+    /// </summary>
+    public sealed class EventBridgeDispatcher : ITelemetryDispatcher
+    {
+        private readonly IAmazonEventBridge _client;
+        private readonly string             _busName;
+        private readonly ILogger<EventBridgeDispatcher> _logger;
+
+        public EventBridgeDispatcher()
+            : this(new AmazonEventBridgeClient(),                                // Will auto-pick region/creds via Lambda environment.
+                   Environment.GetEnvironmentVariable("EVENT_BUS") ?? "pulseops-prod-bus",
+                   LambdaLoggerWrapper.Create<EventBridgeDispatcher>())
+        { }
+
+        // DI constructor
+        public EventBridgeDispatcher(IAmazonEventBridge client, string busName, ILogger<EventBridgeDispatcher> logger)
+        {
+            _client  = client  ?? throw new ArgumentNullException(nameof(client));
+            _busName = busName ?? throw new ArgumentNullException(nameof(busName));
+            _logger  = logger  ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        public async Task DispatchAsync(ProductivityInsight insight, CancellationToken token = default)
+        {
+            var detailJson = JsonSerializer.Serialize(insight, JsonOptions.Options);
+
+            var request = new PutEventsRequest
+            {
+                Entries = new List<PutEventsRequestEntry>
+                {
+                    new()
+                    {
+                        EventBusName = _busName,
+                        Source       = "pulseops.warehouse.transform",
+                        DetailType   = insight.InsightType,
+                        Detail       = detailJson,
+                        Time         = DateTime.UtcNow
+                    }
+                }
+            };
+
+            var response = await _client.PutEventsAsync(request, token).ConfigureAwait(false);
+
+            if (response.FailedEntryCount > 0)
+            {
+                var errorEntry = response.Entries[0];
+                throw new InvalidOperationException(
+                    $"EventBridge publish failed: {errorEntry.ErrorCode} — {errorEntry.ErrorMessage}");
+            }
+
+            _logger.LogDebug("Insight '{InsightType}' dispatched to EventBridge bus '{BusName}'.",
+                insight.InsightType, _busName);
+        }
+    }
+
+    #endregion
+
+    #region Infrastructure -----------------------------------------------------
+
+    /// <summary>
+    /// Simple wrapper for Lambda's built-in ILogger.
+    /// </summary>
+    internal static class LambdaLoggerWrapper
+    {
+        public static ILogger<T> Create<T>() => new LambdaLogger<T>();
+
+        private sealed class LambdaLogger<T> : ILogger<T>, IDisposable
+        {
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                Func<TState, Exception?, string> formatter)
+            {
+                var message = formatter(state, exception);
+                var prefix  = $"[{logLevel}] {typeof(T).Name}: ";
+
+                if (exception != null)
+                    LambdaLogger.Log($"{prefix}{message}\n{exception}");
+                else
+                    LambdaLogger.Log($"{prefix}{message}");
+            }
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public IDisposable BeginScope<TState>(TState state) => this;
+
+            public void Dispose() { } // No-op
+        }
+    }
+
+    internal static class JsonOptions
+    {
+        public static readonly JsonSerializerOptions Options = new()
+        {
+            PropertyNamingPolicy   = JsonNamingPolicy.CamelCase,
+            WriteIndented          = false,
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        };
+    }
+
+    internal sealed class SqsClientSingleton
+    {
+        public static readonly IAmazonSQS Instance =
+            new AmazonSQSClient(new EnvironmentVariablesAWSCredentials());
+    }
+
+    #endregion
+}
+```

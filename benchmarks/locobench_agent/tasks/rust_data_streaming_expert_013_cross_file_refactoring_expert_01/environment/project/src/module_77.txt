@@ -1,0 +1,278 @@
+```rust
+//! module_77: Windowed Sentiment Aggregator
+//!
+//! Consumes raw enrichment events from Kafka, performs quality checks, applies a rolling‐window
+//! aggregation, and periodically publishes metrics as OpenTelemetry gauges.
+//!
+//! High-level responsibilities:
+//! 1. Stream processing (Kafka ➜ async consumer).
+//! 2. Parallel, lock-free aggregation (dashmap).
+//! 3. Data-quality enforcement (range checks, dedupe, clock-skew validation).
+//! 4. Scheduling (cron-like flush job).
+//! 5. Monitoring and tracing (OpenTelemetry).
+//!
+//! NOTE: Error handling is “best-effort”: bad records are counted and skipped, not fatal.
+
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
+use moka::future::Cache;
+use opentelemetry::{
+    metrics::{Counter, Gauge, MeterProvider as _},
+    Context,
+};
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    message::BorrowedMessage,
+    ClientConfig, Message,
+};
+use serde::Deserialize;
+use tokio::{
+    select,
+    signal::ctrl_c,
+    sync::Semaphore,
+    task,
+    time::{interval_at, Instant},
+};
+use tokio_cron_scheduler::{Job, JobScheduler};
+
+/// Kafka topic carrying enrichment events with an on-line sentiment score.
+const TOPIC_RAW_SENTIMENT: &str = "raw_sentiment";
+
+/// Size of sliding window used by the aggregator (in seconds).
+const WINDOW_SIZE_SECS: u64 = 30;
+
+/// Max allowed delay (skew) between message timestamp and wall-clock (in seconds).
+const ALLOWED_SKEW_SECS: i64 = 10;
+
+/// Max number of parallel message handlers.
+const MAX_CONCURRENCY: usize = 32;
+
+/// In-memory deduplication TTL (matches `WINDOW_SIZE_SECS` to avoid leaks).
+const DEDUPE_TTL_SECS: u64 = WINDOW_SIZE_SECS;
+
+/// Flush period for emitting metrics.
+const FLUSH_EVERY_SECS: u64 = 5;
+
+/// JSON schema for an incoming sentiment record.
+#[derive(Debug, Deserialize)]
+struct RawSentimentMsg {
+    /// Unique event ID (source-generated).
+    id: String,
+    /// Epoch millis.
+    timestamp: i64,
+    /// Pre-calculated sentiment in range [-1.0…1.0].
+    sentiment_score: f32,
+}
+
+/// Thread-safe rolling window aggregator.
+#[derive(Debug, Clone)]
+struct SentimentAggregator {
+    /// Buckets, keyed by second.
+    buckets: Arc<DashMap<u64, (f64 /*sum*/, u64 /*cnt*/)>>,
+
+    /// Deduplication LRU.
+    dedupe_cache: Cache<u64, ()>,
+
+    /// Metric handles.
+    gauge_avg_sentiment: Gauge<f64>,
+    counter_bad_records: Counter<u64>,
+}
+
+impl SentimentAggregator {
+    fn new(meter: &opentelemetry::metrics::Meter) -> Self {
+        Self {
+            buckets: Arc::new(DashMap::new()),
+            dedupe_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(DEDUPE_TTL_SECS))
+                .max_capacity(500_000)
+                .build(),
+            gauge_avg_sentiment: meter
+                .f64_gauge("chirppulse.avg_sentiment")
+                .with_description("Rolling window sentiment average")
+                .init(),
+            counter_bad_records: meter
+                .u64_counter("chirppulse.bad_records")
+                .with_description("Number of invalid or dropped records")
+                .init(),
+        }
+    }
+
+    /// Try ingesting a message, returns `Ok(())` when accepted.
+    async fn ingest(&self, raw: &BorrowedMessage<'_>) -> anyhow::Result<()> {
+        let payload = raw
+            .payload_view::<str>()
+            .map_err(|_| anyhow::anyhow!("Invalid UTF-8"))?
+            .ok_or_else(|| anyhow::anyhow!("Empty payload"))?;
+
+        let msg: RawSentimentMsg = match serde_json::from_str(payload) {
+            Ok(m) => m,
+            Err(e) => {
+                self.counter_bad_records.add(&Context::current(), 1, &[]);
+                return Err(e.into());
+            }
+        };
+
+        // Data quality: range check
+        if !(-1.0..=1.0).contains(&msg.sentiment_score) {
+            self.counter_bad_records.add(&Context::current(), 1, &[]);
+            anyhow::bail!("Score out of range")
+        }
+
+        // Data quality: clock skew.
+        let now_ms = Utc::now().timestamp_millis();
+        if (msg.timestamp - now_ms).abs() > ALLOWED_SKEW_SECS * 1000 {
+            self.counter_bad_records.add(&Context::current(), 1, &[]);
+            anyhow::bail!("Clock skew > allowed")
+        }
+
+        // Deduplication using hashed ID.
+        let mut hasher = DefaultHasher::new();
+        msg.id.hash(&mut hasher);
+        let event_hash = hasher.finish();
+        if self.dedupe_cache.get(&event_hash).is_some() {
+            // Duplicate — silently drop.
+            return Ok(());
+        }
+        self.dedupe_cache.insert(event_hash, ()).await;
+
+        // Bucket index (second granularity).
+        let bucket_ts = (msg.timestamp / 1000) as u64;
+        let (sum, cnt) = self
+            .buckets
+            .entry(bucket_ts)
+            .or_insert_with(|| (0.0, 0))
+            .value_mut();
+        *sum += msg.sentiment_score as f64;
+        *cnt += 1;
+
+        Ok(())
+    }
+
+    /// Aggregate across last `WINDOW_SIZE_SECS` seconds and expose gauge.
+    fn flush_metrics(&self) {
+        let now_s = Utc::now().timestamp() as u64;
+        let oldest_allowed = now_s.saturating_sub(WINDOW_SIZE_SECS);
+
+        let mut total_sum = 0.0;
+        let mut total_cnt = 0u64;
+
+        // Iterate buckets; remove stale ones (to bound memory).
+        self.buckets.retain(|ts, (sum, cnt)| {
+            if *ts < oldest_allowed {
+                false
+            } else {
+                total_sum += *sum;
+                total_cnt += *cnt;
+                true
+            }
+        });
+
+        let avg = if total_cnt > 0 {
+            total_sum / total_cnt as f64
+        } else {
+            0.0
+        };
+
+        self.gauge_avg_sentiment
+            .set(&Context::current(), avg, &[]);
+    }
+}
+
+/// Build a configured Tokio Kafka consumer.
+fn build_consumer(brokers: &str, group: &str) -> anyhow::Result<StreamConsumer> {
+    Ok(ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", group)
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()?)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // 1. Initialize logging + tracing.
+    tracing_subscriber::fmt::init();
+
+    // 2. Initialize OpenTelemetry meter.
+    let otel = opentelemetry::sdk::metrics::SdkMeterProvider::builder().build();
+    let meter = otel.meter("chirppulse.sentiment_window");
+
+    // 3. Instantiate aggregator.
+    let aggregator = SentimentAggregator::new(&meter);
+
+    // 4. Spawn metric flush scheduler.
+    let agg_clone = aggregator.clone();
+    task::spawn(async move {
+        let mut ticker =
+            interval_at(Instant::now() + Duration::from_secs(FLUSH_EVERY_SECS), Duration::from_secs(FLUSH_EVERY_SECS));
+        loop {
+            ticker.tick().await;
+            agg_clone.flush_metrics();
+        }
+    });
+
+    // 5. Create Kafka consumer & subscribe.
+    let consumer = build_consumer("localhost:9092", "sentiment_window")?;
+    consumer.subscribe(&[TOPIC_RAW_SENTIMENT])?;
+
+    // 6. Cron-based offset commit job (every minute, resilient to rebalance).
+    let commit_consumer = consumer.clone();
+    task::spawn(async move {
+        let sched = JobScheduler::new().await.unwrap();
+        let job = Job::new_async("1/60 * * * * *", move |_, _| {
+            let commit_consumer = commit_consumer.clone();
+            Box::pin(async move {
+                if let Err(e) = commit_consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Async) {
+                    tracing::warn!("Failed to commit offsets: {e}");
+                }
+            })
+        })
+        .unwrap();
+        sched.add(job).await.unwrap();
+        sched.start().await.unwrap();
+    });
+
+    // 7. Worker pool concurrency guard.
+    let permits = Arc::new(Semaphore::new(MAX_CONCURRENCY));
+
+    // 8. Main event loop.
+    loop {
+        select! {
+            _ = ctrl_c() => {
+                tracing::info!("Ctrl-C received; shutting down");
+                break;
+            }
+            maybe_msg = consumer.recv() => {
+                match maybe_msg {
+                    Err(e) => tracing::error!("Kafka error: {e}"),
+                    Ok(msg) => {
+                        let permits = permits.clone();
+                        let aggregator = aggregator.clone();
+                        // Acquire permit; spawn task.
+                        if let Ok(permit) = permits.acquire().await {
+                            task::spawn(async move {
+                                let _p = permit;
+                                if let Err(e) = aggregator.ingest(&msg).await {
+                                    tracing::debug!("Record could not be ingested: {e}");
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Flush OTLP
+    opentelemetry::global::shutdown_tracer_provider();
+
+    Ok(())
+}
+```

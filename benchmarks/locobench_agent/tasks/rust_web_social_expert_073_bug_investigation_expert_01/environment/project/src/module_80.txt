@@ -1,0 +1,467 @@
+```rust
+//! src/module_80.rs
+//!
+//! Event-bus façade for EduPulse Live.
+//!
+//! This module encapsulates the AMQP message–broker integration used by every
+//! bounded context (search indexing, notifications, achievement calculation,
+//! …).  It exposes a thin, type-safe layer around lapin so domain services can
+//! publish/consume events without depending on AMQP details.  All events are
+//! JSON‐serialised envelopes carrying rich metadata for traceability and GDPR-
+//! compliant erasure.
+//
+//  ──── Crate Features ────────────────────────────────────────────────────────
+//  • async/await powered by Tokio
+//  • AMQP implementation built on top of lapin
+//  • audit trail persisted with sqlx & Postgres
+//  • exponential back-off reconnect
+//
+//  NOTE: The public API deliberately hides lapin types to ease future
+//        migrations (e.g. to NATS or Kafka).
+//
+
+use std::{
+    fmt::Debug,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use lapin::{
+    options::{BasicConsumeOptions, BasicPublishOptions, QueueDeclareOptions},
+    types::FieldTable,
+    BasicProperties, Channel, Connection, ConnectionProperties,
+};
+use rand::{thread_rng, Rng};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use thiserror::Error;
+use tokio::{select, sync::Notify, task, time};
+use tokio_retry::{strategy::ExponentialBackoff, Retry};
+
+/// Global exchange used by all micro-services.
+const EXCHANGE_NAME: &str = "edupulse.events";
+
+/// AMQP dead-letter exchange for failed messages.
+const DLX_EXCHANGE_NAME: &str = "edupulse.dlx";
+
+/// Domain error returned by this module.
+#[derive(Debug, Error)]
+pub enum EventBusError {
+    #[error("AMQP error: {0}")]
+    Amqp(#[from] lapin::Error),
+    #[error("connection closed unexpectedly")]
+    ConnectionClosed,
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+    #[error("task join error: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
+/// Marker trait implemented by all domain events.
+///
+/// The `event_type` method returns a canonical snake-case event name that
+/// becomes the AMQP routing key (e.g. `lesson_published`, `pulse_replied`).
+/// Implementations should be `Clone`, `Serialize`, and `DeserializeOwned`.
+#[async_trait]
+pub trait DomainEvent:
+    Debug + Clone + Send + Sync + Serialize + DeserializeOwned + 'static
+{
+    fn event_type() -> &'static str;
+}
+
+/// Envelope adds cross-cutting metadata around a [`DomainEvent`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope<E: DomainEvent> {
+    pub id: uuid::Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub correlation_id: Option<uuid::Uuid>,
+    #[serde(bound = "E: DomainEvent")]
+    pub payload: E,
+}
+
+impl<E: DomainEvent> EventEnvelope<E> {
+    pub fn new(payload: E) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            correlation_id: None,
+            payload,
+        }
+    }
+
+    /// Returns the routing key for AMQP based on the event type.
+    pub fn routing_key() -> &'static str {
+        E::event_type()
+    }
+}
+
+/// Public façade for publishing and subscribing to events.
+#[derive(Clone)]
+pub struct EventBus {
+    inner: Arc<EventBusInner>,
+}
+
+struct EventBusInner {
+    channel: Channel,
+    notify_disconnect: Arc<Notify>,
+    audit_pool: PgPool,
+}
+
+impl EventBus {
+    /// Connects to the broker and initialises required exchanges/queues.
+    pub async fn connect(amqp_url: &str, postgres_url: &str) -> Result<Self, EventBusError> {
+        let conn = Connection::connect(
+            amqp_url,
+            ConnectionProperties::default().with_default_executor(8),
+        )
+        .await?;
+
+        let channel = conn.create_channel().await?;
+
+        // Declare global exchange (topic) + DLX.
+        channel
+            .exchange_declare(
+                EXCHANGE_NAME,
+                lapin::ExchangeKind::Topic,
+                lapin::options::ExchangeDeclareOptions {
+                    durable: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await?;
+
+        channel
+            .exchange_declare(
+                DLX_EXCHANGE_NAME,
+                lapin::ExchangeKind::Fanout,
+                lapin::options::ExchangeDeclareOptions {
+                    durable: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await?;
+
+        let audit_pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(postgres_url)
+            .await?;
+
+        let inner = Arc::new(EventBusInner {
+            channel,
+            notify_disconnect: Arc::new(Notify::new()),
+            audit_pool,
+        });
+
+        // Spawn watchdog for connection loss.
+        Self::spawn_watchdog(inner.clone());
+
+        Ok(Self { inner })
+    }
+
+    /// Publish a domain event inside an envelope.
+    ///
+    /// – Persist to audit table (fire-and-forget).
+    /// – Publish persistent message to RabbitMQ.
+    pub async fn publish<E>(&self, event: EventEnvelope<E>) -> Result<(), EventBusError>
+    where
+        E: DomainEvent,
+    {
+        let json = serde_json::to_vec(&event)?;
+
+        // Insert into audit log without blocking caller on I/O latency.
+        let pool = self.inner.audit_pool.clone();
+        let audit_clone = event.clone();
+        task::spawn(async move {
+            if let Err(e) = sqlx::query!(
+                r#"
+                INSERT INTO audit_events (id, event_type, occurred_at, payload)
+                VALUES ($1, $2, $3, $4)
+                "#,
+                audit_clone.id,
+                E::event_type(),
+                audit_clone.occurred_at,
+                serde_json::to_value(audit_clone.payload).ok()
+            )
+            .execute(&pool)
+            .await
+            {
+                tracing::error!(error = %e, "failed to persist audit event");
+            }
+        });
+
+        self.inner
+            .channel
+            .basic_publish(
+                EXCHANGE_NAME,
+                E::event_type(),
+                BasicPublishOptions {
+                    mandatory: true,
+                    ..Default::default()
+                },
+                &json,
+                BasicProperties::default().with_content_type("application/json".into()),
+            )
+            .await?
+            .await?; // wait for confirmation
+
+        Ok(())
+    }
+
+    /// Consume events of a specific type.
+    ///
+    /// Handlers run on separate tasks. A manual `ack` will only be sent if
+    /// handler returns `Ok(())`; otherwise the message is rejected and sent
+    /// to DLX for later inspection.
+    pub async fn subscribe<E, H>(&self, queue_name: &str, handler: H) -> Result<(), EventBusError>
+    where
+        E: DomainEvent,
+        H: EventHandler<E>,
+    {
+        let channel = self.inner.channel.clone();
+
+        channel
+            .queue_declare(
+                queue_name,
+                QueueDeclareOptions {
+                    durable: true,
+                    ..Default::default()
+                },
+                FieldTable::from([
+                    ("x-dead-letter-exchange".into(), DLX_EXCHANGE_NAME.into()),
+                ]),
+            )
+            .await?;
+
+        channel
+            .queue_bind(
+                queue_name,
+                EXCHANGE_NAME,
+                E::event_type(),
+                lapin::options::QueueBindOptions::default(),
+                FieldTable::default(),
+            )
+            .await?;
+
+        let consumer = channel
+            .basic_consume(
+                queue_name,
+                "",
+                BasicConsumeOptions {
+                    manual_ack: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await?;
+
+        let handler_arc = Arc::new(handler);
+
+        // Spawn a detached task that processes the stream.
+        task::spawn(async move {
+            for delivery in consumer {
+                match delivery {
+                    Ok(delivery) => {
+                        let envelope = match serde_json::from_slice::<EventEnvelope<E>>(
+                            &delivery.data,
+                        ) {
+                            Ok(env) => env,
+                            Err(err) => {
+                                tracing::error!(error = %err, "failed to deserialize event");
+                                // Reject so it hits DLX.
+                                if let Err(e) = delivery
+                                    .nack(lapin::options::BasicNackOptions::default())
+                                    .await
+                                {
+                                    tracing::error!(error = %e, "nack failed");
+                                }
+                                continue;
+                            }
+                        };
+
+                        let ctx = EventContext {
+                            redelivered: delivery.redelivered,
+                        };
+
+                        match handler_arc.handle(envelope, ctx).await {
+                            Ok(_) => {
+                                if let Err(e) = delivery
+                                    .ack(lapin::options::BasicAckOptions::default())
+                                    .await
+                                {
+                                    tracing::error!(error = %e, "ack failed");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "handler error, rejecting message");
+                                if let Err(e) = delivery
+                                    .nack(lapin::options::BasicNackOptions {
+                                        requeue: false,
+                                        ..Default::default()
+                                    })
+                                    .await
+                                {
+                                    tracing::error!(error = %e, "nack failed");
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "rabbitmq consumer error");
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Background watchdog: listens for disconnections and tries to reconnect
+    /// with an exponential back-off.  In a real-world setup, we would signal
+    /// higher-level components on permanent failure.
+    fn spawn_watchdog(inner: Arc<EventBusInner>) {
+        task::spawn(async move {
+            // Wait until channel is closed (lapin emits this internally).
+            let close_reason = inner.channel.on_error().await;
+            tracing::warn!(?close_reason, "AMQP channel closed, watchdog engaged");
+
+            inner.notify_disconnect.notify_waiters();
+
+            // Retry loop for reconnection attempts.
+            let backoff = ExponentialBackoff::from_millis(250).take(8);
+
+            if let Err(e) = Retry::spawn(backoff, || async {
+                let conn = Connection::connect(
+                    // Re-use original URI from env
+                    &std::env::var("AMQP_URL").unwrap_or_else(|_| "amqp://guest:guest@127.0.0.1:5672/%2f".into()),
+                    ConnectionProperties::default(),
+                )
+                .await?;
+
+                let ch = conn.create_channel().await?;
+                *Arc::get_mut(&mut inner.clone()).unwrap() = EventBusInner {
+                    channel: ch,
+                    notify_disconnect: inner.notify_disconnect.clone(),
+                    audit_pool: inner.audit_pool.clone(),
+                };
+                Ok::<_, lapin::Error>(())
+            })
+            .await
+            {
+                tracing::error!(error = %e, "failed to reconnect to AMQP – manual intervention required");
+            }
+        });
+    }
+}
+
+/// Metadata passed to event handlers.
+#[derive(Debug, Clone)]
+pub struct EventContext {
+    /// Was the message redelivered by RabbitMQ?
+    pub redelivered: bool,
+}
+
+/// Handler trait for a single event type.
+#[async_trait]
+pub trait EventHandler<E: DomainEvent>: Send + Sync {
+    async fn handle(&self, event: EventEnvelope<E>, ctx: EventContext) -> Result<(), anyhow::Error>;
+}
+
+// ─────────────────────────── Example Domain Events ──────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LessonPublished {
+    pub lesson_id: uuid::Uuid,
+    pub author_id: uuid::Uuid,
+    pub title: String,
+}
+
+#[async_trait]
+impl DomainEvent for LessonPublished {
+    fn event_type() -> &'static str {
+        "lesson_published"
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseReplied {
+    pub pulse_id: uuid::Uuid,
+    pub student_id: uuid::Uuid,
+    pub attachments: Vec<String>,
+}
+
+#[async_trait]
+impl DomainEvent for PulseReplied {
+    fn event_type() -> &'static str {
+        "pulse_replied"
+    }
+}
+
+// ────────────────────────────── Unit Tests ──────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    struct NoopHandler;
+    #[async_trait]
+    impl EventHandler<LessonPublished> for NoopHandler {
+        async fn handle(
+            &self,
+            _event: EventEnvelope<LessonPublished>,
+            _ctx: EventContext,
+        ) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn envelope_roundtrip() {
+        let event = LessonPublished {
+            lesson_id: uuid::Uuid::new_v4(),
+            author_id: uuid::Uuid::new_v4(),
+            title: "Rust Traits 101".into(),
+        };
+        let envelope = EventEnvelope::new(event.clone());
+        let json = serde_json::to_vec(&envelope).unwrap();
+        let deser: EventEnvelope<LessonPublished> = serde_json::from_slice(&json).unwrap();
+        assert_eq!(deser.payload.lesson_id, event.lesson_id);
+    }
+
+    // The following test requires a local RabbitMQ & Postgres and is therefore
+    // ignored by default.  Run with:
+    //     AMQP_URL=amqp://guest:guest@localhost:5672/%2f \
+    //     DATABASE_URL=postgres://postgres:password@localhost/edupulse \
+    //     cargo test -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn integration_publish_then_consume() {
+        dotenv::dotenv().ok();
+        let amqp = env::var("AMQP_URL").expect("AMQP_URL not set");
+        let db = env::var("DATABASE_URL").expect("DATABASE_URL not set");
+
+        let bus = EventBus::connect(&amqp, &db).await.unwrap();
+
+        let lesson = LessonPublished {
+            lesson_id: uuid::Uuid::new_v4(),
+            author_id: uuid::Uuid::new_v4(),
+            title: "Integration Test".into(),
+        };
+
+        let envelope = EventEnvelope::new(lesson);
+        bus.publish(envelope.clone()).await.unwrap();
+
+        bus.subscribe("test_queue", NoopHandler).await.unwrap();
+
+        // Give the async consumer some time.
+        time::sleep(Duration::from_millis(500)).await;
+    }
+}
+```

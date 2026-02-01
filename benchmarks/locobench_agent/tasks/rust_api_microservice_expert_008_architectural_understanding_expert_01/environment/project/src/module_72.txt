@@ -1,0 +1,445 @@
+```rust
+//! LedgerLink Nexus – Pagination + Response Caching + Repository glue
+//! ------------------------------------------------------------------
+//! This module brings together three core cross-cutting concerns that are heavily
+//! reused throughout the micro-service:
+//!   1. Generic, typed pagination helpers with validation
+//!   2. A small opinionated Redis-backed response-caching façade
+//!   3. A sample Postgres repository implementation for Ledger Entries
+//!
+//! It is **self-contained** so it can be pulled into integration/unit tests
+//! without touching the rest of the codebase.
+
+#![allow(clippy::module_inception)] // we intentionally group sub-modules here
+#![deny(rust_2018_idioms)]
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::{future::BoxFuture, Future, FutureExt};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+use tokio::{select, time::timeout};
+
+//
+// ─────────────────────────────  ERRORS  ────────────────────────────────
+//
+
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("validation error: {0}")]
+    Validation(String),
+
+    #[error("repository error: {0}")]
+    Repository(String),
+
+    #[error("cache error: {0}")]
+    Cache(String),
+
+    #[error("timeout after {0:?}")]
+    Timeout(Duration),
+
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+//
+// ────────────────────────  PAGINATION PRIMITIVES  ──────────────────────
+//
+mod pagination {
+    use super::ApiError;
+    use serde::{Deserialize, Serialize};
+
+    /// Maximum number of items that can be requested in a single page
+    const MAX_PAGE_SIZE: u32 = 250;
+
+    /// Input query params coming from the client (View)
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+    pub struct PageRequest {
+        pub page: u32,
+        pub size: u32,
+    }
+
+    impl Default for PageRequest {
+        fn default() -> Self {
+            Self { page: 1, size: 50 }
+        }
+    }
+
+    impl PageRequest {
+        /// Validates & bounds the request to ensure we never allocate unbounded
+        /// memory or inadvertently DoS ourselves.
+        pub fn validate(self) -> Result<Self, ApiError> {
+            if self.page == 0 {
+                return Err(ApiError::Validation("page index starts at 1".into()));
+            }
+            if self.size == 0 || self.size > MAX_PAGE_SIZE {
+                return Err(ApiError::Validation(format!(
+                    "size must be 1..={MAX_PAGE_SIZE}"
+                )));
+            }
+            Ok(self)
+        }
+
+        /// Calculates SQL `OFFSET`
+        pub fn offset(self) -> u32 {
+            (self.page.saturating_sub(1)) * self.size
+        }
+    }
+
+    /// Metadata returned alongside every paginated response
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct PageMeta {
+        pub page: u32,
+        pub size: u32,
+        pub total: u64,
+        pub has_next: bool,
+    }
+
+    /// Wrapper DTO sent over the wire
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Paginated<T> {
+        pub data: Vec<T>,
+        pub meta: PageMeta,
+    }
+
+    impl<T> Paginated<T> {
+        pub fn new(data: Vec<T>, meta: PageMeta) -> Self {
+            Self { data, meta }
+        }
+    }
+}
+
+pub use pagination::*;
+
+//
+// ─────────────────────────  REDIS RESPONSE CACHE  ──────────────────────
+//
+mod cache {
+    use super::{ApiError, Digest, Sha256};
+    use redis::{aio::ConnectionManager, AsyncCommands};
+    use serde::{de::DeserializeOwned, Serialize};
+    use std::time::Duration;
+
+    #[derive(Clone)]
+    pub struct ResponseCache {
+        conn: ConnectionManager,
+        ttl: Duration,
+    }
+
+    impl ResponseCache {
+        pub fn new(conn: ConnectionManager, ttl: Duration) -> Self {
+            Self { conn, ttl }
+        }
+
+        /// Hashes the *logical* cache key into a deterministic 64-char SHA-256
+        /// hexadecimal string that is safe for Redis.
+        fn hash_key(key: &str) -> String {
+            let mut hasher = Sha256::new();
+            hasher.update(key.as_bytes());
+            format!("{:x}", hasher.finalize())
+        }
+
+        /// Fetches the cached value if present or, otherwise, executes the
+        /// async supplier closure, stores, and returns its result.
+        pub async fn get_or_insert_with<T, F, Fut>(
+            &mut self,
+            raw_key: &str,
+            supplier: F,
+        ) -> Result<T, ApiError>
+        where
+            T: Serialize + DeserializeOwned + Send + Sync,
+            F: FnOnce() -> Fut + Send,
+            Fut: std::future::Future<Output = Result<T, ApiError>> + Send,
+        {
+            let key = Self::hash_key(raw_key);
+
+            // 1) Try get
+            if let Ok(Some(buf)) = self.conn.get::<_, Vec<u8>>(&key).await {
+                // Do not treat JSON parsing errors as fatal – just invalidate that entry
+                if let Ok(value) = serde_json::from_slice::<T>(&buf) {
+                    return Ok(value);
+                } else {
+                    let _: Result<(), _> = self.conn.del(&key).await;
+                }
+            }
+
+            // 2) Miss: compute
+            let value = supplier().await?;
+
+            // 3) Store
+            let buf = serde_json::to_vec(&value).map_err(|e| ApiError::Cache(e.to_string()))?;
+            let _: () = self
+                .conn
+                .set_ex(&key, buf, self.ttl.as_secs() as usize)
+                .await
+                .map_err(|e| ApiError::Cache(e.to_string()))?;
+
+            Ok(value)
+        }
+
+        /// Helper to eagerly invalidate a known key (e.g. after a mutation).
+        pub async fn purge(&mut self, raw_key: &str) -> Result<(), ApiError> {
+            let key = Self::hash_key(raw_key);
+            self.conn
+                .del(&key)
+                .await
+                .map_err(|e| ApiError::Cache(e.to_string()))
+        }
+    }
+}
+
+pub use cache::ResponseCache;
+
+//
+// ─────────────────────  DOMAIN DTO + REPOSITORY LAYER  ─────────────────
+//
+mod ledger {
+    use super::{pagination::PageRequest, ApiError};
+    use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
+    use serde::{Deserialize, Serialize};
+
+    /// Thin View-Model used by the API + GraphQL layers
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct LedgerEntryDto {
+        pub id: uuid::Uuid,
+        pub tenant_id: uuid::Uuid,
+        pub booked_at: DateTime<Utc>,
+        pub description: String,
+        pub debit: f64,
+        pub credit: f64,
+        pub currency: String,
+        pub created_at: DateTime<Utc>,
+        pub updated_at: DateTime<Utc>,
+    }
+
+    /// Query- side repository
+    #[async_trait]
+    pub trait LedgerEntryRepository: Send + Sync + 'static {
+        async fn fetch_page(
+            &self,
+            tenant: uuid::Uuid,
+            req: PageRequest,
+        ) -> Result<(Vec<LedgerEntryDto>, u64), ApiError>;
+    }
+
+    /// Postgres implementation using `sqlx`
+    ///
+    /// NOTE: The actual SQL schema is simplified for brevity.
+    pub struct PgLedgerEntryRepository {
+        pool: sqlx::PgPool,
+    }
+
+    impl PgLedgerEntryRepository {
+        pub fn new(pool: sqlx::PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    #[async_trait]
+    impl LedgerEntryRepository for PgLedgerEntryRepository {
+        async fn fetch_page(
+            &self,
+            tenant: uuid::Uuid,
+            req: PageRequest,
+        ) -> Result<(Vec<LedgerEntryDto>, u64), ApiError> {
+            let req = req.validate()?;
+
+            let rows: Vec<LedgerEntryDto> = sqlx::query_as!(
+                LedgerEntryDto,
+                r#"
+                SELECT
+                    id,
+                    tenant_id,
+                    booked_at,
+                    description,
+                    debit,
+                    credit,
+                    currency,
+                    created_at,
+                    updated_at
+                FROM ledger_entries
+                WHERE tenant_id = $1
+                ORDER BY booked_at DESC
+                LIMIT $2
+                OFFSET $3
+                "#,
+                tenant,
+                req.size as i64,
+                req.offset() as i64
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ApiError::Repository(e.to_string()))?;
+
+            // Count is stored in a materialized view or computed on demand
+            let total: (i64,) = sqlx::query_as(
+                r#"SELECT COUNT(*) as count FROM ledger_entries WHERE tenant_id = $1"#,
+            )
+            .bind(tenant)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| ApiError::Repository(e.to_string()))?;
+
+            Ok((rows, total.0 as u64))
+        }
+    }
+}
+
+pub use ledger::{LedgerEntryDto, LedgerEntryRepository, PgLedgerEntryRepository};
+
+//
+// ─────────────────────────────  SERVICE LAYER  ─────────────────────────
+//
+mod service {
+    use super::{
+        cache::ResponseCache,
+        ledger::LedgerEntryRepository,
+        pagination::{PageMeta, PageRequest, Paginated},
+        ApiError,
+    };
+    use async_trait::async_trait;
+    use sha2::{Digest, Sha256};
+    use uuid::Uuid;
+
+    #[async_trait]
+    pub trait LedgerEntryService: Send + Sync + 'static {
+        async fn list_entries(
+            &self,
+            tenant: Uuid,
+            req: PageRequest,
+        ) -> Result<Paginated<super::LedgerEntryDto>, ApiError>;
+    }
+
+    pub struct LedgerEntryServiceImpl<R> {
+        repo: R,
+        cache: tokio::sync::Mutex<ResponseCache>, // Mutex to serialize Redis connection usage
+    }
+
+    impl<R> LedgerEntryServiceImpl<R> {
+        pub fn new(repo: R, cache: ResponseCache) -> Self {
+            Self {
+                repo,
+                cache: tokio::sync::Mutex::new(cache),
+            }
+        }
+
+        /// Builds a stable cache key based on tenant + pagination request.
+        fn make_cache_key(tenant: Uuid, req: PageRequest) -> String {
+            format!("ledger:v1:tenant={tenant}:page={}:size={}", req.page, req.size)
+        }
+    }
+
+    #[async_trait]
+    impl<R> LedgerEntryService for LedgerEntryServiceImpl<R>
+    where
+        R: LedgerEntryRepository + Send + Sync,
+    {
+        async fn list_entries(
+            &self,
+            tenant: Uuid,
+            req: PageRequest,
+        ) -> Result<Paginated<super::LedgerEntryDto>, ApiError> {
+            let key = Self::make_cache_key(tenant, req);
+
+            // Use response cache (if redis unavailable, we gracefully degrade)
+            let cached = {
+                let mut guard = self.cache.lock().await;
+                guard
+                    .get_or_insert_with(&key, || async {
+                        // Delegates to repository
+                        let (rows, total) = self.repo.fetch_page(tenant, req).await?;
+                        let meta = PageMeta {
+                            page: req.page,
+                            size: req.size,
+                            total,
+                            has_next: (req.page as u64 * req.size as u64) < total,
+                        };
+                        Ok(Paginated::new(rows, meta))
+                    })
+                    .await
+            }?;
+
+            Ok(cached)
+        }
+    }
+}
+
+pub use service::{LedgerEntryService, LedgerEntryServiceImpl};
+
+//
+// ───────────────────────────────  TESTS  ───────────────────────────────
+//
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use once_cell::sync::Lazy;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    // An in-memory mock repository to avoid hitting Postgres in unit tests.
+    struct MockRepo;
+
+    #[async_trait::async_trait]
+    impl LedgerEntryRepository for MockRepo {
+        async fn fetch_page(
+            &self,
+            _tenant: uuid::Uuid,
+            req: PageRequest,
+        ) -> Result<(Vec<LedgerEntryDto>, u64), ApiError> {
+            let sample = LedgerEntryDto {
+                id: uuid::Uuid::new_v4(),
+                tenant_id: uuid::Uuid::new_v4(),
+                booked_at: Utc::now(),
+                description: "test".into(),
+                debit: 100.0,
+                credit: 0.0,
+                currency: "USD".into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            Ok((vec![sample; req.size as usize], 500))
+        }
+    }
+
+    static REDIS_URL: Lazy<String> =
+        Lazy::new(|| std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".into()));
+
+    async fn make_cache() -> ResponseCache {
+        let client = redis::Client::open(REDIS_URL.as_str()).expect("invalid redis url");
+        let conn = client
+            .get_tokio_connection_manager()
+            .await
+            .expect("redis unavailable");
+        ResponseCache::new(conn, Duration::from_secs(5))
+    }
+
+    #[tokio::test]
+    async fn pagination_validation_works() {
+        assert!(PageRequest { page: 0, size: 10 }.validate().is_err());
+        assert!(PageRequest { page: 1, size: 0 }.validate().is_err());
+        assert!(PageRequest { page: 1, size: 251 }.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn service_returns_paginated_payload() {
+        let cache = make_cache().await;
+        let svc = LedgerEntryServiceImpl::new(MockRepo, cache);
+
+        let tenant = uuid::Uuid::new_v4();
+        let req = PageRequest { page: 2, size: 25 };
+
+        let result = svc.list_entries(tenant, req).await.expect("svc error");
+        assert_eq!(result.data.len(), 25);
+        assert_eq!(result.meta.page, 2);
+        assert_eq!(result.meta.size, 25);
+        assert_eq!(result.meta.total, 500);
+        assert!(result.meta.has_next);
+    }
+}
+```

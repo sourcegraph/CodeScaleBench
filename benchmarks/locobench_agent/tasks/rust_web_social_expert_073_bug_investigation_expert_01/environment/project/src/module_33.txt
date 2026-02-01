@@ -1,0 +1,374 @@
+```rust
+//! src/module_33.rs
+//!
+//! Learning Pulse domain module.
+//!
+//! This encapsulates the domain model, repository implementation,
+//! service layer, and event‐publisher glue for the “Learning Pulse”
+//! feature inside EduPulse Live.
+//!
+//! The code demonstrates several architectural concepts used across
+//! the code-base: Service layer, Repository pattern, event emission,
+//! and async database / broker integrations.
+//!
+//! ┌──────────────────────────────────────────────────┐
+//! │ Teacher creates a Pulse (REST endpoint → Service)│
+//! └──────────────────────────────────────────────────┘
+//!                    │
+//!            +-------▼---------+
+//!            | PulseService     |
+//!            +------------------+
+//!   ┌create─►| Repo.create()    |────────────┐
+//!   │        |                  |            │
+//!   │        | Publisher.publish(event)      │
+//!   │        +------------------+            │
+//!   │                    │                  ▼
+//!   │          +---------▼--------+  +---------------+
+//!   │          | Postgres ledger  |  | RabbitMQ/Kafka|
+//!   │          +------------------+  +---------------+
+//!   │                                          │
+//!   └───────────────────────────────────────────┘
+//!
+//! Down-stream workers subscribe to PulseCreated events to perform
+//! search indexing, scoring bootstrap, notification fan-out, etc.
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use lapin::{
+    options::BasicPublishOptions,
+    BasicProperties, Channel, ExchangeKind,
+};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgQueryResult, PgPool, Postgres, QueryBuilder};
+use thiserror::Error;
+use tokio::time::timeout;
+use uuid::Uuid;
+
+/// Domain model for a “Learning Pulse”
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningPulse {
+    pub id: Uuid,
+    pub title: String,
+    pub description: String,
+    pub teacher_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// DTO required to create a new Pulse
+#[derive(Debug, Clone)]
+pub struct NewPulse<'a> {
+    pub title: &'a str,
+    pub description: &'a str,
+    pub teacher_id: Uuid,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Event envelope published to the broker.
+///
+/// In real production code we would version this schema and add tracing
+/// correlation identifiers; for the sake of brevity we only include the
+/// basics here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DomainEvent {
+    PulseCreated(PulseCreated),
+}
+
+/// Payload for the PulseCreated event
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseCreated {
+    pub pulse_id: Uuid,
+    pub teacher_id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+}
+
+/// Custom error hierarchy for the module
+#[derive(Error, Debug)]
+pub enum PulseError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("event broker error: {0}")]
+    Broker(#[from] lapin::Error),
+
+    #[error("pulse not found (id = {0})")]
+    NotFound(Uuid),
+
+    #[error("operation timed out")]
+    Timeout,
+}
+
+/// Repository abstraction
+#[async_trait]
+pub trait PulseRepository: Send + Sync {
+    async fn create(&self, new_pulse: &NewPulse<'_>) -> Result<LearningPulse, PulseError>;
+    async fn find_by_id(&self, id: Uuid) -> Result<LearningPulse, PulseError>;
+}
+
+/// Event publisher abstraction
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, event: &DomainEvent) -> Result<(), PulseError>;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                         Postgres-backed Repository                         */
+/* -------------------------------------------------------------------------- */
+
+pub struct PgPulseRepository {
+    pool: PgPool,
+}
+
+impl PgPulseRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl PulseRepository for PgPulseRepository {
+    async fn create(&self, new_pulse: &NewPulse<'_>) -> Result<LearningPulse, PulseError> {
+        // SQLx query builder gives us compile-time checked SQL.
+        let mut builder: QueryBuilder<Postgres> =
+            QueryBuilder::new("INSERT INTO learning_pulses ");
+        builder.push("(id, title, description, teacher_id, created_at, expires_at)")
+            .push(" VALUES (")
+            .push_bind(Uuid::new_v4())
+            .push(", ")
+            .push_bind(new_pulse.title)
+            .push(", ")
+            .push_bind(new_pulse.description)
+            .push(", ")
+            .push_bind(new_pulse.teacher_id)
+            .push(", ")
+            .push_bind(Utc::now())
+            .push(", ")
+            .push_bind(new_pulse.expires_at)
+            .push(") RETURNING id, title, description, teacher_id, created_at, expires_at");
+
+        let pulse = builder
+            .build_query_as::<LearningPulse>()
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(pulse)
+    }
+
+    async fn find_by_id(&self, id: Uuid) -> Result<LearningPulse, PulseError> {
+        let pulse = sqlx::query_as!(
+            LearningPulse,
+            r#"
+            SELECT id, title, description, teacher_id, created_at, expires_at
+            FROM learning_pulses
+            WHERE id = $1
+            "#,
+            id
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        pulse.ok_or(PulseError::NotFound(id))
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                          RabbitMQ Event Publisher                          */
+/* -------------------------------------------------------------------------- */
+
+const DEFAULT_EXCHANGE: &str = "edu_pulse_domain_events";
+
+pub struct RabbitMqPublisher {
+    channel: Channel,
+}
+
+impl RabbitMqPublisher {
+    pub fn new(channel: Channel) -> Self {
+        Self { channel }
+    }
+
+    async fn ensure_exchange(&self) -> Result<(), lapin::Error> {
+        self.channel
+            .exchange_declare(
+                DEFAULT_EXCHANGE,
+                ExchangeKind::Topic,
+                lapin::options::ExchangeDeclareOptions {
+                    durable: true,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl EventPublisher for RabbitMqPublisher {
+    async fn publish(&self, event: &DomainEvent) -> Result<(), PulseError> {
+        // Lazily declare the exchange. If it already exists,
+        // RabbitMQ will simply acknowledge.
+        self.ensure_exchange().await?;
+
+        let routing_key = match event {
+            DomainEvent::PulseCreated(_) => "pulse.created",
+        };
+
+        let payload = serde_json::to_vec(event).expect("serialization never fails");
+
+        self.channel
+            .basic_publish(
+                DEFAULT_EXCHANGE,
+                routing_key,
+                BasicPublishOptions::default(),
+                &payload,
+                BasicProperties::default().with_content_type("application/json".into()),
+            )
+            .await?
+            .await?; // Wait for broker confirmation.
+
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              Service Layer                                 */
+/* -------------------------------------------------------------------------- */
+
+pub struct PulseService<R: PulseRepository, P: EventPublisher> {
+    repo: R,
+    publisher: P,
+    broker_timeout: Duration,
+}
+
+impl<R: PulseRepository, P: EventPublisher> PulseService<R, P> {
+    pub fn new(repo: R, publisher: P) -> Self {
+        Self {
+            repo,
+            publisher,
+            broker_timeout: Duration::from_secs(5),
+        }
+    }
+
+    /// Create a Pulse and broadcast a `PulseCreated` domain event.
+    ///
+    /// The method is transactional at the application level. If the event
+    /// cannot be published within [`broker_timeout`], the database insert is
+    /// **not** rolled back (best-effort), but the caller is informed through
+    /// an error.
+    pub async fn create_pulse(&self, new: &NewPulse<'_>) -> Result<LearningPulse, PulseError> {
+        let pulse = self.repo.create(new).await?;
+
+        let event = DomainEvent::PulseCreated(PulseCreated {
+            pulse_id: pulse.id,
+            teacher_id: pulse.teacher_id,
+            occurred_at: Utc::now(),
+        });
+
+        // We don't want to await forever; use `tokio::time::timeout`.
+        timeout(self.broker_timeout, self.publisher.publish(&event))
+            .await
+            .map_err(|_| PulseError::Timeout)??;
+
+        Ok(pulse)
+    }
+
+    pub async fn get(&self, id: Uuid) -> Result<LearningPulse, PulseError> {
+        self.repo.find_by_id(id).await
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                   Tests                                    */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// In-memory mock repository for unit tests
+    struct InMemoryRepo {
+        inner: Arc<Mutex<Vec<LearningPulse>>>,
+    }
+
+    impl InMemoryRepo {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PulseRepository for InMemoryRepo {
+        async fn create(&self, new_pulse: &NewPulse<'_>) -> Result<LearningPulse, PulseError> {
+            let pulse = LearningPulse {
+                id: Uuid::new_v4(),
+                title: new_pulse.title.to_string(),
+                description: new_pulse.description.to_string(),
+                teacher_id: new_pulse.teacher_id,
+                created_at: Utc::now(),
+                expires_at: new_pulse.expires_at,
+            };
+            self.inner.lock().await.push(pulse.clone());
+            Ok(pulse)
+        }
+
+        async fn find_by_id(&self, id: Uuid) -> Result<LearningPulse, PulseError> {
+            let vec = self.inner.lock().await;
+            vec.iter()
+                .find(|p| p.id == id)
+                .cloned()
+                .ok_or(PulseError::NotFound(id))
+        }
+    }
+
+    /// In-memory publisher that records outgoing events
+    struct VecPublisher {
+        events: Arc<Mutex<Vec<DomainEvent>>>,
+    }
+
+    impl VecPublisher {
+        fn new() -> Self {
+            Self {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EventPublisher for VecPublisher {
+        async fn publish(&self, event: &DomainEvent) -> Result<(), PulseError> {
+            self.events.lock().await.push(event.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_pulse_emits_event() {
+        let repo = InMemoryRepo::new();
+        let publisher = VecPublisher::new();
+        let service = PulseService::new(repo, publisher.clone());
+
+        let teacher_id = Uuid::new_v4();
+        let new = NewPulse {
+            title: "Test Pulse",
+            description: "Describe the mitochondria.",
+            teacher_id,
+            expires_at: None,
+        };
+
+        let pulse = service.create_pulse(&new).await.unwrap();
+
+        // Verify pulse fields
+        assert_eq!(pulse.title, new.title);
+        // Verify event dispatch
+        let events = publisher.events.lock().await;
+        assert_eq!(events.len(), 1);
+        matches!(events[0], DomainEvent::PulseCreated(_));
+    }
+}
+```

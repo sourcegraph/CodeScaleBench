@@ -1,0 +1,436 @@
+```rust
+//! src/module_20.rs
+//! -----------------------------------------------------------------------------
+//! Hyperparameter-Tuning & Experiment-Tracking subsystem for VisuTility
+//! Orchestrator.  This module lives inside the `Feature Ops / Model Ops` layers
+//! and is responsible for proposing hyper-parameter candidates, capturing their
+//! evaluation metrics, and broadcasting events that can be consumed by other
+//! system components (e.g. the automated-retraining daemon).
+//!
+//! Architectural patterns used
+//! ---------------------------
+//! • Strategy Pattern – concrete `Tuner` implementations (Grid, Random, …) share
+//!   a common `Tuner` trait.
+//! • Factory Pattern  – `TunerFactory` produces a concrete strategy at runtime
+//!   from high-level configuration.
+//! • Observer Pattern – `EventBus` enables decoupled metric listeners.
+//!
+//! External crates (add to Cargo.toml)
+//! -----------------------------------
+//! rand        = "0.8"
+//! serde       = { version = "1", features = ["derive"] }
+//! thiserror   = "1"
+//! chrono      = { version = "0.4", features = ["serde"] }
+//! log         = "0.4"
+//! parking_lot = "0.12"
+//! -----------------------------------------------------------------------------
+//! NOTE:  This file purposefully avoids referencing any “deep-learny” code; the
+//!        idea is that a caller feeds candidates to a model-training routine
+//!        and then invokes `update_result` with an obtained metric.
+//! -----------------------------------------------------------------------------
+
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fs::{File, OpenOptions},
+    io::{BufWriter, Write},
+    path::Path,
+    sync::Arc,
+};
+
+use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
+use rand::{seq::SliceRandom, Rng};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Result alias to simplify signatures throughout this module.
+type Result<T> = std::result::Result<T, TuningError>;
+
+/// Domain-level errors surfaced by the hyper-parameter sub-system.
+#[derive(Debug, Error)]
+pub enum TuningError {
+    #[error("parameter `{0}` is missing")]
+    MissingParameter(String),
+
+    #[error("exhausted parameter space")]
+    ExhaustedSpace,
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("serialization error: {0}")]
+    SerdeJson(#[from] serde_json::Error),
+}
+
+/// Primitive value supported in the parameter space.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ParamValue {
+    Int(i64),
+    Float(f64),
+    Str(String),
+}
+
+impl std::fmt::Display for ParamValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParamValue::Int(v) => write!(f, "{v}"),
+            ParamValue::Float(v) => write!(f, "{v:.4}"),
+            ParamValue::Str(v) => write!(f, "{v}"),
+        }
+    }
+}
+
+/// Parameter search space definition.  Each parameter maps to a set of allowed
+/// values.  Non-unique vectors are tolerated (for weighted search in future).
+pub type ParamSpace = HashMap<String, Vec<ParamValue>>;
+
+/// A concrete candidate (single point) sampled from the parameter space.
+pub type Candidate = BTreeMap<String, ParamValue /* ordered for stable hashing */>;
+
+/// ----------------------------------------------------------------------------
+/// Strategy Pattern: core trait implemented by concrete tuners.
+/// ----------------------------------------------------------------------------
+pub trait Tuner: Send {
+    /// Produce the next candidate to evaluate.
+    fn next_candidate(&mut self) -> Result<Candidate>;
+
+    /// Notify the tuner that `score` (e.g. validation loss) was obtained for
+    /// `candidate`.  The tuner may use this information for adaptive search.
+    fn update_result(&mut self, candidate: &Candidate, score: f64) -> Result<()>;
+}
+
+/// ----------------------------------------------------------------------------
+/// Grid-Search implementation
+/// ----------------------------------------------------------------------------
+pub struct GridSearchTuner {
+    space: ParamSpace,
+    cursor: Vec<usize>,
+    finished: bool,
+}
+
+impl GridSearchTuner {
+    pub fn new(space: ParamSpace) -> Self {
+        let cursor = vec![0; space.len()];
+        Self {
+            space,
+            cursor,
+            finished: false,
+        }
+    }
+
+    /// Helper for mapping the internal cursor into a concrete `Candidate`.
+    fn cursor_to_candidate(&self) -> Candidate {
+        let mut cand = Candidate::new();
+        for ((key, values), idx) in self.space.iter().zip(self.cursor.iter()) {
+            cand.insert(key.clone(), values[*idx].clone());
+        }
+        cand
+    }
+
+    /// Advances the multi-dimensional cursor.  Returns `false` if wrapped-around
+    /// and the entire grid was already enumerated.
+    fn increment_cursor(&mut self) -> bool {
+        for (dim_idx, (_, values)) in self.space.iter().enumerate().rev() {
+            let limit = values.len();
+            self.cursor[dim_idx] += 1;
+            if self.cursor[dim_idx] < limit {
+                return true; // simple increment in this dimension
+            } else {
+                self.cursor[dim_idx] = 0; // carry-over to higher dimension
+            }
+        }
+        false // all dimensions wrapped
+    }
+}
+
+impl Tuner for GridSearchTuner {
+    fn next_candidate(&mut self) -> Result<Candidate> {
+        if self.finished {
+            return Err(TuningError::ExhaustedSpace);
+        }
+        let cand = self.cursor_to_candidate();
+        if !self.increment_cursor() {
+            self.finished = true;
+        }
+        Ok(cand)
+    }
+
+    fn update_result(&mut self, _candidate: &Candidate, _score: f64) -> Result<()> {
+        // Grid search is exhaustive & non-adaptive → nothing to do.
+        Ok(())
+    }
+}
+
+/// ----------------------------------------------------------------------------
+/// Random-Search implementation
+/// ----------------------------------------------------------------------------
+pub struct RandomSearchTuner {
+    space: ParamSpace,
+    seen_hashes: HashSet<u64>, // prevent duplicates
+    max_trials: Option<usize>,
+}
+
+impl RandomSearchTuner {
+    pub fn new(space: ParamSpace, max_trials: Option<usize>) -> Self {
+        Self {
+            space,
+            seen_hashes: HashSet::new(),
+            max_trials,
+        }
+    }
+
+    fn sample_candidate<R: Rng + ?Sized>(&self, rng: &mut R) -> Candidate {
+        let mut cand = Candidate::new();
+        for (k, vals) in &self.space {
+            let choice = vals.choose(rng).expect("non-empty param values");
+            cand.insert(k.clone(), choice.clone());
+        }
+        cand
+    }
+}
+
+impl Tuner for RandomSearchTuner {
+    fn next_candidate(&mut self) -> Result<Candidate> {
+        if let Some(limit) = self.max_trials {
+            if self.seen_hashes.len() >= limit {
+                return Err(TuningError::ExhaustedSpace);
+            }
+        }
+
+        let mut rng = rand::thread_rng();
+        for _ in 0..1000 {
+            let cand = self.sample_candidate(&mut rng);
+            let hash = fxhash::hash64(&cand);
+            if self.seen_hashes.insert(hash) {
+                return Ok(cand);
+            }
+        }
+        Err(TuningError::ExhaustedSpace)
+    }
+
+    fn update_result(&mut self, _candidate: &Candidate, _score: f64) -> Result<()> {
+        // Could implement adaptive sampling (Bayesian etc.) later.
+        Ok(())
+    }
+}
+
+/// ----------------------------------------------------------------------------
+/// Factory Pattern: create concrete tuner from a lightweight config enum.
+/// ----------------------------------------------------------------------------
+#[derive(Clone, Debug)]
+pub enum TunerKind {
+    Grid,
+    Random { max_trials: Option<usize> },
+}
+
+pub struct TunerFactory;
+
+impl TunerFactory {
+    pub fn build(kind: TunerKind, space: ParamSpace) -> Box<dyn Tuner> {
+        match kind {
+            TunerKind::Grid => Box::new(GridSearchTuner::new(space)),
+            TunerKind::Random { max_trials } => Box::new(RandomSearchTuner::new(space, max_trials)),
+        }
+    }
+}
+
+/// ----------------------------------------------------------------------------
+/// Observer Pattern: EventBus for publishing & subscribing to metric events.
+/// ----------------------------------------------------------------------------
+
+/// Event emitted after a trial is finished.
+#[derive(Clone, Debug, Serialize)]
+pub struct TrialFinishedEvent {
+    pub candidate: Candidate,
+    pub score: f64,
+    pub finished_at: DateTime<Utc>,
+}
+
+/// Simple, in-process event bus backed by `parking_lot::RwLock`.
+#[derive(Default)]
+pub struct EventBus {
+    listeners: RwLock<Vec<Arc<dyn Fn(&TrialFinishedEvent) + Send + Sync>>>,
+}
+
+impl EventBus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Subscribe a listener callback.  Returns a handle that can be `drop`ped to
+    /// unsubscribe (implemented via `Arc` ref-counting).
+    pub fn subscribe<F>(&self, listener: F) -> Arc<dyn Fn(&TrialFinishedEvent) + Send + Sync>
+    where
+        F: Fn(&TrialFinishedEvent) + Send + Sync + 'static,
+    {
+        let arc = Arc::new(listener);
+        self.listeners.write().push(arc.clone());
+        arc
+    }
+
+    pub fn dispatch(&self, evt: TrialFinishedEvent) {
+        for listener in self.listeners.read().iter() {
+            listener(&evt);
+        }
+    }
+}
+
+/// ----------------------------------------------------------------------------
+/// Experiment Tracker
+/// ----------------------------------------------------------------------------
+pub trait ExperimentTracker: Send + Sync {
+    fn log_trial(&self, evt: &TrialFinishedEvent) -> Result<()>;
+}
+
+/// Tracker that appends each trial as JSON to a local file.
+/// Suitable for on-prem installations without an external tracking service.
+pub struct LocalFileTracker {
+    file: RwLock<BufWriter<File>>,
+}
+
+impl LocalFileTracker {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        Ok(Self {
+            file: RwLock::new(BufWriter::new(file)),
+        })
+    }
+}
+
+impl ExperimentTracker for LocalFileTracker {
+    fn log_trial(&self, evt: &TrialFinishedEvent) -> Result<()> {
+        let mut writer = self.file.write();
+        serde_json::to_writer(&mut *writer, evt)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        Ok(())
+    }
+}
+
+/// ----------------------------------------------------------------------------
+/// Glue-code tying everything together.
+/// ----------------------------------------------------------------------------
+pub struct HyperparameterRunner {
+    tuner: Box<dyn Tuner>,
+    bus: Arc<EventBus>,
+    trackers: Vec<Arc<dyn ExperimentTracker>>,
+}
+
+impl HyperparameterRunner {
+    pub fn new(
+        tuner: Box<dyn Tuner>,
+        bus: Arc<EventBus>,
+        trackers: Vec<Arc<dyn ExperimentTracker>>,
+    ) -> Self {
+        Self {
+            tuner,
+            bus,
+            trackers,
+        }
+    }
+
+    /// Blocking loop that pulls a candidate, executes user-provided evaluation
+    /// closure, and then broadcasts / logs the result.
+    pub fn run<Evaluate>(&mut self, mut eval_fn: Evaluate) -> Result<()>
+    where
+        Evaluate: FnMut(&Candidate) -> Result<f64>,
+    {
+        loop {
+            let cand = match self.tuner.next_candidate() {
+                Ok(c) => c,
+                Err(TuningError::ExhaustedSpace) => break,
+                Err(e) => return Err(e),
+            };
+
+            let score = eval_fn(&cand)?;
+            self.tuner.update_result(&cand, score)?;
+
+            let evt = TrialFinishedEvent {
+                candidate: cand,
+                score,
+                finished_at: Utc::now(),
+            };
+
+            // Send to event bus
+            self.bus.dispatch(evt.clone());
+
+            // Persist via trackers
+            for t in &self.trackers {
+                if let Err(e) = t.log_trial(&evt) {
+                    // non-fatal: log and keep going
+                    log::warn!("Experiment-tracker error: {e}");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// ----------------------------------------------------------------------------
+/// Convenience hash implementation for Candidate using `fxhash` for speed.
+/// ----------------------------------------------------------------------------
+mod fxhash {
+    #![allow(clippy::unseparated_literal_suffix)]
+    // 64-bit Fowler–Noll–Vo hash adapted for quick & dirty deduplication.
+    pub fn hash64(candidate: &super::Candidate) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for (k, v) in candidate {
+            for byte in k.as_bytes().iter().chain(v.to_string().as_bytes()) {
+                hash ^= *byte as u64;
+                hash = hash.wrapping_mul(0x00000100000001b3);
+            }
+        }
+        hash
+    }
+}
+
+/// ----------------------------------------------------------------------------
+/// Unit tests
+/// ----------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_space() -> ParamSpace {
+        HashMap::from([
+            ("lr".into(), vec![0.1.into(), 0.01.into(), 0.001.into()]),
+            ("batch".into(), vec![16.into(), 32.into(), 64.into()]),
+        ])
+    }
+
+    impl From<f64> for ParamValue {
+        fn from(v: f64) -> Self {
+            ParamValue::Float(v)
+        }
+    }
+    impl From<i64> for ParamValue {
+        fn from(v: i64) -> Self {
+            ParamValue::Int(v)
+        }
+    }
+
+    #[test]
+    fn grid_search_enumerates_all() {
+        let mut tuner = GridSearchTuner::new(dummy_space());
+        let mut count = 0;
+        while tuner.next_candidate().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 9);
+    }
+
+    #[test]
+    fn random_search_respects_trial_limit() {
+        let mut tuner = RandomSearchTuner::new(dummy_space(), Some(5));
+        let mut count = 0;
+        while tuner.next_candidate().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 5);
+    }
+}
+```

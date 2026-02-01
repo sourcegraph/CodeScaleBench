@@ -1,0 +1,381 @@
+```rust
+//! LedgerLink Nexus – Ledger Entry Query Service
+//!
+//! This module implements the `LedgerEntryQueryService`, a façade between the
+//! transport layer (REST / GraphQL Resolvers) and the domain‐driven
+//! `LedgerEntryRepository`.  Its main responsibilities are:
+//!
+//! 1. Enforcing request validation (tenant scoping, filter sanity checks)
+//! 2. Performing paginated look-ups with count queries
+//! 3. Leveraging a read-through Redis cache to reduce Postgres load
+//! 4. Emitting structured logs for observability
+//! 5. Returning DTO/View Models that are decoupled from domain entities
+//!
+//! NOTE:  Because LedgerLink Nexus is a distributed system, the service never
+//! writes to the cache directly when mutations occur.  Instead, it relies on
+//! domain events published by the Command side to trigger cache invalidation.
+//!
+//! The implementation below purposefully keeps repository and cache backends
+//! generic so that they can be replaced with mocks in unit tests.
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use log::{debug, error, info, trace, warn};
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::time::Duration;
+use thiserror::Error;
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+//
+// ──────────────────────────────────────────────────────────────────────────────
+//  Domain / Repository abstractions
+// ──────────────────────────────────────────────────────────────────────────────
+//
+
+/// A minimal representation of a ledger entry in the domain layer
+#[derive(Debug, Clone)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub tenant_id: String,
+    pub ledger_account: String,
+    pub amount: rust_decimal::Decimal,
+    pub currency: String,
+    pub booked_at: DateTime<Utc>,
+}
+
+/// Repository-level error type
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("database error: {0}")]
+    Database(String),
+    #[error("record not found")]
+    NotFound,
+    #[error("unknown repository error")]
+    Unknown,
+}
+
+/// Pagination cursor
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct Pagination {
+    #[validate(range(min = 1, max = 500))]
+    pub limit: u32,
+
+    /// 0-based page index
+    #[validate(custom = "validate_page_index")]
+    pub page: u32,
+}
+
+fn validate_page_index(n: &u32) -> Result<(), ValidationError> {
+    if *n > 100_000 {
+        return Err(ValidationError::new("page_out_of_bounds"));
+    }
+    Ok(())
+}
+
+/// Paginated response envelope
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Paginated<T> {
+    pub data: Vec<T>,
+    pub total: u64,
+    pub page: u32,
+    pub pages: u32,
+}
+
+/// Repository interface – implemented by the Postgres persistence layer
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    async fn fetch_entries(
+        &self,
+        tenant_id: &str,
+        filter: &LedgerEntryFilter,
+        pagination: &Pagination,
+    ) -> Result<Vec<LedgerEntry>, RepositoryError>;
+
+    async fn count_entries(
+        &self,
+        tenant_id: &str,
+        filter: &LedgerEntryFilter,
+    ) -> Result<u64, RepositoryError>;
+}
+
+/// Generic cache backend (e.g. Redis)
+#[async_trait]
+pub trait CacheBackend: Send + Sync {
+    async fn get<T: serde::de::DeserializeOwned + Send>(&self, key: &str) -> Result<Option<T>, CacheError>;
+    async fn set<T: serde::Serialize + Send>(&self, key: &str, value: &T, ttl: Duration) -> Result<(), CacheError>;
+}
+
+/// Cache-level error type
+#[derive(Debug, Error)]
+pub enum CacheError {
+    #[error("redis error: {0}")]
+    Redis(String),
+    #[error("serialization error: {0}")]
+    Serialization(String),
+    #[error("unknown cache error")]
+    Unknown,
+}
+
+//
+// ──────────────────────────────────────────────────────────────────────────────
+//  DTO / ViewModel layer
+// ──────────────────────────────────────────────────────────────────────────────
+//
+
+/// Client-provided filter
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct LedgerEntryFilter {
+    /// Optional ledger account code (e.g. “AR”)
+    #[validate(length(min = 1, max = 64))]
+    pub account: Option<String>,
+
+    /// ISO 4217
+    #[validate(length(equal = 3))]
+    pub currency: Option<String>,
+
+    /// Inclusive range start (RFC3339)
+    pub booked_from: Option<DateTime<Utc>>,
+
+    /// Inclusive range end (RFC3339)
+    pub booked_to: Option<DateTime<Utc>>,
+}
+
+/// Public ViewModel that the API gateway serializes back to clients
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEntryView {
+    pub id: Uuid,
+    pub account: String,
+    pub amount: rust_decimal::Decimal,
+    pub currency: String,
+    pub booked_at: DateTime<Utc>,
+}
+
+impl From<LedgerEntry> for LedgerEntryView {
+    fn from(e: LedgerEntry) -> Self {
+        Self {
+            id: e.id,
+            account: e.ledger_account,
+            amount: e.amount,
+            currency: e.currency,
+            booked_at: e.booked_at,
+        }
+    }
+}
+
+//
+// ──────────────────────────────────────────────────────────────────────────────
+//  Service-level error handling
+// ──────────────────────────────────────────────────────────────────────────────
+//
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation failed: {0}")]
+    Validation(#[from] validator::ValidationErrors),
+    #[error("repository error: {0}")]
+    Repository(#[from] RepositoryError),
+    #[error("cache error: {0}")]
+    Cache(#[from] CacheError),
+    #[error("internal service error")]
+    Internal,
+}
+
+impl ServiceError {
+    /// Determines if the error is retryable (idempotent read operation)
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, ServiceError::Repository(_) | ServiceError::Cache(_))
+    }
+}
+
+//
+// ──────────────────────────────────────────────────────────────────────────────
+//  LedgerEntryQueryService implementation
+// ──────────────────────────────────────────────────────────────────────────────
+//
+
+/// Read-side application service for ledger entries
+pub struct LedgerEntryQueryService<R, C> {
+    repo: R,
+    cache: C,
+    ttl: Duration,
+}
+
+impl<R, C> LedgerEntryQueryService<R, C>
+where
+    R: LedgerEntryRepository,
+    C: CacheBackend,
+{
+    pub fn new(repo: R, cache: C, ttl: Duration) -> Self {
+        Self { repo, cache, ttl }
+    }
+
+    /// Perform a paginated search with read-through cache.
+    ///
+    /// Cache key is derived from tenant id, filter hash and pagination tuple.
+    pub async fn find(
+        &self,
+        tenant_id: &str,
+        filter: LedgerEntryFilter,
+        pagination: Pagination,
+    ) -> Result<Paginated<LedgerEntryView>, ServiceError> {
+        // Validate incoming user parameters
+        filter.validate()?;
+        pagination.validate()?;
+
+        let cache_key = Self::cache_key(tenant_id, &filter, &pagination);
+
+        // Attempt to retrieve from cache
+        if let Some(cached) = self.cache.get::<Paginated<LedgerEntryView>>(&cache_key).await? {
+            trace!(target: "service::ledger_query", "cache hit tenant={} key={}", tenant_id, cache_key);
+            return Ok(cached);
+        }
+        trace!(target: "service::ledger_query", "cache miss tenant={} key={}", tenant_id, cache_key);
+
+        // Fallback to repository
+        let entries = self
+            .repo
+            .fetch_entries(tenant_id, &filter, &pagination)
+            .await?;
+
+        let total = self.repo.count_entries(tenant_id, &filter).await?;
+
+        // Convert to ViewModel
+        let data: Vec<LedgerEntryView> = entries.into_iter().map(Into::into).collect();
+
+        let pages = ((total as f64) / (pagination.limit as f64)).ceil() as u32;
+
+        let response = Paginated {
+            data,
+            total,
+            page: pagination.page,
+            pages,
+        };
+
+        // Cache the result
+        if let Err(e) = self.cache.set(&cache_key, &response, self.ttl).await {
+            warn!(target: "service::ledger_query", "cache put failed: {:?}", e);
+        }
+
+        Ok(response)
+    }
+
+    fn cache_key(tenant_id: &str, filter: &LedgerEntryFilter, pagination: &Pagination) -> String {
+        // Use a stable hash – here we rely on serde_json for brevity
+        let filter_json = serde_json::to_string(filter).unwrap_or_default();
+        let hash = blake3::hash(filter_json.as_bytes());
+        format!(
+            "ledger:{}:{}:{}:{}",
+            tenant_id, hash, pagination.page, pagination.limit
+        )
+    }
+}
+
+//
+// ──────────────────────────────────────────────────────────────────────────────
+//  Unit tests (compile-time only / mocking)
+// ──────────────────────────────────────────────────────────────────────────────
+//
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    struct MockRepo {
+        records: Vec<LedgerEntry>,
+    }
+
+    #[async_trait]
+    impl LedgerEntryRepository for MockRepo {
+        async fn fetch_entries(
+            &self,
+            _: &str,
+            _: &LedgerEntryFilter,
+            pagination: &Pagination,
+        ) -> Result<Vec<LedgerEntry>, RepositoryError> {
+            let start = (pagination.page * pagination.limit) as usize;
+            let end = ((pagination.page + 1) * pagination.limit) as usize;
+            Ok(self.records[start..end.min(self.records.len())].to_vec())
+        }
+
+        async fn count_entries(
+            &self,
+            _: &str,
+            _: &LedgerEntryFilter,
+        ) -> Result<u64, RepositoryError> {
+            Ok(self.records.len() as u64)
+        }
+    }
+
+    struct MockCache {
+        inner: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+    }
+
+    impl MockCache {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(Mutex::new(Default::default())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CacheBackend for MockCache {
+        async fn get<T: serde::de::DeserializeOwned + Send>(&self, key: &str) -> Result<Option<T>, CacheError> {
+            let map = self.inner.lock().await;
+            if let Some(bin) = map.get(key) {
+                let v = bincode::deserialize::<T>(bin).map_err(|e| CacheError::Serialization(e.to_string()))?;
+                Ok(Some(v))
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn set<T: serde::Serialize + Send>(&self, key: &str, value: &T, _: Duration) -> Result<(), CacheError> {
+            let mut map = self.inner.lock().await;
+            let bin = bincode::serialize(value).map_err(|e| CacheError::Serialization(e.to_string()))?;
+            map.insert(key.to_owned(), bin);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_find_success_paginated_with_cache() {
+        let repo = MockRepo {
+            records: (0..10)
+                .map(|i| LedgerEntry {
+                    id: Uuid::new_v4(),
+                    tenant_id: "t1".into(),
+                    ledger_account: "AR".into(),
+                    amount: rust_decimal::Decimal::new(1000 + i, 2),
+                    currency: "USD".into(),
+                    booked_at: Utc::now(),
+                })
+                .collect(),
+        };
+
+        let cache = MockCache::new();
+        let service = LedgerEntryQueryService::new(repo, cache, Duration::from_secs(60));
+
+        let filter = LedgerEntryFilter {
+            account: None,
+            currency: None,
+            booked_from: None,
+            booked_to: None,
+        };
+
+        let pagination = Pagination { limit: 5, page: 0 };
+
+        // First call -> repo + cache store
+        let first = service.find("t1", filter.clone(), pagination.clone()).await.unwrap();
+        assert_eq!(first.data.len(), 5);
+
+        // Second call -> cache hit
+        let second = service.find("t1", filter, pagination).await.unwrap();
+        assert_eq!(second.data.len(), 5);
+    }
+}
+```

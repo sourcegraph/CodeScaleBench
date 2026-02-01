@@ -1,0 +1,403 @@
+```rust
+//! module_27 – Enrichment Orchestrator
+//!
+//! This module implements the run-time pluggable enrichment pipeline that
+//! powers ChirpPulse’s real-time social sentiment lake.  A registry of
+//! `EnrichmentStrategy`s can be (un)registered at run-time, enabling data
+//! scientists to hot-swap algorithms without redeploying micro-services.
+//!
+//! The orchestrator asynchronously consumes `SocialEvent`s from an upstream
+//! message queue (Kafka in production, but any `Stream<Item = SocialEvent>`
+//! will do), fans-out processing across registered strategies, merges the
+//! results, and publishes an `EnrichedEvent` downstream.
+//!
+//! Production-grade concerns addressed here:
+//!   • Cancellation safety & graceful shutdown (`shutdown` trigger)
+//!   • Back-pressure via a bounded channel
+//!   • Metrics / structured logging through `tracing`
+//!   • Robust error handling with typed errors
+//!   • Thread-safe shared registry powered by `DashMap`
+//!
+//! NOTE: Networking and external service calls (e.g. to a ML inference
+//!       cluster) are mocked for brevity.
+
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
+use futures::{future::join_all, stream::StreamExt};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc},
+    task::JoinHandle,
+    time::timeout,
+};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Maximum time a strategy may take before the orchestrator aborts it.
+const STRATEGY_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// Bounded size for the internal event queue.
+const CHANNEL_DEPTH: usize = 1_024;
+
+/// Domain object representing a raw social event on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialEvent {
+    pub id: String,
+    pub author: String,
+    pub text: String,
+    #[serde(with = "ts_millis")]
+    pub created_at: SystemTime,
+}
+
+/// Generic enrichment key/value.
+pub type Enrichment = serde_json::Map<String, serde_json::Value>;
+
+/// Output object published downstream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichedEvent {
+    pub source: SocialEvent,
+    pub enrichments: Enrichment,
+}
+
+/// Custom timestamp (de)serializer for millisecond precision.
+mod ts_millis {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(ts: &SystemTime, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let millis = ts
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_millis() as u64;
+        s.serialize_u64(millis)
+    }
+
+    pub fn deserialize<'de, D>(d: D) -> Result<SystemTime, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let ms = u64::deserialize(d)?;
+        Ok(UNIX_EPOCH + Duration::from_millis(ms))
+    }
+}
+
+/// Failure modes for individual strategies.
+#[derive(Debug, Error)]
+pub enum StrategyError {
+    #[error("model inference failed: {0}")]
+    Inference(String),
+
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("timeout")]
+    Timeout,
+
+    #[error("unknown: {0}")]
+    Other(String),
+}
+
+/// Failure modes for the orchestrator itself.
+#[derive(Debug, Error)]
+pub enum OrchestratorError {
+    #[error(transparent)]
+    Strategy(#[from] StrategyError),
+
+    #[error("channel closed")]
+    ChannelClosed,
+
+    #[error("shutdown requested")]
+    Shutdown,
+
+    #[error("task join error: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
+/// Runtime pluggable enrichment strategy.
+///
+/// Implementations are required to be `Send + Sync` so they may be shared
+/// across tokio worker threads.  A real implementation might call out to a
+/// TensorFlow serving cluster, make an HTTP request, or reference an on-disk
+/// model; here we use a toy implementation for illustration.
+#[async_trait]
+pub trait EnrichmentStrategy: Send + Sync + 'static {
+    /// Human-readable identifier for logging & registry keys.
+    fn name(&self) -> &'static str;
+
+    /// Attempts to enrich the event, returning a partial `Enrichment`.
+    ///
+    /// The orchestrator will merge the individual strategy outputs into a
+    /// single document.  Returning `Ok(None)` indicates that the strategy
+    /// deliberately produced no output (e.g. unsupported language).
+    async fn enrich(&self, event: &SocialEvent) -> Result<Option<Enrichment>, StrategyError>;
+}
+
+/// Thread-safe registry for run-time strategy hot-swapping.
+#[derive(Debug, Default)]
+pub struct StrategyRegistry {
+    strategies: DashMap<String, Arc<dyn EnrichmentStrategy>>,
+}
+
+impl StrategyRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers or replaces a strategy.
+    pub fn register<S>(&self, strategy: S)
+    where
+        S: EnrichmentStrategy,
+    {
+        let key = strategy.name().to_lowercase();
+        self.strategies.insert(key, Arc::new(strategy));
+        info!(strategy = %key, "strategy registered");
+    }
+
+    /// Removes a strategy from the registry.
+    pub fn unregister(&self, name: &str) {
+        self.strategies.remove(name);
+        info!(strategy = %name, "strategy unregistered");
+    }
+
+    /// Snapshot of the current strategies.
+    pub fn snapshot(&self) -> Vec<Arc<dyn EnrichmentStrategy>> {
+        self.strategies.iter().map(|s| Arc::clone(s.value())).collect()
+    }
+}
+
+/// Orchestrates ingestion, fan-out enrichment, and publication.
+pub struct EnrichmentOrchestrator {
+    input_rx: mpsc::Receiver<SocialEvent>,
+    output_tx: mpsc::Sender<EnrichedEvent>,
+    registry: StrategyRegistry,
+    shutdown_rx: broadcast::Receiver<()>,
+}
+
+/// Builder for `EnrichmentOrchestrator`.
+pub struct OrchestratorBuilder {
+    registry: StrategyRegistry,
+    shutdown_rx: broadcast::Receiver<()>,
+}
+
+impl OrchestratorBuilder {
+    pub fn new(shutdown_rx: broadcast::Receiver<()>) -> Self {
+        Self {
+            registry: StrategyRegistry::new(),
+            shutdown_rx,
+        }
+    }
+
+    pub fn with_strategy<S>(mut self, strategy: S) -> Self
+    where
+        S: EnrichmentStrategy,
+    {
+        self.registry.register(strategy);
+        self
+    }
+
+    pub fn build(
+        self,
+    ) -> (
+        EnrichmentOrchestrator,
+        mpsc::Sender<SocialEvent>,
+        mpsc::Receiver<EnrichedEvent>,
+    ) {
+        let (in_tx, in_rx) = mpsc::channel(CHANNEL_DEPTH);
+        let (out_tx, out_rx) = mpsc::channel(CHANNEL_DEPTH);
+        (
+            EnrichmentOrchestrator {
+                input_rx: in_rx,
+                output_tx: out_tx,
+                registry: self.registry,
+                shutdown_rx: self.shutdown_rx,
+            },
+            in_tx,
+            out_rx,
+        )
+    }
+}
+
+impl EnrichmentOrchestrator {
+    /// Starts the main processing loop.  Returns when shutdown is requested
+    /// or an unrecoverable error occurs.
+    #[instrument(skip(self))]
+    pub async fn run(mut self) -> Result<(), OrchestratorError> {
+        loop {
+            select! {
+                _ = self.shutdown_rx.recv() => {
+                    info!("shutdown signal received");
+                    return Err(OrchestratorError::Shutdown);
+                }
+                maybe_event = self.input_rx.recv() => {
+                    let event = maybe_event.ok_or(OrchestratorError::ChannelClosed)?;
+                    debug!(event_id = %event.id, "received event");
+                    let record = self.handle_event(event).await?;
+                    self.output_tx
+                        .send(record)
+                        .await
+                        .map_err(|_| OrchestratorError::ChannelClosed)?;
+                }
+            }
+        }
+    }
+
+    #[instrument(skip(self, event))]
+    async fn handle_event(&self, event: SocialEvent) -> Result<EnrichedEvent, OrchestratorError> {
+        let strategies = self.registry.snapshot();
+        let mut tasks: Vec<JoinHandle<_>> = Vec::with_capacity(strategies.len());
+
+        for strat in strategies {
+            let e = event.clone();
+            tasks.push(tokio::spawn(async move {
+                let name = strat.name();
+                let result = timeout(STRATEGY_TIMEOUT, strat.enrich(&e)).await;
+                match result {
+                    Ok(Ok(enrichment)) => Ok((name, enrichment)),
+                    Ok(Err(e)) => Err((name, StrategyError::from(e))),
+                    Err(_) => Err((name, StrategyError::Timeout)),
+                }
+            }));
+        }
+
+        let mut merged = Enrichment::new();
+
+        for handle in tasks {
+            match handle.await? {
+                Ok((name, Some(partial))) => {
+                    debug!(strategy = %name, "enrichment succeeded");
+                    merged.extend(partial);
+                }
+                Ok((name, None)) => {
+                    debug!(strategy = %name, "no enrichment produced");
+                }
+                Err((name, err)) => {
+                    warn!(strategy = %name, %err, "enrichment failed");
+                    // Continue processing; per-strategy failures are tolerated.
+                }
+            }
+        }
+
+        Ok(EnrichedEvent {
+            source: event,
+            enrichments: merged,
+        })
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Built-in demo strategies                                                  */
+/* ------------------------------------------------------------------------- */
+
+/// Toy sentiment analysis strategy using naive rules.
+pub struct NaiveSentiment;
+
+#[async_trait]
+impl EnrichmentStrategy for NaiveSentiment {
+    fn name(&self) -> &'static str {
+        "naive_sentiment"
+    }
+
+    async fn enrich(&self, event: &SocialEvent) -> Result<Option<Enrichment>, StrategyError> {
+        // Simulate heavy computation.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let score = if event.text.contains("love") {
+            1.0
+        } else if event.text.contains("hate") {
+            -1.0
+        } else {
+            0.0
+        };
+
+        let mut map = Enrichment::new();
+        map.insert("sentiment_score".into(), serde_json::json!(score));
+        Ok(Some(map))
+    }
+}
+
+/// Toy language detector based on the presence of unicode ranges.
+pub struct SimpleLangDetect;
+
+#[async_trait]
+impl EnrichmentStrategy for SimpleLangDetect {
+    fn name(&self) -> &'static str {
+        "simple_lang_detect"
+    }
+
+    async fn enrich(&self, event: &SocialEvent) -> Result<Option<Enrichment>, StrategyError> {
+        use unicode_script::{Script, UnicodeScript};
+
+        let mut counts = std::collections::HashMap::<Script, usize>::new();
+        for ch in event.text.chars() {
+            *counts.entry(ch.script()).or_default() += 1;
+        }
+
+        let lang = if counts.keys().any(|s| *s == Script::Cyrillic) {
+            "ru"
+        } else if counts.keys().any(|s| *s == Script::Han) {
+            "zh"
+        } else {
+            "en"
+        };
+
+        let mut map = Enrichment::new();
+        map.insert("language".into(), serde_json::json!(lang));
+        Ok(Some(map))
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Example Entrypoint (could be removed in library context)                  */
+/* ------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::broadcast;
+
+    #[tokio::test]
+    async fn integration_flow_works() {
+        tracing_subscriber::fmt::try_init().ok();
+
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let builder = OrchestratorBuilder::new(shutdown_rx)
+            .with_strategy(NaiveSentiment)
+            .with_strategy(SimpleLangDetect);
+        let (orch, in_tx, mut out_rx) = builder.build();
+
+        let orch_handle = tokio::spawn(async move { orch.run().await });
+
+        // Simulate producer
+        in_tx
+            .send(SocialEvent {
+                id: "42".into(),
+                author: "alice".into(),
+                text: "I love Rust 🦀!".into(),
+                created_at: SystemTime::now(),
+            })
+            .await
+            .unwrap();
+
+        // Verify output
+        let enriched = out_rx.recv().await.unwrap();
+        assert_eq!(enriched.source.id, "42");
+        assert!(enriched.enrichments.contains_key("sentiment_score"));
+        assert!(enriched.enrichments.contains_key("language"));
+
+        // Shutdown orchestrator
+        shutdown_tx.send(()).unwrap();
+        orch_handle.await.unwrap().unwrap_err(); // Expect Shutdown
+    }
+}
+```

@@ -1,0 +1,463 @@
+```rust
+//! LedgerLink Nexus – Module 41
+//!
+//! Ledger Entry Query Service + DTOs, Validation, Pagination & Caching.
+//!
+//! In the real code-base this module would live at
+//! `src/services/ledger/query.rs`, but for the purpose of this
+//! exercise it is delivered as `src/module_41.txt`.
+//!
+//! Dependencies (crates):
+//!   - async_trait
+//!   - chrono
+//!   - deadpool_redis
+//!   - futures
+//!   - redis
+//!   - serde
+//!   - serde_json
+//!   - thiserror
+//!   - tokio
+//!   - tracing
+//!   - uuid
+//!   - validator
+//!
+//! All external types are re-exported here through `use` statements so this
+//! file is self-contained and ready to compile (assuming Cargo.toml contains
+//! the listed crates).
+
+#![allow(clippy::missing_docs_in_private_items)]
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use deadpool_redis::{redis::AsyncCommands, Config as RedisConfig, Connection, Pool};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::Mutex;
+use tracing::{debug, instrument, warn};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+/* ------------------------------------------------------------------------------------------------
+ * Error Types
+ * --------------------------------------------------------------------------------------------- */
+
+/// Module-wide error type returned to callers.  
+/// Each variant is converted to a proper HTTP / GraphQL error envelope at the
+/// API-gateway boundary (not shown here).
+#[derive(Debug, Error)]
+pub enum LedgerQueryError {
+    #[error("validation failed: {0}")]
+    Validation(String),
+
+    #[error("unauthorized (tenant_id = {tenant_id})")]
+    Unauthorized { tenant_id: Uuid },
+
+    #[error("repository error: {0}")]
+    Repository(#[from] RepositoryError),
+
+    #[error("cache error: {0}")]
+    Cache(String),
+
+    #[error("internal server error: {0}")]
+    Internal(String),
+}
+
+/// Errors coming from persistence/repository layer.
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("database connection pool exhausted")]
+    PoolExhausted,
+
+    #[error("database query error: {0}")]
+    Query(String),
+
+    #[error("unknown repository error")]
+    Unknown,
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Domain Model
+ * --------------------------------------------------------------------------------------------- */
+
+/// Immutable domain model representing a single ledger entry.
+/// In production this would live in `domain::ledger::model`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub account_id: Uuid,
+    pub amount: f64,
+    pub currency: String,
+    pub booked_at: DateTime<Utc>,
+    pub narrative: String,
+    // … many more bookkeeping fields omitted
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Data Transfer Objects (DTOs) – validated inbound/outbound structures
+ * --------------------------------------------------------------------------------------------- */
+
+/// Query parameters accepted by `GET /tenants/:id/ledger_entries`
+///
+/// Validation derives are applied immediately in the handler so that
+/// only well-formed requests hit the service layer.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct LedgerEntriesQuery {
+    #[validate(range(min = 1, max = 500))]
+    pub page_size: Option<u32>,
+
+    #[validate(range(min = 1))]
+    pub page: Option<u32>,
+
+    /// Optional filter by account.
+    pub account_id: Option<Uuid>,
+
+    /// Optional booked-at date range (Unix timestamps, inclusive).
+    #[validate(custom = "validate_from_to")]
+    pub booked_from: Option<i64>,
+    pub booked_to: Option<i64>,
+}
+
+/// Custom validator to ensure `from` <= `to` when both present.
+fn validate_from_to(query: &LedgerEntriesQuery) -> Result<(), ValidationError> {
+    if let (Some(from), Some(to)) = (query.booked_from, query.booked_to) {
+        if from > to {
+            return Err(ValidationError::new("booked_from_after_booked_to"));
+        }
+    }
+    Ok(())
+}
+
+/// Generic paginated response envelope.
+#[derive(Debug, Clone, Serialize)]
+pub struct Paginated<T> {
+    pub data: Vec<T>,
+    pub page: u32,
+    pub page_size: u32,
+    pub total: u64,
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Repository Layer
+ * --------------------------------------------------------------------------------------------- */
+
+/// Abstract repository interface for ledger entries.
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    /// Returns `(entries, total_count)`
+    async fn fetch(
+        &self,
+        tenant_id: Uuid,
+        query: &LedgerEntriesQuery,
+    ) -> Result<(Vec<LedgerEntry>, u64), RepositoryError>;
+}
+
+/// Dummy in-memory implementation (for tests / examples).
+pub struct InMemoryLedgerRepository {
+    // Wrapped in a mutex for interior mut in tests;
+    // not required for real database repositories.
+    data: Mutex<HashMap<Uuid, Vec<LedgerEntry>>>,
+}
+
+impl InMemoryLedgerRepository {
+    pub fn with_seed(entries: Vec<LedgerEntry>) -> Self {
+        let mut map: HashMap<Uuid, Vec<LedgerEntry>> = HashMap::new();
+        for entry in entries {
+            map.entry(entry.tenant_id).or_default().push(entry);
+        }
+        Self {
+            data: Mutex::new(map),
+        }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for InMemoryLedgerRepository {
+    async fn fetch(
+        &self,
+        tenant_id: Uuid,
+        query: &LedgerEntriesQuery,
+    ) -> Result<(Vec<LedgerEntry>, u64), RepositoryError> {
+        let data = self.data.lock().await;
+        let tenant_entries = data.get(&tenant_id).cloned().unwrap_or_default();
+
+        // Filtering
+        let filtered: Vec<LedgerEntry> = tenant_entries
+            .into_iter()
+            .filter(|e| {
+                if let Some(acc) = query.account_id {
+                    if e.account_id != acc {
+                        return false;
+                    }
+                }
+
+                if let Some(from) = query.booked_from {
+                    if e.booked_at.timestamp() < from {
+                        return false;
+                    }
+                }
+                if let Some(to) = query.booked_to {
+                    if e.booked_at.timestamp() > to {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
+        let total = filtered.len() as u64;
+
+        // Pagination
+        let page_size = query.page_size.unwrap_or(50);
+        let page = query.page.unwrap_or(1);
+        let start = ((page - 1) * page_size) as usize;
+        let end = start + page_size as usize;
+        let paged = filtered
+            .into_iter()
+            .skip(start)
+            .take(page_size as usize)
+            .collect();
+
+        Ok((paged, total))
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Caching Layer (Redis)
+ * --------------------------------------------------------------------------------------------- */
+
+/// Thin wrapper around a Redis cache connection pool.
+#[derive(Clone)]
+pub struct Cache {
+    pool: Pool,
+}
+
+impl Cache {
+    pub fn new(redis_cfg: RedisConfig) -> Result<Self, LedgerQueryError> {
+        let pool = redis_cfg
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .map_err(|e| LedgerQueryError::Cache(e.to_string()))?;
+        Ok(Self { pool })
+    }
+
+    async fn get_conn(&self) -> Result<Connection, LedgerQueryError> {
+        self.pool
+            .get()
+            .await
+            .map_err(|e| LedgerQueryError::Cache(e.to_string()))
+    }
+
+    /// Retrieve cached JSON as `Vec<LedgerEntry>` if present.
+    async fn get_cached(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<LedgerEntry>, u64)>, LedgerQueryError> {
+        let mut conn = self.get_conn().await?;
+        let json: Option<String> = conn.get(key).await.map_err(|e| {
+            warn!("redis GET failed: {e}");
+            LedgerQueryError::Cache(e.to_string())
+        })?;
+        if let Some(raw) = json {
+            let parsed: (Vec<LedgerEntry>, u64) = serde_json::from_str(&raw).map_err(|e| {
+                LedgerQueryError::Internal(format!("cache deserialization failed: {e}"))
+            })?;
+            Ok(Some(parsed))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Cache entries for `ttl` seconds.
+    async fn set_cached(
+        &self,
+        key: &str,
+        value: &(Vec<LedgerEntry>, u64),
+        ttl: Duration,
+    ) -> Result<(), LedgerQueryError> {
+        let mut conn = self.get_conn().await?;
+        let serialized = serde_json::to_string(value).map_err(|e| {
+            LedgerQueryError::Internal(format!("cache serialization failed: {e}"))
+        })?;
+        conn.set_ex(key, serialized, ttl.as_secs() as usize)
+            .await
+            .map_err(|e| LedgerQueryError::Cache(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Service Layer
+ * --------------------------------------------------------------------------------------------- */
+
+/// Facade encapsulating the query use-case.
+#[derive(Clone)]
+pub struct LedgerEntryService<R: LedgerEntryRepository + 'static> {
+    repository: Arc<R>,
+    cache: Option<Cache>,
+}
+
+impl<R: LedgerEntryRepository + 'static> LedgerEntryService<R> {
+    pub fn new(repository: R, cache: Option<Cache>) -> Self {
+        Self {
+            repository: Arc::new(repository),
+            cache,
+        }
+    }
+
+    /// Build function-scoped cache key.
+    fn build_cache_key(tenant_id: Uuid, q: &LedgerEntriesQuery) -> String {
+        // Hash the query object for uniqueness.  
+        // For brevity we use JSON; in prod you'd want a faster binary hash.
+        let query_json =
+            serde_json::to_string(q).expect("LedgerEntriesQuery should always serialize");
+        format!("ledger_entries:{tenant_id}:{:x}", md5::compute(query_json))
+    }
+
+    /// Authorize request (placeholder). In real system this would validate JWT
+    /// scopes, tenant isolation, etc.
+    fn authorize(tenant_id: Uuid, caller_tenant_id: Uuid) -> Result<(), LedgerQueryError> {
+        if tenant_id != caller_tenant_id {
+            return Err(LedgerQueryError::Unauthorized {
+                tenant_id: caller_tenant_id,
+            });
+        }
+        Ok(())
+    }
+
+    /// Public entrypoint used by REST/GraphQL controllers.
+    #[instrument(skip(self, caller_tenant_id))]
+    pub async fn query_ledger_entries(
+        &self,
+        caller_tenant_id: Uuid,
+        tenant_id: Uuid,
+        query: LedgerEntriesQuery,
+    ) -> Result<Paginated<LedgerEntry>, LedgerQueryError> {
+        // 1) AuthZ
+        Self::authorize(tenant_id, caller_tenant_id)?;
+
+        // 2) Validate
+        query
+            .validate()
+            .map_err(|e| LedgerQueryError::Validation(e.to_string()))?;
+
+        // 3) Caching
+        let cache_key = Self::build_cache_key(tenant_id, &query);
+        if let Some(cache) = &self.cache {
+            if let Some((entries, total)) = cache.get_cached(&cache_key).await? {
+                debug!("cache hit: {}", cache_key);
+                return Ok(Self::map_to_paginated(entries, total, &query));
+            }
+        }
+
+        // 4) Repository call
+        let (entries, total) = self.repository.fetch(tenant_id, &query).await?;
+
+        // 5) Persist to cache
+        if let Some(cache) = &self.cache {
+            cache
+                .set_cached(&cache_key, &(entries.clone(), total), Duration::from_secs(30))
+                .await?;
+        }
+
+        // 6) Map to DTO
+        Ok(Self::map_to_paginated(entries, total, &query))
+    }
+
+    fn map_to_paginated(
+        entries: Vec<LedgerEntry>,
+        total: u64,
+        query: &LedgerEntriesQuery,
+    ) -> Paginated<LedgerEntry> {
+        Paginated {
+            data: entries,
+            page: query.page.unwrap_or(1),
+            page_size: query.page_size.unwrap_or(50),
+            total,
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Demonstration / Smoke Test (to be run under `cargo test`)
+ * --------------------------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+    use uuid::Uuid;
+
+    // Helper to create dummy entries
+    fn generate_entries(tenant_id: Uuid, count: usize) -> Vec<LedgerEntry> {
+        let account_id = Uuid::new_v4();
+        (0..count)
+            .map(|i| LedgerEntry {
+                id: Uuid::new_v4(),
+                tenant_id,
+                account_id,
+                amount: 100.0 + i as f64,
+                currency: "USD".into(),
+                booked_at: Utc::now() - ChronoDuration::days(i as i64),
+                narrative: format!("Entry {i}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn query_entries_pagination() {
+        let tenant_id = Uuid::new_v4();
+        let repos = InMemoryLedgerRepository::with_seed(generate_entries(tenant_id, 120));
+
+        // No cache for this test.
+        let service = LedgerEntryService::new(repos, None);
+
+        let query = LedgerEntriesQuery {
+            page: Some(2),
+            page_size: Some(50),
+            account_id: None,
+            booked_from: None,
+            booked_to: None,
+        };
+
+        let result = service
+            .query_ledger_entries(tenant_id, tenant_id, query.clone())
+            .await
+            .expect("query should succeed");
+
+        assert_eq!(result.page, 2);
+        assert_eq!(result.page_size, 50);
+        assert_eq!(result.data.len(), 50);
+        assert_eq!(result.total, 120);
+        // First item of page 2 is index 50
+        assert_eq!(result.data[0].narrative, "Entry 50");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_access_should_fail() {
+        let tenant_id = Uuid::new_v4();
+        let repos = InMemoryLedgerRepository::with_seed(Vec::new());
+        let service = LedgerEntryService::new(repos, None);
+
+        let query = LedgerEntriesQuery {
+            page: Some(1),
+            page_size: Some(10),
+            account_id: None,
+            booked_from: None,
+            booked_to: None,
+        };
+
+        let wrong_tenant = Uuid::new_v4();
+        let err = service
+            .query_ledger_entries(wrong_tenant, tenant_id, query)
+            .await
+            .expect_err("should be unauthorized");
+        matches!(err, LedgerQueryError::Unauthorized { .. });
+    }
+}
+```

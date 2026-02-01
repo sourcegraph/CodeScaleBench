@@ -1,0 +1,352 @@
+```rust
+//! src/module_60.txt
+//!
+//! Windowed social–sentiment aggregation service.
+//!
+//! This module ingests sentiment-scored events from a Kafka topic and publishes
+//! per-window aggregates into an internal channel (which could be further wired
+//! to another Kafka producer or Iceberg sink).  The implementation showcases
+//! • stream processing with rdkafka + Tokio,
+//! • pluggable windowing strategies (Strategy Pattern),
+//! • in-memory state with punctual eviction,
+//! • basic data-quality checks and observability hooks.
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use futures::{stream::StreamExt, FutureExt};
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    message::BorrowedMessage,
+    ClientConfig, Message,
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::{
+    select,
+    sync::{mpsc, Notify, RwLock},
+    time,
+};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Kafka topic that carries individual sentiment-scored messages.
+const INPUT_TOPIC: &str = "sentiment-scores";
+/// How often we check for expired windows.
+const EVICTION_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Input model coming from the enrichment pipeline.
+#[derive(Debug, Deserialize)]
+struct SocialSentimentEvent {
+    event_id: String,
+    user_id: String,
+    platform: String,
+    text: String,
+    /// Unix epoch milli
+    timestamp: u64,
+    /// Normalized range [-1.0, +1.0]
+    sentiment_score: f32,
+    language: String,
+}
+
+/// Aggregate result to be published downstream.
+#[derive(Debug, Serialize)]
+pub struct WindowAggregate {
+    window_start: u64,
+    window_end: u64,
+    platform: String,
+    language: String,
+    sample_size: u64,
+    mean_sentiment: f32,
+    min_sentiment: f32,
+    max_sentiment: f32,
+}
+
+/// Strategy Pattern: how do we assign an event to a time window?
+pub trait WindowStrategy: Send + Sync + 'static {
+    /// Given an event timestamp (milliseconds), return the window start.
+    fn window_start(&self, event_ts: u64) -> u64;
+    /// Given the start, derive the window end (exclusive).
+    fn window_end(&self, window_start: u64) -> u64;
+}
+
+/// Fixed (tumbling) windows of constant duration.
+#[derive(Clone)]
+pub struct FixedWindowStrategy {
+    window_size: Duration,
+}
+
+impl FixedWindowStrategy {
+    pub fn new(window_size: Duration) -> Self {
+        Self { window_size }
+    }
+}
+
+impl WindowStrategy for FixedWindowStrategy {
+    fn window_start(&self, event_ts: u64) -> u64 {
+        let size_ms = self.window_size.as_millis() as u64;
+        event_ts - (event_ts % size_ms)
+    }
+
+    fn window_end(&self, window_start: u64) -> u64 {
+        window_start + self.window_size.as_millis() as u64
+    }
+}
+
+/// Internal accumulator for statistics.
+#[derive(Default, Clone)]
+struct Stats {
+    count: u64,
+    sum: f64,
+    min: f32,
+    max: f32,
+}
+
+impl Stats {
+    fn update(&mut self, score: f32) {
+        self.count += 1;
+        self.sum += score as f64;
+        if self.count == 1 {
+            self.min = score;
+            self.max = score;
+        } else {
+            self.min = self.min.min(score);
+            self.max = self.max.max(score);
+        }
+    }
+
+    fn mean(&self) -> f32 {
+        if self.count == 0 {
+            0.0
+        } else {
+            (self.sum / self.count as f64) as f32
+        }
+    }
+}
+
+/// Key for the HashMap: window_start + dimension values.
+#[derive(Hash, Eq, PartialEq, Debug, Clone)]
+struct BucketKey {
+    win_start: u64,
+    platform: String,
+    language: String,
+}
+
+impl BucketKey {
+    fn new(win_start: u64, platform: &str, language: &str) -> Self {
+        Self {
+            win_start,
+            platform: platform.to_owned(),
+            language: language.to_owned(),
+        }
+    }
+}
+
+/// Thread-safe in-memory state.  Wrap in Arc<RwLock<..>> to share between tasks.
+type State = Arc<RwLock<HashMap<BucketKey, Stats>>>;
+
+/// Orchestrates Kafka ingestion, aggregation and eviction.
+pub struct WindowAggregator<S: WindowStrategy> {
+    strategy: S,
+    state: State,
+    shutdown: Arc<Notify>,
+    /// Channel where completed window aggregates are sent.
+    pub output_tx: mpsc::Sender<WindowAggregate>,
+}
+
+impl<S: WindowStrategy> WindowAggregator<S> {
+    pub fn new(strategy: S, output_tx: mpsc::Sender<WindowAggregate>) -> Self {
+        Self {
+            strategy,
+            state: Arc::default(),
+            shutdown: Arc::new(Notify::new()),
+            output_tx,
+        }
+    }
+
+    /// Public signal to gracefully terminate background tasks.
+    pub fn trigger_shutdown(&self) {
+        self.shutdown.notify_waiters();
+    }
+
+    /// Spawn the async worker pool (Kafka consumer + eviction loop).
+    pub async fn run(self) -> Result<()> {
+        let consumer_task = self.clone().kafka_consumer_loop().fuse();
+        let eviction_task = self.clone().eviction_loop().fuse();
+        futures::pin_mut!(consumer_task, eviction_task);
+
+        select! {
+            res = consumer_task => res,
+            res = eviction_task => res,
+        }
+    }
+
+    /// Continuously poll Kafka and update in-memory stats.
+    #[instrument(skip(self))]
+    async fn kafka_consumer_loop(self) -> Result<()> {
+        let consumer = create_consumer()?;
+        consumer.subscribe(&[INPUT_TOPIC]).context("subscribe")?;
+
+        let mut stream = consumer.stream();
+        loop {
+            select! {
+                _ = self.shutdown.notified() => {
+                    info!("Consumer loop received shutdown");
+                    return Ok(())
+                }
+                maybe_msg = stream.next() => match maybe_msg {
+                    Some(Ok(msg)) => {
+                        if let Err(e) = self.process_message(&msg).await {
+                            // We log malformed messages but keep the stream alive.
+                            warn!(error = ?e, "Failed to process message");
+                        }
+                    }
+                    Some(Err(e)) => warn!("Kafka error: {e:?}"),
+                    None => {
+                        warn!("Kafka stream ended unexpectedly");
+                        return Ok(())
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every EVICTION_INTERVAL, we check for windows that have passed and flush them.
+    #[instrument(skip(self))]
+    async fn eviction_loop(self) -> Result<()> {
+        let mut ticker = time::interval(EVICTION_INTERVAL);
+        loop {
+            select! {
+                _ = self.shutdown.notified() => {
+                    info!("Eviction loop received shutdown");
+                    return Ok(())
+                }
+                _ = ticker.tick() => {
+                    let now_ms = current_epoch_ms();
+                    let mut to_publish = Vec::new();
+
+                    {
+                        let mut guard = self.state.write().await;
+                        let keys: Vec<_> = guard.keys().cloned().collect();
+                        for key in keys {
+                            let end = self.strategy.window_end(key.win_start);
+                            if end <= now_ms {
+                                if let Some(stats) = guard.remove(&key) {
+                                    to_publish.push((key, end, stats));
+                                }
+                            }
+                        }
+                    }
+
+                    // Publish outside the lock
+                    for (key, window_end, stats) in to_publish {
+                        let agg = WindowAggregate {
+                            window_start: key.win_start,
+                            window_end,
+                            platform: key.platform,
+                            language: key.language,
+                            sample_size: stats.count,
+                            mean_sentiment: stats.mean(),
+                            min_sentiment: stats.min,
+                            max_sentiment: stats.max,
+                        };
+                        if let Err(e) = self.output_tx.send(agg).await {
+                            error!(error=?e, "output channel closed");
+                            return Err(anyhow::anyhow!("output channel closed"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Deserialize the Kafka message and update stats.
+    async fn process_message(&self, msg: &BorrowedMessage<'_>) -> Result<()> {
+        let payload = msg.payload().context("empty payload")?;
+        let event: SocialSentimentEvent =
+            serde_json::from_slice(payload).context("invalid JSON")?;
+
+        // Data quality gate
+        if !( -1.0..=1.0 ).contains(&event.sentiment_score) {
+            anyhow::bail!("sentiment out of range");
+        }
+
+        let win_start = self.strategy.window_start(event.timestamp);
+        let key = BucketKey::new(win_start, &event.platform, &event.language);
+
+        let mut guard = self.state.write().await;
+        let stats = guard.entry(key).or_default();
+        stats.update(event.sentiment_score);
+        Ok(())
+    }
+}
+
+impl<S: WindowStrategy> Clone for WindowAggregator<S>
+where
+    S: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            strategy: self.strategy.clone(),
+            state: Arc::clone(&self.state),
+            shutdown: Arc::clone(&self.shutdown),
+            output_tx: self.output_tx.clone(),
+        }
+    }
+}
+
+/// Convenience util to build a configured Kafka consumer.
+fn create_consumer() -> Result<StreamConsumer> {
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("group.id", "chirppulse-window-aggregator")
+        .set("bootstrap.servers", "localhost:9092")
+        .set("enable.partition.eof", "false")
+        .set("enable.auto.commit", "true")
+        .create()
+        .context("create consumer")?;
+    Ok(consumer)
+}
+
+/// Current epoch milliseconds as u64.
+fn current_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock goes backwards")
+        .as_millis() as u64
+}
+
+/// Example entrypoint for local testing.  In production this would be in a
+/// dedicated `bin` crate.
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
+    let (tx, mut rx) = mpsc::channel::<WindowAggregate>(1024);
+    let aggregator = WindowAggregator::new(FixedWindowStrategy::new(Duration::from_secs(60)), tx);
+
+    // Spawn a task that prints finished windows (placeholder for real sink).
+    tokio::spawn(async move {
+        while let Some(agg) = rx.recv().await {
+            let start = DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_millis(agg.window_start));
+            let end = DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_millis(agg.window_end));
+            info!(
+                "Aggregate [{start} - {end}] platform={} lang={} avg={:.3} n={}",
+                agg.platform, agg.language, agg.mean_sentiment, agg.sample_size
+            );
+        }
+    });
+
+    // Handle Ctrl-C shutdown.
+    let shutdown_handle = aggregator.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            info!("Ctrl-C received – initiating shutdown");
+            shutdown_handle.trigger_shutdown();
+        }
+    });
+
+    aggregator.run().await
+}
+```

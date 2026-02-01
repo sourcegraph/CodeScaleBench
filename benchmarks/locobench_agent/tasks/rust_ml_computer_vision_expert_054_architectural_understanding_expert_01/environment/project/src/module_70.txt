@@ -1,0 +1,384 @@
+```rust
+//! VisuTility Orchestrator – Model-Monitoring & Auto-Retraining sub-module
+//!
+//! This module lives in the `Utility Ops` layer and wires together the
+//! Observer, Strategy, and Factory patterns in order to provide completely
+//! decoupled **model-monitoring** and **auto-retraining** capabilities.
+//!
+//! High-level overview
+//! -------------------
+//! 1. A `MonitoringSubject` publishes `MetricsEvent`s on a non-blocking channel.
+//! 2. One or more `RetrainingObserver`s subscribe to that channel.
+//! 3. Each observer is parametrised with a concrete `RetrainingPolicy`
+//!    selected at runtime by a small factory (`PolicyFactory`).
+//! 4. When the policy signals that retraining is required, a message is sent
+//!    to the *Model-Ops* layer via a typed command bus (here represented by the
+//!    `RetrainCmdSender`).
+//!
+//! The entire flow is zero-copy, thread-safe, and cancellation-friendly.
+
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use crossbeam_channel::{bounded, select, tick, Receiver, Sender};
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
+
+///============================================================================
+/// Domain types
+///============================================================================
+
+/// A point-in-time snapshot of model-performance or data-quality metrics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsEvent {
+    pub model_id: String,
+    pub timestamp: Instant,
+    /// Concept drift score as reported by the data-drift detector.
+    pub drift_score: f32,
+    /// Rolling window accuracy estimate.
+    pub accuracy: f32,
+    /// Any additional, backend-specific metadata.
+    pub meta: serde_json::Value,
+}
+
+/// Commands understood by the Model-Ops layer.
+#[derive(Debug, Clone)]
+pub enum RetrainCommand {
+    /// Full retraining from scratch.
+    Full { model_id: String },
+    /// Fine-tune on recent batches.
+    FineTune { model_id: String },
+}
+
+/// Convenience alias; in production this is likely backed by an async
+/// message-broker, but a `crossbeam_channel::Sender` is plenty for demo.
+pub type RetrainCmdSender = Sender<RetrainCommand>;
+
+///============================================================================
+/// Strategy Pattern – Retraining Policies
+///============================================================================
+
+/// Behaviour shared by all re-training decision policies.
+pub trait RetrainingPolicy: Send + Sync {
+    /// Decides whether or not a `MetricsEvent` warrants retraining.
+    fn evaluate(&self, event: &MetricsEvent) -> PolicyOutcome;
+}
+
+/// The result of a policy evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyOutcome {
+    NoOp,
+    FineTune,
+    FullRetrain,
+}
+
+/// Simple threshold-based policy; useful as a baseline.
+pub struct StaticThresholdPolicy {
+    max_allowed_drift: f32,
+    min_required_accuracy: f32,
+}
+
+impl StaticThresholdPolicy {
+    pub fn new(max_allowed_drift: f32, min_required_accuracy: f32) -> Self {
+        Self {
+            max_allowed_drift,
+            min_required_accuracy,
+        }
+    }
+}
+
+impl RetrainingPolicy for StaticThresholdPolicy {
+    fn evaluate(&self, event: &MetricsEvent) -> PolicyOutcome {
+        if event.drift_score > self.max_allowed_drift {
+            PolicyOutcome::FullRetrain
+        } else if event.accuracy < self.min_required_accuracy {
+            PolicyOutcome::FineTune
+        } else {
+            PolicyOutcome::NoOp
+        }
+    }
+}
+
+/// Concept-drift aware policy using a rolling window of recent scores.  
+/// Illustrates a more advanced implementation with state.
+pub struct DriftWindowPolicy {
+    window: sliding_window::SlidingWindow<f32>,
+    drift_threshold: f32,
+}
+
+impl DriftWindowPolicy {
+    pub fn new(capacity: usize, drift_threshold: f32) -> Self {
+        Self {
+            window: sliding_window::SlidingWindow::new(capacity),
+            drift_threshold,
+        }
+    }
+}
+
+impl RetrainingPolicy for DriftWindowPolicy {
+    fn evaluate(&self, event: &MetricsEvent) -> PolicyOutcome {
+        let mean_drift = self.window.mean().unwrap_or(0.0);
+        if mean_drift > self.drift_threshold {
+            PolicyOutcome::FullRetrain
+        } else {
+            PolicyOutcome::NoOp
+        }
+    }
+}
+
+/// Simple circular buffer for numeric types – small helper.
+/// In a real code-base this lives in its own crate.
+mod sliding_window {
+    use std::collections::VecDeque;
+
+    pub struct SlidingWindow<T> {
+        data: VecDeque<T>,
+        capacity: usize,
+    }
+
+    impl<T> SlidingWindow<T>
+    where
+        T: Copy + Into<f64>,
+    {
+        pub fn new(capacity: usize) -> Self {
+            Self {
+                data: VecDeque::with_capacity(capacity),
+                capacity,
+            }
+        }
+
+        pub fn push(&mut self, value: T) {
+            if self.data.len() == self.capacity {
+                self.data.pop_front();
+            }
+            self.data.push_back(value);
+        }
+
+        pub fn mean(&self) -> Option<f32> {
+            if self.data.is_empty() {
+                return None;
+            }
+            let sum: f64 = self.data.iter().map(|&v| v.into()).sum();
+            Some((sum / self.data.len() as f64) as f32)
+        }
+    }
+}
+
+///============================================================================
+/// Factory Pattern – Policy instantiation
+///============================================================================
+
+#[derive(Debug, Clone, Deserialize)]
+pub enum PolicyKind {
+    StaticThreshold,
+    DriftWindow,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PolicyConfig {
+    pub kind: PolicyKind,
+    pub drift_threshold: Option<f32>,
+    pub accuracy_threshold: Option<f32>,
+    pub window_size: Option<usize>,
+}
+
+pub struct PolicyFactory;
+
+impl PolicyFactory {
+    pub fn build(cfg: &PolicyConfig) -> Arc<dyn RetrainingPolicy> {
+        match cfg.kind {
+            PolicyKind::StaticThreshold => {
+                let drift = cfg.drift_threshold.unwrap_or(0.3);
+                let acc = cfg.accuracy_threshold.unwrap_or(0.9);
+                Arc::new(StaticThresholdPolicy::new(drift, acc))
+            }
+            PolicyKind::DriftWindow => {
+                let drift = cfg.drift_threshold.unwrap_or(0.3);
+                let capacity = cfg.window_size.unwrap_or(500);
+                Arc::new(DriftWindowPolicy::new(capacity, drift))
+            }
+        }
+    }
+}
+
+///============================================================================
+/// Observer Pattern – From metrics to retraining commands
+///============================================================================
+
+/// A subject that emits `MetricsEvent`s to subscribed observers.
+pub struct MonitoringSubject {
+    tx: Sender<MetricsEvent>,
+}
+
+impl MonitoringSubject {
+    pub fn new() -> (Self, Receiver<MetricsEvent>) {
+        let (tx, rx) = bounded::<MetricsEvent>(1_024);
+        (Self { tx }, rx)
+    }
+
+    /// Push a new metrics event into the stream.
+    pub fn publish(&self, event: MetricsEvent) -> Result<()> {
+        self.tx
+            .send(event)
+            .context("failed to publish MetricsEvent")
+    }
+}
+
+/// Observer which listens to `MetricsEvent` and triggers appropriate
+/// `RetrainCommand`s using the injected `RetrainingPolicy`.
+pub struct RetrainingObserver {
+    policy: Arc<dyn RetrainingPolicy>,
+    metrics_rx: Receiver<MetricsEvent>,
+    cmd_tx: RetrainCmdSender,
+    /// Graceful shutdown coordination.
+    shutdown: Arc<AtomicBool>,
+}
+
+impl RetrainingObserver {
+    pub fn spawn(
+        policy: Arc<dyn RetrainingPolicy>,
+        metrics_rx: Receiver<MetricsEvent>,
+        cmd_tx: RetrainCmdSender,
+    ) -> Self {
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        {
+            let policy = Arc::clone(&policy);
+            let rx = metrics_rx.clone();
+            let cmd_tx = cmd_tx.clone();
+            let shutdown_flag = Arc::clone(&shutdown);
+
+            thread::Builder::new()
+                .name("retraining-observer".into())
+                .spawn(move || {
+                    let ticker = tick(Duration::from_secs(2));
+
+                    while !shutdown_flag.load(Ordering::Relaxed) {
+                        select! {
+                            recv(rx) -> msg => {
+                                match msg {
+                                    Ok(event) => {
+                                        debug!("Observer received MetricsEvent: {:?}", event);
+                                        Self::handle_event(&policy, &cmd_tx, event);
+                                    }
+                                    Err(err) => {
+                                        error!("Metrics channel closed: {:?}", err);
+                                        break;
+                                    }
+                                }
+                            }
+                            recv(ticker) -> _ => {}, // periodic wake-up for cancellation
+                        }
+                    }
+
+                    info!("RetrainingObserver terminated gracefully.");
+                })
+                .expect("failed to spawn RetrainingObserver thread");
+        }
+
+        Self {
+            policy,
+            metrics_rx,
+            cmd_tx,
+            shutdown,
+        }
+    }
+
+    /// Forward evaluate outcome and emit commands.
+    fn handle_event(policy: &Arc<dyn RetrainingPolicy>, cmd_tx: &RetrainCmdSender, event: MetricsEvent) {
+        match policy.evaluate(&event) {
+            PolicyOutcome::NoOp => {
+                debug!("PolicyOutcome::NoOp for model {}", event.model_id);
+            }
+            PolicyOutcome::FineTune => {
+                warn!(
+                    "PolicyOutcome::FineTune – scheduling fine-tuning for model {}",
+                    event.model_id
+                );
+                if let Err(e) = cmd_tx.send(RetrainCommand::FineTune {
+                    model_id: event.model_id,
+                }) {
+                    error!("Failed to send FineTune command: {:?}", e);
+                }
+            }
+            PolicyOutcome::FullRetrain => {
+                warn!(
+                    "PolicyOutcome::FullRetrain – scheduling full retraining for model {}",
+                    event.model_id
+                );
+                if let Err(e) = cmd_tx.send(RetrainCommand::Full {
+                    model_id: event.model_id,
+                }) {
+                    error!("Failed to send FullRetrain command: {:?}", e);
+                }
+            }
+        }
+    }
+
+    /// Request observer shutdown.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+}
+
+///============================================================================
+/// Mini-demo (only compiled with `cargo test` or `cargo run --example` runs)
+///============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_static_threshold_policy() {
+        let policy = StaticThresholdPolicy::new(0.4, 0.8);
+        let evt = MetricsEvent {
+            model_id: "abc".into(),
+            timestamp: Instant::now(),
+            drift_score: 0.5,
+            accuracy: 0.9,
+            meta: json!({}),
+        };
+        assert_eq!(policy.evaluate(&evt), PolicyOutcome::FullRetrain);
+    }
+
+    #[test]
+    fn integration_observer_triggers_command() {
+        let (subject, rx) = MonitoringSubject::new();
+        let (cmd_tx, cmd_rx) = bounded::<RetrainCommand>(128);
+        let cfg = PolicyConfig {
+            kind: PolicyKind::StaticThreshold,
+            drift_threshold: Some(0.3),
+            accuracy_threshold: Some(0.85),
+            window_size: None,
+        };
+        let policy = PolicyFactory::build(&cfg);
+
+        let observer = RetrainingObserver::spawn(policy, rx, cmd_tx);
+
+        subject
+            .publish(MetricsEvent {
+                model_id: "xyz".into(),
+                timestamp: Instant::now(),
+                drift_score: 0.2,
+                accuracy: 0.7,
+                meta: json!({ "note": "low acc triggers FT" }),
+            })
+            .unwrap();
+
+        // Wait for observer to propagate command.
+        thread::sleep(Duration::from_millis(100));
+
+        let received = cmd_rx.try_recv().expect("expected a command");
+        matches!(received, RetrainCommand::FineTune { .. });
+
+        observer.shutdown();
+    }
+}
+```

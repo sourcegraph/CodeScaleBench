@@ -1,0 +1,503 @@
+```rust
+//! Module 7 – Model-Monitoring & Automated-Retraining Orchestrator
+//! -----------------------------------------------------------------------------
+//! This module wires together the Strategy + Observer patterns to:
+//!   1. Collect model-serving metrics from asynchronous sources
+//!   2. Detect drift / SLA violations through pluggable observers
+//!   3. Decide—via retraining strategy—whether automated retraining should start
+//!   4. Emit retraining jobs into an async work-queue for downstream processing
+//!
+//! The implementation is intentionally self-contained so it can be compiled
+//! standalone for unit-testing, yet is ready to be integrated into the wider
+//! `VisuTility Orchestrator` platform.
+//!
+//! External crates used:
+//!   - tokio      (async runtime + channels)
+//!   - anyhow     (error propagation)
+//!   - serde      (de/serialization of metric payloads)
+//!   - thiserror  (typed error handling)
+//!   - log        (structured + leveled logging)
+//!   - metrics    (project-wide metrics facade)
+//
+//! -----------------------------------------------------------------------------
+
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use anyhow::Result;
+use log::{debug, error, info, warn};
+use metrics::{counter, gauge};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc, oneshot, RwLock},
+    task::JoinHandle,
+    time,
+};
+
+/// Maximum number of historical events kept in memory per model.
+const MAX_WINDOW_SIZE: usize = 5_000;
+/// Channel size for metric ingestion.
+const METRIC_CHANNEL_CAPACITY: usize = 2048;
+/// Channel size for retraining job queue.
+const RETRAIN_CHANNEL_CAPACITY: usize = 128;
+/// Default evaluation interval (how often we evaluate retraining strategies).
+const DEFAULT_EVALUATION_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Error types specific to Monitoring.
+#[derive(Debug, Error)]
+pub enum MonitorError {
+    #[error("metrics channel closed")]
+    ChannelClosed,
+    #[error("failed to send retraining job: {0}")]
+    RetrainSend(String),
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+/// Public handle that can be cloned and used by inference workers to
+/// asynchronously submit new metric events.
+#[derive(Clone)]
+pub struct MetricSink {
+    tx: mpsc::Sender<MetricEvent>,
+}
+
+impl MetricSink {
+    pub async fn submit(&self, evt: MetricEvent) -> Result<(), MonitorError> {
+        self.tx
+            .send(evt)
+            .await
+            .map_err(|_| MonitorError::ChannelClosed)
+    }
+}
+
+/// Public stream (subscriber) receiving retraining jobs that need handling
+/// downstream by Model-Ops components (e.g. a trainer dispatcher).
+#[derive(Clone)]
+pub struct RetrainJobStream {
+    rx: broadcast::Receiver<RetrainJob>,
+}
+
+impl RetrainJobStream {
+    pub async fn recv(&mut self) -> Result<RetrainJob, MonitorError> {
+        self.rx
+            .recv()
+            .await
+            .map_err(|e| MonitorError::RetrainSend(e.to_string()))
+    }
+}
+
+/// Metric payload emitted by serving-layer components.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricEvent {
+    pub model_id: String,
+    /// Unix-timestamp in milliseconds.
+    pub ts: u128,
+    /// End-to-end request latency observed by the client (ms).
+    pub latency_ms: f64,
+    /// Instantaneous throughput (# predictions / sec)
+    pub throughput: f64,
+    /// Running accuracy estimate (0.0 – 1.0) if labels available.
+    pub accuracy: Option<f64>,
+}
+
+impl MetricEvent {
+    pub fn now(
+        model_id: impl Into<String>,
+        latency_ms: f64,
+        throughput: f64,
+        accuracy: Option<f64>,
+    ) -> Self {
+        Self {
+            model_id: model_id.into(),
+            ts: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_millis(),
+            latency_ms,
+            throughput,
+            accuracy,
+        }
+    }
+}
+
+/// Rolling collection of metric events for a single model.
+#[derive(Debug, Default)]
+struct MetricWindow {
+    /// Time-ordered ring-buffer
+    events: VecDeque<MetricEvent>,
+    /// Pre-aggregated stats for constant-time observers
+    latency_sum: f64,
+    throughput_sum: f64,
+    accuracy_sum: f64,
+    accuracy_cnt: usize,
+}
+
+impl MetricWindow {
+    fn push(&mut self, evt: MetricEvent) {
+        if self.events.len() == MAX_WINDOW_SIZE {
+            if let Some(old) = self.events.pop_front() {
+                self.latency_sum -= old.latency_ms;
+                self.throughput_sum -= old.throughput;
+                if let Some(acc) = old.accuracy {
+                    self.accuracy_sum -= acc;
+                    self.accuracy_cnt -= 1;
+                }
+            }
+        }
+
+        self.latency_sum += evt.latency_ms;
+        self.throughput_sum += evt.throughput;
+        if let Some(acc) = evt.accuracy {
+            self.accuracy_sum += acc;
+            self.accuracy_cnt += 1;
+        }
+
+        self.events.push_back(evt);
+    }
+
+    fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    fn mean_latency(&self) -> f64 {
+        if self.events.is_empty() {
+            return 0.0;
+        }
+        self.latency_sum / self.events.len() as f64
+    }
+
+    fn mean_throughput(&self) -> f64 {
+        if self.events.is_empty() {
+            return 0.0;
+        }
+        self.throughput_sum / self.events.len() as f64
+    }
+
+    fn mean_accuracy(&self) -> Option<f64> {
+        if self.accuracy_cnt == 0 {
+            None
+        } else {
+            Some(self.accuracy_sum / self.accuracy_cnt as f64)
+        }
+    }
+
+    fn p99_latency(&self) -> f64 {
+        // naive percentile calc (production code may use histogram)
+        if self.events.is_empty() {
+            return 0.0;
+        }
+        let mut latencies: Vec<_> = self.events.iter().map(|e| e.latency_ms).collect();
+        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let idx = ((latencies.len() as f64) * 0.99).ceil() as usize - 1;
+        latencies[idx]
+    }
+}
+
+/// What action an Observer suggests.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MonitorAction {
+    Noop,
+    FlagRetrain,
+}
+
+/// Observer Pattern: notified of each model’s aggregated metrics.
+trait MetricObserver: Send + Sync {
+    /// Name (for logging/metrics)
+    fn name(&self) -> &'static str;
+    /// Evaluate window; return action.
+    fn on_update(&self, model: &str, window: &MetricWindow) -> MonitorAction;
+}
+
+/// Observer that triggers retraining when P99 latency > threshold.
+struct LatencySlaObserver {
+    /// milliseconds
+    threshold_ms: f64,
+}
+
+impl LatencySlaObserver {
+    fn new(threshold_ms: f64) -> Self {
+        Self { threshold_ms }
+    }
+}
+
+impl MetricObserver for LatencySlaObserver {
+    fn name(&self) -> &'static str {
+        "latency_sla"
+    }
+
+    fn on_update(&self, model: &str, window: &MetricWindow) -> MonitorAction {
+        let p99 = window.p99_latency();
+        gauge!("model.p99_latency", p99, "model" => model);
+        if p99 > self.threshold_ms {
+            warn!(
+                "Model {} P99 latency {:.2}ms above threshold {:.2}ms",
+                model, p99, self.threshold_ms
+            );
+            return MonitorAction::FlagRetrain;
+        }
+        MonitorAction::Noop
+    }
+}
+
+/// Observer that detects accuracy drift below threshold.
+struct AccuracyDriftObserver {
+    min_accuracy: f64,
+}
+
+impl AccuracyDriftObserver {
+    fn new(min_accuracy: f64) -> Self {
+        Self { min_accuracy }
+    }
+}
+
+impl MetricObserver for AccuracyDriftObserver {
+    fn name(&self) -> &'static str {
+        "accuracy_drift"
+    }
+
+    fn on_update(&self, model: &str, window: &MetricWindow) -> MonitorAction {
+        if let Some(acc) = window.mean_accuracy() {
+            gauge!("model.accuracy", acc, "model" => model);
+            if acc < self.min_accuracy {
+                warn!(
+                    "Model {} accuracy {:.4} below threshold {:.4}",
+                    model, acc, self.min_accuracy
+                );
+                return MonitorAction::FlagRetrain;
+            }
+        }
+        MonitorAction::Noop
+    }
+}
+
+/// An internal representation of a retraining job request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrainJob {
+    pub model_id: String,
+    pub reason: String,
+    pub requested_at: u128,
+}
+
+/// Strategy Pattern: decides—based on aggregated Observer signals—if we should
+/// create a RetrainJob.
+#[async_trait::async_trait]
+trait RetrainStrategy: Send + Sync {
+    /// Called periodically with aggregated observer actions
+    async fn evaluate(
+        &self,
+        model: &str,
+        actions: &[MonitorAction],
+        window: &MetricWindow,
+    ) -> Option<RetrainJob>;
+}
+
+/// Simple majority-vote strategy: if any FlagRetrain action is present,
+/// we create a job. Implements a debounce window to avoid spamming.
+struct MajorityStrategy {
+    /// minimum time between two jobs for the same model
+    cooldown: Duration,
+    /// book-keeping of last job timestamps
+    last_job_ts: Arc<RwLock<dashmap::DashMap<String, u128>>>,
+}
+
+impl MajorityStrategy {
+    fn new(cooldown: Duration) -> Self {
+        Self {
+            cooldown,
+            last_job_ts: Arc::new(RwLock::new(dashmap::DashMap::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RetrainStrategy for MajorityStrategy {
+    async fn evaluate(
+        &self,
+        model: &str,
+        actions: &[MonitorAction],
+        _window: &MetricWindow,
+    ) -> Option<RetrainJob> {
+        if !actions.iter().any(|a| *a == MonitorAction::FlagRetrain) {
+            return None;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        {
+            let m = self.last_job_ts.read().await;
+            if let Some(entry) = m.get(model) {
+                let last = *entry;
+                if now - last < self.cooldown.as_millis() {
+                    debug!("Skipping retrain for {model} due to cooldown");
+                    return None;
+                }
+            }
+        }
+
+        {
+            let mut m = self.last_job_ts.write().await;
+            m.insert(model.to_string(), now);
+        }
+
+        Some(RetrainJob {
+            model_id: model.to_string(),
+            reason: "observer_trigger".into(),
+            requested_at: now,
+        })
+    }
+}
+
+/// Central engine wiring together observers + strategy.
+pub struct MonitorEngine {
+    metric_sink: MetricSink,
+    retrain_job_stream: RetrainJobStream,
+    /// keep JoinHandles for graceful shutdown
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl MonitorEngine {
+    pub fn start(
+        observers: Vec<Box<dyn MetricObserver>>,
+        strategy: Arc<dyn RetrainStrategy>,
+    ) -> Self {
+        let (metric_tx, mut metric_rx) = mpsc::channel::<MetricEvent>(METRIC_CHANNEL_CAPACITY);
+        let (retrain_tx, _) = broadcast::channel::<RetrainJob>(RETRAIN_CHANNEL_CAPACITY);
+
+        // In-memory state: per-model rolling window
+        let windows = Arc::new(RwLock::new(dashmap::DashMap::<String, MetricWindow>::new()));
+
+        // Task 1: metric ingestion
+        let windows_clone = Arc::clone(&windows);
+        let metric_task = tokio::spawn(async move {
+            while let Some(evt) = metric_rx.recv().await {
+                counter!("metric_events_ingested", 1, "model" => &evt.model_id);
+
+                let mut windows = windows_clone.write().await;
+                let window = windows
+                    .entry(evt.model_id.clone())
+                    .or_insert_with(MetricWindow::default);
+                window.push(evt);
+            }
+        });
+
+        // Task 2: periodic evaluation
+        let evaluation_task = {
+            let windows = Arc::clone(&windows);
+            let observers = observers
+                .into_iter()
+                .map(|o| (o.name(), o))
+                .collect::<Vec<_>>();
+            let mut retrain_tx = retrain_tx.clone();
+
+            tokio::spawn(async move {
+                let mut ticker = time::interval(DEFAULT_EVALUATION_INTERVAL);
+                loop {
+                    ticker.tick().await;
+                    let windows_guard = windows.read().await;
+
+                    for entry in windows_guard.iter() {
+                        let model = entry.key();
+                        let window = entry.value();
+
+                        if window.len() < 100 {
+                            // Not enough data yet
+                            continue;
+                        }
+
+                        let mut actions = Vec::with_capacity(observers.len());
+                        for (_, obs) in &observers {
+                            let a = obs.on_update(model, window);
+                            actions.push(a);
+                        }
+
+                        // Evaluate strategy
+                        if let Some(job) =
+                            strategy.evaluate(model, &actions, window).await
+                        {
+                            match retrain_tx.send(job.clone()) {
+                                Ok(_) => {
+                                    info!("Enqueued retrain job for model {}", model);
+                                    counter!("retrain_jobs_enqueued", 1, "model" => model);
+                                }
+                                Err(e) => {
+                                    error!("Failed to enqueue retrain job: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        Self {
+            metric_sink: MetricSink { tx: metric_tx },
+            retrain_job_stream: RetrainJobStream {
+                rx: retrain_tx.subscribe(),
+            },
+            tasks: vec![metric_task, evaluation_task],
+        }
+    }
+
+    pub fn sink(&self) -> MetricSink {
+        self.metric_sink.clone()
+    }
+
+    pub fn retrain_jobs(&self) -> RetrainJobStream {
+        self.retrain_job_stream.clone()
+    }
+
+    /// Gracefully stop tasks (await on JoinHandles)
+    pub async fn shutdown(self) {
+        for handle in self.tasks {
+            handle.abort(); // For brevity; in prod, send shutdown signal
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Example integration test (can be toggled with `cargo test --lib`)
+// ----------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn smoke_test_monitor_engine() {
+        // Observers
+        let observers: Vec<Box<dyn MetricObserver>> = vec![
+            Box::new(LatencySlaObserver::new(100.0)),
+            Box::new(AccuracyDriftObserver::new(0.8)),
+        ];
+
+        // Strategy
+        let strategy = Arc::new(MajorityStrategy::new(Duration::from_secs(30)));
+
+        // Start engine
+        let engine = MonitorEngine::start(observers, strategy);
+
+        // Simulate metric events
+        let sink = engine.sink();
+        let mut retrain_stream = engine.retrain_jobs();
+
+        for _ in 0..105 {
+            let evt = MetricEvent::now("dummy_model", 150.0, 50.0, Some(0.75));
+            sink.submit(evt).await.unwrap();
+        }
+
+        // We expect a retrain job (accuracy & latency bad)
+        let job = retrain_stream.recv().await.unwrap();
+        assert_eq!(job.model_id, "dummy_model");
+        assert_eq!(job.reason, "observer_trigger");
+
+        engine.shutdown().await;
+    }
+}
+```

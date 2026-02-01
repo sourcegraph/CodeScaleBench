@@ -1,0 +1,382 @@
+```rust
+//! src/module_51.rs
+//!
+//! ChirpPulse – Sentiment Alerting Micro-Service
+//! --------------------------------------------
+//! This module implements a standalone, async micro-service that
+//! consumes sentiment-enriched events from a Kafka topic, aggregates
+//! them into sliding time-windows, and emits alert events whenever a
+//! pluggable strategy decides that a significant sentiment shift has
+//! occurred.
+//
+//! The micro-service demonstrates the following project patterns:
+//! * Event_Streaming           – rdkafka based consumer / producer
+//! * Strategy_Pattern          – run-time swappable alert strategies
+//! * Observer_Pattern          – alert strategy “observes” aggregated state
+//! * Monitoring / Observability – tracing instrumentation & metrics
+//!
+//! Dependencies (Cargo.toml):
+//! --------------------------
+//! rdkafka         = { version = "0.34", features = ["tokio"] }
+//! serde           = { version = "1.0",  features = ["derive"] }
+//! serde_json      = "1.0"
+//! chrono          = { version = "0.4", features = ["serde"] }
+//! thiserror       = "1.0"
+//! tokio           = { version = "1.35", features = ["rt-multi-thread", "macros", "time"] }
+//! tracing         = "0.1"
+//!
+//! NOTE: Error handling makes use of `thiserror` and `anyhow`.
+//! ------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::message::{BorrowedMessage, Headers};
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::{Message, Offset};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::RwLock;
+use tokio::time::sleep;
+use tracing::{debug, error, info, instrument, warn};
+
+// ------------------------------------------------------------------------
+// Error definitions
+// ------------------------------------------------------------------------
+
+#[derive(Error, Debug)]
+pub enum AlertServiceError {
+    #[error("Kafka error: {0}")]
+    Kafka(#[from] rdkafka::error::KafkaError),
+
+    #[error("Serde JSON error: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("Unexpected null payload")]
+    NullPayload,
+}
+
+// Convenient alias
+type Result<T> = std::result::Result<T, AlertServiceError>;
+
+// ------------------------------------------------------------------------
+// Domain models
+// ------------------------------------------------------------------------
+
+/// Raw sentiment event coming from upstream enrichment pipeline.
+#[derive(Debug, Deserialize)]
+struct SentimentEvent {
+    timestamp: DateTime<Utc>,
+    user_id: String,
+    text_language: String,
+    sentiment_score: f32, // -1.0 .. 1.0
+    topic: Option<String>,
+}
+
+/// Aggregated metrics per (window, topic).
+#[derive(Debug, Default, Clone)]
+struct SentimentWindow {
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+    msg_count: u64,
+    avg_sentiment: f32,
+}
+
+impl SentimentWindow {
+    fn update_with(&mut self, event: &SentimentEvent) {
+        self.msg_count += 1;
+        // Incremental average to avoid f32 overflow & counting error
+        self.avg_sentiment += (event.sentiment_score - self.avg_sentiment) / self.msg_count as f32;
+    }
+}
+
+/// Alert emitted whenever a strategy decides that something worth
+/// reporting happened.
+#[derive(Debug, Serialize)]
+struct SentimentAlert {
+    topic: Option<String>,
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+    avg_sentiment: f32,
+    trigger: String,
+}
+
+// ------------------------------------------------------------------------
+// Strategy Pattern – Alert decision logic
+// ------------------------------------------------------------------------
+
+/// Trait allowing run-time pluggable alert decision algorithms.
+///
+/// Implementors receive an aggregated `SentimentWindow` and decide
+/// whether to emit an alert.
+#[async_trait::async_trait]
+pub trait AlertStrategy: Send + Sync {
+    /// Returns Some(alert) when an alert should be emitted.
+    async fn evaluate(&self, window: &SentimentWindow) -> Option<SentimentAlert>;
+}
+
+/// Emits alert if absolute sentiment exceeds a configurable threshold.
+pub struct ThresholdStrategy {
+    threshold: f32,
+}
+
+impl ThresholdStrategy {
+    pub fn new(threshold: f32) -> Self {
+        Self { threshold }
+    }
+}
+
+#[async_trait::async_trait]
+impl AlertStrategy for ThresholdStrategy {
+    async fn evaluate(&self, window: &SentimentWindow) -> Option<SentimentAlert> {
+        if window.avg_sentiment.abs() >= self.threshold {
+            Some(SentimentAlert {
+                topic: None,
+                window_start: window.window_start,
+                window_end: window.window_end,
+                avg_sentiment: window.avg_sentiment,
+                trigger: format!(
+                    "avg_sentiment {:.3} beyond threshold {:.3}",
+                    window.avg_sentiment, self.threshold
+                ),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+// ------------------------------------------------------------------------
+// Aggregator – Maintains in-memory sliding windows
+// ------------------------------------------------------------------------
+
+/// A key for the internal HashMap of windows (per topic)
+type WindowKey = Option<String>;
+
+struct SlidingAggregator {
+    /// window size (inclusive)
+    window_size: ChronoDuration,
+    /// windows by (topic) key
+    windows: HashMap<WindowKey, SentimentWindow>,
+}
+
+impl SlidingAggregator {
+    fn new(window_size_sec: i64) -> Self {
+        Self {
+            window_size: ChronoDuration::seconds(window_size_sec),
+            windows: HashMap::new(),
+        }
+    }
+
+    /// Update internal state with a new event.
+    fn ingest(&mut self, event: SentimentEvent) {
+        let key: WindowKey = event.topic.clone();
+        let now = event.timestamp;
+        let window_start = now - self.window_size;
+        let window_end = now;
+
+        let entry = self.windows.entry(key).or_insert_with(SentimentWindow::default);
+        entry.window_start = window_start;
+        entry.window_end = window_end;
+        entry.update_with(&event);
+    }
+
+    /// Drain expired windows from memory to keep bounded footprint.
+    fn garbage_collect(&mut self) {
+        let cutoff = Utc::now() - self.window_size * 2;
+        self.windows
+            .retain(|_, w| w.window_end >= cutoff);
+    }
+
+    fn snapshot(&self) -> Vec<SentimentWindow> {
+        self.windows.values().cloned().collect()
+    }
+}
+
+// ------------------------------------------------------------------------
+// Main service
+// ------------------------------------------------------------------------
+
+pub struct SentimentAlertService<S: AlertStrategy> {
+    consumer: StreamConsumer, // generic over kafka cfg
+    producer: FutureProducer,
+    aggregator: Arc<RwLock<SlidingAggregator>>,
+    strategy: Arc<S>,
+    output_topic: String,
+}
+
+impl<S: AlertStrategy> SentimentAlertService<S> {
+    #[instrument(skip_all, name = "SentimentAlertService::new")]
+    pub fn new(
+        consumer: StreamConsumer,
+        producer: FutureProducer,
+        strategy: S,
+        output_topic: String,
+    ) -> Self {
+        // Aggregator with 60-second windows
+        let aggregator = SlidingAggregator::new(60);
+        Self {
+            consumer,
+            producer,
+            aggregator: Arc::new(RwLock::new(aggregator)),
+            strategy: Arc::new(strategy),
+            output_topic,
+        }
+    }
+
+    /// Spawn two async tasks:
+    /// 1. `consume_loop`  – Kafka event ingestion
+    /// 2. `evaluation_loop` – periodic evaluation & alert emission
+    #[instrument(skip(self))]
+    pub async fn run(self) -> Result<()> {
+        let consume_handle = {
+            let service = self.clone();
+            tokio::spawn(async move { service.consume_loop().await })
+        };
+
+        let eval_handle = tokio::spawn(async move { self.evaluation_loop().await });
+
+        // Wait for any task to terminate (propagate error if any)
+        tokio::select! {
+            res = consume_handle => res??,
+            res = eval_handle    => res??,
+        }
+        Ok(())
+    }
+
+    /// Continuously consumes Kafka, deserializes JSON, and updates the
+    /// sliding windows.
+    #[instrument(skip(self))]
+    async fn consume_loop(self) -> Result<()> {
+        loop {
+            match self.consumer.recv().await {
+                Err(e) => {
+                    error!("Kafka recv error: {}", e);
+                    sleep(Duration::from_millis(500)).await;
+                }
+                Ok(msg) => {
+                    if let Err(e) = self.handle_message(&msg).await {
+                        error!("Message handling failed: {:?}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Periodically evaluate windows with the strategy and potentially
+    /// publish alerts.
+    #[instrument(skip(self))]
+    async fn evaluation_loop(self) -> Result<()> {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+
+            let snapshots = {
+                let mut guard = self.aggregator.write().await;
+                guard.garbage_collect();
+                guard.snapshot()
+            };
+
+            for window in snapshots {
+                if let Some(alert) = self.strategy.evaluate(&window).await {
+                    self.publish_alert(alert).await?;
+                }
+            }
+        }
+    }
+
+    /// Deserialize an incoming Kafka record & update aggregator.
+    #[instrument(skip(self, msg))]
+    async fn handle_message(&self, msg: &BorrowedMessage<'_>) -> Result<()> {
+        let payload = msg.payload().ok_or(AlertServiceError::NullPayload)?;
+        let event: SentimentEvent = serde_json::from_slice(payload)?;
+        debug!("received event: {:?}", event);
+
+        let mut guard = self.aggregator.write().await;
+        guard.ingest(event);
+        Ok(())
+    }
+
+    /// Serialize and push alert to Kafka.
+    #[instrument(skip(self))]
+    async fn publish_alert(&self, alert: SentimentAlert) -> Result<()> {
+        let payload = serde_json::to_vec(&alert)?;
+
+        let record = FutureRecord::to(&self.output_topic)
+            .payload(&payload)
+            .key("sentiment_alert");
+
+        // Fire-and-forget with 0-timeout; handle errors via tracing for now
+        match self.producer.send(record, Duration::from_secs(0)).await {
+            Ok(delivery) => {
+                debug!("Alert delivered: {:?}", delivery);
+            }
+            Err((e, _)) => {
+                warn!("Failed to deliver alert: {}", e);
+            }
+        }
+        Ok(())
+    }
+}
+
+// Manual Clone impl because `StreamConsumer` & `FutureProducer` are Arc-ed internally
+impl<S: AlertStrategy> Clone for SentimentAlertService<S> {
+    fn clone(&self) -> Self {
+        Self {
+            consumer: self.consumer.clone(),
+            producer: self.producer.clone(),
+            aggregator: self.aggregator.clone(),
+            strategy: self.strategy.clone(),
+            output_topic: self.output_topic.clone(),
+        }
+    }
+}
+
+// ------------------------------------------------------------------------
+// Bootstrap
+// ------------------------------------------------------------------------
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> anyhow::Result<()> {
+    // Initialize tracing subscriber (env-driven)
+    tracing_subscriber::fmt::init();
+
+    // Build Kafka consumer
+    let consumer: StreamConsumer = rdkafka::config::ClientConfig::new()
+        .set("group.id", "chirp-pulse-sentiment-alert-service")
+        .set("bootstrap.servers", "localhost:9092")
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "latest")
+        .create()
+        .expect("Consumer creation failed");
+
+    consumer
+        .subscribe(&["sentiment.enriched"])
+        .expect("Topic subscription failed");
+
+    // Build Kafka producer
+    let producer: FutureProducer = rdkafka::config::ClientConfig::new()
+        .set("bootstrap.servers", "localhost:9092")
+        .create()
+        .expect("Producer creation failed");
+
+    // Strategy: Alert when |avg_sentiment| >= 0.75
+    let strategy = ThresholdStrategy::new(0.75);
+
+    let service = SentimentAlertService::new(
+        consumer,
+        producer,
+        strategy,
+        "sentiment.alerts".to_string(),
+    );
+
+    // Run indefinitely
+    if let Err(e) = service.run().await {
+        error!("Service terminated with error: {}", e);
+    }
+    Ok(())
+}
+```

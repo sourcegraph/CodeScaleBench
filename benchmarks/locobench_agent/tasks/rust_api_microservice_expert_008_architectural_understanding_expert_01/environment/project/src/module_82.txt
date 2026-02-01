@@ -1,0 +1,276 @@
+```rust
+//! src/module_82.rs
+//!
+//! Caching, validation and pagination helpers for LedgerEntry
+//! query endpoints.  The module is completely self-contained so
+//! it can be dropped into integration/unit tests without the
+//! remainder of the service being present.
+//!
+//! In the real application this module is re-exported from
+//! `crate::services::ledger`.
+
+#![allow(clippy::missing_errors_doc)]
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use std::{fmt, sync::Arc};
+use thiserror::Error;
+use tokio::time::{timeout, Duration};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+/// Maximum “per page” size we allow clients to request.  Prevents
+/// **death-star** queries that might accidentally load the entire
+/// ledger into memory.
+pub const MAX_PER_PAGE: u16 = 10_000;
+
+/// Hard upper-bound for Redis operations so we never hang the
+/// request thread if the cache is unhealthy.
+const REDIS_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Convenience alias to keep signatures short.
+pub type Result<T> = std::result::Result<T, ServiceError>;
+
+/// Wire format for a single ledger entry returned via the public API.
+///
+/// The full domain model contains sensitive fields; this DTO is
+/// stripped of internal data and converted to `camelCase` so that the
+/// JSON matches the GraphQL/RFC 7643 conventions used elsewhere in
+/// LedgerLink Nexus.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerEntryDto {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub currency: String,
+    pub debit: i64,
+    pub credit: i64,
+    pub booking_date: DateTime<Utc>,
+}
+
+/// User-supplied query arguments.  All validation happens *after* the
+/// struct is deserialized which means we return nice `400 Bad Request`
+/// errors rather than deserialization panics.
+///
+/// For an example of more advanced validation constraints, see
+/// [`validate_page_zero`].
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct PaginationParams {
+    #[validate(custom = "validate_page_zero")]
+    #[serde(default = "default_page")]
+    pub page: u32,
+
+    #[validate(range(min = 1, max = "MAX_PER_PAGE"))]
+    #[serde(default = "default_per_page")]
+    pub per_page: u16,
+}
+
+fn default_page() -> u32 {
+    0
+}
+
+fn default_per_page() -> u16 {
+    50
+}
+
+/// Custom validator to prevent negative page numbers sneaking through
+/// in signed integers coming from exotic JSON parsers.
+fn validate_page_zero(page: &u32) -> std::result::Result<(), ValidationError> {
+    if *page > u32::MAX - 1 {
+        let mut err = ValidationError::new("page_out_of_range");
+        err.message = Some("page is too large".into());
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Wrapper returned to the caller that contains the result set as
+/// well as pagination metadata.  The GraphQL server is able to
+/// convert this 1-to-1 into Relay compatible `edges { … }` nodes.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Paginated<T> {
+    pub items: Vec<T>,
+    pub page: u32,
+    pub per_page: u16,
+    pub total_items: u64,
+    pub total_pages: u32,
+}
+
+impl<T> Paginated<T> {
+    fn new(items: Vec<T>, page: u32, per_page: u16, total_items: u64) -> Self {
+        let total_pages =
+            ((total_items as f64) / f64::from(per_page)).ceil() as u32;
+        Self {
+            items,
+            page,
+            per_page,
+            total_items,
+            total_pages,
+        }
+    }
+}
+
+/// Domain repository which can be backed by PostgreSQL, Cockroach or
+/// Kafka event snapshots.  Only the methods the service needs are
+/// included here.
+#[async_trait]
+pub trait LedgerRepository: Send + Sync + 'static {
+    async fn fetch_ledger_entries(
+        &self,
+        page: u32,
+        per_page: u16,
+    ) -> Result<(Vec<LedgerEntryDto>, u64)>;
+}
+
+/// Abstraction over a Redis cache so we can swap in a fake
+/// in-process map during unit tests.
+#[async_trait]
+pub trait CacheClient: Send + Sync + 'static {
+    async fn get_json<T>(&self, key: &str) -> Result<Option<T>>
+    where
+        for<'de> T: serde::Deserialize<'de> + Send;
+
+    async fn set_json<T>(&self, key: &str, value: &T, ttl_secs: usize) -> Result<()>
+    where
+        T: Serialize + Send + Sync;
+}
+
+/// Implementation of [`CacheClient`] for `deadpool-redis`.
+#[derive(Debug, Clone)]
+pub struct RedisCache {
+    pool: Arc<deadpool_redis::Pool>,
+}
+
+impl RedisCache {
+    pub fn new(pool: Arc<deadpool_redis::Pool>) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl CacheClient for RedisCache {
+    async fn get_json<T>(&self, key: &str) -> Result<Option<T>>
+    where
+        for<'de> T: serde::Deserialize<'de> + Send,
+    {
+        let mut conn = timeout(REDIS_TIMEOUT, self.pool.get())
+            .await
+            .map_err(|_| ServiceError::CacheUnavailable)??;
+
+        let blob: Option<Vec<u8>> =
+            timeout(REDIS_TIMEOUT, conn.get(key)).await.map_err(|_| {
+                ServiceError::CacheUnavailable
+            })?;
+
+        Ok(match blob {
+            Some(bytes) => Some(serde_json::from_slice(&bytes)?),
+            None => None,
+        })
+    }
+
+    async fn set_json<T>(&self, key: &str, value: &T, ttl_secs: usize) -> Result<()>
+    where
+        T: Serialize + Send + Sync,
+    {
+        let mut conn = timeout(REDIS_TIMEOUT, self.pool.get())
+            .await
+            .map_err(|_| ServiceError::CacheUnavailable)??;
+
+        let serialized = serde_json::to_vec(value)?;
+        timeout(REDIS_TIMEOUT, conn.set_ex::<&str, Vec<u8>, ()>(key, serialized, ttl_secs))
+            .await
+            .map_err(|_| ServiceError::CacheUnavailable)??;
+        Ok(())
+    }
+}
+
+/// Public service responsible for orchestrating repository, caching
+/// and validation logic.
+#[derive(Clone)]
+pub struct LedgerEntryService<R, C> {
+    repo: Arc<R>,
+    cache: Arc<C>,
+}
+
+impl<R, C> LedgerEntryService<R, C> {
+    pub fn new(repo: Arc<R>, cache: Arc<C>) -> Self {
+        Self { repo, cache }
+    }
+}
+
+#[async_trait]
+impl<R, C> LedgerEntryFetcher for LedgerEntryService<R, C>
+where
+    R: LedgerRepository,
+    C: CacheClient,
+{
+    async fn fetch_paginated(
+        &self,
+        params: PaginationParams,
+    ) -> Result<Paginated<LedgerEntryDto>> {
+        params.validate()?;
+
+        let key = format!("ledger:v1:page:{}:per:{}", params.page, params.per_page);
+
+        // Try cache first.
+        if let Some(cached) = self.cache.get_json::<Paginated<LedgerEntryDto>>(&key).await? {
+            return Ok(cached);
+        }
+
+        let (items, total) = self
+            .repo
+            .fetch_ledger_entries(params.page, params.per_page)
+            .await?;
+
+        let response =
+            Paginated::new(items, params.page, params.per_page, total);
+
+        // Store response in cache.  Short TTL because underlying ledger
+        // mutates frequently.
+        let _ = self.cache.set_json(&key, &response, 30).await;
+
+        Ok(response)
+    }
+}
+
+/// Trait exposed to controllers/GraphQL resolvers; keeps the concrete
+/// [`LedgerEntryService`] hidden so callers depend only on the
+/// behaviour, not the implementation details.
+#[async_trait]
+pub trait LedgerEntryFetcher: Send + Sync {
+    async fn fetch_paginated(
+        &self,
+        params: PaginationParams,
+    ) -> Result<Paginated<LedgerEntryDto>>;
+}
+
+/// Rich error envelope so we can generate precise `ProblemDetails`
+/// (RFC 9457) objects in the HTTP layer.
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation failed: {0}")]
+    Validation(#[from] validator::ValidationErrors),
+
+    #[error("cache unavailable")]
+    CacheUnavailable,
+
+    #[error("repository error: {0}")]
+    Repository(Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+impl fmt::Display for Paginated<LedgerEntryDto> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Paginated ledger entries page={} per_page={} total_items={}",
+            self.page, self.per_page, self.total_items
+        )
+    }
+}
+```

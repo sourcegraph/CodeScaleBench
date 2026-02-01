@@ -1,0 +1,357 @@
+```rust
+//! src/module_10.rs
+//!
+//! High-level, production-quality module that models the creation of a
+//! “Learning Pulse”, persists it through a repository, and publishes a
+//! domain event to an external message broker.  The module follows the
+//! Repository + Service-Layer patterns and is completely asynchronous.
+//!
+//! Compile with:
+//! ```bash
+//! cargo add anyhow async-trait chrono serde serde_json thiserror tokio uuid
+//! cargo add sqlx --features=["runtime-tokio-rustls","postgres","uuid","chrono"]
+//! cargo add async-nats   # or your favourite broker client
+//! ```
+//!
+//! Environment variables expected (for the live application):
+//! - DATABASE_URL  : Postgres connection string
+//! - NATS_URL      : NATS server address
+//!
+//! The unit tests run against an in-memory SQLite database to keep the CI fast
+//! and self-contained, but the production repository targets Postgres.
+
+#![allow(clippy::missing_errors_doc)] // Intentionally left for brevity in example.
+
+use std::sync::Arc;
+
+use anyhow::Context;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool, Pool, Postgres, Row};
+use thiserror::Error;
+use tokio::{sync::broadcast, task};
+use uuid::Uuid;
+
+/// Convenience alias for strongly-typed IDs.
+pub type LearningPulseId = Uuid;
+pub type UserId = Uuid;
+
+/// Domain aggregate root.
+#[derive(Debug, Clone)]
+pub struct LearningPulse {
+    pub id: LearningPulseId,
+    pub teacher_id: UserId,
+    pub title: String,
+    pub description: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl LearningPulse {
+    /// Factory method that encapsulates invariants.
+    pub fn new(teacher_id: UserId, title: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            teacher_id,
+            title: title.into(),
+            description: description.into(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+/* ────────────────────────────────────────────────────────────── Repository ── */
+
+/// Abstract repository interface.  Allows us to swap the backing store without
+/// touching business logic.
+#[async_trait]
+pub trait LearningPulseRepository: Send + Sync {
+    async fn insert(&self, pulse: &LearningPulse) -> Result<(), RepositoryError>;
+}
+
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/* ─────────────────────────────────────────────────── Postgres implementation ── */
+
+/// Production-grade repository backed by PostgreSQL.
+///
+/// # Safety & performance
+/// - Uses connection pooling (`sqlx::PgPool`).
+/// - Queries are compile-time checked with the `query!` macro only in unit tests
+///   or when the `offline` feature is off to keep CI fast.
+#[derive(Debug, Clone)]
+pub struct PostgresLearningPulseRepository {
+    pool: PgPool,
+}
+
+impl PostgresLearningPulseRepository {
+    pub async fn new(database_url: &str, max_connections: u32) -> Result<Self, sqlx::Error> {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(database_url)
+            .await?;
+
+        // Run migrations here if needed.
+        // sqlx::migrate!().run(&pool).await?;
+
+        Ok(Self { pool })
+    }
+}
+
+#[async_trait]
+impl LearningPulseRepository for PostgresLearningPulseRepository {
+    async fn insert(&self, pulse: &LearningPulse) -> Result<(), RepositoryError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO learning_pulses (id, teacher_id, title, description, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            pulse.id,
+            pulse.teacher_id,
+            pulse.title,
+            pulse.description,
+            pulse.created_at
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+}
+
+/* ────────────────────────────────────────────────────────────── Events ────── */
+
+/// Application-level events that leave the bounded context.  Each variant must
+/// be serialisable so that downstream micro-services written in other
+/// languages can consume them.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DomainEvent {
+    LearningPulseCreated(LearningPulseCreated),
+}
+
+/// Payload for the `learning_pulse_created` event.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LearningPulseCreated {
+    pub pulse_id: LearningPulseId,
+    pub teacher_id: UserId,
+    pub title: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/* ──────────────────────────────────────────────── Event Publisher trait ───── */
+
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, event: &DomainEvent) -> Result<(), EventPublishError>;
+}
+
+#[derive(Debug, Error)]
+pub enum EventPublishError {
+    #[error("broker error: {0}")]
+    Broker(#[from] anyhow::Error),
+}
+
+/* ────────────────────────────── NATS implementation (production) ─────────── */
+
+/// Thin wrapper around an async-nats client.  You could easily swap this for
+/// Kafka, RabbitMQ, or an in-house broker.
+#[derive(Clone)]
+pub struct NatsEventPublisher {
+    client: async_nats::Client,
+    subject: String,
+}
+
+impl NatsEventPublisher {
+    pub async fn new(nats_url: &str, subject: impl Into<String>) -> anyhow::Result<Self> {
+        let client = async_nats::connect(nats_url).await?;
+        Ok(Self {
+            client,
+            subject: subject.into(),
+        })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for NatsEventPublisher {
+    async fn publish(&self, event: &DomainEvent) -> Result<(), EventPublishError> {
+        let payload = serde_json::to_vec(event)?;
+        self.client
+            .publish(self.subject.clone(), payload.into())
+            .await
+            .context("failed to publish event")?;
+        Ok(())
+    }
+}
+
+/* ────────────────────────────────────────────── Service Layer ─────────────── */
+
+/// Errors surfaced by the service boundary.
+#[derive(Debug, Error)]
+pub enum PulseServiceError {
+    #[error("title may not be empty")]
+    EmptyTitle,
+    #[error("repository: {0}")]
+    Repository(#[from] RepositoryError),
+    #[error("event publisher: {0}")]
+    Publisher(#[from] EventPublishError),
+}
+
+/// Business logic façade for the “Learning Pulse” domain.
+#[derive(Clone)]
+pub struct LearningPulseService<R: LearningPulseRepository, P: EventPublisher> {
+    repository: Arc<R>,
+    publisher: Arc<P>,
+}
+
+impl<R: LearningPulseRepository, P: EventPublisher> LearningPulseService<R, P> {
+    pub fn new(repository: R, publisher: P) -> Self {
+        Self {
+            repository: Arc::new(repository),
+            publisher: Arc::new(publisher),
+        }
+    }
+
+    /// Creates a new learning pulse, persists it, and emits a domain event.
+    pub async fn create_pulse(
+        &self,
+        teacher_id: UserId,
+        title: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Result<LearningPulseId, PulseServiceError> {
+        let title = title.into();
+        if title.trim().is_empty() {
+            return Err(PulseServiceError::EmptyTitle);
+        }
+
+        let description = description.into();
+        let pulse = LearningPulse::new(teacher_id, title.clone(), description);
+
+        // Persist to DB
+        self.repository.insert(&pulse).await?;
+
+        // Emit event asynchronously, but *do not* fail the request if
+        // publication fails; instead we spawn a background task and only log.
+        let event = DomainEvent::LearningPulseCreated(LearningPulseCreated {
+            pulse_id: pulse.id,
+            teacher_id: pulse.teacher_id,
+            title,
+            created_at: pulse.created_at,
+        });
+
+        let publisher = self.publisher.clone();
+        task::spawn(async move {
+            if let Err(e) = publisher.publish(&event).await {
+                tracing::error!(
+                    error = %e,
+                    "Failed to publish LearningPulseCreated event (pulse_id={})",
+                    pulse.id
+                );
+            }
+        });
+
+        Ok(pulse.id)
+    }
+}
+
+/* ──────────────────────────────────────────────── In-Memory mock ─────────── */
+
+/// Very small, in-memory stub for tests or local development.
+#[derive(Default, Clone)]
+pub struct InMemoryPulseRepository {
+    pulses: Arc<tokio::sync::Mutex<Vec<LearningPulse>>>,
+}
+
+#[async_trait]
+impl LearningPulseRepository for InMemoryPulseRepository {
+    async fn insert(&self, pulse: &LearningPulse) -> Result<(), RepositoryError> {
+        self.pulses.lock().await.push(pulse.clone());
+        Ok(())
+    }
+}
+
+/// Simple broadcast publisher—handy for unit tests.
+#[derive(Clone)]
+pub struct BroadcastPublisher {
+    tx: broadcast::Sender<DomainEvent>,
+}
+
+impl BroadcastPublisher {
+    pub fn new() -> Self {
+        let (tx, _rx) = broadcast::channel(16);
+        Self { tx }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<DomainEvent> {
+        self.tx.subscribe()
+    }
+}
+
+#[async_trait]
+impl EventPublisher for BroadcastPublisher {
+    async fn publish(&self, event: &DomainEvent) -> Result<(), EventPublishError> {
+        self.tx
+            .send(event.clone())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/* ───────────────────────────────────────────────────── Tests ─────────────── */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{self, Duration};
+
+    #[tokio::test]
+    async fn create_pulse_persists_and_emits() -> anyhow::Result<()> {
+        let repo = InMemoryPulseRepository::default();
+        let publisher = BroadcastPublisher::new();
+        let mut rx = publisher.subscribe();
+        let service = LearningPulseService::new(repo.clone(), publisher);
+
+        let teacher_id = Uuid::new_v4();
+        let title = "Async Rust Challenge";
+        let description = "Implement the async/await model in a small kata";
+
+        let pulse_id = service
+            .create_pulse(teacher_id, title, description)
+            .await
+            .expect("must succeed");
+
+        // Repository must contain one item
+        let pulses = repo.pulses.lock().await;
+        assert_eq!(pulses.len(), 1);
+        assert_eq!(pulses[0].id, pulse_id);
+
+        // Publisher must receive the event
+        let event = time::timeout(Duration::from_secs(1), rx.recv()).await??;
+        match event {
+            DomainEvent::LearningPulseCreated(e) => {
+                assert_eq!(e.pulse_id, pulse_id);
+                assert_eq!(e.teacher_id, teacher_id);
+                assert_eq!(e.title, title);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_title_is_rejected() {
+        let repo = InMemoryPulseRepository::default();
+        let publisher = BroadcastPublisher::new();
+        let service = LearningPulseService::new(repo, publisher);
+
+        let result = service
+            .create_pulse(Uuid::new_v4(), "", "no content")
+            .await;
+        assert!(matches!(result, Err(PulseServiceError::EmptyTitle)));
+    }
+}
+```

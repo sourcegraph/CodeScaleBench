@@ -1,0 +1,391 @@
+```cpp
+/**
+ * CardioInsight360 – Unified Healthcare Analytics Engine
+ * ------------------------------------------------------
+ * License Verification & Runtime Enforcement Module
+ *
+ * File:     cardio_insight_360/LICENSE
+ * Language: C++17
+ *
+ * Overview
+ * --------
+ * This translation unit implements compile-time–free, runtime enforcement
+ * of product licensing for CardioInsight360.  The engine ships as a single
+ * deployable binary; therefore, the license verifier must also be embedded
+ * in-process, lightweight, thread-safe, and self-contained while honouring
+ * cryptographic-grade signature validation.
+ *
+ * Responsibilities
+ * ----------------
+ *  •  Load a JSON license payload from disk (or memory‐mapped container)
+ *  •  Verify the payload’s RSA-SHA256 signature against a baked-in public key
+ *  •  Expose “feature-gating” helpers (isFeatureEnabled, isValid, expiresOn…)
+ *  •  Fail-fast when the license is tampered or expired
+ *
+ * Dependencies
+ * ------------
+ *  • OpenSSL 1.1+              (RSA / SHA-256 / Base64 helpers)
+ *  • nlohmann/json             (header-only JSON parser)
+ *
+ * Build
+ * -----
+ *  g++ -std=c++17 -lssl -lcrypto license.cpp -o license
+ *
+ * NOTE
+ * ----
+ * “LICENSE” lives under `src/` and is compiled into the final binary,
+ * NOT to be confused with the legal FOSS license text located at repo root.
+ */
+
+#include <array>
+#include <chrono>
+#include <fstream>
+#include <iomanip>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/sha.h>
+
+#include "nlohmann/json.hpp"
+
+namespace cardio_insight::licensing {
+
+using json            = nlohmann::json;
+using Clock           = std::chrono::system_clock;
+using TimePoint       = std::chrono::time_point<Clock>;
+using Duration        = std::chrono::seconds;
+using FeatureSet      = std::unordered_set<std::string>;
+using BinaryBuffer    = std::vector<unsigned char>;
+using StringView      = std::string_view;
+
+/*--------------------------------------------------------*/
+/*               Lightweight Utility Helpers              */
+/*--------------------------------------------------------*/
+
+/**
+ * Decode a Base64 encoded string into binary buffer using OpenSSL.
+ * Throws std::runtime_error on malformed input.
+ */
+static BinaryBuffer base64Decode(const std::string& b64)
+{
+    BIO* bio     = BIO_new_mem_buf(b64.data(), static_cast<int>(b64.size()));
+    BIO* b64bio  = BIO_new(BIO_f_base64());
+    bio          = BIO_push(b64bio, bio);
+
+    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL); // No newlines
+
+    BinaryBuffer buffer(b64.size()); // Upper bound
+
+    const int decodedLen = BIO_read(bio, buffer.data(), static_cast<int>(buffer.size()));
+    BIO_free_all(bio);
+
+    if (decodedLen < 0)
+        throw std::runtime_error("Base64 decode failure");
+
+    buffer.resize(static_cast<size_t>(decodedLen));
+    return buffer;
+}
+
+/**
+ * Convert RFC3339 string "yyyy-mm-dd" to std::chrono::system_clock::time_point.
+ * Throws std::invalid_argument for malformed dates.
+ */
+static TimePoint parseDate(const std::string& yyyy_mm_dd)
+{
+    std::tm tm{};
+    std::istringstream ss(yyyy_mm_dd);
+    ss >> std::get_time(&tm, "%Y-%m-%d");
+    if (ss.fail())
+        throw std::invalid_argument("Invalid date format: " + yyyy_mm_dd);
+
+    std::time_t tt = timegm(&tm); // convert to UTC epoch (non-portable but OK on GLibc)
+    return Clock::from_time_t(tt);
+}
+
+/**
+ * Return formatted date "YYYY-MM-DD" from time_point.
+ */
+static std::string toDateString(const TimePoint& tp)
+{
+    std::time_t tt = Clock::to_time_t(tp);
+    std::tm       tm{};
+    gmtime_r(&tt, &tm);
+
+    std::ostringstream os;
+    os << std::put_time(&tm, "%Y-%m-%d");
+    return os.str();
+}
+
+/*--------------------------------------------------------*/
+/*                License Domain Model                    */
+/*--------------------------------------------------------*/
+
+struct License
+{
+    std::string customer_id;
+    TimePoint   issued_on;
+    TimePoint   expires_on;
+    FeatureSet  features;
+    BinaryBuffer signature; // RSA signature over canonical JSON payload
+
+    json        original_payload; // for troubleshooting
+};
+
+/*--------------------------------------------------------*/
+/*              Exception Hierarchy (light)               */
+/*--------------------------------------------------------*/
+
+class LicenseError            : public std::runtime_error { using std::runtime_error::runtime_error; };
+class LicenseExpiredError     : public LicenseError      { using LicenseError::LicenseError; };
+class LicenseSignatureError   : public LicenseError      { using LicenseError::LicenseError; };
+class LicenseParsingError     : public LicenseError      { using LicenseError::LicenseError; };
+
+/*--------------------------------------------------------*/
+/*                    License Parser                      */
+/*--------------------------------------------------------*/
+
+static License parseLicenseFile(const std::string& path)
+{
+    std::ifstream ifs(path);
+    if (!ifs)
+        throw LicenseParsingError("Unable to open license file: " + path);
+
+    json j;
+    try {
+        ifs >> j;
+    } catch (const json::parse_error& e) {
+        throw LicenseParsingError("JSON parse error: " + std::string(e.what()));
+    }
+
+    // Mandatory fields
+    for (const auto& k : {"customer_id", "issued_on", "expires_on", "features", "signature"})
+        if (!j.contains(k))
+            throw LicenseParsingError(std::string("Missing field: ") + k);
+
+    License lic;
+    lic.customer_id      = j["customer_id"].get<std::string>();
+    lic.issued_on        = parseDate(j["issued_on"].get<std::string>());
+    lic.expires_on       = parseDate(j["expires_on"].get<std::string>());
+    lic.features         = FeatureSet(j["features"].begin(), j["features"].end());
+    lic.signature        = base64Decode(j["signature"].get<std::string>());
+    lic.original_payload = j;
+
+    return lic;
+}
+
+/*--------------------------------------------------------*/
+/*             Cryptographic Signature Validation         */
+/*--------------------------------------------------------*/
+
+/**
+ * Return OpenSSL RSA public key object loaded from memory (PEM string).
+ * The key is embedded at compile time to eliminate external dependencies.
+ */
+static RSA* loadPublicKey()
+{
+    // Replace the following placeholder with a real 2048/4096-bit RSA public key
+    static const char kPem[] =
+        "-----BEGIN PUBLIC KEY-----\n"
+        "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAn0+aD/BQn8cB9VqpMfKS\n"
+        "K9G2xWzfk8hCBrSCqRWfjXDtTHH1JdXrpIO0iX9qT0uIjd0HPkQoVPsH6v/Qc8jc\n"
+        "A6XS5Cqai40Hs1uyU8tn6XzzvVfyMzd5qG6mCtcCETTeoEAUpo7eZcA0bF/H/Kho\n"
+        "x/SGhQ71jc5x3+DpzMLqwVWO4kCrz2yvyb/REmjIClC4W2DjViJjw4UZjwZ5zcrt\n"
+        "Ioiu9UTN8j2F6eierUtc0JcHh6lbYOGh23Qy6Rp+R6Vcqm2/F9t6lvKsXnx8Stl4\n"
+        "jA0Im8cVULafwqZne+R6q6V2dbCPbn7iBszRHQIDAQAB\n"
+        "-----END PUBLIC KEY-----\n";
+
+    BIO* bio = BIO_new_mem_buf(kPem, static_cast<int>(sizeof(kPem)));
+    if (!bio) throw LicenseError("Failed to allocate BIO");
+
+    RSA* rsa = PEM_read_bio_RSA_PUBKEY(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+
+    if (!rsa)
+        throw LicenseError("Failed to parse embedded public key");
+
+    return rsa; // The RSA object will be freed elsewhere
+}
+
+/**
+ * Canonicalize JSON by stable ordering & compact representation;
+ * we reuse nlohmann::json default `.dump()` with sorted keys enabled.
+ */
+static std::string canonicalizeJson(const json& j)
+{
+    return j.dump(-1, ' ', false, json::error_handler_t::replace, true /* ensure_ascii */);
+}
+
+/**
+ * Verify RSA-SHA256 signature.
+ *  • Build SHA256 digest on canonicalized JSON (excluding the "signature" field)
+ *  • Validate via RSA_public_decrypt / OpenSSL EVP interface
+ */
+static void verifySignature(const License& lic)
+{
+    // Copy payload and erase "signature" member for canonicalization
+    json payload = lic.original_payload;
+    payload.erase("signature");
+
+    std::string canonical = canonicalizeJson(payload);
+
+    // Compute SHA-256 digest
+    unsigned char md[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(canonical.data()),
+           canonical.size(),
+           md);
+
+    // Load public key
+    RSA* rsa = loadPublicKey();
+
+    // Verify signature using PKCS#1 v1.5 SHA256
+    const int verify_result = RSA_verify(
+        NID_sha256,
+        md,
+        SHA256_DIGEST_LENGTH,
+        lic.signature.data(),
+        static_cast<unsigned int>(lic.signature.size()),
+        rsa);
+
+    RSA_free(rsa);
+
+    if (verify_result != 1)
+        throw LicenseSignatureError("Invalid license signature");
+}
+
+/*--------------------------------------------------------*/
+/*                 License Manager (Singleton)            */
+/*--------------------------------------------------------*/
+
+class LicenseManager
+{
+public:
+    static LicenseManager& instance()
+    {
+        static LicenseManager inst;
+        return inst;
+    }
+
+    /**
+     * Load and verify license from the specified path.
+     * Thread-safe: multiple calls from different threads will serialize.
+     */
+    void load(const std::string& path)
+    {
+        std::scoped_lock lk(mutex_);
+
+        // Already loaded and valid
+        if (licenseLoaded_)
+            return;
+
+        License lic = parseLicenseFile(path);
+        verifySignature(lic);
+
+        // Check expiration
+        TimePoint now = Clock::now();
+        if (now > lic.expires_on)
+            throw LicenseExpiredError("License expired on " + toDateString(lic.expires_on));
+
+        license_       = std::move(lic);
+        licenseLoaded_ = true;
+    }
+
+    /**
+     * Whether the license is loaded and still valid at current time.
+     */
+    bool isValid() const
+    {
+        std::scoped_lock lk(mutex_);
+        return licenseLoaded_ && Clock::now() <= license_.expires_on;
+    }
+
+    /**
+     * Runtime feature gate.
+     */
+    bool isFeatureEnabled(StringView feature) const
+    {
+        std::scoped_lock lk(mutex_);
+        return isValid() && license_.features.count(std::string(feature)) > 0;
+    }
+
+    std::string customerId() const
+    {
+        std::scoped_lock lk(mutex_);
+        return license_.customer_id;
+    }
+
+    TimePoint expiresOn() const
+    {
+        std::scoped_lock lk(mutex_);
+        return license_.expires_on;
+    }
+
+private:
+    LicenseManager()  = default;
+    ~LicenseManager() = default;
+
+    mutable std::mutex mutex_;
+    License            license_;
+    bool               licenseLoaded_{false};
+};
+
+/*--------------------------------------------------------*/
+/*   Convenience Global Function (avoids Singleton Abuse) */
+/*--------------------------------------------------------*/
+
+inline bool featureEnabled(StringView name)
+{
+    return LicenseManager::instance().isFeatureEnabled(name);
+}
+
+} // namespace cardio_insight::licensing
+
+/*--------------------------------------------------------*/
+/*                Self-contained smoke test               */
+/*--------------------------------------------------------*/
+#ifdef CARDIOINSIGHT_LICENSE_TEST
+
+#include <iostream>
+
+int main(int argc, char** argv)
+{
+    using namespace cardio_insight::licensing;
+
+    try {
+        if (argc != 2) {
+            std::cerr << "Usage: " << argv[0] << " <license.json>\n";
+            return EXIT_FAILURE;
+        }
+
+        LicenseManager::instance().load(argv[1]);
+
+        std::cout << "License valid for customer: "
+                  << LicenseManager::instance().customerId()
+                  << ", expires on "
+                  << toDateString(LicenseManager::instance().expiresOn())
+                  << "\n";
+
+        for (const auto& f : {"stream_processing", "data_validation", "foo"})
+            std::cout << f << " => "
+                      << (featureEnabled(f) ? "ENABLED" : "DISABLED") << "\n";
+
+        return EXIT_SUCCESS;
+    } catch (const LicenseExpiredError& e) {
+        std::cerr << "[EXPIRED] " << e.what() << "\n";
+    } catch (const LicenseSignatureError& e) {
+        std::cerr << "[SIGNATURE] " << e.what() << "\n";
+    } catch (const LicenseError& e) {
+        std::cerr << "[LICENSE] " << e.what() << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] " << e.what() << "\n";
+    }
+    return EXIT_FAILURE;
+}
+
+#endif // CARDIOINSIGHT_LICENSE_TEST
+```

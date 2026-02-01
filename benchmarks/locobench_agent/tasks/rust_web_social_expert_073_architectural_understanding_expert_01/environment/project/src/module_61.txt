@@ -1,0 +1,408 @@
+```rust
+//! src/module_61.rs
+//! -------------------------------------------------------------
+//! Search & Analytics Event Consumer
+//! -------------------------------------------------------------
+//! This module listens to the global EDU-event bus (NATS) and
+//! reacts to a subset of domain events that require near-realtime
+//! search-index updates and analytics logging.  It demonstrates:
+//!   • Robust async streaming with back-pressure
+//!   • Graceful shutdown handling
+//!   • Structured error management
+//!   • Decoupled, test-friendly design (traits over concrete types)
+//
+//! NOTE: The concrete broker (NATS) and search backend
+//! (OpenSearch/Elastic) are thin adapters; the core logic is broker-
+//! agnostic. Feel free to wire additional implementations via DI.
+
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use async_nats::{jetstream, Client as NatsClient, Message as NatsMessage};
+use elasticsearch::{Elasticsearch, http::transport::Transport};
+use futures::{StreamExt, TryFutureExt};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    signal,
+    sync::Mutex,
+    task::JoinHandle,
+    time::sleep,
+};
+use tracing::{error, info, instrument, warn};
+
+/// Upstream subject we subscribe to; configured via env (`EDUPULSE_EVENT_SUBJECT`)
+const DEFAULT_SUBJECT: &str = "edupulse.domain.>";
+
+/// Hard limit how many messages we process concurrently
+const CONCURRENCY: usize = 32;
+
+// ---------- Domain Event Definitions --------------------------------------
+
+/// Generic envelope every service publishes to the event bus.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub id: String,
+    pub event_type: DomainEventType,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    pub payload: serde_json::Value,
+}
+
+/// Sub-set of domain events we care about in this module.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainEventType {
+    LessonPublished,
+    QuizSubmitted,
+    PeerFeedbackGiven,
+    BadgeAwarded,
+    Unknown,
+}
+
+impl From<&str> for DomainEventType {
+    fn from(s: &str) -> Self {
+        match s {
+            "lesson_published" => Self::LessonPublished,
+            "quiz_submitted" => Self::QuizSubmitted,
+            "peer_feedback_given" => Self::PeerFeedbackGiven,
+            "badge_awarded" => Self::BadgeAwarded,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+// ---------- Error Handling -------------------------------------------------
+
+#[derive(Error, Debug)]
+pub enum EventConsumerError {
+    #[error("NATS error: {0}")]
+    Nats(#[from] async_nats::Error),
+
+    #[error("Search error: {0}")]
+    Search(#[from] elasticsearch::Error),
+
+    #[error("Serde error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+/// Alias for results produced in this module.
+pub type Result<T> = std::result::Result<T, EventConsumerError>;
+
+// ---------- Traits (ports) -------------------------------------------------
+
+/// Abstraction for a component that can index a domain event.
+#[async_trait::async_trait]
+pub trait SearchIndexer: Send + Sync {
+    async fn index_event(&self, envelope: &EventEnvelope) -> Result<()>;
+}
+
+/// Abstraction for event source.
+#[async_trait::async_trait]
+pub trait EventStream: Send + Sync {
+    /// Consume next raw broker message.  None == stream closed.
+    async fn next(&mut self) -> Option<Result<NatsMessage>>;
+}
+
+// ---------- Concrete Implementations --------------------------------------
+
+/// Elasticsearch-based indexer.  Uses minimal mapping to keep example short.
+pub struct ElasticIndexer {
+    client: Elasticsearch,
+    index_name: String,
+}
+
+impl ElasticIndexer {
+    pub fn new(endpoint: &str, index_name: &str) -> Result<Self> {
+        let transport = Transport::single_node(endpoint)?;
+        Ok(Self {
+            client: Elasticsearch::new(transport),
+            index_name: index_name.to_owned(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl SearchIndexer for ElasticIndexer {
+    #[instrument(skip_all, err)]
+    async fn index_event(&self, envelope: &EventEnvelope) -> Result<()> {
+        let body = serde_json::json!({
+            "event_id": envelope.id,
+            "event_type": envelope.event_type,
+            "occurred_at": envelope.occurred_at,
+            "payload": envelope.payload,
+        });
+
+        self.client
+            .index(elasticsearch::IndexParts::Index(&self.index_name))
+            .body(body)
+            .send()
+            .map_err(EventConsumerError::from)
+            .await?;
+
+        Ok(())
+    }
+}
+
+/// JetStream consumer that yields raw NATS messages with at-least-once
+/// semantics.  Offset/ack management is handled internally.
+pub struct JetStreamStream {
+    inner: jetstream::stream::Consumer,
+}
+
+impl JetStreamStream {
+    pub async fn new(client: &NatsClient, subject: &str) -> Result<Self> {
+        let js = jetstream::new(client);
+        let stream = js.get_or_create_stream(jetstream::stream::Config {
+            name: "EDUPULSE_DOMAIN_EVENTS".into(),
+            subjects: vec![subject.into()],
+            ..Default::default()
+        })
+        .await?;
+
+        // Durable pull consumer guarantees we resume on restart
+        let consumer = stream
+            .get_or_create_consumer(jetstream::consumer::pull::Config {
+                durable_name: Some("search_service".into()),
+                ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                ..Default::default()
+            })
+            .await?;
+
+        Ok(Self { inner: consumer })
+    }
+}
+
+#[async_trait::async_trait]
+impl EventStream for JetStreamStream {
+    async fn next(&mut self) -> Option<Result<NatsMessage>> {
+        loop {
+            match self.inner.fetch(1).await {
+                Ok(mut batch) => {
+                    if let Some(msg) = batch.next().await {
+                        return Some(Ok(msg));
+                    }
+                    // drain-empty, retry
+                }
+                Err(e) => return Some(Err(EventConsumerError::Nats(e))),
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+
+// ---------- Supervisor -----------------------------------------------------
+
+/// Supervisor that orchestrates fetching, decoding, and indexing.
+pub struct EventConsumer<S: SearchIndexer, E: EventStream> {
+    indexer: Arc<S>,
+    stream: Mutex<E>,
+    graceful_stop: Arc<tokio_util::sync::CancellationToken>,
+}
+
+impl<S, E> EventConsumer<S, E>
+where
+    S: SearchIndexer + 'static,
+    E: EventStream + 'static,
+{
+    pub fn new(indexer: S, stream: E) -> Self {
+        Self {
+            indexer: Arc::new(indexer),
+            stream: Mutex::new(stream),
+            graceful_stop: Arc::new(tokio_util::sync::CancellationToken::new()),
+        }
+    }
+
+    /// Spawn the background consumer returning a handle for .await
+    pub fn spawn(self) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut tasks = futures::stream::FuturesUnordered::new();
+            let stop_token = self.graceful_stop.clone();
+
+            loop {
+                tokio::select! {
+                    _ = stop_token.cancelled() => {
+                        info!("EventConsumer: received shutdown signal");
+                        break;
+                    }
+                    maybe_msg = self.stream.lock().await.next(), if tasks.len() < CONCURRENCY => {
+                        match maybe_msg {
+                            Some(Ok(msg)) => {
+                                let indexer = self.indexer.clone();
+                                tasks.push(tokio::spawn(Self::process_message(indexer, msg)));
+                            }
+                            Some(Err(e)) => error!("Stream error: {e:?}"),
+                            None => break, // stream closed
+                        }
+                    }
+                    Some(res) = tasks.next() => {
+                        if let Err(e) = res {
+                            warn!("Worker panicked: {e:?}");
+                        }
+                    }
+                }
+            }
+
+            // Drain remaining tasks
+            futures::future::join_all(tasks).await;
+            info!("EventConsumer: shutdown complete");
+        })
+    }
+
+    /// Request graceful shutdown – e.g., on SIGTERM or app stop
+    pub fn shutdown(&self) {
+        self.graceful_stop.cancel();
+    }
+
+    #[instrument(skip_all, err, fields(subject = msg.subject))]
+    async fn process_message(indexer: Arc<S>, msg: NatsMessage) -> Result<()> {
+        let ack = msg.ack();
+        let envelope: EventEnvelope = serde_json::from_slice(&msg.payload)?;
+
+        // Only index events relevant for search; ignore others
+        match envelope.event_type {
+            DomainEventType::LessonPublished
+            | DomainEventType::QuizSubmitted
+            | DomainEventType::PeerFeedbackGiven => {
+                indexer.index_event(&envelope).await?;
+            }
+            _ => {
+                info!("Ignored event_type = {:?}", envelope.event_type);
+            }
+        }
+
+        ack.await?;
+        Ok(())
+    }
+}
+
+// ---------- Bootstrap CLI --------------------------------------------------
+
+/// Fire up the consumer using environment configuration.
+/// Intended to be executed from `bin/search_worker.rs`, but placed here to
+/// keep the self-contained code sample small.
+#[tokio::main]
+async fn main() -> Result<()> {
+    dotenv::dotenv().ok();
+    tracing_subscriber::fmt::init();
+
+    let nats_url = std::env::var("EVENT_BROKER_URL")
+        .unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+
+    let search_url = std::env::var("SEARCH_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:9200".into());
+
+    let index_name = std::env::var("SEARCH_INDEX").unwrap_or_else(|_| "events".into());
+
+    let subject = std::env::var("EDUPULSE_EVENT_SUBJECT").unwrap_or_else(|_| DEFAULT_SUBJECT.into());
+
+    let nats_client = async_nats::connect(nats_url).await?;
+    let consumer_stream = JetStreamStream::new(&nats_client, &subject).await?;
+    let indexer = ElasticIndexer::new(&search_url, &index_name)?;
+
+    let consumer = EventConsumer::new(indexer, consumer_stream);
+    let handle = consumer.spawn();
+
+    // Wait for Ctrl-C / SIGTERM
+    signal::ctrl_c().await?;
+    info!("Shutdown requested – forwarding signal to consumer");
+    consumer.shutdown();
+    handle.await.ok();
+
+    Ok(())
+}
+
+// ---------- Tests ----------------------------------------------------------
+//! These tests use the `mockall` crate to stub broker & indexer.
+//! They can run entirely in-memory and are therefore fast & deterministic.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use mockall::mock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    mock! {
+        pub Indexer {}
+
+        #[async_trait]
+        impl SearchIndexer for Indexer {
+            async fn index_event(&self, envelope: &EventEnvelope) -> Result<()>;
+        }
+    }
+
+    mock! {
+        pub Stream {}
+
+        #[async_trait]
+        impl EventStream for Stream {
+            async fn next(&mut self) -> Option<Result<NatsMessage>>;
+        }
+    }
+
+    // Helper to craft synthetic NATS messages
+    fn fake_nats_message(event: &EventEnvelope) -> NatsMessage {
+        let payload = serde_json::to_vec(event).expect("serialize");
+        NatsMessage {
+            subject: "edupulse.domain.lesson_published".into(),
+            payload: payload.into(),
+            reply: None,
+            headers: None,
+            client: None,
+            status: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn indexes_lesson_published() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let ctr2 = counter.clone();
+
+        // Mock indexer increments counter for each call
+        let mut idx = MockIndexer::new();
+        idx.expect_index_event()
+            .times(1)
+            .returning(move |_: &EventEnvelope| {
+                ctr2.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            });
+
+        // Produce a single lesson event then close stream
+        let mut stream = MockStream::new();
+        let envelope = EventEnvelope {
+            id: "evt1".into(),
+            event_type: DomainEventType::LessonPublished,
+            occurred_at: chrono::Utc::now(),
+            payload: serde_json::json!({"lesson_id":"lsn42"}),
+        };
+        let msg = fake_nats_message(&envelope);
+
+        stream
+            .expect_next()
+            .times(2)
+            .returning(move || {
+                static CALLS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let call = CALLS.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    Some(Ok(msg.clone()))
+                } else {
+                    None // stream closed
+                }
+            });
+
+        let consumer = EventConsumer::new(idx, stream);
+        let handle = consumer.spawn();
+
+        // Allow worker to finish
+        sleep(Duration::from_millis(100)).await;
+        consumer.shutdown();
+        handle.await.expect("join");
+
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+}
+```

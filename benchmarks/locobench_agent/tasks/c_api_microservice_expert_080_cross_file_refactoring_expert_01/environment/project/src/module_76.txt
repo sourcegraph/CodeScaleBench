@@ -1,0 +1,403 @@
+```c
+/****************************************************************************************
+ * MercuryMonolith Commerce Hub – Rate-Limiter Module
+ *
+ * src/module_76.txt  (compiled as mmc_rate_limiter.c)
+ *
+ * This module implements an in-memory, thread-safe token-bucket rate limiter that is
+ * leveraged by the API-Gateway layer to guarantee per-consumer or per-route throughput
+ * limits.  Buckets are lazily created and stored in a lock-free hash table backed by
+ * UTHash.  Each bucket is protected by its own pthread mutex to minimize contention.
+ *
+ * Dependencies
+ *  • Pthreads           – thread safety
+ *  • stdatomic.h        – lock-free statistics updates
+ *  • uthash             – hash map (header included below for self-containment)
+ *
+ * Notes
+ *  • This file purposefully embeds uthash.h to avoid an external dependency.
+ *  • Metrics/logging integrations are exposed via weak symbols so the module
+ *    can link even if the wider observability stack is not present.
+ ****************************************************************************************/
+
+#define _POSIX_C_SOURCE 200809L   /* clock_gettime, pthread, strdup */
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* ────────────────────────────────────────────────────────────────────────────── */
+/*                          Embedded UTHash (abridged)                           */
+/* ────────────────────────────────────────────────────────────────────────────── */
+/* A minimal subset of UTHash (https://troydhanson.github.io/uthash/) required
+ * for this compilation unit.  For the full licence please visit the original
+ * repository. The implementation below only supports string keys.              */
+#ifndef MMC_UTHASH_H
+#define MMC_UTHASH_H
+
+#define UTHASH_VERSION 2.3.0
+#define uthash_malloc(sz)       malloc(sz)
+#define uthash_free(ptr,sz)     free(ptr)
+
+#define uthash_fatal(msg)       do { abort(); } while (0)
+
+#define uthash_noexpand_fyi(tbl)
+#define uthash_expand_fyi(tbl)
+
+#define HASH_FIND_STR(head,findstr,out)                                          \
+    HASH_FIND(hh,head,findstr,strlen(findstr),out)
+
+#define HASH_ADD_STR(head,strfield,add)                                          \
+    HASH_ADD(hh,head,strfield[0],strlen(add->strfield),add)
+
+#define HASH_DEL(head,delptr)                                                    \
+    HASH_DELETE(hh,head,delptr)
+
+#define HASH_FIND(hh,head,keyptr,keylen,out)                                     \
+    do {                                                                         \
+        out=NULL;                                                                \
+        if (head) {                                                              \
+            unsigned _hf_bkt;                                                    \
+            HASH_FCN(keyptr,keylen, head->hh.tbl->num_buckets, _hf_bkt);         \
+            out=head->hh.tbl->buckets[_hf_bkt].hh_head;                          \
+            while (out) {                                                        \
+                if ((out->keylen == keylen) &&                                   \
+                    (memcmp(out->key, keyptr, keylen) == 0)) break;              \
+                out=out->hh_next;                                                \
+            }                                                                    \
+        }                                                                        \
+    } while(0)
+
+#define HASH_ADD(hh,head,keyptr,keylen_in,add)                                   \
+    do {                                                                         \
+        unsigned _ha_bkt;                                                        \
+        (add)->key = (char*)keyptr;                                              \
+        (add)->keylen = (unsigned)keylen_in;                                     \
+        if (!(head)) {                                                           \
+            (head)=(add);                                                        \
+            (head)->hh.tbl = (UT_hash_table*)uthash_malloc(                      \
+                sizeof(UT_hash_table));                                          \
+            memset((head)->hh.tbl,0,sizeof(UT_hash_table));                      \
+            (head)->hh.tbl->num_buckets = 128;                                   \
+            (head)->hh.tbl->buckets = (UT_hash_bucket*)uthash_malloc(           \
+                 (head)->hh.tbl->num_buckets * sizeof(struct UT_hash_bucket));   \
+            memset((head)->hh.tbl->buckets,0,                                    \
+                   (head)->hh.tbl->num_buckets * sizeof(struct UT_hash_bucket)); \
+        }                                                                        \
+        HASH_FCN((add)->key,(add)->keylen, (head)->hh.tbl->num_buckets, _ha_bkt);\
+        UT_hash_handle *_hh=&(add)->hh;                                          \
+        _hh->tbl=(head)->hh.tbl;                                                 \
+        _hh->key=(add)->key;                                                     \
+        _hh->keylen=(add)->keylen;                                               \
+        _hh->hh_next=_hh->tbl->buckets[_ha_bkt].hh_head;                         \
+        _hh->tbl->buckets[_ha_bkt].hh_head=add;                                  \
+    } while(0)
+
+#define HASH_DELETE(hh,head,delptr)                                              \
+    do {                                                                         \
+        unsigned _hd_bkt;                                                        \
+        HASH_FCN((delptr)->key,(delptr)->keylen, (head)->hh.tbl->num_buckets,    \
+                 _hd_bkt);                                                       \
+        struct mmc_bucket *_tmp=(head)->hh.tbl->buckets[_hd_bkt].hh_head;        \
+        struct mmc_bucket *_prev=NULL;                                           \
+        while(_tmp) {                                                            \
+            if (_tmp == (delptr)) {                                              \
+                if (_prev) _prev->hh_next=_tmp->hh_next;                         \
+                else _tmp->hh.tbl->buckets[_hd_bkt].hh_head=_tmp->hh_next;       \
+                break;                                                           \
+            }                                                                    \
+            _prev=_tmp;                                                          \
+            _tmp=_tmp->hh_next;                                                  \
+        }                                                                        \
+    } while(0)
+
+/* simplistic Fowler–Noll–Vo hash function */
+#define HASH_FCN(keyptr,keylen,num_bkts,out)                                     \
+    do {                                                                         \
+        const unsigned char *_hf_key=(const unsigned char*)(keyptr);             \
+        unsigned _hf_i; uint32_t _hf_hash=2166136261u;                           \
+        for(_hf_i=0; _hf_i<keylen; _hf_i++)                                      \
+            _hf_hash = (_hf_hash ^ _hf_key[_hf_i]) * 16777619u;                  \
+        out = (unsigned)(_hf_hash & (num_bkts - 1));                             \
+    } while(0)
+
+typedef struct UT_hash_bucket {
+    struct mmc_bucket *hh_head;
+} UT_hash_bucket;
+
+typedef struct UT_hash_table {
+    UT_hash_bucket *buckets;
+    unsigned num_buckets;
+} UT_hash_table;
+
+typedef struct UT_hash_handle {
+    struct mmc_bucket *hh_next; /* next element in bucket */
+    UT_hash_table     *tbl;
+    void              *key;
+    unsigned           keylen;
+} UT_hash_handle;
+
+#endif /* MMC_UTHASH_H */
+
+/* ────────────────────────────────────────────────────────────────────────────── */
+/*                             Observability Hooks                              */
+/* ────────────────────────────────────────────────────────────────────────────── */
+/* The wider monolith exposes logging/metrics via these symbols.  Weak aliases
+ * ensure compilation succeeds even when linked stand-alone (unit tests).       */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+__attribute__((weak)) void mmc_log_warn(const char *fmt, ...)  {}
+__attribute__((weak)) void mmc_log_debug(const char *fmt, ...) {}
+__attribute__((weak)) void mmc_metrics_counter_inc(const char *name) {}
+#pragma GCC diagnostic pop
+
+/* ────────────────────────────────────────────────────────────────────────────── */
+/*                               Data Structures                                */
+/* ────────────────────────────────────────────────────────────────────────────── */
+
+/* Token-bucket state for a single key */
+typedef struct mmc_bucket {
+    char               *key;               /* hash map key (malloc'ed) */
+    unsigned            keylen;
+    uint64_t            capacity;          /* max tokens */
+    uint64_t            refill_rate;       /* tokens / second */
+    uint64_t            tokens;            /* current token count */
+    struct timespec     last_ts;           /* last refill */
+    pthread_mutex_t     mtx;               /* protects this bucket */
+    UT_hash_handle      hh;                /* uthash handle */
+} mmc_bucket_t;
+
+/* Rate limiter global configuration */
+typedef struct {
+    atomic_uint_fast64_t default_capacity;
+    atomic_uint_fast64_t default_rate;
+    pthread_rwlock_t     map_guard;        /* protects 'buckets' for structural chg */
+    mmc_bucket_t        *buckets;          /* uthash table root */
+} mmc_rate_limiter_t;
+
+static mmc_rate_limiter_t g_rl = {
+    .default_capacity = ATOMIC_VAR_INIT(1000),
+    .default_rate     = ATOMIC_VAR_INIT(250),
+    .map_guard        = PTHREAD_RWLOCK_INITIALIZER,
+    .buckets          = NULL
+};
+
+/* ────────────────────────────────────────────────────────────────────────────── */
+/*                      Time Helpers (monotonic, nanoseconds)                   */
+/* ────────────────────────────────────────────────────────────────────────────── */
+
+/* Returns monotonic time in nanoseconds */
+static inline uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1_000_000_000ull) + (uint64_t)ts.tv_nsec;
+}
+
+/* ────────────────────────────────────────────────────────────────────────────── */
+/*                    Internal Bucket Management Prototypes                      */
+/* ────────────────────────────────────────────────────────────────────────────── */
+static mmc_bucket_t *
+bucket_lookup_or_create(const char *key, uint64_t capacity, uint64_t rate);
+
+/* ────────────────────────────────────────────────────────────────────────────── */
+/*                               API Interface                                  */
+/* ────────────────────────────────────────────────────────────────────────────── */
+
+/*
+ * mmc_rate_limiter_configure_default()
+ * ------------------------------------
+ * Adjust the default capacity and refill rate for newly created buckets.
+ * Existing buckets are unaffected to avoid race conditions with in-flight
+ * operations.  This is typically invoked during bootstrap when loading
+ * per-tenant plans from the configuration repository.
+ */
+void
+mmc_rate_limiter_configure_default(uint64_t capacity, uint64_t refill_per_sec)
+{
+    atomic_store_explicit(&g_rl.default_capacity, capacity, memory_order_relaxed);
+    atomic_store_explicit(&g_rl.default_rate,     refill_per_sec, memory_order_relaxed);
+
+    mmc_log_debug("[rate_limiter] Updated default capacity=%" PRIu64
+                  " rate=%" PRIu64 "/s", capacity, refill_per_sec);
+}
+
+/*
+ * mmc_rate_limiter_allow()
+ * ------------------------
+ * Attempt to consume a single token from the bucket associated with `key`.
+ * Returns true if the request should be allowed, false if rate-limited.
+ */
+bool
+mmc_rate_limiter_allow(const char *key)
+{
+    if (key == NULL || *key == '\0') {
+        mmc_log_warn("[rate_limiter] NULL or empty key provided; denying.");
+        mmc_metrics_counter_inc("mmc_rl_invalid_key");
+        return false;
+    }
+
+    /* Lookup or lazily create bucket */
+    uint64_t capacity = atomic_load_explicit(&g_rl.default_capacity,
+                                             memory_order_relaxed);
+    uint64_t rate     = atomic_load_explicit(&g_rl.default_rate,
+                                             memory_order_relaxed);
+
+    mmc_bucket_t *bucket = bucket_lookup_or_create(key, capacity, rate);
+    if (bucket == NULL) {
+        /* OOM or mutex init failure */
+        mmc_metrics_counter_inc("mmc_rl_bucket_alloc_fail");
+        return false;
+    }
+
+    /* --- Critical section: per-bucket mutex --- */
+    pthread_mutex_lock(&bucket->mtx);
+
+    /* Refill tokens proportional to elapsed time */
+    uint64_t now = now_ns();
+    uint64_t last = ((uint64_t)bucket->last_ts.tv_sec * 1_000_000_000ull) +
+                     (uint64_t)bucket->last_ts.tv_nsec;
+
+    if (now > last) {
+        uint64_t delta_ns = now - last;
+        uint64_t tokens_to_add = (delta_ns * bucket->refill_rate) / 1_000_000_000ull;
+        if (tokens_to_add > 0) {
+            bucket->tokens = bucket->tokens + tokens_to_add > bucket->capacity
+                               ? bucket->capacity
+                               : bucket->tokens + tokens_to_add;
+            clock_gettime(CLOCK_MONOTONIC, &bucket->last_ts);
+        }
+    }
+
+    bool allowed = false;
+    if (bucket->tokens > 0) {
+        bucket->tokens--;
+        allowed = true;
+    }
+
+    pthread_mutex_unlock(&bucket->mtx);
+    /* --- End critical section --- */
+
+    const char *metric = allowed ? "mmc_rl_allowed" : "mmc_rl_blocked";
+    mmc_metrics_counter_inc(metric);
+
+    return allowed;
+}
+
+/*
+ * mmc_rate_limiter_cleanup()
+ * --------------------------
+ * Gracefully release resources used by the global bucket registry.  It is safe
+ * to call this during program shutdown once all request threads are quiescent.
+ */
+void
+mmc_rate_limiter_cleanup(void)
+{
+    pthread_rwlock_wrlock(&g_rl.map_guard);
+
+    mmc_bucket_t *iter, *tmp;
+    HASH_ITER(hh, g_rl.buckets, iter, tmp) {
+        HASH_DEL(g_rl.buckets, iter);
+        pthread_mutex_destroy(&iter->mtx);
+        free(iter->key);
+        free(iter);
+    }
+
+    pthread_rwlock_unlock(&g_rl.map_guard);
+}
+
+/* ────────────────────────────────────────────────────────────────────────────── */
+/*                    Internal — Bucket Lookup/Create Logic                     */
+/* ────────────────────────────────────────────────────────────────────────────── */
+
+/*
+ * bucket_lookup_or_create()
+ * -------------------------
+ * Fast path: attempt to locate bucket under read-lock.
+ * Slow path: upgrade to write-lock to allocate a new bucket.
+ */
+static mmc_bucket_t *
+bucket_lookup_or_create(const char *key, uint64_t capacity, uint64_t rate)
+{
+    mmc_bucket_t *bucket = NULL;
+
+    /* Read lock – allows concurrent lookups */
+    pthread_rwlock_rdlock(&g_rl.map_guard);
+    HASH_FIND_STR(g_rl.buckets, key, bucket);
+    pthread_rwlock_unlock(&g_rl.map_guard);
+
+    if (bucket) {
+        return bucket; /* existing bucket (hot path) */
+    }
+
+    /* Upgrade to write lock to insert new bucket */
+    pthread_rwlock_wrlock(&g_rl.map_guard);
+
+    /* Recheck: bucket may have been inserted by another thread */
+    HASH_FIND_STR(g_rl.buckets, key, bucket);
+    if (bucket == NULL) {
+        bucket = calloc(1, sizeof(*bucket));
+        if (bucket == NULL) {
+            pthread_rwlock_unlock(&g_rl.map_guard);
+            return NULL;
+        }
+        bucket->key     = strdup(key);
+        bucket->keylen  = (unsigned)strlen(key);
+        bucket->capacity= capacity;
+        bucket->refill_rate = rate;
+        bucket->tokens  = capacity;
+        clock_gettime(CLOCK_MONOTONIC, &bucket->last_ts);
+        if (pthread_mutex_init(&bucket->mtx, NULL) != 0) {
+            free(bucket->key);
+            free(bucket);
+            pthread_rwlock_unlock(&g_rl.map_guard);
+            return NULL;
+        }
+
+        HASH_ADD_STR(g_rl.buckets, key, bucket);
+
+        mmc_log_debug("[rate_limiter] Created new bucket for key='%s'", key);
+    }
+
+    pthread_rwlock_unlock(&g_rl.map_guard);
+    return bucket;
+}
+
+/* ────────────────────────────────────────────────────────────────────────────── */
+/*                         Unit-Test Entry Point (opt)                           */
+/* ────────────────────────────────────────────────────────────────────────────── */
+#ifdef MMC_RATE_LIMITER_TESTDRIVE
+#include <stdio.h>
+static void *spam(void *arg)
+{
+    const char *k = (const char *)arg;
+    int allowed = 0, blocked = 0;
+    for (int i = 0; i < 10000; ++i) {
+        if (mmc_rate_limiter_allow(k))
+            allowed++;
+        else
+            blocked++;
+    }
+    printf("Thread for key=%s allowed=%d blocked=%d\n", k, allowed, blocked);
+    return NULL;
+}
+
+int main(void)
+{
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, spam, "tenantA");
+    pthread_create(&t2, NULL, spam, "tenantA");
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+
+    mmc_rate_limiter_cleanup();
+    return 0;
+}
+#endif /* MMC_RATE_LIMITER_TESTDRIVE */
+```

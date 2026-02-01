@@ -1,0 +1,374 @@
+```rust
+//! LedgerLink Nexus – Response Cache module
+//!
+//! This module provides a Redis–backed, typed response cache that is
+//! multi-tenant aware and suitable for high-throughput API endpoints.
+//!
+//! It is designed to be plugged into the Command/Query service layer
+//! to cache expensive read-only queries (ledger snapshots, forecasts, …).
+//!
+//! Key features
+//!  * Multi-tenant isolation
+//!  * Namespaced cache scopes (per endpoint)
+//!  * Pluggable serialization (bincode / JSON)
+//!  * Fine-grained TTL control
+//!  * Structured logging via `tracing`
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use std::time::Duration;
+//! use ledgerlink_nexus_cache::{RedisResponseCache, ResponseCache};
+//!
+//! # #[tokio::main] async fn main() -> anyhow::Result<()> {
+//! let redis_cfg = "redis://127.0.0.1/";
+//! let cache      = RedisResponseCache::connect(redis_cfg).await?;
+//!
+//! // store
+//! cache.set_json("acme-inc", "ledger_entries:v1", "qhash", &vec![1,2,3], Duration::from_secs(60)).await?;
+//!
+//! // fetch
+//! if let Some(entries): Option<Vec<i32>> = cache.get_json("acme-inc", "ledger_entries:v1", "qhash").await? {
+//!     println!("hit: {:?}", entries);
+//! }
+//!
+//! Ok(())
+//! # }
+//! ```
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::module_name_repetitions)]
+
+use std::fmt::{self, Display};
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use redis::aio::{Connection, ConnectionManager};
+use redis::{Client, RedisError};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+use tokio::sync::RwLock;
+use tracing::{debug, error, instrument};
+
+/// Type alias for tenant identifier.
+///
+/// Tenants are case-insensitive ASCII strings (`[a-z0-9_-]`).
+/// Keeping the type opaque avoids stringly-typed mistakes across the code-base.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TenantId(String);
+
+impl TenantId {
+    /// Creates a new `TenantId` if `raw` is valid, otherwise an error is returned.
+    ///
+    /// The validation rules are intentionally strict to avoid cache-poisoning
+    /// by malicious payloads.
+    pub fn parse(raw: &str) -> Result<Self, CacheError> {
+        let valid = !raw.is_empty()
+            && raw.len() <= 64
+            && raw
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+        if valid {
+            Ok(Self(raw.to_string()))
+        } else {
+            Err(CacheError::InvalidTenant(raw.into()))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for TenantId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Errors emitted by the cache layer.
+#[derive(Debug, Error)]
+pub enum CacheError {
+    #[error("redis error: {0}")]
+    Redis(#[from] RedisError),
+    #[error("serialization: {0}")]
+    Serialization(#[from] bincode::Error),
+    #[error("tenant id '{0}' is invalid")]
+    InvalidTenant(String),
+}
+
+/// Top-level abstraction for a response cache.
+///
+/// Implementations are encouraged to be cheap to clone (`Arc` internally).
+#[async_trait]
+pub trait ResponseCache: Send + Sync {
+    /// Fetches a cached value by `(tenant, scope, digest)` returning an
+    /// optional deserialized payload.
+    async fn get<T>(&self, tenant: &TenantId, scope: &str, digest: &str) -> Result<Option<T>, CacheError>
+    where
+        T: DeserializeOwned + Send;
+
+    /// Stores the value with a TTL.
+    async fn set<T>(
+        &self,
+        tenant: &TenantId,
+        scope: &str,
+        digest: &str,
+        value: &T,
+        ttl: Duration,
+    ) -> Result<(), CacheError>
+    where
+        T: Serialize + Send;
+
+    /// Delete all keys belonging to `(tenant, scope)`.
+    async fn invalidate_scope(&self, tenant: &TenantId, scope: &str) -> Result<u64, CacheError>;
+}
+
+/// Concrete Redis implementation.
+///
+/// The struct internally keeps a pooled async connection manager so that cloning
+/// is cheap and recommended to pass it by value through service structs.
+///
+/// Serialization format can be chosen at call site (`bincode`/`JSON`) via helpers.
+#[derive(Clone)]
+pub struct RedisResponseCache {
+    pool: Arc<RwLock<ConnectionManager>>,
+}
+
+impl RedisResponseCache {
+    /// Establishes an async `redis::ConnectionManager` with exponential back-off
+    /// retries (at most 3 attempts). Production systems often start before Redis,
+    /// so some resilience is desired.
+    #[instrument(name = "cache_connect", skip(redis_url))]
+    pub async fn connect(redis_url: &str) -> Result<Self, CacheError> {
+        let client = Client::open(redis_url)?;
+        let mut attempt = 0;
+        let pool = loop {
+            match client.get_tokio_connection_manager().await {
+                Ok(conn) => break conn,
+                Err(e) if attempt < 3 => {
+                    attempt += 1;
+                    let wait = Duration::from_millis(200u64.saturating_pow(attempt));
+                    error!(attempt, err = %e, "failed to connect to redis – retrying");
+                    tokio::time::sleep(wait).await;
+                }
+                Err(e) => return Err(CacheError::Redis(e)),
+            }
+        };
+
+        Ok(Self {
+            pool: Arc::new(RwLock::new(pool)),
+        })
+    }
+
+    async fn connection(&self) -> redis::RedisResult<Connection> {
+        self.pool.read().await.clone_connection()
+    }
+
+    /// Helper that converts an arbitrary key triple into a single Redis key.
+    ///
+    /// Format: `nexus:{tenant}:{scope}:{digest}`
+    fn compose_key(tenant: &TenantId, scope: &str, digest: &str) -> String {
+        format!("nexus:{}:{}:{}", tenant.as_str(), scope, digest)
+    }
+
+    /// High-level helper that serializes to bincode.
+    pub async fn get_bin<T>(
+        &self,
+        tenant: &str,
+        scope: &str,
+        digest: &str,
+    ) -> Result<Option<T>, CacheError>
+    where
+        T: DeserializeOwned + Send,
+    {
+        let tenant = TenantId::parse(tenant)?;
+        self.get(&tenant, scope, digest).await
+    }
+
+    /// High-level helper that deserializes JSON.
+    pub async fn get_json<T>(
+        &self,
+        tenant: &str,
+        scope: &str,
+        digest: &str,
+    ) -> Result<Option<T>, CacheError>
+    where
+        T: DeserializeOwned + Send,
+    {
+        let tenant = TenantId::parse(tenant)?;
+        let key = Self::compose_key(&tenant, scope, digest);
+        let raw: Option<String> = self.connection().await?.get(key).await?;
+        if let Some(json) = raw {
+            let val = serde_json::from_str(&json)
+                .map_err(|e| CacheError::Serialization(bincode::Error::new(e)))?;
+            Ok(Some(val))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn set_json<T>(
+        &self,
+        tenant: &str,
+        scope: &str,
+        digest: &str,
+        value: &T,
+        ttl: Duration,
+    ) -> Result<(), CacheError>
+    where
+        T: Serialize + Send,
+    {
+        let tenant = TenantId::parse(tenant)?;
+        let key = Self::compose_key(&tenant, scope, digest);
+        let json = serde_json::to_string(value)
+            .map_err(|e| CacheError::Serialization(bincode::Error::new(e)))?;
+        let mut con = self.connection().await?;
+        con.set_ex(key, json, ttl.as_secs() as usize).await?;
+        Ok(())
+    }
+}
+
+/// Binary (bincode) implementation of [`ResponseCache`] for Redis.
+#[async_trait]
+impl ResponseCache for RedisResponseCache {
+    #[instrument(name = "cache_get", skip(self))]
+    async fn get<T>(&self, tenant: &TenantId, scope: &str, digest: &str) -> Result<Option<T>, CacheError>
+    where
+        T: DeserializeOwned + Send,
+    {
+        let key = Self::compose_key(tenant, scope, digest);
+        let mut con = self.connection().await?;
+        let raw: Option<Vec<u8>> = con.get(key).await?;
+        match raw {
+            Some(buf) => {
+                debug!(%tenant, %scope, hit = true, "cache hit");
+                let val = bincode::deserialize::<T>(&buf)?;
+                Ok(Some(val))
+            }
+            None => {
+                debug!(%tenant, %scope, hit = false, "cache miss");
+                Ok(None)
+            }
+        }
+    }
+
+    #[instrument(name = "cache_set", skip_all, fields(size = value_size(value)))]
+    async fn set<T>(
+        &self,
+        tenant: &TenantId,
+        scope: &str,
+        digest: &str,
+        value: &T,
+        ttl: Duration,
+    ) -> Result<(), CacheError>
+    where
+        T: Serialize + Send,
+    {
+        let key = Self::compose_key(tenant, scope, digest);
+        let buf = bincode::serialize(value)?;
+        let mut con = self.connection().await?;
+        con.set_ex(key, buf, ttl.as_secs() as usize).await?;
+        Ok(())
+    }
+
+    #[instrument(name = "cache_invalidate_scope", skip(self))]
+    async fn invalidate_scope(&self, tenant: &TenantId, scope: &str) -> Result<u64, CacheError> {
+        // Use SCAN to avoid blocking Redis for large key spaces
+        let pattern = format!("nexus:{}:{}:*", tenant.as_str(), scope);
+        let mut con = self.connection().await?;
+        let mut cursor: u64 = 0;
+        let mut total_deleted = 0;
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(1000)
+                .query_async(&mut con)
+                .await?;
+
+            if !keys.is_empty() {
+                let deleted: u64 = con.del(keys).await?;
+                total_deleted += deleted;
+            }
+
+            if next_cursor == 0 {
+                break;
+            }
+            cursor = next_cursor;
+        }
+        Ok(total_deleted)
+    }
+}
+
+/// Convenience helper to compute a stable digest (SHA-256/hex) from a serializable input.
+///
+/// Used by query handlers to generate deterministic cache keys based on request
+/// parameters.
+pub fn compute_digest<T: Serialize>(input: &T) -> Result<String, CacheError> {
+    let json = serde_json::to_vec(input)
+        .map_err(|e| CacheError::Serialization(bincode::Error::new(e)))?;
+    Ok(hex::encode(Sha256::digest(&json)))
+}
+
+// ----------------- tests -----------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+    use tokio::runtime::Runtime;
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct Dummy {
+        v: i32,
+    }
+
+    #[test]
+    fn tenant_validation() {
+        assert!(TenantId::parse("acme_inc").is_ok());
+        assert!(TenantId::parse("💩").is_err());
+        assert!(TenantId::parse("UPPERCASE").is_err());
+    }
+
+    #[test]
+    fn digest_consistency() {
+        let d1 = compute_digest(&42u32).unwrap();
+        let d2 = compute_digest(&42u32).unwrap();
+        assert_eq!(d1, d2);
+
+        let d3 = compute_digest(&43u32).unwrap();
+        assert_ne!(d1, d3);
+    }
+
+    #[test]
+    fn roundtrip_bincode() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            // Use a local in-process Redis instance if available, otherwise skip.
+            let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".into());
+            let cache = match RedisResponseCache::connect(&url).await {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!("Redis not reachable – skipping test");
+                    return;
+                }
+            };
+
+            let tenant = TenantId::parse("acme-test").unwrap();
+            let scope = "dummy_scope";
+            let digest = "unit-test";
+            let val = Dummy { v: 123 };
+
+            cache
+                .set(&tenant, scope, digest, &val, Duration::from_secs(30))
+                .await
+                .unwrap();
+            let got: Option<Dummy> = cache.get(&tenant, scope, digest).await.unwrap();
+            assert_eq!(Some(val), got);
+        });
+    }
+}
+```

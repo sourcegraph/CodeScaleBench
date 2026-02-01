@@ -1,0 +1,431 @@
+```rust
+//! src/module_66.rs
+//!
+//! Automated-retraining orchestration layer: listens for model-metric events
+//! published by the Model Monitoring subsystem, detects significant model
+//! performance drift, then kicks off a retraining pipeline with an adaptive
+//! hyper-parameter search strategy.
+//!
+//! This module demonstrates a Strategy + Observer combination: the observer
+//! (`RetrainingTrigger`) subscribes to `MetricEvent`s; if drift is detected the
+//! trigger delegates to a pluggable `HyperParamTuner` strategy as well as a
+//! `ModelTrainer` implementation.  The entire flow is async so that alerts do
+//! not block critical inference paths.
+//!
+//! External dependencies (declared in workspace `Cargo.toml`):
+//!  async-trait = "0.1"
+//!  chrono      = { version = "0.4", features = ["serde"] }
+//!  serde       = { version = "1.0", features = ["derive"] }
+//!  thiserror   = "1.0"
+//!  tokio       = { version = "1", features = ["macros", "rt-multi-thread"] }
+//!  tracing     = "0.1"
+//!
+//! Down-stream modules may reuse the public traits exported here.
+
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
+
+/// A typed identifier for each registered model.
+///
+/// `Display` and `FromStr` impls allow models to be manipulated and emitted
+/// over the wire as human-readable IDs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ModelId(String);
+
+impl std::fmt::Display for ModelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::str::FromStr for ModelId {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(ModelId(s.to_owned()))
+    }
+}
+
+/// Enum describing the metric being reported.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum MetricKind {
+    Accuracy,
+    Precision,
+    Recall,
+    F1Score,
+}
+
+/// A metric value reported by the online-inference service.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MetricValue {
+    pub kind: MetricKind,
+    pub value: f32,
+    pub ts: DateTime<Utc>,
+}
+
+/// Event forwarded by the Monitoring layer every `event_granularity` seconds.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MetricEvent {
+    pub model: ModelId,
+    pub values: Vec<MetricValue>,
+}
+
+/// Observer trait for receiving metric events.
+#[async_trait]
+pub trait MetricEventObserver: Send + Sync {
+    async fn on_event(&self, ev: MetricEvent);
+}
+
+/// Defines the common interface for triggering model training jobs.
+#[async_trait]
+pub trait ModelTrainer: Send + Sync {
+    async fn train(
+        &self,
+        model: &ModelId,
+        training_data_uri: &str,
+        hyper_params: HyperParams,
+    ) -> Result<TrainingJobInfo, OrchestratorError>;
+}
+
+/// Pluggable hyper-parameter tuner strategy.
+#[async_trait]
+pub trait HyperParamTuner: Send + Sync {
+    async fn tune(
+        &self,
+        model: &ModelId,
+        historic_metrics: &[MetricValue],
+    ) -> HyperParams;
+}
+
+/// Generic key/value store of hyper-parameters.
+pub type HyperParams = std::collections::HashMap<String, String>;
+
+/// Metadata returned after scheduling a training job.
+#[derive(Clone, Debug)]
+pub struct TrainingJobInfo {
+    pub job_id: String,
+    pub queued_at: DateTime<Utc>,
+    pub estimated_completion: Option<DateTime<Utc>>,
+}
+
+/// Custom domain errors for this module.
+#[derive(Error, Debug)]
+pub enum OrchestratorError {
+    #[error("IO/FS error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("trainer backend error: {0}")]
+    TrainerBackend(String),
+
+    #[error("validator error: {0}")]
+    Validation(String),
+
+    #[error("unknown orchestrator error")]
+    Unknown,
+}
+
+/// Concrete implementation: a simple rolling-window drift detector.
+///
+/// When the average of the monitored metric drops below `threshold`,
+/// a retraining signal is emitted.
+///
+/// The detector is kept intentionally generic: clients can configure which
+/// metric to monitor (e.g. F1) and the size of the window.
+pub struct DriftDetector {
+    metric_of_interest: MetricKind,
+    min_samples: usize,
+    threshold: f32,
+    window: RwLock<VecDeque<MetricValue>>,
+}
+
+impl DriftDetector {
+    pub fn new(metric_of_interest: MetricKind, min_samples: usize, threshold: f32) -> Self {
+        Self {
+            metric_of_interest,
+            min_samples,
+            threshold,
+            window: RwLock::new(VecDeque::with_capacity(min_samples * 2)),
+        }
+    }
+
+    /// Inserts a value and returns `true` if drift is detected.
+    async fn push_and_check(&self, mv: MetricValue) -> bool {
+        if mv.kind != self.metric_of_interest {
+            // Ignore other metrics.
+            return false;
+        }
+
+        let mut guard = self.window.write().await;
+        guard.push_back(mv);
+        // Keep the window bounded.
+        if guard.len() > self.min_samples {
+            guard.pop_front();
+        }
+
+        if guard.len() < self.min_samples {
+            return false;
+        }
+
+        let avg = guard
+            .iter()
+            .map(|v| v.value as f64)
+            .sum::<f64>() / guard.len() as f64;
+
+        debug!(
+            "DriftDetector – window {} samples, avg: {:.4}",
+            guard.len(),
+            avg
+        );
+
+        avg < self.threshold as f64
+    }
+}
+
+/// Concrete hyper-parameter tuner that performs a coarse grid search.
+///
+/// In production this would be swapped with Bayesian optimization or
+/// evolutionary algorithms.  For demo purposes we just build a handful of
+/// candidate learning rates and regularization strengths based on the
+/// historic metric trend.
+pub struct GridSearchTuner;
+
+#[async_trait]
+impl HyperParamTuner for GridSearchTuner {
+    async fn tune(
+        &self,
+        _model: &ModelId,
+        historic_metrics: &[MetricValue],
+    ) -> HyperParams {
+        let degradation_speed = historic_metrics
+            .windows(2)
+            .filter_map(|w| {
+                let prev = w[0].value;
+                let next = w[1].value;
+                if prev > 0.0 {
+                    Some((prev - next) / prev)
+                } else {
+                    None
+                }
+            })
+            .sum::<f32>()
+            / (historic_metrics.len().max(1) as f32);
+
+        let mut params = HyperParams::new();
+        if degradation_speed > 0.05 {
+            // Aggressive learning rate if metrics degrade quickly.
+            params.insert("learning_rate".into(), "5e-4".into());
+            params.insert("weight_decay".into(), "1e-4".into());
+        } else {
+            params.insert("learning_rate".into(), "1e-4".into());
+            params.insert("weight_decay".into(), "5e-4".into());
+        }
+
+        params
+    }
+}
+
+/// Placeholder trainer that delegates work to an external job scheduler.
+///
+/// In reality, this would call out to a Kubernetes Job, AWS SageMaker, etc.
+pub struct RemoteTrainer {
+    endpoint: String,
+    client: reqwest::Client,
+}
+
+impl RemoteTrainer {
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelTrainer for RemoteTrainer {
+    async fn train(
+        &self,
+        model: &ModelId,
+        training_data_uri: &str,
+        hyper_params: HyperParams,
+    ) -> Result<TrainingJobInfo, OrchestratorError> {
+        #[derive(Serialize)]
+        struct TrainRequest<'a> {
+            model_id: &'a str,
+            data_uri: &'a str,
+            hyper_params: &'a HyperParams,
+        }
+
+        let req_body = TrainRequest {
+            model_id: &model.0,
+            data_uri: training_data_uri,
+            hyper_params: &hyper_params,
+        };
+
+        let resp = self
+            .client
+            .post(format!("{}/schedule", self.endpoint))
+            .json(&req_body)
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::TrainerBackend(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(OrchestratorError::TrainerBackend(format!(
+                "HTTP {}",
+                resp.status()
+            )));
+        }
+
+        #[derive(Deserialize)]
+        struct TrainResp {
+            job_id: String,
+            eta_secs: Option<u64>,
+        }
+
+        let parsed: TrainResp = resp
+            .json()
+            .await
+            .map_err(|e| OrchestratorError::TrainerBackend(e.to_string()))?;
+
+        Ok(TrainingJobInfo {
+            job_id: parsed.job_id,
+            queued_at: Utc::now(),
+            estimated_completion: parsed.eta_secs.map(|s| Utc::now() + chrono::Duration::seconds(s as i64)),
+        })
+    }
+}
+
+/// Observer that wires everything together.
+pub struct RetrainingTrigger<T: HyperParamTuner, M: ModelTrainer> {
+    detector: Arc<DriftDetector>,
+    tuner: Arc<T>,
+    trainer: Arc<M>,
+    /// Where to read training data from (i.e. S3 prefix, HDFS path, etc.).
+    training_data_root: String,
+    /// We enforce a cooldown between scheduled jobs to prevent thrashing.
+    min_cooldown: Duration,
+    /// Stores the last time a retrain job was triggered.
+    last_triggered: RwLock<Option<SystemTime>>,
+}
+
+impl<T, M> RetrainingTrigger<T, M>
+where
+    T: HyperParamTuner + 'static,
+    M: ModelTrainer + 'static,
+{
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        detector: Arc<DriftDetector>,
+        tuner: Arc<T>,
+        trainer: Arc<M>,
+        training_data_root: impl Into<String>,
+        min_cooldown: Duration,
+    ) -> Self {
+        Self {
+            detector,
+            tuner,
+            trainer,
+            training_data_root: training_data_root.into(),
+            min_cooldown,
+            last_triggered: RwLock::new(None),
+        }
+    }
+
+    /// Determine if we are allowed to trigger a new job based on cooldown.
+    async fn can_trigger(&self) -> bool {
+        let now = SystemTime::now();
+        let mut guard = self.last_triggered.write().await;
+        match *guard {
+            Some(last) if now.duration_since(last).unwrap_or_default() < self.min_cooldown => false,
+            _ => {
+                *guard = Some(now);
+                true
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl<T, M> MetricEventObserver for RetrainingTrigger<T, M>
+where
+    T: HyperParamTuner + Send + Sync + 'static,
+    M: ModelTrainer + Send + Sync + 'static,
+{
+    async fn on_event(&self, ev: MetricEvent) {
+        debug!("RetrainingTrigger – received metric event: {:?}", ev);
+
+        // 1. Push metrics & check drift
+        let drift_detected = ev
+            .values
+            .iter()
+            .any(|mv| self.detector.push_and_check(mv.clone()).await);
+
+        if !drift_detected {
+            debug!("No drift detected for model {}", ev.model);
+            return;
+        }
+        warn!("Drift detected for model {}", ev.model);
+
+        // 2. Check cooldown
+        if !self.can_trigger().await {
+            warn!("Cooldown in effect, skipping retraining trigger");
+            return;
+        }
+
+        // 3. Build training data URI
+        let data_uri = format!("{}/{}", self.training_data_root, ev.model);
+
+        // 4. Hyper-parameter tuning
+        let hyper_params = self.tuner.tune(&ev.model, &ev.values).await;
+        info!(
+            "Hyper-params for model {} determined: {:?}",
+            ev.model, hyper_params
+        );
+
+        // 5. Start training job
+        match self
+            .trainer
+            .train(&ev.model, &data_uri, hyper_params)
+            .await
+        {
+            Ok(job_info) => info!(
+                "Retraining for model {} scheduled. Job ID: {}, ETA: {:?}",
+                ev.model, job_info.job_id, job_info.estimated_completion
+            ),
+            Err(err) => error!("Failed to schedule retraining job: {err:?}"),
+        };
+    }
+}
+
+/// Utility function to wire up the trigger from config.
+///
+/// Example usage:
+///
+/// let trigger = build_retraining_trigger(Default::default()).await;
+pub async fn build_retraining_trigger(
+    model_registry_endpoint: String,
+) -> Arc<dyn MetricEventObserver> {
+    // In a real system these would come from config files or CLI flags.
+    let detector = Arc::new(DriftDetector::new(MetricKind::F1Score, 30, 0.85));
+    let tuner = Arc::new(GridSearchTuner);
+    let trainer = Arc::new(RemoteTrainer::new(model_registry_endpoint));
+    let trigger = RetrainingTrigger::new(
+        detector,
+        tuner,
+        trainer,
+        "s3://vision-bucket/training_data",
+        Duration::from_secs(60 * 60), // 1-hour cooldown
+    );
+    Arc::new(trigger)
+}
+```

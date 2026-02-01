@@ -1,0 +1,440 @@
+```c
+/**
+ * MercuryMonolith Commerce Hub
+ * Module: Response Cache
+ * File:   src/module_11.txt            (compiled as response_cache.c)
+ *
+ * A production-grade, thread-safe, in-memory LRU cache for HTTP responses.
+ * The cache is used by the API-Gateway layer to provide micro-service-style
+ * response caching with max-age / stale-while-revalidate semantics.
+ *
+ * Copyright (c) 2024
+ *
+ * NOTE: This compilation unit is intentionally written without knowledge of
+ *       the complete build system.  Project-local headers such as
+ *       "mm_logging.h", "mm_metrics.h", and "mm_http.h" are assumed to exist
+ *       elsewhere in the repository.
+ */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <assert.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdatomic.h>
+#include <string.h>
+#include <time.h>
+
+#include "mm_logging.h"   /* project-wide structured logging      */
+#include "mm_metrics.h"   /* Prometheus-compatible metric macros */
+#include "mm_http.h"      /* request / response abstractions     */
+#include "uthash.h"       /* single-header hash table            */
+
+/* -------------------------------------------------------------------------- */
+/*                             Forward Declarations                            */
+/* -------------------------------------------------------------------------- */
+
+struct mm_resp_cache;
+typedef struct mm_resp_cache mm_resp_cache_t;
+
+/**
+ * Middleware function signature as expected by the Gateway.
+ *  next_handler() is the remaining handler chain after the cache.
+ */
+typedef int (*mm_http_handler_fn)(
+        const mm_http_request_t *req,
+        mm_http_response_t      **resp_out,
+        void                    *user_data);
+
+/**
+ * Public API
+ */
+mm_resp_cache_t *mm_resp_cache_create(size_t capacity_bytes, uint32_t default_ttl_sec);
+void             mm_resp_cache_destroy(mm_resp_cache_t *cache);
+
+int  mm_resp_cache_middleware(
+        const mm_http_request_t *req,
+        mm_http_response_t      **resp_out,
+        void                    *next_handler);
+
+/* -------------------------------------------------------------------------- */
+/*                        Internal implementation details                     */
+/* -------------------------------------------------------------------------- */
+
+/* Metrics ------------------------------------------------------------------ */
+static mm_metric_counter_t *g_metric_hits           = NULL;
+static mm_metric_counter_t *g_metric_misses         = NULL;
+static mm_metric_gauge_t   *g_metric_items          = NULL;
+static mm_metric_gauge_t   *g_metric_memory_bytes   = NULL;
+static mm_metric_counter_t *g_metric_evictions      = NULL;
+
+static void
+ensure_metrics_registered(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+
+    pthread_once(&once, (void (*)(void)) (void *) ^{
+        g_metric_hits         = mm_metrics_counter("cache_hits_total",
+                                                   "Total cache hits");
+        g_metric_misses       = mm_metrics_counter("cache_misses_total",
+                                                   "Total cache misses");
+        g_metric_items        = mm_metrics_gauge("cache_items",
+                                                 "Number of items in cache");
+        g_metric_memory_bytes = mm_metrics_gauge("cache_memory_bytes",
+                                                 "Total heap memory consumed by cache");
+        g_metric_evictions    = mm_metrics_counter("cache_evictions_total",
+                                                   "Number of LRU evictions");
+    });
+}
+
+/* Entry -------------------------------------------------------------------- */
+typedef struct cache_entry {
+    char                   *key;           /* normalized cache key            */
+    mm_http_response_t     *resp;          /* deep-copied response            */
+    size_t                  resp_size;     /* size of resp (approx)           */
+    time_t                  expiry;        /* unix epoch when entry expires   */
+
+    struct cache_entry     *prev, *next;   /* doubly-linked LRU list          */
+    UT_hash_handle          hh;            /* makes this structure hashable   */
+} cache_entry_t;
+
+/* LRU Cache ---------------------------------------------------------------- */
+struct mm_resp_cache {
+    pthread_rwlock_t  lock;                /* readers-writable lock           */
+    size_t            capacity_bytes;      /* soft cap                        */
+    size_t            current_bytes;
+    uint32_t          default_ttl_sec;
+
+    cache_entry_t    *lut;                 /* hash map lookup table           */
+    cache_entry_t    *lru_head;            /* MRU (front)                     */
+    cache_entry_t    *lru_tail;            /* LRU (back)                      */
+};
+
+/* Memory helpers ----------------------------------------------------------- */
+static inline void *
+xmalloc(size_t sz)
+{
+    void *p = malloc(sz);
+    if (!p) {
+        MM_LOG_CRITICAL("memory_allocation_failed size=%zu", sz);
+        abort();
+    }
+    return p;
+}
+
+/* Doubly linked LRU list helpers ------------------------------------------ */
+static inline void
+lru_move_to_front(mm_resp_cache_t *c, cache_entry_t *e)
+{
+    if (c->lru_head == e) return;
+
+    /* detach */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    /* insert at front */
+    e->prev        = NULL;
+    e->next        = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head    = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+static inline void
+lru_push_front(mm_resp_cache_t *c, cache_entry_t *e)
+{
+    e->prev     = NULL;
+    e->next     = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+/* Approximate deep copy of mm_http_response_t ------------------------------ */
+static mm_http_response_t *
+resp_deep_copy(const mm_http_response_t *src, size_t *out_size)
+{
+    mm_http_response_t *dest = mm_http_response_clone(src); /* project helper */
+    if (!dest) return NULL;
+
+    if (out_size) {
+        /* naive: headers + body */
+        *out_size = strlen(src->body) + 1 + 256; /* fudge header memory */
+    }
+    return dest;
+}
+
+/* Eviction ----------------------------------------------------------------- */
+static void
+evict_lru(mm_resp_cache_t *c)
+{
+    while (c->current_bytes > c->capacity_bytes && c->lru_tail) {
+        cache_entry_t *victim = c->lru_tail;
+
+        /* unlink from LRU list */
+        if (victim->prev) victim->prev->next = NULL;
+        c->lru_tail = victim->prev;
+        if (c->lru_head == victim) c->lru_head = NULL;
+
+        /* remove from hash */
+        HASH_DEL(c->lut, victim);
+
+        /* update metrics */
+        mm_metrics_counter_inc(g_metric_evictions);
+        mm_metrics_gauge_dec(g_metric_items);
+
+        c->current_bytes -= victim->resp_size;
+        mm_metrics_gauge_set(g_metric_memory_bytes, (double)c->current_bytes);
+
+        /* free resources */
+        mm_http_response_free(victim->resp);
+        free(victim->key);
+        free(victim);
+    }
+}
+
+/* Purge expired entries ---------------------------------------------------- */
+static void
+purge_expired(mm_resp_cache_t *c, time_t now)
+{
+    cache_entry_t *e, *tmp;
+    HASH_ITER(hh, c->lut, e, tmp)
+    {
+        if (e->expiry < now) {
+            /* unlink from LRU */
+            if (e->prev) e->prev->next = e->next;
+            if (e->next) e->next->prev = e->prev;
+            if (c->lru_head == e) c->lru_head = e->next;
+            if (c->lru_tail == e) c->lru_tail = e->prev;
+
+            HASH_DEL(c->lut, e);
+
+            mm_metrics_gauge_dec(g_metric_items);
+            c->current_bytes -= e->resp_size;
+            mm_metrics_gauge_set(g_metric_memory_bytes, (double)c->current_bytes);
+
+            mm_http_response_free(e->resp);
+            free(e->key);
+            free(e);
+        }
+    }
+}
+
+/* Lookup ------------------------------------------------------------------- */
+static mm_http_response_t *
+cache_lookup(mm_resp_cache_t *c, const char *key, time_t now)
+{
+    cache_entry_t *e;
+    HASH_FIND_STR(c->lut, key, e);
+    if (!e) {
+        mm_metrics_counter_inc(g_metric_misses);
+        return NULL;
+    }
+
+    if (e->expiry < now) {
+        /* expired */
+        mm_metrics_counter_inc(g_metric_misses);
+        return NULL;
+    }
+
+    mm_metrics_counter_inc(g_metric_hits);
+    lru_move_to_front(c, e);
+    return resp_deep_copy(e->resp, NULL); /* caller gets own copy */
+}
+
+/* Insert / Update ---------------------------------------------------------- */
+static void
+cache_insert(mm_resp_cache_t *c, const char *key,
+             const mm_http_response_t *resp,
+             uint32_t ttl_sec)
+{
+    size_t approx_size = 0;
+    mm_http_response_t *cpy = resp_deep_copy(resp, &approx_size);
+    if (!cpy) return;
+
+    cache_entry_t *e;
+    HASH_FIND_STR(c->lut, key, e);
+    if (e) {
+        /* Replace in-place */
+        c->current_bytes -= e->resp_size;
+        mm_http_response_free(e->resp);
+        e->resp       = cpy;
+        e->expiry     = time(NULL) + ttl_sec;
+        e->resp_size  = approx_size;
+        c->current_bytes += approx_size;
+        lru_move_to_front(c, e);
+    } else {
+        e          = xmalloc(sizeof(*e));
+        e->key     = strdup(key);
+        e->resp    = cpy;
+        e->resp_size = approx_size;
+        e->expiry  = time(NULL) + ttl_sec;
+        e->prev = e->next = NULL;
+
+        HASH_ADD_KEYPTR(hh, c->lut, e->key, strlen(e->key), e);
+        lru_push_front(c, e);
+
+        mm_metrics_gauge_inc(g_metric_items);
+        c->current_bytes += approx_size;
+    }
+
+    mm_metrics_gauge_set(g_metric_memory_bytes, (double)c->current_bytes);
+    evict_lru(c);
+}
+
+/* Cache constructor / destructor ------------------------------------------ */
+mm_resp_cache_t *
+mm_resp_cache_create(size_t capacity_bytes, uint32_t default_ttl_sec)
+{
+    ensure_metrics_registered();
+
+    mm_resp_cache_t *c = xmalloc(sizeof(*c));
+    pthread_rwlock_init(&c->lock, NULL);
+    c->capacity_bytes    = capacity_bytes;
+    c->default_ttl_sec   = default_ttl_sec;
+    c->current_bytes     = 0;
+    c->lut               = NULL;
+    c->lru_head          = NULL;
+    c->lru_tail          = NULL;
+
+    MM_LOG_INFO("Response cache initialised capacity=%zu default_ttl=%u",
+                capacity_bytes, default_ttl_sec);
+
+    return c;
+}
+
+void
+mm_resp_cache_destroy(mm_resp_cache_t *cache)
+{
+    if (!cache) return;
+
+    pthread_rwlock_wrlock(&cache->lock);
+
+    cache_entry_t *e, *tmp;
+    HASH_ITER(hh, cache->lut, e, tmp)
+    {
+        HASH_DEL(cache->lut, e);
+        mm_http_response_free(e->resp);
+        free(e->key);
+        free(e);
+    }
+
+    pthread_rwlock_unlock(&cache->lock);
+    pthread_rwlock_destroy(&cache->lock);
+    free(cache);
+}
+
+/* Middleware --------------------------------------------------------------- */
+typedef struct middleware_ctx {
+    mm_resp_cache_t *cache;
+    mm_http_handler_fn next;
+    void             *next_ud;
+} middleware_ctx_t;
+
+/* Utility: build canonical cache key -------------------------------------- */
+static char *
+build_cache_key(const mm_http_request_t *req)
+{
+    /* Make key: METHOD|PATH|QUERY|AUTH|ACCEPT_HEADER */
+    /* In practice we could include tenant/locale etc. */
+
+    const char *method = mm_http_method_str(req->method);
+    size_t sz = strlen(method) + strlen(req->path) + strlen(req->query ? req->query : "")
+                + strlen(req->headers.accept ? req->headers.accept : "") + 4;
+    char *key = xmalloc(sz);
+    snprintf(key, sz, "%s|%s|%s|%s",
+             method,
+             req->path,
+             req->query ? req->query : "",
+             req->headers.accept ? req->headers.accept : "");
+    return key;
+}
+
+/*
+ * The exported middleware entry point is thin: it looks up the process-global
+ * cache instance stored in user_data and wraps the next handler accordingly.
+ */
+int
+mm_resp_cache_middleware(const mm_http_request_t *req,
+                         mm_http_response_t      **resp_out,
+                         void                    *user_data)
+{
+    middleware_ctx_t *ctx = (middleware_ctx_t *)user_data;
+    mm_resp_cache_t  *cache = ctx->cache;
+    time_t now = time(NULL);
+
+    /* 1. Determine eligibility ------------------------------------------------
+     *    Skip caching for:
+     *      - Non-idempotent methods (POST, PATCH, DELETE, etc.)
+     *      - Requests with Authorization header (private resource)
+     *      - Explicit 'Cache-Control: no-cache' upstream
+     */
+    if (req->method != HTTP_GET ||
+        req->headers.authorization != NULL ||
+        (req->headers.cache_control &&
+         strstr(req->headers.cache_control, "no-cache") != NULL)) {
+        return ctx->next(req, resp_out, ctx->next_ud);
+    }
+
+    /* 2. Lookup -------------------------------------------------------------- */
+    char *key = build_cache_key(req);
+    pthread_rwlock_rdlock(&cache->lock);
+    mm_http_response_t *cached = cache_lookup(cache, key, now);
+    pthread_rwlock_unlock(&cache->lock);
+
+    if (cached) {
+        *resp_out = cached;
+        MM_LOG_DEBUG("cache hit key=%s", key);
+        free(key);
+        return 0;
+    }
+
+    /* 3. Miss: call downstream ---------------------------------------------- */
+    int rc = ctx->next(req, resp_out, ctx->next_ud);
+    if (rc != 0 || !*resp_out) {
+        free(key);
+        return rc; /* downstream errored */
+    }
+
+    /* 4. Insert into cache if status 200 ------------------------------------ */
+    if ((*resp_out)->status_code == 200) {
+        uint32_t ttl = cache->default_ttl_sec;
+
+        /* Inspect Cache-Control: max-age */
+        const char *cc = mm_http_header_get(&(*resp_out)->headers, "Cache-Control");
+        if (cc) {
+            const char *max_age_ptr = strstr(cc, "max-age=");
+            if (max_age_ptr) {
+                ttl = (uint32_t)strtoul(max_age_ptr + 8, NULL, 10);
+            }
+        }
+
+        pthread_rwlock_wrlock(&cache->lock);
+        purge_expired(cache, now);
+        cache_insert(cache, key, *resp_out, ttl);
+        pthread_rwlock_unlock(&cache->lock);
+        MM_LOG_DEBUG("cached key=%s ttl=%u", key, ttl);
+    }
+
+    free(key);
+    return 0;
+}
+
+/* Factory helper exposed to main() ---------------------------------------- */
+void *
+mm_resp_cache_build_middleware(mm_resp_cache_t  *cache,
+                               mm_http_handler_fn next,
+                               void             *next_ud)
+{
+    middleware_ctx_t *ctx = xmalloc(sizeof(*ctx));
+    ctx->cache   = cache;
+    ctx->next    = next;
+    ctx->next_ud = next_ud;
+    return ctx;
+}
+```

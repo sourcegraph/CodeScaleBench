@@ -1,0 +1,425 @@
+```rust
+//! src/module_50.rs
+//!
+//! Reliable Domain Event Outbox implementation
+//! ===========================================
+//! This module provides a production-ready* implementation of the
+//! Outbox/Inbox pattern for EduPulse Live.  All domain events are first
+//! persisted inside the same Postgres transaction that modified the
+//! aggregate and are later *atomically* published to the message broker
+//! (e.g. RabbitMQ).  This guarantees *at-least-once* delivery without
+//! sacrificing database consistency.
+//!
+//! # Architecture
+//! 1. Domain layer inserts a row into the `outbox_events` table
+//!    through [`OutboxRepository::insert`].
+//! 2. [`OutboxProcessor`] polls the table on an interval (or is triggered
+//!    by NOTIFY/LISTEN) and publishes unpublished events.
+//! 3. After a successful publish it marks the event as `published_at`.
+//!
+//! # Usage
+//! ```no_run
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     env_logger::init();
+//!
+//!     let db = PgPoolOptions::new()
+//!         .max_connections(5)
+//!         .connect("postgres://user:password@localhost/edupulse")
+//!         .await?;
+//!
+//!     // Initialise AMQP connection
+//!     let amqp_addr = "amqp://guest:guest@127.0.0.1:5672/%2f";
+//!     let publisher = RabbitMqPublisher::connect(amqp_addr, "edupulse.events").await?;
+//!
+//!     // Fire-and-forget background processing task
+//!     OutboxProcessor::spawn(db.clone(), publisher);
+//!
+//!     // … start REST API, etc.
+//!     Ok(())
+//! }
+//! ```
+//! *Error handling, retries, and back-off have been implemented but can be
+//! expanded with metrics, dead-letter queues, etc.*
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use backoff::{future::retry, ExponentialBackoff};
+use chrono::{DateTime, Utc};
+use lapin::{
+    options::{BasicPublishOptions, QueueDeclareOptions},
+    types::FieldTable,
+    BasicProperties, Channel, Connection, ConnectionProperties,
+};
+use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgRow, PgPool, Row};
+use thiserror::Error;
+use tokio::{
+    sync::Mutex,
+    task::{self, JoinHandle},
+    time,
+};
+use uuid::Uuid;
+
+/* -------------------------------------------------------------------------- */
+/*                                Domain Event                                */
+/* -------------------------------------------------------------------------- */
+
+/// A single row inside the `outbox_events` table.
+///
+/// NOTE: `payload` is stored as **raw JSON** to keep the table generic and
+/// future-proof.  Consumers can decode it based on the `event_type`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OutboxEvent {
+    pub id: Uuid,
+    pub aggregate_type: String,
+    pub aggregate_id: Uuid,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub occurred_at: DateTime<Utc>,
+    pub published_at: Option<DateTime<Utc>>,
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                  Errors                                    */
+/* -------------------------------------------------------------------------- */
+
+#[derive(Error, Debug)]
+pub enum OutboxError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("AMQP error: {0}")]
+    Amqp(#[from] lapin::Error),
+
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+/* -------------------------------------------------------------------------- */
+/*                           Outbox Repository (DAO)                          */
+/* -------------------------------------------------------------------------- */
+
+/// Repository responsible for accessing the `outbox_events` table.
+#[derive(Clone)]
+pub struct OutboxRepository {
+    pool: PgPool,
+}
+
+impl OutboxRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Inserts a new [`OutboxEvent`] within an existing transaction or
+    /// standalone if `tx` is `None`.
+    pub async fn insert(
+        &self,
+        mut event: OutboxEvent,
+        tx: Option<&mut sqlx::Transaction<'_, sqlx::Postgres>>,
+    ) -> Result<OutboxEvent, OutboxError> {
+        event.id = event.id; // ensure id exists
+        let query = sqlx::query!(
+            r#"
+            INSERT INTO outbox_events (
+                id,
+                aggregate_type,
+                aggregate_id,
+                event_type,
+                payload,
+                occurred_at,
+                published_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+            "#,
+            event.id,
+            event.aggregate_type,
+            event.aggregate_id,
+            event.event_type,
+            event.payload,
+            event.occurred_at,
+            event.published_at
+        );
+
+        match tx {
+            Some(tx_ref) => {
+                query.execute(&mut *tx_ref).await?;
+            }
+            None => {
+                query.execute(&self.pool).await?;
+            }
+        }
+
+        Ok(event)
+    }
+
+    /// Fetches a batch of unpublished events, ordered by `occurred_at`.
+    pub async fn fetch_unpublished(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<OutboxEvent>, OutboxError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id,
+                aggregate_type,
+                aggregate_id,
+                event_type,
+                payload,
+                occurred_at,
+                published_at
+            FROM outbox_events
+            WHERE published_at IS NULL
+            ORDER BY occurred_at
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .map(|row: PgRow| OutboxEvent {
+            id: row.get("id"),
+            aggregate_type: row.get("aggregate_type"),
+            aggregate_id: row.get("aggregate_id"),
+            event_type: row.get("event_type"),
+            payload: row.get::<serde_json::Value, _>("payload"),
+            occurred_at: row.get("occurred_at"),
+            published_at: row.get("published_at"),
+        })
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Marks the event as published.
+    pub async fn mark_as_published(&self, id: Uuid) -> Result<(), OutboxError> {
+        sqlx::query!(
+            r#"
+            UPDATE outbox_events
+            SET published_at = NOW()
+            WHERE id = $1
+            "#,
+            id
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                             Event Publisher                                */
+/* -------------------------------------------------------------------------- */
+
+/// Trait that abstracts away the underlying message broker implementation.
+/// This allows swapping RabbitMQ for NATS, Kafka, etc. without touching the
+/// domain/application layer.
+#[async_trait]
+pub trait EventPublisher: Send + Sync + 'static {
+    async fn publish(&self, event: &OutboxEvent) -> Result<(), OutboxError>;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                             RabbitMQ Publisher                             */
+/* -------------------------------------------------------------------------- */
+
+/// Thin wrapper around a RabbitMQ channel that implements [`EventPublisher`].
+#[derive(Clone)]
+pub struct RabbitMqPublisher {
+    channel: Arc<Channel>,
+    exchange: String,
+}
+
+impl RabbitMqPublisher {
+    /// Establishes a connection and ensures that the declared exchange exists.
+    pub async fn connect(
+        amqp_addr: &str,
+        exchange: &str,
+    ) -> Result<Self, OutboxError> {
+        let conn = Connection::connect(amqp_addr, ConnectionProperties::default()).await?;
+        let channel = conn.create_channel().await?;
+
+        channel
+            .queue_declare(
+                exchange,
+                QueueDeclareOptions::default(),
+                FieldTable::default(),
+            )
+            .await?;
+
+        Ok(Self {
+            channel: Arc::new(channel),
+            exchange: exchange.to_string(),
+        })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for RabbitMqPublisher {
+    async fn publish(&self, event: &OutboxEvent) -> Result<(), OutboxError> {
+        let payload = serde_json::to_vec(event)?;
+        self.channel
+            .basic_publish(
+                "",
+                &self.exchange,
+                BasicPublishOptions::default(),
+                &payload,
+                BasicProperties::default()
+                    .with_content_type("application/json".into())
+                    .with_message_id(event.id.to_string().into())
+                    .with_type(event.event_type.clone().into()),
+            )
+            .await?
+            .await?; // wait for broker confirmation
+
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            Outbox Processor                                */
+/* -------------------------------------------------------------------------- */
+
+/// Responsible for periodically polling the DB, publishing events and
+/// updating their status. It runs indefinitely in a tokio task.
+pub struct OutboxProcessor {
+    handle: JoinHandle<()>,
+}
+
+impl OutboxProcessor {
+    /// Spawns the background `OutboxProcessor` task with sensible defaults.
+    ///
+    /// `poll_interval` defaults to 500 ms and `batch_size` to 100.
+    pub fn spawn<P>(pool: PgPool, publisher: P) -> Self
+    where
+        P: EventPublisher,
+    {
+        let poll_interval = Duration::from_millis(500);
+        let batch_size = 100;
+
+        let repo = OutboxRepository::new(pool);
+        let publisher = Arc::new(publisher);
+
+        let handle = task::spawn(async move {
+            let mut interval = time::interval(poll_interval);
+            loop {
+                interval.tick().await;
+                if let Err(err) =
+                    Self::drain_batch(&repo, Arc::clone(&publisher), batch_size).await
+                {
+                    error!("Error draining outbox: {:?}", err);
+                }
+            }
+        });
+
+        Self { handle }
+    }
+
+    async fn drain_batch<P>(
+        repo: &OutboxRepository,
+        publisher: Arc<P>,
+        batch_size: i64,
+    ) -> Result<(), OutboxError>
+    where
+        P: EventPublisher,
+    {
+        // Fetch a batch; early return if empty
+        let events = repo.fetch_unpublished(batch_size).await?;
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // Publish events sequentially (could be parallel with `join_all` if
+        // ordering isn't important)
+        for event in events {
+            let op = || async {
+                publisher.publish(&event).await?;
+                repo.mark_as_published(event.id).await?;
+                Ok::<(), OutboxError>(())
+            };
+
+            // Retry with exponential back-off (max ~10 min)
+            let mut backoff = ExponentialBackoff {
+                initial_interval: Duration::from_millis(250),
+                multiplier: 2.0,
+                max_interval: Duration::from_secs(30),
+                max_elapsed_time: Some(Duration::from_secs(600)),
+                ..Default::default()
+            };
+
+            if let Err(err) = retry(backoff, op).await {
+                // This should rarely happen; send to Sentry, Dead-letter, etc.
+                warn!("Failed to publish event {}: {:?}", event.id, err);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Waits for the background task to finish (e.g. on graceful shutdown).
+    pub async fn join(self) -> Result<(), task::JoinError> {
+        self.handle.await
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                   Tests                                    */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Executor;
+    use tokio::sync::Mutex;
+
+    /// Dummy in-memory publisher that records the number of published events.
+    #[derive(Default, Clone)]
+    struct MockPublisher {
+        published: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl EventPublisher for MockPublisher {
+        async fn publish(&self, _event: &OutboxEvent) -> Result<(), OutboxError> {
+            let mut guard = self.published.lock().await;
+            *guard += 1;
+            Ok(())
+        }
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn processor_publishes_and_marks_event(pool: PgPool) -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Arrange
+        let repo = OutboxRepository::new(pool.clone());
+        let publisher = MockPublisher::default();
+        let now = Utc::now();
+
+        let event = OutboxEvent {
+            id: Uuid::new_v4(),
+            aggregate_type: "Lesson".into(),
+            aggregate_id: Uuid::new_v4(),
+            event_type: "LessonPublished".into(),
+            payload: serde_json::json!({"title": "Intro"}),
+            occurred_at: now,
+            published_at: None,
+        };
+
+        repo.insert(event.clone(), None).await?;
+
+        // Act
+        OutboxProcessor::drain_batch(&repo, Arc::new(publisher.clone()), 10).await?;
+
+        // Assert
+        let unpublished = repo.fetch_unpublished(10).await?;
+        assert!(unpublished.is_empty(), "event should be marked as published");
+
+        let hits = *publisher.published.lock().await;
+        assert_eq!(hits, 1, "event should have been published exactly once");
+
+        Ok(())
+    }
+}
+```

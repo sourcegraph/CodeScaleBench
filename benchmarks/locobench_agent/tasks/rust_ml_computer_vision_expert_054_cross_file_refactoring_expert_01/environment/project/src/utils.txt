@@ -1,0 +1,466 @@
+//! Generic utilities commonly used across VisuTility Orchestrator.
+//!
+//! The abstractions in this module are intentionally framework-agnostic:
+//! they do not depend on any particular CV/ML crate and can therefore be
+//! shared by every layer (Ingress, Data-Ops, Feature-Ops, …).
+//!
+//! All functions are `#[inline]` where it makes sense to do so, and
+//! significant branches are annotated with `#[cold]` to let the optimizer
+//! keep hot-paths small.
+
+use std::{
+    fmt,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant},
+};
+
+use anyhow::{anyhow, Context, Result};
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tracing::{debug, error, info, instrument};
+
+/// VisuTility's generic error type for utility-layer operations.
+///
+/// We prefer using [`anyhow::Error`] at the top-level application
+/// boundary to allow for heterogeneous sources, but within the
+/// utility layer we capture the most common failure categories so that
+/// callers can still pattern-match when they need to.
+#[derive(Debug, Error)]
+pub enum UtilError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("configuration not found at path `{0}`")]
+    ConfigNotFound(PathBuf),
+
+    #[error("task failed: {0}")]
+    TaskFailed(String),
+}
+
+/// Generic wrapper around an [`Instant`] which logs the elapsed time at
+/// **drop**.  The measurement is therefore *scoped*; as soon as the guard
+/// goes out of scope, latency is emitted through the `tracing` facade.
+///
+/// ```no_run
+/// use visu_tility_utils::ScopedTimer;
+/// let _g = ScopedTimer::new("heavy_initialisation");
+/// // … some expensive code …
+— guard drops here and we get a log line with
+//   the elapsed time
+/// ```
+pub struct ScopedTimer<'a> {
+    started: Instant,
+    label: &'a str,
+}
+
+impl<'a> ScopedTimer<'a> {
+    /// Begin measuring elapsed time for the supplied label.
+    #[inline]
+    pub fn new(label: &'a str) -> Self {
+        Self {
+            started: Instant::now(),
+            label,
+        }
+    }
+
+    /// Stop the timer and return the [`Duration`] since creation without
+    /// logging. This allows manual control when automatic logging at `drop`
+    /// is not desired.
+    #[inline]
+    pub fn stop(self) -> Duration {
+        Instant::now() - self.started
+    }
+}
+
+impl<'a> Drop for ScopedTimer<'a> {
+    fn drop(&mut self) {
+        let elapsed = Instant::now() - self.started;
+        info!(
+            label = %self.label,
+            ms = %elapsed.as_millis(),
+            "ScopedTimer finished"
+        );
+        METRICS
+            .write()
+            .record_duration(self.label, elapsed.as_secs_f64());
+    }
+}
+
+/// Global metrics collector with *zero* external dependencies.  This is
+/// intentionally minimal because higher layers might choose to forward these
+/// numbers to Prometheus, StatsD, or another monitoring backend.
+///
+/// Internally it stores *exponential moving averages* so that it can be used
+/// in hot-paths without unbounded memory growth.
+pub struct Metrics {
+    /// Moving average of durations (seconds) per label.
+    durations: std::collections::HashMap<String, f64>,
+    /// EWMA smoothing factor in `[0,1]`.
+    alpha: f64,
+}
+
+impl Metrics {
+    fn new(alpha: f64) -> Self {
+        Self {
+            durations: std::collections::HashMap::new(),
+            alpha,
+        }
+    }
+
+    /// Record a latency sample under `label`.
+    pub fn record_duration(&mut self, label: impl Into<String>, secs: f64) {
+        let label = label.into();
+        let entry = self.durations.entry(label).or_insert(secs);
+        // EWMA: v_t = alpha * x_t + (1-alpha) * v_{t-1}
+        *entry = self.alpha * secs + (1.0 - self.alpha) * *entry;
+    }
+
+    /// Return the current EWMA for `label`, if any.
+    pub fn duration_avg(&self, label: &str) -> Option<f64> {
+        self.durations.get(label).copied()
+    }
+}
+
+/// Static metrics instance; tweak the smoothing factor as needed.
+/// We protect it with a *fair* RwLock to allow many concurrent readers.
+static METRICS: Lazy<RwLock<Metrics>> = Lazy::new(|| RwLock::new(Metrics::new(0.20)));
+
+/// Typed representation of the global **application config**.
+///
+/// This is intentionally limited to fields that the utility layer needs
+/// to know about; higher layers maintain their own extensions.
+///
+/// Because config files are versioned in the Model Registry, we include a
+/// `schema_version` field to prevent silent breakage when the expected
+/// structure changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    pub schema_version: u16,
+    pub experiment_tracking_uri: Option<String>,
+    pub model_registry_uri: Option<String>,
+    pub default_retry: RetryConfig,
+    /// Additional arbitrary key/value flavour that can be stored alongside
+    /// the canonical config.  Can be abused for feature flags, etc.
+    #[serde(default)]
+    pub user: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RetryConfig {
+    pub max_attempts: usize,
+    pub backoff_millis: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            backoff_millis: 500,
+        }
+    }
+}
+
+/// Maximum size (bytes) that we allow a configuration file to have before
+/// we refuse to load it.  Protects against accidental loading of huge blobs.
+const MAX_CONFIG_SIZE: usize = 256 * 1024; // 256 KiB
+
+/// Load and parse application configuration **once** at start-up.
+///
+/// The file format is auto-detected based on extension (`.yaml`/`.yml` or
+/// `.json`).  The resulting struct is cached in a global `Lazy`.
+///
+/// Example:
+/// ```no_run
+/// let cfg = visu_tility_utils::config();
+/// println!("Schema v{} loaded", cfg.schema_version);
+/// ```
+fn read_config_from_disk(path: &Path) -> Result<AppConfig> {
+    if !path.exists() {
+        return Err(UtilError::ConfigNotFound(path.into()).into());
+    }
+
+    let mut file =
+        File::open(path).with_context(|| format!("opening configuration file `{}`", path.display()))?;
+
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .with_context(|| format!("reading configuration file `{}`", path.display()))?;
+
+    if buf.len() > MAX_CONFIG_SIZE {
+        return Err(anyhow!(
+            "configuration file `{}` larger than {} KiB",
+            path.display(),
+            MAX_CONFIG_SIZE / 1024
+        ));
+    }
+
+    let cfg = match path.extension().and_then(|s| s.to_str()) {
+        Some("yaml") | Some("yml") => serde_yaml::from_slice(&buf)?,
+        Some("json") => serde_json::from_slice(&buf)?,
+        other => {
+            return Err(anyhow!(
+                "unsupported configuration extension {:?} for `{}`",
+                other,
+                path.display()
+            ))
+        }
+    };
+
+    Ok(cfg)
+}
+
+/// Discover the config path in the following order:
+///
+/// 1. Explicit argument via `VISU_CONFIG` environment variable.
+/// 2. `${CWD}/visu_config.yaml`
+/// 3. `${CWD}/visu_config.json`
+fn auto_discover_config() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("VISU_CONFIG") {
+        return Some(PathBuf::from(path));
+    }
+
+    const CANDIDATES: &[&str] = &["visu_config.yaml", "visu_config.yml", "visu_config.json"];
+    for c in CANDIDATES {
+        let p = PathBuf::from(c);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Global application configuration singleton.
+static CONFIG: Lazy<AppConfig> = Lazy::new(|| {
+    let path = auto_discover_config()
+        .unwrap_or_else(|| PathBuf::from("visu_config.yaml")); // fallback for nicer error msg
+    match read_config_from_disk(&path) {
+        Ok(cfg) => {
+            info!(
+                file = %path.display(),
+                version = cfg.schema_version,
+                "configuration file loaded"
+            );
+            cfg
+        }
+        Err(e) => {
+            error!(
+                file = %path.display(),
+                error = %e,
+                "failed to load configuration; using built-in defaults"
+            );
+            // Fallback
+            AppConfig {
+                schema_version: 0,
+                experiment_tracking_uri: None,
+                model_registry_uri: None,
+                default_retry: RetryConfig::default(),
+                user: Default::default(),
+            }
+        }
+    }
+});
+
+/// Access the application-wide [`AppConfig`].
+#[inline]
+pub fn config() -> &'static AppConfig {
+    &CONFIG
+}
+
+/// Generic exponential *back-off* / *retry* helper.
+///
+/// The provided closure is executed until it either succeeds or
+/// max_attempts have been reached.
+///
+/// Usage:
+/// ```ignore
+/// use visu_tility_utils::retry;
+///
+/// let result = retry(
+///     &config().default_retry,
+///     || {
+///         // call external dependency that might fail
+///         some_unstable_operation()
+///     });
+/// ```
+pub fn retry<F, T, E>(cfg: &RetryConfig, mut f: F) -> Result<T, E>
+where
+    F: FnMut() -> Result<T, E>,
+{
+    let mut attempt = 0;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt + 1 == cfg.max_attempts => return Err(e),
+            Err(_e) => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(cfg.backoff_millis));
+            }
+        }
+    }
+}
+
+/// Simple **ID generator** that hands out monotonically increasing
+/// identifiers from a global counter.
+///
+/// This is useful when datasets or intermediate artefacts need a
+/// transaction-like handle but heavyweight UUIDs are overkill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Id(u64);
+
+// global counter
+static COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+impl Id {
+    /// Allocate a fresh id.
+    #[inline]
+    pub fn fresh() -> Self {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        Id(n as u64)
+    }
+
+    /// Return the underlying integer.
+    #[inline]
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for Id {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// **Observer pattern**: runtime event bus.
+//
+/// Very light-weight publisher/subscriber abstraction built on top of
+/// [`crossbeam_channel`].  Since layers of the Orchestrator run in
+/// different scheduling contexts we cannot rely on *any* runtime; a
+/// channel-based design has zero dependencies on async executors.
+pub mod event_bus {
+    use super::*;
+    use crossbeam_channel::{unbounded, Receiver, Sender};
+
+    /// Event types that travel on the bus.  This enum grows over time as new
+    /// features make use of the bus; by keeping it located in a *utility*
+    /// crate we avoid circular dependencies.
+    #[derive(Debug, Clone)]
+    pub enum Event {
+        HyperparameterTuningStarted { experiment_id: Id },
+        HyperparameterTuningFinished { experiment_id: Id },
+        ModelRegistered {
+            name: String,
+            version: String,
+            metadata: std::collections::HashMap<String, String>,
+        },
+        ModelDriftDetected {
+            model: String,
+            magnitude: f32,
+            timestamp: chrono::DateTime<chrono::Utc>,
+        },
+        Custom(String, serde_json::Value),
+    }
+
+    /// Handle required for publishing events.
+    #[derive(Clone)]
+    pub struct Publisher {
+        tx: Sender<Event>,
+    }
+
+    impl Publisher {
+        /// Publish an event; errors are logged but otherwise ignored since the
+        /// system should remain functional even when no-one is listening.
+        pub fn publish(&self, evt: Event) {
+            if let Err(e) = self.tx.send(evt.clone()) {
+                debug!(error = ?e, event = ?evt, "failed to publish event");
+            }
+        }
+    }
+
+    /// A stream of events.
+    pub type Subscription = Receiver<Event>;
+
+    /// Construct a **single** global bus so that layers can obtain
+    /// cheap clones of the `Publisher` without having to pass them around.
+    static BUS: Lazy<(Publisher, Subscription)> = Lazy::new(|| {
+        let (tx, rx) = unbounded::<Event>();
+        (Publisher { tx }, rx)
+    });
+
+    /// Return a handle for *publishing* events.
+    pub fn publisher() -> Publisher {
+        BUS.0.clone()
+    }
+
+    /// Subscribe to events.  Every caller receives a *clone* of the receiver
+    /// which means all subscribers see *all* events (fan-out).
+    pub fn subscribe() -> Subscription {
+        BUS.1.clone()
+    }
+}
+
+/// A small proc-macro-like helper (implemented as declarative macro to avoid meta
+/// crate) for scoped timing.
+///
+/// ```
+/// visu_tility_utils::scope_time!("fancy_stage", {
+///     expensive();
+/// });
+/// ```
+#[macro_export]
+macro_rules! scope_time {
+    ($label:expr, $block:block) => {{
+        let _g = $crate::ScopedTimer::new($label);
+        $block
+    }};
+}
+
+/// Tests live inside the same file so that the utils crate remains
+/// a **single** compilation unit.  This is important for global singletons
+/// (`Lazy`) which must not be duplicated across multiple crates.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_monotonicity() {
+        let a = Id::fresh();
+        let b = Id::fresh();
+        assert!(b.as_u64() > a.as_u64());
+    }
+
+    #[test]
+    fn retry_succeeds_eventually() {
+        let cfg = RetryConfig {
+            max_attempts: 5,
+            backoff_millis: 1,
+        };
+        let mut n = 0;
+        let res: Result<usize, usize> = retry(&cfg, || {
+            if n < 3 {
+                n += 1;
+                Err(n)
+            } else {
+                Ok(n)
+            }
+        });
+        assert_eq!(res.unwrap(), 3);
+    }
+
+    #[test]
+    fn metrics_ewma() {
+        METRICS.write().record_duration("foo", 1.0);
+        METRICS.write().record_duration("foo", 1.0);
+        let avg = METRICS.read().duration_avg("foo").unwrap();
+        assert!(avg > 0.0 && avg <= 1.0);
+    }
+}

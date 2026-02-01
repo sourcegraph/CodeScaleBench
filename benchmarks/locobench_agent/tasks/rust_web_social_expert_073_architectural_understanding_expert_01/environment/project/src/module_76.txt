@@ -1,0 +1,319 @@
+```rust
+//! src/module_76.rs
+//!
+//! Generic, production-grade event bus for EduPulse Live.
+//! ======================================================
+//! This module wires domain events to asynchronous handlers while persisting
+//! them into an append-only event store.  Designed to live inside the core API
+//! crate, it exposes a minimal façade so that higher-level modules
+//! (lessons/quizzes/auth/etc.) can remain agnostic of the underlying message
+//! transport.
+//!
+//! Highlights
+//! ----------
+//! • Tokio-powered, back-pressure-aware broadcast channel  
+//! • Pluggable `EventStore` (in-memory + SQLx/Postgres ref. impl)  
+//! • Dynamic subscription registry using `async_trait` + `DashMap`  
+//! • JSON-serialised events for wire compatibility (RabbitMQ/NATS/etc.)  
+//! • Tracing-instrumented for observability
+//!
+//! Usage
+//! -----
+//! ```rust,no_run
+//! let event_bus = Arc::new(EventBus::new(InMemoryEventStore::default()));
+//! event_bus.start_worker_pool(4);                    // spawn background workers
+//! event_bus.register_handler(SearchIndexer::new()?); // Tantivy search handler
+//! event_bus.emit(DomainEvent::LessonPublished {...}).await?;
+//! ```
+
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use dashmap::DashMap;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tokio::{
+    select,
+    spawn,
+    sync::{broadcast, mpsc},
+    task::JoinHandle,
+};
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
+
+/// Default broadcast channel capacity (per Tokio docs, power of two for perf)
+const CHANNEL_CAPACITY: usize = 1 << 8;
+
+/// All domain-level events that flow through the platform.
+///
+/// When this enum grows large, consider splitting variants into separate enums
+/// and boxing them in an `enum`/`trait object` for compile-time boundary
+/// management.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum DomainEvent {
+    LessonPublished {
+        lesson_id: Uuid,
+        author_id: Uuid,
+        title: String,
+        published_at: UnixTimestamp,
+    },
+    QuizSubmitted {
+        quiz_id: Uuid,
+        student_id: Uuid,
+        score: u8,
+        submitted_at: UnixTimestamp,
+    },
+    // --- truncated: add more events as needed ---
+}
+
+/// Simple millisecond-precision unix timestamp wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct UnixTimestamp(u64);
+
+impl Default for UnixTimestamp {
+    fn default() -> Self {
+        Self(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_millis() as u64,
+        )
+    }
+}
+
+/// Persistence façade for storing domain events.
+///
+/// The event store is append-only and can be replayed for audits, projections
+/// or rebuilding read models.
+#[async_trait]
+pub trait EventStore: Send + Sync + 'static {
+    async fn append(&self, event: &DomainEvent) -> Result<()>;
+    async fn stream_all<E>(&self) -> Result<Vec<E>>
+    where
+        E: DeserializeOwned + Send + 'static;
+}
+
+/// In-memory reference implementation; suitable for tests / dev playground.
+#[derive(Debug, Default)]
+pub struct InMemoryEventStore {
+    events: tokio::sync::RwLock<Vec<Vec<u8>>>,
+}
+
+#[async_trait]
+impl EventStore for InMemoryEventStore {
+    #[instrument(skip(self, event))]
+    async fn append(&self, event: &DomainEvent) -> Result<()> {
+        let payload = serde_json::to_vec(event).context("serialising event")?;
+        self.events.write().await.push(payload);
+        Ok(())
+    }
+
+    async fn stream_all<E>(&self) -> Result<Vec<E>>
+    where
+        E: DeserializeOwned + Send + 'static,
+    {
+        let raw = self.events.read().await.clone();
+        let mut out = Vec::with_capacity(raw.len());
+        for bytes in raw {
+            let evt = serde_json::from_slice::<E>(&bytes).context("deserialising")?;
+            out.push(evt);
+        }
+        Ok(out)
+    }
+}
+
+/// Event handler contract.
+///
+/// Note: we purposefully consume by value (`self`) to allow stateful handlers to
+/// move into the async task when registered.
+#[async_trait]
+pub trait EventHandler: Send + Sync + 'static {
+    /// A human-readable name for observability.
+    fn name(&self) -> &'static str;
+
+    /// Business logic invoked for each event.
+    async fn handle(&self, evt: DomainEvent) -> Result<()>;
+}
+
+/// Thread-safe, async event bus.
+#[derive(Debug)]
+pub struct EventBus<S: EventStore> {
+    tx: broadcast::Sender<DomainEvent>,
+    store: Arc<S>,
+    handlers: DashMap<&'static str, Box<dyn EventHandler>>,
+    /// Workers receive events from the broadcast channel and sequentially
+    /// deliver them to handlers (de-duplicated per handler).
+    worker_txs: Vec<mpsc::Sender<DomainEvent>>,
+}
+
+impl<S: EventStore> EventBus<S> {
+    pub fn new(store: S) -> Self {
+        let (tx, _rx) = broadcast::channel(CHANNEL_CAPACITY);
+        Self {
+            tx,
+            store: Arc::new(store),
+            handlers: DashMap::new(),
+            worker_txs: Vec::new(),
+        }
+    }
+
+    /// Emit a single event.
+    #[instrument(skip(self))]
+    pub async fn emit(&self, evt: DomainEvent) -> Result<()> {
+        self.store.append(&evt).await?;
+        self.tx
+            .send(evt)
+            .map_err(|e| anyhow::anyhow!("broadcast failure: {e}"))?;
+        Ok(())
+    }
+
+    /// Register a handler; idempotent per handler name.
+    pub fn register_handler<H>(&self, handler: H)
+    where
+        H: EventHandler,
+    {
+        if self.handlers.insert(handler.name(), Box::new(handler)).is_some() {
+            warn!("handler {} replaced at runtime", handler.name());
+        } else {
+            info!("handler {} registered", handler.name());
+        }
+    }
+
+    /// Spawn a worker pool that fans-out events to handlers.
+    ///
+    /// Each worker owns an mpsc channel (to avoid contention) and reads from
+    /// the *same* broadcast channel.  This guarantees at-least-once delivery to
+    /// each handler.
+    pub fn start_worker_pool(self: &Arc<Self>, workers: usize) -> Vec<JoinHandle<()>> {
+        let mut handles = Vec::with_capacity(workers);
+        for id in 0..workers {
+            let (tx, mut rx) = mpsc::channel::<DomainEvent>(CHANNEL_CAPACITY);
+            self.worker_txs.push(tx);
+
+            let bus = Arc::clone(self);
+            let mut broadcast_rx = bus.tx.subscribe();
+            handles.push(spawn(async move {
+                info!(worker = id, "event worker started");
+                loop {
+                    select! {
+                        Ok(evt) = broadcast_rx.recv() => {
+                            // fan-in to single queue
+                            if let Err(e) = rx.try_send(evt) {
+                                debug!(%e, worker = id, "worker queue full; dropping");
+                            }
+                        },
+
+                        Some(evt) = rx.recv() => {
+                            for item in bus.handlers.iter() {
+                                let handler = item.value();
+                                let evt_clone = evt.clone();
+                                let h_name = handler.name();
+                                let res = handler.handle(evt_clone).await;
+                                if let Err(e) = res {
+                                    error!(%e, handler = h_name, "event handler failed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+        handles
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* ----------------------- Example Production Handler ----------------------- */
+/* -------------------------------------------------------------------------- */
+
+/// Tantivy-powered search indexer.
+///
+/// In a real deployment this would:
+/// 1. Open a persistent `Index` directory;
+/// 2. Map domain events to documents;
+/// 3. Commit in batches for throughput.
+pub struct SearchIndexer {
+    // index: tantivy::Index,
+}
+
+impl SearchIndexer {
+    pub fn new() -> Result<Self> {
+        // let index = tantivy::Index::open_or_create(...)?;
+        Ok(Self {
+            // index,
+        })
+    }
+}
+
+#[async_trait]
+impl EventHandler for SearchIndexer {
+    fn name(&self) -> &'static str {
+        "search_indexer"
+    }
+
+    #[instrument(skip(self))]
+    async fn handle(&self, evt: DomainEvent) -> Result<()> {
+        match evt {
+            DomainEvent::LessonPublished {
+                lesson_id,
+                title,
+                author_id,
+                ..
+            } => {
+                debug!(
+                    ?lesson_id,
+                    %title,
+                    ?author_id,
+                    "indexing lesson into search engine"
+                );
+                // let mut writer = self.index.writer(50_000_000)?;
+                // writer.add_document(...);
+                // writer.commit()?;
+            }
+            _ => { /* ignore other events */ }
+        }
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* ------------------------------- Unit Tests ------------------------------- */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_roundtrip() -> Result<()> {
+        tracing_subscriber::fmt::try_init().ok();
+
+        let bus = Arc::new(EventBus::new(InMemoryEventStore::default()));
+        bus.register_handler(SearchIndexer::new()?);
+        bus.start_worker_pool(2);
+
+        let evt = DomainEvent::LessonPublished {
+            lesson_id: Uuid::new_v4(),
+            author_id: Uuid::new_v4(),
+            title: "Rust for Edu-preneurs".into(),
+            published_at: UnixTimestamp::default(),
+        };
+        bus.emit(evt.clone()).await?;
+
+        // allow some processing time
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // ensure event persisted
+        let events: Vec<DomainEvent> = bus.store.stream_all().await?;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], DomainEvent::LessonPublished { .. }));
+
+        Ok(())
+    }
+}
+```

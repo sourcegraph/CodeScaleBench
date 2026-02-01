@@ -1,0 +1,366 @@
+```rust
+//! src/utils.rs
+//!
+//! Utility helpers that are reused across the LedgerLink Nexus
+//! micro-service.  The modules below are intentionally **domain-agnostic**
+//! and focus on cross-cutting concerns such as pagination, caching,
+//! validation and structured logging.  Nothing in here should depend on a
+//! concrete database schema or business rule.
+//!
+//! # Public Modules
+//! - `pagination` — Cursor/offset pagination helpers
+//! - `cache`      — Small Redis wrapper with a “get-or-set” convenience
+//! - `validation` — Re-exports validator macros + common error envelope
+//! - `logext`     — Opinionated `tracing` helpers
+//!
+//! Each sub-module can be pulled in independently:
+//
+//! ```rust
+//! use crate::utils::pagination::Pagination;
+//! use crate::utils::cache::Cache;
+//! ```
+#![allow(clippy::module_name_repetitions)]
+
+use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use redis::aio::ConnectionManager;
+use redis::AsyncCommands;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+use tokio::sync::RwLock;
+use tracing::{debug, instrument, Span};
+use validator::{Validate, ValidationError};
+
+/// Re-export commonly used items so callers only need to
+/// `use crate::utils::*;`.
+pub use cache::Cache;
+pub use logext::*;
+pub use pagination::{PageRequest, PageResponse, Pagination};
+pub use validation::{RequestExt, ValidationErrors};
+
+/// Pagination helper module.
+pub mod pagination {
+    use super::*;
+
+    /// Maximum items per page allowed by the public API.
+    const MAX_PAGE_SIZE: u16 = 1_000;
+    const DEFAULT_PAGE_SIZE: u16 = 50;
+
+    /// Common error type returned by pagination builders.
+    #[derive(Debug, Error)]
+    #[error("invalid pagination arguments: {0}")]
+    pub struct PaginationError(String);
+
+    /// Raw page parameters supplied via the transport layer (e.g. query string).
+    ///
+    /// The struct is intentionally flat so it can be derived via `serde` on
+    /// query parameters or GraphQL arguments.
+    #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+    pub struct PageRequest {
+        #[serde(default = "PageRequest::default_page")]
+        #[validate(range(min = 1))]
+        pub page: u32,
+
+        #[serde(default = "PageRequest::default_page_size")]
+        #[validate(range(min = 1, max = "MAX_PAGE_SIZE"))]
+        pub per_page: u16,
+    }
+
+    impl PageRequest {
+        const fn default_page() -> u32 {
+            1
+        }
+        const fn default_page_size() -> u16 {
+            DEFAULT_PAGE_SIZE
+        }
+
+        /// Convert the incoming payload into an internal `Pagination` struct.
+        pub fn into_pagination(self) -> Result<Pagination, PaginationError> {
+            self.validate().map_err(|e| PaginationError(e.to_string()))?;
+            let offset = (u64::from(self.page) - 1) * u64::from(self.per_page);
+            Ok(Pagination {
+                limit: self.per_page,
+                offset,
+                page: self.page,
+            })
+        }
+    }
+
+    /// Response envelope sent back to the caller.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct PageResponse {
+        pub current_page: u32,
+        pub per_page: u16,
+        pub total_items: u64,
+        pub total_pages: u32,
+    }
+
+    /// Internal representation used by repository layer.
+    #[derive(Debug, Clone)]
+    pub struct Pagination {
+        pub limit: u16,
+        pub offset: u64,
+        pub page: u32,
+    }
+
+    impl Pagination {
+        /// Translate repository count into client-facing metadata.
+        pub fn to_response(&self, total_items: u64) -> PageResponse {
+            let total_pages =
+                (total_items as f64 / self.limit as f64).ceil() as u32;
+            PageResponse {
+                current_page: self.page,
+                per_page: self.limit,
+                total_items,
+                total_pages,
+            }
+        }
+    }
+}
+
+/// Redis-backed caching utilities.
+///
+/// We purposefully keep a **thin wrapper** around the connection manager
+/// because we don’t want to mask Redis semantics—this is purely ergonomic.
+pub mod cache {
+    use super::*;
+
+    /// Errors surfaced by the cache layer.
+    #[derive(Error, Debug)]
+    pub enum CacheError {
+        #[error("redis error: {0}")]
+        Redis(#[from] redis::RedisError),
+
+        #[error("serialization error: {0}")]
+        Serde(#[from] serde_json::Error),
+    }
+
+    /// Trait that models *anything* that can be turned into a stable Redis key.
+    pub trait CacheKey {
+        fn cache_key(&self) -> String;
+    }
+
+    impl<T> CacheKey for T
+    where
+        T: fmt::Debug + Serialize,
+    {
+        /// The default implementation serializes the struct into JSON
+        /// and hashes the output to avoid gigantic keys.
+        fn cache_key(&self) -> String {
+            let as_json =
+                serde_json::to_vec(self).expect("serializing CacheKey");
+            let mut hasher = Sha256::new();
+            hasher.update(as_json);
+            format!("{:x}", hasher.finalize())
+        }
+    }
+
+    /// Thread-safe new-type around a Redis connection pool.
+    #[derive(Clone)]
+    pub struct Cache {
+        inner: Arc<RwLock<ConnectionManager>>,
+        default_ttl: Duration,
+    }
+
+    impl Cache {
+        /// Spawn a new cache wrapper with the given TTL.
+        pub async fn new(
+            redis_url: &str,
+            default_ttl: Duration,
+        ) -> Result<Self, CacheError> {
+            let client = redis::Client::open(redis_url)?;
+            let manager = ConnectionManager::new(client)
+                .await
+                .map_err(CacheError::Redis)?;
+            Ok(Self {
+                inner: Arc::new(RwLock::new(manager)),
+                default_ttl,
+            })
+        }
+
+        /// Fetch value from Redis or compute & store it.
+        ///
+        /// The `key_input` is turned into a key via `CacheKey`.
+        #[instrument(skip_all, fields(cache.key, cache.hit))]
+        pub async fn get_or_set_json<T, F>(
+            &self,
+            key_input: &impl CacheKey,
+            ttl: Option<Duration>,
+            compute: F,
+        ) -> Result<T, CacheError>
+        where
+            T: Serialize + DeserializeOwned + Send + Sync,
+            F: std::future::Future<Output = Result<T, CacheError>> + Send,
+        {
+            let key = format!("nxs:{}", key_input.cache_key());
+            Span::current().record("cache.key", &&*key);
+
+            // READ
+            if let Some(cached) = self.get::<T>(&key).await? {
+                Span::current().record("cache.hit", &true);
+                return Ok(cached);
+            }
+            Span::current().record("cache.hit", &false);
+
+            // MISS — compute and cache
+            let value = compute.await?;
+            self.set(&key, &value, ttl.unwrap_or(self.default_ttl))
+                .await?;
+            Ok(value)
+        }
+
+        /// Consumes and deletes a cached entry.
+        pub async fn invalidate(&self, key_input: &impl CacheKey) {
+            let key = format!("nxs:{}", key_input.cache_key());
+            if let Ok(mut conn) = self.inner.write().await
+                .deref_mut()
+            {
+                let _: redis::RedisResult<()> = conn.del(key).await;
+            }
+        }
+
+        async fn get<T>(&self, key: &str) -> Result<Option<T>, CacheError>
+        where
+            T: DeserializeOwned,
+        {
+            let mut conn = self.inner.write().await;
+            let bytes: Option<Vec<u8>> = conn.get(key).await?;
+            match bytes {
+                Some(bin) => Ok(Some(serde_json::from_slice(&bin)?)),
+                None => Ok(None),
+            }
+        }
+
+        async fn set<T>(
+            &self,
+            key: &str,
+            value: &T,
+            ttl: Duration,
+        ) -> Result<(), CacheError>
+        where
+            T: ?Sized + Serialize,
+        {
+            let mut conn = self.inner.write().await;
+            let bin = serde_json::to_vec(value)?;
+            let _: () = redis::pipe()
+                .set(key, bin)
+                .expire(key, ttl.as_secs() as usize)
+                .query_async(&mut *conn)
+                .await?;
+            Ok(())
+        }
+    }
+}
+
+/// Validation helpers.
+///
+/// The project uses `validator` for payload validation.  We expose a single
+/// `validate_or_err` method to streamline early-return error handling.
+pub mod validation {
+    use super::*;
+
+    /// Re-export `validator`’s error type so callers don’t need an extra import.
+    pub type ValidationErrors = validator::ValidationErrors;
+
+    /// Extension trait implemented for every validated request DTO.
+    pub trait RequestExt: Validate + Sized {
+        /// Runs `validator` and wraps the resulting error in an anyhow
+        /// context carrying the type name—this bubbles up nicely through
+        /// our error handling middleware.
+        fn validate_or_err(self) -> Result<Self, ValidationErrors> {
+            self.validate()?;
+            Ok(self)
+        }
+    }
+
+    impl<T: Validate> RequestExt for T {}
+}
+
+/// Structured logging extensions.
+///
+/// We use `tracing` as the global logging façade.  The helpers here add
+/// strongly-typed context keys so that our logs are de-duped and properly
+/// queryable in Grafana/Loki.
+pub mod logext {
+    use super::*;
+    use tracing::field::{Field, Visit};
+
+    /// Emit the given `msg` at `debug` level, attaching the span’s
+    /// key-value pairs.
+    pub fn debug_with_ctx(msg: &str) {
+        debug!(message = msg);
+    }
+
+    /// Convenient shorthand to annotate a span with a request ID.
+    pub fn attach_request_id(span: &Span, req_id: uuid::Uuid) {
+        span.record("request_id", &req_id.to_string().as_str());
+    }
+
+    /// Helper method to extract a key from span for telemetry systems
+    /// that are not `tracing`-native.
+    pub fn get_span_field(span: &Span, name: &'static str) -> Option<String> {
+        struct Visitor<'a> {
+            name: &'static str,
+            value: Option<String>,
+            span: &'a Span,
+        }
+        impl<'a> Visit for Visitor<'a> {
+            fn record_debug(
+                &mut self,
+                field: &Field,
+                value: &dyn fmt::Debug,
+            ) {
+                if field.name() == self.name {
+                    self.value = Some(format!("{value:?}"));
+                }
+            }
+        }
+
+        let mut visitor = Visitor {
+            name,
+            value: None,
+            span,
+        };
+        span.record(&mut visitor);
+        visitor.value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn pagination_roundtrip() {
+        let req = PageRequest {
+            page: 2,
+            per_page: 25,
+        };
+        let pag = req.into_pagination().unwrap();
+        let resp = pag.to_response(250);
+        assert_eq!(resp.current_page, 2);
+        assert_eq!(resp.total_pages, 10);
+    }
+
+    #[tokio::test]
+    async fn cache_get_set() {
+        let cache = Cache::new("redis://localhost", Duration::from_secs(5))
+            .await
+            .unwrap();
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Foo(i32);
+
+        let key_input = ("foo", 1);
+        let out: Foo = cache
+            .get_or_set_json(&key_input, None, async { Ok(Foo(42)) })
+            .await
+            .unwrap();
+        assert_eq!(out, Foo(42));
+    }
+}
+```

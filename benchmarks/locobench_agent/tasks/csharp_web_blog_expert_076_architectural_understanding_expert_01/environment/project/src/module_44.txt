@@ -1,0 +1,194 @@
+```csharp
+// File: src/module_44.txt
+// Project: TempoScribe Pro – Hexagonal Productivity Blog Suite (web_blog)
+// Description: Core application service responsible for processing and publishing
+//              posts that have been scheduled for future publication.
+//
+// NOTE: This file sits inside the application service layer (hexagon core) and therefore
+//       depends exclusively on domain models and port abstractions. No external
+//       infrastructure concerns should be referenced directly here.
+
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using TempoScribePro.Core.Domain.Posts;
+using TempoScribePro.Core.Domain.Shared;
+using TempoScribePro.Core.Domain.Users;
+using TempoScribePro.Core.Ports.Cache;
+using TempoScribePro.Core.Ports.Clock;
+using TempoScribePro.Core.Ports.Logging;
+using TempoScribePro.Core.Ports.Payment;
+using TempoScribePro.Core.Ports.Persistence;
+using TempoScribePro.Core.Ports.Search;
+using TempoScribePro.Core.Ports.Telemetry;
+
+namespace TempoScribePro.Core.Application.Services
+{
+    /// <summary>
+    /// Represents the available outcomes when processing a scheduled post.
+    /// </summary>
+    public enum ScheduledPublishOutcome
+    {
+        Published,
+        SkippedAlreadyPublished,
+        SkippedUnmetPayment,
+        SkippedDraftState,
+        Failed
+    }
+
+    /// <summary>
+    /// Response model returned per processed post.
+    /// </summary>
+    public sealed record ScheduledPublishResult(
+        PostId PostId,
+        ScheduledPublishOutcome Outcome,
+        string? Message = null);
+
+    /// <summary>
+    /// Service application layer responsible for publishing posts whose scheduled
+    /// publishing date has arrived.
+    ///
+    /// This service:
+    ///    • Validates premium payment state through the payment gateway
+    ///    • Persists status changes through the repository port
+    ///    • Invalidates cache entries to guarantee fresh reads
+    ///    • Updates the search index for newly published posts
+    ///    • Emits structured logs & tracing telemetry
+    ///    • Remains fully agnostic of infrastructure details
+    /// </summary>
+    public interface IScheduledPublishService
+    {
+        Task<IReadOnlyCollection<ScheduledPublishResult>> ProcessScheduledPostsAsync(
+            DateTimeOffset upToUtc,
+            CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Default production-ready implementation of <see cref="IScheduledPublishService"/>.
+    /// </summary>
+    public sealed class ScheduledPublishService : IScheduledPublishService
+    {
+        private readonly IPostRepository _postRepository;
+        private readonly IPaymentGateway _paymentGateway;
+        private readonly ICacheService _cache;
+        private readonly ISearchIndexer _searchIndexer;
+        private readonly ISystemClock _clock;
+        private readonly ITelemetry _telemetry;
+        private readonly IAppLogger _logger;
+
+        // Keys used for cache invalidation. Kept internal for test visibility.
+        internal const string CacheKeyPrefix_Post = "post:";
+
+        public ScheduledPublishService(
+            IPostRepository postRepository,
+            IPaymentGateway paymentGateway,
+            ICacheService cache,
+            ISearchIndexer searchIndexer,
+            ISystemClock clock,
+            ITelemetry telemetry,
+            IAppLogger logger)
+        {
+            _postRepository = postRepository ?? throw new ArgumentNullException(nameof(postRepository));
+            _paymentGateway = paymentGateway ?? throw new ArgumentNullException(nameof(paymentGateway));
+            _cache = cache ?? throw new ArgumentNullException(nameof(cache));
+            _searchIndexer = searchIndexer ?? throw new ArgumentNullException(nameof(searchIndexer));
+            _clock = clock ?? throw new ArgumentNullException(nameof(clock));
+            _telemetry = telemetry ?? throw new ArgumentNullException(nameof(telemetry));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        /// <inheritdoc />
+        public async Task<IReadOnlyCollection<ScheduledPublishResult>> ProcessScheduledPostsAsync(
+            DateTimeOffset upToUtc,
+            CancellationToken cancellationToken = default)
+        {
+            var span = _telemetry.StartSpan("ScheduledPublishService.Process");
+            var results = new List<ScheduledPublishResult>();
+
+            try
+            {
+                // Fetch all posts that are scheduled to be published up to the supplied moment.
+                var candidates = await _postRepository.GetScheduledPostsAsync(upToUtc, cancellationToken)
+                                .ConfigureAwait(false);
+
+                foreach (var post in candidates)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    var outcome = await ProcessSinglePostAsync(post, cancellationToken)
+                                   .ConfigureAwait(false);
+
+                    results.Add(outcome);
+                }
+
+                return results.AsReadOnly();
+            }
+            finally
+            {
+                span.Dispose();
+            }
+        }
+
+        private async Task<ScheduledPublishResult> ProcessSinglePostAsync(
+            Post post,
+            CancellationToken ct)
+        {
+            // Sanity checks
+            if (post.IsPublished)
+            {
+                _logger.Debug("Skipping Post {PostId} – already published.", post.Id);
+                return new ScheduledPublishResult(post.Id, ScheduledPublishOutcome.SkippedAlreadyPublished);
+            }
+
+            if (post.Status != PostStatus.Scheduled)
+            {
+                _logger.Debug("Skipping Post {PostId} – not in scheduled status.", post.Id);
+                return new ScheduledPublishResult(post.Id, ScheduledPublishOutcome.SkippedDraftState);
+            }
+
+            // If post is premium, ensure payment requirements are satisfied
+            if (post.IsPremium)
+            {
+                var paymentOk = await _paymentGateway.VerifyAuthorEligibilityAsync(
+                                    post.AuthorId, ct).ConfigureAwait(false);
+
+                if (!paymentOk)
+                {
+                    const string msg = "Author has not completed required payment setup.";
+                    _logger.Warning("Skipping premium Post {PostId} – {Reason}", post.Id, msg);
+                    return new ScheduledPublishResult(
+                        post.Id, ScheduledPublishOutcome.SkippedUnmetPayment, msg);
+                }
+            }
+
+            try
+            {
+                // Publish the post
+                post.MarkAsPublished(at: _clock.UtcNow);
+
+                await _postRepository.UnitOfWork.ExecuteAsync(async () =>
+                {
+                    await _postRepository.UpdateAsync(post, ct).ConfigureAwait(false);
+                    await _searchIndexer.IndexPostAsync(post, ct).ConfigureAwait(false);
+
+                    // Invalidate related caches
+                    await _cache.RemoveAsync($"{CacheKeyPrefix_Post}{post.Id}", ct)
+                                .ConfigureAwait(false);
+                }, ct).ConfigureAwait(false);
+
+                _logger.Information("Published Post {PostId} successfully.", post.Id);
+
+                return new ScheduledPublishResult(post.Id, ScheduledPublishOutcome.Published);
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(ex, "Failed to publish Post {PostId}.", post.Id);
+
+                // Make sure occasional failures don't halt processing
+                return new ScheduledPublishResult(post.Id, ScheduledPublishOutcome.Failed, ex.Message);
+            }
+        }
+    }
+}
+```

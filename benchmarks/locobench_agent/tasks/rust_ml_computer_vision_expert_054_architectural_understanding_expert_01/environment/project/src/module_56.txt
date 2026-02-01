@@ -1,0 +1,459 @@
+```rust
+//! src/module_56.rs
+//!
+//! Adaptive Model-Monitoring & Auto-Retraining Dispatcher
+//! =====================================================
+//! This module wires a full Observer/Strategy–based, production-ready subsystem that listens
+//! to model-performance metrics pushed by the inference layer and decides—at runtime—whether
+//! a model requires automated retraining.  It demonstrates how VisuTility Orchestrator’s
+//! layers cooperate while keeping extremely low coupling via trait-based abstractions.
+//!
+//! High-level flow
+//! ---------------
+//! 1. `MetricsBus` receives `MetricEvent`s from *any* upstream task.
+//! 2. `Dispatcher` fan-outs the events to all registered `MetricObserver`s.
+//! 3. `RetrainingTrigger` implements `MetricObserver`; it evaluates each event via an
+//!    injected `RetrainStrategy` (Strategy Pattern).
+//! 4. Once a strategy signals *true* the trigger kicks off a new training job using an
+//!    abstract `ModelTrainer` and registers the new artefact into a `ModelRegistry`.
+//!
+//! The entire chain is async, fault-tolerant, and hot-plug capable.
+
+use std::{fmt, sync::Arc};
+
+use chrono::{DateTime, Utc};
+use log::{debug, error, info, warn};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc, oneshot, RwLock},
+};
+use uuid::Uuid;
+
+/* ───────────────────────────────── Error Types ────────────────────────────── */
+
+#[derive(Error, Debug)]
+pub enum MetricsError {
+    #[error("failed to send metric: {0}")]
+    Send(String),
+
+    #[error("dispatcher channel closed")]
+    Closed,
+}
+
+#[derive(Error, Debug)]
+pub enum ObserverError {
+    #[error("observer processing failed: {0}")]
+    Processing(String),
+}
+
+#[derive(Error, Debug)]
+pub enum TrainingError {
+    #[error("training job failed: {0}")]
+    Failed(String),
+}
+
+#[derive(Error, Debug)]
+pub enum RegistryError {
+    #[error("registry operation failed: {0}")]
+    Generic(String),
+}
+
+/* ───────────────────────────────── Domain Types ───────────────────────────── */
+
+/// Enumeration of canonical metric kinds the platform understands.  
+/// Extend cautiously—every variant should be serialisation- and backwards-compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MetricType {
+    Accuracy,
+    Precision,
+    Recall,
+    F1Score,
+    DriftScore,
+}
+
+impl fmt::Display for MetricType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use MetricType::*;
+        write!(
+            f,
+            "{}",
+            match self {
+                Accuracy => "accuracy",
+                Precision => "precision",
+                Recall => "recall",
+                F1Score => "f1_score",
+                DriftScore => "drift_score",
+            }
+        )
+    }
+}
+
+/// Unified metric event sent through the [`MetricsBus`].
+#[derive(Debug, Clone)]
+pub struct MetricEvent {
+    pub model_id: Uuid,
+    pub kind: MetricType,
+    pub value: f32,
+    pub timestamp: DateTime<Utc>,
+}
+
+impl MetricEvent {
+    pub fn new(model_id: Uuid, kind: MetricType, value: f32) -> Self {
+        Self {
+            model_id,
+            kind,
+            value,
+            timestamp: Utc::now(),
+        }
+    }
+}
+
+/* ───────────────────────────────── Metrics Bus ────────────────────────────── */
+
+/// Central broadcast bus for metric events.  
+/// Internally uses [`tokio::sync::broadcast`] so every subscriber receives all events.
+#[derive(Clone)]
+pub struct MetricsBus {
+    inner: broadcast::Sender<MetricEvent>,
+}
+
+impl MetricsBus {
+    /// Create a new bus with a bounded channel capacity.  
+    /// A small capacity risks *lagging* subscribers; a huge one wastes memory.
+    pub fn new(capacity: usize) -> Self {
+        let (tx, _rx) = broadcast::channel(capacity);
+        Self { inner: tx }
+    }
+
+    /// Send an event to all current subscribers.
+    pub fn publish(&self, event: MetricEvent) -> Result<(), MetricsError> {
+        self.inner
+            .send(event)
+            .map_err(|e| MetricsError::Send(e.to_string()))
+            .map(|_| ())
+    }
+
+    /// Retrieve a new receiver handle.
+    pub fn subscribe(&self) -> broadcast::Receiver<MetricEvent> {
+        self.inner.subscribe()
+    }
+}
+
+/* ──────────────────────────── Observer Abstractions ───────────────────────── */
+
+/// Observer receives every [`MetricEvent`] from the dispatcher.
+#[async_trait::async_trait]
+pub trait MetricObserver: Send + Sync {
+    async fn on_event(&self, event: MetricEvent) -> Result<(), ObserverError>;
+}
+
+/* ─────────────────────────── Dispatcher Implementation ────────────────────── */
+
+/// Fan-out dispatcher: receives from the [`MetricsBus`] and pushes to observers.  
+/// Adding or dropping observers has O(1) cost thanks to an `Arc<RwLock<..>>`.
+pub struct Dispatcher {
+    observer_pool: Arc<RwLock<Vec<Arc<dyn MetricObserver>>>>,
+    rx: broadcast::Receiver<MetricEvent>,
+    /// Optional shutdown signal for graceful termination.
+    shutdown: oneshot::Receiver<()>,
+}
+
+impl Dispatcher {
+    pub fn new(
+        bus: &MetricsBus,
+        shutdown: oneshot::Receiver<()>,
+    ) -> Self {
+        Self {
+            observer_pool: Arc::new(RwLock::new(Vec::new())),
+            rx: bus.subscribe(),
+            shutdown,
+        }
+    }
+
+    pub async fn add_observer<O>(&self, observer: O)
+    where
+        O: MetricObserver + 'static,
+    {
+        self.observer_pool.write().await.push(Arc::new(observer));
+    }
+
+    /// Main loop—consumes metric events until the `shutdown` ‑channel is triggered.
+    pub async fn run(mut self) -> Result<(), MetricsError> {
+        loop {
+            select! {
+                biased;
+
+                _ = &mut self.shutdown => {
+                    info!("Dispatcher received shutdown");
+                    return Ok(());
+                }
+
+                res = self.rx.recv() => {
+                    match res {
+                        Ok(event) => {
+                            self.dispatch(event).await;
+                        },
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Metric dispatcher lagged by {} messages", n);
+                        },
+                        Err(broadcast::error::RecvError::Closed) => {
+                            warn!("Metric bus closed; dispatcher exiting");
+                            return Err(MetricsError::Closed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn dispatch(&self, event: MetricEvent) {
+        let observers = self.observer_pool.read().await.clone();
+        for obs in observers {
+            let e = event.clone();
+            let obs = obs.clone();
+            // Spawn per-observer task to avoid blocking.
+            tokio::spawn(async move {
+                if let Err(e) = obs.on_event(e).await {
+                    error!("observer error: {:?}", e);
+                }
+            });
+        }
+    }
+}
+
+/* ──────────────────────── Strategy-Based Trigger Logic ───────────────────── */
+
+/// Strategy decides whether to retrain on a given `MetricEvent`.
+pub trait RetrainStrategy: Send + Sync {
+    /// Returns `true` when retraining should be triggered.
+    fn should_retrain(&self, event: &MetricEvent) -> bool;
+}
+
+/// A simple threshold-based implementation.
+pub struct ThresholdStrategy {
+    kind: MetricType,
+    /// When `value` drops **below** this threshold, retraining triggers.
+    threshold: f32,
+}
+
+impl ThresholdStrategy {
+    pub fn new(kind: MetricType, threshold: f32) -> Self {
+        Self { kind, threshold }
+    }
+}
+
+impl RetrainStrategy for ThresholdStrategy {
+    fn should_retrain(&self, event: &MetricEvent) -> bool {
+        event.kind == self.kind && event.value < self.threshold
+    }
+}
+
+/* ─────────────────────────── Model Trainer / Registry ─────────────────────── */
+
+#[async_trait::async_trait]
+pub trait ModelTrainer: Send + Sync {
+    /// Performs retraining; returns newly produced model version UUID.
+    async fn retrain(&self, model_id: Uuid) -> Result<Uuid, TrainingError>;
+}
+
+/// Handle to model registry (e.g. S3, PostgreSQL, etc.).
+#[async_trait::async_trait]
+pub trait ModelRegistry: Send + Sync {
+    async fn register_new_version(
+        &self,
+        model_id: Uuid,
+        version_id: Uuid,
+        created_at: DateTime<Utc>,
+    ) -> Result<(), RegistryError>;
+}
+
+/* ───────────────────────────── Retraining Observer ────────────────────────── */
+
+/// Observer that triggers automated retraining based on a strategy.
+pub struct RetrainingTrigger<S, T, R>
+where
+    S: RetrainStrategy,
+    T: ModelTrainer,
+    R: ModelRegistry,
+{
+    strategy: S,
+    trainer: Arc<T>,
+    registry: Arc<R>,
+
+    /// Prevents retriggering while job is running.
+    busy: Arc<RwLock<bool>>,
+}
+
+impl<S, T, R> RetrainingTrigger<S, T, R>
+where
+    S: RetrainStrategy,
+    T: ModelTrainer,
+    R: ModelRegistry,
+{
+    pub fn new(strategy: S, trainer: Arc<T>, registry: Arc<R>) -> Self {
+        Self {
+            strategy,
+            trainer,
+            registry,
+            busy: Arc::new(RwLock::new(false)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<S, T, R> MetricObserver for RetrainingTrigger<S, T, R>
+where
+    S: RetrainStrategy + Sync + Send + 'static,
+    T: ModelTrainer + Sync + Send + 'static,
+    R: ModelRegistry + Sync + Send + 'static,
+{
+    async fn on_event(&self, event: MetricEvent) -> Result<(), ObserverError> {
+        // 1. Fast strategy evaluation.
+        if !self.strategy.should_retrain(&event) {
+            return Ok(());
+        }
+
+        // 2. Check if another job is ongoing.
+        {
+            let mut guard = self.busy.write().await;
+            if *guard {
+                debug!(
+                    "Retraining already in progress for model {}; skipping",
+                    event.model_id
+                );
+                return Ok(());
+            }
+            *guard = true;
+        }
+
+        let trainer = self.trainer.clone();
+        let registry = self.registry.clone();
+        let busy_flag = self.busy.clone();
+
+        // 3. Fire training in background.
+        tokio::spawn(async move {
+            info!(
+                "Triggering retraining for model {} (metric {:?} dropped below threshold)",
+                event.model_id, event.kind
+            );
+            match trainer.retrain(event.model_id).await {
+                Ok(version_id) => {
+                    info!("New version {} produced for model {}", version_id, event.model_id);
+                    if let Err(e) = registry
+                        .register_new_version(event.model_id, version_id, Utc::now())
+                        .await
+                    {
+                        error!("Failed to register new model version: {:?}", e);
+                    }
+                }
+                Err(e) => error!("Retraining job failed: {:?}", e),
+            }
+
+            // Release busy lock.
+            *busy_flag.write().await = false;
+        });
+
+        Ok(())
+    }
+}
+
+/* ───────────────────────────── Example Stubs ─────────────────────────────── */
+
+/// Dummy trainer for demonstration & unit-testing purposes.
+pub struct NopTrainer;
+
+#[async_trait::async_trait]
+impl ModelTrainer for NopTrainer {
+    async fn retrain(&self, _model_id: Uuid) -> Result<Uuid, TrainingError> {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        Ok(Uuid::new_v4())
+    }
+}
+
+/// In-memory registry useful for tests.
+pub struct InMemoryRegistry {
+    store: RwLock<Vec<(Uuid, Uuid, DateTime<Utc>)>>,
+}
+
+impl InMemoryRegistry {
+    pub fn new() -> Self {
+        Self {
+            store: RwLock::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelRegistry for InMemoryRegistry {
+    async fn register_new_version(
+        &self,
+        model_id: Uuid,
+        version_id: Uuid,
+        created_at: DateTime<Utc>,
+    ) -> Result<(), RegistryError> {
+        self.store
+            .write()
+            .await
+            .push((model_id, version_id, created_at));
+        Ok(())
+    }
+}
+
+/* ─────────────────────────────── Unit Tests ──────────────────────────────── */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{sleep, Duration};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_retraining_triggered() {
+        let bus = MetricsBus::new(16);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        // Build dispatcher.
+        let dispatcher = Dispatcher::new(&bus, shutdown_rx);
+
+        // Prepare trigger.
+        let trainer = Arc::new(NopTrainer);
+        let registry = Arc::new(InMemoryRegistry::new());
+        let strategy = ThresholdStrategy::new(MetricType::Accuracy, 0.8);
+        let trigger = RetrainingTrigger::new(strategy, trainer, registry.clone());
+
+        dispatcher.add_observer(trigger).await;
+
+        // Launch dispatcher in background.
+        tokio::spawn(async move {
+            dispatcher.run().await.unwrap();
+        });
+
+        // Publish a *good* metric (no retrain).
+        bus.publish(MetricEvent::new(
+            Uuid::new_v4(),
+            MetricType::Accuracy,
+            0.95,
+        ))
+        .unwrap();
+
+        sleep(Duration::from_millis(50)).await;
+        assert!(registry.store.read().await.is_empty());
+
+        // Publish a *bad* metric (triggers retrain).
+        bus.publish(MetricEvent::new(
+            Uuid::new_v4(),
+            MetricType::Accuracy,
+            0.42,
+        ))
+        .unwrap();
+
+        // Wait for the fake training job to finish.
+        sleep(Duration::from_secs(3)).await;
+
+        assert_eq!(registry.store.read().await.len(), 1);
+
+        // Shutdown dispatcher and clean up.
+        shutdown_tx.send(()).unwrap();
+    }
+}
+```

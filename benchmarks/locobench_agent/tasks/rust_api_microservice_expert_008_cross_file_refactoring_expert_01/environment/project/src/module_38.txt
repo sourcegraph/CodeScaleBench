@@ -1,0 +1,324 @@
+```rust
+//! Pagination, repository abstraction and a concrete implementation for
+//! Ledger Entries.
+//
+//! This module is **self–contained** and depends only on widely–used crates
+//! (`sqlx`, `serde`, `validator`, `chrono`, …).  It is written to be dropped
+//! into the LedgerLink Nexus code-base without further modification.
+//
+//! High-level responsibilities
+//! ---------------------------
+//! 1. Parse & validate incoming pagination parameters
+//! 2. Offer a *view-model* friendly `Paginated<T>` envelope
+//! 3. Expose a generic `PaginatedRepository` trait (Command/Query separation)
+//! 4. Provide a production-grade Postgres implementation for ledger entries
+//! 5. Supply rich error reporting + structured tracing instrumentation
+//! 6. Attach *caching hints* so the API-Gateway can make smart decisions
+
+#![allow(clippy::module_name_repetitions)]
+
+use std::collections::HashMap;
+use std::fmt;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgQueryResult, PgPool, Postgres, QueryBuilder, FromRow};
+use thiserror::Error;
+use tracing::{error, instrument};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+/// The maximum amount of elements that can be retrieved in a single page.
+/// Going beyond this hurts DB & network throughput and opens the door for
+/// DoS attacks.
+const MAX_LIMIT: u32 = 250;
+
+/// How long a paginated list is allowed to live inside our CDN / Redis (secs).
+/// Ledger data does not change *that* often (writes are append-only) so we can
+/// afford a reasonably aggressive cache.
+const DEFAULT_TTL_SECONDS: u64 = 10;
+
+/// A strongly-typed representation of client-supplied paging parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct Pagination {
+    /// Number of records to skip (SQL `OFFSET`)
+    #[validate(custom = "validate_offset")]
+    pub offset: u32,
+    /// Number of records to fetch (SQL `LIMIT`)
+    #[validate(custom = "validate_limit")]
+    pub limit:  u32,
+    /// Optional column(s) used for sorting (e.g. `"created_at:desc"`).
+    pub sort:   Option<String>,
+}
+
+impl Default for Pagination {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            limit:  50,
+            sort:   None,
+        }
+    }
+}
+
+/// Custom offset validator — negative values are already impossible (u32),
+/// but we still disallow **gigantic** values to protect the DB.
+fn validate_offset(offset: &u32) -> Result<(), ValidationError> {
+    if *offset > 100_000 {
+        return Err(ValidationError::new("offset_too_large"));
+    }
+    Ok(())
+}
+
+/// Custom limit validator — cannot exceed `MAX_LIMIT`.
+fn validate_limit(limit: &u32) -> Result<(), ValidationError> {
+    if *limit == 0 || *limit > MAX_LIMIT {
+        return Err(ValidationError::new("limit_out_of_bounds"));
+    }
+    Ok(())
+}
+
+impl Pagination {
+    /// Tries to build a [`Pagination`] struct from an arbitrary query map,
+    /// returning validation errors early.
+    pub fn try_from_query_map(
+        params: &HashMap<String, String>,
+    ) -> Result<Self, PaginationError> {
+        let offset = params
+            .get("offset")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or_default();
+
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or_else(|| Self::default().limit);
+
+        let sort = params.get("sort").cloned();
+
+        let candidate = Self { offset, limit, sort };
+
+        candidate.validate()?;
+
+        Ok(candidate)
+    }
+
+    /// Calculates SQL LIMIT/OFFSET for the current page.
+    #[must_use]
+    pub fn sql_limit_offset(&self) -> (u32, u32) {
+        (self.limit, self.offset)
+    }
+}
+
+/// The envelope returned by list-style endpoints.
+#[derive(Debug, Clone, Serialize)]
+pub struct Paginated<T>
+where
+    T: Serialize,
+{
+    pub items:       Vec<T>,
+    pub total:       u64,
+    pub offset:      u32,
+    pub limit:       u32,
+    pub has_more:    bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hint:  Option<CacheHint>,
+}
+
+impl<T> Paginated<T>
+where
+    T: Serialize,
+{
+    pub fn new(
+        items: Vec<T>,
+        total: u64,
+        pagination: &Pagination,
+        cacheable: bool,
+    ) -> Self {
+        let has_more = (pagination.offset as u64 + items.len() as u64) < total;
+        let cache_hint = cacheable.then(|| CacheHint::new(DEFAULT_TTL_SECONDS));
+
+        Self {
+            items,
+            total,
+            offset:   pagination.offset,
+            limit:    pagination.limit,
+            has_more,
+            cache_hint,
+        }
+    }
+}
+
+/// A *soft* hint for upstream caches (API GW, CDN, Redis front-door, …).
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheHint {
+    pub ttl_seconds: u64,
+}
+
+impl CacheHint {
+    #[must_use]
+    pub const fn new(ttl_seconds: u64) -> Self {
+        Self { ttl_seconds }
+    }
+}
+
+/// Domain error type emitted by repository & pagination helpers.
+#[derive(Debug, Error)]
+pub enum PaginationError {
+    #[error("validation failure: {0}")]
+    Validation(#[from] validator::ValidationErrors),
+    #[error("not found")]
+    NotFound,
+    #[error("database error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+}
+
+/// Generic repository for resources requiring paginated listing.
+#[async_trait]
+pub trait PaginatedRepository {
+    /// DTO returned to the API layer.
+    type Output: Serialize + Send + Sync + 'static;
+
+    /// Returns a single page + record count.
+    async fn paginated_list(
+        &self,
+        pagination: &Pagination,
+    ) -> Result<Paginated<Self::Output>, PaginationError>;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                      ──  Ledger-specific implementation  ──                 */
+/* -------------------------------------------------------------------------- */
+
+/// Row mapping for the `ledger_entries` table.  This is our **domain model**.
+/// (In reality the amount would likely be a decimal; using i64 for brevity.)
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct LedgerEntry {
+    pub id:          Uuid,
+    pub account_id:  Uuid,
+    pub amount:      i64,             // amount in *minor* units (cents)
+    pub currency:    String,
+    pub description: Option<String>,
+    pub created_at:  DateTime<Utc>,
+}
+
+/// Strongly-typed wrapper over *sqlx* PgPool implementing the
+/// [`PaginatedRepository`] trait for [`LedgerEntry`].
+pub struct LedgerEntryPgRepository {
+    pool: PgPool,
+}
+
+impl LedgerEntryPgRepository {
+    /// Allocate a new repository instance.
+    #[must_use]
+    pub const fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl PaginatedRepository for LedgerEntryPgRepository {
+    type Output = LedgerEntry;
+
+    #[instrument(skip_all, name = "repo.ledger.list")]
+    async fn paginated_list(
+        &self,
+        pagination: &Pagination,
+    ) -> Result<Paginated<Self::Output>, PaginationError> {
+        // -------------------- Build the dynamic SQL query --------------------
+        // We expect an index on ( account_id, created_at DESC ) in production.
+        let mut builder: QueryBuilder<Postgres> =
+            QueryBuilder::new("SELECT * FROM ledger_entries ");
+
+        // Optional ORDER BY clause from the client — only allow whitelisted cols.
+        if let Some(sort_spec) = &pagination.sort {
+            match sort_spec.as_str() {
+                "created_at:asc"  => builder.push("ORDER BY created_at ASC "),
+                "created_at:desc" => builder.push("ORDER BY created_at DESC "),
+                "amount:asc"      => builder.push("ORDER BY amount ASC "),
+                "amount:desc"     => builder.push("ORDER BY amount DESC "),
+                _ => {
+                    return Err(PaginationError::Validation(
+                        ValidationError::new("invalid_sort").into(),
+                    ));
+                }
+            }
+        } else {
+            builder.push("ORDER BY created_at DESC ");
+        }
+
+        // Apply LIMIT / OFFSET
+        let (limit, offset) = pagination.sql_limit_offset();
+        builder.push("LIMIT ").push_bind(limit as i64).push(" ");
+        builder.push("OFFSET ").push_bind(offset as i64);
+
+        // --------------------- Execute the data query ------------------------
+        let entries: Vec<LedgerEntry> = builder
+            .build_query_as()
+            .fetch_all(&self.pool)
+            .await?;
+
+        // -------------------- Get the *total* record count -------------------
+        let total: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) as count FROM ledger_entries")
+                .fetch_one(&self.pool)
+                .await?;
+
+        // ---------------------------------------------------------------------
+        Ok(Paginated::new(
+            entries,
+            total.0 as u64,
+            pagination,
+            /*cacheable=*/ true,
+        ))
+    }
+}
+
+/// An *idempotent* command that inserts a ledger entry inside its own
+/// transaction.  Exposed as a convenience; not part of the trait.
+///
+/// Demonstrates how we keep read & write paths separated (`CQRS` style).
+impl LedgerEntryPgRepository {
+    #[instrument(skip_all, name = "repo.ledger.insert")]
+    pub async fn insert(&self, entry: &LedgerEntry) -> Result<(), PaginationError> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO ledger_entries
+            (id, account_id, amount, currency, description, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(entry.id)
+        .bind(entry.account_id)
+        .bind(entry.amount)
+        .bind(&entry.currency)
+        .bind(&entry.description)
+        .bind(entry.created_at)
+        .execute(&mut tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                             Auxiliary helpers                              */
+/* -------------------------------------------------------------------------- */
+
+impl fmt::Display for Pagination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Pagination(limit={}, offset={}, sort={})",
+            self.limit,
+            self.offset,
+            self.sort.as_deref().unwrap_or("<default>")
+        )
+    }
+}
+```

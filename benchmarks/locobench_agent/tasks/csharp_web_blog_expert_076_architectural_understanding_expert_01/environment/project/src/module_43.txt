@@ -1,0 +1,299 @@
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Polly;
+using Polly.Retry;
+using Stripe;
+
+namespace TempoScribe.Adapters.Payments.Stripe
+{
+    /// <summary>
+    /// Hexagonal adapter that bridges the domain-facing <see cref="IPaymentPort"/> 
+    /// to the external Stripe REST API.
+    /// </summary>
+    public sealed class StripePaymentAdapter : IPaymentPort
+    {
+        private const string CachePrefix = "stripe-payment";
+        private readonly StripeOptions _stripeOptions;
+        private readonly ILogger<StripePaymentAdapter> _logger;
+        private readonly IMemoryCache _cache;
+        private readonly ChargeService _chargeService;
+        private readonly RefundService _refundService;
+        private readonly AsyncRetryPolicy _retry;
+
+        public StripePaymentAdapter(
+            IOptions<StripeOptions> options,
+            ILogger<StripePaymentAdapter> logger,
+            IMemoryCache cache)
+        {
+            _stripeOptions = options?.Value ?? throw new ArgumentNullException(nameof(options));
+            _logger        = logger  ?? throw new ArgumentNullException(nameof(logger));
+            _cache         = cache   ?? throw new ArgumentNullException(nameof(cache));
+
+            StripeConfiguration.ApiKey = _stripeOptions.SecretKey;
+            _chargeService             = new ChargeService();
+            _refundService             = new RefundService();
+
+            _retry = Policy
+                .Handle<StripeException>()
+                .WaitAndRetryAsync(
+                    retryCount: 3,
+                    sleepDurationProvider: attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)),
+                    onRetry: (exception, delay, attempt, ctx) =>
+                    {
+                        _logger.LogWarning(exception,
+                            "Transient Stripe error on attempt {Attempt}. Waiting {Delay} before retry.",
+                            attempt, delay);
+                    });
+        }
+
+        /// <inheritdoc />
+        public async Task<PaymentResult> ChargeAsync(PaymentRequest request,
+                                                    CancellationToken cancellationToken = default)
+        {
+            if (request == null) throw new ArgumentNullException(nameof(request));
+
+            // Guard against duplicate charges using in-memory cache + Stripe idempotency key.
+            var cacheKey = $"{CachePrefix}:{request.IdempotencyKey}";
+            if (_cache.TryGetValue<PaymentResult>(cacheKey, out var cachedResult))
+            {
+                _logger.LogDebug("Returning cached payment result for key {CacheKey}", cacheKey);
+                return cachedResult;
+            }
+
+            using var activity = new Activity(nameof(ChargeAsync)).Start();
+
+            var createOptions = new ChargeCreateOptions
+            {
+                Amount      = (long)(request.Amount.Value * 100), // Stripe expects cents.
+                Currency    = request.Amount.Currency.ToLowerInvariant(),
+                Description = request.Description,
+                Source      = request.SourceToken, // e.g., obtained via Stripe.js.
+                Metadata    = new Dictionary<string, string>
+                {
+                    { "requestId" , request.RequestId.ToString() },
+                    { "postId"    , request.PostId?.ToString() ?? string.Empty }
+                }
+            };
+
+            try
+            {
+                var charge = await _retry.ExecuteAsync(
+                    async () =>
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        return await _chargeService.CreateAsync(
+                            createOptions,
+                            new RequestOptions
+                            {
+                                IdempotencyKey = request.IdempotencyKey,
+                                ApiKey         = _stripeOptions.SecretKey
+                            },
+                            cancellationToken);
+                    });
+
+                var result = PaymentResult.Success(
+                    transactionId : charge.Id,
+                    grossAmount   : request.Amount,
+                    feeAmount     : Money.FromMinorUnits(charge.BalanceTransaction?.Fee ?? 0,
+                                                         request.Amount.Currency),
+                    createdUtc    : DateTimeOffset.FromUnixTimeSeconds(charge.Created)
+                );
+
+                // Cache for 5 minutes to prevent subsequent retries from double-charging.
+                _cache.Set(cacheKey, result, TimeSpan.FromMinutes(5));
+
+                _logger.LogInformation("Stripe charge succeeded for {TransactionId}", charge.Id);
+                return result;
+            }
+            catch (StripeException ex)
+            {
+                _logger.LogError(ex, "Stripe charge failed for Request {RequestId}", request.RequestId);
+
+                var failed = PaymentResult.Failure(
+                    request.RequestId,
+                    ex.StripeError?.Message ?? ex.Message,
+                    ex.StripeError?.Code);
+
+                _cache.Set(cacheKey, failed, TimeSpan.FromMinutes(1));
+                return failed;
+            }
+        }
+
+        /// <inheritdoc />
+        public async Task<PaymentResult> RefundAsync(RefundRequest request,
+                                                     CancellationToken cancellationToken = default)
+        {
+            if (request == null) throw new ArgumentNullException(nameof(request));
+
+            using var activity = new Activity(nameof(RefundAsync)).Start();
+
+            var refundOptions = new RefundCreateOptions
+            {
+                Charge  = request.TransactionId,
+                Amount  = request.Amount.HasValue
+                            ? (long)(request.Amount.Value.Value * 100)
+                            : (long?)null,
+                Reason  = request.Reason?.ToString().ToLowerInvariant()
+            };
+
+            try
+            {
+                var refund = await _retry.ExecuteAsync(
+                    async () =>
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        return await _refundService.CreateAsync(
+                            refundOptions,
+                            new RequestOptions
+                            {
+                                ApiKey         = _stripeOptions.SecretKey,
+                                IdempotencyKey = $"refund-{request.IdempotencyKey}"
+                            },
+                            cancellationToken);
+                    });
+
+                var result = PaymentResult.Refunded(
+                    transactionId : refund.Id,
+                    refundId      : refund.Id,
+                    amount        : Money.FromMinorUnits(refund.Amount,
+                                                         refund.Currency.ToUpperInvariant()));
+
+                _logger.LogInformation("Stripe refund succeeded for Refund {RefundId}", refund.Id);
+                return result;
+            }
+            catch (StripeException ex)
+            {
+                _logger.LogError(ex, "Stripe refund failed for Transaction {TransactionId}", request.TransactionId);
+                return PaymentResult.Failure(request.RequestId,
+                                             ex.StripeError?.Message ?? ex.Message,
+                                             ex.StripeError?.Code);
+            }
+        }
+    }
+
+    #region Ports & Contracts --------------------------------------------------
+
+    /// <summary>
+    /// Primary port for payment processing inside the TempoScribe domain.
+    /// </summary>
+    public interface IPaymentPort
+    {
+        Task<PaymentResult> ChargeAsync(PaymentRequest request, CancellationToken cancellationToken = default);
+        Task<PaymentResult> RefundAsync(RefundRequest request, CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Immutable DTO representing a money amount with minor/major conversion helpers.
+    /// </summary>
+    public readonly struct Money
+    {
+        public decimal Value     { get; }
+        public string  Currency  { get; }
+
+        private Money(decimal value, string currency)
+        {
+            Value    = value;
+            Currency = currency ?? throw new ArgumentNullException(nameof(currency));
+        }
+
+        public static Money Of(decimal value, string currency) => new(value, currency);
+        public static Money FromMinorUnits(long minorUnits, string currency)
+            => new(minorUnits / 100m, currency);
+
+        public override string ToString() => $"{Value:N2} {Currency.ToUpperInvariant()}";
+    }
+
+    public sealed record PaymentRequest(
+        Guid     RequestId,
+        Money    Amount,
+        string   SourceToken,
+        string   IdempotencyKey,
+        string   Description,
+        Guid?    PostId);
+
+    public sealed record RefundRequest(
+        Guid     RequestId,
+        string   TransactionId,
+        Money?   Amount,
+        RefundReason? Reason,
+        string   IdempotencyKey);
+
+    public enum RefundReason
+    {
+        Duplicate,
+        RequestedByCustomer,
+        Fraudulent
+    }
+
+    public sealed record PaymentResult
+    {
+        public bool                  IsSuccess      { get; init; }
+        public bool                  IsRefund       { get; init; }
+        public string?               TransactionId  { get; init; }
+        public string?               RefundId       { get; init; }
+        public Money?                GrossAmount    { get; init; }
+        public Money?                FeeAmount      { get; init; }
+        public DateTimeOffset?       CreatedUtc     { get; init; }
+        public string?               ErrorMessage   { get; init; }
+        public string?               ErrorCode      { get; init; }
+
+        public static PaymentResult Success(string transactionId,
+                                            Money grossAmount,
+                                            Money feeAmount,
+                                            DateTimeOffset createdUtc)
+            => new()
+            {
+                IsSuccess     = true,
+                TransactionId = transactionId,
+                GrossAmount   = grossAmount,
+                FeeAmount     = feeAmount,
+                CreatedUtc    = createdUtc
+            };
+
+        public static PaymentResult Failure(Guid requestId,
+                                            string errorMessage,
+                                            string? errorCode = null)
+            => new()
+            {
+                IsSuccess    = false,
+                ErrorMessage = errorMessage,
+                ErrorCode    = errorCode
+            };
+
+        public static PaymentResult Refunded(string transactionId,
+                                             string refundId,
+                                             Money amount)
+            => new()
+            {
+                IsSuccess     = true,
+                IsRefund      = true,
+                TransactionId = transactionId,
+                RefundId      = refundId,
+                GrossAmount   = amount,
+                CreatedUtc    = DateTimeOffset.UtcNow
+            };
+    }
+
+    /// <summary>
+    /// Strongly typed configuration settings for Stripe.
+    /// </summary>
+    public sealed class StripeOptions
+    {
+        public const string SectionName = "Stripe";
+
+        /// <summary>
+        /// Test or live secret key. Loaded from secrets or env variables.
+        /// </summary>
+        public string SecretKey { get; init; } = default!;
+    }
+
+    #endregion
+}
+```

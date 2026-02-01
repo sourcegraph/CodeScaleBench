@@ -1,0 +1,470 @@
+```rust
+//! src/module_56.rs
+//!
+//! Centralised, event-driven outbox dispatcher for **EduPulse Live**.
+//!
+//! The code below demonstrates how the platform stores domain events in a
+//! transactional “outbox” table (PostgreSQL) and subsequently publishes those
+//! events to an external broker (e.g. NATS, RabbitMQ, or Kafka).  By doing so
+//! we guarantee at-least-once delivery while keeping the core transaction
+//! against the primary database fully ACID-compliant.
+//!
+//! This file can be compiled on its own, but in production you would move the
+//! SQL migrations to `migrations/`, pull configuration from `FIGMENT` or
+//! similar, and wire the dispatcher into your service’s bootstrap sequence.
+
+use std::{sync::Arc, time::Duration};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use thiserror::Error;
+use tokio::sync::broadcast::{self, Receiver};
+use tokio::{select, task, time};
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
+
+/// -------------------------------
+/// Error Handling
+/// -------------------------------
+
+#[derive(Debug, Error)]
+pub enum OutboxError {
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+
+    #[error("serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("broker publish error: {0}")]
+    Broker(#[from] BrokerError),
+
+    #[error("shutdown signal received")]
+    Shutdown,
+}
+
+#[derive(Debug, Error)]
+pub enum BrokerError {
+    #[error("connection failure: {0}")]
+    Connection(String),
+
+    #[error("publish failure: {0}")]
+    Publish(String),
+}
+
+/// -------------------------------
+/// Domain Event Abstractions
+/// -------------------------------
+
+/// A marker trait implemented by all domain-specific events.  Enums are fine
+/// when you’re inside a single bounded context, but because we need
+/// cross-boundary extensibility we rely on trait objects + SERDE.
+#[async_trait]
+pub trait DomainEvent: Send + Sync + 'static {
+    /// A short, kebab-case name (`lesson-published`) suitable for routing keys.
+    fn event_type(&self) -> &'static str;
+
+    /// Serialise to JSON for outbox/broker storage.
+    fn to_json(&self) -> Result<JsonValue, serde_json::Error>
+    where
+        Self: Serialize,
+    {
+        serde_json::to_value(self)
+    }
+}
+
+/// Example event: a teacher publishes a lesson.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LessonPublished {
+    pub lesson_id: Uuid,
+    pub author_id: Uuid,
+    pub title: String,
+    pub published_at: DateTime<Utc>,
+}
+
+#[async_trait]
+impl DomainEvent for LessonPublished {
+    fn event_type(&self) -> &'static str {
+        "lesson-published"
+    }
+}
+
+/// Example event: a student submits a quiz.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QuizSubmitted {
+    pub quiz_id: Uuid,
+    pub student_id: Uuid,
+    pub score: f32,
+    pub submitted_at: DateTime<Utc>,
+}
+
+#[async_trait]
+impl DomainEvent for QuizSubmitted {
+    fn event_type(&self) -> &'static str {
+        "quiz-submitted"
+    }
+}
+
+/// -------------------------------
+/// Outbox Persistence
+/// -------------------------------
+
+/// Lightweight representation stored in the `outbox` table.
+/// Every aggregate mutation appends one or more `OutboxEvent` records inside
+/// the same RDBMS transaction.
+#[derive(Debug)]
+pub struct OutboxEvent {
+    pub id: Uuid,
+    pub aggregate_id: Uuid,
+    pub event_type: String,
+    pub payload: JsonValue,
+    pub occurred_at: DateTime<Utc>,
+    pub dispatched: bool,
+}
+
+impl OutboxEvent {
+    pub fn from_domain<E: DomainEvent + Serialize>(
+        aggregate_id: Uuid,
+        domain: &E,
+    ) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            id: Uuid::new_v4(),
+            aggregate_id,
+            event_type: domain.event_type().into(),
+            payload: domain.to_json()?,
+            occurred_at: Utc::now(),
+            dispatched: false,
+        })
+    }
+}
+
+/// Data-access boundary for the Outbox.
+#[async_trait]
+pub trait OutboxRepository: Send + Sync {
+    async fn add_event(&self, event: OutboxEvent) -> Result<(), OutboxError>;
+
+    async fn fetch_undispatched(
+        &self,
+        batch_size: i64,
+    ) -> Result<Vec<OutboxEvent>, OutboxError>;
+
+    async fn mark_dispatched<'e, E>(
+        &self,
+        conn: E,
+        ids: &[Uuid],
+    ) -> Result<(), OutboxError>
+    where
+        E: sqlx::Acquire<'e, Database = sqlx::Postgres> + Send;
+}
+
+/// Concrete Postgres implementation.
+///
+/// Schema:
+/// ```sql
+/// CREATE TABLE IF NOT EXISTS outbox (
+///   id           UUID PRIMARY KEY,
+///   aggregate_id UUID NOT NULL,
+///   event_type   TEXT NOT NULL,
+///   payload      JSONB NOT NULL,
+///   occurred_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+///   dispatched   BOOLEAN NOT NULL DEFAULT FALSE
+/// );
+/// CREATE INDEX IF NOT EXISTS idx_outbox_dispatched ON outbox(dispatched);
+/// ```
+pub struct PgOutboxRepository {
+    pool: sqlx::PgPool,
+}
+
+impl PgOutboxRepository {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl OutboxRepository for PgOutboxRepository {
+    #[instrument(skip_all, fields(event_type=%event.event_type))]
+    async fn add_event(&self, event: OutboxEvent) -> Result<(), OutboxError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO outbox (id, aggregate_id, event_type, payload, occurred_at, dispatched)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+            event.id,
+            event.aggregate_id,
+            event.event_type,
+            event.payload,
+            event.occurred_at,
+            event.dispatched,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    #[instrument(skip_all, fields(batch_size))]
+    async fn fetch_undispatched(
+        &self,
+        batch_size: i64,
+    ) -> Result<Vec<OutboxEvent>, OutboxError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, aggregate_id, event_type, payload, occurred_at, dispatched
+            FROM outbox
+            WHERE dispatched = FALSE
+            ORDER BY occurred_at
+            LIMIT $1
+            "#,
+            batch_size
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| OutboxEvent {
+                id: row.id,
+                aggregate_id: row.aggregate_id,
+                event_type: row.event_type,
+                payload: row.payload,
+                occurred_at: row.occurred_at,
+                dispatched: row.dispatched,
+            })
+            .collect())
+    }
+
+    #[instrument(skip_all, fields(count=ids.len()))]
+    async fn mark_dispatched<'e, E>(
+        &self,
+        mut conn: E,
+        ids: &[Uuid],
+    ) -> Result<(), OutboxError>
+    where
+        E: sqlx::Acquire<'e, Database = sqlx::Postgres> + Send,
+    {
+        // Use UNNEST for bulk update.
+        sqlx::query!(
+            r#"
+            UPDATE outbox
+            SET dispatched = TRUE
+            WHERE id = ANY($1)
+            "#,
+            &ids
+        )
+        .execute(conn.acquire().await?)
+        .await?;
+
+        Ok(())
+    }
+}
+
+/// -------------------------------
+/// Broker Abstraction
+/// -------------------------------
+
+#[async_trait]
+pub trait EventBroker: Send + Sync {
+    async fn publish(
+        &self,
+        routing_key: &str,
+        payload: &JsonValue,
+    ) -> Result<(), BrokerError>;
+}
+
+/// Stub implementation that simply logs messages.
+pub struct LogBroker;
+
+#[async_trait]
+impl EventBroker for LogBroker {
+    #[instrument(skip_all, fields(routing_key))]
+    async fn publish(
+        &self,
+        routing_key: &str,
+        payload: &JsonValue,
+    ) -> Result<(), BrokerError> {
+        info!(%routing_key, payload = %payload, "Publishing event");
+        Ok(())
+    }
+}
+
+/// -------------------------------
+/// Dispatcher Runtime
+/// -------------------------------
+
+/// Controls the outbox polling loop.
+pub struct OutboxDispatcher<R: OutboxRepository, B: EventBroker> {
+    repo: Arc<R>,
+    broker: Arc<B>,
+    poll_interval: Duration,
+    batch_size: i64,
+    shutdown_tx: broadcast::Sender<()>,
+}
+
+impl<R, B> OutboxDispatcher<R, B>
+where
+    R: OutboxRepository + 'static,
+    B: EventBroker + 'static,
+{
+    pub fn new(
+        repo: Arc<R>,
+        broker: Arc<B>,
+        poll_interval: Duration,
+        batch_size: i64,
+    ) -> Self {
+        let (shutdown_tx, _) = broadcast::channel(1);
+        Self {
+            repo,
+            broker,
+            poll_interval,
+            batch_size,
+            shutdown_tx,
+        }
+    }
+
+    /// Fire a shutdown signal; all running loops will terminate gracefully.
+    pub fn shutdown(&self) {
+        info!("Shutdown signal sent to outbox dispatcher");
+        let _ = self.shutdown_tx.send(());
+    }
+
+    /// Spawn continuous async task.
+    pub fn spawn(self) -> task::JoinHandle<Result<(), OutboxError>> {
+        task::spawn(async move { self.run().await })
+    }
+
+    /// Main loop.
+    #[instrument(skip(self))]
+    async fn run(self) -> Result<(), OutboxError> {
+        let mut shutdown_rx: Receiver<()> = self.shutdown_tx.subscribe();
+        let mut ticker = time::interval(self.poll_interval);
+
+        loop {
+            select! {
+                _ = ticker.tick() => {
+                    if let Err(e) = self.flush_once().await {
+                        error!(error=%e, "Outbox flush failed");
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    warn!("Outbox dispatcher received shutdown");
+                    return Err(OutboxError::Shutdown)
+                }
+            }
+        }
+    }
+
+    /// Process a single batch.
+    #[instrument(skip(self))]
+    async fn flush_once(&self) -> Result<(), OutboxError> {
+        let events = self
+            .repo
+            .fetch_undispatched(self.batch_size)
+            .await?;
+
+        if events.is_empty() {
+            debug!("No events to dispatch");
+            return Ok(());
+        }
+
+        info!(count = events.len(), "Dispatching events");
+
+        // Publish sequentially; can be parallelised if idempotent.
+        for evt in &events {
+            self.broker
+                .publish(&evt.event_type, &evt.payload)
+                .await?;
+        }
+
+        // Mark as dispatched in a single transaction for consistency.
+        let mut tx = self
+            .repo
+            .as_ref()
+            .as_ref()
+            .begin()
+            .await
+            .map_err(OutboxError::Db)?;
+
+        let ids: Vec<Uuid> = events.iter().map(|e| e.id).collect();
+        self.repo.mark_dispatched(&mut tx, &ids).await?;
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+}
+
+/// -------------------------------
+/// Example Bootstrap (test only)
+/// -------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::{postgres::PgPoolOptions, Executor};
+    use tokio::time::timeout;
+
+    /// Integration-test the dispatcher with an in-memory PostgreSQL
+    /// (requires `docker` + `testcontainers` in CI, not demonstrated here).
+    #[tokio::test]
+    async fn dispatcher_smoke_test() {
+        // NOTE: replace with a proper test container or a fixture DB.
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost/edupulse_test".into());
+
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("failed to connect to postgres");
+
+        // Ensure schema is present.
+        pool.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS outbox (
+                id           UUID PRIMARY KEY,
+                aggregate_id UUID NOT NULL,
+                event_type   TEXT NOT NULL,
+                payload      JSONB NOT NULL,
+                occurred_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                dispatched   BOOLEAN NOT NULL DEFAULT FALSE
+            )
+            "#,
+        )
+        .await
+        .unwrap();
+
+        let repo = Arc::new(PgOutboxRepository::new(pool.clone()));
+        let broker = Arc::new(LogBroker);
+
+        // Insert a fake event.
+        let lesson_evt = LessonPublished {
+            lesson_id: Uuid::new_v4(),
+            author_id: Uuid::new_v4(),
+            title: "Rust for Rocket-Scientists".into(),
+            published_at: Utc::now(),
+        };
+
+        let outbox_evt =
+            OutboxEvent::from_domain(lesson_evt.lesson_id, &lesson_evt).unwrap();
+        repo.add_event(outbox_evt).await.unwrap();
+
+        let dispatcher = OutboxDispatcher::new(
+            repo.clone(),
+            broker,
+            Duration::from_millis(200),
+            10,
+        );
+
+        let handle = dispatcher.spawn();
+
+        // Give it some time to process.
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("dispatcher timed out")
+            .unwrap()
+            .unwrap_err(); // we expect Shutdown because we didn't send one
+    }
+}
+```

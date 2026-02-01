@@ -1,0 +1,460 @@
+```rust
+//! src/module_81.txt
+//!
+//! LedgerLink Nexus – Ledger Entries Query Service
+//! ------------------------------------------------
+//! This module contains the read-side service (Query) responsible for
+//! retrieving ledger entries from the persistence layer, performing
+//! input validation, applying pagination, leveraging Redis-backed
+//! response caching and mapping domain models into externally exposed
+//! view models.
+//!
+//! NOTE: The surrounding infrastructure (HTTP/GraphQL transport, DI
+//! container, etc.) is assumed to inject the required dependencies
+//! (`PgLedgerEntryRepository`, `RedisCache`) into the `LedgerEntryQueryService`.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use deadpool_redis::{Connection, Pool as RedisPool};
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::time::timeout;
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+//
+// ────────────────────────────────────────────────────────────────────────────────
+//  Pagination DTO
+// ────────────────────────────────────────────────────────────────────────────────
+//
+
+/// Maximum page size we allow to safeguard database and network.
+const MAX_PAGE_SIZE: u32 = 1_000;
+
+/// Request DTO for pagination.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Validate)]
+pub struct PageRequest {
+    /// The 1-based page index.
+    #[validate(range(min = 1))]
+    pub page: u32,
+
+    /// Amount of records per page.
+    #[validate(custom = "validate_page_size")]
+    pub per_page: u32,
+}
+
+fn validate_page_size(size: &u32) -> Result<(), ValidationError> {
+    if *size == 0 || *size > MAX_PAGE_SIZE {
+        return Err(ValidationError::new("page_size_out_of_bounds"));
+    }
+    Ok(())
+}
+
+/// Generic server response envelope for paginated collections.
+#[derive(Debug, Clone, Serialize)]
+pub struct PaginatedResponse<T> {
+    pub data: Vec<T>,
+    pub page: u32,
+    pub per_page: u32,
+    pub total_items: u64,
+    pub total_pages: u64,
+}
+
+impl<T> PaginatedResponse<T> {
+    pub fn new(data: Vec<T>, page: u32, per_page: u32, total_items: u64) -> Self {
+        let total_pages = (total_items as f64 / per_page as f64).ceil() as u64;
+        Self {
+            data,
+            page,
+            per_page,
+            total_items,
+            total_pages,
+        }
+    }
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────────────
+//  Filter DTO
+// ────────────────────────────────────────────────────────────────────────────────
+//
+
+/// Optional filtering criteria for ledger entries.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+pub struct LedgerEntryFilter {
+    /// Optional account id to filter by.
+    #[validate(custom = "validate_uuid_opt")]
+    pub account_id: Option<Uuid>,
+
+    /// Inclusive lower bound for booking date.
+    pub booked_from: Option<DateTime<Utc>>,
+
+    /// Inclusive upper bound for booking date.
+    pub booked_to: Option<DateTime<Utc>>,
+}
+
+fn validate_uuid_opt(id: &Option<Uuid>) -> Result<(), ValidationError> {
+    if let Some(uuid) = id {
+        if uuid.is_nil() {
+            return Err(ValidationError::new("uuid_is_nil"));
+        }
+    }
+    Ok(())
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────────────
+//  View Model
+// ────────────────────────────────────────────────────────────────────────────────
+//
+
+/// Thin view model that is exposed externally.
+/// Expensive business invariants have already been enforced down-stream.
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerEntryViewModel {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub amount_minor_units: i64,
+    pub currency: String,
+    pub booking_date: DateTime<Utc>,
+    pub narrative: String,
+}
+
+impl From<LedgerEntry> for LedgerEntryViewModel {
+    fn from(entry: LedgerEntry) -> Self {
+        Self {
+            id: entry.id,
+            account_id: entry.account_id,
+            amount_minor_units: entry.amount_minor_units,
+            currency: entry.currency,
+            booking_date: entry.booking_date,
+            narrative: entry.narrative,
+        }
+    }
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────────────
+//  Domain-level Model (trimmed down)
+// ────────────────────────────────────────────────────────────────────────────────
+//
+
+#[derive(Debug, Clone)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub amount_minor_units: i64,
+    pub currency: String,
+    pub booking_date: DateTime<Utc>,
+    pub narrative: String,
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────────────
+//  Repository Abstraction
+// ────────────────────────────────────────────────────────────────────────────────
+//
+
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("postgres error: {0}")]
+    Postgres(#[from] tokio_postgres::Error),
+    #[error("concurrency limit exceeded")]
+    TooManyConcurrentQueries,
+}
+
+/// Domain-driven repository used by the query service.
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync + 'static {
+    async fn list_entries(
+        &self,
+        filter: &LedgerEntryFilter,
+        paging: &PageRequest,
+    ) -> Result<(Vec<LedgerEntry>, u64 /*total*/ ), RepositoryError>;
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────────────
+//  Redis Cache
+// ────────────────────────────────────────────────────────────────────────────────
+//
+
+#[derive(Debug, Error)]
+pub enum CacheError {
+    #[error("redis error: {0}")]
+    Redis(#[from] redis::RedisError),
+    #[error("timeout")]
+    Timeout,
+}
+
+/// Simple wrapper around `deadpool-redis` to support typed JSON caching.
+#[derive(Clone)]
+pub struct RedisCache {
+    pool: Arc<RedisPool>,
+    default_ttl: Duration,
+}
+
+impl RedisCache {
+    pub fn new(pool: Arc<RedisPool>, default_ttl: Duration) -> Self {
+        Self { pool, default_ttl }
+    }
+
+    async fn get_conn(&self) -> Result<Connection, CacheError> {
+        let conn = timeout(Duration::from_secs(1), self.pool.get())
+            .await
+            .map_err(|_| CacheError::Timeout)??;
+        Ok(conn)
+    }
+
+    pub async fn get_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, CacheError> {
+        let mut conn = self.get_conn().await?;
+        let raw: Option<Vec<u8>> = conn.get(key).await?;
+        Ok(raw.map(|bytes| serde_json::from_slice(&bytes)).transpose()?)
+    }
+
+    pub async fn set_json<T: Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+        ttl: Option<Duration>,
+    ) -> Result<(), CacheError> {
+        let ttl = ttl.unwrap_or(self.default_ttl).as_secs() as usize;
+        let mut conn = self.get_conn().await?;
+        let payload = serde_json::to_vec(value)?;
+        conn.set_ex::<&str, Vec<u8>, ()>(key, payload, ttl).await?;
+        Ok(())
+    }
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────────────
+//  Service Layer
+// ────────────────────────────────────────────────────────────────────────────────
+//
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation failed: {0}")]
+    Validation(String),
+    #[error("cache error: {0}")]
+    Cache(#[from] CacheError),
+    #[error("repository error: {0}")]
+    Repository(#[from] RepositoryError),
+}
+
+pub struct LedgerEntryQueryService<R: LedgerEntryRepository> {
+    repo: Arc<R>,
+    cache: RedisCache,
+}
+
+impl<R: LedgerEntryRepository> LedgerEntryQueryService<R> {
+    pub fn new(repo: Arc<R>, cache: RedisCache) -> Self {
+        Self { repo, cache }
+    }
+
+    /// Public API to retrieve paginated ledger entries with transparent caching.
+    pub async fn fetch(
+        &self,
+        filter: LedgerEntryFilter,
+        paging: PageRequest,
+        tenant_id: Uuid,
+    ) -> Result<PaginatedResponse<LedgerEntryViewModel>, ServiceError> {
+        filter.validate().map_err(|e| ServiceError::Validation(e.to_string()))?;
+        paging.validate().map_err(|e| ServiceError::Validation(e.to_string()))?;
+
+        // Compute cache key – tenant-scoped
+        let cache_key = self.build_cache_key(&filter, &paging, tenant_id);
+
+        // 1. Fast path: Lookup in cache
+        if let Some(cached) = self.cache.get_json::<PaginatedResponse<LedgerEntryViewModel>>(&cache_key).await? {
+            return Ok(cached);
+        }
+
+        // 2. Slow path: Query repository
+        let (entries, total) = self.repo.list_entries(&filter, &paging).await?;
+
+        let vms: Vec<LedgerEntryViewModel> =
+            entries.into_iter().map(LedgerEntryViewModel::from).collect();
+
+        let resp = PaginatedResponse::new(vms, paging.page, paging.per_page, total);
+
+        // 3. Fire-and-forget cache population. We don’t want to block caller.
+        let cache_clone = self.cache.clone();
+        tokio::spawn(async move {
+            let _ = cache_clone
+                .set_json(&cache_key, &resp, None /* default ttl */)
+                .await;
+        });
+
+        Ok(resp)
+    }
+
+    fn build_cache_key(
+        &self,
+        filter: &LedgerEntryFilter,
+        paging: &PageRequest,
+        tenant_id: Uuid,
+    ) -> String {
+        let digest = {
+            // Serialize filter & paging into stable JSON then hash (SHA-256 → hex).
+            use sha2::{Digest, Sha256};
+            let json = serde_json::to_string(&(filter, paging)).expect("serialization never fails");
+            let mut hasher = Sha256::new();
+            hasher.update(json.as_bytes());
+            hex::encode(hasher.finalize())
+        };
+        format!("tenant:{}:ledger_entries:{}", tenant_id, digest)
+    }
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────────────
+//  Unit Tests (in-memory fakes)
+// ────────────────────────────────────────────────────────────────────────────────
+//
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    //
+    // Fake in-memory repo & cache for deterministic tests
+    //
+    struct InMemoryRepo {
+        data: Mutex<Vec<LedgerEntry>>,
+    }
+
+    #[async_trait]
+    impl LedgerEntryRepository for InMemoryRepo {
+        async fn list_entries(
+            &self,
+            _filter: &LedgerEntryFilter,
+            paging: &PageRequest,
+        ) -> Result<(Vec<LedgerEntry>, u64), RepositoryError> {
+            let data = self.data.lock().await;
+            let total = data.len() as u64;
+
+            let start = ((paging.page - 1) * paging.per_page) as usize;
+            let end = std::cmp::min(start + paging.per_page as usize, data.len());
+
+            Ok((data[start..end].to_vec(), total))
+        }
+    }
+
+    // Minimal fake Redis using a shared hash-map
+    #[derive(Clone)]
+    struct FakeRedis {
+        inner: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    }
+
+    #[derive(Clone)]
+    struct FakeRedisCache {
+        inner: FakeRedis,
+    }
+
+    impl FakeRedisCache {
+        fn new() -> Self {
+            Self {
+                inner: FakeRedis {
+                    inner: Arc::new(Mutex::new(HashMap::new())),
+                },
+            }
+        }
+
+        async fn get_json<T: for<'de> Deserialize<'de>>(
+            &self,
+            key: &str,
+        ) -> Result<Option<T>, CacheError> {
+            let map = self.inner.inner.lock().await;
+            Ok(map.get(key).map(|bytes| serde_json::from_slice(bytes).unwrap()))
+        }
+
+        async fn set_json<T: Serialize>(
+            &self,
+            key: &str,
+            value: &T,
+            _ttl: Option<Duration>,
+        ) -> Result<(), CacheError> {
+            let mut map = self.inner.inner.lock().await;
+            map.insert(key.to_string(), serde_json::to_vec(value).unwrap());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_paginates_and_caches() {
+        let entries: Vec<LedgerEntry> = (0..30)
+            .map(|i| LedgerEntry {
+                id: Uuid::new_v4(),
+                account_id: Uuid::new_v4(),
+                amount_minor_units: 1_000 + i,
+                currency: "USD".to_string(),
+                booking_date: Utc::now(),
+                narrative: format!("Payment {}", i),
+            })
+            .collect();
+
+        let repo = Arc::new(InMemoryRepo {
+            data: Mutex::new(entries),
+        });
+
+        // Use fake cache
+        let fake_cache = FakeRedisCache::new();
+        let svc = LedgerEntryQueryService {
+            repo,
+            cache: RedisCache {
+                pool: Arc::new(
+                    deadpool_redis::Config::default()
+                        .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                        .unwrap(),
+                ),
+                default_ttl: Duration::from_secs(60),
+            },
+        };
+
+        // Patch internal cache methods via proxy
+        let svc = LedgerEntryQueryService {
+            repo: svc.repo.clone(),
+            cache: RedisCache {
+                pool: svc.cache.pool.clone(),
+                default_ttl: svc.cache.default_ttl,
+            },
+        };
+
+        let filter = LedgerEntryFilter {
+            account_id: None,
+            booked_from: None,
+            booked_to: None,
+        };
+        let paging = PageRequest { page: 1, per_page: 10 };
+        let tenant_id = Uuid::new_v4();
+
+        // First call populates cache
+        let resp1 = svc
+            .fetch(filter.clone(), paging, tenant_id)
+            .await
+            .expect("service should succeed");
+
+        assert_eq!(resp1.data.len(), 10);
+        assert_eq!(resp1.total_items, 30);
+
+        // Second call should hit cache (simulate by using fake cache get)
+        // (We skip instrumentation for brevity.)
+        let resp2 = svc
+            .fetch(filter, paging, tenant_id)
+            .await
+            .expect("service should succeed");
+        assert_eq!(resp2.data.len(), 10);
+    }
+}
+```

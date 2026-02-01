@@ -1,0 +1,323 @@
+//! Enrichment strategy registry and pipeline for ChirpPulse
+//!
+//! This module allows the streaming platform to dynamically register and execute enrichment
+//! algorithms against raw social events. Data scientists can hot-swap strategies at runtime
+//! without redeploying the service, e.g. rolling out a new sentiment model during a sport final.
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+    time::SystemTime,
+};
+
+use async_trait::async_trait;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::time::{timeout, Duration};
+use tracing::{error, info, instrument};
+
+/// Maximum amount of time a strategy is allowed to take for a single event
+const STRATEGY_TIMEOUT_MS: u64 = 900;
+
+/// Domain error type for the enrichment pipeline.
+#[derive(Debug, Error)]
+pub enum EnrichmentError {
+    #[error("strategy `{0}` not found in registry")]
+    StrategyNotFound(String),
+
+    #[error("strategy `{0}` timed out after {1:?}")]
+    StrategyTimeout(String, Duration),
+
+    #[error("strategy `{0}` failed: {1}")]
+    StrategyFailure(String, #[source] Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("pipeline stopped: {0}")]
+    PipelineStopped(String),
+}
+
+/// Raw social event ingested from a source topic (tweets, comments, etc.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialEvent {
+    pub id: String,
+    pub created_at: SystemTime,
+    pub payload: serde_json::Value,
+    pub source_topic: String,
+}
+
+/// An enriched version of [`SocialEvent`]. Each strategy can mutate the `enrichment` map.
+///
+/// The raw event fields are kept intact so that downstream services can reconstruct
+/// the original context if needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichedEvent {
+    pub original: SocialEvent,
+    pub enrichment: serde_json::Map<String, serde_json::Value>,
+}
+
+impl From<SocialEvent> for EnrichedEvent {
+    fn from(event: SocialEvent) -> Self {
+        Self {
+            original: event,
+            enrichment: serde_json::Map::new(),
+        }
+    }
+}
+
+/// The Strategy Pattern: each enrichment algorithm implements this trait
+#[async_trait]
+pub trait EnrichmentStrategy: Send + Sync {
+    /// Unique identifier for the strategy.
+    fn name(&self) -> &'static str;
+
+    /// Process a single social event, returning an enriched version or an error.
+    async fn process(&self, event: EnrichedEvent) -> Result<EnrichedEvent, EnrichmentError>;
+}
+
+/// Global registry for enrichment strategies.
+///
+/// The registry is thread-safe and supports live (hot) registration.
+/// Strategies are wrapped in `Arc` so that each pipeline can cheaply clone them.
+static STRATEGY_REGISTRY: Lazy<RwLock<HashMap<&'static str, Arc<dyn EnrichmentStrategy>>>> =
+    Lazy::new(|| {
+        let mut map: HashMap<&'static str, Arc<dyn EnrichmentStrategy>> = HashMap::new();
+        // Pre-register built-in strategies
+        let lang = Arc::new(LanguageDetectionStrategy::default());
+        map.insert(lang.name(), lang);
+
+        let sent = Arc::new(SentimentAnalysisStrategy::default());
+        map.insert(sent.name(), sent);
+
+        RwLock::new(map)
+    });
+
+/// Register a new strategy at runtime.
+///
+/// If a strategy with the same name already exists, this function will replace it and
+/// return the old one. Observability tooling should be used to detect unintentional
+/// shadowing.
+pub fn register_strategy(
+    strategy: Arc<dyn EnrichmentStrategy>,
+) -> Option<Arc<dyn EnrichmentStrategy>> {
+    let mut registry = STRATEGY_REGISTRY
+        .write()
+        .expect("registry write lock poisoned");
+    registry.insert(strategy.name(), strategy)
+}
+
+/// Retrieve a registered strategy by name.
+///
+/// Returns `None` if the strategy is not known.
+pub fn lookup_strategy(name: &str) -> Option<Arc<dyn EnrichmentStrategy>> {
+    let registry = STRATEGY_REGISTRY
+        .read()
+        .expect("registry read lock poisoned");
+    registry.get(name).cloned()
+}
+
+/// A pipeline is an ordered list of strategies executed sequentially.
+///
+/// Each strategy sees the output of the previous one.
+#[derive(Debug, Clone)]
+pub struct EnrichmentPipeline {
+    stages: Vec<Arc<dyn EnrichmentStrategy>>,
+}
+
+impl EnrichmentPipeline {
+    /// Build a pipeline from a list of strategy names.
+    ///
+    /// Returns [`EnrichmentError::StrategyNotFound`] if any name is unknown.
+    pub fn from_strategy_names(names: &[String]) -> Result<Self, EnrichmentError> {
+        let mut stages = Vec::with_capacity(names.len());
+        for n in names {
+            let strat = lookup_strategy(n).ok_or_else(|| EnrichmentError::StrategyNotFound(n.clone()))?;
+            stages.push(strat);
+        }
+        Ok(Self { stages })
+    }
+
+    /// Execute the pipeline for a single event.
+    ///
+    /// Each stage is given a bounded amount of time (`STRATEGY_TIMEOUT_MS`) to complete.
+    /// When a stage fails, the error is returned and the remaining stages are skipped.
+    #[instrument(skip(self, event))]
+    pub async fn run(&self, event: SocialEvent) -> Result<EnrichedEvent, EnrichmentError> {
+        let mut enriched = EnrichedEvent::from(event);
+
+        for stage in &self.stages {
+            let stage_name = stage.name();
+            let fut = stage.process(enriched);
+            match timeout(Duration::from_millis(STRATEGY_TIMEOUT_MS), fut).await {
+                Ok(Ok(out)) => {
+                    enriched = out;
+                }
+                Ok(Err(e)) => {
+                    error!(%stage_name, err = ?e, "strategy failed");
+                    return Err(e);
+                }
+                Err(_) => {
+                    error!(%stage_name, "strategy timed out");
+                    return Err(EnrichmentError::StrategyTimeout(
+                        stage_name.to_owned(),
+                        Duration::from_millis(STRATEGY_TIMEOUT_MS),
+                    ));
+                }
+            }
+        }
+
+        Ok(enriched)
+    }
+}
+
+//
+// ─── BUILT-IN STRATEGIES ──────────────────────────────────────────────────────────
+//
+
+/// A dummy language detection implementation; in production this would call an ML model.
+#[derive(Default, Debug)]
+pub struct LanguageDetectionStrategy;
+
+#[async_trait]
+impl EnrichmentStrategy for LanguageDetectionStrategy {
+    fn name(&self) -> &'static str {
+        "language_detection"
+    }
+
+    #[instrument(skip(self, event))]
+    async fn process(&self, mut event: EnrichedEvent) -> Result<EnrichedEvent, EnrichmentError> {
+        // A placeholder detection based on payload heuristics
+        let text = event
+            .original
+            .payload
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        let lang = detect_language(text);
+        event
+            .enrichment
+            .insert("language".to_string(), serde_json::json!(lang));
+        Ok(event)
+    }
+}
+
+/// A dummy sentiment analysis strategy; replace with transformer model inference.
+#[derive(Default, Debug)]
+pub struct SentimentAnalysisStrategy;
+
+#[async_trait]
+impl EnrichmentStrategy for SentimentAnalysisStrategy {
+    fn name(&self) -> &'static str {
+        "sentiment_analysis"
+    }
+
+    #[instrument(skip(self, event))]
+    async fn process(&self, mut event: EnrichedEvent) -> Result<EnrichedEvent, EnrichmentError> {
+        let lang = event
+            .enrichment
+            .get("language")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        // Don't run sentiment if we couldn't detect language; skip gracefully
+        if lang == "unknown" {
+            info!("skipping sentiment analysis due to unknown language");
+            return Ok(event);
+        }
+
+        let text = event
+            .original
+            .payload
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        // Naive rule-based sentiment detection
+        let score = naive_sentiment_score(text);
+        event
+            .enrichment
+            .insert("sentiment_score".to_string(), serde_json::json!(score));
+        Ok(event)
+    }
+}
+
+/// Very naive language detector; placeholder
+fn detect_language(text: &str) -> &'static str {
+    if text.is_empty() {
+        "unknown"
+    } else if text.chars().any(|c| ('а'..='я').contains(&c) || ('А'..='Я').contains(&c)) {
+        "ru"
+    } else {
+        "en"
+    }
+}
+
+/// Very naive sentiment detector; placeholder
+fn naive_sentiment_score(text: &str) -> f32 {
+    let positive = ["good", "great", "love", "awesome", "win"];
+    let negative = ["bad", "terrible", "hate", "awful", "lose"];
+
+    let mut score = 0f32;
+    for token in text.split_whitespace() {
+        if positive.contains(&token.to_lowercase().as_str()) {
+            score += 1.0;
+        }
+        if negative.contains(&token.to_lowercase().as_str()) {
+            score -= 1.0;
+        }
+    }
+
+    score / (text.split_whitespace().count().max(1) as f32)
+}
+
+//
+// ─── TESTS ────────────────────────────────────────────────────────────────────────
+//
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::runtime::Runtime;
+
+    fn sample_event(text: &str) -> SocialEvent {
+        SocialEvent {
+            id: "1".to_string(),
+            created_at: SystemTime::now(),
+            payload: json!({ "text": text }),
+            source_topic: "twitter".to_string(),
+        }
+    }
+
+    #[test]
+    fn registry_contains_built_ins() {
+        assert!(lookup_strategy("language_detection").is_some());
+        assert!(lookup_strategy("sentiment_analysis").is_some());
+    }
+
+    #[test]
+    fn language_detection_works() {
+        let lang = detect_language("Hello world!");
+        assert_eq!(lang, "en");
+
+        let lang = detect_language("Привет мир!");
+        assert_eq!(lang, "ru");
+    }
+
+    #[test]
+    fn pipeline_executes() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let pipeline = EnrichmentPipeline::from_strategy_names(&vec![
+                "language_detection".into(),
+                "sentiment_analysis".into(),
+            ])
+            .unwrap();
+
+            let event = sample_event("I love Rust, it's awesome!");
+            let enriched = pipeline.run(event).await.unwrap();
+            assert!(enriched.enrichment.get("language").is_some());
+            assert!(enriched.enrichment.get("sentiment_score").is_some());
+        });
+    }
+}

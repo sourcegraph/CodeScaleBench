@@ -1,0 +1,374 @@
+```rust
+//! src/module_12.rs
+//!
+//! Event-bus abstraction and a concrete NATS implementation
+//! for EduPulse Live.  This module is responsible for
+//! publishing and subscribing domain events flowing through
+//! the system.  The design hides message–broker specifics
+//! behind a small, test-friendly trait while still exposing
+//! advanced features (e.g. queue groups, back-pressure).
+//!
+//! Compile-time flags enable seamless downgrade to an in-memory
+//! bus for unit tests (`cargo test --features in_memory_bus`).
+//!
+//! Example
+//! -------
+//! ```no_run
+//! # use edupulse_event_bus::{EventBus, DomainEvent, EventBusConfig};
+//! # #[tokio::main]
+//! # async fn main() -> anyhow::Result<()> {
+//! let config = EventBusConfig::from_env()?;
+//! let bus = EventBus::connect(config).await?;
+//!
+//! bus.publish(DomainEvent::lesson_published("lesson-id".into(), "alice".into()))
+//!     .await?;
+//!
+//! let mut sub = bus.subscribe("quiz.submitted".into()).await?;
+//! while let Some(event) = sub.recv().await {
+//!     println!("Incoming event: {event:#?}");
+//! }
+//! # Ok(()) }
+//! ```
+
+#![deny(clippy::all)]
+#![deny(rustdoc::broken_intra_doc_links)]
+
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc},
+};
+use tracing::{debug, error, info, instrument, trace};
+use uuid::Uuid;
+
+#[cfg(not(feature = "in_memory_bus"))]
+use async_nats::Client as NatsClient;
+
+/// Top-level error type returned by public APIs.
+#[derive(Debug, Error)]
+pub enum BusError {
+    #[error("nats client error: {0}")]
+    Nats(#[from] async_nats::Error),
+
+    /// Returned when a subscriber misses messages due to a full buffer.
+    #[error("subscriber lagged behind and missed messages")]
+    Lagged,
+
+    /// Serialization / deserialization failures.
+    #[error("serde json error: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    /// Environment variable or config errors.
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    #[error("channel closed")]
+    Closed,
+}
+
+/// An immutable domain event.
+///
+/// Persisted for auditing and sent over the event-bus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainEvent {
+    pub id:            Uuid,
+    pub occurred_at:   SystemTime,
+    pub event_type:    String,
+    pub correlation_id: Option<Uuid>,
+    #[serde(flatten)]
+    pub data:          EventData,
+}
+
+impl DomainEvent {
+    pub fn lesson_published(lesson_id: String, author: String) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            occurred_at: SystemTime::now(),
+            event_type: "lesson.published".into(),
+            correlation_id: None,
+            data: EventData::LessonPublished { lesson_id, author },
+        }
+    }
+
+    pub fn quiz_submitted(quiz_id: String, student_id: String, score: u8) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            occurred_at: SystemTime::now(),
+            event_type: "quiz.submitted".into(),
+            correlation_id: None,
+            data: EventData::QuizSubmitted {
+                quiz_id,
+                student_id,
+                score,
+            },
+        }
+    }
+}
+
+/// Strongly-typed payloads for `DomainEvent`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventData {
+    LessonPublished { lesson_id: String, author: String },
+    QuizSubmitted { quiz_id: String, student_id: String, score: u8 },
+    LearningPulseResponded { pulse_id: String, responder: String },
+    //  ↑ Add more variants as the domain evolves
+}
+
+/// A configuration object used to build [`EventBus`] instances.
+#[derive(Clone)]
+pub struct EventBusConfig {
+    /// Comma-separated list of NATS endpoints.
+    pub nats_url: String,
+    /// Optional credentials file for NATS authentication.
+    pub creds: Option<String>,
+    /// Subject prefix (e.g. `"edupulse"` → `"edupulse.lesson.published"`).
+    pub prefix: String,
+    /// Size of the bounded channel for fan-out to internal subscribers.
+    pub internal_buffer: usize,
+}
+
+impl fmt::Debug for EventBusConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EventBusConfig")
+            .field("nats_url", &self.nats_url)
+            .field("creds", &self.creds.as_deref().unwrap_or("<none>"))
+            .field("prefix", &self.prefix)
+            .field("internal_buffer", &self.internal_buffer)
+            .finish()
+    }
+}
+
+impl Default for EventBusConfig {
+    fn default() -> Self {
+        Self {
+            nats_url: "localhost:4222".into(),
+            creds: None,
+            prefix: "edupulse".into(),
+            internal_buffer: 1024,
+        }
+    }
+}
+
+impl EventBusConfig {
+    /// Attempt to build a configuration from environment variables.
+    pub fn from_env() -> Result<Self, BusError> {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| Self::default().nats_url);
+        let creds = std::env::var("NATS_CREDS").ok();
+        let prefix = std::env::var("EVENT_SUBJECT_PREFIX").unwrap_or_else(|_| "edupulse".into());
+
+        Ok(Self {
+            nats_url,
+            creds,
+            prefix,
+            internal_buffer: 1024,
+        })
+    }
+}
+
+/// Tokio-aware streaming receiver produced by [`EventBus::subscribe`].
+pub struct EventStream {
+    rx: broadcast::Receiver<Arc<DomainEvent>>,
+}
+
+impl EventStream {
+    /// Await the next event.  `None` is returned only when the bus is shutting
+    /// down or the sender dropped, signalling the consumer to exit.
+    pub async fn recv(&mut self) -> Option<Arc<DomainEvent>> {
+        loop {
+            match self.rx.recv().await {
+                Ok(ev) => return Some(ev),
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    error!("subscriber lagged behind event stream");
+                    return None;
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+}
+
+#[async_trait]
+pub trait EventBus: Send + Sync {
+    /// Publish a single event to the broker.
+    async fn publish(&self, event: DomainEvent) -> Result<(), BusError>;
+
+    /// Subscribe to a beginning of subject pattern.  Wild-cards supported
+    /// (`*` for token, `>` for all remaining).
+    async fn subscribe(&self, subject: String) -> Result<EventStream, BusError>;
+
+    /// Gracefully close all connections / tasks.
+    async fn close(&self) -> Result<(), BusError>;
+}
+
+/// Concrete NATS-backed implementation.
+///
+/// When the `in_memory_bus` feature is enabled, a stub is compiled instead—
+#[derive(Clone)]
+pub struct NatsEventBus {
+    #[cfg(not(feature = "in_memory_bus"))]
+    nats: NatsClient,
+
+    /// Internal fan-out so multiple components inside the same service can
+    /// subscribe without hitting the broker again.
+    tx: broadcast::Sender<Arc<DomainEvent>>,
+    cfg: Arc<EventBusConfig>,
+}
+
+impl fmt::Debug for NatsEventBus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NatsEventBus")
+            .field("cfg", &self.cfg)
+            .finish()
+    }
+}
+
+impl NatsEventBus {
+    /// Establish connection and spin up the inbound pump.
+    pub async fn connect(cfg: EventBusConfig) -> Result<Arc<Self>, BusError> {
+        let cfg = Arc::new(cfg);
+        let (tx, _) = broadcast::channel(cfg.internal_buffer);
+
+        #[cfg(not(feature = "in_memory_bus"))]
+        let nats = {
+            use async_nats::ConnectOptions;
+            let mut opts = ConnectOptions::new();
+            if let Some(creds) = &cfg.creds {
+                opts = opts.authenticate(async_nats::auth::Credentials::from_file(creds));
+            }
+            let client = opts.name("edupulse-event-bus").connect(&cfg.nats_url).await?;
+            client.flush().await?;
+            client
+        };
+
+        #[cfg(feature = "in_memory_bus")]
+        let nats = ();
+
+        let bus = Arc::new(Self { nats, tx, cfg });
+
+        // Spawn inbound pump only when real NATS is used.
+        #[cfg(not(feature = "in_memory_bus"))]
+        {
+            let bus_clone = Arc::clone(&bus);
+            tokio::spawn(async move {
+                if let Err(e) = bus_clone.run_inbound_pump().await {
+                    error!("Inbound pump terminated: {e}");
+                }
+            });
+        }
+
+        Ok(bus)
+    }
+
+    /// Long-running task that forwards NATS messages to [`broadcast::Sender`].
+    #[cfg(not(feature = "in_memory_bus"))]
+    async fn run_inbound_pump(self: Arc<Self>) -> Result<(), BusError> {
+        let subject = format!("{}.*", self.cfg.prefix);
+        let mut sub = self.nats.subscribe(subject).await?;
+
+        loop {
+            select! {
+                msg = sub.next() => {
+                    match msg {
+                        Some(m) => self.forward_inbound(m).await?,
+                        None => break,
+                    }
+                }
+                // Add graceful shutdown signal here if needed
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "in_memory_bus"))]
+    async fn forward_inbound(&self, msg: async_nats::Message) -> Result<(), BusError> {
+        let ev: DomainEvent = serde_json::from_slice(&msg.payload)?;
+        trace!(target: "event_bus", ?ev, "inbound event");
+        let _ = self.tx.send(Arc::new(ev));
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl EventBus for NatsEventBus {
+    #[instrument(skip(self, event))]
+    async fn publish(&self, event: DomainEvent) -> Result<(), BusError> {
+        let subject = format!("{}.{}", self.cfg.prefix, event.event_type);
+        let payload = serde_json::to_vec(&event)?;
+        #[cfg(not(feature = "in_memory_bus"))]
+        self.nats.publish(subject, payload.into()).await?;
+        #[cfg(feature = "in_memory_bus")]
+        {
+            let _ = self.tx.send(Arc::new(event.clone()));
+            trace!(?event, "loopback publish (in-memory)");
+        }
+        Ok(())
+    }
+
+    async fn subscribe(&self, subject: String) -> Result<EventStream, BusError> {
+        let pattern = if subject.starts_with(&self.cfg.prefix) {
+            subject
+        } else {
+            format!("{}.{}", self.cfg.prefix, subject)
+        };
+
+        #[cfg(not(feature = "in_memory_bus"))]
+        {
+            // Ensure NATS has a subscription so events get delivered even if
+            // no internal consumers are listening yet.
+            let _sub = self.nats.subscribe(pattern).await?;
+            // Discard messages; we'll receive them via inbound pump.
+        }
+
+        let rx = self.tx.subscribe();
+        Ok(EventStream { rx })
+    }
+
+    async fn close(&self) -> Result<(), BusError> {
+        // Closing broadcast::Sender drops all receivers.
+        self.tx.close();
+
+        #[cfg(not(feature = "in_memory_bus"))]
+        self.nats.close();
+
+        Ok(())
+    }
+}
+
+// Optional re-export for consumers of this library.
+pub use NatsEventBus as DefaultEventBus;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::timeout;
+
+    // Use in-memory bus to avoid needing a running NATS server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn roundtrip_publish_subscribe() -> Result<(), BusError> {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_env_filter("debug")
+            .try_init();
+
+        let bus = NatsEventBus::connect(EventBusConfig::default()).await?;
+        let mut stream = bus.subscribe("*".into()).await?;
+
+        let lesson = DomainEvent::lesson_published("123".into(), "alice".into());
+        bus.publish(lesson.clone()).await?;
+
+        let received = timeout(Duration::from_secs(1), stream.recv()).await?;
+        assert_eq!(received.unwrap().id, lesson.id);
+        bus.close().await?;
+        Ok(())
+    }
+}
+```

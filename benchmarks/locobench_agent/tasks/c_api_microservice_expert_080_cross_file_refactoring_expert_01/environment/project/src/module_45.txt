@@ -1,0 +1,504 @@
+/***********************************************************************
+ * MercuryMonolith Commerce Hub
+ * Module 45: Response Cache
+ *
+ * This module implements an in-memory, thread-safe, time-aware LRU cache
+ * for HTTP/GraphQL responses.  The cache is intended to sit in the
+ * Gateway layer to accelerate repeated requests with identical inputs.
+ *
+ * Key features
+ *   • Hash-based lookup (uthash)
+ *   • Doubly-linked LRU eviction
+ *   • Per-entry TTL (time-to-live)
+ *   • Metrics hooks (Prometheus-style counters / gauges)
+ *   • Structured logging
+ *
+ * Public interface
+ *   rc_cache_t *rc_cache_create(size_t max_entries, uint32_t default_ttl_sec);
+ *   void        rc_cache_destroy(rc_cache_t *cache);
+ *
+ *   bool rc_cache_get(rc_cache_t *cache,
+ *                     const char *key,
+ *                     size_t      key_len,
+ *                     char      **out_val,
+ *                     size_t     *out_len);
+ *
+ *   bool rc_cache_put(rc_cache_t *cache,
+ *                     const char *key,
+ *                     size_t      key_len,
+ *                     const char *val,
+ *                     size_t      val_len,
+ *                     uint32_t    ttl_override_sec); // 0 = use default
+ *
+ ***********************************************************************/
+
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "metrics.h"    /* project-wide metrics facade                         */
+#include "mm_log.h"     /* project-wide structured logging macros             */
+#include "rc_alloc.h"   /* project-wide allocator abstraction                 */
+
+#define RC_MODULE_NAME "response_cache"
+#define RC_MAX_KEY_LEN  4096   /* hard safety limit                             */
+#define RC_MAX_VAL_LEN 65536   /* 64 KiB per cached response                    */
+
+#ifndef likely
+#  define likely(x)   __builtin_expect(!!(x), 1)
+#  define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
+
+/* ============================== uthash =================================== */
+#include "uthash.h"
+
+/* ============================== Typedefs ================================= */
+
+typedef struct rc_node {
+    /* uthash fields */
+    char            *key;        /* allocated key buffer (null-terminated)      */
+    size_t           key_len;
+    UT_hash_handle   hh;         /* needs to be first for uthash                */
+
+    /* payload */
+    char            *value;      /* allocated value buffer                      */
+    size_t           val_len;
+    time_t           expires_at; /* absolute expiration (epoch seconds)         */
+
+    /* LRU bookkeeping */
+    struct rc_node  *prev;
+    struct rc_node  *next;
+} rc_node_t;
+
+typedef struct rc_cache {
+    pthread_rwlock_t lk;         /* global RW lock                              */
+    rc_node_t       *map;        /* uthash hash map                             */
+
+    rc_node_t       *lru_head;   /* most recently used                          */
+    rc_node_t       *lru_tail;   /* least recently used                         */
+
+    size_t           max_entries;
+    uint32_t         default_ttl_sec;
+    size_t           cur_entries;
+
+    /* metrics handles (opaque pointers) */
+    mm_metric_t     *m_hit;
+    mm_metric_t     *m_miss;
+    mm_metric_t     *m_evicted;
+    mm_metric_t     *g_size;
+} rc_cache_t;
+
+/* ========================== Internal helpers ============================ */
+
+static inline void
+rc_lru_move_to_front(rc_cache_t *c, rc_node_t *n)
+{
+    if (c->lru_head == n) {
+        return;
+    }
+
+    /* detach */
+    if (n->prev) n->prev->next = n->next;
+    if (n->next) n->next->prev = n->prev;
+
+    if (c->lru_tail == n) {
+        c->lru_tail = n->prev;
+    }
+
+    /* insert at head */
+    n->prev        = NULL;
+    n->next        = c->lru_head;
+    if (c->lru_head) {
+        c->lru_head->prev = n;
+    }
+    c->lru_head = n;
+    if (!c->lru_tail) {
+        c->lru_tail = n;
+    }
+}
+
+static void
+rc_lru_append_front(rc_cache_t *c, rc_node_t *n)
+{
+    n->prev = NULL;
+    n->next = c->lru_head;
+    if (c->lru_head) {
+        c->lru_head->prev = n;
+    }
+    c->lru_head = n;
+    if (!c->lru_tail) {
+        c->lru_tail = n;
+    }
+}
+
+static void
+rc_lru_remove(rc_cache_t *c, rc_node_t *n)
+{
+    if (n->prev) n->prev->next = n->next;
+    if (n->next) n->next->prev = n->prev;
+    if (c->lru_head == n) c->lru_head = n->next;
+    if (c->lru_tail == n) c->lru_tail = n->prev;
+    n->prev = n->next = NULL;
+}
+
+static void
+rc_evict_tail(rc_cache_t *c)
+{
+    if (!c->lru_tail) return;
+    rc_node_t *victim = c->lru_tail;
+
+    HASH_DEL(c->map, victim);
+    rc_lru_remove(c, victim);
+
+    rc_free(victim->key);
+    rc_free(victim->value);
+    rc_free(victim);
+    c->cur_entries--;
+
+    mm_metric_inc(c->m_evicted);
+    mm_metric_set(c->g_size, (double)c->cur_entries);
+}
+
+/* Remove expired entries when encountered (lazy expiration) */
+static void
+rc_prune_expired(rc_cache_t *c)
+{
+    time_t now = time(NULL);
+    rc_node_t *n, *tmp;
+
+    for (n = c->map; n != NULL; n = tmp) {
+        tmp = n->hh.next;
+        if (n->expires_at <= now) {
+            HASH_DEL(c->map, n);
+            rc_lru_remove(c, n);
+
+            rc_free(n->key);
+            rc_free(n->value);
+            rc_free(n);
+            c->cur_entries--;
+            mm_metric_inc(c->m_evicted);
+        }
+    }
+    mm_metric_set(c->g_size, (double)c->cur_entries);
+}
+
+/* ============================= API ====================================== */
+
+rc_cache_t *
+rc_cache_create(size_t max_entries, uint32_t default_ttl_sec)
+{
+    if (max_entries == 0 || default_ttl_sec == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    rc_cache_t *c = rc_calloc(1, sizeof(*c));
+    if (!c) return NULL;
+
+    if (pthread_rwlock_init(&c->lk, NULL) != 0) {
+        rc_free(c);
+        return NULL;
+    }
+
+    c->max_entries       = max_entries;
+    c->default_ttl_sec   = default_ttl_sec;
+
+    /* Register metrics */
+    c->m_hit    = mm_metric_counter(RC_MODULE_NAME "_hits_total",
+                                   "Cache hit counter");
+    c->m_miss   = mm_metric_counter(RC_MODULE_NAME "_miss_total",
+                                   "Cache miss counter");
+    c->m_evicted = mm_metric_counter(RC_MODULE_NAME "_evicted_total",
+                                    "Cache eviction counter");
+    c->g_size   = mm_metric_gauge(RC_MODULE_NAME "_current_size",
+                                  "Current number of cached entries");
+
+    mm_metric_set(c->g_size, 0.0);
+    MM_INFO("Response cache initialized (max_entries=%zu, ttl=%u)",
+            max_entries, default_ttl_sec);
+    return c;
+}
+
+void
+rc_cache_destroy(rc_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_rwlock_wrlock(&c->lk);
+
+    rc_node_t *n, *tmp;
+    HASH_ITER(hh, c->map, n, tmp)
+    {
+        HASH_DEL(c->map, n);
+        rc_free(n->key);
+        rc_free(n->value);
+        rc_free(n);
+    }
+    c->map = NULL;
+    c->lru_head = c->lru_tail = NULL;
+    c->cur_entries = 0;
+
+    pthread_rwlock_unlock(&c->lk);
+    pthread_rwlock_destroy(&c->lk);
+
+    /* metrics handles intentionally leaked (global registry) */
+    rc_free(c);
+    MM_INFO("Response cache destroyed");
+}
+
+static bool
+rc_get_locked(rc_cache_t *c,
+              const char *key,
+              size_t      key_len,
+              char      **out_val,
+              size_t     *out_len,
+              time_t      now)
+{
+    rc_node_t *n = NULL;
+    HASH_FIND(hh, c->map, key, (uint32_t)key_len, n);
+    if (unlikely(!n)) {
+        return false;
+    }
+
+    if (n->expires_at <= now) {
+        /* treat as miss and remove */
+        HASH_DEL(c->map, n);
+        rc_lru_remove(c, n);
+
+        rc_free(n->key);
+        rc_free(n->value);
+        rc_free(n);
+        c->cur_entries--;
+        mm_metric_inc(c->m_evicted);
+        mm_metric_set(c->g_size, (double)c->cur_entries);
+        return false;
+    }
+
+    /* Hit */
+    rc_lru_move_to_front(c, n);
+    *out_len = n->val_len;
+    *out_val = rc_alloc(n->val_len + 1);
+    if (likely(*out_val)) {
+        memcpy(*out_val, n->value, n->val_len);
+        (*out_val)[n->val_len] = '\0';
+    }
+    return true;
+}
+
+bool
+rc_cache_get(rc_cache_t *c,
+             const char *key,
+             size_t      key_len,
+             char      **out_val,
+             size_t     *out_len)
+{
+    if (!c || !key || key_len == 0 || key_len > RC_MAX_KEY_LEN ||
+        !out_val || !out_len) {
+        errno = EINVAL;
+        return false;
+    }
+
+    bool hit = false;
+    time_t now = time(NULL);
+
+    pthread_rwlock_rdlock(&c->lk);
+    hit = rc_get_locked(c, key, key_len, out_val, out_len, now);
+    pthread_rwlock_unlock(&c->lk);
+
+    if (hit) {
+        mm_metric_inc(c->m_hit);
+        MM_DEBUG("Cache hit: key='%.*s'", (int)key_len, key);
+    } else {
+        mm_metric_inc(c->m_miss);
+        MM_DEBUG("Cache miss: key='%.*s'", (int)key_len, key);
+    }
+
+    return hit;
+}
+
+bool
+rc_cache_put(rc_cache_t *c,
+             const char *key,
+             size_t      key_len,
+             const char *val,
+             size_t      val_len,
+             uint32_t    ttl_override_sec)
+{
+    if (!c || !key || !val ||
+        key_len == 0 || key_len > RC_MAX_KEY_LEN ||
+        val_len == 0 || val_len > RC_MAX_VAL_LEN) {
+        errno = EINVAL;
+        return false;
+    }
+
+    pthread_rwlock_wrlock(&c->lk);
+
+    /* if exists, update value + metadata */
+    rc_node_t *n = NULL;
+    HASH_FIND(hh, c->map, key, (uint32_t)key_len, n);
+    if (n) {
+        rc_lru_move_to_front(c, n);
+
+        char *new_val = rc_alloc(val_len + 1);
+        if (!new_val) {
+            pthread_rwlock_unlock(&c->lk);
+            return false;
+        }
+        memcpy(new_val, val, val_len);
+        new_val[val_len] = '\0';
+
+        rc_free(n->value);
+        n->value      = new_val;
+        n->val_len    = val_len;
+        n->expires_at = time(NULL) +
+                        (ttl_override_sec ? ttl_override_sec
+                                          : c->default_ttl_sec);
+
+        pthread_rwlock_unlock(&c->lk);
+        MM_DEBUG("Cache updated: key='%.*s'", (int)key_len, key);
+        return true;
+    }
+
+    /* ensure capacity */
+    while (c->cur_entries >= c->max_entries) {
+        rc_evict_tail(c);
+    }
+
+    /* allocate node */
+    n = rc_calloc(1, sizeof(*n));
+    if (!n) {
+        pthread_rwlock_unlock(&c->lk);
+        return false;
+    }
+
+    n->key = rc_alloc(key_len + 1);
+    n->value = rc_alloc(val_len + 1);
+    if (!n->key || !n->value) {
+        rc_free(n->key);
+        rc_free(n->value);
+        rc_free(n);
+        pthread_rwlock_unlock(&c->lk);
+        return false;
+    }
+
+    memcpy(n->key, key, key_len);
+    n->key[key_len] = '\0';
+
+    memcpy(n->value, val, val_len);
+    n->value[val_len] = '\0';
+
+    n->key_len   = key_len;
+    n->val_len   = val_len;
+    n->expires_at = time(NULL) +
+                    (ttl_override_sec ? ttl_override_sec
+                                      : c->default_ttl_sec);
+
+    /* insert into hash and LRU */
+    HASH_ADD_KEYPTR(hh, c->map, n->key, (uint32_t)n->key_len, n);
+    rc_lru_append_front(c, n);
+
+    c->cur_entries++;
+    mm_metric_set(c->g_size, (double)c->cur_entries);
+
+    pthread_rwlock_unlock(&c->lk);
+    MM_DEBUG("Cache insert: key='%.*s' ttl=%u",
+             (int)key_len, key,
+             (ttl_override_sec ? ttl_override_sec : c->default_ttl_sec));
+    return true;
+}
+
+/* ======================= Background maintenance ========================= */
+
+/*
+ * Periodic eviction thread (optional)
+ *   In production we rely mostly on lazy expiration, but a background
+ *   sweeper can further reduce memory pressure.  This helper is exposed
+ *   yet opt-in, to avoid spawning threads unconditionally inside a lib.
+ */
+
+typedef struct {
+    rc_cache_t *cache;
+    uint32_t    sweep_interval_sec;
+    pthread_t   tid;
+    int         running;
+} rc_sweeper_t;
+
+static void *
+rc_sweeper_main(void *arg)
+{
+    rc_sweeper_t *sw = arg;
+    while (sw->running) {
+        sleep(sw->sweep_interval_sec);
+        pthread_rwlock_wrlock(&sw->cache->lk);
+        rc_prune_expired(sw->cache);
+        pthread_rwlock_unlock(&sw->cache->lk);
+    }
+    return NULL;
+}
+
+/*
+ * Starts a sweeper thread. Returns NULL on failure.
+ * Caller owns returned handle and must stop it via rc_sweeper_stop().
+ */
+rc_sweeper_t *
+rc_sweeper_start(rc_cache_t *cache, uint32_t interval_sec)
+{
+    if (!cache || interval_sec == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    rc_sweeper_t *sw = rc_calloc(1, sizeof(*sw));
+    if (!sw) return NULL;
+    sw->cache = cache;
+    sw->sweep_interval_sec = interval_sec;
+    sw->running = 1;
+
+    if (pthread_create(&sw->tid, NULL, rc_sweeper_main, sw) != 0) {
+        rc_free(sw);
+        return NULL;
+    }
+    pthread_detach(sw->tid);
+    MM_INFO("Cache sweeper thread started (interval=%u)", interval_sec);
+    return sw;
+}
+
+void
+rc_sweeper_stop(rc_sweeper_t *sw)
+{
+    if (!sw) return;
+    sw->running = 0;
+    /* give up ownership; thread is detached */
+    rc_free(sw);
+}
+
+/* ============================== Testing ================================= */
+
+#ifdef RC_CACHE_SELFTEST
+
+#include <stdio.h>
+
+int main(void)
+{
+    rc_cache_t *c = rc_cache_create(4, 2); /* max entries, ttl=2s */
+
+    rc_cache_put(c, "foo", 3, "bar", 3, 0);
+    char *val = NULL;
+    size_t len = 0;
+
+    bool hit = rc_cache_get(c, "foo", 3, &val, &len);
+    printf("hit1=%d val=%.*s\n", hit, (int)len, val);
+    rc_free(val);
+
+    sleep(3);
+    hit = rc_cache_get(c, "foo", 3, &val, &len);
+    printf("hit2=%d\n", hit);
+
+    rc_cache_destroy(c);
+    return 0;
+}
+
+#endif /* RC_CACHE_SELFTEST */

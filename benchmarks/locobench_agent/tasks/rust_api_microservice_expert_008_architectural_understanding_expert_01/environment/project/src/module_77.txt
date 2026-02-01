@@ -1,0 +1,400 @@
+```rust
+//! src/module_77.rs
+//!
+//! Ledger entry pagination + cache orchestration module.
+//!
+//! This module is **self-contained** and can be dropped into any binary / library
+//! crate inside `LedgerLink Nexus`.  It demonstrates one piece of the
+//! MVVM-inspired service stack: an application‐level **Query Service** that
+//! fetches paginated ledger entries via a repository, then exposes them to the
+//! upper layers with deterministic caching behaviour.
+//!
+//! * Repository pattern (async, Postgres w/ `sqlx`)
+//! * Response-cache façade (async Redis)
+//! * Structured error envelope
+//! * Pagination helpers + total-count hint
+//! * Tracing instrumentation
+//!
+//! The code purposefully avoids any framework-specific HTTP/GraphQL glue so that
+//! it stays independent from Actix-Web, Axum, Juniper, async-graphql, etc.
+//!
+//! # Example
+//!
+//! ```no_run
+//! # use std::sync::Arc;
+//! # use module_77::*;
+//! # async fn run() -> Result<(), ServiceError> {
+//! let pg = sqlx::PgPool::connect("postgres://user:secret@localhost/ledger").await?;
+//! let redis = redis::Client::open("redis://127.0.0.1/")?;
+//!
+//! let repo = Arc::new(PgLedgerEntryRepository::new(pg));
+//! let cache = Arc::new(RedisCacheBackend::new(redis));
+//!
+//! let svc  = LedgerEntryQueryService::new(repo, cache);
+//!
+//! let ctx  = TenantContext::new("acme-corp");
+//! let page = Pagination::new(1, 50)?;
+//!
+//! let response = svc.list_ledger_entries(&ctx, page).await?;
+//! println!("Fetched {} entries", response.data.len());
+//! # Ok(())
+//! # }
+//! ```
+
+// region: --- dependencies (crates)
+
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use redis::AsyncCommands;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use thiserror::Error;
+use tracing::{debug, error, instrument};
+use uuid::Uuid;
+
+// endregion: --- dependencies
+
+// -------------------------------------------------------------------------------------------------
+// DTOs & Utility Types
+// -------------------------------------------------------------------------------------------------
+
+/// A single immutable ledger entry row.
+///
+/// Domain rules purposefully _do not_ live on this struct; it is a read-only
+/// projection returned to the outside world.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub id:          Uuid,
+    pub account_id:  Uuid,
+    pub currency:    String,
+    pub amount:      Decimal,
+    pub description: Option<String>,
+    pub entry_ts:    DateTime<Utc>,
+}
+
+/// Pagination request primitive (1-indexed).
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Pagination {
+    page:     NonZeroU32,
+    per_page: NonZeroU32,
+}
+
+impl Pagination {
+    pub fn new(page: u32, per_page: u32) -> Result<Self, ServiceError> {
+        Ok(Self {
+            page: NonZeroU32::new(page).ok_or(ServiceError::InvalidPagination)?,
+            per_page: NonZeroU32::new(per_page).ok_or(ServiceError::InvalidPagination)?,
+        })
+    }
+
+    pub fn limit(self) -> i64 {
+        self.per_page.get() as i64
+    }
+
+    pub fn offset(self) -> i64 {
+        ((self.page.get() - 1) * self.per_page.get()) as i64
+    }
+
+    pub fn page(&self) -> u32 {
+        self.page.get()
+    }
+    pub fn per_page(&self) -> u32 {
+        self.per_page.get()
+    }
+}
+
+/// Generic paginated envelope with total count hint.
+#[derive(Debug, Clone, Serialize)]
+pub struct Paginated<T> {
+    pub data: Vec<T>,
+    pub page: u32,
+    pub per_page: u32,
+    pub total: Option<u64>,
+}
+
+// -------------------------------------------------------------------------------------------------
+// Domain Context
+// -------------------------------------------------------------------------------------------------
+
+/// Simple tenant tagging abstraction.
+/// In production this could be much richer (role scopes, permissions, etc.)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TenantContext {
+    tenant_id: String,
+}
+
+impl TenantContext {
+    pub fn new<S: Into<String>>(tenant_id: S) -> Self {
+        Self { tenant_id: tenant_id.into() }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.tenant_id
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Repository Layer
+// -------------------------------------------------------------------------------------------------
+
+/// Repository contract for fetching ledger entries.
+///
+/// The trait is async so that implementors can use any async client they want.
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync + 'static {
+    async fn paged_by_tenant(
+        &self,
+        tenant: &TenantContext,
+        pagination: Pagination,
+    ) -> Result<(Vec<LedgerEntry>, Option<u64>), ServiceError>;
+}
+
+/// Postgres/SQLx implementation
+pub struct PgLedgerEntryRepository {
+    pool: PgPool,
+}
+
+impl PgLedgerEntryRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for PgLedgerEntryRepository {
+    #[instrument(skip(self))]
+    async fn paged_by_tenant(
+        &self,
+        tenant: &TenantContext,
+        pagination: Pagination,
+    ) -> Result<(Vec<LedgerEntry>, Option<u64>), ServiceError> {
+        // NOTE: `ledger_entries` is assumed to be partitioned by tenant_id.
+        //       For multi-tenant isolation (e.g. RLS) you can add a WHERE clause.
+        let entries: Vec<LedgerEntry> = sqlx::query_as!(
+            LedgerEntry,
+            r#"
+            SELECT id,
+                   account_id,
+                   currency,
+                   amount,
+                   description,
+                   entry_ts
+            FROM   ledger_entries
+            WHERE  tenant_id = $1
+            ORDER  BY entry_ts DESC
+            LIMIT  $2
+            OFFSET $3
+            "#,
+            tenant.id(),
+            pagination.limit(),
+            pagination.offset()
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(ServiceError::Db)?;
+
+        // Get total count for relevant UI hints
+        let total: Option<(i64,)> = sqlx::query_as(
+            "SELECT COUNT(*) as count FROM ledger_entries WHERE tenant_id = $1",
+        )
+        .bind(tenant.id())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(ServiceError::Db)?;
+
+        Ok((entries, total.map(|t| t.0 as u64)))
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Cache Backend Abstraction
+// -------------------------------------------------------------------------------------------------
+
+/// Interface for a simple cache backend capable of storing JSON blobs.
+#[async_trait]
+pub trait ResponseCache: Send + Sync + 'static {
+    async fn get_json<T: for<'de> Deserialize<'de> + Send>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, ServiceError>;
+
+    async fn set_json<T: Serialize + Send>(
+        &self,
+        key: &str,
+        value: &T,
+        ttl: Duration,
+    ) -> Result<(), ServiceError>;
+}
+
+/// Redis implementation using `redis` crate (aio).
+pub struct RedisCacheBackend {
+    client: redis::Client,
+}
+
+impl RedisCacheBackend {
+    pub fn new(client: redis::Client) -> Self {
+        Self { client }
+    }
+
+    async fn conn(&self) -> Result<redis::aio::Connection, ServiceError> {
+        self.client
+            .get_async_connection()
+            .await
+            .map_err(ServiceError::Cache)
+    }
+}
+
+#[async_trait]
+impl ResponseCache for RedisCacheBackend {
+    async fn get_json<T: for<'de> Deserialize<'de> + Send>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, ServiceError> {
+        let mut conn = self.conn().await?;
+        let data: Option<Vec<u8>> = conn.get(key).await.map_err(ServiceError::Cache)?;
+        if let Some(bin) = data {
+            let item = serde_json::from_slice(&bin).map_err(ServiceError::Serde)?;
+            Ok(Some(item))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn set_json<T: Serialize + Send>(
+        &self,
+        key: &str,
+        value: &T,
+        ttl: Duration,
+    ) -> Result<(), ServiceError> {
+        let mut conn = self.conn().await?;
+        let payload = serde_json::to_vec(value).map_err(ServiceError::Serde)?;
+        // SETEX <key> <seconds> <value>
+        conn.set_ex::<_, _, ()>(key, payload, ttl.as_secs() as usize)
+            .await
+            .map_err(ServiceError::Cache)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Query Service Layer
+// -------------------------------------------------------------------------------------------------
+
+pub struct LedgerEntryQueryService {
+    repo:  Arc<dyn LedgerEntryRepository>,
+    cache: Arc<dyn ResponseCache>,
+    default_ttl: Duration,
+}
+
+impl LedgerEntryQueryService {
+    pub fn new(
+        repo: Arc<dyn LedgerEntryRepository>,
+        cache: Arc<dyn ResponseCache>,
+    ) -> Self {
+        Self {
+            repo,
+            cache,
+            default_ttl: Duration::from_secs(30),
+        }
+    }
+
+    #[instrument(skip(self))]
+    pub async fn list_ledger_entries(
+        &self,
+        tenant: &TenantContext,
+        pagination: Pagination,
+    ) -> Result<Paginated<LedgerEntry>, ServiceError> {
+        let cache_key = format!(
+            "ledger:{}:entries:p{}:pp{}",
+            tenant.id(),
+            pagination.page(),
+            pagination.per_page()
+        );
+
+        // ------ Fast path: cache hit ------------------------------------------------------------
+        if let Some(cached) = self.cache.get_json::<Paginated<LedgerEntry>>(&cache_key).await? {
+            debug!(%cache_key, "cache hit");
+            return Ok(cached);
+        }
+
+        // ------ Slow path: database + store in cache --------------------------------------------
+        let (rows, total) = self.repo.paged_by_tenant(tenant, pagination).await?;
+        let response = Paginated {
+            data: rows,
+            page: pagination.page(),
+            per_page: pagination.per_page(),
+            total,
+        };
+
+        // Fire-and-forget: we don't want to block user if Redis is sad.
+        let cache = self.cache.clone();
+        let resp_clone = response.clone();
+        let ttl = self.default_ttl;
+        let key_clone = cache_key.clone();
+        tokio::spawn(async move {
+            if let Err(e) = cache.set_json(&key_clone, &resp_clone, ttl).await {
+                error!(%key_clone, error = ?e, "failed to persist cache");
+            }
+        });
+
+        Ok(response)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Error Handling
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Error, Debug)]
+pub enum ServiceError {
+    #[error("invalid pagination values")]
+    InvalidPagination,
+
+    #[error("database error")]
+    Db(#[source] sqlx::Error),
+
+    #[error("cache error")]
+    Cache(#[from] redis::RedisError),
+
+    #[error("serialization error")]
+    Serde(#[from] serde_json::Error),
+}
+
+impl From<sqlx::Error> for ServiceError {
+    fn from(e: sqlx::Error) -> Self {
+        ServiceError::Db(e)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Tests
+// -------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn pagination_helpers() {
+        let p = Pagination::new(3, 25).unwrap();
+        assert_eq!(p.limit(), 25);
+        assert_eq!(p.offset(), 50);
+    }
+
+    #[tokio::test]
+    async fn serialize_paginated() {
+        let payload = Paginated::<LedgerEntry> {
+            data: vec![],
+            page: 1,
+            per_page: 10,
+            total: Some(0),
+        };
+        let val = serde_json::to_value(&payload).unwrap();
+        assert_eq!(val["page"], json!(1));
+        assert_eq!(val["total"], json!(0));
+    }
+}
+```

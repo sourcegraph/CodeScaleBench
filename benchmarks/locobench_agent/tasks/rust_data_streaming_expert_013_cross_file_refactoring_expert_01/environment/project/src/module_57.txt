@@ -1,0 +1,408 @@
+```rust
+//! Module 57 – Sentiment-trend micro–service
+//! ----------------------------------------
+//! Consumes enriched social-chatter events from Kafka, applies a pluggable
+//! sentiment-aggregation strategy, and publishes rolling sentiment trends.
+//!
+//! This file is designed to be dropped into the ChirpPulse workspace.  All
+//! external dependencies are available on crates.io.
+//
+//! key points
+//! * Strategy pattern for sentiment aggregation.
+//! * Tokio-asynchronous Kafka consumer / producer (rdkafka).
+//! * Graceful shutdown on SIGINT / SIGTERM.
+//! * Structured logging (tracing) and rich error contexts (anyhow).
+//!
+//! Build flags (in Cargo.toml):
+//! ------------------------------------
+//! [dependencies]
+//! anyhow       = "1"
+//! async-trait  = "0.1"
+//! chrono       = { version = "0.4", features = ["serde"] }
+//! rdkafka      = { version = "0.36", features = ["tokio"] }
+//! serde        = { version = "1.0", features = ["derive"] }
+//! serde_json   = "1"
+//! tokio        = { version = "1.37", features = ["macros", "rt-multi-thread", "signal"] }
+//! tracing      = "0.1"
+//!
+//! Optional (enable the `metrics` feature):
+//! prometheus-client = { version = "0.22", optional = true }
+
+use std::{
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use rdkafka::{
+    config::ClientConfig,
+    consumer::{Consumer, StreamConsumer},
+    message::BorrowedMessage,
+    producer::{FutureProducer, FutureRecord},
+    util::Timeout,
+};
+use serde::{Deserialize, Serialize};
+use tokio::{select, signal, task};
+use tracing::{error, info, instrument};
+
+//
+// ────────────────────────────────────────────────────────────────
+// Data structures
+// ────────────────────────────────────────────────────────────────
+//
+
+/// An enriched social event emitted by an upstream pipeline stage.
+///
+/// Upstream guarantees language detection, basic toxicity filtering and
+/// single-tweet sentiment scoring (via a model such as `twitter-roberta-base`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EnrichedChirp {
+    id: String,
+    text: String,
+    lang: String,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    timestamp: DateTime<Utc>,
+    /// Per-chirp sentiment score in range [-1.0, 1.0].
+    sentiment_score: f32,
+}
+
+/// A rolling sentiment trend aggregated over a period or message window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SentimentTrend {
+    /// Inclusive start of the aggregation window.
+    #[serde(with = "chrono::serde::ts_seconds")]
+    window_start: DateTime<Utc>,
+    /// Exclusive end of the aggregation window.
+    #[serde(with = "chrono::serde::ts_seconds")]
+    window_end: DateTime<Utc>,
+    /// Aggregated sentiment score, semantics depend on algorithm.
+    aggregate_score: f32,
+    /// Number of events considered.
+    event_count: usize,
+}
+
+//
+// ────────────────────────────────────────────────────────────────
+// Strategy pattern for aggregation
+// ────────────────────────────────────────────────────────────────
+//
+
+/// Strategy trait for pluggable sentiment aggregation.
+///
+/// An implementation may keep internal state (e.g., a sliding window) and must
+/// be Send + Sync because it can be shared across tokio tasks.
+#[async_trait]
+trait SentimentStrategy: Send + Sync {
+    /// Incorporate a new message into the internal state.
+    async fn update(&self, chirp: &EnrichedChirp);
+
+    /// Generate a `SentimentTrend` snapshot if the strategy decides it is ready.
+    ///
+    /// Implementations return `None` when they are not ready to publish; e.g.,
+    /// when not enough data points have been ingested.
+    async fn maybe_snapshot(&self, now: DateTime<Utc>) -> Option<SentimentTrend>;
+}
+
+/// Simple average across a fixed-length sliding message window.
+struct MovingAverageStrategy {
+    window_size: usize,
+    buffer: Arc<tokio::sync::Mutex<VecDeque<(DateTime<Utc>, f32)>>>,
+}
+
+impl MovingAverageStrategy {
+    fn new(window_size: usize) -> Self {
+        Self {
+            window_size,
+            buffer: Arc::new(tokio::sync::Mutex::new(VecDeque::with_capacity(
+                window_size + 1,
+            ))),
+        }
+    }
+}
+
+#[async_trait]
+impl SentimentStrategy for MovingAverageStrategy {
+    async fn update(&self, chirp: &EnrichedChirp) {
+        let mut buf = self.buffer.lock().await;
+        buf.push_back((chirp.timestamp, chirp.sentiment_score));
+        if buf.len() > self.window_size {
+            buf.pop_front();
+        }
+    }
+
+    async fn maybe_snapshot(&self, _now: DateTime<Utc>) -> Option<SentimentTrend> {
+        let buf = self.buffer.lock().await;
+        if buf.len() < self.window_size {
+            return None; // Not enough data
+        }
+
+        let sum: f32 = buf.iter().map(|(_, s)| *s).sum();
+        let avg = sum / (buf.len() as f32);
+        let window_start = buf.front().map(|(ts, _)| *ts).unwrap();
+        let window_end = buf.back().map(|(ts, _)| *ts).unwrap();
+
+        Some(SentimentTrend {
+            window_start,
+            window_end,
+            aggregate_score: avg,
+            event_count: buf.len(),
+        })
+    }
+}
+
+/// Exponential moving average (time-decay) strategy.
+///
+/// Weight of each event decays exponentially with half-life controlled via
+/// `alpha`.
+struct ExponentialDecayStrategy {
+    alpha: f32,
+    state: Arc<tokio::sync::Mutex<Option<(f32, DateTime<Utc>, usize)>>>,
+}
+
+impl ExponentialDecayStrategy {
+    fn new(half_life_secs: f32) -> Self {
+        // alpha derived from half-life: weight = 0.5 after 'half_life_secs'
+        let alpha = (-std::f32::consts::LN_2 / half_life_secs).exp();
+        Self {
+            alpha,
+            state: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+}
+
+#[async_trait]
+impl SentimentStrategy for ExponentialDecayStrategy {
+    async fn update(&self, chirp: &EnrichedChirp) {
+        let mut guard = self.state.lock().await;
+        match *guard {
+            None => {
+                *guard = Some((chirp.sentiment_score, chirp.timestamp, 1));
+            }
+            Some((current_avg, _, count)) => {
+                // Exponentially weighted average
+                let updated_avg = self.alpha * current_avg + (1.0 - self.alpha) * chirp.sentiment_score;
+                *guard = Some((updated_avg, chirp.timestamp, count + 1));
+            }
+        }
+    }
+
+    async fn maybe_snapshot(&self, _now: DateTime<Utc>) -> Option<SentimentTrend> {
+        let guard = self.state.lock().await;
+        guard.as_ref().map(|(avg, ts, count)| SentimentTrend {
+            window_start: *ts, // Not accurate for decay model, but acceptable for demo.
+            window_end: *ts,
+            aggregate_score: *avg,
+            event_count: *count,
+        })
+    }
+}
+
+//
+// ────────────────────────────────────────────────────────────────
+// Configuration helpers
+// ────────────────────────────────────────────────────────────────
+//
+
+/// Kafka connection details pulled from the environment.
+#[derive(Debug)]
+struct KafkaConfig {
+    bootstrap_servers: String,
+    group_id: String,
+    input_topic: String,
+    output_topic: String,
+}
+
+impl KafkaConfig {
+    fn from_env() -> Result<Self> {
+        Ok(Self {
+            bootstrap_servers: std::env::var("KAFKA_BOOTSTRAP")?,
+            group_id: std::env::var("KAFKA_GROUP").unwrap_or_else(|_| "chirp-sentiment-trend".into()),
+            input_topic: std::env::var("KAFKA_INPUT_TOPIC").unwrap_or_else(|_| "chirp.enriched".into()),
+            output_topic: std::env::var("KAFKA_OUTPUT_TOPIC").unwrap_or_else(|_| "chirp.sentiment.trends".into()),
+        })
+    }
+}
+
+//
+// ────────────────────────────────────────────────────────────────
+// Aggregator service
+// ────────────────────────────────────────────────────────────────
+//
+
+struct TrendAggregator {
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+    strategy: Arc<dyn SentimentStrategy>,
+    running: Arc<AtomicBool>,
+    cfg: KafkaConfig,
+}
+
+impl TrendAggregator {
+    /// Build an aggregator with the provided strategy.
+    async fn new(strategy: Arc<dyn SentimentStrategy>) -> Result<Self> {
+        // Load configuration
+        let cfg = KafkaConfig::from_env().context("loading Kafka config")?;
+
+        // ── Kafka consumer
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.bootstrap_servers)
+            .set("group.id", &cfg.group_id)
+            .set("auto.offset.reset", "earliest")
+            .set("enable.partition.eof", "false")
+            .create()
+            .context("creating Kafka consumer")?;
+
+        consumer
+            .subscribe(&[&cfg.input_topic])
+            .context("subscribing to input topic")?;
+
+        // ── Kafka producer
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.bootstrap_servers)
+            .create()
+            .context("creating Kafka producer")?;
+
+        Ok(Self {
+            consumer,
+            producer,
+            strategy,
+            running: Arc::new(AtomicBool::new(true)),
+            cfg,
+        })
+    }
+
+    /// Spawn signal listeners for graceful shutdown.
+    fn install_shutdown_hook(&self) {
+        let running = self.running.clone();
+        tokio::spawn(async move {
+            // Listen for Ctrl-C or SIGTERM (Kubernetes)
+            let _ = signal::ctrl_c().await;
+            running.store(false, Ordering::SeqCst);
+            info!("Shutdown signal received, terminating sentiment-trend service");
+        });
+    }
+
+    /// Main processing loop.
+    #[instrument(skip(self))]
+    async fn run(&self) -> Result<()> {
+        self.install_shutdown_hook();
+
+        // Consume messages and forward them to the strategy
+        let mut stream = self.consumer.stream();
+
+        while self.running.load(Ordering::SeqCst) {
+            select! {
+                maybe_msg = stream.next() => match maybe_msg {
+                    Some(Ok(msg)) => {
+                        if let Err(e) = self.handle_message(msg).await {
+                            error!(error = %e, "error handling message");
+                        }
+                    },
+                    Some(Err(e)) => {
+                        error!(error = %e, "Kafka error");
+                    },
+                    None => {
+                        // Stream exhausted; wait a bit to avoid busy loop
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                },
+                // Alternatively, snapshot on a ticker to avoid relying on message frequency
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    self.try_snapshot().await?;
+                }
+            }
+        }
+
+        // Ensure commit and producer flush
+        self.consumer.commit_consumer_state(Timeout::After(Duration::from_secs(3)))?;
+        self.producer.flush(Timeout::After(Duration::from_secs(5)));
+        Ok(())
+    }
+
+    /// Deserialize inbound message; feed the strategy.
+    #[instrument(skip(self, msg))]
+    async fn handle_message(&self, msg: BorrowedMessage<'_>) -> Result<()> {
+        let payload = msg
+            .payload_view::<str>()
+            .context("invalid UTF-8 payload")?
+            .context("empty payload")?;
+
+        let chirp: EnrichedChirp = serde_json::from_str(payload).context("deserializing EnrichedChirp")?;
+        self.strategy.update(&chirp).await;
+
+        // Perform snapshotting opportunistically on each message.
+        self.try_snapshot().await?;
+
+        // Asynchronously commit offsets (at-least-once)
+        self.consumer.commit_message(&msg, rdkafka::consumer::CommitMode::Async)?;
+
+        Ok(())
+    }
+
+    /// Ask the strategy for a snapshot and publish if available.
+    async fn try_snapshot(&self) -> Result<()> {
+        if let Some(trend) = self.strategy.maybe_snapshot(Utc::now()).await {
+            let json = serde_json::to_vec(&trend).context("serializing SentimentTrend")?;
+            let record = FutureRecord::to(&self.cfg.output_topic)
+                .payload(&json)
+                .key(&trend.window_end.timestamp().to_string());
+
+            // Fire-and-forget with one-second timeout
+            let _ = self
+                .producer
+                .send(record, Timeout::After(Duration::from_secs(1)))
+                .await;
+            info!(
+                score = trend.aggregate_score,
+                count = trend.event_count,
+                "Published sentiment trend"
+            );
+        }
+        Ok(())
+    }
+}
+
+//
+// ────────────────────────────────────────────────────────────────
+// Entrypoint
+// ────────────────────────────────────────────────────────────────
+//
+
+/// When compiled as a standalone binary (`cargo run -p sentiment_trend`),
+/// this main will be used.  In workspace contexts the module can be called
+/// directly from orchestrators, so we keep `pub async fn start()`.
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize structured logging.  Upstream decides the global subscriber.
+    tracing_subscriber::fmt::init();
+
+    // Choose strategy according to ENV so that data scientists can hot-swap
+    // algorithms without downtime.
+    let strategy: Arc<dyn SentimentStrategy> = match std::env::var("STRATEGY")
+        .unwrap_or_else(|_| "moving_avg".into())
+        .as_str()
+    {
+        "exp_decay" => Arc::new(ExponentialDecayStrategy::new(60.0)),
+        _ => Arc::new(MovingAverageStrategy::new(
+            std::env::var("WINDOW_SIZE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(120),
+        )),
+    };
+
+    let svc = TrendAggregator::new(strategy).await?;
+    if let Err(e) = svc.run().await {
+        error!(error = %e, "Service exited with error");
+    }
+
+    info!("Sentiment-trend service stopped");
+    Ok(())
+}
+```

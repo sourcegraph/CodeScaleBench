@@ -1,0 +1,435 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * Module 78  –  In-memory Response Cache (LRU + TTL)
+ *
+ * This module provides a thread-safe, memory-bounded response cache that is
+ * shared across all REST and GraphQL handlers.  Entries are stored in an
+ * LRU list with individual TTLs.  Metrics and structured logging are wired
+ * in, but the actual back-ends (mm_log.h / mm_metrics.h) are supplied by
+ * upper layers of the monolith.
+ *
+ * Public Interface (see mm_cache.h):
+ *      mm_cache_t *mm_cache_create(const char *name,
+ *                                  size_t         max_bytes,
+ *                                  uint64_t       default_ttl_ms);
+ *
+ *      int  mm_cache_put( mm_cache_t *cache,
+ *                         const char *key,
+ *                         const void *buf,
+ *                         size_t      len,
+ *                         uint64_t    ttl_ms);
+ *
+ *      int  mm_cache_get( mm_cache_t *cache,
+ *                         const char *key,
+ *                         void      **out_buf,
+ *                         size_t     *out_len);
+ *
+ *      void mm_cache_release(void *buf);
+ *      void mm_cache_destroy(mm_cache_t *cache);
+ *
+ * Build:
+ *      cc -Iinclude -pthread -std=c11 -Wall -Wextra -O2 -c src/mm_cache.c
+ *
+ * Author:
+ *      MercuryMonolith Core Team <core@mercury-monolith.io>
+ */
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* 3rd-party single-header hash map (https://troydhanson.github.io/uthash/) */
+#include "uthash.h"
+
+/* House-style logging and metrics facades */
+#include "mm_log.h"      /* mm_log_debug(), mm_log_warn(), mm_log_error()    */
+#include "mm_metrics.h"  /* mm_metrics_counter_inc(), mm_metrics_gauge_set() */
+#include "mm_time.h"     /* mm_time_now_ms()                                 */
+#include "mm_cache.h"    /* public header for this implementation            */
+
+/*-----------------------------------------------------------------------------
+ * Internal Structures
+ *---------------------------------------------------------------------------*/
+typedef struct cache_entry {
+    char               *key;          /* heap-allocated, NULL-terminated      */
+    void               *data;         /* heap-allocated payload               */
+    size_t              data_len;     /* payload length                       */
+    uint64_t            expires_at;   /* absolute epoch ms                    */
+
+    /* Intrusive LRU pointers                                                 */
+    struct cache_entry *prev;
+    struct cache_entry *next;
+
+    /* uthash handle (must be last)                                           */
+    UT_hash_handle      hh;
+} cache_entry_t;
+
+struct mm_cache {
+    char     name[MM_CACHE_NAME_MAX]; /* label for logging/metrics            */
+    size_t   max_bytes;               /* memory ceiling                       */
+    size_t   cur_bytes;               /* running total                        */
+    uint64_t default_ttl_ms;          /* 0 == no expiry                       */
+
+    /* LRU doubly-linked list head/tail                                       */
+    cache_entry_t *lru_head;
+    cache_entry_t *lru_tail;
+
+    /* Hash map root                                                          */
+    cache_entry_t *hash_root;
+
+    pthread_mutex_t lock;
+};
+
+/*-----------------------------------------------------------------------------
+ * Helpers
+ *---------------------------------------------------------------------------*/
+
+/* Remove an entry from the LRU list (does not touch hash map) */
+static inline void
+unlink_lru(mm_cache_t *c, cache_entry_t *e)
+{
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_head == e) c->lru_head = e->next;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+    e->prev = e->next = NULL;
+}
+
+/* Append entry to the front (MRU) */
+static inline void
+link_lru_front(mm_cache_t *c, cache_entry_t *e)
+{
+    e->prev       = NULL;
+    e->next       = c->lru_head;
+    if (c->lru_head)
+        c->lru_head->prev = e;
+    c->lru_head   = e;
+    if (!c->lru_tail)
+        c->lru_tail = e;
+}
+
+/* Free entry memory and adjust accounting */
+static void
+free_entry(mm_cache_t *c, cache_entry_t *e)
+{
+    if (!e) return;
+
+    /* Update metrics before freeing */
+    if (c->cur_bytes >= e->data_len)
+        c->cur_bytes -= e->data_len;
+    else
+        c->cur_bytes  = 0; /* should never happen */
+
+    mm_metrics_gauge_set(c->name, "cache_bytes", (double)c->cur_bytes);
+
+    free(e->key);
+    free(e->data);
+    free(e);
+}
+
+/* Purge a single expired entry (caller holds lock) */
+static void
+purge_expired_locked(mm_cache_t *c, uint64_t now_ms)
+{
+    cache_entry_t *itr, *tmp;
+    HASH_ITER(hh, c->hash_root, itr, tmp) {
+        if (itr->expires_at > 0 && itr->expires_at <= now_ms) {
+            mm_log_debug("[%s] Purging expired entry '%s'", c->name, itr->key);
+            unlink_lru(c, itr);
+            HASH_DEL(c->hash_root, itr);
+            free_entry(c, itr);
+            mm_metrics_counter_inc(c->name, "cache_evictions_expired", 1);
+        }
+    }
+}
+
+/* Evict entries until we are <= max_bytes (caller holds lock) */
+static void
+evict_lru_locked(mm_cache_t *c)
+{
+    while (c->cur_bytes > c->max_bytes && c->lru_tail) {
+        cache_entry_t *victim = c->lru_tail;
+        mm_log_debug("[%s] Evicting LRU '%s' (%zu bytes)", c->name,
+                     victim->key, victim->data_len);
+
+        unlink_lru(c, victim);
+        HASH_DEL(c->hash_root, victim);
+        free_entry(c, victim);
+
+        mm_metrics_counter_inc(c->name, "cache_evictions_lru", 1);
+    }
+}
+
+/*-----------------------------------------------------------------------------
+ * Public API
+ *---------------------------------------------------------------------------*/
+mm_cache_t *
+mm_cache_create(const char *name, size_t max_bytes, uint64_t default_ttl_ms)
+{
+    if (!name || max_bytes == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    mm_cache_t *c = calloc(1, sizeof(*c));
+    if (!c)
+        return NULL;
+
+    strlcpy(c->name, name, sizeof(c->name));
+    c->max_bytes      = max_bytes;
+    c->cur_bytes      = 0;
+    c->default_ttl_ms = default_ttl_ms;
+
+    if (pthread_mutex_init(&c->lock, NULL) != 0) {
+        free(c);
+        return NULL;
+    }
+
+    mm_log_info("[%s] Cache created (max=%zu bytes, default_ttl=%" PRIu64 " ms)",
+                c->name, c->max_bytes, c->default_ttl_ms);
+    mm_metrics_gauge_set(c->name, "cache_bytes", 0.0);
+
+    return c;
+}
+
+int
+mm_cache_put(mm_cache_t *c,
+             const char *key,
+             const void *buf,
+             size_t      len,
+             uint64_t    ttl_ms)
+{
+    if (!c || !key || !buf || len == 0)
+        return EINVAL;
+
+    int rc = pthread_mutex_lock(&c->lock);
+    if (rc != 0)
+        return rc;
+
+    uint64_t now_ms = mm_time_now_ms();
+
+    /* trash expired entries opportunistically */
+    purge_expired_locked(c, now_ms);
+
+    cache_entry_t *e = NULL;
+    HASH_FIND_STR(c->hash_root, key, e);
+    if (e) {
+        /* Replace existing entry */
+        unlink_lru(c, e);
+        if (c->cur_bytes >= e->data_len)
+            c->cur_bytes -= e->data_len;
+        free(e->data);
+
+        e->data = malloc(len);
+        if (!e->data) {
+            pthread_mutex_unlock(&c->lock);
+            return ENOMEM;
+        }
+        memcpy(e->data, buf, len);
+        e->data_len   = len;
+        e->expires_at = ttl_ms ? now_ms + ttl_ms
+                               : (c->default_ttl_ms ? now_ms + c->default_ttl_ms : 0);
+
+        c->cur_bytes += len;
+        link_lru_front(c, e);
+
+        mm_metrics_counter_inc(c->name, "cache_puts_update", 1);
+    } else {
+        /* New entry */
+        e = calloc(1, sizeof(*e));
+        if (!e) {
+            pthread_mutex_unlock(&c->lock);
+            return ENOMEM;
+        }
+
+        e->key = strdup(key);
+        if (!e->key) {
+            free(e);
+            pthread_mutex_unlock(&c->lock);
+            return ENOMEM;
+        }
+        e->data = malloc(len);
+        if (!e->data) {
+            free(e->key);
+            free(e);
+            pthread_mutex_unlock(&c->lock);
+            return ENOMEM;
+        }
+        memcpy(e->data, buf, len);
+        e->data_len   = len;
+        e->expires_at = ttl_ms ? now_ms + ttl_ms
+                               : (c->default_ttl_ms ? now_ms + c->default_ttl_ms : 0);
+
+        HASH_ADD_KEYPTR(hh, c->hash_root, e->key, strlen(e->key), e);
+        link_lru_front(c, e);
+        c->cur_bytes += len;
+
+        mm_metrics_counter_inc(c->name, "cache_puts_new", 1);
+    }
+
+    mm_metrics_gauge_set(c->name, "cache_bytes", (double)c->cur_bytes);
+
+    /* Shed overflow */
+    evict_lru_locked(c);
+
+    pthread_mutex_unlock(&c->lock);
+    return 0;
+}
+
+int
+mm_cache_get(mm_cache_t *c,
+             const char *key,
+             void      **out_buf,
+             size_t     *out_len)
+{
+    if (!c || !key || !out_buf || !out_len)
+        return EINVAL;
+
+    int rc = pthread_mutex_lock(&c->lock);
+    if (rc != 0)
+        return rc;
+
+    uint64_t now_ms = mm_time_now_ms();
+
+    cache_entry_t *e = NULL;
+    HASH_FIND_STR(c->hash_root, key, e);
+    if (!e) {
+        pthread_mutex_unlock(&c->lock);
+        mm_metrics_counter_inc(c->name, "cache_miss", 1);
+        return ENOENT;
+    }
+
+    if (e->expires_at > 0 && e->expires_at <= now_ms) {
+        /* stale */
+        unlink_lru(c, e);
+        HASH_DEL(c->hash_root, e);
+        free_entry(c, e);
+
+        pthread_mutex_unlock(&c->lock);
+        mm_metrics_counter_inc(c->name, "cache_miss_expired", 1);
+        return ENOENT;
+    }
+
+    /* Hit */
+    unlink_lru(c, e);
+    link_lru_front(c, e);
+    mm_metrics_counter_inc(c->name, "cache_hit", 1);
+
+    /* Return a heap-copy so caller can free() at will */
+    void *dup = malloc(e->data_len);
+    if (!dup) {
+        pthread_mutex_unlock(&c->lock);
+        return ENOMEM;
+    }
+    memcpy(dup, e->data, e->data_len);
+    *out_buf = dup;
+    *out_len = e->data_len;
+
+    pthread_mutex_unlock(&c->lock);
+    return 0;
+}
+
+void
+mm_cache_release(void *buf)
+{
+    free(buf);
+}
+
+void
+mm_cache_destroy(mm_cache_t *c)
+{
+    if (!c)
+        return;
+
+    pthread_mutex_lock(&c->lock);
+
+    cache_entry_t *itr, *tmp;
+    HASH_ITER(hh, c->hash_root, itr, tmp) {
+        unlink_lru(c, itr);
+        HASH_DEL(c->hash_root, itr);
+        free_entry(c, itr);
+    }
+
+    pthread_mutex_unlock(&c->lock);
+    pthread_mutex_destroy(&c->lock);
+
+    mm_log_info("[%s] Cache destroyed", c->name);
+    free(c);
+}
+
+/*-----------------------------------------------------------------------------
+ * Convenience wrappers for REST layer (ETag / JSON helpers, etc.)
+ *---------------------------------------------------------------------------*/
+/*
+ * While the core cache is payload-agnostic, MercuryMonolith’s REST gateway
+ * frequently stores compressed JSON along with RFC-7232 ETags.  The helpers
+ * below keep that boiler-plate in one place.
+ */
+int
+mm_cache_put_json(mm_cache_t  *c,
+                  const char  *key,
+                  const char  *etag,
+                  const char  *json,
+                  uint64_t     ttl_ms)
+{
+    /* On-wire format:  |etag_len(2B)|etag|json_payload */
+    uint16_t etag_len = (uint16_t)strlen(etag);
+    size_t   payload  = sizeof(etag_len) + etag_len + strlen(json);
+
+    unsigned char *buf = malloc(payload);
+    if (!buf)
+        return ENOMEM;
+
+    memcpy(buf, &etag_len, sizeof(etag_len));
+    memcpy(buf + sizeof(etag_len), etag, etag_len);
+    strcpy((char *)(buf + sizeof(etag_len) + etag_len), json);
+
+    int rc = mm_cache_put(c, key, buf, payload, ttl_ms);
+    free(buf);
+    return rc;
+}
+
+int
+mm_cache_get_json(mm_cache_t *c,
+                  const char *key,
+                  char      **out_etag,
+                  char      **out_json)
+{
+    void   *buf = NULL;
+    size_t  len = 0;
+    int rc = mm_cache_get(c, key, &buf, &len);
+    if (rc != 0)
+        return rc;
+
+    if (len < sizeof(uint16_t)) {
+        mm_cache_release(buf);
+        return EPROTO;
+    }
+
+    uint16_t etag_len = 0;
+    memcpy(&etag_len, buf, sizeof(etag_len));
+
+    if (len < sizeof(uint16_t) + etag_len + 1) {
+        mm_cache_release(buf);
+        return EPROTO;
+    }
+
+    char *etag = strndup((char *)buf + sizeof(uint16_t), etag_len);
+    char *json = strdup((char *)buf + sizeof(uint16_t) + etag_len);
+
+    mm_cache_release(buf);
+
+    if (!etag || !json) {
+        free(etag);
+        free(json);
+        return ENOMEM;
+    }
+
+    *out_etag = etag;
+    *out_json = json;
+    return 0;
+}

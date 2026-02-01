@@ -1,0 +1,279 @@
+```csharp
+// File: src/module_28.txt   (should be renamed to NotificationOrchestrator.cs in build pipeline)
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Logging;
+
+namespace TempoScribePro.Application.Notifications
+{
+    #region Public Contracts (Ports)
+
+    /// <summary>
+    /// Represents a single notification to be dispatched.
+    /// </summary>
+    public interface INotification
+    {
+        string Subject { get; }
+        string Message { get; }
+        NotificationSeverity Severity { get; }
+        IReadOnlyCollection<NotificationRecipient> Recipients { get; }
+        DateTimeOffset CreatedUtc { get; }
+        IReadOnlyDictionary<string, string> Metadata { get; }
+    }
+
+    /// <summary>
+    /// Implemented by adapters capable of sending notifications to a medium
+    /// (e-mail, in-app toast, push, Slack, etc.).
+    /// </summary>
+    public interface INotificationSender
+    {
+        string ChannelName { get; }
+
+        /// <summary>
+        /// Sends a notification.  
+        /// Implementations MUST be idempotent.
+        /// </summary>
+        Task SendAsync(INotification notification, CancellationToken ct = default);
+    }
+
+    /// <summary>
+    /// Application service that converts domain events into notifications,
+    /// applies deduplication/throttling rules, and dispatches through
+    /// configured <see cref="INotificationSender"/> ports.
+    /// </summary>
+    public interface INotificationOrchestrator
+    {
+        Task PublishEventAsync(IDomainEvent domainEvent, CancellationToken ct = default);
+    }
+
+    /// <summary>
+    /// Marker interface for domain events coming out of the core.
+    /// </summary>
+    public interface IDomainEvent
+    {
+        Guid EventId { get; }
+        DateTimeOffset OccurredUtc { get; }
+    }
+
+    #endregion
+
+    #region Domain Event → Notification Registry
+
+    /// <summary>
+    /// Keeps mappings between domain events and <see cref="INotification"/> factories.
+    /// Can be extended at runtime via modules (e.g. plug-in).
+    /// </summary>
+    public interface INotificationMappingRegistry
+    {
+        bool TryCreateNotification(IDomainEvent @event, out INotification? notification);
+    }
+
+    public sealed class NotificationMappingRegistry : INotificationMappingRegistry
+    {
+        private readonly Dictionary<Type, Func<IDomainEvent, INotification>> _map =
+            new();
+
+        public NotificationMappingRegistry()
+        {
+            // Register default mappings.
+            Register<PostPublishedEvent>(evt =>
+            {
+                var e = (PostPublishedEvent)evt;
+                return new BasicNotification(
+                    subject: $"New post published: {e.PostTitle}",
+                    message: $"🎉 \"{e.PostTitle}\" is live! Read it now.",
+                    severity: NotificationSeverity.Info,
+                    recipients: e.Subscribers.Select(s => new NotificationRecipient(s.UserId, s.Email)).ToArray(),
+                    metadata: new Dictionary<string, string>
+                    {
+                        ["postId"] = e.PostId.ToString()
+                    });
+            });
+        }
+
+        public void Register<TEvent>(Func<IDomainEvent, INotification> factory)
+            where TEvent : IDomainEvent
+        {
+            _map[typeof(TEvent)] = factory;
+        }
+
+        public bool TryCreateNotification(IDomainEvent @event, out INotification? notification)
+        {
+            if (_map.TryGetValue(@event.GetType(), out var factory))
+            {
+                notification = factory(@event);
+                return true;
+            }
+
+            notification = null;
+            return false;
+        }
+    }
+
+    #endregion
+
+    #region Core Implementations
+
+    /// <summary>
+    /// Production-ready orchestrator with deduplication, logging, and fallback logic.
+    /// </summary>
+    public sealed class NotificationOrchestrator : INotificationOrchestrator
+    {
+        private const string DedupCachePrefix = "notif-dedup-";
+        private readonly IEnumerable<INotificationSender> _senders;
+        private readonly INotificationMappingRegistry _registry;
+        private readonly IDistributedCache _cache;
+        private readonly ILogger<NotificationOrchestrator> _logger;
+
+        public NotificationOrchestrator(
+            IEnumerable<INotificationSender> senders,
+            INotificationMappingRegistry registry,
+            IDistributedCache cache,
+            ILogger<NotificationOrchestrator> logger)
+        {
+            _senders = senders ?? throw new ArgumentNullException(nameof(senders));
+            _registry = registry ?? throw new ArgumentNullException(nameof(registry));
+            _cache = cache ?? throw new ArgumentNullException(nameof(cache));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        public async Task PublishEventAsync(IDomainEvent domainEvent, CancellationToken ct = default)
+        {
+            if (!_registry.TryCreateNotification(domainEvent, out var notification))
+            {
+                _logger.LogDebug("No notification mapping found for event {EventType}", domainEvent.GetType().Name);
+                return;
+            }
+
+            var dedupKey = BuildDeduplicationKey(notification);
+            if (!await TryAcquireDeduplicationSlotAsync(dedupKey, ct))
+            {
+                _logger.LogDebug("Duplicate notification detected for key {DedupKey}. Skipping.", dedupKey);
+                return;
+            }
+
+            var tasks = _senders.Select(sender => SendAsync(sender, notification, ct)).ToArray();
+            await Task.WhenAll(tasks);
+        }
+
+        private async Task SendAsync(INotificationSender sender, INotification notification, CancellationToken ct)
+        {
+            try
+            {
+                await sender.SendAsync(notification, ct);
+                _logger.LogInformation("Notification {NotificationId} sent via {Channel}", notification.Subject, sender.ChannelName);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                _logger.LogWarning("Sending notification {NotificationId} via {Channel} was canceled.", notification.Subject, sender.ChannelName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to send notification {NotificationId} via {Channel}", notification.Subject, sender.ChannelName);
+                // TODO: Add retry / dead-letter queue integration.
+            }
+        }
+
+        /// <summary>
+        /// Creates a deterministic key that remains constant for "semantically identical"
+        /// notifications. Used to avoid flooding users with repeated alerts.
+        /// </summary>
+        private static string BuildDeduplicationKey(INotification notification)
+        {
+            var recipientHash = string.Join('|', notification.Recipients.OrderBy(r => r.UserId).Select(r => r.UserId));
+            var metaHash = string.Join('|', notification.Metadata.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}:{kv.Value}"));
+            return $"{DedupCachePrefix}{notification.Subject}:{metaHash}:{recipientHash}";
+        }
+
+        /// <summary>
+        /// Tries to acquire a deduplication slot for the given key. If the key already exists
+        /// in the cache, returns false; otherwise writes the key with a short TTL and returns true.
+        /// </summary>
+        private async Task<bool> TryAcquireDeduplicationSlotAsync(string dedupKey, CancellationToken ct)
+        {
+            var existingBytes = await _cache.GetAsync(dedupKey, ct).ConfigureAwait(false);
+            if (existingBytes != null)
+            {
+                return false;
+            }
+
+            var options = new DistributedCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5) // avoid duplicate notifications for 5 minutes
+            };
+
+            await _cache.SetAsync(
+                dedupKey,
+                JsonSerializer.SerializeToUtf8Bytes(new { createdUtc = DateTimeOffset.UtcNow }),
+                options,
+                ct).ConfigureAwait(false);
+
+            return true;
+        }
+    }
+
+    #endregion
+
+    #region Supporting Types
+
+    public sealed record NotificationRecipient(Guid UserId, string Email);
+
+    public enum NotificationSeverity
+    {
+        Info,
+        Warning,
+        Error,
+        Critical
+    }
+
+    /// <summary>
+    /// Minimal implementation of <see cref="INotification"/> used by default in
+    /// <see cref="NotificationMappingRegistry"/>.
+    /// </summary>
+    public sealed record BasicNotification(
+        string Subject,
+        string Message,
+        NotificationSeverity Severity,
+        IReadOnlyCollection<NotificationRecipient> Recipients,
+        IReadOnlyDictionary<string, string> Metadata) : INotification
+    {
+        public DateTimeOffset CreatedUtc { get; } = DateTimeOffset.UtcNow;
+    }
+
+    #endregion
+
+    #region Sample Domain Event (for illustration / compile safety)
+
+    public sealed class PostPublishedEvent : IDomainEvent
+    {
+        public PostPublishedEvent(
+            Guid postId,
+            string postTitle,
+            IEnumerable<SubscriberInfo> subscribers)
+        {
+            PostId = postId;
+            PostTitle = postTitle;
+            Subscribers = subscribers.ToArray();
+            EventId = Guid.NewGuid();
+            OccurredUtc = DateTimeOffset.UtcNow;
+        }
+
+        public Guid EventId { get; }
+        public DateTimeOffset OccurredUtc { get; }
+        public Guid PostId { get; }
+        public string PostTitle { get; }
+        public IReadOnlyCollection<SubscriberInfo> Subscribers { get; }
+    }
+
+    public sealed record SubscriberInfo(Guid UserId, string Email);
+
+    #endregion
+}
+```

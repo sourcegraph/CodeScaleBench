@@ -1,0 +1,410 @@
+```rust
+//! module_27 – Hyper-parameter Tuning Orchestrator
+//! =================================================
+//! This module implements a production–ready, asynchronous hyper-parameter
+//! tuning engine that plugs into the VisuTility Orchestrator.  It combines
+//! the Strategy Pattern (pluggable search strategies) with the Observer
+//! Pattern (progress / result callbacks).  Although self-contained, all
+//! public APIs are intentionally generic so the module can be embedded in
+//! other crates or binaries across the platform.
+//
+//  Architectural highlights
+//  ------------------------
+//  • A `HyperparameterTuner` drives the life-cycle of an experiment.
+//  • A `HyperparameterSearchStrategy` encapsulates the search logic
+//    (Grid, Random, Bayesian, …).  New strategies can be added at run-time
+//    via dynamic dispatch, or at compile-time via a generic parameter.
+//  • Observers (typically UI dashboards, metrics sinks, or a Model Registry)
+//    subscribe to `TuningEvent`s via an async broadcast channel.
+//  • All blocking or CPU-heavy code is wrapped in `spawn_blocking` so the
+//    public API remains async-friendly.
+//  • Errors leverage the `thiserror` crate for rich context.
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use rand::{prelude::SliceRandom, Rng};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    sync::{broadcast, Mutex},
+    task,
+    time,
+};
+
+/// Type alias for clarity.  We treat a hyper-parameter as `String → f64`.
+pub type Hyperparameters = HashMap<String, f64>;
+
+/// Errors thrown by the tuning engine.
+#[derive(Debug, Error)]
+pub enum TuningError {
+    #[error("strategy failed: {0}")]
+    StrategyFailure(String),
+
+    #[error("observer error: {0}")]
+    ObserverError(String),
+
+    #[error("no trials were generated")]
+    EmptySearchSpace,
+}
+
+/// Progress / result events published during tuning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TuningEvent {
+    TrialStarted {
+        trial_id: u64,
+        params: Hyperparameters,
+        timestamp: Instant,
+    },
+    TrialCompleted {
+        trial_id: u64,
+        params: Hyperparameters,
+        score: f64,
+        duration: Duration,
+    },
+    Finished {
+        best_params: Hyperparameters,
+        best_score: f64,
+        total_trials: usize,
+        total_duration: Duration,
+    },
+}
+
+/// Observer trait – implementors react to tuning events (Observer Pattern).
+pub trait TuningObserver: Send + Sync + 'static {
+    fn on_event(&self, event: &TuningEvent);
+}
+
+/// Convenience macro for optional logging in observers.
+macro_rules! log_event {
+    ($event:expr) => {
+        log::debug!("tuning_event: {:?}", $event);
+    };
+}
+
+/// Strategy Pattern – defines how new hyper-parameter sets are proposed.
+#[async_trait::async_trait]
+pub trait HyperparameterSearchStrategy: Send + Sync {
+    /// Initialize the strategy with a search space and desired budget.
+    async fn init(&mut self, search_space: SearchSpace, budget: usize) -> Result<(), TuningError>;
+
+    /// Generate the next candidate hyper-parameters.
+    async fn next(&mut self) -> Option<Hyperparameters>;
+}
+
+/// A simple discrete search space (can be extended as needed).
+#[derive(Debug, Clone)]
+pub struct SearchSpace(pub HashMap<String, Vec<f64>>);
+
+/// Grid-search – exhaustively enumerates the cartesian product.
+pub struct GridSearch {
+    queue: Vec<Hyperparameters>,
+}
+
+impl GridSearch {
+    pub fn new() -> Self {
+        Self { queue: Vec::new() }
+    }
+
+    /// Recursive cartesian product builder.
+    fn build(
+        names: &[String],
+        values: &[Vec<f64>],
+        idx: usize,
+        acc: &mut Hyperparameters,
+        out: &mut Vec<Hyperparameters>,
+    ) {
+        if idx == names.len() {
+            out.push(acc.clone());
+            return;
+        }
+        for &v in &values[idx] {
+            acc.insert(names[idx].clone(), v);
+            Self::build(names, values, idx + 1, acc, out);
+            acc.remove(&names[idx]);
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl HyperparameterSearchStrategy for GridSearch {
+    async fn init(&mut self, search_space: SearchSpace, _budget: usize) -> Result<(), TuningError> {
+        let names: Vec<String> = search_space.0.keys().cloned().collect();
+        let values: Vec<Vec<f64>> = names
+            .iter()
+            .map(|k| search_space.0.get(k).cloned().unwrap_or_default())
+            .collect();
+
+        if names.is_empty() {
+            return Err(TuningError::EmptySearchSpace);
+        }
+
+        let mut acc = Hyperparameters::default();
+        Self::build(&names, &values, 0, &mut acc, &mut self.queue);
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Option<Hyperparameters> {
+        self.queue.pop()
+    }
+}
+
+/// Random Search – uniform sampling within discrete values.
+pub struct RandomSearch {
+    rng: rand::rngs::StdRng,
+    search_space: Option<SearchSpace>,
+    generated: usize,
+    budget: usize,
+}
+
+impl RandomSearch {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            rng: rand::SeedableRng::seed_from_u64(seed),
+            search_space: None,
+            generated: 0,
+            budget: 0,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl HyperparameterSearchStrategy for RandomSearch {
+    async fn init(&mut self, search_space: SearchSpace, budget: usize) -> Result<(), TuningError> {
+        self.search_space = Some(search_space);
+        self.budget = budget;
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Option<Hyperparameters> {
+        if self.generated >= self.budget {
+            return None;
+        }
+        self.generated += 1;
+        let mut params = Hyperparameters::default();
+        if let Some(space) = &self.search_space {
+            for (name, values) in &space.0 {
+                if let Some(&v) = values.choose(&mut self.rng) {
+                    params.insert(name.clone(), v);
+                }
+            }
+        }
+        Some(params)
+    }
+}
+
+/// The main orchestrator performing tuning loops.
+pub struct HyperparameterTuner<S: HyperparameterSearchStrategy> {
+    strategy: Mutex<S>, // Wrapped in a mutex to allow &self to be Sync.
+    observers: Vec<Arc<dyn TuningObserver>>,
+    sender: broadcast::Sender<TuningEvent>,
+    evaluation_fn: Arc<dyn Fn(Hyperparameters) -> f64 + Send + Sync>,
+}
+
+impl<S: HyperparameterSearchStrategy> HyperparameterTuner<S> {
+    /// Create a new tuner.
+    pub fn new(
+        strategy: S,
+        evaluation_fn: impl Fn(Hyperparameters) -> f64 + Send + Sync + 'static,
+    ) -> Self {
+        let (sender, _receiver) = broadcast::channel(128);
+        Self {
+            strategy: Mutex::new(strategy),
+            observers: Vec::new(),
+            sender,
+            evaluation_fn: Arc::new(evaluation_fn),
+        }
+    }
+
+    /// Subscribe an observer to receive tuning events.
+    pub fn register_observer(&mut self, obs: Arc<dyn TuningObserver>) {
+        self.observers.push(obs);
+    }
+
+    /// Allows external components to subscribe via async broadcast.
+    pub fn subscribe(&self) -> broadcast::Receiver<TuningEvent> {
+        self.sender.subscribe()
+    }
+
+    /// Helper to notify observers and broadcast events.
+    fn notify(&self, event: TuningEvent) {
+        // Fire-and-forget broadcast; ignore lagging receivers.
+        let _ = self.sender.send(event.clone());
+
+        // Synchronous observer callback (bounded cost).
+        for obs in &self.observers {
+            obs.on_event(&event);
+        }
+        log_event!(event);
+    }
+
+    /// Execute the tuning loop until the strategy is exhausted or cancelled.
+    pub async fn run(
+        self: Arc<Self>,
+        search_space: SearchSpace,
+        budget: usize,
+    ) -> Result<(), TuningError> {
+        let start_all = Instant::now();
+
+        {
+            let mut s = self.strategy.lock().await;
+            s.init(search_space.clone(), budget).await?;
+        }
+
+        let mut best_score = f64::NEG_INFINITY;
+        let mut best_params = Hyperparameters::default();
+        let mut trials = 0u64;
+
+        loop {
+            let maybe_params = { self.strategy.lock().await.next().await };
+            let params = match maybe_params {
+                Some(p) => p,
+                None => break,
+            };
+
+            let trial_id = trials;
+            trials += 1;
+            let start = Instant::now();
+
+            self.notify(TuningEvent::TrialStarted {
+                trial_id,
+                params: params.clone(),
+                timestamp: start,
+            });
+
+            // Run evaluation in blocking pool to avoid stalling the executor.
+            let eval_fn = Arc::clone(&self.evaluation_fn);
+            let params_eval = params.clone();
+            let score = task::spawn_blocking(move || (eval_fn)(params_eval))
+                .await
+                .map_err(|e| TuningError::StrategyFailure(e.to_string()))?;
+
+            let duration = start.elapsed();
+            self.notify(TuningEvent::TrialCompleted {
+                trial_id,
+                params: params.clone(),
+                score,
+                duration,
+            });
+
+            if score > best_score {
+                best_score = score;
+                best_params = params;
+            }
+
+            // Cooperative yield after each trial to keep the executor responsive.
+            time::sleep(Duration::from_millis(1)).await;
+        }
+
+        self.notify(TuningEvent::Finished {
+            best_params,
+            best_score,
+            total_trials: trials as usize,
+            total_duration: start_all.elapsed(),
+        });
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Example Observer Implementations
+// ---------------------------------------------------------------------------
+
+/// A noop observer that simply dumps events to the log.
+pub struct LoggingObserver;
+
+impl TuningObserver for LoggingObserver {
+    fn on_event(&self, event: &TuningEvent) {
+        println!("[LoggingObserver] {:?}", event);
+    }
+}
+
+/// Metrics observer stub – in production this would push to Prometheus.
+pub struct MetricsObserver {
+    pub prefix: String,
+}
+
+impl TuningObserver for MetricsObserver {
+    fn on_event(&self, event: &TuningEvent) {
+        match event {
+            TuningEvent::TrialCompleted { score, .. } => {
+                println!(
+                    "[MetricsObserver] {}_trial_score {}",
+                    self.prefix, score
+                );
+            }
+            TuningEvent::Finished {
+                best_score,
+                total_trials,
+                ..
+            } => {
+                println!(
+                    "[MetricsObserver] {}_best_score {} (trials={})",
+                    self.prefix, best_score, total_trials
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn toy_eval(params: Hyperparameters) -> f64 {
+        // Simple convex function peaked at (2.0,2.0).
+        let x = params.get("x").copied().unwrap_or(0.0);
+        let y = params.get("y").copied().unwrap_or(0.0);
+        -(x - 2.0).powi(2) - (y - 2.0).powi(2)
+    }
+
+    fn make_search_space() -> SearchSpace {
+        let mut map = HashMap::new();
+        map.insert("x".to_string(), vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+        map.insert("y".to_string(), vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+        SearchSpace(map)
+    }
+
+    #[tokio::test]
+    async fn grid_search_finds_optimum() {
+        let strategy = GridSearch::new();
+        let tuner = Arc::new(HyperparameterTuner::new(strategy, toy_eval));
+        tuner.register_observer(Arc::new(LoggingObserver));
+
+        tuner
+            .run(make_search_space(), /*budget*/ usize::MAX)
+            .await
+            .expect("grid search failed");
+    }
+
+    #[tokio::test]
+    async fn random_search_respects_budget() {
+        let strategy = RandomSearch::new(42);
+        let tuner = Arc::new(HyperparameterTuner::new(strategy, toy_eval));
+
+        let budget = 10;
+        tuner
+            .run(make_search_space(), budget)
+            .await
+            .expect("random search failed");
+
+        // ensure broadcast receiver works
+        let mut rx = tuner.subscribe();
+        let mut finished_seen = false;
+        while let Ok(evt) = rx.try_recv() {
+            if matches!(evt, TuningEvent::Finished { .. }) {
+                finished_seen = true;
+            }
+        }
+        assert!(finished_seen, "no Finished event published");
+    }
+}
+```

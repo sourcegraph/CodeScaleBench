@@ -1,0 +1,359 @@
+```rust
+//! src/module_69.rs
+//!
+//! Reactive domain-events infrastructure for EduPulse Live.
+//!
+//! This module exposes the abstractions and a reference implementation for an
+//! event bus that backs the entire **EduPulse Live** ecosystem.  All bounded
+//! contexts in the application rely on these traits to publish / subscribe to
+//! business events such as:
+//!     * `LearningPulsePublished`
+//!     * `LearningPulseResponseSubmitted`
+//!     * `BadgeAwarded`
+//!
+//! Down-stream consumers (search-indexer, notification worker, analytics, …)
+//! connect to the same bus transparently—regardless of whether the underlying
+//! transport is an embedded channel for tests, a Kafka cluster, or an AMQP
+//! broker in production.
+//!
+//! # Crate features
+//! * `test-helpers` – Exposes synchronous helpers for black-box tests.
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+};
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    select,
+    sync::{broadcast, mpsc, oneshot, RwLock},
+};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Unique identifier for each event.
+///
+/// We use `uuid::Uuid` under the hood; however the type is kept opaque
+/// to prevent ad-hoc string concatenations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EventId(uuid::Uuid);
+
+impl Default for EventId {
+    fn default() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+impl std::fmt::Display for EventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <uuid::Uuid as std::fmt::Display>::fmt(&self.0, f)
+    }
+}
+
+/// Common envelope that wraps *all* domain events.
+///
+/// The concrete payload is stored in a `serde_json::Value`, therefore callers
+/// can treat the bus as opaque and cast back to the concrete type via
+/// `serde_json::from_value`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub id: EventId,
+    pub kind: EventKind,
+    pub occurred_at: DateTime<Utc>,
+    pub metadata: EventMetadata,
+    pub payload: serde_json::Value,
+}
+
+/// High-level classification of an event.
+/// Can be used for selective subscriptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    LearningPulsePublished,
+    LearningPulseResponseSubmitted,
+    BadgeAwarded,
+    PaymentProcessed,
+    // … add new kinds here
+}
+
+/// Additional data that is orthogonal to the domain payload.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EventMetadata {
+    /// Initiating user, if any (for audit trail).
+    pub principal_id: Option<uuid::Uuid>,
+    /// Tenant / school / organisation in multi-tenant setups.
+    pub tenant: Option<String>,
+    /// Correlation id for tracing distributed workflows.
+    pub correlation_id: Option<String>,
+}
+
+/// Asynchronous event bus.
+///
+/// Publishing an event returns immediately—consumers will *eventually* handle it.
+#[async_trait]
+pub trait EventBus: Send + Sync + 'static {
+    /// Publish a single event onto the bus.
+    async fn publish(&self, event: EventEnvelope) -> Result<()>;
+
+    /// Subscribe to *all* events.
+    ///
+    /// Implementations should deliver events in **at-least-once** fashion.
+    /// Event ordering is preserved *per partition/key* only.
+    async fn subscribe(&self) -> Result<EventStream>;
+}
+
+/// Concrete stream type returned by `subscribe`.
+pub type EventStream = mpsc::Receiver<EventEnvelope>;
+
+/// A local in-memory event bus backed by `tokio::sync` primitives.
+///
+/// This is intended for unit/integration tests and _development_ servers only.
+/// It should never be used in production because:
+///  1. Events are lost on process shutdown.
+///  2. Back-pressure is bounded by memory and the channel size.
+///
+#[derive(Debug, Clone)]
+pub struct InMemoryBus {
+    sender: broadcast::Sender<EventEnvelope>,
+}
+
+impl InMemoryBus {
+    pub fn new(buffer: usize) -> Self {
+        let (sender, _) = broadcast::channel(buffer);
+        Self { sender }
+    }
+}
+
+#[async_trait]
+impl EventBus for InMemoryBus {
+    #[instrument(skip(self, event))]
+    async fn publish(&self, event: EventEnvelope) -> Result<()> {
+        self.sender
+            .send(event)
+            .map(|_| ())
+            .context("in-memory bus lagged")
+    }
+
+    async fn subscribe(&self) -> Result<EventStream> {
+        let mut rx = self.sender.subscribe();
+        // Fan-out broadcast receiver into an mpsc channel
+        let (tx, stream) = mpsc::channel::<EventEnvelope>(1024);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(evt) => {
+                        if tx.send(evt).await.is_err() {
+                            // Consumer dropped -> exit task
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "consumer lagged behind in-memory bus");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        Ok(stream)
+    }
+}
+
+/// Persists events for durability and audit trail.
+///
+/// In production we use Postgres via `sqlx`.  The repository is used by the
+/// HTTP API + background workers to reconstruct an aggregate’s event stream.
+#[derive(Debug, Clone)]
+pub struct PgEventStore {
+    pool: sqlx::PgPool,
+}
+
+impl PgEventStore {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Append a new envelope.
+    pub async fn append(&self, event: &EventEnvelope) -> Result<()> {
+        let payload = serde_json::to_value(event)
+            .context("failed serialising event envelope")?;
+        sqlx::query!(
+            r#"
+            INSERT INTO event_store(id, kind, occurred_at, metadata, payload)
+            VALUES($1, $2, $3, $4, $5)
+            "#,
+            event.id.0,
+            event.kind as EventKind, // enum mapping
+            event.occurred_at,
+            serde_json::to_value(&event.metadata)?,
+            payload
+        )
+        .execute(&self.pool)
+        .await
+        .context("cannot persist event")
+        .map(|_| ())
+    }
+}
+
+/// Event handler abstraction.
+///
+/// Implementations are registered in a service provider and wired up by the
+/// [`Dispatcher`].
+#[async_trait]
+pub trait EventHandler: Send + Sync {
+    /// Which event kind does this handler deal with?
+    fn interested_in(&self) -> EventKind;
+
+    /// Handle the incoming event.
+    async fn handle(&self, event: EventEnvelope) -> Result<()>;
+}
+
+/// Multiplexes events to specific [`EventHandler`]s.
+///
+/// The dispatcher owns the subscription stream and forwards each incoming
+/// envelope to **all** handlers that declared interest in that kind.
+/// Errors are logged, yet _never_ propagated—otherwise one faulty consumer
+/// would block the whole pipeline.
+#[derive(Debug)]
+pub struct Dispatcher<B: EventBus> {
+    bus: Arc<B>,
+    handlers: Arc<RwLock<HashMap<EventKind, Vec<Arc<dyn EventHandler>>>>>,
+}
+
+impl<B: EventBus> Dispatcher<B> {
+    pub fn new(bus: Arc<B>) -> Self {
+        Self {
+            bus,
+            handlers: Arc::default(),
+        }
+    }
+
+    /// Register a new event handler.
+    pub async fn register(&self, handler: Arc<dyn EventHandler>) {
+        let kind = handler.interested_in();
+        let mut map = self.handlers.write().await;
+        map.entry(kind).or_default().push(handler);
+    }
+
+    /// Start forwarding events to handlers until `shutdown` is signalled.
+    pub async fn run(self: Arc<Self>, mut shutdown: oneshot::Receiver<()>) -> Result<()> {
+        let mut stream = self.bus.subscribe().await?;
+        loop {
+            select! {
+                Some(event) = stream.recv() => {
+                    let handlers = {
+                        let map = self.handlers.read().await;
+                        map.get(&event.kind).cloned()
+                    };
+
+                    if let Some(handlers) = handlers {
+                        for handler in handlers {
+                            // Spawn each handler in its own task.
+                            let event_clone = event.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = handler.handle(event_clone).await {
+                                    error!(error = ?e, "event handler failed");
+                                }
+                            });
+                        }
+                    }
+                },
+                _ = &mut shutdown => {
+                    info!("dispatcher shutdown");
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/* ---- Example Handler ----------------------------------------------- */
+
+/// Trigger plagiarism check whenever a student submits a response.
+///
+/// In real production we'd integrate with an external micro-service through
+/// gRPC / HTTP.  For demonstration we just log the intent.
+pub struct PlagiarismCheckHandler;
+
+#[async_trait]
+impl EventHandler for PlagiarismCheckHandler {
+    fn interested_in(&self) -> EventKind {
+        EventKind::LearningPulseResponseSubmitted
+    }
+
+    #[instrument(name="plagiarism_check", skip(self))]
+    async fn handle(&self, event: EventEnvelope) -> Result<()> {
+        debug!(
+            event_id = %event.id,
+            "initiating plagiarism check (mock)"
+        );
+        // TODO: make network call here
+        Ok(())
+    }
+}
+
+/* ---- Helper to wire everything together for binary / tests --------- */
+
+/// Build a fully-wired in-memory dispatcher that can be used inside integration
+/// tests without touching the database.
+pub async fn testing_dispatcher() -> Arc<Dispatcher<InMemoryBus>> {
+    let bus = Arc::new(InMemoryBus::new(512));
+    let dispatcher = Arc::new(Dispatcher::new(bus.clone()));
+    dispatcher
+        .register(Arc::new(PlagiarismCheckHandler))
+        .await;
+
+    // Kick off dispatcher loop in background
+    let (tx, rx) = oneshot::channel();
+    let cloned = dispatcher.clone();
+    tokio::spawn(async move {
+        if let Err(e) = cloned.run(rx).await {
+            error!(error = ?e, "dispatcher terminated with error");
+        }
+    });
+
+    // Store sender on dispatcher so caller can gracefully stop it (simplified)
+    tokio::spawn(async move {
+        // Shut down after 60 seconds in tests by default
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let _ = tx.send(());
+    });
+
+    dispatcher
+}
+
+/* ---- Integration test ---------------------------------------------- */
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn handler_is_triggered() -> Result<()> {
+        let dispatcher = testing_dispatcher().await;
+
+        let envelope = EventEnvelope {
+            id: EventId::default(),
+            kind: EventKind::LearningPulseResponseSubmitted,
+            occurred_at: Utc::now(),
+            metadata: EventMetadata::default(),
+            payload: json!({
+                "response_id": "12345",
+                "student_id": "abcd-ef12",
+                "answer": "Rust code snippet"
+            }),
+        };
+
+        dispatcher.bus.publish(envelope).await?;
+        // Sleep a bit to allow async handler to run
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Nothing to assert—if handler panics test will fail anyway
+        Ok(())
+    }
+}
+```

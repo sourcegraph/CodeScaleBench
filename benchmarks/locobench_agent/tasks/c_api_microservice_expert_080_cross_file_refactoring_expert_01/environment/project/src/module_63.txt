@@ -1,0 +1,475 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * --------------------------------------
+ * Module: Response Cache (LRU, thread-safe)
+ * File:   src/module_63.txt                   (compiled as response_cache.c)
+ *
+ * This module implements an in-memory, thread-safe LRU response cache that is
+ * shared across all REST and GraphQL endpoints.  It supports:
+ *
+ *   • O(1) lookup / insert / eviction (hash-table + intrusive doubly linked list)
+ *   • Per-entry TTL
+ *   • Capacity-based eviction
+ *   • Prometheus-style metrics
+ *   • Structured logging
+ *
+ * Dependencies that must exist elsewhere in the code-base:
+ *   mm_logger.h      – leveled logging macros  (MM_LOG_INFO, MM_LOG_WARN, etc.)
+ *   mm_metrics.h     – counter/gauge helpers   (mm_metrics_inc, mm_metrics_set)
+ *   mm_alloc.h       – safe malloc/realloc     (mm_calloc, mm_free)
+ *
+ * Copyright (c) 2024  Neptune Software
+ * SPDX-License-Identifier: MIT
+ */
+
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+#include <errno.h>
+
+#include "mm_logger.h"
+#include "mm_metrics.h"
+#include "mm_alloc.h"
+
+/* -------------------------------------------------------------------------- */
+/* Internal Hash Map (open addressing, 64-bit FNV-1a)                         */
+/* -------------------------------------------------------------------------- */
+
+/* Simple, dependency-free hash table.  Collisions resolved by linear probing.
+ * For production use this table is amor­tized O(1) and lock-protected by the
+ * cache-wide rw-lock, so complexity is deemed acceptable. */
+
+typedef struct rc_slot_s {
+    uint64_t            hash;   /* 0 == unused */
+    struct rc_entry_s  *entry;
+} rc_slot_t;
+
+/* -------------------------------------------------------------------------- */
+/* Cache Entry & LRU List                                                     */
+/* -------------------------------------------------------------------------- */
+
+typedef struct rc_entry_s {
+    /* Key */
+    char               *key;
+    size_t              key_len;
+
+    /* Value (raw payload, e.g. JSON) */
+    uint8_t            *blob;
+    size_t              blob_len;
+
+    /* Expiration */
+    time_t              ts_expire;
+
+    /* Intrusive LRU list */
+    struct rc_entry_s  *prev;
+    struct rc_entry_s  *next;
+} rc_entry_t;
+
+/* -------------------------------------------------------------------------- */
+/* Public Handle                                                              */
+/* -------------------------------------------------------------------------- */
+
+typedef struct {
+    /* Settings (immutable after init) */
+    size_t              capacity;   /* max number of entries (not bytes)  */
+    uint32_t            ttl_sec;    /* default time-to-live per entry     */
+
+    /* Synchronization */
+    pthread_rwlock_t    rwlock;
+
+    /* Hash table */
+    rc_slot_t          *slots;
+    size_t              slots_len;  /* always power-of-two                */
+    size_t              size;       /* current #entries                   */
+
+    /* LRU pointers */
+    rc_entry_t         *lru_head;   /* most recently used                 */
+    rc_entry_t         *lru_tail;   /* least recently used                */
+
+    /* Metrics (cumulative) */
+    uint64_t            hits;
+    uint64_t            misses;
+    uint64_t            evictions;
+} response_cache_t;
+
+/* -------------------------------------------------------------------------- */
+/* Forward Decls                                                              */
+/* -------------------------------------------------------------------------- */
+
+static uint64_t     rc_hash(const void *data, size_t len);
+static rc_entry_t  *rc_lookup_locked(response_cache_t *c,
+                                     const char *key,
+                                     size_t key_len,
+                                     uint64_t hv,
+                                     size_t *slot_index_out);
+static void         rc_lru_promote(response_cache_t *c, rc_entry_t *e);
+static void         rc_evict_tail(response_cache_t *c);
+static int          rc_resize_table(response_cache_t *c, size_t new_slots);
+
+/* -------------------------------------------------------------------------- */
+/* Public API                                                                 */
+/* -------------------------------------------------------------------------- */
+
+/* Initialize a new cache instance.  Returns NULL on allocation failure. */
+response_cache_t *
+rc_create(size_t capacity /* ≥1 */, uint32_t ttl_sec /* ≥1 */)
+{
+    if (capacity == 0 || ttl_sec == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    response_cache_t *c = mm_calloc(1, sizeof(*c));
+    if (!c) {
+        return NULL;
+    }
+
+    /* Find next power-of-two table size ≥ capacity*2 (load factor ≤0.5) */
+    size_t tbl_sz = 1;
+    while (tbl_sz < (capacity * 2)) {
+        tbl_sz <<= 1;
+    }
+
+    c->slots = mm_calloc(tbl_sz, sizeof(rc_slot_t));
+    if (!c->slots) {
+        mm_free(c);
+        return NULL;
+    }
+
+    c->capacity  = capacity;
+    c->ttl_sec   = ttl_sec;
+    c->slots_len = tbl_sz;
+
+    if (pthread_rwlock_init(&c->rwlock, NULL) != 0) {
+        mm_free(c->slots);
+        mm_free(c);
+        return NULL;
+    }
+
+    MM_LOG_INFO("response_cache: initialized (capacity=%zu, ttl=%us, slots=%zu)",
+                capacity, ttl_sec, tbl_sz);
+    return c;
+}
+
+/* Destroy cache and free all resources. */
+void
+rc_destroy(response_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    /* Free entries */
+    rc_entry_t *cur = c->lru_tail;
+    while (cur) {
+        rc_entry_t *prev = cur->prev;
+        mm_free(cur->key);
+        mm_free(cur->blob);
+        mm_free(cur);
+        cur = prev;
+    }
+
+    mm_free(c->slots);
+    pthread_rwlock_unlock(&c->rwlock);
+    pthread_rwlock_destroy(&c->rwlock);
+    mm_free(c);
+
+    MM_LOG_INFO("response_cache: destroyed");
+}
+
+/* Lookup a cached payload.
+ * Returns 0 on hit, ENOENT on miss/expired, other errno on error.
+ * Caller receives a heap-allocated copy of blob; must free(). */
+int
+rc_get(response_cache_t *c,
+       const char *key,
+       size_t key_len,
+       uint8_t **out_blob,
+       size_t *out_blob_len)
+{
+    if (!c || !key || key_len == 0 || !out_blob || !out_blob_len) {
+        return EINVAL;
+    }
+
+    uint64_t hv = rc_hash(key, key_len);
+
+    /* Shared lock for read */
+    pthread_rwlock_rdlock(&c->rwlock);
+
+    size_t slot_idx;
+    rc_entry_t *e = rc_lookup_locked(c, key, key_len, hv, &slot_idx);
+
+    if (!e) {
+        c->misses++;
+        mm_metrics_inc("response_cache_miss_total", 1);
+        pthread_rwlock_unlock(&c->rwlock);
+        return ENOENT;
+    }
+
+    /* Check expiration */
+    time_t now = time(NULL);
+    if (e->ts_expire < now) {
+        /* Need to promote to writer lock to evict expired entry */
+        pthread_rwlock_unlock(&c->rwlock);
+        pthread_rwlock_wrlock(&c->rwlock);
+
+        /* Ensure same slot still holds the entry (re-verify) */
+        if (c->slots[slot_idx].entry == e) {
+            /* Remove from structures */
+            if (e->prev) e->prev->next = e->next;
+            if (e->next) e->next->prev = e->prev;
+            if (c->lru_head == e) c->lru_head = e->next;
+            if (c->lru_tail == e) c->lru_tail = e->prev;
+
+            mm_free(e->key);
+            mm_free(e->blob);
+            mm_free(e);
+            c->slots[slot_idx].hash  = 0;
+            c->slots[slot_idx].entry = NULL;
+            c->size--;
+            c->evictions++;
+            mm_metrics_inc("response_cache_eviction_total", 1);
+        }
+
+        pthread_rwlock_unlock(&c->rwlock);
+        return ENOENT;
+    }
+
+    /* Copy payload */
+    uint8_t *dup = mm_calloc(1, e->blob_len);
+    if (!dup) {
+        pthread_rwlock_unlock(&c->rwlock);
+        return ENOMEM;
+    }
+    memcpy(dup, e->blob, e->blob_len);
+    *out_blob     = dup;
+    *out_blob_len = e->blob_len;
+
+    c->hits++;
+    mm_metrics_inc("response_cache_hit_total", 1);
+
+    /* Need to update LRU order – upgrade to writer lock */
+    pthread_rwlock_unlock(&c->rwlock);
+    pthread_rwlock_wrlock(&c->rwlock);
+    rc_lru_promote(c, e);
+    pthread_rwlock_unlock(&c->rwlock);
+
+    return 0;
+}
+
+/* Insert or replace a cached payload.
+ * Return 0 on success, or errno.  Caller retains ownership of value buffer.
+ */
+int
+rc_put(response_cache_t *c,
+       const char *key,
+       size_t key_len,
+       const uint8_t *blob,
+       size_t blob_len)
+{
+    if (!c || !key || key_len == 0 || !blob || blob_len == 0) {
+        return EINVAL;
+    }
+
+    uint64_t hv = rc_hash(key, key_len);
+
+    /* Writer lock for modification */
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    size_t slot_idx;
+    rc_entry_t *existing = rc_lookup_locked(c, key, key_len, hv, &slot_idx);
+
+    /* Duplicate buffers */
+    char    *dup_key  = mm_calloc(1, key_len);
+    uint8_t *dup_blob = mm_calloc(1, blob_len);
+    if (!dup_key || !dup_blob) {
+        pthread_rwlock_unlock(&c->rwlock);
+        mm_free(dup_key);
+        mm_free(dup_blob);
+        return ENOMEM;
+    }
+    memcpy(dup_key,  key,  key_len);
+    memcpy(dup_blob, blob, blob_len);
+
+    /* Create / replace entry */
+    rc_entry_t *e;
+    if (existing) {
+        /* Replace value but keep LRU position */
+        mm_free(existing->key);  existing->key  = dup_key;
+        mm_free(existing->blob); existing->blob = dup_blob;
+        existing->key_len  = key_len;
+        existing->blob_len = blob_len;
+        existing->ts_expire = time(NULL) + c->ttl_sec;
+
+        e = existing;
+    } else {
+        e = mm_calloc(1, sizeof(*e));
+        if (!e) {
+            pthread_rwlock_unlock(&c->rwlock);
+            mm_free(dup_key);
+            mm_free(dup_blob);
+            return ENOMEM;
+        }
+
+        e->key       = dup_key;
+        e->key_len   = key_len;
+        e->blob      = dup_blob;
+        e->blob_len  = blob_len;
+        e->ts_expire = time(NULL) + c->ttl_sec;
+
+        /* Insert into hash table */
+        while (1) {
+            rc_slot_t *slot = &c->slots[slot_idx];
+            if (slot->hash == 0) {
+                slot->hash  = hv;
+                slot->entry = e;
+                break;
+            }
+            slot_idx = (slot_idx + 1) & (c->slots_len - 1);
+        }
+        c->size++;
+    }
+
+    /* Promote to MRU */
+    rc_lru_promote(c, e);
+
+    /* Evict if over capacity */
+    if (c->size > c->capacity) {
+        rc_evict_tail(c);
+    }
+
+    mm_metrics_set("response_cache_entries", (double)c->size);
+
+    pthread_rwlock_unlock(&c->rwlock);
+    return 0;
+}
+
+/* Current cache statistics (thread-safe snapshot). */
+void
+rc_stats(const response_cache_t *c,
+         uint64_t *out_hits,
+         uint64_t *out_misses,
+         uint64_t *out_evictions,
+         size_t   *out_entries)
+{
+    if (!c) return;
+
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&c->rwlock);
+    if (out_hits)      *out_hits      = c->hits;
+    if (out_misses)    *out_misses    = c->misses;
+    if (out_evictions) *out_evictions = c->evictions;
+    if (out_entries)   *out_entries   = c->size;
+    pthread_rwlock_unlock((pthread_rwlock_t *)&c->rwlock);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Private Helpers                                                            */
+/* -------------------------------------------------------------------------- */
+
+static uint64_t
+rc_hash(const void *data, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t h = 14695981039346656037ULL;   /* offset basis */
+    for (size_t i = 0; i < len; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ULL;              /* prime */
+    }
+    return h == 0 ? 1 : h;                  /* reserve 0 for EMPTY */
+}
+
+/* Find entry with given key.
+ * Caller holds at least a read-lock. */
+static rc_entry_t *
+rc_lookup_locked(response_cache_t *c,
+                 const char *key,
+                 size_t key_len,
+                 uint64_t hv,
+                 size_t *slot_index_out)
+{
+    size_t idx = hv & (c->slots_len - 1);
+
+    while (1) {
+        rc_slot_t *slot = &c->slots[idx];
+        if (slot->hash == 0) {
+            if (slot_index_out) *slot_index_out = idx;
+            return NULL; /* not found */
+        }
+        if (slot->hash == hv) {
+            rc_entry_t *e = slot->entry;
+            if (e && e->key_len == key_len &&
+                memcmp(e->key, key, key_len) == 0) {
+                if (slot_index_out) *slot_index_out = idx;
+                return e;
+            }
+        }
+        idx = (idx + 1) & (c->slots_len - 1);
+    }
+}
+
+/* Move entry to head (MRU).  Writer lock must be held. */
+static void
+rc_lru_promote(response_cache_t *c, rc_entry_t *e)
+{
+    if (c->lru_head == e) return;
+
+    /* Detach */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    /* Insert at head */
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+/* Evict least recently used entry.  Writer lock must be held. */
+static void
+rc_evict_tail(response_cache_t *c)
+{
+    rc_entry_t *victim = c->lru_tail;
+    if (!victim) return;
+
+    /* Remove from hash map */
+    uint64_t hv = rc_hash(victim->key, victim->key_len);
+    size_t idx  = hv & (c->slots_len - 1);
+    while (1) {
+        rc_slot_t *slot = &c->slots[idx];
+        if (slot->hash == hv && slot->entry == victim) {
+            slot->hash  = 0;
+            slot->entry = NULL;
+            break;
+        }
+        idx = (idx + 1) & (c->slots_len - 1);
+    }
+
+    /* Remove from LRU list */
+    if (victim->prev) victim->prev->next = NULL;
+    c->lru_tail = victim->prev;
+    if (c->lru_head == victim) c->lru_head = NULL;
+
+    mm_free(victim->key);
+    mm_free(victim->blob);
+    mm_free(victim);
+
+    c->size--;
+    c->evictions++;
+    mm_metrics_inc("response_cache_eviction_total", 1);
+
+    MM_LOG_DEBUG("response_cache: evicted entry (size=%zu)", c->size);
+}
+
+/* Future enhancement: dynamic table resize
+ * Currently unused; provided for completeness. */
+static int
+rc_resize_table(response_cache_t *c, size_t new_slots)
+{
+    (void)c;
+    (void)new_slots;
+    return 0;
+}

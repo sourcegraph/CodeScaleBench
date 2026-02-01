@@ -1,0 +1,504 @@
+```rust
+//! VisuTility Orchestrator – Module 28  
+//! Model-Monitoring & Automated-Retraining Observer implementation.
+//!
+//! This module sits in the **Model-Ops** layer.  It continuously evaluates
+//! real-time performance metrics pushed by the inference engines, detects
+//! degradation or data-drift, and notifies registered observers such as the
+//! retraining scheduler and alerting services.
+//!
+//! Architectural patterns used here:
+//!   • Observer Pattern – to decouple metric collection from side-effects  
+//!   • Strategy Pattern – tunable threshold strategies (static vs adaptive)  
+//!   • Factory Pattern  – to build observers dynamically from config
+//!
+//! # Overview
+//! ```text
+//! ┌───────────────┐  metrics   ┌───────────────────┐
+//! │ Inference Run │───────────▶│  ModelMonitor     │
+//! └───────────────┘            └──────────┬────────┘
+//!                                         │ notify()
+//!                            ┌────────────▼────────────┐
+//!                            │  RetrainingScheduler    │
+//!                            ├─────────────────────────┤
+//!                            │   AlertingService       │
+//!                            └─────────────────────────┘
+//! ```
+//!
+//! The `ModelMonitor` caches a sliding window of performance snapshots.
+//! Whenever a snapshot breaches the active `ThresholdStrategy`, an event is
+//! emitted to **all** observers.  Observers can be provided by downstream
+//! crates at runtime, enabling pluggable behaviour.
+
+#![allow(clippy::module_name_repetitions)]
+
+use std::{
+    collections::VecDeque,
+    error::Error,
+    fmt::{self, Display},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::Result;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use crossbeam_channel::Sender;
+use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+use url::Url;
+use uuid::Uuid;
+
+// ---------- Domain types ----------------------------------------------------
+
+/// Single point-in-time performance snapshot emitted by an inference pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPerformanceSnapshot {
+    pub model_name:       String,
+    pub model_version:    String,
+    pub accuracy:         f32,
+    pub precision:        f32,
+    pub recall:           f32,
+    pub f1_score:         f32,
+    pub drift_score:      f32,
+    pub avg_latency_ms:   f64,
+    pub throughput_fps:   f64,
+    pub timestamp:        DateTime<Utc>,
+}
+
+impl ModelPerformanceSnapshot {
+    pub fn new(
+        model_name: impl Into<String>,
+        model_version: impl Into<String>,
+        accuracy: f32,
+        precision: f32,
+        recall: f32,
+        f1_score: f32,
+        drift_score: f32,
+        avg_latency_ms: f64,
+        throughput_fps: f64,
+    ) -> Self {
+        Self {
+            model_name: model_name.into(),
+            model_version: model_version.into(),
+            accuracy,
+            precision,
+            recall,
+            f1_score,
+            drift_score,
+            avg_latency_ms,
+            throughput_fps,
+            timestamp: Utc::now(),
+        }
+    }
+}
+
+/// Events emitted by the `ModelMonitor` towards its observers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ModelEvent {
+    PerformanceDegradation {
+        snapshot: ModelPerformanceSnapshot,
+        threshold: ThresholdViolation,
+    },
+    DataDrift {
+        snapshot: ModelPerformanceSnapshot,
+        threshold: ThresholdViolation,
+    },
+    HighLatency {
+        snapshot: ModelPerformanceSnapshot,
+        threshold: ThresholdViolation,
+    },
+}
+
+/// Explains which threshold has been violated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThresholdViolation {
+    pub field:        &'static str,
+    pub expected:     f64,
+    pub observed:     f64,
+    pub tolerance:    f64,
+}
+
+impl Display for ThresholdViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Violation on `{}` – expected ≥ {:.4} (±{:.4}), observed {:.4}",
+            self.field, self.expected, self.tolerance, self.observed
+        )
+    }
+}
+
+// ---------- Threshold Strategy ----------------------------------------------
+
+/// Strategy trait determining *how* the monitor evaluates snapshots.
+#[async_trait]
+pub trait ThresholdStrategy: Send + Sync {
+    /// Checks the snapshot against the active strategy.
+    async fn evaluate(&self, snapshot: &ModelPerformanceSnapshot)
+        -> Option<ThresholdViolation>;
+}
+
+/// Fixed user-provided thresholds.
+#[derive(Debug)]
+pub struct StaticThresholdStrategy {
+    pub min_accuracy:       f32,
+    pub min_f1_score:       f32,
+    pub max_drift_score:    f32,
+    pub max_latency_ms:     f64,
+}
+
+#[async_trait]
+impl ThresholdStrategy for StaticThresholdStrategy {
+    async fn evaluate(
+        &self,
+        snapshot: &ModelPerformanceSnapshot,
+    ) -> Option<ThresholdViolation> {
+        if snapshot.accuracy < self.min_accuracy {
+            return Some(ThresholdViolation {
+                field:     "accuracy",
+                expected:  self.min_accuracy as f64,
+                observed:  snapshot.accuracy as f64,
+                tolerance: 0.0,
+            });
+        }
+        if snapshot.f1_score < self.min_f1_score {
+            return Some(ThresholdViolation {
+                field:     "f1_score",
+                expected:  self.min_f1_score as f64,
+                observed:  snapshot.f1_score as f64,
+                tolerance: 0.0,
+            });
+        }
+        if snapshot.drift_score > self.max_drift_score {
+            return Some(ThresholdViolation {
+                field:     "drift_score",
+                expected:  self.max_drift_score as f64,
+                observed:  snapshot.drift_score as f64,
+                tolerance: 0.0,
+            });
+        }
+        if snapshot.avg_latency_ms > self.max_latency_ms {
+            return Some(ThresholdViolation {
+                field:     "latency_ms",
+                expected:  self.max_latency_ms,
+                observed:  snapshot.avg_latency_ms,
+                tolerance: 0.0,
+            });
+        }
+        None
+    }
+}
+
+// ---------- Observer pattern -------------------------------------------------
+
+/// Observers receive `ModelEvent`s.
+#[async_trait]
+pub trait Observer: Send + Sync {
+    async fn on_event(&self, event: &ModelEvent) -> Result<()>;
+}
+
+/// Monitor subject which tracks snapshots and notifies observers.
+pub struct ModelMonitor {
+    observers:      RwLock<Vec<Arc<dyn Observer>>>,
+    strategy:       Arc<dyn ThresholdStrategy>,
+    history:        RwLock<VecDeque<ModelPerformanceSnapshot>>,
+    history_limit:  usize,
+    /// Last time observers were notified successfully.
+    last_notify_ts: RwLock<Option<Instant>>,
+}
+
+impl ModelMonitor {
+    pub fn new(
+        strategy: Arc<dyn ThresholdStrategy>,
+        history_limit: usize,
+    ) -> Self {
+        Self {
+            observers: RwLock::new(Vec::new()),
+            strategy,
+            history: RwLock::new(VecDeque::with_capacity(history_limit)),
+            history_limit,
+            last_notify_ts: RwLock::new(None),
+        }
+    }
+
+    /// Registers a new observer.
+    pub async fn register(&self, observer: Arc<dyn Observer>) {
+        self.observers.write().await.push(observer);
+    }
+
+    /// Pushes a new snapshot into the monitor.
+    pub async fn record(&self, snapshot: ModelPerformanceSnapshot) {
+        // Maintain sliding window.
+        {
+            let mut history = self.history.write().await;
+            if history.len() == self.history_limit {
+                history.pop_front();
+            }
+            history.push_back(snapshot.clone());
+        }
+
+        // Evaluate against thresholds.
+        if let Some(violation) = self.strategy.evaluate(&snapshot).await {
+            let event = build_event(&snapshot, &violation);
+
+            let observers = self.observers.read().await.clone();
+            for obs in observers {
+                if let Err(err) = obs.on_event(&event).await {
+                    error!("observer failed: {err:?}");
+                }
+            }
+            *self.last_notify_ts.write().await = Some(Instant::now());
+        }
+    }
+}
+
+fn build_event(
+    snapshot: &ModelPerformanceSnapshot,
+    violation: &ThresholdViolation,
+) -> ModelEvent {
+    match violation.field {
+        "drift_score" => ModelEvent::DataDrift {
+            snapshot: snapshot.clone(),
+            threshold: violation.clone(),
+        },
+        "latency_ms" => ModelEvent::HighLatency {
+            snapshot: snapshot.clone(),
+            threshold: violation.clone(),
+        },
+        _ => ModelEvent::PerformanceDegradation {
+            snapshot: snapshot.clone(),
+            threshold: violation.clone(),
+        },
+    }
+}
+
+// ---------- Concrete Observers ----------------------------------------------
+
+// 1. Retraining Scheduler -----------------------------------------------------
+
+/// Payload handed to the background training-job orchestrator.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RetrainingJob {
+    pub job_id:         Uuid,
+    pub model_name:     String,
+    pub model_version:  String,
+    pub triggered_by:   ThresholdViolation,
+    pub created_at:     DateTime<Utc>,
+}
+
+/// Observer that enqueues a `RetrainingJob` when degradation is detected.
+pub struct RetrainingScheduler {
+    tx: Sender<RetrainingJob>,
+}
+
+impl RetrainingScheduler {
+    pub fn new(tx: Sender<RetrainingJob>) -> Self {
+        Self { tx }
+    }
+}
+
+#[async_trait]
+impl Observer for RetrainingScheduler {
+    async fn on_event(&self, event: &ModelEvent) -> Result<()> {
+        if let ModelEvent::PerformanceDegradation { snapshot, threshold }
+        |       ModelEvent::DataDrift            { snapshot, threshold } = event
+        {
+            let job = RetrainingJob {
+                job_id:        Uuid::new_v4(),
+                model_name:    snapshot.model_name.clone(),
+                model_version: snapshot.model_version.clone(),
+                triggered_by:  threshold.clone(),
+                created_at:    Utc::now(),
+            };
+            self.tx
+                .send(job)
+                .map_err(|e| anyhow::anyhow!("failed to enqueue retraining job: {e}"))?;
+            info!(
+                "[RetrainingScheduler] job enqueued for model {}:{}",
+                snapshot.model_name, snapshot.model_version
+            );
+        }
+        Ok(())
+    }
+}
+
+// 2. Alerting Service ---------------------------------------------------------
+
+/// Observer that pings an external webhook (e.g. PagerDuty/Slack) on alerts.
+pub struct AlertingService {
+    webhook: Url,
+    client:  reqwest::Client,
+    timeout: Duration,
+}
+
+impl AlertingService {
+    pub fn new(webhook: Url, timeout: Duration) -> Self {
+        Self {
+            webhook,
+            client: reqwest::Client::new(),
+            timeout,
+        }
+    }
+}
+
+#[async_trait]
+impl Observer for AlertingService {
+    async fn on_event(&self, event: &ModelEvent) -> Result<()> {
+        let payload = serde_json::to_value(event)?;
+        let res = self
+            .client
+            .post(self.webhook.clone())
+            .timeout(self.timeout)
+            .json(&payload)
+            .send()
+            .await?;
+
+        if !res.status().is_success() {
+            warn!(
+                "[AlertingService] Webhook responded with HTTP {}",
+                res.status()
+            );
+        } else {
+            info!("[AlertingService] Alert dispatched successfully");
+        }
+        Ok(())
+    }
+}
+
+// ---------- Factory helpers --------------------------------------------------
+
+/// Wire-up utility constructing observers from configuration.
+pub mod factory {
+    use super::*;
+
+    /// Specification for an observer loaded from (e.g.) TOML/YAML config.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(tag = "type")]
+    pub enum ObserverSpec {
+        RetrainingScheduler {
+            channel_capacity: Option<usize>,
+        },
+        AlertingService {
+            webhook: Url,
+            #[serde(default = "default_timeout_ms")]
+            timeout_ms: u64,
+        },
+    }
+
+    fn default_timeout_ms() -> u64 { 4_000 }
+
+    impl ObserverSpec {
+        pub fn build(&self) -> Result<Arc<dyn Observer>> {
+            match self {
+                ObserverSpec::RetrainingScheduler { channel_capacity } => {
+                    let (tx, rx) = crossbeam_channel::bounded(
+                        channel_capacity.unwrap_or(64),
+                    );
+
+                    // Spawn background worker draining the queue.
+                    std::thread::Builder::new()
+                        .name("retrain-worker".into())
+                        .spawn(move || drain_retrain_queue(rx))
+                        .map_err(|e| anyhow::anyhow!("spawn failed: {e}"))?;
+
+                    Ok(Arc::new(RetrainingScheduler::new(tx)))
+                }
+                ObserverSpec::AlertingService { webhook, timeout_ms } => {
+                    Ok(Arc::new(AlertingService::new(
+                        webhook.clone(),
+                        Duration::from_millis(*timeout_ms),
+                    )))
+                }
+            }
+        }
+    }
+
+    fn drain_retrain_queue(rx: crossbeam_channel::Receiver<RetrainingJob>) {
+        for job in rx {
+            // In a real system, this would enqueue into the Model-Training
+            // orchestration layer (Airflow, Argo-Workflows, etc.).
+            // Here, we simply log and *pretend* it's sent.
+            info!(
+                "[RetrainingWorker] sending job {} for model {}:{}",
+                job.job_id, job.model_name, job.model_version
+            );
+
+            // Simulate processing time.
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+// ---------- Example Usage ----------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::sleep;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_to_end_monitoring() -> Result<()> {
+        // Build monitor with static thresholds.
+        let strategy = StaticThresholdStrategy {
+            min_accuracy:    0.94,
+            min_f1_score:    0.90,
+            max_drift_score: 0.05,
+            max_latency_ms:  120.0,
+        };
+        let monitor = Arc::new(ModelMonitor::new(
+            Arc::new(strategy),
+            128,
+        ));
+
+        // Attach observers via factory.
+        let retrain = factory::ObserverSpec::RetrainingScheduler {
+            channel_capacity: Some(4),
+        }
+        .build()?;
+        let alert = factory::ObserverSpec::AlertingService {
+            webhook: Url::parse("https://example.com/webhook").unwrap(),
+            timeout_ms: 2_000,
+        }
+        .build()?;
+
+        monitor.register(retrain).await;
+        monitor.register(alert).await;
+
+        // Feed good metrics.
+        monitor
+            .record(ModelPerformanceSnapshot::new(
+                "vision_model",
+                "v1.0.0",
+                0.96,
+                0.95,
+                0.94,
+                0.945,
+                0.01,
+                80.0,
+                100.0,
+            ))
+            .await;
+
+        // Feed bad metrics to trigger observers.
+        monitor
+            .record(ModelPerformanceSnapshot::new(
+                "vision_model",
+                "v1.0.0",
+                0.80,
+                0.79,
+                0.78,
+                0.785,
+                0.15,
+                200.0,
+                60.0,
+            ))
+            .await;
+
+        // Allow async tasks to flush.
+        sleep(Duration::from_millis(200)).await;
+        Ok(())
+    }
+}
+```

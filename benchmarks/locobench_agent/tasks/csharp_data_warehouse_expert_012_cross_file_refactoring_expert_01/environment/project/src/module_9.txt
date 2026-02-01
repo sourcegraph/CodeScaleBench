@@ -1,0 +1,411 @@
+```csharp
+// -----------------------------------------------------------------------------
+// PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+// File: src/module_9.cs
+//
+// Module 9: Dynamic Data-Transformation Engine
+//
+// Description
+// -----------
+// Implements the Strategy Pattern to dynamically resolve and execute
+// data-transformation algorithms at runtime.  The engine is used by several
+// Lambda micro-components (stream, batch, CDC) to convert raw telemetry into
+// domain KPIs.  Strategies are resolved through attribute-based discovery and
+// wired via Microsoft.Extensions.DependencyInjection so that teams can
+// hot-swap business logic without re-deploying the outer Lambda shell.
+//
+// AWS SSM is used for real-time feature-flag control, enabling Ops to promote
+// or roll back strategies instantly.  The engine is thread-safe, highly
+// observable, and defensive against poisoned messages.
+//
+// -----------------------------------------------------------------------------
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.SimpleSystemsManagement;
+using Amazon.SimpleSystemsManagement.Model;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformations
+{
+    #region Public Contracts
+
+    /// <summary>
+    ///   DTO for an incoming pipeline record.  The envelope contains both the
+    ///   raw JSON payload and a set of normalized headers used throughout the
+    ///   warehouse mesh.
+    /// </summary>
+    public sealed record RecordEnvelope(
+        string Stream,               // e.g. “prod/github/push”
+        string SchemaVersion,        // e.g. “v1”
+        DateTimeOffset Timestamp,    // producer timestamp
+        JsonDocument Payload)        // opaque JSON blob
+    {
+        public string TenantId =>
+            Payload.RootElement.TryGetProperty("tenantId", out var t)
+                ? t.GetString() ?? "unknown"
+                : "unknown";
+
+        /// <summary>Convenience accessor for correlation id.</summary>
+        public string CorrelationId =>
+            Payload.RootElement.TryGetProperty("correlationId", out var c)
+                ? c.GetString() ?? Guid.Empty.ToString()
+                : Guid.Empty.ToString();
+    }
+
+    /// <summary>
+    ///   Data-transformation strategy abstraction.  Implementations convert a
+    ///   <see cref="RecordEnvelope"/> into the derived KPI representation.
+    /// </summary>
+    public interface IDataTransformationStrategy
+    {
+        /// <summary>Unique name used during strategy selection (case-insensitive).</summary>
+        string Name { get; }
+
+        /// <summary>Executes the transformation asynchronously.</summary>
+        /// <exception cref="TransformationException">
+        ///   Thrown when a business-rule violation or unrecoverable data
+        ///   inconsistency is detected.
+        /// </exception>
+        Task<JsonElement> TransformAsync(
+            RecordEnvelope envelope,
+            CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    ///   Marker attribute used for automatic strategy discovery through
+    ///   reflection.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Class)]
+    public sealed class TransformationStrategyAttribute : Attribute
+    {
+        public TransformationStrategyAttribute(string name)
+        {
+            Name = name;
+        }
+
+        public string Name { get; }
+    }
+
+    /// <summary>Thrown when transformation processing fails.</summary>
+    public sealed class TransformationException : Exception
+    {
+        public TransformationException(string message, Exception? inner = null)
+            : base(message, inner) { }
+    }
+
+    #endregion
+
+    #region Strategy Resolution & Execution Engine
+
+    /// <summary>
+    ///   Resolves and executes transformation strategies.  The engine supports
+    ///   per-tenant overrides by querying AWS SSM Parameter Store for a
+    ///   “/pulseops/{tenant}/transformationStrategy” string parameter.
+    /// </summary>
+    public sealed class DataTransformationEngine
+    {
+        private const string DefaultStrategyParameter =
+            "/pulseops/global/defaultTransformationStrategy";
+
+        private readonly IServiceProvider _serviceProvider;
+        private readonly IAmazonSimpleSystemsManagement _ssm;
+        private readonly ILogger<DataTransformationEngine> _logger;
+
+        // Cache mapping strategy name -> strategy instance
+        private readonly ConcurrentDictionary<string, IDataTransformationStrategy>
+            _strategyCache = new(StringComparer.OrdinalIgnoreCase);
+
+        // Cache mapping tenant -> active strategy name
+        private readonly ConcurrentDictionary<string, (string StrategyName, DateTimeOffset Expires)>
+            _tenantStrategyCache = new(StringComparer.OrdinalIgnoreCase);
+
+        // TTL for Parameter Store look-ups
+        private readonly TimeSpan _parameterTtl = TimeSpan.FromMinutes(5);
+
+        public DataTransformationEngine(
+            IServiceProvider serviceProvider,
+            IAmazonSimpleSystemsManagement ssm,
+            ILogger<DataTransformationEngine> logger)
+        {
+            _serviceProvider = serviceProvider;
+            _ssm            = ssm;
+            _logger         = logger;
+        }
+
+        /// <summary>
+        ///   Discovers all strategy types that carry <see cref="TransformationStrategyAttribute"/>
+        ///   and registers them with the DI container.  Should be invoked once
+        ///   during application startup.
+        /// </summary>
+        public static void RegisterStrategies(IServiceCollection services, ILogger? bootstrapLogger = null)
+        {
+            var strategyTypes =
+                Assembly.GetExecutingAssembly()
+                        .DefinedTypes
+                        .Where(t => !t.IsAbstract
+                                    && typeof(IDataTransformationStrategy).IsAssignableFrom(t)
+                                    && t.GetCustomAttribute<TransformationStrategyAttribute>() is not null)
+                        .ToArray();
+
+            foreach (var type in strategyTypes)
+            {
+                services.AddSingleton(typeof(IDataTransformationStrategy), type);
+                bootstrapLogger?.LogInformation(
+                    "Registered transformation strategy {StrategyType}", type.FullName);
+            }
+        }
+
+        /// <summary>
+        ///   Entry point used by Lambda handler.
+        /// </summary>
+        public async Task<JsonElement> TransformAsync(
+            RecordEnvelope envelope,
+            CancellationToken cancellationToken = default)
+        {
+            if (envelope is null)
+                throw new ArgumentNullException(nameof(envelope));
+
+            var strategy = await ResolveStrategyAsync(envelope.TenantId, cancellationToken);
+            try
+            {
+                return await strategy.TransformAsync(envelope, cancellationToken);
+            }
+            catch (TransformationException tex)
+            {
+                // Business-level exception: send to DLQ with context
+                _logger.LogWarning(tex,
+                    "Transformation failed (tenant={Tenant}, strategy={Strategy})",
+                    envelope.TenantId, strategy.Name);
+
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // Unexpected failure
+                _logger.LogError(ex,
+                    "Unhandled error in transformation engine (tenant={Tenant}, strategy={Strategy})",
+                    envelope.TenantId, strategy.Name);
+
+                throw new TransformationException(
+                    $"Unexpected error executing strategy {strategy.Name}", ex);
+            }
+        }
+
+        #region Strategy Resolution Internals
+
+        private async Task<IDataTransformationStrategy> ResolveStrategyAsync(
+            string tenant,
+            CancellationToken cancellationToken)
+        {
+            var (strategyName, _) =
+                await GetTenantStrategyNameAsync(tenant, cancellationToken);
+
+            if (_strategyCache.TryGetValue(strategyName, out var strategy))
+                return strategy;
+
+            // Strategy not yet cached, resolve through DI
+            strategy = _serviceProvider
+                      .GetServices<IDataTransformationStrategy>()
+                      .FirstOrDefault(s =>
+                          s.Name.Equals(strategyName, StringComparison.OrdinalIgnoreCase));
+
+            if (strategy is null)
+            {
+                // Fallback to default & warn
+                _logger.LogWarning(
+                    "Configured strategy '{Strategy}' not found; falling back to 'Noop'",
+                    strategyName);
+
+                strategy = new NoopTransformationStrategy();
+            }
+
+            _strategyCache[strategyName] = strategy;
+            return strategy;
+        }
+
+        private async Task<(string StrategyName, DateTimeOffset Expires)>
+            GetTenantStrategyNameAsync(string tenant, CancellationToken token)
+        {
+            if (_tenantStrategyCache.TryGetValue(tenant, out var entry)
+                && entry.Expires > DateTimeOffset.UtcNow)
+            {
+                return entry;
+            }
+
+            // Compose tenant parameter path
+            var parameterName = $"/pulseops/{tenant}/transformationStrategy";
+            var defaultUsed   = false;
+
+            try
+            {
+                var response = await _ssm.GetParameterAsync(
+                    new GetParameterRequest
+                    {
+                        Name           = parameterName,
+                        WithDecryption = false
+                    }, token);
+
+                entry = (response.Parameter.Value, DateTimeOffset.UtcNow + _parameterTtl);
+            }
+            catch (ParameterNotFoundException)
+            {
+                // Tenant override missing — use global default
+                var response = await _ssm.GetParameterAsync(
+                    new GetParameterRequest
+                    {
+                        Name           = DefaultStrategyParameter,
+                        WithDecryption = false
+                    }, token);
+
+                entry       = (response.Parameter.Value, DateTimeOffset.UtcNow + _parameterTtl);
+                defaultUsed = true;
+            }
+
+            _tenantStrategyCache[tenant] = entry;
+
+            if (defaultUsed)
+                _logger.LogInformation(
+                    "Using default strategy '{Strategy}' for tenant '{Tenant}'",
+                    entry.StrategyName, tenant);
+            else
+                _logger.LogInformation(
+                    "Using tenant-specific strategy '{Strategy}' for tenant '{Tenant}'",
+                    entry.StrategyName, tenant);
+
+            return entry;
+        }
+
+        #endregion
+    }
+
+    #endregion
+
+    #region Built-in Strategies
+
+    /// <summary>
+    ///   Default no-op strategy that simply echos back the original payload.
+    ///   Useful for smoke tests or when a tenant chooses to disable KPI
+    ///   generation entirely.
+    /// </summary>
+    [TransformationStrategy("Noop")]
+    internal sealed class NoopTransformationStrategy : IDataTransformationStrategy
+    {
+        public string Name => "Noop";
+
+        public Task<JsonElement> TransformAsync(
+            RecordEnvelope envelope,
+            CancellationToken cancellationToken = default)
+        {
+            // Avoid copying by re-using existing JsonElement
+            return Task.FromResult(envelope.Payload.RootElement.Clone());
+        }
+    }
+
+    /// <summary>
+    ///   Calculates Meeting Cost Index (MCI) based on calendar telemetry.
+    ///   The resulting JSON adheres to the KPI v1 schema.
+    /// </summary>
+    [TransformationStrategy("MeetingCostIndex")]
+    internal sealed class MeetingCostIndexStrategy : IDataTransformationStrategy
+    {
+        public string Name => "MeetingCostIndex";
+
+        public async Task<JsonElement> TransformAsync(
+            RecordEnvelope envelope,
+            CancellationToken cancellationToken = default)
+        {
+            // Simulate I/O latency for demonstration purposes
+            await Task.Delay(TimeSpan.FromMilliseconds(15), cancellationToken);
+
+            var root = envelope.Payload.RootElement;
+
+            if (!root.TryGetProperty("attendees", out var attendees))
+                throw new TransformationException("Payload missing 'attendees' property");
+
+            if (!root.TryGetProperty("durationMinutes", out var durationProp)
+                || !durationProp.TryGetInt32(out var durationMinutes))
+                throw new TransformationException("Payload missing or invalid 'durationMinutes'");
+
+            var totalHourlyCost = attendees.EnumerateArray()
+                                           .Select(a => a.GetProperty("hourlyRateUsd").GetDecimal())
+                                           .Sum();
+
+            var cost = totalHourlyCost * (durationMinutes / 60m);
+
+            using var doc = JsonDocument.Parse($$"""
+            {
+              "kpi"            : "meetingCostIndex",
+              "schemaVersion"  : "v1",
+              "tenantId"       : "{{envelope.TenantId}}",
+              "correlationId"  : "{{envelope.CorrelationId}}",
+              "timestampUtc"   : "{{DateTimeOffset.UtcNow:o}}",
+              "payload"        : {
+                  "meetingId"       : "{{root.GetProperty("meetingId").GetString()}}",
+                  "durationMinutes" : {{durationMinutes}},
+                  "attendeeCount"   : {{attendees.GetArrayLength()}},
+                  "totalCostUsd"    : {{cost}}
+              }
+            }
+            """);
+
+            // Materialize JsonElement before disposing doc
+            return doc.RootElement.Clone();
+        }
+    }
+
+    /// <summary>
+    ///   Calculates Focus Time Ratio KPI from IDE + Calendar streams.
+    /// </summary>
+    [TransformationStrategy("FocusTimeRatio")]
+    internal sealed class FocusTimeRatioStrategy : IDataTransformationStrategy
+    {
+        public string Name => "FocusTimeRatio";
+
+        public Task<JsonElement> TransformAsync(
+            RecordEnvelope envelope,
+            CancellationToken cancellationToken = default)
+        {
+            var root = envelope.Payload.RootElement;
+
+            // Defensive parsing
+            if (!root.TryGetProperty("focusedSeconds", out var focusedProp)
+                || !root.TryGetProperty("interruptedSeconds", out var interruptedProp))
+                throw new TransformationException(
+                    "Payload missing required focus-time properties");
+
+            var focused      = focusedProp.GetInt32();
+            var interrupted  = interruptedProp.GetInt32();
+            var totalSeconds = focused + interrupted;
+
+            var ratio = totalSeconds == 0 ? 0 : (decimal)focused / totalSeconds;
+
+            using var doc = JsonDocument.Parse($$"""
+            {
+              "kpi"            : "focusTimeRatio",
+              "schemaVersion"  : "v1",
+              "tenantId"       : "{{envelope.TenantId}}",
+              "correlationId"  : "{{envelope.CorrelationId}}",
+              "timestampUtc"   : "{{DateTimeOffset.UtcNow:o}}",
+              "payload"        : {
+                  "focusSeconds"      : {{focused}},
+                  "interruptedSeconds": {{interrupted}},
+                  "ratio"             : {{ratio}}
+              }
+            }
+            """);
+
+            return Task.FromResult(doc.RootElement.Clone());
+        }
+    }
+
+    #endregion
+}
+```

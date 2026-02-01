@@ -1,0 +1,375 @@
+```rust
+//! module_35 – Pagination + Response-Caching service component
+//!
+//! This module provides a generic, highly-reusable pagination façade that
+//! transparently layers Redis-backed response caching on top of an arbitrary
+//! repository.  It is designed to sit in the Service layer, keeping HTTP/View
+//! concerns outside while still exposing enough metadata (ETag, page info) for
+//! the API Gateway to forward to clients.
+//!
+//! High-level flow
+//! 1. Validate incoming `PageRequest` (page, per_page, sort).
+//! 2. Derive a deterministic cache key from request + query parameters.
+//! 3. Try Redis GET. If hit → deserialize + return.
+//! 4. On miss → call underlying repository, build `Page<T>` DTO, store in
+//!    Redis with configurable TTL.
+//! 5. Return strongly-typed `Page<T>` with `etag` for downstream headers.
+//!
+//! The code purposefully avoids pulling in heavy HTTP frameworks; instead it
+//! focuses on Service/Domain concerns so it can be wired into Axum, Actix or
+//! GraphQL resolvers alike.
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use redis::{AsyncCommands, RedisError};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{fmt::Debug, marker::PhantomData, sync::Arc};
+use thiserror::Error;
+use tokio::time::{sleep, Duration};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Hard upper-limit to prevent pathological queries from impacting
+/// DB performance.  Could be driven from `app_config`.
+pub const MAX_PER_PAGE: u16 = 500;
+
+/// Common request DTO received from controller layer.
+///
+/// Implements a couple of convenience helpers (validation + limit offset
+/// calculation) so resource endpoints can stay DRY.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PageRequest {
+    pub page: u32,
+    pub per_page: u16,
+    /// Column name or index as understood by the repository.
+    pub sort_by: Option<&'static str>,
+}
+
+impl PageRequest {
+    /// Validate the request, applying sane defaults and clamping limits.
+    pub fn validated(mut self) -> Result<Self, ValidationError> {
+        if self.page == 0 {
+            return Err(ValidationError::PageMustStartAtOne);
+        }
+
+        if self.per_page == 0 {
+            self.per_page = 25; // default
+        } else if self.per_page > MAX_PER_PAGE {
+            return Err(ValidationError::PerPageExceedsLimit {
+                requested: self.per_page,
+                max: MAX_PER_PAGE,
+            });
+        }
+        Ok(self)
+    }
+
+    pub fn limit_offset(&self) -> (u16, u32) {
+        (self.per_page, (self.page.saturating_sub(1) * self.per_page as u32))
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ValidationError {
+    #[error("Page index must be at least 1")]
+    PageMustStartAtOne,
+    #[error("Requested page size {requested} is greater than maximum {max}")]
+    PerPageExceedsLimit { requested: u16, max: u16 },
+}
+
+/// Envelope returned by the pagination service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Page<T> {
+    pub data: Vec<T>,
+    pub total: u64,
+    pub page: u32,
+    pub per_page: u16,
+    pub etag: String,
+    pub cached: bool,
+    pub generated_at: DateTime<Utc>,
+}
+
+/// Abstract repository trait decoupled from persistence details.
+/// Could be implemented by a Postgres, Dynamo, or in-memory adapter.
+#[async_trait]
+pub trait PagedRepository<Q, T>: Send + Sync
+where
+    T: Serialize + Send + Sync,
+{
+    async fn query(
+        &self,
+        params: Q,
+        page: PageRequest,
+    ) -> Result<(Vec<T>, u64), RepositoryError>;
+}
+
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("Database error: {0}")]
+    Db(#[from] sqlx::Error),
+    #[error("Unexpected repository error: {0}")]
+    Other(#[from] anyhow::Error),
+}
+
+/// Abstraction over a key/value store so the paginator can be unit-tested
+/// without Redis available at compile-time.
+#[async_trait]
+pub trait CacheBackend: Send + Sync {
+    async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError>;
+    async fn set_bytes(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl: Duration,
+    ) -> Result<(), CacheError>;
+}
+
+#[derive(Debug, Error)]
+pub enum CacheError {
+    #[error("Redis error: {0}")]
+    Redis(#[from] RedisError),
+    #[error("Deserialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Production cache backed by Redis.
+#[derive(Clone)]
+pub struct RedisCache {
+    /// Re-use a multiplexer connection or pool.
+    conn: Arc<redis::aio::ConnectionManager>,
+}
+
+#[async_trait]
+impl CacheBackend for RedisCache {
+    async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError> {
+        let mut conn = self.conn.clone();
+        let bytes: Option<Vec<u8>> = conn.get(key).await?;
+        Ok(bytes)
+    }
+
+    async fn set_bytes(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl: Duration,
+    ) -> Result<(), CacheError> {
+        let mut conn = self.conn.clone();
+        // Redis SETPX for ms TTL.
+        conn.set_ex::<&str, &[u8], ()>(key, value, ttl.as_secs() as usize)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Service wrapper that adds caching & ETag calculation over a repository.
+pub struct CachedPaginator<C, R, Q, T>
+where
+    C: CacheBackend,
+    R: PagedRepository<Q, T>,
+    T: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    cache: C,
+    repository: R,
+    /// Time-to-live for cached items.
+    ttl: Duration,
+    _phantom: PhantomData<(Q, T)>,
+}
+
+impl<C, R, Q, T> CachedPaginator<C, R, Q, T>
+where
+    C: CacheBackend,
+    R: PagedRepository<Q, T>,
+    T: Serialize + DeserializeOwned + Send + Sync + Debug + 'static,
+    Q: Serialize + Send + Sync,
+{
+    pub fn new(cache: C, repository: R, ttl: Duration) -> Self {
+        Self {
+            cache,
+            repository,
+            ttl,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Main entry-point; returns a fully-populated `Page<T>` DTO.
+    #[instrument(skip(self, params), fields(page=%page.page))]
+    pub async fn fetch(
+        &self,
+        params: Q,
+        page: PageRequest,
+    ) -> Result<Page<T>, ServiceError> {
+        let page = page.validated()?;
+        let cache_key = Self::make_key(&params, &page)?;
+
+        // Attempt cache hit
+        if let Some(raw) = self.cache.get_bytes(&cache_key).await? {
+            let mut envelope: Page<T> = serde_json::from_slice(&raw)?;
+            envelope.cached = true;
+            debug!(%cache_key, "cache_hit");
+            return Ok(envelope);
+        }
+
+        debug!(%cache_key, "cache_miss");
+        // Fallback to repository
+        let (items, total) = self.repository.query(params, page).await?;
+
+        // Build envelope & generate ETag
+        let mut envelope = Page {
+            data: items,
+            total,
+            page: page.page,
+            per_page: page.per_page,
+            cached: false,
+            etag: String::new(), // placeholder
+            generated_at: Utc::now(),
+        };
+
+        envelope.etag = Self::calculate_etag(&envelope)?;
+
+        // Serialize for cache
+        let raw = serde_json::to_vec(&envelope)?;
+        self.cache
+            .set_bytes(&cache_key, &raw, self.ttl)
+            .await
+            .or_else(|e| {
+                // Don’t fail the request when cache writes fail.
+                warn!(error = %e, "cache_set_failed");
+                Ok(())
+            })?;
+
+        Ok(envelope)
+    }
+
+    fn make_key(params: &Q, page: &PageRequest) -> Result<String, ServiceError> {
+        // Hash the query params + page info to keep the key short and
+        // avoid accidental PII exposure.
+        let mut hasher = Sha256::new();
+        hasher.update(serde_json::to_vec(params)?);
+        hasher.update(page.page.to_le_bytes());
+        hasher.update(page.per_page.to_le_bytes());
+        if let Some(sort) = page.sort_by {
+            hasher.update(sort.as_bytes());
+        }
+        Ok(format!("nexus:page:{}", hex::encode(hasher.finalize())))
+    }
+
+    fn calculate_etag(page: &Page<T>) -> Result<String, ServiceError> {
+        let mut hasher = Sha256::new();
+        hasher.update(serde_json::to_vec(page)?);
+        Ok(hex::encode(hasher.finalize()))
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("Validation error: {0}")]
+    Validation(#[from] ValidationError),
+    #[error("Repository error: {0}")]
+    Repository(#[from] RepositoryError),
+    #[error("Cache error: {0}")]
+    Cache(#[from] CacheError),
+    #[error("Serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("Hashing error: {0}")]
+    Crypto(#[from] std::io::Error),
+}
+
+//
+// ---------------------- Testing Section ----------------------------------
+// These tests use a stub memory cache + in-memory repository.
+//
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    // ---------------- In-memory stub cache ----------------
+    #[derive(Clone, Default)]
+    struct MemoryCache {
+        store: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CacheBackend for MemoryCache {
+        async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError> {
+            let guard = self.store.lock().await;
+            Ok(guard.get(key).cloned())
+        }
+
+        async fn set_bytes(
+            &self,
+            key: &str,
+            value: &[u8],
+            _ttl: Duration,
+        ) -> Result<(), CacheError> {
+            let mut guard = self.store.lock().await;
+            guard.insert(key.to_string(), value.to_vec());
+            Ok(())
+        }
+    }
+
+    // ---------------- In-memory stub repo ------------------
+    struct FakeRepo;
+
+    #[async_trait::async_trait]
+    impl PagedRepository<(), i32> for FakeRepo {
+        async fn query(
+            &self,
+            _params: (),
+            page: PageRequest,
+        ) -> Result<(Vec<i32>, u64), RepositoryError> {
+            // deterministically return numbers so tests can assert equality
+            let (limit, offset) = page.limit_offset();
+            let start = offset as i32;
+            let data: Vec<i32> = (start..start + limit as i32).collect();
+            Ok((data, 10_000))
+        }
+    }
+
+    #[tokio::test]
+    async fn roundtrip_cache() {
+        let svc = CachedPaginator::new(MemoryCache::default(), FakeRepo, Duration::from_secs(30));
+
+        let req = PageRequest {
+            page: 1,
+            per_page: 5,
+            sort_by: None,
+        };
+
+        // first call should hit repo
+        let first = svc.fetch((), req).await.expect("fetch 1");
+        assert!(!first.cached);
+
+        // second call should hit cache
+        let second = svc.fetch((), req).await.expect("fetch 2");
+        assert!(second.cached);
+
+        // content must be identical
+        assert_eq!(first.data, second.data);
+        assert_eq!(first.etag, second.etag);
+    }
+
+    #[tokio::test]
+    async fn validation_errors_bubble_up() {
+        let svc = CachedPaginator::new(MemoryCache::default(), FakeRepo, Duration::from_secs(30));
+
+        // page 0 should error
+        let err = svc
+            .fetch(
+                (),
+                PageRequest {
+                    page: 0,
+                    per_page: 10,
+                    sort_by: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        matches!(err, ServiceError::Validation(_));
+    }
+}
+```

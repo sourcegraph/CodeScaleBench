@@ -1,0 +1,264 @@
+```csharp
+using System;
+using System.Buffers;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformations
+{
+    /// <summary>
+    /// Calculates the Deployment-Lead-Time KPI by correlating Commit events
+    /// with their corresponding Production-Deployment events.
+    ///
+    /// Lead-Time is defined as the elapsed wall-clock time between a commit
+    /// entering the <c>main</c> branch and that same commit being deployed
+    /// to a production environment.
+    ///
+    /// ┌──────────────────────────┐      ┌─────────────────────────────┐
+    /// │ CommitEvent (git push)   │ ───► │  DeploymentEvent (prod)     │
+    /// └──────────────────────────┘      └─────────────────────────────┘
+    ///                       ▲
+    ///                       └─  Lead-Time
+    ///
+    /// The implementation is stream-centric and memory-efficient; it is
+    /// able to process unbounded, out-of-order streams (Kinesis, Kafka, S3
+    /// object enumeration, etc.) by utilising asynchronous channels and a
+    /// bounded in-memory cache for correlation.
+    /// </summary>
+    public sealed class DeploymentLeadTimeStrategy : IKpiTransformationStrategy
+    {
+        private const int CacheCapacity = 10_000;                           // ~ configurable
+        private static readonly TimeSpan CommitRetention = TimeSpan.FromDays(14);
+
+        private readonly ILogger<DeploymentLeadTimeStrategy> _logger;
+        private readonly IMetricSink _metricSink;
+        private readonly IClock _clock;
+
+        public DeploymentLeadTimeStrategy(
+            ILogger<DeploymentLeadTimeStrategy> logger,
+            IMetricSink metricSink,
+            IClock clock)
+        {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _metricSink = metricSink ?? throw new ArgumentNullException(nameof(metricSink));
+            _clock = clock ?? throw new ArgumentNullException(nameof(clock));
+        }
+
+        public string Name => "deployment_lead_time";
+
+        /// <inheritdoc />
+        public async ValueTask TransformAsync(
+            IAsyncEnumerable<DataRecord> records,
+            CancellationToken cancellationToken = default)
+        {
+            var correlationCache = new CorrelationCache(CacheCapacity);
+
+            await foreach (var record in records.WithCancellation(cancellationToken).ConfigureAwait(false))
+            {
+                if (record is CommitEvent commit)
+                {
+                    correlationCache.SaveCommit(commit);
+                    _logger.LogTrace("Cached commit {CommitSha} at {Timestamp}", commit.Sha, commit.Timestamp);
+                }
+                else if (record is DeploymentEvent deployment)
+                {
+                    if (!correlationCache.TryGetCommit(deployment.CommitSha, out var commitTimestamp))
+                    {
+                        _logger.LogWarning(
+                            "Deployment for commit {CommitSha} observed without prior commit event. " +
+                            "Lead-Time cannot be calculated.",
+                            deployment.CommitSha);
+                        continue;
+                    }
+
+                    var leadTime = deployment.Timestamp - commitTimestamp;
+                    if (leadTime < TimeSpan.Zero)
+                    {
+                        // Out-of-order clocks / skew; ignore but log.
+                        _logger.LogWarning(
+                            "Negative lead-time detected for commit {CommitSha}: {LeadTime}. " +
+                            "Timestamps may be skewed.",
+                            deployment.CommitSha,
+                            leadTime);
+                        continue;
+                    }
+
+                    var metric = new KpiMetric(
+                        name: "deployment_lead_time_minutes",
+                        value: leadTime.TotalMinutes,
+                        timestamp: deployment.Timestamp,
+                        tags: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                        {
+                            ["service"] = deployment.Service,
+                            ["environment"] = deployment.Environment
+                        });
+
+                    await _metricSink.EmitAsync(metric, cancellationToken).ConfigureAwait(false);
+
+                    _logger.LogInformation(
+                        "Emitted deployment lead-time metric for commit {CommitSha}: {LeadTime}",
+                        deployment.CommitSha,
+                        leadTime);
+                }
+
+                // Periodically purge old commits from the cache to avoid unbounded memory growth.
+                correlationCache.Purge(_clock.UtcNow - CommitRetention);
+            }
+        }
+
+        #region –––––––––––––––––– Internal Types ––––––––––––––––––
+
+        /// <summary>
+        /// Bounded, thread-safe correlation cache.
+        /// </summary>
+        private sealed class CorrelationCache
+        {
+            private readonly int _capacity;
+            private readonly ConcurrentDictionary<string, DateTimeOffset> _commitIndex;
+            private readonly Channel<CommitEvent> _evictionChannel;
+
+            public CorrelationCache(int capacity)
+            {
+                _capacity = capacity;
+                _commitIndex = new ConcurrentDictionary<string, DateTimeOffset>(StringComparer.Ordinal);
+                _evictionChannel = Channel.CreateBounded<CommitEvent>(
+                    new BoundedChannelOptions(capacity)
+                    {
+                        SingleReader = true,
+                        SingleWriter = true,
+                        FullMode = BoundedChannelFullMode.DropOldest
+                    });
+
+                // Kick off eviction consumer.
+                _ = Task.Run(EvictAsync);
+            }
+
+            public void SaveCommit(CommitEvent commit)
+            {
+                if (_commitIndex.TryAdd(commit.Sha, commit.Timestamp))
+                {
+                    _evictionChannel.Writer.TryWrite(commit);
+                }
+            }
+
+            public bool TryGetCommit(string sha, out DateTimeOffset timestamp) =>
+                _commitIndex.TryGetValue(sha, out timestamp);
+
+            public void Purge(DateTimeOffset threshold)
+            {
+                foreach (var kvp in _commitIndex)
+                {
+                    if (kvp.Value < threshold)
+                    {
+                        _commitIndex.TryRemove(kvp.Key, out _);
+                    }
+                }
+            }
+
+            private async Task EvictAsync()
+            {
+                await foreach (var commit in _evictionChannel.Reader.ReadAllAsync())
+                {
+                    while (_commitIndex.Count > _capacity)
+                    {
+                        // Remove oldest; by heuristic, channel retains order.
+                        _commitIndex.TryRemove(commit.Sha, out _);
+                    }
+                }
+            }
+        }
+
+        #endregion
+    }
+
+    #region ––––––––––––––––––– Shared Contracts –––––––––––––––––––
+
+    /// <summary>
+    /// Base record for all incoming event-stream items.
+    /// </summary>
+    public abstract record DataRecord(DateTimeOffset Timestamp);
+
+    public sealed record CommitEvent(
+        string Sha,
+        string Branch,
+        string Author,
+        DateTimeOffset Timestamp) : DataRecord(Timestamp);
+
+    public sealed record DeploymentEvent(
+        string CommitSha,
+        string Service,
+        string Environment,
+        DateTimeOffset Timestamp) : DataRecord(Timestamp);
+
+    /// <summary>
+    /// Standardised KPI metric DTO.
+    /// </summary>
+    public sealed class KpiMetric
+    {
+        public KpiMetric(
+            string name,
+            double value,
+            DateTimeOffset timestamp,
+            IReadOnlyDictionary<string, string>? tags = null)
+        {
+            Name = name ?? throw new ArgumentNullException(nameof(name));
+            Value = value;
+            Timestamp = timestamp;
+            Tags = tags ?? new Dictionary<string, string>(0);
+        }
+
+        public string Name { get; }
+        public double Value { get; }
+        public DateTimeOffset Timestamp { get; }
+        public IReadOnlyDictionary<string, string> Tags { get; }
+
+        public string ToJson() => JsonSerializer.Serialize(this);
+    }
+
+    /// <summary>
+    /// Strategy abstraction for KPI transformations.
+    /// </summary>
+    public interface IKpiTransformationStrategy
+    {
+        string Name { get; }
+
+        /// <summary>
+        /// Transforms a sequence of <see cref="DataRecord"/> items into one
+        /// or more KPI emissions.
+        /// </summary>
+        /// <param name="records">Sorted or unsorted event stream.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        ValueTask TransformAsync(
+            IAsyncEnumerable<DataRecord> records,
+            CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Metric sink abstraction (CloudWatch, Prometheus, etc.).
+    /// </summary>
+    public interface IMetricSink
+    {
+        Task EmitAsync(
+            KpiMetric metric,
+            CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Time provider abstraction to ease testing (time-travel).
+    /// </summary>
+    public interface IClock
+    {
+        DateTimeOffset UtcNow { get; }
+    }
+
+    #endregion
+}
+```

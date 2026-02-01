@@ -1,0 +1,591 @@
+/*
+ * MercuryMonolith Commerce Hub – Response Cache
+ *
+ * File:    src/module_3.txt             (compiled as .c)
+ * License: MIT
+ *
+ * Summary
+ * -------
+ * Thread–safe, in-memory LRU cache used by the API-Gateway layer to store
+ * serialized HTTP / GraphQL responses.  The cache provides:
+ *
+ *   • O(1) inserts, look-ups, & deletions (hash table + DLL)
+ *   • Per-entry TTL (seconds)
+ *   • Global maximum entry count (evicts LRU on overflow)
+ *   • Instrumentation hooks (Prometheus-style counters / gauges)
+ *
+ * NOTE: This translation unit purposefully avoids any allocation outside the
+ *       cache API to simplify memory-ownership semantics for callers.
+ */
+
+#define _POSIX_C_SOURCE 200809L /* clock_gettime, pthread_mutexattr_settype */
+
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* --------------------------------------------------------------------------
+ * uthash – single-header hash map (public domain by Troy D. Hanson)
+ * -------------------------------------------------------------------------- */
+#ifndef UTHASH_H
+#define UTHASH_H
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+
+#define uthash_malloc(sz)        malloc(sz)
+#define uthash_free(ptr, sz)     free(ptr)
+#define uthash_noexpand_fyi(tbl) /* nop */
+#define uthash_expand_fyi(tbl)   /* nop */
+#define HASH_BLOOM 16
+
+#include <stddef.h> /* size_t, ptrdiff_t */
+#include <limits.h>
+#include <inttypes.h>
+
+/* --- trimmed down uthash.h implementation (keyed by const char*) ---------- */
+/* Only functions/macros actually used by this module are included to keep
+ * the snippet compact.  For the full feature-set import the canonical header.
+ */
+typedef struct UT_hash_bucket {
+    unsigned count;
+    struct UT_hash_handle *hh_head;
+} UT_hash_bucket;
+
+typedef struct UT_hash_table {
+    UT_hash_bucket *buckets;
+    unsigned num_buckets, log2_num_buckets;
+    unsigned upper_bound;
+    unsigned num_items;
+    ptrdiff_t hho;
+} UT_hash_table;
+
+typedef struct UT_hash_handle {
+    struct UT_hash_table *tbl;
+    void *prev;                /* prev element in app order      */
+    void *next;                /* next element in app order      */
+    struct UT_hash_handle *hh_prev; /* previous hh in bucket order */
+    struct UT_hash_handle *hh_next; /* next hh in bucket order     */
+    const void *key;
+    unsigned keylen;
+    uint32_t hashv;
+} UT_hash_handle;
+
+/* small helpers ----------------------------------------------------------- */
+static inline uint32_t _uthash_rotl32(uint32_t v, uint32_t n) {
+    return (v << n) | (v >> (32 - n));
+}
+
+static inline uint32_t _uthash_murmur(const unsigned char *key, unsigned len) {
+    uint32_t h = 0x9747b28c;
+    const uint32_t m = 0x5bd1e995;
+    const int r = 24;
+
+    while (len >= 4) {
+        uint32_t k = *(uint32_t *)key;
+        k *= m; k ^= k >> r; k *= m;
+        h *= m; h ^= k;
+        key += 4; len -= 4;
+    }
+
+    switch (len) {
+        case 3: h ^= key[2] << 16;
+        case 2: h ^= key[1] << 8;
+        case 1: h ^= key[0];
+                h *= m;
+    };
+
+    h ^= h >> 13;
+    h *= m;
+    h ^= h >> 15;
+    return h;
+}
+
+#define HASH_INITIAL_NUM_BUCKETS 32U
+#define HASH_INITIAL_NUM_BUCKETS_LOG2 5U
+#define HASH_BKT_CAPACITY_THRESH 10U
+
+#define HASH_FIND_STR(head, findstr, out)                                      \
+    HASH_FIND(hh, head, findstr, (unsigned)strlen(findstr), out)
+
+#define HASH_ADD_KEYPTR(hh, head, keyptr, keylen_in, add)                      \
+    HASH_ADD_KEYPTR_BYHASHVALUE(hh, head, keyptr, keylen_in,                   \
+                                _uthash_murmur((const unsigned char *)keyptr,  \
+                                               (unsigned)keylen_in), add)
+
+#define HASH_DEL(head, delptr)                                                 \
+    HASH_DELETE(hh, head, delptr)
+
+#define HASH_FIND(hh, head, keyptr, keylen, out)                               \
+do {                                                                           \
+    out = NULL;                                                                \
+    if (head) {                                                                \
+        uint32_t _hf_hashv =                                                   \
+            _uthash_murmur((const unsigned char *)keyptr, keylen);             \
+        unsigned _hf_bkt = _hf_hashv & head->hh.tbl->num_buckets-1;            \
+        struct UT_hash_handle *_hf_hh = head->hh.tbl->buckets[_hf_bkt].hh_head;\
+        while (_hf_hh) {                                                       \
+            if ((_hf_hh->keylen == keylen) &&                                  \
+                (memcmp(_hf_hh->key, keyptr, keylen) == 0)) {                  \
+                out = _hf_hh->prev ? (void*)_hf_hh->prev :                     \
+                      (void*)((char*)_hf_hh - _hf_hh->tbl->hho);               \
+                break;                                                         \
+            }                                                                  \
+            _hf_hh = _hf_hh->hh_next;                                          \
+        }                                                                      \
+    }                                                                          \
+} while (0)
+
+#define HASH_ADD_KEYPTR_BYHASHVALUE(hh, head, keyptr, keylen_in, hashval, add) \
+do {                                                                           \
+    unsigned _ha_bkt;                                                          \
+    (add)->hh.key = (const void*)(keyptr);                                     \
+    (add)->hh.keylen = (unsigned)(keylen_in);                                  \
+    (add)->hh.hashv = hashval;                                                 \
+    if (!(head)) {                                                             \
+        (head) = (add);                                                        \
+        (head)->hh.tbl = (UT_hash_table*)uthash_malloc(sizeof(UT_hash_table)); \
+        memset((head)->hh.tbl, 0, sizeof(UT_hash_table));                      \
+        (head)->hh.tbl->num_buckets = HASH_INITIAL_NUM_BUCKETS;                \
+        (head)->hh.tbl->log2_num_buckets = HASH_INITIAL_NUM_BUCKETS_LOG2;      \
+        (head)->hh.tbl->buckets = (UT_hash_bucket*)uthash_malloc(              \
+            HASH_INITIAL_NUM_BUCKETS * sizeof(struct UT_hash_bucket));         \
+        memset((head)->hh.tbl->buckets, 0,                                     \
+               HASH_INITIAL_NUM_BUCKETS * sizeof(struct UT_hash_bucket));      \
+        (head)->hh.tbl->hho = (char*)&((typeof(add))0)->hh - (char*)0;         \
+    }                                                                          \
+    (add)->hh.tbl = (head)->hh.tbl;                                            \
+    _ha_bkt = (add)->hh.hashv & ((add)->hh.tbl->num_buckets - 1);              \
+    struct UT_hash_bucket *_ha_bucket = &((add)->hh.tbl->buckets[_ha_bkt]);    \
+    (add)->hh.hh_next = _ha_bucket->hh_head;                                   \
+    _ha_bucket->hh_head = &((add)->hh);                                        \
+    _ha_bucket->count++;                                                       \
+    (add)->prev = NULL;                                                        \
+    (add)->next = (void*)(head);                                               \
+    if (head) ((typeof(add))(head))->prev = (add);                             \
+    (head) = (add);                                                            \
+} while (0)
+
+#define HASH_DELETE(hh, head, delptr)                                          \
+do {                                                                           \
+    unsigned _hd_bkt;                                                          \
+    if (delptr->hh.prev)                                                       \
+        ((typeof(delptr))delptr->hh.prev)->hh.next = delptr->hh.next;          \
+    else                                                                       \
+        head = delptr->hh.next;                                                \
+    if (delptr->hh.next)                                                       \
+        ((typeof(delptr))delptr->hh.next)->hh.prev = delptr->hh.prev;          \
+    _hd_bkt = delptr->hh.hashv & (delptr->hh.tbl->num_buckets - 1);            \
+    if (delptr->hh.tbl->buckets[_hd_bkt].hh_head == &delptr->hh)               \
+        delptr->hh.tbl->buckets[_hd_bkt].hh_head = delptr->hh.hh_next;         \
+    if (delptr->hh.hh_prev)                                                    \
+        delptr->hh.hh_prev->hh_next = delptr->hh.hh_next;                      \
+    if (delptr->hh.hh_next)                                                    \
+        delptr->hh.hh_next->hh_prev = delptr->hh.hh_prev;                      \
+    delptr->hh.tbl->buckets[_hd_bkt].count--;                                  \
+} while (0)
+
+#pragma GCC diagnostic pop
+#endif /* UTHASH_H */
+
+/* --------------------------------------------------------------------------
+ * Public Types
+ * -------------------------------------------------------------------------- */
+
+/* Serialized HTTP response kept in the cache. Ownership:
+ *   - The 'body' buffer is heap-allocated and freed by the cache.  Callers
+ *     receive a deep copy of every string/ buffer to avoid lifetime issues.
+ */
+typedef struct {
+    uint16_t status_code;
+    char    *content_type; /* UTF-8, NUL-terminated               */
+    void    *body;         /* opaque; may be binary               */
+    size_t   body_len;
+} cached_response_t;
+
+/* Prometheus-style counter + gauge metrics snapshot */
+typedef struct {
+    uint64_t lookups_total;
+    uint64_t hits_total;
+    uint64_t misses_total;
+    uint64_t evictions_total;
+    uint64_t size;           /* number of live entries (gauge) */
+} cache_metrics_t;
+
+/* Opaque handle exported to the world */
+typedef struct response_cache  response_cache_t;
+
+/* --------------------------------------------------------------------------
+ * Internal Structures
+ * -------------------------------------------------------------------------- */
+
+typedef struct cache_entry {
+    /* Hash key + links ----------------------------------------------------- */
+    char *key;                        /* composite cache key                */
+    UT_hash_handle hh;                /* uthash linkage                     */
+
+    /* LRU doubly linked list ---------------------------------------------- */
+    struct cache_entry *prev, *next;  /* prev/newer, next/older             */
+
+    /* Payload -------------------------------------------------------------- */
+    cached_response_t resp;
+
+    /* Expiration ----------------------------------------------------------- */
+    time_t expiry_epoch;
+
+} cache_entry_t;
+
+struct response_cache {
+    /* Synchronization lock */
+    pthread_mutex_t mtx;
+
+    /* Config */
+    size_t   max_entries;
+    uint32_t default_ttl;
+
+    /* Hash map root (key → entry) */
+    cache_entry_t *dict;
+
+    /* LRU list head (MRU) / tail (LRU) */
+    cache_entry_t *lru_head;
+    cache_entry_t *lru_tail;
+
+    /* Metrics */
+    uint64_t lookups_total;
+    uint64_t hits_total;
+    uint64_t misses_total;
+    uint64_t evictions_total;
+};
+
+/* --------------------------------------------------------------------------
+ * Static helpers
+ * -------------------------------------------------------------------------- */
+
+/* Return current epoch seconds (monotonic not needed for expirations) */
+static inline time_t _now_seconds(void) {
+    return time(NULL);
+}
+
+static cached_response_t _deep_copy_resp(const cached_response_t *src) {
+    cached_response_t copy = {0};
+    copy.status_code = src->status_code;
+    copy.body_len    = src->body_len;
+
+    if (src->content_type) {
+        copy.content_type = strdup(src->content_type);
+    }
+    if (src->body_len > 0 && src->body) {
+        copy.body = malloc(src->body_len);
+        memcpy(copy.body, src->body, src->body_len);
+    }
+    return copy;
+}
+
+static void _free_resp(cached_response_t *r) {
+    if (!r) return;
+    free(r->content_type);
+    free(r->body);
+    memset(r, 0, sizeof(*r));
+}
+
+/* Remove node from LRU list (does not manipulate hash map) */
+static inline void _lru_detach(response_cache_t *c, cache_entry_t *e) {
+    if (!e) return;
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_head == e) c->lru_head = e->next;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+    e->prev = e->next = NULL;
+}
+
+/* Insert node at list head (most recently used) */
+static inline void _lru_insert_mru(response_cache_t *c, cache_entry_t *e) {
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+/* Evict least-recently-used entry */
+static void _evict_tail(response_cache_t *c) {
+    cache_entry_t *victim = c->lru_tail;
+    if (!victim) return;
+
+    /* Remove from LRU list */
+    _lru_detach(c, victim);
+
+    /* Remove from dictionary */
+    HASH_DEL(c->dict, victim);
+
+    /* Update metrics */
+    c->evictions_total++;
+
+    /* Free resources */
+    _free_resp(&victim->resp);
+    free(victim->key);
+    free(victim);
+}
+
+/* Garbage collect expired items. Called opportunistically from public API. */
+static void _purge_expired_locked(response_cache_t *c) {
+    cache_entry_t *e = c->lru_tail;
+    time_t now = _now_seconds();
+
+    while (e && e->expiry_epoch <= now) {
+        cache_entry_t *prev = e->prev;
+        _lru_detach(c, e);
+        HASH_DEL(c->dict, e);
+
+        _free_resp(&e->resp);
+        free(e->key);
+        free(e);
+
+        c->evictions_total++;
+        e = prev;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Public API
+ * -------------------------------------------------------------------------- */
+
+response_cache_t *response_cache_new(size_t max_entries,
+                                     uint32_t default_ttl_seconds)
+{
+    if (max_entries == 0 || default_ttl_seconds == 0) {
+        return NULL;
+    }
+
+    response_cache_t *c = calloc(1, sizeof(*c));
+    if (!c) return NULL;
+
+    c->max_entries = max_entries;
+    c->default_ttl = default_ttl_seconds;
+
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
+    pthread_mutex_init(&c->mtx, &attr);
+    pthread_mutexattr_destroy(&attr);
+
+    return c;
+}
+
+void response_cache_free(response_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_mutex_lock(&c->mtx);
+    cache_entry_t *e, *tmp;
+    HASH_ITER(hh, c->dict, e, tmp) {
+        HASH_DEL(c->dict, e);
+        _free_resp(&e->resp);
+        free(e->key);
+        free(e);
+    }
+    pthread_mutex_unlock(&c->mtx);
+    pthread_mutex_destroy(&c->mtx);
+    free(c);
+}
+
+bool response_cache_get(response_cache_t *c,
+                        const char *key,
+                        cached_response_t *out)
+{
+    if (!c || !key || !out) return false;
+
+    pthread_mutex_lock(&c->mtx);
+    c->lookups_total++;
+
+    /* purge expirations on read path (cheap) */
+    _purge_expired_locked(c);
+
+    cache_entry_t *e;
+    HASH_FIND_STR(c->dict, key, e);
+
+    if (!e) {
+        c->misses_total++;
+        pthread_mutex_unlock(&c->mtx);
+        return false;
+    }
+
+    /* Check TTL */
+    if (e->expiry_epoch <= _now_seconds()) {
+        /* expired – treat as miss */
+        _lru_detach(c, e);
+        HASH_DEL(c->dict, e);
+        _free_resp(&e->resp);
+        free(e->key);
+        free(e);
+
+        c->misses_total++;
+        c->evictions_total++;
+        pthread_mutex_unlock(&c->mtx);
+        return false;
+    }
+
+    /* Hit */
+    c->hits_total++;
+
+    /* Move to MRU */
+    _lru_detach(c, e);
+    _lru_insert_mru(c, e);
+
+    /* Deep copy for caller */
+    *out = _deep_copy_resp(&e->resp);
+
+    pthread_mutex_unlock(&c->mtx);
+    return true;
+}
+
+void response_cache_put(response_cache_t *c,
+                        const char *key,
+                        const void *payload,
+                        size_t len,
+                        const char *content_type,
+                        uint16_t http_status,
+                        uint32_t ttl_seconds)
+{
+    if (!c || !key || !payload || len == 0) return;
+
+    pthread_mutex_lock(&c->mtx);
+
+    /* purge expired first */
+    _purge_expired_locked(c);
+
+    cache_entry_t *e;
+    HASH_FIND_STR(c->dict, key, e);
+
+    if (e) {
+        /* Replace existing payload --------------------------------------- */
+        _lru_detach(c, e);
+        _free_resp(&e->resp);
+
+        e->resp.body = malloc(len);
+        memcpy(e->resp.body, payload, len);
+        e->resp.body_len = len;
+        e->resp.status_code = http_status;
+        e->resp.content_type = content_type ? strdup(content_type) : NULL;
+    } else {
+        /* Allocate new entry --------------------------------------------- */
+        e = calloc(1, sizeof(*e));
+        e->key = strdup(key);
+
+        e->resp.body = malloc(len);
+        memcpy(e->resp.body, payload, len);
+        e->resp.body_len = len;
+        e->resp.status_code = http_status;
+        e->resp.content_type = content_type ? strdup(content_type) : NULL;
+
+        HASH_ADD_KEYPTR(hh, c->dict, e->key, strlen(e->key), e);
+    }
+
+    /* Expiration */
+    uint32_t ttl = ttl_seconds ? ttl_seconds : c->default_ttl;
+    e->expiry_epoch = _now_seconds() + ttl;
+
+    /* Update LRU */
+    _lru_insert_mru(c, e);
+
+    /* enforce capacity */
+    while (HASH_COUNT(c->dict) > c->max_entries) {
+        _evict_tail(c);
+    }
+
+    pthread_mutex_unlock(&c->mtx);
+}
+
+void response_cache_invalidate(response_cache_t *c, const char *key)
+{
+    if (!c || !key) return;
+
+    pthread_mutex_lock(&c->mtx);
+    cache_entry_t *e;
+    HASH_FIND_STR(c->dict, key, e);
+
+    if (e) {
+        _lru_detach(c, e);
+        HASH_DEL(c->dict, e);
+        _free_resp(&e->resp);
+        free(e->key);
+        free(e);
+        c->evictions_total++;
+    }
+    pthread_mutex_unlock(&c->mtx);
+}
+
+void response_cache_purge(response_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_mutex_lock(&c->mtx);
+    cache_entry_t *e, *tmp;
+    HASH_ITER(hh, c->dict, e, tmp) {
+        HASH_DEL(c->dict, e);
+        _free_resp(&e->resp);
+        free(e->key);
+        free(e);
+        c->evictions_total++;
+    }
+    c->lru_head = c->lru_tail = NULL;
+    pthread_mutex_unlock(&c->mtx);
+}
+
+void response_cache_snapshot_metrics(response_cache_t *c,
+                                     cache_metrics_t *out)
+{
+    if (!c || !out) return;
+    pthread_mutex_lock(&c->mtx);
+    out->lookups_total  = c->lookups_total;
+    out->hits_total     = c->hits_total;
+    out->misses_total   = c->misses_total;
+    out->evictions_total= c->evictions_total;
+    out->size           = HASH_COUNT(c->dict);
+    pthread_mutex_unlock(&c->mtx);
+}
+
+/* --------------------------------------------------------------------------
+ * Debug / Unit-test scaffolding (compile with -DRESPONSE_CACHE_TEST)
+ * -------------------------------------------------------------------------- */
+#ifdef RESPONSE_CACHE_TEST
+#include <assert.h>
+
+static void _basic_test(void)
+{
+    const char *key = "GET:/v1/orders?limit=10";
+    const char *body = "{\"orders\":[]}";
+
+    response_cache_t *c = response_cache_new(4, 5);
+    assert(c);
+
+    cached_response_t out;
+    bool ok = response_cache_get(c, key, &out);
+    assert(!ok);
+
+    response_cache_put(c, key, body, strlen(body),
+                       "application/json", 200, 2);
+
+    ok = response_cache_get(c, key, &out);
+    assert(ok);
+    assert(out.status_code == 200);
+    assert(out.body_len == strlen(body));
+    response_cache_invalidate(c, key);
+    _free_resp(&out);
+
+    ok = response_cache_get(c, key, &out);
+    assert(!ok);
+
+    response_cache_free(c);
+    puts("Response cache tests passed.");
+}
+
+int main(void)
+{
+    _basic_test();
+    return 0;
+}
+#endif /* RESPONSE_CACHE_TEST */

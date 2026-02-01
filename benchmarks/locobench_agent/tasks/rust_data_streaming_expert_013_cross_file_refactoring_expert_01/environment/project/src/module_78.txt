@@ -1,0 +1,481 @@
+// src/module_78.rs
+
+//! Real-time enrichment and quality control pipeline.
+//!
+//! This module implements a configurable, pluggable enrichment pipeline that
+//! continuously consumes `SocialEvent` items from a Kafka topic (or any
+//! compatible [`Stream`]) and publishes the transformed events to downstream
+//! sinks.  The design follows the Strategy Pattern so that new enrichment
+//! algorithms can be hot-swapped without recompiling the rest of the
+//! application.
+//
+// Features demonstrated:
+// * Parallel execution of enrichment strategies (tokio tasks / Rayon optional).
+// * Data-quality checks w/ pluggable validation rules.
+// * Scheduling of maintenance tasks (retention, compaction) using cron
+//   patterns.
+// * Observability via [`tracing`] and [`metrics`].
+// * Graceful error handling and back-pressure aware stream processing.
+
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::{stream::FuturesUnordered, Stream, StreamExt};
+use metrics::{counter, gauge, histogram};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    select,
+    sync::mpsc::{self, Receiver, Sender},
+    task,
+    time,
+};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Maximum number of concurrent events that may be processed.
+///
+/// In practice this would be tuned according to CPU/RAM and downstream
+/// throughput characteristics.
+const MAX_CONCURRENT_EVENTS: usize = 1024;
+
+/// A domain object representing a single unit of social data that entered the
+/// platform.
+///
+/// The struct is intentionally minimal; any number of optional metadata values
+/// may live under `tags`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialEvent {
+    pub event_id: String,
+    pub author_id: String,
+    pub created_at: DateTime<Utc>,
+    pub text: String,
+
+    /// Additional, arbitrary metadata appended by upstream sources.
+    pub tags: HashMap<String, String>,
+}
+
+/// An enriched version of [`SocialEvent`].
+///
+/// Enrichment strategies may add or mutate fields, but never remove them.  We
+/// separate the enriched event into its own type to provide compile-time
+/// guarantees that mandatory enrichment has been executed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichedEvent {
+    pub base: SocialEvent,
+
+    /// ISO-639 language code (e.g. "en", "es").
+    pub language: Option<String>,
+
+    /// Toxicity score between 0.0 and 1.0 where 1.0 is highly toxic.
+    pub toxicity_score: Option<f32>,
+
+    /// Arbitrary extra tags.
+    pub extra: HashMap<String, String>,
+}
+
+/// Errors that can occur during enrichment or quality checks.
+#[derive(thiserror::Error, Debug)]
+pub enum PipelineError {
+    #[error("enrichment failed: {0}")]
+    Enrichment(#[from] anyhow::Error),
+
+    #[error("data quality violation: {0}")]
+    Validation(String),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("channel closed")]
+    ChannelClosed,
+}
+
+/// Strategy pattern for enrichment.
+///
+/// Each concrete implementation is a *hot-swappable* component that can be
+/// loaded from configuration at runtime.  We favour async traits in order to
+/// support network calls (language models, external toxicity APIs, …).
+#[async_trait]
+pub trait EnrichmentStrategy: Send + Sync {
+    async fn enrich(&self, event: EnrichedEvent) -> Result<EnrichedEvent, PipelineError>;
+
+    /// A short human-readable label used in metrics and logs.
+    fn name(&self) -> &'static str;
+}
+
+/// A quality control rule that inspects a value and returns success or failure.
+pub trait DataQualityRule: Send + Sync {
+    fn check(&self, event: &SocialEvent) -> Result<(), PipelineError>;
+
+    /// Same semantic purpose as [`EnrichmentStrategy::name`].
+    fn name(&self) -> &'static str;
+}
+
+/// Validate that the text body is not empty or whitespace.
+pub struct RuleNonEmptyText;
+
+impl DataQualityRule for RuleNonEmptyText {
+    fn check(&self, event: &SocialEvent) -> Result<(), PipelineError> {
+        if event.text.trim().is_empty() {
+            Err(PipelineError::Validation(
+                "Text payload must not be empty".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "non_empty_text"
+    }
+}
+
+/// Validate maximum payload length.
+pub struct RuleMaxLength {
+    max_len: usize,
+}
+
+impl RuleMaxLength {
+    pub fn new(max_len: usize) -> Self {
+        Self { max_len }
+    }
+}
+
+impl DataQualityRule for RuleMaxLength {
+    fn check(&self, event: &SocialEvent) -> Result<(), PipelineError> {
+        if event.text.len() > self.max_len {
+            Err(PipelineError::Validation(format!(
+                "payload too large: {} > {}",
+                event.text.len(),
+                self.max_len
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "max_length"
+    }
+}
+
+/// A concrete enrichment strategy using a third-party ML model to detect the
+/// dominant language of a post.
+///
+/// The implementation is stubbed out; in production this might call a
+/// transformer model or remote REST endpoint.
+pub struct LangDetectStrategy;
+
+#[async_trait]
+impl EnrichmentStrategy for LangDetectStrategy {
+    async fn enrich(&self, mut event: EnrichedEvent) -> Result<EnrichedEvent, PipelineError> {
+        histogram!("pipeline.strategy.latency_ms", 0.0, "strategy" => self.name());
+        // Placeholder heuristic; replace with proper detection.
+        let language = if event.base.text.is_ascii() { "en" } else { "und" };
+
+        event.language = Some(language.into());
+        Ok(event)
+    }
+
+    fn name(&self) -> &'static str {
+        "lang_detect"
+    }
+}
+
+/// A concrete enrichment strategy that assigns a toxicity score.
+///
+/// The example uses a dummy scoring function.
+pub struct ToxicityScoringStrategy;
+
+#[async_trait]
+impl EnrichmentStrategy for ToxicityScoringStrategy {
+    async fn enrich(&self, mut event: EnrichedEvent) -> Result<EnrichedEvent, PipelineError> {
+        // Again, placeholder method. Replace by call to Jigsaw Perspective API etc.
+        let score = if event.base.text.to_lowercase().contains("hate") {
+            0.9
+        } else {
+            0.1
+        };
+
+        event.toxicity_score = Some(score);
+        Ok(event)
+    }
+
+    fn name(&self) -> &'static str {
+        "toxicity_scoring"
+    }
+}
+
+/// A thin abstraction around the collection of [`DataQualityRule`] items.
+#[derive(Default)]
+pub struct DataQualityEngine {
+    rules: Vec<Arc<dyn DataQualityRule>>,
+}
+
+impl DataQualityEngine {
+    pub fn new(rules: Vec<Arc<dyn DataQualityRule>>) -> Self {
+        Self { rules }
+    }
+
+    pub fn check(&self, event: &SocialEvent) -> Result<(), PipelineError> {
+        for rule in &self.rules {
+            match rule.check(event) {
+                Ok(()) => {
+                    counter!("pipeline.quality.ok", 1, "rule" => rule.name());
+                }
+                Err(err) => {
+                    counter!("pipeline.quality.err", 1, "rule" => rule.name());
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// An asynchronous enrichment pipeline.
+///
+/// Clones of the pipeline share the same underlying strategy list by `Arc`.
+pub struct Pipeline {
+    enrichers: Vec<Arc<dyn EnrichmentStrategy>>,
+    dq_engine: Arc<DataQualityEngine>,
+}
+
+impl Pipeline {
+    pub fn builder() -> PipelineBuilder {
+        PipelineBuilder::default()
+    }
+
+    #[instrument(skip(self))]
+    pub async fn process_event(&self, input: SocialEvent) -> Result<EnrichedEvent, PipelineError> {
+        // 1. Data quality checks
+        self.dq_engine.check(&input)?;
+
+        // 2. Convert to enriched representation
+        let mut enriched = EnrichedEvent {
+            base: input,
+            language: None,
+            toxicity_score: None,
+            extra: HashMap::new(),
+        };
+
+        // 3. Pass through all enrichment strategies
+        for enricher in &self.enrichers {
+            let now = SystemTime::now();
+            enriched = enricher.enrich(enriched).await?;
+            let took = SystemTime::now()
+                .duration_since(now)
+                .unwrap_or_else(|_| Duration::from_millis(0));
+            histogram!(
+                "pipeline.strategy.latency_ms",
+                took.as_millis() as f64,
+                "strategy" => enricher.name()
+            );
+        }
+
+        Ok(enriched)
+    }
+}
+
+#[derive(Default)]
+pub struct PipelineBuilder {
+    enrichers: Vec<Arc<dyn EnrichmentStrategy>>,
+    rules: Vec<Arc<dyn DataQualityRule>>,
+}
+
+impl PipelineBuilder {
+    pub fn with_enricher<E: EnrichmentStrategy + 'static>(mut self, enricher: E) -> Self {
+        self.enrichers.push(Arc::new(enricher));
+        self
+    }
+
+    pub fn with_quality_rule<R: DataQualityRule + 'static>(mut self, rule: R) -> Self {
+        self.rules.push(Arc::new(rule));
+        self
+    }
+
+    pub fn build(self) -> Pipeline {
+        let dq_engine = DataQualityEngine::new(self.rules);
+        Pipeline {
+            enrichers: self.enrichers,
+            dq_engine: Arc::new(dq_engine),
+        }
+    }
+}
+
+/// Spawns the streaming pipeline.
+///
+/// Consumes events from the given [`Stream`], processes them concurrently, and
+/// publishes them to the supplied [`Sender`].
+///
+/// The caller is responsible for providing a bounded channel with sufficient
+/// capacity to handle downstream back-pressure.
+///
+/// Returns once the input stream ends or a fatal error occurs.
+pub async fn run_pipeline<S>(
+    pipeline: Arc<Pipeline>,
+    mut input: S,
+    mut output: Sender<EnrichedEvent>,
+) -> Result<(), PipelineError>
+where
+    S: Stream<Item = SocialEvent> + Unpin + Send + 'static,
+{
+    info!("starting pipeline loop");
+
+    let mut in_flight: FuturesUnordered<
+        Pin<Box<dyn Future<Output = (Result<EnrichedEvent, PipelineError>, SystemTime)> + Send>>,
+    > = FuturesUnordered::new();
+
+    loop {
+        select! {
+            maybe_event = input.next(), if in_flight.len() < MAX_CONCURRENT_EVENTS => {
+                match maybe_event {
+                    Some(event) => {
+                        let span = tracing::info_span!("process_event", event_id=%event.event_id);
+                        let fut = {
+                            let p = pipeline.clone();
+                            async move {
+                                let started = SystemTime::now();
+                                let res = p.process_event(event).await;
+                                (res, started)
+                            }
+                        };
+                        in_flight.push(Box::pin(fut).instrument(span));
+                    }
+                    None => {
+                        debug!("input stream exhausted");
+                        break;
+                    }
+                }
+            }
+
+            Some((res, started)) = in_flight.next() => {
+                match res {
+                    Ok(enriched) => {
+                        let latency = SystemTime::now().duration_since(started).unwrap_or_default();
+                        histogram!("pipeline.event.latency_ms", latency.as_millis() as f64);
+                        if let Err(err) = output.send(enriched).await {
+                            error!(error=%err, "failed to forward enriched event");
+                            return Err(PipelineError::ChannelClosed);
+                        }
+                    }
+                    Err(err) => {
+                        warn!(%err, "discarding event due to error");
+                        counter!("pipeline.event.discarded", 1, "reason" => format!("{err:?}"));
+                    }
+                }
+            }
+
+            else => {
+                // All events processed and no new events incoming.
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Background job that triggers batch compaction and statistics aggregation.
+///
+/// Demonstrates the scheduling feature; in real deployments this would touch the
+/// Iceberg table or fire off Airflow jobs.
+pub async fn schedule_maintenance_jobs() {
+    let mut interval = time::interval(Duration::from_secs(60 * 60)); // every hour
+    loop {
+        interval.tick().await;
+
+        let span = tracing::info_span!("maintenance_job", job="compaction");
+        let _enter = span.enter();
+        let start = SystemTime::now();
+
+        if let Err(err) = run_compaction().await {
+            error!(%err, "maintenance job failed");
+        }
+
+        let took = SystemTime::now().duration_since(start).unwrap_or_default();
+        info!("maintenance job completed in {:?}", took);
+    }
+}
+
+/// Example stub for a heavy batch task.
+async fn run_compaction() -> Result<(), PipelineError> {
+    // Simulate compaction work
+    time::sleep(Duration::from_secs(3)).await;
+    Ok(())
+}
+
+/// Sets up tracing, metrics, and kicks off an example pipeline.
+///
+/// This function is for demonstration / integration test purposes and would
+/// normally live in a `main.rs`.  To prevent accidental inclusion in production
+/// builds the code is guarded by the `"bin"` feature flag.
+#[cfg(feature = "bin")]
+pub async fn demo() -> Result<(), PipelineError> {
+    // Initialize global subscribers
+    tracing_subscriber::fmt::init();
+    metrics_exporter_prometheus::PrometheusBuilder::new().install()?;
+
+    // Prepare a fake data source that yields random events.
+    let (src_tx, src_rx) = mpsc::channel(1024);
+    task::spawn(simulate_source(src_tx));
+
+    // Downstream sink
+    let (sink_tx, mut sink_rx) = mpsc::channel::<EnrichedEvent>(1024);
+
+    // Build pipeline
+    let pipeline = Pipeline::builder()
+        .with_quality_rule(RuleNonEmptyText)
+        .with_quality_rule(RuleMaxLength::new(280))
+        .with_enricher(LangDetectStrategy)
+        .with_enricher(ToxicityScoringStrategy)
+        .build();
+
+    let pipeline = Arc::new(pipeline);
+
+    // Spawn pipeline as background task
+    let pipe_handle = {
+        let p = pipeline.clone();
+        task::spawn(async move { run_pipeline(p, tokio_stream::wrappers::ReceiverStream::new(src_rx), sink_tx).await })
+    };
+
+    // Consume enriched events
+    task::spawn(async move {
+        while let Some(event) = sink_rx.recv().await {
+            debug!("Enriched event: {:?}", event);
+        }
+    });
+
+    // Run maintenance scheduler
+    task::spawn(schedule_maintenance_jobs());
+
+    pipe_handle.await??;
+    Ok(())
+}
+
+#[cfg(feature = "bin")]
+async fn simulate_source(mut tx: Sender<SocialEvent>) {
+    let mut id = 0u64;
+    loop {
+        id += 1;
+        let event = SocialEvent {
+            event_id: id.to_string(),
+            author_id: "alice".into(),
+            created_at: Utc::now(),
+            text: "I love Rust!".into(),
+            tags: HashMap::new(),
+        };
+
+        if let Err(err) = tx.send(event).await {
+            error!(%err, "source channel closed");
+            break;
+        }
+
+        time::sleep(Duration::from_millis(100)).await;
+    }
+}

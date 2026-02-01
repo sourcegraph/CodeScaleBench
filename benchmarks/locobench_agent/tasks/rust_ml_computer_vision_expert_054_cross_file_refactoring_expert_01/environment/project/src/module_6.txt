@@ -1,0 +1,423 @@
+```rust
+//! VisuTility Orchestrator
+//! -------------------------------------------------------------
+//! Module 6 ‒ Model-Monitoring + Auto-Retraining Orchestrator
+//!
+//! Responsibility
+//! --------------
+//! • Collect continuous, aggregated performance metrics flowing
+//!   from Serving-Ops.
+//! • Evaluate metrics against a configurable retraining strategy.
+//! • When criteria are met, delegate new-model training to a
+//!   ModelTrainer implementation.
+//! • Atomically register & promote the freshly trained model
+//!   inside the internal [ModelRegistry].
+//!
+//! Architectural Patterns
+//! ----------------------
+//! • Observer Pattern   –  `MetricsBroadcaster` ↔ observers
+//! • Strategy Pattern   –  `RetrainingStrategy` pluggable logic
+//! • Factory  Pattern   –  `TrainerFactory` (dynamic trainer)
+//! • Registry Pattern   –  `ModelRegistry` versioned storage
+//!
+//! NOTE: This is **production-oriented** code: underlying I/O is
+//! mock-only so the module is self-contained for unit-testing;
+//! swap the mocked layer with real subsystems in integration
+//! crates.
+
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, RwLock, Weak},
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use rand::Rng;
+use thiserror::Error;
+use tokio::{
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    task,
+    time::sleep,
+};
+
+/// ───────────────────────────────────────────────────────────────
+/// Domain Types
+/// ───────────────────────────────────────────────────────────────
+
+/// KPI metrics published by Serving-Ops.
+///
+/// In real deployments this would originate from a streaming
+/// source (Prometheus, Kafka, …).
+#[derive(Debug, Clone)]
+pub struct PerformanceMetrics {
+    pub accuracy: f32,
+    pub f1_score: f32,
+    pub drift_score: f32,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// A monotonic model version identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModelVersion(pub u32);
+
+/// Registry entry stored in the [`ModelRegistry`].
+#[derive(Debug, Clone)]
+pub struct ModelArtifact {
+    pub version: ModelVersion,
+    pub path: PathBuf,
+    pub created_at: DateTime<Utc>,
+    pub metadata: HashMap<String, String>,
+}
+
+/// Domain errors bubbled to upstream callers.
+#[derive(Debug, Error)]
+pub enum OrchestratorError {
+    #[error("I/O failure: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Registry locked poisoned")]
+    PoisonedLock,
+
+    #[error("No model versions available")]
+    EmptyRegistry,
+}
+
+/// ───────────────────────────────────────────────────────────────
+/// Observer Pattern – Monitor callbacks
+/// ───────────────────────────────────────────────────────────────
+
+/// Observer contract implemented by components interested in
+/// inference-time performance.
+#[async_trait]
+pub trait ModelPerformanceObserver: Send + Sync {
+    async fn update(&self, metrics: PerformanceMetrics);
+}
+
+/// Central broadcaster fan-out reducing tight coupling.
+#[derive(Debug, Default)]
+pub struct MetricsBroadcaster {
+    observers: Mutex<Vec<Weak<dyn ModelPerformanceObserver>>>,
+}
+
+impl MetricsBroadcaster {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register an observer; automatically purges dropped ones.
+    pub fn register(&self, observer: Arc<dyn ModelPerformanceObserver>) {
+        let mut obs = self.observers.lock().unwrap();
+        // purge dead refs
+        obs.retain(|o| o.upgrade().is_some());
+        obs.push(Arc::downgrade(&observer));
+    }
+
+    /// Broadcast the metrics to all alive observers.
+    pub async fn broadcast(&self, metrics: PerformanceMetrics) {
+        let observers = {
+            let obs = self.observers.lock().unwrap();
+            obs.clone()
+        };
+
+        // Fire & forget; each update happens concurrently.
+        for weak in observers {
+            if let Some(observer) = weak.upgrade() {
+                let m = metrics.clone();
+                task::spawn(async move { observer.update(m).await });
+            }
+        }
+    }
+}
+
+/// ───────────────────────────────────────────────────────────────
+/// Strategy Pattern – Retraining criteria
+/// ───────────────────────────────────────────────────────────────
+
+#[async_trait]
+pub trait RetrainingStrategy: Send + Sync {
+    /// Decide whether the model must be retrained based on the last
+    /// *N* metrics (historical window).
+    async fn should_trigger(&self, history: &[PerformanceMetrics]) -> bool;
+}
+
+/// Rolling-window strategy comparing aggregated KPIs with
+/// configurable thresholds.
+#[derive(Debug)]
+pub struct RollingWindowStrategy {
+    window: usize,
+    min_accuracy: f32,
+    max_drift: f32,
+}
+
+impl RollingWindowStrategy {
+    pub fn new(window: usize, min_accuracy: f32, max_drift: f32) -> Self {
+        Self {
+            window,
+            min_accuracy,
+            max_drift,
+        }
+    }
+}
+
+#[async_trait]
+impl RetrainingStrategy for RollingWindowStrategy {
+    async fn should_trigger(&self, history: &[PerformanceMetrics]) -> bool {
+        if history.len() < self.window {
+            return false;
+        }
+        let slice = &history[history.len() - self.window..];
+
+        let accuracy_ok = slice.iter().map(|m| m.accuracy).sum::<f32>() / self.window as f32
+            >= self.min_accuracy;
+        let drift_ok =
+            slice.iter().map(|m| m.drift_score).sum::<f32>() / self.window as f32 <= self.max_drift;
+
+        !(accuracy_ok && drift_ok)
+    }
+}
+
+/// ───────────────────────────────────────────────────────────────
+/// Registry Pattern – Atomic model versioning
+/// ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default)]
+pub struct ModelRegistry {
+    inner: RwLock<Vec<ModelArtifact>>,
+}
+
+impl ModelRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return the current production model.
+    pub fn current(&self) -> Result<ModelArtifact, OrchestratorError> {
+        let guard = self.inner.read().map_err(|_| OrchestratorError::PoisonedLock)?;
+        guard.last().cloned().ok_or(OrchestratorError::EmptyRegistry)
+    }
+
+    /// Promote a new artifact atomically.
+    pub fn promote(&self, artifact: ModelArtifact) -> Result<(), OrchestratorError> {
+        let mut guard = self.inner.write().map_err(|_| OrchestratorError::PoisonedLock)?;
+        guard.push(artifact);
+        Ok(())
+    }
+
+    /// List N latest versions.
+    pub fn latest(&self, n: usize) -> Result<Vec<ModelArtifact>, OrchestratorError> {
+        let guard = self.inner.read().map_err(|_| OrchestratorError::PoisonedLock)?;
+        Ok(guard.iter().rev().take(n).cloned().collect())
+    }
+}
+
+/// ───────────────────────────────────────────────────────────────
+/// Factory + Training abstraction
+/// ───────────────────────────────────────────────────────────────
+
+#[async_trait]
+pub trait ModelTrainer: Send + Sync {
+    async fn train(&self) -> Result<ModelArtifact, OrchestratorError>;
+}
+
+/// Mock trainer returning a dummy artifact; replace with real
+/// training pipeline invocation (e.g. PyTorch, ONNX, …).
+pub struct CpuBoundMockTrainer {
+    output_dir: PathBuf,
+    version_counter: Mutex<u32>,
+}
+
+impl CpuBoundMockTrainer {
+    pub fn new<P: AsRef<Path>>(output_dir: P) -> Self {
+        Self {
+            output_dir: output_dir.as_ref().to_path_buf(),
+            version_counter: Mutex::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelTrainer for CpuBoundMockTrainer {
+    async fn train(&self) -> Result<ModelArtifact, OrchestratorError> {
+        // -- expensive CPU-bound training mocked by delay -------
+        sleep(Duration::from_secs(2)).await;
+
+        // Simulate file creation.
+        let mut counter = self
+            .version_counter
+            .lock()
+            .map_err(|_| OrchestratorError::PoisonedLock)?;
+        *counter += 1;
+
+        let file_name = format!("model_v{}.bin", counter);
+        let file_path = self.output_dir.join(&file_name);
+        std::fs::write(&file_path, b"mock-weights")?;
+
+        let artifact = ModelArtifact {
+            version: ModelVersion(*counter),
+            path: file_path,
+            created_at: Utc::now(),
+            metadata: HashMap::from([("framework".into(), "MockNet".into())]),
+        };
+        Ok(artifact)
+    }
+}
+
+/// Dynamic trainer resolver – kept simple here.
+pub struct TrainerFactory;
+
+impl TrainerFactory {
+    pub fn resolve_trainer(camera_modality: &str) -> Arc<dyn ModelTrainer> {
+        // In a real system switch over RGB/Thermal, etc…
+        let dir = std::env::temp_dir().join(camera_modality);
+        std::fs::create_dir_all(&dir).expect("temp dir create");
+        Arc::new(CpuBoundMockTrainer::new(dir))
+    }
+}
+
+/// ───────────────────────────────────────────────────────────────
+/// Auto-Retraining Orchestrator (Observer implementation)
+/// ───────────────────────────────────────────────────────────────
+
+pub struct AutoRetrainOrchestrator {
+    registry: Arc<ModelRegistry>,
+    strategy: Arc<dyn RetrainingStrategy>,
+    trainer: Arc<dyn ModelTrainer>,
+    history: Mutex<Vec<PerformanceMetrics>>,
+    tx_event: UnboundedSender<RetrainEvent>,
+}
+
+impl AutoRetrainOrchestrator {
+    pub fn new(
+        registry: Arc<ModelRegistry>,
+        strategy: Arc<dyn RetrainingStrategy>,
+        trainer: Arc<dyn ModelTrainer>,
+    ) -> Arc<Self> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let slf = Arc::new(Self {
+            registry,
+            strategy,
+            trainer,
+            history: Mutex::new(Vec::with_capacity(128)),
+            tx_event: tx,
+        });
+
+        // Dedicated actor processing retrain events sequentially
+        Self::spawn_event_loop(Arc::clone(&slf), rx);
+
+        slf
+    }
+
+    fn spawn_event_loop(
+        me: Arc<Self>,
+        mut rx: UnboundedReceiver<RetrainEvent>,
+    ) {
+        task::spawn(async move {
+            while let Some(evt) = rx.recv().await {
+                if let RetrainEvent::Trigger(metrics) = evt {
+                    log::info!(
+                        "[AutoRetrain] Metrics threshold breached at {} – starting retraining …",
+                        metrics.timestamp
+                    );
+                    match me.trainer.train().await {
+                        Ok(artifact) => {
+                            if let Err(e) = me.registry.promote(artifact.clone()) {
+                                log::error!("[AutoRetrain] Registry error: {}", e);
+                                continue;
+                            }
+                            log::info!(
+                                "[AutoRetrain] Success – promoted model version {:?}",
+                                artifact.version
+                            );
+                        }
+                        Err(e) => {
+                            log::error!("[AutoRetrain] Training failure: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Retrain event queue (internal).
+enum RetrainEvent {
+    Trigger(PerformanceMetrics),
+}
+
+#[async_trait]
+impl ModelPerformanceObserver for AutoRetrainOrchestrator {
+    async fn update(&self, metrics: PerformanceMetrics) {
+        // Store history
+        {
+            let mut hist = self.history.lock().unwrap();
+            hist.push(metrics.clone());
+        }
+
+        // Evaluate strategy
+        let should_trigger = {
+            let hist = self.history.lock().unwrap();
+            self.strategy.should_trigger(&hist).await
+        };
+
+        if should_trigger {
+            // Non-blocking send
+            if let Err(e) = self.tx_event.send(RetrainEvent::Trigger(metrics)) {
+                log::error!("[AutoRetrain] Failed to enqueue retrain event: {}", e);
+            }
+        }
+    }
+}
+
+/// ───────────────────────────────────────────────────────────────
+/// Example wiring (tests/demos would import and call this)
+// ───────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use env_logger::Env;
+    use tokio::runtime::Runtime;
+
+    #[test]
+    fn integration_flow_smoke() {
+        let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info")).try_init();
+
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            // Given
+            let registry = Arc::new(ModelRegistry::new());
+            let strategy: Arc<dyn RetrainingStrategy> =
+                Arc::new(RollingWindowStrategy::new(5, 0.90, 0.05));
+            let trainer = TrainerFactory::resolve_trainer("rgb");
+
+            let orchestrator =
+                AutoRetrainOrchestrator::new(Arc::clone(&registry), strategy, trainer);
+
+            let broadcaster = MetricsBroadcaster::new();
+            broadcaster.register(orchestrator);
+
+            // When: push 10 random metrics
+            for _ in 0..10 {
+                let mut rng = rand::thread_rng();
+                let m = PerformanceMetrics {
+                    accuracy: rng.gen_range(0.8..0.95),
+                    f1_score: rng.gen_range(0.75..0.96),
+                    drift_score: rng.gen_range(0.0..0.1),
+                    timestamp: Utc::now(),
+                };
+                broadcaster.broadcast(m).await;
+                sleep(Duration::from_millis(100)).await;
+            }
+
+            // Await pending tasks
+            sleep(Duration::from_secs(3)).await;
+
+            // Then
+            let current = registry.current().expect("at least one model");
+            assert!(current.version.0 >= 1);
+            println!("Promoted model {:?}", current.version);
+        });
+    }
+}
+```

@@ -1,0 +1,202 @@
+```csharp
+// File: src/module_52.txt
+// Project: TempoScribe Pro – Hexagonal Productivity Blog Suite (web_blog)
+// Language: C#
+//
+// Purpose:
+//     Central, domain-centric application-service that atomically publishes all posts
+//     whose scheduled PublishAt has elapsed.  Implements the “ports & adapters” style
+//     by depending on domain-level abstractions (repositories, unit of work, event bus,
+//     etc.) and by exposing a narrow application port (IScheduledPublishingService)
+//     that can be triggered from REST, GraphQL, CLI, Hangfire, or any other adapter.
+//
+//     Responsibilities:
+//         • Query for due posts (status = Scheduled && PublishAt ≤ now)
+//         • Transition them to Published, recording PublishedAt
+//         • Persist the mutation through a unit-of-work
+//         • Broadcast an integration event per post
+//         • Invalidate all relevant caches
+//         • Raise editor-facing notifications
+//         • Provide rich logging & error handling                                   
+
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using TempoScribePro.Domain.Posts;
+using TempoScribePro.Domain.Common;
+using TempoScribePro.Application.Abstractions.Messaging;
+using TempoScribePro.Application.Abstractions.Clock;
+using TempoScribePro.Application.Abstractions.Caching;
+using TempoScribePro.Application.Abstractions.Notifications;
+
+namespace TempoScribePro.Application.Publishing
+{
+    /// <summary>
+    /// Application port for executing scheduled publications.
+    /// </summary>
+    public interface IScheduledPublishingService
+    {
+        /// <summary>
+        /// Transitions every post whose <see cref="Post.PublishAt"/> is in the past
+        /// from <see cref="PostStatus.Scheduled"/> to <see cref="PostStatus.Published"/>.
+        /// </summary>
+        /// <param name="cancellationToken">Co-operative cancellation token.</param>
+        /// <returns>Number of posts successfully published.</returns>
+        Task<int> ExecutePendingPublicationsAsync(CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Production-grade implementation of <see cref="IScheduledPublishingService"/>.
+    /// </summary>
+    public sealed class ScheduledPublishingService : IScheduledPublishingService
+    {
+        private const int DefaultBatchSize = 100;
+
+        private readonly IPostRepository          _postRepository;
+        private readonly IUnitOfWork               _unitOfWork;
+        private readonly ISystemClock              _clock;
+        private readonly IEventBus                 _eventBus;
+        private readonly ICacheProvider            _cacheProvider;
+        private readonly INotificationDispatcher   _notificationDispatcher;
+        private readonly ILogger<ScheduledPublishingService> _logger;
+
+        public ScheduledPublishingService(
+            IPostRepository          postRepository,
+            IUnitOfWork              unitOfWork,
+            ISystemClock             clock,
+            IEventBus                eventBus,
+            ICacheProvider           cacheProvider,
+            INotificationDispatcher  notificationDispatcher,
+            ILogger<ScheduledPublishingService> logger)
+        {
+            _postRepository         = postRepository  ?? throw new ArgumentNullException(nameof(postRepository));
+            _unitOfWork             = unitOfWork      ?? throw new ArgumentNullException(nameof(unitOfWork));
+            _clock                  = clock           ?? throw new ArgumentNullException(nameof(clock));
+            _eventBus               = eventBus        ?? throw new ArgumentNullException(nameof(eventBus));
+            _cacheProvider          = cacheProvider   ?? throw new ArgumentNullException(nameof(cacheProvider));
+            _notificationDispatcher = notificationDispatcher ?? throw new ArgumentNullException(nameof(notificationDispatcher));
+            _logger                 = logger          ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        /// <inheritdoc />
+        public async Task<int> ExecutePendingPublicationsAsync(CancellationToken cancellationToken = default)
+        {
+            var nowUtc = _clock.UtcNow;
+            int publishedCount = 0;
+
+            // Loop batching to avoid flooding memory when tens of thousands of posts are scheduled.
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                IReadOnlyList<Post> duePosts =
+                    await _postRepository.GetPostsDueForPublishingAsync(
+                        nowUtc, DefaultBatchSize, cancellationToken)
+                                         .ConfigureAwait(false);
+
+                if (duePosts.Count == 0)
+                    break; // Nothing left to publish.
+
+                _logger.LogInformation(
+                    "Publishing batch of {Count} post(s) scheduled before {Now}",
+                    duePosts.Count, nowUtc);
+
+                foreach (var post in duePosts)
+                {
+                    try
+                    {
+                        TransitionPostToPublished(post, nowUtc);
+
+                        // Cache evict early to prevent race conditions with eventual consistency.
+                        _cacheProvider.Remove($"post:{post.Id}");
+                        _cacheProvider.Remove($"post-preview:{post.Id}");
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log and continue, but do not remove the post from queue so that future run can retry.
+                        _logger.LogError(
+                            ex,
+                            "Failed to transition post {PostId} to Published; will retry on next cycle.",
+                            post.Id);
+                    }
+                }
+
+                // Persist all successful changes in a single transaction.
+                try
+                {
+                    await _unitOfWork.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                    await DispatchIntegrationEventsAsync(duePosts, cancellationToken).ConfigureAwait(false);
+                    await NotifyEditorsAsync(duePosts, cancellationToken).ConfigureAwait(false);
+
+                    publishedCount += duePosts.Count;
+                }
+                catch (Exception ex)
+                {
+                    // Rollback responsibility is handled by IUnitOfWork implementation (e.g., EF Core)
+                    _logger.LogCritical(
+                        ex,
+                        "Critical failure persisting scheduled publications; transaction rolled back.");
+                    // Abort outer loop—manual intervention required.
+                    throw;
+                }
+            }
+
+            _logger.LogInformation("Scheduled publisher completed. {Count} post(s) published.", publishedCount);
+            return publishedCount;
+        }
+
+        #region Private helpers -------------------------------------------------------------------
+
+        private static void TransitionPostToPublished(Post post, DateTimeOffset nowUtc)
+        {
+            if (post.Status != PostStatus.Scheduled)
+                throw new InvalidOperationException(
+                    $"Post {post.Id} must be in Scheduled state to be published; current = {post.Status}.");
+
+            post.Status      = PostStatus.Published;
+            post.PublishedAt = nowUtc;
+            post.LastUpdated = nowUtc;
+        }
+
+        private async Task DispatchIntegrationEventsAsync(IEnumerable<Post> posts, CancellationToken ct)
+        {
+            foreach (var post in posts)
+            {
+                var evt = new PostPublishedIntegrationEvent(post.Id, post.Slug, post.AuthorId, post.PublishedAt!.Value);
+                await _eventBus.PublishAsync(evt, ct).ConfigureAwait(false);
+            }
+        }
+
+        private async Task NotifyEditorsAsync(IEnumerable<Post> posts, CancellationToken ct)
+        {
+            foreach (var post in posts)
+            {
+                var notification = new Notification(
+                    recipientUserId : post.AuthorId,
+                    title           : $"“{post.Title}” is now live! 🎉",
+                    message         : "Your scheduled post has been automatically published.",
+                    type            : NotificationType.Info,
+                    correlationId   : post.Id.ToString());
+
+                await _notificationDispatcher.DispatchAsync(notification, ct).ConfigureAwait(false);
+            }
+        }
+
+        #endregion ------------------------------------------------------------------------------
+    }
+
+    #region Integration-Event DTO ----------------------------------------------------------------
+    /// <summary>
+    /// Integration event raised whenever a post transitions to Published.
+    /// Consumers include driving e-mail digests, search-indexers, cache warmers, etc.
+    /// </summary>
+    public sealed record PostPublishedIntegrationEvent(
+        Guid PostId,
+        string Slug,
+        Guid AuthorId,
+        DateTimeOffset PublishedAtUtc) : IIntegrationEvent;
+    #endregion
+}
+```

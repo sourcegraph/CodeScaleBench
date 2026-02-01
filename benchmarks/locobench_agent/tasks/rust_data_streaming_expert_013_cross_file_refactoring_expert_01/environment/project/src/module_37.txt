@@ -1,0 +1,299 @@
+```rust
+//! ChirpPulse – Module 37
+//! Hot-swappable Sentiment Analysis engine using the Strategy Pattern.
+//
+//! This module demonstrates how ChirpPulse lets data-scientists switch
+//! sentiment-analysis algorithms in production without downtime.  A file-based
+//! configuration is watched at runtime; when it changes the system atomically
+//! swaps in a new implementation that immediately serves all subsequent
+//! requests while in-flight calls continue using the previous instance.
+//
+//! Key concepts shown here
+//! * Strategy pattern via the `SentimentEngine` trait
+//! * Atomic, lock-free hot-swap with `arc_swap`
+//! * File-watching reload using the `notify` crate (debounced)
+//! * Asynchronous processing with Tokio
+//! * Rich error handling via `thiserror`
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use log::{error, info, warn};
+use notify::{recommended_watcher, RecursiveMode, Watcher};
+use serde::Deserialize;
+use serde_json::Value as Json;
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{mpsc, oneshot},
+};
+
+/// Public facing score returned for an analysed text.
+///
+/// * `polarity`  ranges from –1.0 (negative) to +1.0 (positive)
+/// * `magnitude` is an arbitrary overall sentiment strength (≥ 0.0)
+#[derive(Debug, Clone, PartialEq)]
+pub struct SentimentScore {
+    pub polarity: f32,
+    pub magnitude: f32,
+}
+
+/// Core strategy trait for a sentiment algorithm.
+///
+/// Implementations MUST be thread-safe (Send + Sync) and cheap to clone ‑
+/// cloning should be an Arc clone, not an expensive reallocation.
+#[async_trait]
+pub trait SentimentEngine: Send + Sync {
+    async fn analyze(&self, text: &str) -> SentimentScore;
+
+    /// Human friendly name, used for metrics / introspection.
+    fn name(&self) -> &'static str;
+}
+
+/// Lightweight lexicon-based algorithm (placeholder for Vader / AFINN / etc.).
+#[derive(Debug, Default)]
+pub struct LexiconEngine;
+
+#[async_trait]
+impl SentimentEngine for LexiconEngine {
+    async fn analyze(&self, text: &str) -> SentimentScore {
+        let up = text.matches(['🙂', '😀', '❤️']).count() as i32;
+        let down = text.matches(['😡', '🤮', '💔']).count() as i32;
+        let len = text.chars().count().max(1) as f32;
+
+        SentimentScore {
+            polarity: (up - down) as f32 / len,
+            magnitude: (up + down) as f32,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "lexicon"
+    }
+}
+
+/// Mock deep-learning model.  In production this could be a TorchScript/ONNX
+/// session.  Here we just pretend with a deterministic hash.
+#[derive(Debug, Default)]
+pub struct BertEngine;
+
+#[async_trait]
+impl SentimentEngine for BertEngine {
+    async fn analyze(&self, text: &str) -> SentimentScore {
+        let hash = seahash::hash(text.as_bytes());
+        let polarity = ((hash % 200) as i64 - 100) as f32 / 100.0;
+        SentimentScore {
+            polarity,
+            magnitude: polarity.abs() * 10.0,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "bert"
+    }
+}
+
+/// Configuration file format that selects the implementation and holds any
+/// algorithm-specific opaque params (as JSON).
+#[derive(Debug, Deserialize)]
+struct EngineConfig {
+    implementation: Implementation,
+    #[serde(default)]
+    params: Json,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Implementation {
+    Lexicon,
+    Bert,
+}
+
+impl Implementation {
+    fn build(self, _params: Json) -> Arc<dyn SentimentEngine> {
+        match self {
+            Implementation::Lexicon => Arc::new(LexiconEngine::default()),
+            Implementation::Bert => Arc::new(BertEngine::default()),
+        }
+    }
+}
+
+/// All errors produced by this module.
+#[derive(Debug, Error)]
+pub enum SentimentError {
+    #[error("IO failure while reading config {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Failed to parse config {path}: {source}")]
+    ParseToml {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("Notify error: {0}")]
+    Watch(#[from] notify::Error),
+}
+
+/// Thread-safe handle exposed to other services.  Internally delegates to an
+/// `ArcSwap` so reads are wait-free and swaps are atomic.
+#[derive(Debug)]
+pub struct EngineHandle {
+    inner: ArcSwap<dyn SentimentEngine>,
+}
+
+impl EngineHandle {
+    fn new(initial: Arc<dyn SentimentEngine>) -> Self {
+        Self {
+            inner: ArcSwap::from(initial),
+        }
+    }
+
+    /// Retrieve the current engine implementation.  Clone is cheap (Arc clone).
+    pub fn get(&self) -> Arc<dyn SentimentEngine> {
+        self.inner.load_full()
+    }
+
+    /// Atomically replace the inner engine.
+    fn swap(&self, new_engine: Arc<dyn SentimentEngine>) {
+        self.inner.store(new_engine);
+    }
+}
+
+/// Spawn a background task that watches `config_path` for changes and hot-swaps
+/// the `EngineHandle` implementation.  Returns a `JoinHandle` and a oneshot
+/// you can use to request graceful shutdown.
+pub fn spawn_reload_task(
+    config_path: impl AsRef<Path>,
+    engine: EngineHandle,
+) -> Result<(tokio::task::JoinHandle<()>, oneshot::Sender<()>), SentimentError> {
+    let path = config_path.as_ref().to_owned();
+    let (tx_shutdown, mut rx_shutdown) = oneshot::channel::<()>();
+    let (tx_debounced, mut rx_debounced) = mpsc::channel::<()>(1);
+
+    // Watcher runs on its own blocking thread.  We debounce by pushing a msg to
+    // a Tokio channel and ignoring duplicates within a window.
+    let mut watcher = recommended_watcher(move |_| {
+        // If channel is full, ignore: consumer will pick up first one soon.
+        let _ = tx_debounced.try_send(());
+    })?;
+    watcher.watch(&path, RecursiveMode::NonRecursive)?;
+
+    // Initial load
+    engine.swap(Arc::new(load_engine(&path)?));
+
+    let handle = tokio::spawn(async move {
+        let mut last_reload = std::time::Instant::now();
+
+        loop {
+            select! {
+                _ = rx_shutdown.closed() => {
+                    info!("Sentiment engine reload task received shutdown");
+                    break;
+                }
+                opt = rx_debounced.recv() => {
+                    if opt.is_none() { continue; }
+
+                    // Simple debounce: ignore events that are too close
+                    if last_reload.elapsed() < Duration::from_millis(300) {
+                        continue;
+                    }
+                    last_reload = std::time::Instant::now();
+
+                    match load_engine(&path) {
+                        Ok(new_engine) => {
+                            info!("Reloading sentiment engine: {}", new_engine.name());
+                            engine.swap(Arc::new(new_engine));
+                        }
+                        Err(e) => {
+                            warn!("Failed to reload sentiment engine: {e}");
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok((handle, tx_shutdown))
+}
+
+/// Blocking load helper used by both the initial startup and reloads.
+fn load_engine(path: &Path) -> Result<Arc<dyn SentimentEngine>, SentimentError> {
+    let raw = fs::read_to_string(path).map_err(|e| SentimentError::Io {
+        path: path.to_owned(),
+        source: e,
+    })?;
+    let cfg: EngineConfig = toml::from_str(&raw).map_err(|e| SentimentError::ParseToml {
+        path: path.to_owned(),
+        source: e,
+    })?;
+    Ok(cfg.implementation.build(cfg.params))
+}
+
+/* ---------- Demo stream integration (toy) -------------------------------- */
+
+/// Example streaming interface that consumes incoming texts, applies sentiment
+/// analysis and forwards the result to downstream Kafka / gRPC / etc.
+///
+/// This function is only a showcase for how the hot-swap handle is used.
+pub async fn process_stream<S>(mut input: S, engine: EngineHandle)
+where
+    S: futures::Stream<Item = String> + Unpin,
+{
+    while let Some(text) = input.next().await {
+        let engine = engine.get();
+        let score = engine.analyze(&text).await;
+
+        info!(
+            "text=\"{}\" engine={} polarity={:.3} magnitude={:.2}",
+            text,
+            engine.name(),
+            score.polarity,
+            score.magnitude
+        );
+
+        // TODO: send to Kafka / Pulsar / in-memory bus, etc.
+    }
+}
+
+/* ---------- Tests -------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::{stream, StreamExt};
+
+    #[tokio::test]
+    async fn hot_swap_is_visible() {
+        // Create a handle with initial lexicon engine.
+        let handle = EngineHandle::new(Arc::new(LexiconEngine::default()));
+
+        // Prepare a very small stream.
+        let texts = vec!["Great 🙂".into(), "Terrible 😡".into()];
+        let mut result = Vec::new();
+
+        tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                let input = stream::iter(texts.clone());
+                process_stream(input, handle).await;
+            }
+        });
+
+        // Swap to BERT and analyse a new text.
+        handle.swap(Arc::new(BertEngine::default()));
+        let engine = handle.get();
+        result.push(engine.name());
+
+        assert_eq!(&result[0], "bert");
+    }
+}
+```

@@ -1,0 +1,405 @@
+```rust
+//! module_57 – Model-Monitoring subsystem
+//!
+//! This module hosts the run-time monitoring and alerting logic that observes
+//! model-level metrics (accuracy, latency, data/label drift, …).  Whenever an
+//! anomaly is detected it broadcasts an `Alert` that can be consumed by
+//! downstream components such as the Automated-Retraining service.  
+//!
+//! Architectural patterns in play:
+//!   • Observer Pattern      – `ModelMonitor` subscribes to a `MetricProducer`
+//!   • Strategy Pattern      – pluggable `ThresholdStrategy` implementations
+//!   • Factory Pattern       – `StrategyFactory` builds strategies from cfg
+//!
+//! Dependencies expected in `Cargo.toml` (top-level crate):
+//! ```toml
+//! [dependencies]
+//! tokio          = { version = "1", features = ["rt-multi-thread", "macros"] }
+//! tokio-stream   = "0.1"
+//! tracing        = "0.1"
+//! thiserror      = "1.0"
+//! serde          = { version = "1.0", features = ["derive"] }
+//! serde_json     = "1.0"
+//! ```
+//!
+//! Although the crate graph is larger in VisuTility-Orchestrator, this file
+//! remains fully self-contained and can be compiled on its own for illustration.
+
+#![allow(dead_code)] // This file is usually compiled as part of a bigger crate.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde::Deserialize;
+use thiserror::Error;
+use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+use tracing::{debug, error, info, warn};
+
+/// Domain-specific metric variants we care about.
+#[derive(Debug, Clone)]
+pub enum Metric {
+    /// Inference latency in *milliseconds*.
+    InferenceLatency(f64),
+    /// Online accuracy measured via sliding-window
+    Accuracy(f64),
+    /// Jensen-Shannon divergence between training and prod data
+    PredictionDrift(f64),
+}
+
+impl Metric {
+    /// Friendly metric name for logging / UI.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Metric::InferenceLatency(_) => "inference_latency_ms",
+            Metric::Accuracy(_) => "accuracy",
+            Metric::PredictionDrift(_) => "prediction_drift",
+        }
+    }
+
+    /// Extract numeric value for strategy evaluation.
+    pub fn value(&self) -> f64 {
+        match self {
+            Metric::InferenceLatency(v)
+            | Metric::Accuracy(v)
+            | Metric::PredictionDrift(v) => *v,
+        }
+    }
+}
+
+/// Wrapper to include a timestamp with the metric value.
+#[derive(Debug, Clone)]
+pub struct MetricSample {
+    pub timestamp: Instant,
+    pub metric: Metric,
+}
+
+/// Topic broadcast by a [`ModelMonitor`] once an anomaly is detected.
+#[derive(Debug, Clone)]
+pub struct Alert {
+    pub model_id: String,
+    pub metric: Metric,
+    pub message: String,
+    pub created_at: Instant,
+}
+
+/// Error variants emitted by this subsystem.
+#[derive(Error, Debug)]
+pub enum MonitorError {
+    #[error("Metric channel closed unexpectedly")]
+    ChannelClosed,
+    #[error("Internal mutex got poisoned")]
+    Poisoned,
+    #[error("Strategy error: {0}")]
+    Strategy(String),
+}
+
+/// API contract for anything able to stream `MetricSample`s.
+pub trait MetricProducer: Send + Sync + 'static {
+    fn stream(&self) -> Box<dyn Stream<Item = MetricSample> + Unpin + Send>;
+}
+
+/// API to execute side-effects once an alert is published.
+pub trait RetrainingNotifier: Send + Sync {
+    fn notify_retraining(&self, model_id: &str, reason: &str);
+}
+
+/// Encapsulates threshold logic; returns `true` if the sample should raise an
+/// alert.  Each strategy may decide to maintain internal state (e.g. EWMA).
+#[async_trait::async_trait]
+pub trait ThresholdStrategy: Send + Sync {
+    async fn exceeds_threshold(&self, sample: &MetricSample) -> Result<bool, MonitorError>;
+}
+
+/// Simple static upper / lower bound strategy.
+///
+///   • For latency / drift we commonly use an *upper* bound  
+///   • For accuracy we alert when we go *below* the bound
+///
+/// The semantic of `bound` therefore depends on the metric kind.
+pub struct StaticThresholdStrategy {
+    bound: f64,
+}
+
+#[async_trait::async_trait]
+impl ThresholdStrategy for StaticThresholdStrategy {
+    async fn exceeds_threshold(&self, sample: &MetricSample) -> Result<bool, MonitorError> {
+        let value = sample.metric.value();
+        let exceeds = match sample.metric {
+            Metric::Accuracy(_) => value < self.bound,
+            _ => value > self.bound,
+        };
+        Ok(exceeds)
+    }
+}
+
+/// Exponential Weighted Moving Average anomaly detection.
+///
+/// An alert is triggered when the absolute difference between the current value
+/// and the EWMA crosses `k_sigma * sigma`.  The classic Bollinger-style band.
+pub struct EwmaStrategy {
+    alpha: f64,
+    k_sigma: f64,
+    state: Mutex<EwmaState>,
+}
+
+struct EwmaState {
+    mean: f64,
+    variance: f64,
+    initialized: bool,
+}
+
+impl EwmaStrategy {
+    pub fn new(alpha: f64, k_sigma: f64) -> Self {
+        Self {
+            alpha,
+            k_sigma,
+            state: Mutex::new(EwmaState {
+                mean: 0.0,
+                variance: 0.0,
+                initialized: false,
+            }),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ThresholdStrategy for EwmaStrategy {
+    async fn exceeds_threshold(&self, sample: &MetricSample) -> Result<bool, MonitorError> {
+        let mut state = self
+            .state
+            .lock()
+            .await; // We choose async Mutex to avoid blocking.
+        if !state.initialized {
+            state.mean = sample.metric.value();
+            state.variance = 0.0;
+            state.initialized = true;
+            return Ok(false);
+        }
+
+        let diff = sample.metric.value() - state.mean;
+        state.mean = self.alpha * sample.metric.value() + (1.0 - self.alpha) * state.mean;
+        state.variance =
+            self.alpha * diff.powi(2) + (1.0 - self.alpha) * state.variance.max(1e-9);
+
+        let std_dev = state.variance.sqrt();
+        let exceeds = diff.abs() > self.k_sigma * std_dev;
+
+        Ok(exceeds)
+    }
+}
+
+/// JSON-parseable configuration used by `StrategyFactory`.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StrategyConfig {
+    Static { bound: f64 },
+    Ewma { alpha: f64, k_sigma: f64 },
+}
+
+/// Factory that turns a runtime configuration into a concrete `ThresholdStrategy`.
+pub struct StrategyFactory;
+
+impl StrategyFactory {
+    pub fn build(cfg: StrategyConfig) -> Arc<dyn ThresholdStrategy> {
+        match cfg {
+            StrategyConfig::Static { bound } => Arc::new(StaticThresholdStrategy { bound }),
+            StrategyConfig::Ewma { alpha, k_sigma } => Arc::new(EwmaStrategy::new(alpha, k_sigma)),
+        }
+    }
+}
+
+/// Core monitor that consumes metrics, evaluates strategies and publishes
+/// alerts through a broadcast channel.
+pub struct ModelMonitor {
+    model_id: String,
+    metric_rx: mpsc::Receiver<MetricSample>,
+    strategy: Arc<dyn ThresholdStrategy>,
+    alert_tx: broadcast::Sender<Alert>,
+    notifier: Arc<dyn RetrainingNotifier>,
+    polling_interval: Duration,
+}
+
+impl ModelMonitor {
+    pub fn new(
+        model_id: impl Into<String>,
+        producer: Arc<dyn MetricProducer>,
+        strategy: Arc<dyn ThresholdStrategy>,
+        notifier: Arc<dyn RetrainingNotifier>,
+        polling_interval: Duration,
+    ) -> Self {
+        let (metric_tx, metric_rx) = mpsc::channel::<MetricSample>(1024);
+        let (alert_tx, _) = broadcast::channel(1024);
+        let model_id = model_id.into();
+
+        // Fan-out: spawn a task that forwards producer stream into our channel.
+        tokio::spawn({
+            let mut stream = producer.stream();
+            let model_id = model_id.clone();
+            async move {
+                while let Some(sample) = stream.next().await {
+                    if let Err(e) = metric_tx.send(sample).await {
+                        error!(model = %model_id, "Metric sender failed: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+
+        Self {
+            model_id,
+            metric_rx,
+            strategy,
+            alert_tx,
+            notifier,
+            polling_interval,
+        }
+    }
+
+    /// Returns a clone of the broadcast sender so other services can `subscribe`.
+    pub fn alert_channel(&self) -> broadcast::Sender<Alert> {
+        self.alert_tx.clone()
+    }
+
+    /// Spawn the monitoring loop on the Tokio runtime.
+    pub fn start(mut self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let model_id = self.model_id.clone();
+            info!(model = %model_id, "ModelMonitor started");
+            loop {
+                match self.metric_rx.recv().await {
+                    Some(sample) => {
+                        if let Err(e) = self.process_sample(sample).await {
+                            error!(model = %model_id, "Error processing metric: {e}");
+                        }
+                    }
+                    None => {
+                        warn!(model = %model_id, "Metric channel closed; shutting down");
+                        break;
+                    }
+                }
+                // Back-pressure guard: ensure we don’t starve the executor
+                tokio::time::sleep(self.polling_interval).await;
+            }
+            info!(model = %model_id, "ModelMonitor stopped");
+        })
+    }
+
+    async fn process_sample(&self, sample: MetricSample) -> Result<(), MonitorError> {
+        if self.strategy.exceeds_threshold(&sample).await? {
+            let message = format!(
+                "Anomaly detected for {}: {} = {:.4}",
+                self.model_id,
+                sample.metric.name(),
+                sample.metric.value()
+            );
+
+            let alert = Alert {
+                model_id: self.model_id.clone(),
+                metric: sample.metric.clone(),
+                message: message.clone(),
+                created_at: Instant::now(),
+            };
+
+            // Fire-and-forget; if nobody is listening we don’t fail the loop.
+            let _ = self.alert_tx.send(alert.clone());
+
+            warn!(
+                model = %self.model_id,
+                metric = sample.metric.name(),
+                value = %sample.metric.value(),
+                "{}", message
+            );
+
+            // Notify retraining supervisor
+            self.notifier
+                .notify_retraining(&self.model_id, &message);
+        }
+
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* ----------------------------- Demo section ------------------------------- */
+/* -------------------------------------------------------------------------- */
+
+/// Convenience builder for demonstration / unit-tests.
+pub struct DummyMetricProducer {
+    period: Duration,
+}
+
+impl DummyMetricProducer {
+    pub fn new(period: Duration) -> Self {
+        Self { period }
+    }
+}
+
+impl MetricProducer for DummyMetricProducer {
+    fn stream(&self) -> Box<dyn Stream<Item = MetricSample> + Unpin + Send> {
+        let period = self.period;
+        // Return a stream that yields a random latency value every `period`.
+        let (mut tx, rx) = mpsc::channel::<MetricSample>(128);
+
+        tokio::spawn(async move {
+            loop {
+                let latency = 50.0 + 50.0 * rand::random::<f64>(); // 50-100ms
+                let sample = MetricSample {
+                    timestamp: Instant::now(),
+                    metric: Metric::InferenceLatency(latency),
+                };
+                if tx.send(sample).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(period).await;
+            }
+        });
+
+        Box::new(ReceiverStream::new(rx))
+    }
+}
+
+/// Very thin notifier that just logs.  In the real system this would enqueue
+/// the event to Kafka or hit a webhook inside the Retraining Service.
+pub struct LogNotifier;
+
+impl RetrainingNotifier for LogNotifier {
+    fn notify_retraining(&self, model_id: &str, reason: &str) {
+        info!(model = %model_id, reason = %reason, "Triggering automated retraining");
+    }
+}
+
+/// Compile-time test that starts a monitor for 3 seconds.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn smoke_test_monitor_runs() {
+        tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_test_writer()
+            .init();
+
+        let producer = Arc::new(DummyMetricProducer::new(Duration::from_millis(10)));
+        let strategy_cfg = StrategyConfig::Static { bound: 60.0 };
+        let strategy = StrategyFactory::build(strategy_cfg);
+
+        let monitor = ModelMonitor::new(
+            "unit_test_model",
+            producer,
+            strategy,
+            Arc::new(LogNotifier),
+            Duration::from_millis(1),
+        );
+        let _alert_rx = monitor.alert_channel().subscribe();
+
+        let handle = monitor.start();
+
+        // Let it run a bit
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        handle.abort(); // For the sake of unit test speed
+    }
+}
+```

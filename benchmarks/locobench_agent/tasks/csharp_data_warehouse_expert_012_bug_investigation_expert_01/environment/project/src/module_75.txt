@@ -1,0 +1,391 @@
+```csharp
+// File: src/module_75.txt
+// Project: PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+// Language: C# 10
+// ---------------------------------------------
+// This module implements a reusable, back-pressure-aware time-series
+// aggregation engine that can be plugged into any Lambda/Kinesis
+// micro-component.  It embraces the Observer pattern in order to be
+// embeddable in both streaming (push) and batch (pull) scenarios while
+// still preserving functional purity through a user-supplied
+// aggregation delegate.
+//
+// Key capabilities
+// • Tumbling & sliding windows                                             
+// • Thread-safe, lock-free hot path                                        
+// • Back-pressure aware via System.Threading.Channels                      
+// • Real-time Observable<KpiMetric> output                                 
+// • Fault-tolerant (bubble-up strategy / DLQ compatible)                   
+// ---------------------------------------------
+#nullable enable
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Reactive.Linq;
+using System.Reactive.Subjects;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+
+namespace PulseOps.Warehouse.Transformations
+{
+    /// <summary>
+    /// Single domain event coming from any ingestion source.
+    /// A deliberately flat structure that can be re-shaped downstream.
+    /// </summary>
+    /// <param name="Timestamp">UTC timestamp the event occurred.</param>
+    /// <param name="EventType">Human-friendly event discriminator.</param>
+    /// <param name="ActorId">Primary user / system identifier.</param>
+    /// <param name="NumericValue">
+    /// Optional raw measurement (e.g. duration seconds, bytes, …).
+    /// When null the <see cref="Attributes"/> collection must carry meaning.
+    /// </param>
+    /// <param name="Attributes">Catch-all property bag.</param>
+    public sealed record ProductivityEvent(
+        DateTimeOffset Timestamp,
+        string EventType,
+        string ActorId,
+        decimal? NumericValue,
+        IReadOnlyDictionary<string, string>? Attributes);
+
+    /// <summary>
+    /// Output of the aggregator – one atomic KPI.
+    /// </summary>
+    /// <param name="WindowStart">Left-inclusive boundary.</param>
+    /// <param name="WindowEnd">Right-exclusive boundary.</param>
+    /// <param name="MetricName">Business-level name (e.g. "FocusTimeRatio").</param>
+    /// <param name="Value">Aggregated numeric value.</param>
+    /// <param name="DimensionKeys">Partition keys used for slicing/dicing.</param>
+    public sealed record KpiMetric(
+        DateTimeOffset WindowStart,
+        DateTimeOffset WindowEnd,
+        string MetricName,
+        decimal Value,
+        IReadOnlyDictionary<string, string>? DimensionKeys);
+
+    /// <summary>
+    /// Sliding or tumbling time window policy.
+    /// </summary>
+    public enum TimeWindowType
+    {
+        Tumbling,
+        Sliding
+    }
+
+    /// <summary>
+    /// Configuration object for <see cref="TimeSeriesWindowAggregator"/>.
+    /// </summary>
+    public sealed class TimeWindowOptions
+    {
+        /// <summary>
+        /// Total width of the window.  Must be ≥ <see cref="SlideInterval"/>.
+        /// </summary>
+        public required TimeSpan WindowSize { get; init; }
+
+        /// <summary>
+        /// Distance between consecutive window emit points.
+        /// For tumbling windows this acts as window size as well.
+        /// </summary>
+        public required TimeSpan SlideInterval { get; init; }
+
+        /// <summary>
+        /// Whether watermarking (late event allowance) is active.
+        /// </summary>
+        public TimeSpan AllowedLateness { get; init; } = TimeSpan.Zero;
+
+        public TimeWindowType WindowType { get; init; } = TimeWindowType.Tumbling;
+
+        /// <summary>
+        /// Safety check to avoid mis-configuration at runtime.
+        /// </summary>
+        /// <exception cref="ArgumentException"></exception>
+        public void Validate()
+        {
+            if (WindowSize <= TimeSpan.Zero)
+                throw new ArgumentException($"{nameof(WindowSize)} must be > 0", nameof(WindowSize));
+
+            if (SlideInterval <= TimeSpan.Zero)
+                throw new ArgumentException($"{nameof(SlideInterval)} must be > 0", nameof(SlideInterval));
+
+            if (SlideInterval > WindowSize && WindowType == TimeWindowType.Sliding)
+                throw new ArgumentException(
+                    $"{nameof(SlideInterval)} cannot exceed {nameof(WindowSize)} for sliding windows.", nameof(SlideInterval));
+        }
+    }
+
+    /// <summary>
+    /// Calculates a KPI value from a set of <see cref="ProductivityEvent"/> items.
+    /// </summary>
+    /// <param name="windowEvents">Events belonging to one complete time window.</param>
+    /// <returns>The calculated KPI metric(s).</returns>
+    public delegate IEnumerable<KpiMetric> KpiAggregationDelegate(
+        IReadOnlyCollection<ProductivityEvent> windowEvents,
+        DateTimeOffset windowStart,
+        DateTimeOffset windowEnd);
+
+    /// <summary>
+    /// Reactive, high-performance aggregation engine.
+    /// Implements IObserver for ingestion and IObservable for metric fan-out.
+    /// </summary>
+    public sealed class TimeSeriesWindowAggregator : IObserver<ProductivityEvent>, IObservable<KpiMetric>, IAsyncDisposable
+    {
+        private readonly KpiAggregationDelegate _aggregationLogic;
+        private readonly TimeWindowOptions _options;
+
+        private readonly Subject<KpiMetric> _metricStream = new();
+        private readonly Channel<ProductivityEvent> _inputChannel;
+
+        // Concurrency primitives
+        private readonly CancellationTokenSource _cts = new();
+        private readonly Task _backgroundTask;
+
+        // Internal buffer storing events inside the current active window(s)
+        // We deliberately use a ConcurrentQueue to keep insertion O(1) and avoid
+        // global locks on the hot path.
+        private readonly ConcurrentQueue<ProductivityEvent> _buffer = new();
+
+        // Latest watermark processed (monotonic)
+        private DateTimeOffset _currentWindowCutoff;
+
+        public TimeSeriesWindowAggregator(
+            KpiAggregationDelegate aggregationLogic,
+            TimeWindowOptions options,
+            int boundedCapacity = 10_000) // backpressure
+        {
+            options.Validate();
+
+            _aggregationLogic = aggregationLogic ?? throw new ArgumentNullException(nameof(aggregationLogic));
+            _options = options;
+
+            _inputChannel = Channel.CreateBounded<ProductivityEvent>(new BoundedChannelOptions(boundedCapacity)
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.Wait
+            });
+
+            _currentWindowCutoff = AlignToWindowStart(DateTimeOffset.UtcNow);
+
+            _backgroundTask = Task.Factory.StartNew(
+                WorkLoopAsync,
+                _cts.Token,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default).Unwrap();
+        }
+
+        #region IObserver
+
+        public void OnNext(ProductivityEvent value)
+        {
+            if (!_inputChannel.Writer.TryWrite(value))
+            {
+                // backpressure fallback – should never happen due to boundedChannel Wait
+                throw new InvalidOperationException("Input channel rejected write unexpectedly.");
+            }
+        }
+
+        public void OnError(Exception error)
+        {
+            // Bubble up to downstream subscribers – they'll decide what to do.
+            _metricStream.OnError(error);
+        }
+
+        public void OnCompleted()
+        {
+            _inputChannel.Writer.Complete();
+        }
+
+        #endregion
+
+        #region IObservable
+
+        public IDisposable Subscribe(IObserver<KpiMetric> observer)
+        {
+            return _metricStream.AsObservable().Subscribe(observer);
+        }
+
+        #endregion
+
+        private async Task WorkLoopAsync()
+        {
+            try
+            {
+                var reader = _inputChannel.Reader;
+
+                while (await reader.WaitToReadAsync(_cts.Token).ConfigureAwait(false))
+                {
+                    while (reader.TryRead(out var evt))
+                    {
+                        _buffer.Enqueue(evt);
+                    }
+
+                    FlushExpiredWindows();
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Normal shutdown – ignore.
+            }
+            catch (Exception ex)
+            {
+                // Surface unexpected exceptions so ops team is alerted (PagerDuty).
+                _metricStream.OnError(ex);
+            }
+            finally
+            {
+                _metricStream.OnCompleted();
+            }
+        }
+
+        /// <summary>
+        /// Remove records that no longer belong to any open window and emit
+        /// completed windows downstream.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void FlushExpiredWindows()
+        {
+            var now = DateTimeOffset.UtcNow;
+
+            // Move watermark forward in increments of SlideInterval until the current time is covered.
+            while (_currentWindowCutoff + _options.WindowSize <= now)
+            {
+                var windowStart = _currentWindowCutoff;
+                var windowEnd = windowStart + _options.WindowSize;
+
+                // Gather relevant events.
+                var windowEvents = DrainEvents(windowStart, windowEnd);
+
+                // Apply user-supplied aggregation delegate.
+                try
+                {
+                    foreach (var metric in _aggregationLogic(windowEvents, windowStart, windowEnd))
+                    {
+                        _metricStream.OnNext(metric);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Fail-fast on faulty business logic so we don't silently produce wrong numbers.
+                    _metricStream.OnError(new AggregationException(
+                        $"Aggregation delegate threw for window {windowStart:o}-{windowEnd:o}", ex));
+                }
+
+                // Advance watermark
+                _currentWindowCutoff = windowStart + _options.SlideInterval;
+            }
+        }
+
+        /// <summary>
+        /// Retrieve and remove events from the buffer that are part of the
+        /// requested window interval.
+        /// </summary>
+        private IReadOnlyCollection<ProductivityEvent> DrainEvents(DateTimeOffset windowStart, DateTimeOffset windowEnd)
+        {
+            var set = new List<ProductivityEvent>(capacity: 1024);
+
+            while (_buffer.TryPeek(out var candidate))
+            {
+                if (candidate.Timestamp < windowStart)
+                {
+                    // Too old: discard
+                    _buffer.TryDequeue(out _);
+                    continue;
+                }
+
+                if (candidate.Timestamp >= windowEnd)
+                {
+                    // Still in future window – stop draining.
+                    break;
+                }
+
+                // In window range
+                _buffer.TryDequeue(out var inWindow);
+                if (inWindow != null)
+                {
+                    set.Add(inWindow);
+                }
+            }
+
+            return set;
+        }
+
+        /// <summary>
+        /// Aligns the given timestamp to the previous aligned window boundary.
+        /// </summary>
+        private DateTimeOffset AlignToWindowStart(DateTimeOffset timestamp)
+        {
+            var ticks = (long)(_options.SlideInterval.Ticks *
+                               Math.Floor(timestamp.UtcTicks / (double)_options.SlideInterval.Ticks));
+            return new DateTimeOffset(ticks, TimeSpan.Zero);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _cts.Cancel();
+
+            // Wait for graceful termination, but don't block forever.
+            var completedTask = await Task.WhenAny(_backgroundTask, Task.Delay(5000)).ConfigureAwait(false);
+            if (completedTask != _backgroundTask)
+            {
+                // Force task to fault for diagnostic purposes
+                _metricStream.OnError(new TimeoutException("Aggregator failed to shut down in timely manner."));
+            }
+
+            _cts.Dispose();
+            _metricStream.Dispose();
+        }
+
+        /// <summary>
+        /// Aggregation delegate convenience builder that computes a simple
+        /// sum over NumericValue field.
+        /// </summary>
+        public static KpiAggregationDelegate SumNumeric(string metricName, Func<ProductivityEvent, bool>? predicate = null)
+            => (events, start, end) =>
+            {
+                var query = predicate is null ? events : events.Where(predicate);
+                var total = query.Sum(e => e.NumericValue.GetValueOrDefault());
+                return new[]
+                {
+                    new KpiMetric(start, end, metricName, total, DimensionKeys: null)
+                };
+            };
+    }
+
+    /// <summary>
+    /// Bundles aggregation related failures so they can be handled explicitly
+    /// by an upstream error boundary (e.g. Lambda DLQ).
+    /// </summary>
+    public sealed class AggregationException : Exception
+    {
+        public AggregationException(string message, Exception innerException)
+            : base(message, innerException)
+        {
+        }
+    }
+
+    // Example usage wiring in a Lambda context
+    //
+    // var options = new TimeWindowOptions
+    // {
+    //     WindowSize = TimeSpan.FromMinutes(5),
+    //     SlideInterval = TimeSpan.FromMinutes(1)
+    // };
+    //
+    // var aggregator = new TimeSeriesWindowAggregator(
+    //         TimeSeriesWindowAggregator.SumNumeric("LinesOfCodeChanged"),
+    //         options);
+    //
+    // aggregator.Subscribe(metric =>
+    // {
+    //     // e.g. Push to DynamoDB/ S3 / CloudWatch
+    //     PutMetric(metric);
+    // });
+    //
+    // inputEvents.ForEach(aggregator.OnNext);
+    // aggregator.OnCompleted();
+}
+```

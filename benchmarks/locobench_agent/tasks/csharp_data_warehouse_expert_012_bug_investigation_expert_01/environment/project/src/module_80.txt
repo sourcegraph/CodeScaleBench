@@ -1,0 +1,392 @@
+```csharp
+// ---------------------------------------------------------------------------------------------------------------------
+// File:    module_80.cs                                      (original path: src/module_80.txt)
+// Project: PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//
+// Purpose: High-throughput Kinesis stream processor that dynamically routes raw telemetry
+//          events to the correct KPI transformation strategy.  Implements a reflection-
+//          driven Strategy pattern, offers bounded parallelism, publishes faults to a DLQ,
+//          and is designed to run as an AWS Lambda function.
+//
+// NOTE:    This single file is self-contained for illustration purposes.  In the real code-
+//          base, each interface/class would live in its own file and be covered by unit tests.
+// ---------------------------------------------------------------------------------------------------------------------
+
+#pragma warning disable CA1031 // Do not catch general exception types — deliberate for top-level fault barrier.
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.Lambda.Core;
+using Amazon.Lambda.KinesisEvents;
+using Amazon.SimpleNotificationService;
+using Amazon.SimpleNotificationService.Model;
+
+// ReSharper disable ClassNeverInstantiated.Global — instantiated by AWS Lambda runtime.
+namespace PulseOps.Warehouse.StreamProcessing
+{
+    #region === Public Lambda Entrypoint ==============================================================================
+
+    /// <summary>
+    /// Lambda entry-point for the “transform” stage of the warehouse ingestion pipeline.
+    /// The function is subscribed to a Kinesis Data Stream fan-out of raw events.
+    /// Each event is dynamically dispatched to a concrete <see cref="ITransformationStrategy"/>
+    /// based on its content-type.  KPI records are then written to an intermediary store
+    /// (omitted here — would typically be a Firehose stream or S3), while transformation
+    /// failures are routed to a DLQ via SNS.
+    /// </summary>
+    public sealed class StreamTransformationCoordinator
+    {
+        private const int DefaultParallelism = 8;            // Tune according to Lambda memory size / vCPU.
+        private readonly IStrategyResolver _resolver;
+        private readonly IDlqPublisher _dlqPublisher;
+        private readonly int _maxParallelism;
+
+        /// <summary>
+        /// Parameterless constructor required by AWS Lambda runtime.  Uses DI-less
+        /// service locator helpers (<see cref="StrategyResolver"/> and <see cref="SnsDlqPublisher"/>).
+        /// </summary>
+        public StreamTransformationCoordinator()
+            : this(new StrategyResolver(), new SnsDlqPublisher(), DefaultParallelism)
+        { }
+
+        /// <summary>For unit-testing / composition-root usage.</summary>
+        public StreamTransformationCoordinator(
+            IStrategyResolver resolver,
+            IDlqPublisher dlqPublisher,
+            int maxParallelism)
+        {
+            _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
+            _dlqPublisher = dlqPublisher ?? throw new ArgumentNullException(nameof(dlqPublisher));
+            _maxParallelism = maxParallelism < 1 ? DefaultParallelism : maxParallelism;
+        }
+
+        // -----------------------------------------------------------------------------------------
+        // Lambda handler
+        // -----------------------------------------------------------------------------------------
+
+        /// <summary>
+        /// Primary Lambda handler invoked by the AWS runtime.
+        /// </summary>
+        /// <remarks>
+        /// Signature must remain asynchronous for the runtime to honour returned task completion.
+        /// </remarks>
+        public async Task HandleAsync(KinesisEvent kinesisEvent, ILambdaContext context)
+        {
+            var logger = context.Logger;
+            logger.LogDebug($"Received batch with {kinesisEvent.Records.Count} record(s).");
+
+            using var semaphore = new SemaphoreSlim(_maxParallelism);
+            var tasks = kinesisEvent.Records.Select(async record =>
+            {
+                await semaphore.WaitAsync(context.CancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await ProcessRecordAsync(record, context).ConfigureAwait(false);
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            }).ToList();
+
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+
+            logger.LogInformation("Batch processed successfully.");
+        }
+
+        #endregion
+
+        #region === Record Processing ===================================================================================
+
+        private async Task ProcessRecordAsync(KinesisEvent.KinesisEventRecord record, ILambdaContext ctx)
+        {
+            var logger = ctx.Logger;
+            RawEvent rawEvent;
+            try
+            {
+                rawEvent = DeserializeRecord(record);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($"[DeserializationFail] PartitionKey={record.Kinesis.PartitionKey} — {ex}");
+                await _dlqPublisher.PublishAsync(DlqMessage.FromDeadLetter(record, ex), ctx.CancellationToken)
+                                   .ConfigureAwait(false);
+                return;
+            }
+
+            ITransformationStrategy? strategy = null;
+            try
+            {
+                strategy = _resolver.Resolve(rawEvent.ContentType);
+            }
+            catch (UnknownContentTypeException uctEx)
+            {
+                logger.LogWarning(uctEx.Message);
+                await _dlqPublisher.PublishAsync(DlqMessage.FromDeadLetter(record, uctEx), ctx.CancellationToken)
+                                   .ConfigureAwait(false);
+                return;
+            }
+
+            try
+            {
+                var kpiRecord = await strategy.TransformAsync(rawEvent, ctx.CancellationToken).ConfigureAwait(false);
+
+                // Persist KPI record (omitted — could be S3, Redshift, Firehose, etc.).
+                logger.LogDebug($"Successfully transformed event → KPI '{kpiRecord.KpiName}'.");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($"[StrategyFail] Strategy={strategy.GetType().Name} — {ex}");
+                await _dlqPublisher.PublishAsync(DlqMessage.FromDeadLetter(record, ex), ctx.CancellationToken)
+                                   .ConfigureAwait(false);
+            }
+        }
+
+        private static RawEvent DeserializeRecord(KinesisEvent.KinesisEventRecord record)
+        {
+            var json = Encoding.UTF8.GetString(record.Kinesis.Data.Span);
+            var document = JsonDocument.Parse(json);
+            var root = document.RootElement;
+
+            return new RawEvent(
+                ContentType: root.GetProperty("contentType").GetString() ?? "application/unknown",
+                Payload: root.GetProperty("payload"),
+                Timestamp: root.GetProperty("timestamp").GetDateTime());
+        }
+
+        #endregion
+    }
+
+    #region === Strategy Pattern Infrastructure =======================================================================
+
+    /// <summary>
+    /// Lightweight service-locator for <see cref="ITransformationStrategy"/> implementations.
+    /// Scans the current assembly only once and caches results in a thread-safe dictionary.
+    /// </summary>
+    internal sealed class StrategyResolver : IStrategyResolver
+    {
+        private readonly ConcurrentDictionary<string, ITransformationStrategy> _cache = new();
+
+        public StrategyResolver()
+        {
+            // Pre-warm the cache so that we fail fast on startup if multiple
+            // strategies claim to handle the same content type.
+            var implementations = Assembly.GetExecutingAssembly()
+                                          .GetTypes()
+                                          .Where(t => !t.IsAbstract && typeof(ITransformationStrategy).IsAssignableFrom(t));
+
+            foreach (var type in implementations)
+            {
+                var instance = (ITransformationStrategy)Activator.CreateInstance(type)!;
+                foreach (var contentType in instance.SupportedContentTypes)
+                {
+                    if (!_cache.TryAdd(contentType, instance))
+                    {
+                        throw new InvalidOperationException(
+                            $"Multiple transformation strategies registered for content type '{contentType}'.");
+                    }
+                }
+            }
+        }
+
+        public ITransformationStrategy Resolve(string contentType)
+        {
+            if (!_cache.TryGetValue(contentType, out var strategy))
+            {
+                throw new UnknownContentTypeException(contentType);
+            }
+
+            return strategy;
+        }
+    }
+
+    /// <summary>
+    /// Thrown when no strategy is found for the specified content type.
+    /// </summary>
+    public sealed class UnknownContentTypeException : Exception
+    {
+        public UnknownContentTypeException(string contentType)
+            : base($"No transformation strategy registered for content type '{contentType}'.")
+        { }
+    }
+
+    /// <summary>
+    /// Abstraction for locating the correct transformation strategy.
+    /// </summary>
+    public interface IStrategyResolver
+    {
+        ITransformationStrategy Resolve(string contentType);
+    }
+
+    /// <summary>
+    /// Common interface for KPI transformation strategies.  Each implementation
+    /// must declare which content types it can consume.
+    /// </summary>
+    public interface ITransformationStrategy
+    {
+        IReadOnlyCollection<string> SupportedContentTypes { get; }
+
+        /// <summary>
+        /// Transforms a raw telemetry event into a normalized KPI record.
+        /// </summary>
+        Task<KpiRecord> TransformAsync(RawEvent rawEvent, CancellationToken token);
+    }
+
+    #endregion
+
+    #region === Concrete Strategy Examples ============================================================================
+
+    /// <summary>
+    /// Example strategy that derives “Focus Time” KPI from calendar metadata.
+    /// </summary>
+    internal sealed class CalendarFocusTimeStrategy : ITransformationStrategy
+    {
+        public IReadOnlyCollection<string> SupportedContentTypes { get; } =
+            new[] { "application/vnd.pulseops.calendar+json" };
+
+        public Task<KpiRecord> TransformAsync(RawEvent rawEvent, CancellationToken token)
+        {
+            // Domain-specific parsing stripped down for brevity.
+            var meetingDurationMinutes = rawEvent.Payload.GetProperty("meetingDurationMinutes").GetInt32();
+            var userId = rawEvent.Payload.GetProperty("userId").GetString()!;
+
+            var focusTime = 480 - meetingDurationMinutes; // 8h work day.
+
+            var kpiPayload = JsonSerializer.SerializeToElement(new
+            {
+                userId,
+                focusTimeMinutes = focusTime,
+                computationDate = rawEvent.Timestamp.Date
+            });
+
+            return Task.FromResult(new KpiRecord("focus_time", kpiPayload));
+        }
+    }
+
+    /// <summary>
+    /// Example strategy computing “Deployment Lead Time” KPI from CI/CD events.
+    /// </summary>
+    internal sealed class DeploymentLeadTimeStrategy : ITransformationStrategy
+    {
+        public IReadOnlyCollection<string> SupportedContentTypes { get; } =
+            new[] { "application/vnd.pulseops.cicd+json" };
+
+        public Task<KpiRecord> TransformAsync(RawEvent rawEvent, CancellationToken token)
+        {
+            var queuedAt = rawEvent.Payload.GetProperty("queuedAt").GetDateTime();
+            var deployedAt = rawEvent.Payload.GetProperty("deployedAt").GetDateTime();
+
+            var leadTimeMinutes = (deployedAt - queuedAt).TotalMinutes;
+
+            var pipelineId = rawEvent.Payload.GetProperty("pipelineId").GetString()!;
+
+            var kpiPayload = JsonSerializer.SerializeToElement(new
+            {
+                pipelineId,
+                leadTimeMinutes,
+                dequeuedDate = deployedAt.Date
+            });
+
+            return Task.FromResult(new KpiRecord("deployment_lead_time", kpiPayload));
+        }
+    }
+
+    #endregion
+
+    #region === Dead Letter Queue Components ==========================================================================
+
+    /// <summary>
+    /// Simple abstraction for publishing dead-letter messages.
+    /// </summary>
+    public interface IDlqPublisher
+    {
+        Task PublishAsync(DlqMessage message, CancellationToken token);
+    }
+
+    /// <summary>
+    /// SNS-backed DLQ publisher used in production.  Topic ARN is provided via environment variable.
+    /// </summary>
+    internal sealed class SnsDlqPublisher : IDlqPublisher
+    {
+        private static readonly string TopicArn =
+            Environment.GetEnvironmentVariable("DLQ_TOPIC_ARN")
+            ?? throw new InvalidOperationException("DLQ_TOPIC_ARN environment variable not set.");
+
+        private readonly IAmazonSimpleNotificationService _snsClient;
+
+        public SnsDlqPublisher() : this(new AmazonSimpleNotificationServiceClient()) { }
+
+        // ctor injection facilitates unit testing with a mocked IAmazonSimpleNotificationService.
+        public SnsDlqPublisher(IAmazonSimpleNotificationService snsClient)
+        {
+            _snsClient = snsClient;
+        }
+
+        public async Task PublishAsync(DlqMessage message, CancellationToken token)
+        {
+            var request = new PublishRequest
+            {
+                TopicArn = TopicArn,
+                Message = JsonSerializer.Serialize(message)
+            };
+
+            await _snsClient.PublishAsync(request, token).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Canonical schema for dead-letter messages.
+    /// </summary>
+    public sealed record DlqMessage(
+        string Source,
+        string Reason,
+        object OriginalEvent)
+    {
+        public static DlqMessage FromDeadLetter(KinesisEvent.KinesisEventRecord record, Exception ex) =>
+            new(
+                Source: "StreamTransformationCoordinator",
+                Reason: ex.ToString(),
+                OriginalEvent: new
+                {
+                    record.EventId,
+                    PartitionKey = record.Kinesis.PartitionKey,
+                    SequenceNumber = record.Kinesis.SequenceNumber
+                });
+    }
+
+    #endregion
+
+    #region === Data Contracts ========================================================================================
+
+    /// <summary>
+    /// Lightweight representation of a raw telemetry event pulled from Kinesis.
+    /// </summary>
+    /// <param name="ContentType">MIME-type identifying the event schema.</param>
+    /// <param name="Payload">JSON payload of the event.</param>
+    /// <param name="Timestamp">Event-time.</param>
+    public sealed record RawEvent(
+        string ContentType,
+        JsonElement Payload,
+        DateTime Timestamp);
+
+    /// <summary>
+    /// Normalized KPI record emitted by a transformation strategy.
+    /// </summary>
+    /// <param name="KpiName">Short identifier of the KPI.</param>
+    /// <param name="DerivedData">JSON payload containing computed KPI fields.</param>
+    public sealed record KpiRecord(
+        string KpiName,
+        JsonElement DerivedData);
+
+    #endregion
+}
+
+#pragma warning restore CA1031
+```

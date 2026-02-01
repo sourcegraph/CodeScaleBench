@@ -1,0 +1,477 @@
+```rust
+//! src/module_4.rs
+//!
+//! Centralised domain-event infrastructure for EduPulse Live.
+//!
+//! This module exposes:
+//!   * DomainEvent & DomainEventKind – strongly-typed, versioned event
+//!     definitions shared across bounded contexts.
+//!   * EventPublisher – service-layer abstraction allowing the core API to
+//!     remain ignorant of transport details (NATS, Kafka, etc.).
+//!   * NatsEventPublisher – production implementation that publishes JSON
+//!     envelopes to a NATS JetStream subject hierarchy.
+//!   * EventStore – ACID append-only persistence used for audit trail / GDPR
+//!     erase workflow.
+//!   * PostgresEventStore – repository implementation via `sqlx`.
+//!   * LearningPulseService – sample use-case that persists a new learning
+//!     pulse and emits the corresponding event within a single transaction.
+//!
+//! The code follows Repository + Service-Layer patterns and is intended to be
+//! wired up by the dependency-injection crate of your choice (e.g. `shuttle`,
+//! `axum::extract::State`, or `tower` layers).
+//!
+//! # Crate features required
+//! Make sure `Cargo.toml` enables the following dependencies:
+//!
+//! ```toml
+//! [dependencies]
+//! async-nats = { version = "0.34", default-features = false, features = ["jetstream"] }
+//! async-trait = "0.1"
+//! anyhow = "1"
+//! chrono = { version = "0.4", features = ["serde"] }
+//! serde = { version = "1.0", features = ["derive"] }
+//! serde_json = "1.0"
+//! sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
+//! tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+//! tracing = "0.1"
+//! uuid = { version = "1", features = ["serde", "v4"] }
+//! ```
+//!
+//! ## Warning
+//! Production environments should tune JetStream options (e.g., stream
+//! retention), connection retries, and TLS settings. This sample is simplified
+//! for readability.
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use async_nats::jetstream::{self, stream::Stream};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgQueryResult, PgPool, Postgres, Transaction};
+use tracing::{debug, error, info, instrument};
+use uuid::Uuid;
+
+// -------------------------------------------------------------------------------------------------
+// Domain Event Definitions
+// -------------------------------------------------------------------------------------------------
+
+/// Enum representing all event payloads produced by the **web_social** bounded
+/// context. Each variant must remain strictly additive (append-only) to avoid
+/// breaking consumers performing pattern matching.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+#[non_exhaustive]
+pub enum DomainEventKind {
+    LessonPublished {
+        lesson_id: Uuid,
+        teacher_id: Uuid,
+    },
+    QuizSubmitted {
+        quiz_id: Uuid,
+        student_id: Uuid,
+        score_percentage: f32,
+    },
+    BadgeAwarded {
+        badge_id: Uuid,
+        student_id: Uuid,
+    },
+    PaymentProcessed {
+        payment_id: Uuid,
+        order_total_cents: i64,
+        payer_id: Uuid,
+    },
+    LearningPulseCreated {
+        pulse_id: Uuid,
+        teacher_id: Uuid,
+    },
+    LearningPulseResponded {
+        pulse_id: Uuid,
+        student_id: Uuid,
+        response_id: Uuid,
+    },
+}
+
+/// Envelope that wraps every event with rich metadata required for correlation
+/// and causation analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainEvent {
+    /// Unique ID for this event. Uses UUID v4 for randomness and horizontal
+    /// partitioning friendliness.
+    pub id: Uuid,
+    /// ID that allows grouping of events that belong to the same workflow.
+    pub correlation_id: Option<Uuid>,
+    /// ID of the event that directly triggered this one, if any.
+    pub causation_id: Option<Uuid>,
+    /// Actor responsible (user, system) – useful for audit trail.
+    pub actor_id: Option<Uuid>,
+    /// Time of creation in UTC with millisecond precision.
+    pub occurred_at: DateTime<Utc>,
+    /// Semantic version of the payload schema.
+    pub schema_version: u16,
+    /// Actual business payload.
+    pub payload: DomainEventKind,
+}
+
+impl DomainEvent {
+    /// Creates a new envelope, stamping with `Utc::now()`.
+    pub fn new(actor_id: Option<Uuid>, payload: DomainEventKind) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            correlation_id: None,
+            causation_id: None,
+            actor_id,
+            occurred_at: Utc::now(),
+            schema_version: 1,
+            payload,
+        }
+    }
+
+    /// Returns the recommended NATS subject where this event should be
+    /// published, following the `edupulse.{bounded_context}.{event_name}` style
+    /// to facilitate fine-grained subscriptions.
+    pub fn subject(&self) -> String {
+        let event_name = match &self.payload {
+            DomainEventKind::LessonPublished { .. } => "lesson_published",
+            DomainEventKind::QuizSubmitted { .. } => "quiz_submitted",
+            DomainEventKind::BadgeAwarded { .. } => "badge_awarded",
+            DomainEventKind::PaymentProcessed { .. } => "payment_processed",
+            DomainEventKind::LearningPulseCreated { .. } => "learning_pulse_created",
+            DomainEventKind::LearningPulseResponded { .. } => "learning_pulse_responded",
+        };
+        format!("edupulse.web_social.{}", event_name)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// EventPublisher Abstraction
+// -------------------------------------------------------------------------------------------------
+
+/// Transport-agnostic publisher for domain events. Implementations must be
+/// idempotent and **MUST NOT** panic; failures are returned as `Err`.
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, event: &DomainEvent) -> Result<()>;
+}
+
+// -------------------------------------------------------------------------------------------------
+// NATS JetStream Implementation
+// -------------------------------------------------------------------------------------------------
+
+/// Production-grade NATS JetStream publisher, supporting at-least-once delivery.
+/// Uses JSON serialisation for maximum interoperability with polyglot services.
+pub struct NatsEventPublisher {
+    client: async_nats::Client,
+    jetstream: jetstream::Context,
+    stream: Stream,
+}
+
+impl NatsEventPublisher {
+    /// Creates a new publisher, auto-provisioning the `edupulse` stream if it
+    /// does not exist. The stream is configured for message-size budgets
+    /// typical to domain events (< 64 KiB).
+    pub async fn new(nats_url: &str) -> Result<Self> {
+        let client = async_nats::connect(nats_url).await?;
+        let jetstream = jetstream::new(client.clone());
+
+        let stream = match jetstream.get_stream("EDUPULSE").await {
+            Ok(stream) => stream,
+            Err(_) => {
+                info!("creating JetStream stream `EDUPULSE`");
+                jetstream
+                    .create_stream(jetstream::stream::Config {
+                        name: "EDUPULSE".to_owned(),
+                        subjects: vec!["edupulse.>".to_owned()],
+                        max_age: chrono::Duration::days(7).to_std().unwrap(),
+                        storage: jetstream::stream::StorageType::File,
+                        ..Default::default()
+                    })
+                    .await?
+            }
+        };
+
+        Ok(Self {
+            client,
+            jetstream,
+            stream,
+        })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for NatsEventPublisher {
+    #[instrument(skip_all, fields(event_id = %event.id, subject = %event.subject()))]
+    async fn publish(&self, event: &DomainEvent) -> Result<()> {
+        let bytes = serde_json::to_vec(event)?;
+        self.client
+            .publish(event.subject(), bytes.into())
+            .await
+            .context("failed to publish event to NATS")?;
+        Ok(())
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Event Store Repository
+// -------------------------------------------------------------------------------------------------
+
+/// Append-only store for domain events, enabling event sourcing and audit trail
+/// reconstruction. Each implementation should ensure **exactly-once** writes.
+#[async_trait]
+pub trait EventStore: Send + Sync {
+    async fn append(&self, tx: &mut Transaction<'_, Postgres>, event: &DomainEvent)
+        -> Result<()>;
+    async fn list_by_aggregate(
+        &self,
+        aggregate_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<DomainEvent>>;
+}
+
+/// Postgres implementation utilising `jsonb` column for payload + metadata.
+pub struct PostgresEventStore {
+    pool: PgPool,
+}
+
+impl PostgresEventStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl EventStore for PostgresEventStore {
+    async fn append(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        event: &DomainEvent,
+    ) -> Result<()> {
+        let payload_json = serde_json::to_value(event)?;
+        sqlx::query!(
+            r#"
+            INSERT INTO domain_events (
+                id,
+                occurred_at,
+                aggregate_id,
+                correlation_id,
+                causation_id,
+                actor_id,
+                schema_version,
+                payload
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            "#,
+            event.id,
+            event.occurred_at,
+            extract_aggregate_id(event), // helper below
+            event.correlation_id,
+            event.causation_id,
+            event.actor_id,
+            event.schema_version as i32,
+            payload_json
+        )
+        .execute(&mut *tx)
+        .await
+        .context("failed to append domain event")?;
+        Ok(())
+    }
+
+    async fn list_by_aggregate(
+        &self,
+        aggregate_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<DomainEvent>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT payload
+            FROM domain_events
+            WHERE aggregate_id = $1
+            ORDER BY occurred_at
+            LIMIT $2 OFFSET $3
+            "#,
+            aggregate_id,
+            limit,
+            offset
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let value: serde_json::Value = row.payload;
+                let ev: DomainEvent = serde_json::from_value(value)
+                    .context("failed to deserialize stored event")?;
+                Ok(ev)
+            })
+            .collect()
+    }
+}
+
+/// Extracts a stable aggregate identifier from the given event. For some events
+/// the aggregate is obvious (e.g., `lesson_id`), for others a different domain
+/// decision may be needed. For demo purposes we pick the first UUID.
+fn extract_aggregate_id(event: &DomainEvent) -> Uuid {
+    match &event.payload {
+        DomainEventKind::LessonPublished { lesson_id, .. } => *lesson_id,
+        DomainEventKind::QuizSubmitted { quiz_id, .. } => *quiz_id,
+        DomainEventKind::BadgeAwarded { badge_id, .. } => *badge_id,
+        DomainEventKind::PaymentProcessed { payment_id, .. } => *payment_id,
+        DomainEventKind::LearningPulseCreated { pulse_id, .. } => *pulse_id,
+        DomainEventKind::LearningPulseResponded { pulse_id, .. } => *pulse_id,
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// LearningPulse Service (Use-Case Example)
+// -------------------------------------------------------------------------------------------------
+
+/// DTO used by controllers when a teacher creates a new learning pulse.
+#[derive(Debug, Deserialize)]
+pub struct NewLearningPulse {
+    pub teacher_id: Uuid,
+    pub title: String,
+    pub description: Option<String>,
+    pub due_date: Option<DateTime<Utc>>,
+}
+
+/// Lightweight representation of a persisted learning pulse.
+#[derive(Debug, Serialize)]
+pub struct LearningPulse {
+    pub id: Uuid,
+    pub teacher_id: Uuid,
+    pub title: String,
+    pub description: Option<String>,
+    pub due_date: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Service encapsulating the invariants and business rules related to Learning
+/// Pulses. Other bounded contexts interact via REST or gRPC, never directly
+/// with repositories.
+pub struct LearningPulseService {
+    pool: PgPool,
+    event_store: Arc<dyn EventStore>,
+    publisher: Arc<dyn EventPublisher>,
+}
+
+impl LearningPulseService {
+    pub fn new(
+        pool: PgPool,
+        event_store: Arc<dyn EventStore>,
+        publisher: Arc<dyn EventPublisher>,
+    ) -> Self {
+        Self {
+            pool,
+            event_store,
+            publisher,
+        }
+    }
+
+    /// Creates a new learning pulse in a single ACID transaction, appends and
+    /// publishes the corresponding domain event only **after** the DB write
+    /// succeeds (`outbox` pattern).
+    #[instrument(skip(self))]
+    pub async fn create_pulse(&self, dto: NewLearningPulse) -> Result<LearningPulse> {
+        // Begin transaction.
+        let mut tx = self.pool.begin().await?;
+        let pulse_id = Uuid::new_v4();
+
+        // Insert row.
+        let q: PgQueryResult = sqlx::query!(
+            r#"
+            INSERT INTO learning_pulses (id, teacher_id, title, description, due_date)
+            VALUES ($1,$2,$3,$4,$5)
+            "#,
+            pulse_id,
+            dto.teacher_id,
+            dto.title,
+            dto.description,
+            dto.due_date
+        )
+        .execute(&mut *tx)
+        .await
+        .context("failed to insert learning pulse")?;
+
+        debug!(rows_affected = q.rows_affected(), "inserted learning pulse");
+
+        // Build domain event.
+        let event = DomainEvent::new(
+            Some(dto.teacher_id),
+            DomainEventKind::LearningPulseCreated {
+                pulse_id,
+                teacher_id: dto.teacher_id,
+            },
+        );
+
+        // Persist event to store.
+        self.event_store.append(&mut tx, &event).await?;
+
+        // Commit.
+        tx.commit().await?;
+
+        // Publish *after* commit to ensure read-your-own writes semantics.
+        if let Err(e) = self.publisher.publish(&event).await {
+            // Publishing failures should be retried via a dead-letter queue in
+            // real deployments. We log the error and continue – state is
+            // durable because the event is stored.
+            error!(error = %e, "failed to publish learning_pulse_created");
+        }
+
+        Ok(LearningPulse {
+            id: pulse_id,
+            teacher_id: dto.teacher_id,
+            title: dto.title,
+            description: dto.description,
+            due_date: dto.due_date,
+            created_at: Utc::now(),
+        })
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// SQL bootstrap helpers (optional)
+// -------------------------------------------------------------------------------------------------
+
+/// Executes the  required DDL statements if they do not yet exist. In a real
+/// environment, run migrations separately (e.g., with `sqlx migrate`), but this
+/// is handy for integration tests / demos.
+pub async fn ensure_schema(pool: &PgPool) -> Result<()> {
+    info!("ensuring Postgres schema for domain events & learning pulses");
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS learning_pulses (
+            id UUID PRIMARY KEY,
+            teacher_id UUID NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            due_date TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS domain_events (
+            id UUID PRIMARY KEY,
+            occurred_at TIMESTAMPTZ NOT NULL,
+            aggregate_id UUID NOT NULL,
+            correlation_id UUID,
+            causation_id UUID,
+            actor_id UUID,
+            schema_version SMALLINT NOT NULL,
+            payload JSONB NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+```

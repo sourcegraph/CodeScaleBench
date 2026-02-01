@@ -1,0 +1,449 @@
+```rust
+//! ChirpPulse – Sentiment Strategy Engine
+//!
+//! This module owns the pluggable sentiment–analysis layer that powers the
+//! real-time enrichment pipeline.  It demonstrates a Strategy pattern with
+//! hot-swappable implementations, Kafka ingestion / egress, and observability
+//! baked in.
+//!
+//! The code is self-contained to keep the example manageable, yet it mirrors
+//! production concerns: graceful shutdown, back-pressure handling, schema
+//! evolution, and golden-path unit tests.
+
+use std::{
+    fmt::{self, Display},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use futures::{Stream, StreamExt, TryStreamExt};
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    error::KafkaError,
+    message::{BorrowedMessage, OwnedMessage},
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Message,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, RwLock, RwLockReadGuard},
+    task::JoinHandle,
+    time::sleep,
+};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Domain-layer error representation.
+#[derive(Debug, Error)]
+pub enum SentimentEngineError {
+    #[error("Kafka error: {0}")]
+    Kafka(#[from] KafkaError),
+
+    #[error("Serde error: {0}")]
+    SerdeJson(#[from] serde_json::Error),
+
+    #[error("Strategy error: {0}")]
+    Strategy(#[from] StrategyError),
+
+    #[error("Graceful shutdown invoked")]
+    Shutdown,
+}
+
+/// Strategy-level errors.
+#[derive(Debug, Error)]
+pub enum StrategyError {
+    #[error("unsupported language: {0}")]
+    UnsupportedLanguage(String),
+
+    #[error("model initialization failed: {0}")]
+    ModelInitialization(String),
+
+    #[error("internal: {0}")]
+    Internal(String),
+}
+
+/// Outgoing enriched record.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EnrichedEvent {
+    pub id: String,
+    pub text: String,
+    pub lang: String,
+    pub sentiment_score: f32,
+    pub algorithm: String,
+    pub ts_ms: i64,
+}
+
+/// Incoming raw social event.
+#[derive(Debug, Deserialize)]
+pub struct RawEvent {
+    pub id: String,
+    pub text: String,
+    pub lang: String,
+    pub ts_ms: i64,
+}
+
+/// Strategy interface.
+#[async_trait]
+pub trait SentimentStrategy: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    /// Run sentiment inference, returning a polarity score in `[-1.0, 1.0]`
+    /// where `1` is strongly positive.
+    async fn infer(&self, lang: &str, text: &str) -> Result<f32, StrategyError>;
+}
+
+/// Lightweight rule-based strategy (VADER-like).
+#[derive(Default)]
+pub struct RuleBasedVader;
+
+#[async_trait]
+impl SentimentStrategy for RuleBasedVader {
+    fn name(&self) -> &'static str {
+        "rule_vader"
+    }
+
+    #[instrument(level = "debug", skip(self, text))]
+    async fn infer(&self, lang: &str, text: &str) -> Result<f32, StrategyError> {
+        if lang != "en" {
+            return Err(StrategyError::UnsupportedLanguage(lang.into()));
+        }
+
+        // Extremely naïve implementation for demonstration.
+        let positive = ["good", "great", "love", "happy", "excellent"];
+        let negative = ["bad", "terrible", "hate", "angry", "awful"];
+
+        let mut score = 0.0;
+        for token in text.split_whitespace() {
+            if positive.contains(&token.to_lowercase().as_str()) {
+                score += 1.0;
+            } else if negative.contains(&token.to_lowercase().as_str()) {
+                score -= 1.0;
+            }
+        }
+
+        Ok(score.clamp(-1.0, 1.0))
+    }
+}
+
+/// Fake transformer-based sentiment strategy that pretends to use a deep model.
+/// In production, this would wrap a TorchScript or ONNX runtime.
+pub struct TransformerXL {
+    lang: String,
+}
+
+impl TransformerXL {
+    pub async fn new(lang: &str) -> Result<Self, StrategyError> {
+        // Pretend we load weights here.
+        sleep(Duration::from_millis(150)).await; // Simulate I/O latency
+        if lang == "en" || lang == "es" {
+            Ok(Self {
+                lang: lang.to_owned(),
+            })
+        } else {
+            Err(StrategyError::UnsupportedLanguage(lang.into()))
+        }
+    }
+}
+
+#[async_trait]
+impl SentimentStrategy for TransformerXL {
+    fn name(&self) -> &'static str {
+        "transformer_xl"
+    }
+
+    #[instrument(level = "debug", skip(self, text))]
+    async fn infer(&self, _lang: &str, text: &str) -> Result<f32, StrategyError> {
+        // Dummy: use text length mod magic number to create pseudo-random score.
+        let mut hash = 0u32;
+        for byte in text.as_bytes() {
+            hash = hash.wrapping_mul(31).wrapping_add(*byte as u32);
+        }
+        let score = ((hash % 200) as f32 / 100.0) - 1.0;
+        Ok(score)
+    }
+}
+
+/// Thread-safe runtime container capable of hot-swapping strategies at runtime.
+#[derive(Clone)]
+pub struct StrategyRegistry {
+    /// Current active strategy.
+    inner: Arc<RwLock<Box<dyn SentimentStrategy>>>,
+}
+
+impl StrategyRegistry {
+    pub async fn new_default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Box::new(RuleBasedVader::default()))),
+        }
+    }
+
+    /// Swap strategy globally. All upcoming analyses will immediately use the
+    /// new instance.
+    #[instrument(skip(self, new_strategy))]
+    pub async fn swap(&self, new_strategy: Box<dyn SentimentStrategy>) {
+        let mut guard = self.inner.write().await;
+        *guard = new_strategy;
+        info!("Strategy swapped; consumers now use '{}'", guard.name());
+    }
+
+    pub async fn read(&self) -> RwLockReadGuard<'_, Box<dyn SentimentStrategy>> {
+        self.inner.read().await
+    }
+}
+
+impl Display for StrategyRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        futures::executor::block_on(async {
+            let guard = self.inner.read().await;
+            write!(f, "StrategyRegistry<{}>", guard.name())
+        })
+    }
+}
+
+/// Engine orchestrates the ingestion -> enrichment -> egress pipeline.
+pub struct SentimentEngine {
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+    input_topic: String,
+    output_topic: String,
+    registry: StrategyRegistry,
+    shutdown_tx: broadcast::Sender<()>,
+}
+
+impl SentimentEngine {
+    pub async fn new<K: Into<String>>(
+        brokers: &str,
+        group_id: &str,
+        input_topic: K,
+        output_topic: K,
+    ) -> Result<Self, SentimentEngineError> {
+        // Configure consumer
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set("group.id", group_id)
+            .set("enable.auto.commit", "true")
+            .create()?;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .create()?;
+
+        consumer.subscribe(&[&input_topic.into()])?;
+
+        let registry = StrategyRegistry::new_default().await;
+        let (shutdown_tx, _) = broadcast::channel(4);
+
+        Ok(Self {
+            consumer,
+            producer,
+            input_topic: input_topic.into(),
+            output_topic: output_topic.into(),
+            registry,
+            shutdown_tx,
+        })
+    }
+
+    pub fn strategy_registry(&self) -> StrategyRegistry {
+        self.registry.clone()
+    }
+
+    /// Non-blocking run. Returns a handle you can `.await` for termination.
+    pub fn spawn(mut self) -> JoinHandle<Result<(), SentimentEngineError>> {
+        tokio::spawn(async move { self.run().await })
+    }
+
+    #[instrument(name = "sentiment_engine", skip(self))]
+    async fn run(&mut self) -> Result<(), SentimentEngineError> {
+        let mut stream = self.consumer.stream();
+
+        loop {
+            select! {
+                biased;
+                _ = self.shutdown_tx.subscribe().recv() => {
+                    warn!("Shutdown signal received");
+                    return Err(SentimentEngineError::Shutdown);
+                }
+
+                maybe_msg = stream.next() => {
+                    let borrowed = match maybe_msg {
+                        Some(Ok(msg)) => msg,
+                        Some(Err(e)) => {
+                            error!("Kafka error: {e}");
+                            continue; // Resilient to bad records
+                        }
+                        None => {
+                            // Stream ended (unlikely for Kafka)
+                            warn!("Stream terminated");
+                            break;
+                        }
+                    };
+
+                    if let Err(e) = self.process_message(borrowed).await {
+                        error!("Failed to process message: {e}");
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[instrument(level = "debug", skip(self, borrowed))]
+    async fn process_message(
+        &self,
+        borrowed: BorrowedMessage<'_>,
+    ) -> Result<(), SentimentEngineError> {
+        let payload = match borrowed.payload_view::<str>() {
+            None | Some(Err(_)) => {
+                warn!("Skipping message with invalid payload");
+                return Ok(());
+            }
+            Some(Ok(s)) => s,
+        };
+
+        // Parse raw event
+        let raw: RawEvent = serde_json::from_str(payload)?;
+        debug!(event_id = %raw.id, "Processing raw event");
+
+        // Sentiment analysis
+        let guard = self.registry.read().await;
+        let score = guard.infer(&raw.lang, &raw.text).await?;
+
+        let enriched = EnrichedEvent {
+            id: raw.id,
+            text: raw.text,
+            lang: raw.lang,
+            sentiment_score: score,
+            algorithm: guard.name().into(),
+            ts_ms: raw.ts_ms,
+        };
+
+        drop(guard); // release read lock early
+
+        self.produce(enriched).await?;
+
+        Ok(())
+    }
+
+    #[instrument(level = "debug", skip(self, event))]
+    async fn produce(&self, event: EnrichedEvent) -> Result<(), SentimentEngineError> {
+        let payload = serde_json::to_vec(&event)?;
+        let record = FutureRecord::to(&self.output_topic)
+            .payload(&payload)
+            .key(&event.id);
+
+        // Fire-and-forget, but await for potential errors with timeout.
+        let delivery_status = self
+            .producer
+            .send(record, Duration::from_secs(0))
+            .await
+            .map_err(|(e, _msg)| SentimentEngineError::Kafka(e))?;
+
+        debug!("Produced message: {delivery_status:?}");
+        Ok(())
+    }
+
+    /// Request a graceful shutdown.
+    pub fn stop(&self) {
+        let _ = self.shutdown_tx.send(());
+    }
+}
+
+//
+// ─── Tests ────────────────────────────────────────────────────────────────────
+//
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn test_rule_based_vader() {
+        let strategy = RuleBasedVader::default();
+        let positive = strategy.infer("en", "i love this great product").await.unwrap();
+        let negative = strategy.infer("en", "this is bad and awful").await.unwrap();
+
+        assert!(positive > 0.0);
+        assert!(negative < 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_strategy_registry_swap() {
+        let registry = StrategyRegistry::new_default().await;
+        {
+            let guard = registry.read().await;
+            assert_eq!(guard.name(), "rule_vader");
+        }
+
+        // Prepare new strategy
+        let new_strategy = Box::new(TransformerXL::new("en").await.unwrap()) as Box<dyn SentimentStrategy>;
+        registry.swap(new_strategy).await;
+
+        let guard = registry.read().await;
+        assert_eq!(guard.name(), "transformer_xl");
+    }
+
+    // Integration test using in-memory channels instead of Kafka. Demonstrates
+    // engine pipeline correctness without external infra.
+    #[tokio::test]
+    async fn test_engine_pipeline_memory() {
+        // --- create mocked kafka clients --------------------------
+        //
+        // We use rdkafka's `MockClient` in real tests, but to stay dependency-
+        // light for this snippet, we spin up an engine but never call run().
+        // We'll directly exercise process_message().
+        //
+        let (engine, mock_consumer_msg) = {
+            // Create dummy engine
+            let dummy = SentimentEngine::new("localhost:9092", "test", "in", "out")
+                .await
+                .expect("Engine creation");
+
+            // Build synthetic OwnedMessage
+            let raw = RawEvent {
+                id: "abc".into(),
+                text: "i love rust".into(),
+                lang: "en".into(),
+                ts_ms: 1_697_000_000_000,
+            };
+            let bytes = serde_json::to_vec(&raw).unwrap();
+            let owned = OwnedMessage::new(
+                bytes,
+                None,
+                None,
+                None,
+                None,
+                "in".to_owned(),
+                0,
+                0,
+                None,
+            );
+            (dummy, owned.detach())
+        };
+
+        let score_before = {
+            let guard = engine.registry.read().await;
+            guard.infer("en", "i love rust").await.unwrap()
+        };
+
+        // Should succeed
+        engine.process_message(mock_consumer_msg.borrow()).await.unwrap();
+
+        // Swap strategy and ensure changed behavior
+        engine
+            .registry
+            .swap(Box::new(TransformerXL::new("en").await.unwrap()))
+            .await;
+
+        let score_after = {
+            let guard = engine.registry.read().await;
+            guard.infer("en", "i love rust").await.unwrap()
+        };
+
+        assert_ne!(score_before, score_after);
+    }
+}
+```

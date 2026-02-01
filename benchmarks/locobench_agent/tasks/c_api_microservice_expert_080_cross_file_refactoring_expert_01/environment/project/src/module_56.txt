@@ -1,0 +1,405 @@
+```c
+/****************************************************************************************
+ * MercuryMonolith Commerce Hub
+ * Module: Response Cache (src/module_56.txt)
+ *
+ * A production-grade, in-memory, TTL-aware, size-bounded, thread-safe LRU cache
+ * for HTTP / GraphQL responses.  The cache is shared by all service modules and
+ * is designed for low-latency look-ups, predictable memory usage, and seamless
+ * integration with the Hub’s structured logging and monitoring subsystems.
+ *
+ * Public API (mm_cache.h):
+ *      mm_cache_t *mm_cache_create(size_t max_bytes, uint32_t default_ttl_sec);
+ *      void        mm_cache_destroy(mm_cache_t *c);
+ *      int         mm_cache_get(mm_cache_t *c,
+ *                               const char *key,
+ *                               const uint8_t **out_buf,
+ *                               size_t *out_len);
+ *      int         mm_cache_put(mm_cache_t *c,
+ *                               const char *key,
+ *                               const uint8_t *buf,
+ *                               size_t len,
+ *                               uint32_t ttl);   // ttl == 0 → use default
+ *      void        mm_cache_metrics_emit(mm_cache_t *c);
+ *
+ * Implementation details:
+ *  –   Doubly-linked list + uthash hash table for O(1) get/put.
+ *  –   All public functions are guarded by a pthread mutex.
+ *  –   Lazy expiry check on read.
+ *  –   Eviction follows LRU until memory usage ≤ max_bytes.
+ *  –   Metrics: hits, misses, evictions, bytes_used exported to Hub metrics bus.
+ *
+ * Copyright (c) 2024 MercuryMonolith.
+ ****************************************************************************************/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <pthread.h>
+#include <time.h>
+#include <errno.h>
+
+/* External, project-wide single-header dependencies. */
+#include "uthash.h"        /* Tiny hash table (https://troydhanson.github.io/uthash/) */
+
+/* Hub-wide logging & monitoring headers.  These are provided elsewhere in the
+ * codebase.  To keep this compilation unit self-contained we fall back to
+ * POSIX syslog / stderr when the headers are missing. */
+#ifndef MM_LOGGER_H
+#define MM_LOGGER_H
+#   include <syslog.h>
+#   define LOG_INFO(fmt, ...)  syslog(LOG_INFO,  "[CACHE] " fmt, ##__VA_ARGS__)
+#   define LOG_WARN(fmt, ...)  syslog(LOG_WARNING,"[CACHE] " fmt, ##__VA_ARGS__)
+#   define LOG_ERR(fmt, ...)   syslog(LOG_ERR,   "[CACHE] " fmt, ##__VA_ARGS__)
+#endif
+
+#ifndef MM_MONITOR_H
+#   define MM_MONITOR_H
+    /* Simple stub for Prometheus-compatible monitoring.  The real
+     * implementation feeds metrics into the internal event bus. */
+    static inline void mm_monitor_emit(const char *name, double value)
+    {
+        (void)name; (void)value;
+        /* No-op fallback. */
+    }
+#endif /* MM_MONITOR_H */
+
+/* ------------------------------- Public API ------------------------------- */
+
+typedef struct mm_cache mm_cache_t;
+
+/* --------------------------- Internal structures -------------------------- */
+
+typedef struct cache_entry {
+    /* Key     */
+    char               *key;
+
+    /* Value   */
+    uint8_t            *data;
+    size_t              data_len;
+
+    /* LRU list */
+    struct cache_entry *prev;
+    struct cache_entry *next;
+
+    /* Expiry */
+    time_t              expires_at;
+
+    /* uthash handle (keyed by char*) */
+    UT_hash_handle      hh;
+} cache_entry_t;
+
+struct mm_cache {
+    /* Hash table root */
+    cache_entry_t     *table;
+
+    /* LRU list anchors */
+    cache_entry_t     *lru_head;
+    cache_entry_t     *lru_tail;
+
+    /* Config & stats */
+    size_t             max_bytes;
+    uint32_t           default_ttl;
+    size_t             bytes_used;
+
+    uint64_t           hits;
+    uint64_t           misses;
+    uint64_t           evictions;
+
+    /* Thread safety */
+    pthread_mutex_t    mtx;
+};
+
+/* ------------------------------- Constants -------------------------------- */
+
+#define MM_CACHE_SUCCESS          0
+#define MM_CACHE_KEY_NOT_FOUND   -1
+#define MM_CACHE_ERR_NOMEM       -2
+#define MM_CACHE_ERR_INVAL       -3
+
+/* ------------------------- Internal helper macros ------------------------- */
+
+#define GUARD_MTX(c)   pthread_mutex_lock(&(c)->mtx)
+#define UNGUARD_MTX(c) pthread_mutex_unlock(&(c)->mtx)
+
+/* --------------------------- Utility functions ---------------------------- */
+
+static inline time_t _now_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (time_t)ts.tv_sec;
+}
+
+static void _lru_move_to_front(mm_cache_t *c, cache_entry_t *e)
+{
+    if (c->lru_head == e) return;      /* Already front. */
+
+    /* Detach */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    /* Insert at head */
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+static void _lru_append_front(mm_cache_t *c, cache_entry_t *e)
+{
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+static void _lru_remove(mm_cache_t *c, cache_entry_t *e)
+{
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_head == e) c->lru_head = e->next;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+    e->prev = e->next = NULL;
+}
+
+/* ------------------------- Memory accounting utils ------------------------ */
+
+static void _account_add(mm_cache_t *c, size_t bytes)
+{
+    c->bytes_used += bytes;
+}
+
+static void _account_sub(mm_cache_t *c, size_t bytes)
+{
+    c->bytes_used -= bytes;
+}
+
+/* --------------------------- Eviction routine ----------------------------- */
+
+static void _evict_if_needed(mm_cache_t *c)
+{
+    while (c->bytes_used > c->max_bytes && c->lru_tail) {
+        cache_entry_t *victim = c->lru_tail;
+
+        HASH_DEL(c->table, victim);
+        _lru_remove(c, victim);
+
+        _account_sub(c, victim->data_len);
+
+        LOG_INFO("Evicting key='%s' (size=%zu)", victim->key, victim->data_len);
+        c->evictions++;
+
+        free(victim->key);
+        free(victim->data);
+        free(victim);
+    }
+}
+
+/* ----------------------------- Public API --------------------------------- */
+
+mm_cache_t *mm_cache_create(size_t max_bytes, uint32_t default_ttl_sec)
+{
+    if (max_bytes == 0 || default_ttl_sec == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    mm_cache_t *c = calloc(1, sizeof *c);
+    if (!c) return NULL;
+
+    c->max_bytes   = max_bytes;
+    c->default_ttl = default_ttl_sec;
+    pthread_mutex_init(&c->mtx, NULL);
+    return c;
+}
+
+void mm_cache_destroy(mm_cache_t *c)
+{
+    if (!c) return;
+
+    GUARD_MTX(c);
+    cache_entry_t *e, *tmp;
+    HASH_ITER(hh, c->table, e, tmp) {
+        HASH_DEL(c->table, e);
+        free(e->key);
+        free(e->data);
+        free(e);
+    }
+    UNGUARD_MTX(c);
+    pthread_mutex_destroy(&c->mtx);
+    free(c);
+}
+
+/*
+ * Fetch a cached response.
+ * Returns:
+ *      MM_CACHE_SUCCESS        – Cache hit.
+ *      MM_CACHE_KEY_NOT_FOUND – Missing or expired.
+ */
+int mm_cache_get(mm_cache_t *c,
+                 const char *key,
+                 const uint8_t **out_buf,
+                 size_t *out_len)
+{
+    if (!c || !key || !out_buf || !out_len)
+        return MM_CACHE_ERR_INVAL;
+
+    GUARD_MTX(c);
+
+    cache_entry_t *e = NULL;
+    HASH_FIND_STR(c->table, key, e);
+
+    if (!e) {
+        c->misses++;
+        UNGUARD_MTX(c);
+        return MM_CACHE_KEY_NOT_FOUND;
+    }
+
+    /* Check expiry. */
+    if (e->expires_at < _now_sec()) {
+        LOG_INFO("Cache expired for key='%s'", key);
+
+        /* Remove expired entry. */
+        HASH_DEL(c->table, e);
+        _lru_remove(c, e);
+        _account_sub(c, e->data_len);
+
+        free(e->key);
+        free(e->data);
+        free(e);
+
+        c->misses++;
+        UNGUARD_MTX(c);
+        return MM_CACHE_KEY_NOT_FOUND;
+    }
+
+    /* Hit */
+    _lru_move_to_front(c, e);
+    c->hits++;
+
+    *out_buf = e->data;
+    *out_len = e->data_len;
+
+    UNGUARD_MTX(c);
+    return MM_CACHE_SUCCESS;
+}
+
+/*
+ * Store / overwrite a cache entry.
+ * Returns:
+ *      MM_CACHE_SUCCESS  – Success.
+ *      MM_CACHE_ERR_NOMEM – Allocation failure.
+ *      MM_CACHE_ERR_INVAL – Bad arguments.
+ */
+int mm_cache_put(mm_cache_t *c,
+                 const char *key,
+                 const uint8_t *buf,
+                 size_t len,
+                 uint32_t ttl)
+{
+    if (!c || !key || !buf || len == 0)
+        return MM_CACHE_ERR_INVAL;
+
+    /* Reject big entries outright. */
+    if (len > c->max_bytes)
+        return MM_CACHE_ERR_INVAL;
+
+    /* Make defensive copies of key & data before acquiring lock. */
+    char *key_dup = strdup(key);
+    if (!key_dup) return MM_CACHE_ERR_NOMEM;
+
+    uint8_t *data_dup = malloc(len);
+    if (!data_dup) {
+        free(key_dup);
+        return MM_CACHE_ERR_NOMEM;
+    }
+    memcpy(data_dup, buf, len);
+
+    GUARD_MTX(c);
+
+    /* Overwrite if key already exists. */
+    cache_entry_t *e = NULL;
+    HASH_FIND_STR(c->table, key_dup, e);
+    if (e) {
+        _lru_remove(c, e);
+        HASH_DEL(c->table, e);
+
+        _account_sub(c, e->data_len);
+        free(e->key);
+        free(e->data);
+        free(e);
+    }
+
+    e = calloc(1, sizeof *e);
+    if (!e) {
+        UNGUARD_MTX(c);
+        free(key_dup); free(data_dup);
+        return MM_CACHE_ERR_NOMEM;
+    }
+
+    e->key        = key_dup;
+    e->data       = data_dup;
+    e->data_len   = len;
+    e->expires_at = _now_sec() + (ttl ? ttl : c->default_ttl);
+
+    HASH_ADD_KEYPTR(hh, c->table, e->key, strlen(e->key), e);
+    _lru_append_front(c, e);
+    _account_add(c, len);
+
+    _evict_if_needed(c);
+
+    UNGUARD_MTX(c);
+    return MM_CACHE_SUCCESS;
+}
+
+void mm_cache_metrics_emit(mm_cache_t *c)
+{
+    if (!c) return;
+    GUARD_MTX(c);
+
+    mm_monitor_emit("mm_cache_hits_total",      (double)c->hits);
+    mm_monitor_emit("mm_cache_misses_total",    (double)c->misses);
+    mm_monitor_emit("mm_cache_evictions_total", (double)c->evictions);
+    mm_monitor_emit("mm_cache_bytes_used",      (double)c->bytes_used);
+
+    UNGUARD_MTX(c);
+}
+
+/* --------------------------------- Tests ---------------------------------- */
+/* Compile with:
+ *      cc -pthread -DMM_CACHE_TEST -o mm_cache_test mm_cache.c
+ */
+#ifdef MM_CACHE_TEST
+#include <assert.h>
+
+static void _test_basic(void)
+{
+    mm_cache_t *c = mm_cache_create(1024 * 1024, 5); /* 1 MiB, 5s ttl */
+    assert(c);
+
+    const char *k1 = "foo/bar?x=1";
+    const uint8_t payload[] = "hello";
+
+    assert(mm_cache_put(c, k1, payload, sizeof payload, 0) == MM_CACHE_SUCCESS);
+
+    const uint8_t *out; size_t len;
+    assert(mm_cache_get(c, k1, &out, &len) == MM_CACHE_SUCCESS);
+    assert(len == sizeof payload);
+    assert(memcmp(out, payload, len) == 0);
+
+    mm_cache_destroy(c);
+    puts("Basic cache test passed.");
+}
+
+int main(void)
+{
+    _test_basic();
+    return 0;
+}
+#endif /* MM_CACHE_TEST */
+```

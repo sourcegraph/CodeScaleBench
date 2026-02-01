@@ -1,0 +1,241 @@
+```csharp
+// -------------------------------------------------------------------------------------
+//  PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//  File:        src/module_59.txt  (mapped to FocusTimeRatioStrategy.cs at build time)
+//  Synopsis:    Strategy implementation that converts a stream of raw user-activity
+//               tuples into a Focus-Time Ratio KPI per user/day.
+//  Author:      PulseOps Engineering
+//  Copyright:   (c) 2024 PulseOps, Inc.
+// -------------------------------------------------------------------------------------
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformations.FocusedProductivity
+{
+    #region Contracts ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    ///     Marker interface for all transformation strategies.
+    /// </summary>
+    /// <typeparam name="TIn">Raw input model. Represents denormalized lake records.</typeparam>
+    /// <typeparam name="TOut">Normalized output model. Represents warehouse entities.</typeparam>
+    public interface ITransformationStrategy<in TIn, TOut>
+    {
+        /// <summary>
+        ///     Transforms <paramref name="input"/> into an enumerable of <typeparamref name="TOut" />.
+        ///     Returning an <see cref="IAsyncEnumerable{T}"/> makes the transformation stream-friendly
+        ///     (Kinesis shards, S3 select, etc.).
+        /// </summary>
+        /// <exception cref="TransformationException">Any semantic validation failure.</exception>
+        IAsyncEnumerable<TOut> ExecuteAsync(
+            IAsyncEnumerable<TIn> input,
+            CancellationToken   cancellationToken = default);
+    }
+
+    /// <summary>
+    ///     Observer that receives typed business events (post-transformation).
+    /// </summary>
+    /// <typeparam name="T">Event payload type.</typeparam>
+    public interface IEventObserver<in T>
+    {
+        ValueTask OnNextAsync(T evt, CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    ///     Domain exception for any unrecoverable transformation anomaly.
+    /// </summary>
+    public sealed class TransformationException : Exception
+    {
+        public TransformationException(string message, Exception? inner = null)
+            : base(message, inner) { }
+    }
+
+    #endregion
+
+    #region Domain Models ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    ///     Raw, denormalized activity record as ingested from the lake.
+    /// </summary>
+    public sealed record ActivityRecord
+    {
+        /// <summary>RFC-3339 timestamp (UTC).</summary>
+        public DateTimeOffset TimestampUtc { get; init; }
+
+        /// <summary>
+        ///     High-level origin of the activity.
+        ///     Example: "Calendar", "Editor", "CI", "Slack"
+        /// </summary>
+        public string Source { get; init; } = string.Empty;
+
+        /// <summary>
+        ///     Duration in seconds.
+        /// </summary>
+        public int DurationSec { get; init; }
+
+        /// <summary>Opaque user identifier.</summary>
+        public string UserId { get; init; } = string.Empty;
+    }
+
+    /// <summary>
+    ///     Aggregated KPI emitted by this strategy.
+    /// </summary>
+    public sealed record FocusTimeKpi
+    {
+        public string UserId          { get; init; } = string.Empty;
+        public DateOnly WorkDate      { get; init; }
+        public double  FocusTimeRatio { get; init; }
+
+        /// <summary>
+        ///     Correlation metadata for lineage tracking.
+        /// </summary>
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public IReadOnlyDictionary<string, string>? Meta { get; init; }
+    }
+
+    #endregion
+
+    #region Strategy Implementation ─────────────────────────────────────────────────
+
+    /// <summary>
+    ///     Computes Focus-Time Ratio KPI:
+    ///     
+    ///         focus_time_ratio = Σ(coding-sec) / [Σ(coding-sec) + Σ(meeting-sec)]
+    ///     
+    ///     Notes
+    ///     • 'coding'    sources → "Editor","IDE","Terminal"
+    ///     • 'meeting'   sources → "Calendar"
+    ///     • All other sources are ignored.
+    /// </summary>
+    public sealed class FocusTimeRatioStrategy :
+        ITransformationStrategy<ActivityRecord, FocusTimeKpi>
+    {
+        private static readonly HashSet<string> CodingSources   = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Editor", "IDE", "Terminal"
+        };
+
+        private static readonly HashSet<string> MeetingSources  = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Calendar"
+        };
+
+        private readonly ILogger<FocusTimeRatioStrategy> _logger;
+        private readonly IEventObserver<FocusTimeKpi>?   _observer;
+
+        /// <param name="logger">Structured logging sink.</param>
+        /// <param name="observer">
+        ///     Observer for downstream consumers (DLQ spooler, notifier, etc.).
+        ///     Can be <see langword="null"/> when no reactive fan-out is required.
+        /// </param>
+        public FocusTimeRatioStrategy(
+            ILogger<FocusTimeRatioStrategy> logger,
+            IEventObserver<FocusTimeKpi>?   observer = null)
+        {
+            _logger   = logger  ?? throw new ArgumentNullException(nameof(logger));
+            _observer = observer; // may be null (Null-Object)
+        }
+
+        public async IAsyncEnumerable<FocusTimeKpi> ExecuteAsync(
+            IAsyncEnumerable<ActivityRecord> input,
+            [EnumeratorCancellation] CancellationToken              cancellationToken = default)
+        {
+            // Step-1: group activities by (UserId, Date)
+            var grouped = new Dictionary<(string user, DateOnly date), (long codingSec, long meetingSec)>();
+
+            await foreach (var record in input.WithCancellation(cancellationToken))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                try
+                {
+                    if (!IsTrackedSource(record.Source))        // fast path
+                        continue;
+
+                    if (record.DurationSec <= 0)
+                    {
+                        _logger.LogWarning(
+                            "Ignoring record with zero/negative duration — {@Record}", record);
+                        continue;
+                    }
+
+                    var key = (record.UserId,
+                               DateOnly.FromDateTime(record.TimestampUtc.UtcDateTime));
+
+                    var tuple = grouped.TryGetValue(key, out var acc)
+                        ? acc
+                        : (codingSec: 0L, meetingSec: 0L);
+
+                    if (CodingSources.Contains(record.Source))
+                        tuple.codingSec  += record.DurationSec;
+                    else if (MeetingSources.Contains(record.Source))
+                        tuple.meetingSec += record.DurationSec;
+
+                    grouped[key] = tuple;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to ingest record — {@Record}", record);
+                    // decide whether to fail fast or continue — we choose to continue and encapsulate failure
+                    continue;
+                }
+            }
+
+            // Step-2: compute ratios and emit
+            foreach (var (key, (codingSec, meetingSec)) in grouped)
+            {
+                // Skip days with no meeting/coding time
+                if (codingSec == 0 && meetingSec == 0)
+                    continue;
+
+                var kpi = new FocusTimeKpi
+                {
+                    UserId          = key.user,
+                    WorkDate        = key.date,
+                    FocusTimeRatio  = Math.Round(
+                                          codingSec / (double)(codingSec + meetingSec),
+                                          4, MidpointRounding.AwayFromZero),
+                    Meta            = new Dictionary<string, string>
+                    {
+                        ["coding_sec"]  = codingSec.ToString(),
+                        ["meeting_sec"] = meetingSec.ToString()
+                    }
+                };
+
+                // Fire-and-forget observer (no back-pressure)
+                if (_observer is not null)
+                    _ = SafeNotifyAsync(kpi, cancellationToken);
+
+                yield return kpi;
+            }
+        }
+
+        #endregion
+
+        #region Helpers ──────────────────────────────────────────────────────────────
+
+        private static bool IsTrackedSource(string source)
+            => CodingSources.Contains(source) || MeetingSources.Contains(source);
+
+        private async Task SafeNotifyAsync(FocusTimeKpi kpi, CancellationToken token)
+        {
+            try
+            {
+                await _observer!.OnNextAsync(kpi, token);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Observer notification failed for KPI {@Kpi}", kpi);
+            }
+        }
+
+        #endregion
+    }
+}
+```

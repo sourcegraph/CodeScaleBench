@@ -1,0 +1,352 @@
+```rust
+//! VisuTility Orchestrator – Module 42  
+//! Model-Monitoring & Automated-Retraining Observer/Strategy implementation.
+//!
+//! This module wires together three fundamental concepts used across the
+//! platform’s Model-Ops layer.
+//!
+//! 1. MetricPublisher (Observable) – streams model-health snapshots coming from
+//!    on-device edge collectors or server-side evaluators.
+//! 2. MetricObserver (Observer) – listens for MetricSnapshot events.
+//! 3. RetrainStrategy (Strategy) – decides *when* and *how* to trigger an
+//!    automated-retraining pipeline based on streamed metrics.
+//!
+//! All pieces are kept generic and trait-driven so that alternative monitoring
+//! back-ends, domain-specific KPIs, or sophisticated strategies (e.g. Bayesian
+//! change-point detection) can be plugged in without rewriting orchestration
+//! code.
+//!
+//! The async primitives (tokio broadcast & mpsc) make the system capable of
+//! handling high-frequency, low-latency metric feeds while simultaneously
+//! supporting slow consumers such as dashboards or audit logs.
+//!
+//! NOTE: In production this module would live in `src/module_42.rs`, but the
+//! repository layout stores Rust sources as `.txt` files for compatibility
+//! with certain code-review bots.
+
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc},
+    task::JoinHandle,
+    time::interval,
+};
+
+/// Maximum number of buffered `MetricSnapshot`s per Tokio broadcast channel.
+pub const METRIC_CHANNEL_BUFFER: usize = 1_024;
+/// Interval at which the internal watchdog checks for stalled metric streams.
+pub const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Unified error type for this module.
+#[derive(Debug, Error)]
+pub enum MonitoringError {
+    #[error("failed to publish metric snapshot: {0}")]
+    PublishError(#[from] broadcast::error::SendError<MetricSnapshot>),
+
+    #[error("failed to receive metric snapshot: {0}")]
+    RecvError(#[from] broadcast::error::RecvError),
+
+    #[error("internal task join error: {0}")]
+    JoinError(#[from] tokio::task::JoinError),
+}
+
+/// A single atomic snapshot of model performance at a given point in time.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct MetricSnapshot {
+    /// Human-readable model identifier (e.g. “obj_det_v12.3.1”).
+    pub model_version: String,
+    /// Primary KPI. Interpretation depends on problem-type (accuracy/mAP/etc.).
+    pub score: f64,
+    /// Optional loss value for supervised tasks.
+    pub loss: Option<f64>,
+    /// Wall-clock timestamp, generated at the source side.
+    pub timestamp: SystemTime,
+}
+
+impl MetricSnapshot {
+    /// Whether the snapshot qualifies as *degraded* compared to `baseline`.
+    pub fn is_degraded(&self, baseline: &Self, tolerance: f64) -> bool {
+        self.model_version == baseline.model_version && self.score + tolerance < baseline.score
+    }
+}
+
+/// Trait for types that can observe streamed [`MetricSnapshot`]s.
+pub trait MetricObserver: Send + Sync + 'static {
+    fn on_metric(&self, metric: &MetricSnapshot);
+}
+
+/// Helper newtype for type-erasing observers.
+#[derive(Clone)]
+pub struct DynObserver(Arc<dyn MetricObserver>);
+
+impl DynObserver {
+    pub fn new<T: MetricObserver>(observer: T) -> Self {
+        Self(Arc::new(observer))
+    }
+}
+
+impl fmt::Debug for DynObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DynObserver(...)")
+    }
+}
+
+/// Central publisher/observable for metric snapshots.
+/// Uses Tokio broadcast so that each observer receives *all* events.
+#[derive(Debug)]
+pub struct MetricPublisher {
+    sender: broadcast::Sender<MetricSnapshot>,
+    observers: RwLock<Vec<DynObserver>>,
+}
+
+impl MetricPublisher {
+    pub fn new(buffer: usize) -> Self {
+        let (sender, _receiver) = broadcast::channel(buffer);
+        Self {
+            sender,
+            observers: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Publish a snapshot to all observers and broadcast receivers.
+    pub fn publish(&self, metric: MetricSnapshot) -> Result<(), MonitoringError> {
+        self.sender.send(metric.clone())?;
+        // Fan-out to in-process observers synchronously.
+        for obs in self.observers.read().iter() {
+            obs.0.on_metric(&metric);
+        }
+        Ok(())
+    }
+
+    /// Subscribe a *new* asynchronous receiver to this publisher.
+    pub fn subscribe_async(&self) -> broadcast::Receiver<MetricSnapshot> {
+        self.sender.subscribe()
+    }
+
+    /// Attach a synchronous observer.
+    pub fn attach(&self, observer: DynObserver) {
+        self.observers.write().push(observer);
+    }
+
+    /// Count currently registered synchronous observers.
+    pub fn observer_count(&self) -> usize {
+        self.observers.read().len()
+    }
+}
+
+/// Strategy interface for deciding when to trigger automated retraining.
+#[async_trait::async_trait]
+pub trait RetrainStrategy: Send + Sync + 'static {
+    /// Consumes a stream of `MetricSnapshot`s and emits a *true* value whenever
+    /// retraining should be kicked off.
+    async fn run(
+        &self,
+        mut rx: broadcast::Receiver<MetricSnapshot>,
+        tx_trigger: mpsc::Sender<RetrainSignal>,
+    ) -> Result<(), MonitoringError>;
+}
+
+/// Simple signal type emitted by [`RetrainStrategy`] implementations.
+#[derive(Debug)]
+pub struct RetrainSignal {
+    pub degraded_snapshot: MetricSnapshot,
+}
+
+/// Baseline-comparison strategy.
+/// Fires a signal once the KPI degrades beyond `tolerance` wrt. `baseline`.
+pub struct BaselineStrategy {
+    baseline: MetricSnapshot,
+    tolerance: f64,
+}
+
+impl BaselineStrategy {
+    pub fn new(baseline: MetricSnapshot, tolerance: f64) -> Self {
+        Self { baseline, tolerance }
+    }
+}
+
+#[async_trait::async_trait]
+impl RetrainStrategy for BaselineStrategy {
+    async fn run(
+        &self,
+        mut rx: broadcast::Receiver<MetricSnapshot>,
+        tx_trigger: mpsc::Sender<RetrainSignal>,
+    ) -> Result<(), MonitoringError> {
+        loop {
+            match rx.recv().await {
+                Ok(snapshot) if snapshot.is_degraded(&self.baseline, self.tolerance) => {
+                    let signal = RetrainSignal {
+                        degraded_snapshot: snapshot,
+                    };
+                    if tx_trigger.send(signal).await.is_err() {
+                        // Downstream has dropped; nothing more to do.
+                        break;
+                    }
+                }
+                Ok(_) => { /* healthy snapshot */ }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(lagged = n, "Lagged behind on metric stream");
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// High-level supervisor that bundles publisher, strategy, and trigger channel.
+/// Spawn via [`Self::spawn`] to obtain a running Tokio task.
+pub struct MonitoringSupervisor<S>
+where
+    S: RetrainStrategy,
+{
+    publisher: Arc<MetricPublisher>,
+    strategy: Arc<S>,
+    tx_trigger: mpsc::Sender<RetrainSignal>,
+}
+
+impl<S> MonitoringSupervisor<S>
+where
+    S: RetrainStrategy,
+{
+    pub fn new(publisher: Arc<MetricPublisher>, strategy: S) -> (Self, mpsc::Receiver<RetrainSignal>) {
+        let (tx_trigger, rx_trigger) = mpsc::channel(16);
+        (
+            Self {
+                publisher,
+                strategy: Arc::new(strategy),
+                tx_trigger,
+            },
+            rx_trigger,
+        )
+    }
+
+    /// Spawn the monitoring supervisor plus internal watchdog as detached tasks.
+    pub fn spawn(self) -> JoinHandle<Result<(), MonitoringError>> {
+        tokio::spawn(async move {
+            // Strategy task.
+            let strategy_handle = {
+                let rx = self.publisher.subscribe_async();
+                let tx = self.tx_trigger.clone();
+                let s = self.strategy.clone();
+                tokio::spawn(async move { s.run(rx, tx).await })
+            };
+
+            // Watchdog ensures metric stream is alive.
+            let watchdog_handle = {
+                let mut interval = interval(WATCHDOG_INTERVAL);
+                let mut last_seen = SystemTime::now();
+                let rx = self.publisher.subscribe_async();
+
+                tokio::spawn(async move {
+                    tokio::pin!(rx);
+                    loop {
+                        select! {
+                            _ = interval.tick() => {
+                                if last_seen.elapsed().unwrap_or_default() > WATCHDOG_INTERVAL * 2 {
+                                    tracing::error!("Metric stream stalled >2× watchdog interval");
+                                }
+                            }
+                            msg = rx.recv() => {
+                                if let Ok(_) = msg {
+                                    last_seen = SystemTime::now();
+                                }
+                            }
+                        }
+                    }
+                    #[allow(unreachable_code)]
+                    Ok::<(), MonitoringError>(())
+                })
+            };
+
+            // Wait on subtasks.
+            strategy_handle.await??;
+            watchdog_handle.await??;
+            Ok(())
+        })
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              Built-in Observer                             */
+/* -------------------------------------------------------------------------- */
+
+/// Console-based observer useful for local debugging and smoke tests.
+pub struct ConsoleObserver;
+
+impl MetricObserver for ConsoleObserver {
+    fn on_metric(&self, metric: &MetricSnapshot) {
+        println!(
+            "[{}] Model={} Score={:.4} Loss={:?}",
+            humantime::format_rfc3339(metric.timestamp),
+            metric.model_version,
+            metric.score,
+            metric.loss
+        );
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                   Tests                                    */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    #[tokio::test]
+    async fn baseline_strategy_triggers_on_degradation() {
+        let publisher = Arc::new(MetricPublisher::new(METRIC_CHANNEL_BUFFER));
+
+        // Baseline snapshot with good score.
+        let baseline = MetricSnapshot {
+            model_version: "v1".into(),
+            score: 0.95,
+            loss: Some(0.05),
+            timestamp: SystemTime::now(),
+        };
+
+        let (supervisor, mut rx_trigger) =
+            MonitoringSupervisor::new(publisher.clone(), BaselineStrategy::new(baseline.clone(), 0.05));
+
+        let _handle = supervisor.spawn();
+
+        // Publish snapshots — first healthy, then degraded.
+        publisher
+            .publish(MetricSnapshot {
+                timestamp: SystemTime::now(),
+                ..baseline.clone()
+            })
+            .unwrap();
+
+        publisher
+            .publish(MetricSnapshot {
+                score: 0.80, // degraded
+                timestamp: SystemTime::now(),
+                ..baseline
+            })
+            .unwrap();
+
+        // Assert we receive a retrain signal.
+        let signal = tokio::time::timeout(Duration::from_secs(2), rx_trigger.recv())
+            .await
+            .expect("timeout waiting for signal")
+            .expect("channel closed");
+
+        assert_eq!(signal.degraded_snapshot.score, 0.80);
+
+        // Give supervisor tasks time to shut down gracefully.
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+```

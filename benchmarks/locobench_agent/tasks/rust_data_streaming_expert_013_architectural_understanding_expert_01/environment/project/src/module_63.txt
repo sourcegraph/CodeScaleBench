@@ -1,0 +1,408 @@
+```rust
+//! ChirpPulse – Real-Time Social Sentiment Lake
+//! -------------------------------------------
+//! module_63: sentiment_enricher
+//!
+//! This module implements an asynchronously hot-swappable sentiment‐analysis
+//! pipeline that consumes raw social messages from a Kafka topic, enriches them
+//! with a configurable sentiment algorithm (Strategy pattern), performs data-
+//! quality checks, and emits the enriched records to a downstream topic.
+//!
+//! ‣ High-level flow
+//!   ┌────────────┐   ┌───────────────┐   ┌─────────────────┐   ┌──────────────┐
+//!   │ Kafka In   │ → │ Quality Check │ → │ Sentiment Algo │ → │ Kafka Out    │
+//!   └────────────┘   └───────────────┘   └─────────────────┘   └──────────────┘
+//!
+//! ‣ Operational guarantees
+//!   • At-least-once processing with manual offsets
+//!   • Back-pressure via bounded channels
+//!   • Hot swapping of sentiment algorithms without downtime using `ArcSwap`
+//!
+//! NOTE: External service I/O (Kafka, metrics, etc.) is intentionally minimal
+//!       for compilation simplicity. Integrate with real SDKs in production.
+
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::{stream::FuturesUnordered, StreamExt};
+use rdkafka::{
+    consumer::{CommitMode, Consumer, StreamConsumer},
+    message::BorrowedMessage,
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{select, sync::mpsc, task, time};
+
+// --------------------------- Domain Structures ------------------------------- //
+
+/// Raw message coming in from the upstream social firehose.
+#[derive(Debug, Deserialize)]
+pub struct RawSocialMessage {
+    pub id: String,
+    pub text: String,
+    pub lang: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The enriched message published downstream.
+#[derive(Debug, Serialize)]
+pub struct EnrichedMessage {
+    pub id: String,
+    pub text: String,
+    pub lang: String,
+    pub sentiment_score: f32,
+    pub processed_at: DateTime<Utc>,
+}
+
+/// Sentiment analysis errors.
+#[derive(Debug, Error)]
+pub enum SentimentError {
+    #[error("failed to analyze sentiment: {0}")]
+    Analysis(String),
+}
+
+/// Data-quality validation errors.
+#[derive(Debug, Error)]
+pub enum QualityError {
+    #[error("missing field: {0}")]
+    MissingField(&'static str),
+    #[error("language '{0}' is not supported")]
+    UnsupportedLang(String),
+}
+
+/// Global error wrapper for the pipeline.
+#[derive(Debug, Error)]
+pub enum PipelineError {
+    #[error("quality check failed: {0}")]
+    Quality(#[from] QualityError),
+    #[error("sentiment failed: {0}")]
+    Sentiment(#[from] SentimentError),
+    #[error("kafka error: {0}")]
+    Kafka(#[from] rdkafka::error::KafkaError),
+}
+
+// --------------------------- Strategy Pattern -------------------------------- //
+
+/// Strategy trait for pluggable sentiment algorithms.
+#[async_trait]
+pub trait SentimentAlgorithm: Send + Sync + 'static {
+    /// Calculates a sentiment score in the range [-1.0, 1.0].
+    async fn score(&self, text: &str, lang: &str) -> Result<f32, SentimentError>;
+
+    /// Returns an identifier used in metrics.
+    fn name(&self) -> &str;
+}
+
+/// A simplistic rule-based algorithm (placeholder for a real ML model).
+pub struct RuleBasedSentiment;
+
+#[async_trait]
+impl SentimentAlgorithm for RuleBasedSentiment {
+    async fn score(&self, text: &str, _lang: &str) -> Result<f32, SentimentError> {
+        let lowered = text.to_ascii_lowercase();
+
+        let pos = ["good", "love", "great"].iter().filter(|w| lowered.contains(**w)).count();
+        let neg = ["bad", "hate", "terrible"].iter().filter(|w| lowered.contains(**w)).count();
+
+        Ok(match pos.cmp(&neg) {
+            std::cmp::Ordering::Greater => 0.5,
+            std::cmp::Ordering::Less => -0.5,
+            std::cmp::Ordering::Equal => 0.0,
+        })
+    }
+
+    fn name(&self) -> &str {
+        "rule_based"
+    }
+}
+
+// --------------------------- Data-Quality Checks ----------------------------- //
+
+/// Trait for pluggable data-quality validators.
+#[async_trait]
+pub trait QualityGate: Send + Sync {
+    async fn validate(&self, msg: &RawSocialMessage) -> Result<(), QualityError>;
+}
+
+/// Validates presence of mandatory fields and language whitelist.
+pub struct BasicQualityGate {
+    lang_whitelist: Vec<String>,
+}
+
+impl BasicQualityGate {
+    pub fn new(whitelist: Vec<String>) -> Self {
+        Self { lang_whitelist: whitelist }
+    }
+}
+
+#[async_trait]
+impl QualityGate for BasicQualityGate {
+    async fn validate(&self, msg: &RawSocialMessage) -> Result<(), QualityError> {
+        if msg.text.trim().is_empty() {
+            return Err(QualityError::MissingField("text"));
+        }
+
+        if !self.lang_whitelist.iter().any(|l| l == &msg.lang) {
+            return Err(QualityError::UnsupportedLang(msg.lang.clone()));
+        }
+
+        Ok(())
+    }
+}
+
+// --------------------------- Pipeline Implementation ------------------------- //
+
+/// Runtime configuration for the pipeline.
+#[derive(Debug, Clone)]
+pub struct PipelineConfig {
+    pub input_topic: String,
+    pub output_topic: String,
+    pub group_id: String,
+    pub brokers: String,
+    pub parallelism: usize,
+    pub queue_capacity: usize,
+}
+
+/// An opaque handle that can be used to swap the algorithm at runtime.
+#[derive(Clone)]
+pub struct AlgoHandle {
+    inner: Arc<ArcSwap<dyn SentimentAlgorithm>>,
+}
+
+impl AlgoHandle {
+    pub fn new(default_algo: Arc<dyn SentimentAlgorithm>) -> Self {
+        Self { inner: Arc::new(ArcSwap::from(default_algo)) }
+    }
+
+    /// Replace the algorithm atomically.
+    pub fn swap(&self, new_algo: Arc<dyn SentimentAlgorithm>) {
+        self.inner.store(new_algo);
+    }
+
+    /// Get a shared reference for processing.
+    pub fn load(&self) -> Arc<dyn SentimentAlgorithm> {
+        self.inner.load().clone()
+    }
+}
+
+/// The main enrichment service.
+pub struct EnrichmentService {
+    cfg: PipelineConfig,
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+    quality_gate: Arc<dyn QualityGate>,
+    algo_handle: AlgoHandle,
+}
+
+impl EnrichmentService {
+    pub async fn new(
+        cfg: PipelineConfig,
+        quality_gate: Arc<dyn QualityGate>,
+        algo: Arc<dyn SentimentAlgorithm>,
+    ) -> Result<Self, PipelineError> {
+        // -- Kafka consumer
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.brokers)
+            .set("group.id", &cfg.group_id)
+            .set("enable.auto.commit", "false")
+            .create()?;
+
+        consumer.subscribe(&[&cfg.input_topic])?;
+
+        // -- Kafka producer
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.brokers)
+            .set("message.timeout.ms", "5000")
+            .create()?;
+
+        Ok(Self {
+            cfg,
+            consumer,
+            producer,
+            quality_gate,
+            algo_handle: AlgoHandle::new(algo),
+        })
+    }
+
+    /// Starts the enrichment loop (non-blocking).
+    pub async fn run(self) -> Result<(), PipelineError> {
+        let (tx, mut rx) = mpsc::channel::<BorrowedMessage<'_>>(self.cfg.queue_capacity);
+
+        // Spawn a task to pull records from Kafka into bounded channel.
+        let consumer = self.consumer.clone();
+        let input_task = task::spawn(async move {
+            let mut stream = consumer.stream();
+            loop {
+                match stream.next().await {
+                    Some(Ok(msg)) => {
+                        if tx.send(msg).await.is_err() {
+                            log::warn!("receiver dropped, shutting down consumer task");
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => log::error!("Kafka consumer error: {}", e),
+                    None => {
+                        log::info!("Kafka stream ended");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Spawn N worker tasks for parallel enrichment.
+        let mut workers = FuturesUnordered::new();
+        for _ in 0..self.cfg.parallelism {
+            let mut rx = rx.clone();
+            let prod = self.producer.clone();
+            let out_topic = self.cfg.output_topic.clone();
+            let gate = self.quality_gate.clone();
+            let algo_handle = self.algo_handle.clone();
+
+            workers.push(task::spawn(async move {
+                while let Some(bmsg) = rx.recv().await {
+                    if let Err(e) = process_message(bmsg, &gate, &algo_handle, &prod, &out_topic).await
+                    {
+                        // Negative ack still commits offset (optionally may skip commit here).
+                        log::error!("processing error: {}", e);
+                    }
+                }
+            }));
+        }
+
+        // Wait for shutdown signal
+        select! {
+            _ = async { workers.next().await; } => log::info!("workers terminated"),
+            _ = input_task => log::info!("input task terminated"),
+            _ = shutdown_signal() => log::info!("shutdown signal received"),
+        };
+
+        // Gracefully commit final offsets
+        self.consumer.commit_consumer_state(CommitMode::Sync)?;
+        Ok(())
+    }
+}
+
+// --------------------------- Internal Helpers -------------------------------- //
+
+async fn process_message<'a>(
+    bmsg: BorrowedMessage<'a>,
+    gate: &Arc<dyn QualityGate>,
+    algo_handle: &AlgoHandle,
+    producer: &FutureProducer,
+    out_topic: &str,
+) -> Result<(), PipelineError> {
+    let payload = std::str::from_utf8(bmsg.payload().unwrap_or_default()).unwrap_or_default();
+    let raw: RawSocialMessage = serde_json::from_str(payload).map_err(|e| {
+        QualityError::MissingField("payload deserialize") as QualityError
+    })?;
+
+    gate.validate(&raw).await?;
+
+    let algo = algo_handle.load();
+    let score = algo.score(&raw.text, &raw.lang).await?;
+
+    let enriched = EnrichedMessage {
+        id: raw.id,
+        text: raw.text,
+        lang: raw.lang,
+        sentiment_score: score,
+        processed_at: DateTime::<Utc>::from(SystemTime::now()),
+    };
+
+    let serialized = serde_json::to_vec(&enriched).expect("serialization never fails");
+
+    // Send to Kafka (fire-and-forget with timeout)
+    producer
+        .send(
+            FutureRecord::to(out_topic)
+                .payload(&serialized)
+                .key(&enriched.id),
+            Duration::from_secs(1),
+        )
+        .await
+        .map_err(|(e, _msg)| PipelineError::Kafka(e))?;
+
+    Ok(())
+}
+
+/// Placeholder for graceful shutdown handling (CTRL-C, kubernetes SIGTERM, etc.).
+async fn shutdown_signal() {
+    // Wait for either CTRL-C or SIGTERM.
+    let _ = select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = signal(SignalKind::terminate()).expect("register SIGTERM handler");
+                sigterm.recv().await;
+            }
+            #[cfg(not(unix))]
+            futures::future::pending::<()>().await
+        } => {}
+    };
+}
+
+// --------------------------- Tests ------------------------------------------- //
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    struct DummyGate;
+    #[async_trait]
+    impl QualityGate for DummyGate {
+        async fn validate(&self, _msg: &RawSocialMessage) -> Result<(), QualityError> {
+            Ok(())
+        }
+    }
+
+    /// Mock algorithm that returns constant score for testing swapping logic.
+    struct ConstAlgo(f32, &'static str);
+    #[async_trait]
+    impl SentimentAlgorithm for ConstAlgo {
+        async fn score(&self, _text: &str, _lang: &str) -> Result<f32, SentimentError> {
+            Ok(self.0)
+        }
+        fn name(&self) -> &str {
+            self.1
+        }
+    }
+
+    #[tokio::test]
+    async fn test_algo_swap() {
+        let handle = AlgoHandle::new(Arc::new(ConstAlgo(0.1, "algo_a")));
+        assert_eq!(handle.load().score("", "").await.unwrap(), 0.1);
+
+        handle.swap(Arc::new(ConstAlgo(-0.2, "algo_b")));
+        assert_eq!(handle.load().score("", "").await.unwrap(), -0.2);
+    }
+
+    #[tokio::test]
+    async fn test_quality_gate() {
+        let gate = BasicQualityGate::new(vec!["en".into(), "es".into()]);
+        let msg = RawSocialMessage {
+            id: "1".into(),
+            text: "hello world".into(),
+            lang: "en".into(),
+            created_at: Utc::now(),
+        };
+        assert!(gate.validate(&msg).await.is_ok());
+
+        let mut bad = msg.clone();
+        bad.lang = "fr".into();
+        assert!(matches!(
+            gate.validate(&bad).await,
+            Err(QualityError::UnsupportedLang(_))
+        ));
+    }
+}
+```

@@ -1,0 +1,367 @@
+```rust
+//! src/module_28.rs
+//!
+//! High-level event infrastructure for “EduPulse Live – Event-Driven Social
+//! Learning Hub”.  This module exposes a small, production-ready event-bus
+//! abstraction that the rest of the code-base can rely on.  It supports:
+//!   • Strongly-typed domain events (serde-serialisable for storage/Kafka/etc.)
+//!   • Asynchronous fan-out to multiple subscribers
+//!   • Correlation / causation IDs for distributed tracing
+//!   • Back-pressure using Tokio’s bounded MPSC channels
+//!
+//! NOTE: In a real code-base this module would live in its own crate and be
+//! re-exported by the `web_social` workspace.  For brevity, only an in-memory
+//! implementation is provided – swapping to e.g. Kafka/Pulsar is just a matter
+//! of implementing `EventPublisher` / `EventSubscriber` for the desired client.
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc, oneshot, RwLock},
+    task::JoinHandle,
+};
+use tracing::{debug, error, info, instrument};
+use uuid::Uuid;
+
+/// Maximum number of events the in-memory bus can buffer before applying
+/// back-pressure to publishers (per channel).
+const DEFAULT_BUFFER: usize = 1_024;
+
+/// Minimum TTL for slow subscribers; if a consumer cannot keep up for longer
+/// than this duration it will be dropped to protect the system.
+const SLOW_SUBSCRIBER_GRACE: Duration = Duration::from_secs(60);
+
+/// Standard envelope used by *every* domain event flowing through the system.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope<E: DomainEvent> {
+    /// Unique, immutable ID of the envelope (UUID v4).
+    pub id: Uuid,
+    /// When the event *actually* happened, according to the producer.
+    pub occurred_at: DateTime<Utc>,
+    /// Optional identifier allowing cross-service correlation.
+    pub correlation_id: Option<Uuid>,
+    /// Optional identifier describing the *cause* of this event.
+    pub causation_id: Option<Uuid>,
+    /// Strongly-typed, concrete domain event payload.
+    pub payload: E,
+}
+
+impl<E: DomainEvent> EventEnvelope<E> {
+    /// Convenience constructor that auto-fills metadata.
+    pub fn new(payload: E) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            correlation_id: None,
+            causation_id: None,
+            payload,
+        }
+    }
+
+    /// Attach correlation ID to enable distributed tracing.
+    pub fn with_correlation(mut self, correlation_id: Uuid) -> Self {
+        self.correlation_id = Some(correlation_id);
+        self
+    }
+
+    /// Attach causation ID (usually the ID of the triggering envelope).
+    pub fn with_causation(mut self, causation_id: Uuid) -> Self {
+        self.causation_id = Some(causation_id);
+        self
+    }
+}
+
+/// Marker trait for *all* domain events.
+/// Extend `DomainEvent` for new events to automatically plug into the bus.
+pub trait DomainEvent: Send + Sync + std::fmt::Debug + Serialize + for<'de> Deserialize<'de> {
+    /// A stable, kebab-case event name.  Used for routing / analytics.
+    fn name(&self) -> &'static str;
+}
+
+/// Error surfaced by publishers if the bus is unavailable.
+#[derive(Debug, Error)]
+pub enum PublishError {
+    #[error("subscriber dropped without acknowledgement")]
+    SubscriberLagged,
+    #[error("the bus is shutting down")]
+    ShuttingDown,
+}
+
+#[async_trait]
+pub trait EventPublisher<E: DomainEvent + 'static>: Send + Sync {
+    async fn publish(&self, evt: EventEnvelope<E>) -> Result<(), PublishError>;
+}
+
+/// Error value returned by individual subscribers.
+#[derive(Debug, Error)]
+pub enum SubscriberError {
+    #[error("subscriber timed out")]
+    Timeout,
+    #[error("subscriber channel closed")]
+    ChannelClosed,
+    #[error("internal handler error: {0}")]
+    HandlerFailure(String),
+}
+
+#[async_trait]
+pub trait EventSubscriber<E: DomainEvent + 'static>: Send + Sync {
+    /// Human-readable identifier (good for logging).
+    fn name(&self) -> &'static str;
+
+    /// Handle an incoming event.  Should be lightweight; expensive / blocking
+    /// workloads need to be offloaded to a job-queue.
+    async fn handle(&self, evt: EventEnvelope<E>) -> Result<(), SubscriberError>;
+}
+
+/// Simple in-memory event-bus using Tokio broadcast channels.
+/// Guarantees at-least-once delivery semantics.
+pub struct InMemoryEventBus<E: DomainEvent + 'static> {
+    tx: broadcast::Sender<Arc<EventEnvelope<E>>>,
+    /// Track subscribers so we can shut them down gracefully.
+    subscribers: RwLock<HashMap<Uuid, JoinHandle<()>>>,
+}
+
+impl<E: DomainEvent + 'static> Default for InMemoryEventBus<E> {
+    fn default() -> Self {
+        let (tx, _rx) = broadcast::channel(DEFAULT_BUFFER);
+        Self {
+            tx,
+            subscribers: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl<E: DomainEvent + 'static> InMemoryEventBus<E> {
+    /// Register an async subscriber.  Returns a *detach* handle allowing the
+    /// caller to manually stop a subscriber at runtime.
+    pub async fn add_subscriber<S>(&self, subscriber: S) -> Uuid
+    where
+        S: EventSubscriber<E> + 'static,
+    {
+        // Each subscriber receives its own rooted broadcast receiver
+        let mut rx = self.tx.subscribe();
+        let id = Uuid::new_v4();
+        let name = subscriber.name();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+        // Background task fan-out loop
+        let handle = tokio::spawn(async move {
+            info!(subscriber = name, "subscriber spawned");
+            loop {
+                select! {
+                    biased;
+
+                    _ = &mut shutdown_rx => {
+                        info!(subscriber = name, "subscriber shutdown");
+                        break;
+                    },
+
+                    msg = rx.recv() => match msg {
+                        Ok(evt) => {
+                            let evt_clone = (*evt).clone(); // cheap Arc clone
+                            // Protect overall bus latency – if a single subscriber
+                            // is slow we eventually drop it.
+                            let fut = subscriber.handle(evt_clone);
+                            let res = tokio::time::timeout(SLOW_SUBSCRIBER_GRACE, fut).await;
+                            match res {
+                                Ok(Ok(())) => {
+                                    debug!(subscriber = name, "event processed");
+                                }
+                                Ok(Err(e)) => {
+                                    error!(subscriber = name, error = ?e, "handler failure");
+                                }
+                                Err(_) => {
+                                    error!(subscriber = name, "subscriber too slow, dropping");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            error!(subscriber = name, skipped, "subscriber lagged behind bus");
+                            break;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            debug!(subscriber = name, "bus closed");
+                            break;
+                        }
+                    }
+                }
+            }
+            // Notify shutdown channel, ignore errors
+            let _ = shutdown_tx.send(());
+        });
+
+        self.subscribers.write().await.insert(id, handle);
+        id
+    }
+
+    /// Gracefully stop and await a previously registered subscriber.
+    pub async fn remove_subscriber(&self, id: Uuid) {
+        if let Some(handle) = self.subscribers.write().await.remove(&id) {
+            handle.abort(); // we rely on cooperative cancellation in task
+            let _ = handle.await;
+        }
+    }
+
+    /// Gracefully shut down the whole bus, draining subscribers.
+    pub async fn shutdown(self) {
+        let subs = self.subscribers.into_inner();
+        for (_, handle) in subs {
+            handle.abort();
+        }
+    }
+}
+
+#[async_trait]
+impl<E: DomainEvent + 'static> EventPublisher<E> for InMemoryEventBus<E> {
+    #[instrument(skip(self, evt), fields(event = evt.payload.name()))]
+    async fn publish(&self, evt: EventEnvelope<E>) -> Result<(), PublishError> {
+        // Use Arc to avoid multiple allocations if N subscribers
+        let arc_evt = Arc::new(evt);
+        self.tx
+            .send(arc_evt)
+            .map_err(|broadcast::error::SendError { .. }| PublishError::SubscriberLagged)
+            .map(|_| ())
+    }
+}
+
+/* ---------------------------------------------------------------------------
+   Example Domain Events
+   --------------------------------------------------------------------------- */
+
+/// Various concrete events produced by the Social-Learning domain.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum SocialEvent {
+    /// Teacher published a new lesson.
+    LessonPublished {
+        lesson_id: Uuid,
+        teacher_id: Uuid,
+        title: String,
+        published_at: DateTime<Utc>,
+    },
+    /// Student submitted a quiz.
+    QuizSubmitted {
+        quiz_id: Uuid,
+        student_id: Uuid,
+        score: f32,
+        submitted_at: DateTime<Utc>,
+    },
+    /// Student received a badge.
+    BadgeAwarded {
+        badge_id: Uuid,
+        student_id: Uuid,
+        reason: String,
+        awarded_at: DateTime<Utc>,
+    },
+    /// Payment succeeded for premium micro-course.
+    PaymentCaptured {
+        payment_id: Uuid,
+        user_id: Uuid,
+        amount_cents: i64,
+        currency: String,
+        captured_at: DateTime<Utc>,
+    },
+}
+
+impl DomainEvent for SocialEvent {
+    fn name(&self) -> &'static str {
+        match self {
+            SocialEvent::LessonPublished { .. } => "lesson-published",
+            SocialEvent::QuizSubmitted { .. } => "quiz-submitted",
+            SocialEvent::BadgeAwarded { .. } => "badge-awarded",
+            SocialEvent::PaymentCaptured { .. } => "payment-captured",
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+   Example Subscriber Implementations
+   --------------------------------------------------------------------------- */
+
+/// Subscriber writing events to stdout in NDJSON format (useful for debugging)
+pub struct StdoutSubscriber;
+
+#[async_trait]
+impl EventSubscriber<SocialEvent> for StdoutSubscriber {
+    fn name(&self) -> &'static str {
+        "stdout-subscriber"
+    }
+
+    #[instrument(skip(self, evt))]
+    async fn handle(&self, evt: EventEnvelope<SocialEvent>) -> Result<(), SubscriberError> {
+        println!("{}", serde_json::to_string(&evt).unwrap());
+        Ok(())
+    }
+}
+
+/// Subscriber simulating expensive behaviour like search indexing.
+pub struct SearchIndexer;
+
+#[async_trait]
+impl EventSubscriber<SocialEvent> for SearchIndexer {
+    fn name(&self) -> &'static str {
+        "search-indexer"
+    }
+
+    #[instrument(skip(self, evt))]
+    async fn handle(&self, evt: EventEnvelope<SocialEvent>) -> Result<(), SubscriberError> {
+        // Offload heavy tasks to separate thread-pool to avoid blocking the async runtime.
+        let payload_name = evt.payload.name();
+        tokio::task::spawn_blocking(move || {
+            // Simulate IO + CPU bound work
+            std::thread::sleep(Duration::from_millis(200));
+            println!("Indexed event {}", payload_name);
+        })
+        .await
+        .map_err(|e| SubscriberError::HandlerFailure(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/* ---------------------------------------------------------------------------
+   Unit Tests (can be run with `cargo test`)
+   --------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::timeout;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_test_event_flow() {
+        // Setup bus and subscribers
+        let bus = Arc::new(InMemoryEventBus::<SocialEvent>::default());
+        bus.add_subscriber(StdoutSubscriber).await;
+        bus.add_subscriber(SearchIndexer).await;
+
+        // Build example event
+        let lesson_event = SocialEvent::LessonPublished {
+            lesson_id: Uuid::new_v4(),
+            teacher_id: Uuid::new_v4(),
+            title: "Rust for Educators".into(),
+            published_at: Utc::now(),
+        };
+        let envelope = EventEnvelope::new(lesson_event);
+
+        // Publish & assert no error
+        bus.publish(envelope).await.expect("publish must succeed");
+
+        // Give subscribers time (should finish < 1s)
+        timeout(Duration::from_secs(1), async {}).await.ok();
+
+        // Clean shutdown
+        bus.shutdown().await;
+    }
+}
+```
+

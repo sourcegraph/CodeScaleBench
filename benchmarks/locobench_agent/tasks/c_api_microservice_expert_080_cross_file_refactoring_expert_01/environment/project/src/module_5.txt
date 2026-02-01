@@ -1,0 +1,368 @@
+/**
+ * MercuryMonolith Commerce Hub
+ * ---------------------------------
+ * File:   src/module_5.txt   (actually C source)
+ * Module: rate_limiter
+ *
+ * High-performance, thread-safe token-bucket rate limiter used by the API
+ * gateway layer to enforce per-tenant or per-endpoint quotas.  The module
+ * is completely self-contained (no third-party deps) and can be built into
+ * the unified monolith or statically linked into unit-tests.
+ *
+ * Features
+ *   - Lock-striped hash-map holding up to RL_DEFAULT_BUCKETS active keys
+ *   - O(1) amortised lookup with linear-probing open addressing
+ *   - Nanosecond-accurate refill using CLOCK_MONOTONIC
+ *   - Automatic bucket eviction after RL_BUCKET_TTL seconds of inactivity
+ *   - Prometheus-style metrics export (text/plain; version 0.0.4)
+ *
+ * Build
+ *   cc -std=c11 -Wall -Wextra -pedantic -pthread -c rate_limiter.c
+ *
+ * Author: MercuryMonolith Core Team
+ * License: MIT
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <string.h>
+#include <time.h>
+#include <errno.h>
+#include <pthread.h>
+#include <inttypes.h>
+
+/* ============================================================================
+ * Tunables
+ * ==========================================================================*/
+#define RL_DEFAULT_BUCKETS   4096U          /* Must be power-of-two            */
+#define RL_KEY_MAX           64U            /* Maximum length of identifier    */
+#define RL_BUCKET_TTL        30             /* Seconds of inactivity before GC */
+#define RL_GC_SCAN_EVERY     1000U          /* Do a GC scan every N operations */
+#define RL_METRIC_BUF_SZ     64 * 1024      /* Export buffer size (64 KiB)     */
+
+/* ============================================================================
+ * Utility macros
+ * ==========================================================================*/
+#define likely(x)   __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+
+#define RL_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+
+/* ============================================================================
+ * Time helpers
+ * ==========================================================================*/
+static inline uint64_t nsec_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static inline double seconds_since(uint64_t last_ns, uint64_t now_ns)
+{
+    return (double)(now_ns - last_ns) / 1e9;
+}
+
+/* ============================================================================
+ * Bucket structure
+ * ==========================================================================*/
+typedef struct rl_bucket_t
+{
+    char      key[RL_KEY_MAX];
+    double    tokens;          /* current token level           */
+    double    capacity;        /* maximum tokens allowed        */
+    double    refill_rate;     /* tokens per second             */
+    uint64_t  last_refill_ns;  /* CLOCK_MONOTONIC timestamp     */
+    uint64_t  last_access_ns;  /* For TTL eviction              */
+    bool      in_use;
+} rl_bucket_t;
+
+/* ============================================================================
+ * Rate limiter state
+ * ==========================================================================*/
+typedef struct rate_limiter
+{
+    rl_bucket_t *buckets;
+    uint32_t     bucket_mask;        /* buckets_len-1 (power-of-two)        */
+    pthread_mutex_t *locks;          /* one lock per lock-stripe            */
+    uint32_t     lock_count;
+    uint64_t     op_counter;         /* operations executed (for GC scan)   */
+} rate_limiter_t;
+
+/* Forward declarations */
+static uint32_t rl_hash_key(const char *key);
+static rl_bucket_t *rl_lookup_bucket(rate_limiter_t *rl, const char *key, bool create_if_missing);
+static void rl_evict_stale(rate_limiter_t *rl);
+
+/* ============================================================================
+ * Public API
+ * ==========================================================================*/
+
+/**
+ * rate_limiter_init: Initialise a new rate limiter
+ *
+ * Parameters:
+ *   rl            – pointer to uninitialised struct
+ *   buckets       – number of hash table slots (must be power-of-two)
+ *   lock_stripes  – number of mutexes to shard across the table (power-of-two)
+ *
+ * Return:
+ *   0 on success, errno value on failure.
+ */
+int rate_limiter_init(rate_limiter_t *rl,
+                      uint32_t buckets,
+                      uint32_t lock_stripes)
+{
+    if (unlikely(!rl))
+        return EINVAL;
+
+    if (buckets == 0 || (buckets & (buckets - 1)) != 0)
+        buckets = RL_DEFAULT_BUCKETS;
+
+    if (lock_stripes == 0 || (lock_stripes & (lock_stripes - 1)) != 0)
+        lock_stripes = 64; /* reasonable default */
+
+    rl->buckets = calloc(buckets, sizeof(rl_bucket_t));
+    if (!rl->buckets)
+        return ENOMEM;
+
+    rl->locks = calloc(lock_stripes, sizeof(pthread_mutex_t));
+    if (!rl->locks) {
+        free(rl->buckets);
+        return ENOMEM;
+    }
+
+    for (uint32_t i = 0; i < lock_stripes; ++i) {
+        pthread_mutex_init(&rl->locks[i], NULL);
+    }
+
+    rl->bucket_mask = buckets - 1;
+    rl->lock_count  = lock_stripes;
+    rl->op_counter  = 0;
+    return 0;
+}
+
+/**
+ * rate_limiter_consume: Attempt to take N tokens from a bucket.
+ *
+ * Parameters:
+ *   rl        – rate limiter instance
+ *   key       – identifier (e.g., tenant_id or IP address)
+ *   capacity  – maximum burst
+ *   rate      – refill rate in tokens/sec
+ *   tokens    – tokens requested for this call
+ *   allowed   – output flag set to true if request may proceed
+ *
+ * Return:
+ *   0 on success, errno on failure (does not indicate throttling).
+ */
+int rate_limiter_consume(rate_limiter_t *rl,
+                         const char *key,
+                         double capacity,
+                         double rate,
+                         double tokens,
+                         bool *allowed)
+{
+    if (unlikely(!rl || !key || !allowed || capacity <= 0 || rate <= 0 || tokens <= 0))
+        return EINVAL;
+
+    uint32_t h = rl_hash_key(key);
+    uint32_t lock_idx = h & (rl->lock_count - 1);
+
+    pthread_mutex_lock(&rl->locks[lock_idx]);
+
+    rl_bucket_t *bucket = rl_lookup_bucket(rl, key, /*create=*/true);
+    if (unlikely(!bucket)) {
+        pthread_mutex_unlock(&rl->locks[lock_idx]);
+        return ENOMEM;
+    }
+
+    /* Refill tokens based on time elapsed */
+    uint64_t now = nsec_now();
+    double elapsed = seconds_since(bucket->last_refill_ns, now);
+    if (elapsed > 0) {
+        bucket->tokens = bucket->tokens + elapsed * bucket->refill_rate;
+        if (bucket->tokens > bucket->capacity)
+            bucket->tokens = bucket->capacity;
+        bucket->last_refill_ns = now;
+    }
+
+    /* Consume */
+    if (bucket->tokens >= tokens) {
+        bucket->tokens -= tokens;
+        *allowed = true;
+    } else {
+        *allowed = false;
+    }
+
+    bucket->last_access_ns = now;
+    pthread_mutex_unlock(&rl->locks[lock_idx]);
+
+    /* Lazy GC */
+    if ((++rl->op_counter % RL_GC_SCAN_EVERY) == 0) {
+        rl_evict_stale(rl);
+    }
+
+    return 0;
+}
+
+/**
+ * rate_limiter_metrics: Export internal metrics to Prometheus text format
+ *
+ * Caller must free the returned buffer.
+ */
+char *rate_limiter_metrics(rate_limiter_t *rl)
+{
+    if (!rl) return NULL;
+
+    char *buf = malloc(RL_METRIC_BUF_SZ);
+    if (!buf) return NULL;
+
+    size_t off = 0;
+    off += snprintf(buf + off, RL_METRIC_BUF_SZ - off,
+                    "# HELP rl_buckets Number of buckets currently in use\n"
+                    "# TYPE rl_buckets gauge\n");
+
+    uint32_t in_use = 0;
+    for (uint32_t i = 0; i <= rl->bucket_mask; ++i) {
+        if (rl->buckets[i].in_use)
+            ++in_use;
+    }
+    off += snprintf(buf + off, RL_METRIC_BUF_SZ - off,
+                    "rl_buckets %u\n", in_use);
+
+    off += snprintf(buf + off, RL_METRIC_BUF_SZ - off,
+                    "# HELP rl_ops_total Total rate limiter operations\n"
+                    "# TYPE rl_ops_total counter\n");
+    off += snprintf(buf + off, RL_METRIC_BUF_SZ - off,
+                    "rl_ops_total %" PRIu64 "\n", rl->op_counter);
+
+    return buf;
+}
+
+/**
+ * rate_limiter_destroy: Free resources
+ */
+void rate_limiter_destroy(rate_limiter_t *rl)
+{
+    if (!rl) return;
+    for (uint32_t i = 0; i < rl->lock_count; ++i) {
+        pthread_mutex_destroy(&rl->locks[i]);
+    }
+    free(rl->locks);
+    free(rl->buckets);
+    memset(rl, 0, sizeof(*rl));
+}
+
+/* ============================================================================
+ * Internal helpers
+ * ==========================================================================*/
+
+/* FNV-1a 32-bit hash */
+static uint32_t rl_hash_key(const char *key)
+{
+    uint32_t hash = 2166136261u;
+    unsigned char c;
+    while ((c = (unsigned char)*key++)) {
+        hash ^= c;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+/**
+ * rl_lookup_bucket: Find or create a bucket for key
+ */
+static rl_bucket_t *rl_lookup_bucket(rate_limiter_t *rl,
+                                     const char *key,
+                                     bool create_if_missing)
+{
+    uint32_t idx = rl_hash_key(key) & rl->bucket_mask;
+    uint32_t start_idx = idx;
+
+    do {
+        rl_bucket_t *b = &rl->buckets[idx];
+        if (!b->in_use) {
+            if (!create_if_missing)
+                return NULL;
+
+            /* Claim this slot */
+            b->in_use = true;
+            strncpy(b->key, key, RL_KEY_MAX - 1);
+            b->key[RL_KEY_MAX - 1] = '\0';
+            b->tokens = 0.0;
+            b->capacity = 0.0;      /* will be set by first consume */
+            b->refill_rate = 0.0;
+            b->last_refill_ns = nsec_now();
+            b->last_access_ns = b->last_refill_ns;
+            return b;
+        }
+        if (strncmp(b->key, key, RL_KEY_MAX) == 0) {
+            return b;
+        }
+        idx = (idx + 1) & rl->bucket_mask;
+    } while (idx != start_idx);
+
+    /* Table full */
+    return NULL;
+}
+
+/**
+ * rl_evict_stale: Remove buckets that haven't been accessed recently
+ * Runs under the assumption that we can obtain each relevant stripe lock.
+ * As this is called infrequently, we lock the entire table stripe-by-stripe.
+ */
+static void rl_evict_stale(rate_limiter_t *rl)
+{
+    uint64_t now = nsec_now();
+    for (uint32_t l = 0; l < rl->lock_count; ++l) {
+        pthread_mutex_lock(&rl->locks[l]);
+
+        for (uint32_t i = l; i <= rl->bucket_mask; i += rl->lock_count) {
+            rl_bucket_t *b = &rl->buckets[i];
+            if (!b->in_use) continue;
+            double idle = seconds_since(b->last_access_ns, now);
+            if (idle > RL_BUCKET_TTL) {
+                /* Evict */
+                memset(b, 0, sizeof(*b));
+            }
+        }
+
+        pthread_mutex_unlock(&rl->locks[l]);
+    }
+}
+
+/* ============================================================================
+ * Example usage & smoke test (compile with -DRL_MAIN to build)
+ * ==========================================================================*/
+#ifdef RL_MAIN
+#include <assert.h>
+
+int main(void)
+{
+    rate_limiter_t rl;
+    int rc = rate_limiter_init(&rl, 0, 0);
+    assert(rc == 0);
+
+    bool ok;
+    for (int i = 0; i < 5; ++i) {
+        rc = rate_limiter_consume(&rl, "clientA", 10, 5, 3, &ok);
+        assert(rc == 0);
+        printf("iter=%d allowed=%d\n", i, ok);
+        struct timespec s = { .tv_sec = 0, .tv_nsec = 500 * 1000 * 1000 };
+        nanosleep(&s, NULL);
+    }
+
+    char *metrics = rate_limiter_metrics(&rl);
+    if (metrics) {
+        puts("\n--- Metrics ---");
+        puts(metrics);
+        free(metrics);
+    }
+
+    rate_limiter_destroy(&rl);
+    return 0;
+}
+#endif

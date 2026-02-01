@@ -1,0 +1,378 @@
+// src/module_17.rs
+
+//! Model Monitoring & Automated Retraining
+//! =======================================
+//! A production-grade Observer implementation that listens to real-time
+//! `MetricEvent`s, detects performance regressions or drift, and launches
+//! background retraining jobs.  
+//!
+//! Layers touched
+//! --------------
+//! • **Model-Ops** — Retraining orchestration  
+//! • **Serving-Ops** — Metric ingestion / monitoring  
+//! • **Utility-Ops** — Logging / tracing / error handling  
+//!
+//! Architectural Patterns
+//! ----------------------
+//! • Observer Pattern (metric bus ↔ observers)  
+//! • Strategy Pattern (pluggable monitoring strategies)  
+//! • Pipeline Pattern (metric flow → monitoring → retraining)  
+//! • Factory Pattern (omitted here – see real code base)  
+//!
+//! NOTE: This module compiles stand-alone for demonstration purposes; in
+//! VisuTility it would live inside the `model_ops` crate and interoperate with
+//! the Model Registry and Scheduler services.
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime},
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc},
+    task,
+    time,
+};
+use tracing::{debug, error, info, instrument, warn};
+
+// ==============================================================================================
+// Domain types
+// ==============================================================================================
+
+/// Unique identifier inside the Model Registry.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModelId(pub String);
+
+/// Kinds of metrics emitted by the Serving layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MetricKind {
+    /// Sliding-window accuracy.
+    Accuracy,
+    /// Inference latency (ms).
+    Latency,
+    /// Throughput (inferences / s).
+    Throughput,
+    /// Population-level data-drift score (0 – 1).
+    DataDrift,
+    /// Concept-drift score (0 – 1).
+    ConceptDrift,
+}
+
+/// Single metric observation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricEvent {
+    pub model_id: ModelId,
+    pub kind: MetricKind,
+    pub value: f64,
+    pub timestamp: DateTime<Utc>,
+}
+
+impl MetricEvent {
+    pub fn new(model_id: ModelId, kind: MetricKind, value: f64) -> Self {
+        Self {
+            model_id,
+            kind,
+            value,
+            timestamp: Utc::now(),
+        }
+    }
+}
+
+/// Specification for a retraining job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrainingSpec {
+    pub model_id: ModelId,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
+// ==============================================================================================
+// Error definitions
+// ==============================================================================================
+
+#[derive(Debug, Error)]
+pub enum MonitorError {
+    #[error("observer channel send failure")]
+    ObserverSendFailed,
+    #[error("threshold for metric {0:?} not configured")]
+    ThresholdNotFound(MetricKind),
+}
+
+// ==============================================================================================
+// Observer pattern abstractions
+// ==============================================================================================
+
+/// Async observer of `MetricEvent`s.
+#[async_trait]
+pub trait MetricsObserver: Send + Sync + 'static {
+    async fn on_metric(&self, metric: MetricEvent) -> Result<(), MonitorError>;
+}
+
+/// Entity that emits metrics to observers.
+#[async_trait]
+pub trait MetricsObservable: Send + Sync {
+    async fn register(&self, observer: Arc<dyn MetricsObserver>);
+    async fn emit(&self, metric: MetricEvent);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Broadcast-based bus implementation
+// ------------------------------------------------------------------------------------------------
+
+/// `MetricsObservable` backed by a Tokio broadcast channel.
+#[derive(Debug)]
+pub struct MetricsBus {
+    tx: broadcast::Sender<MetricEvent>,
+    observers: Arc<Mutex<Vec<Arc<dyn MetricsObserver>>>>,
+}
+
+impl MetricsBus {
+    pub fn new(buffer: usize) -> Self {
+        let (tx, _rx) = broadcast::channel(buffer);
+        Self {
+            tx,
+            observers: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn spawn_dispatcher(&self) {
+        let mut rx = self.tx.subscribe();
+        let observers = self.observers.clone();
+
+        task::spawn(async move {
+            loop {
+                select! {
+                    res = rx.recv() => match res {
+                        Ok(metric) => {
+                            let snapshot = {
+                                let lock = observers.lock().unwrap();
+                                lock.clone()
+                            };
+                            for obs in snapshot {
+                                let m = metric.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = obs.on_metric(m).await {
+                                        error!("observer error: {e:?}");
+                                    }
+                                });
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("metrics bus lagged by {n} messages");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            debug!("metrics bus dispatcher exited");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[async_trait]
+impl MetricsObservable for MetricsBus {
+    async fn register(&self, observer: Arc<dyn MetricsObserver>) {
+        {
+            let mut lock = self.observers.lock().unwrap();
+            lock.push(observer);
+        }
+        if self.observers.lock().unwrap().len() == 1 {
+            self.spawn_dispatcher();
+        }
+    }
+
+    async fn emit(&self, metric: MetricEvent) {
+        let _ = self.tx.send(metric);
+    }
+}
+
+// ==============================================================================================
+// Concrete observer: threshold-based monitor
+// ==============================================================================================
+
+/// Metric thresholds that trigger retraining.
+#[derive(Debug, Clone)]
+pub struct Thresholds {
+    pub accuracy_min: f64,
+    pub latency_max: f64,
+    pub throughput_min: f64,
+    pub data_drift_max: f64,
+    pub concept_drift_max: f64,
+}
+
+impl Default for Thresholds {
+    fn default() -> Self {
+        Self {
+            accuracy_min: 0.90,
+            latency_max: 250.0,
+            throughput_min: 50.0,
+            data_drift_max: 0.3,
+            concept_drift_max: 0.3,
+        }
+    }
+}
+
+/// Observer that triggers retraining when thresholds are violated.
+pub struct ThresholdBasedMonitor {
+    thresholds: Thresholds,
+    retrain_tx: mpsc::Sender<RetrainingSpec>,
+    last_metrics: Arc<Mutex<HashMap<(ModelId, MetricKind), MetricEvent>>>,
+}
+
+impl ThresholdBasedMonitor {
+    pub fn new(thresholds: Thresholds, retrain_tx: mpsc::Sender<RetrainingSpec>) -> Self {
+        Self {
+            thresholds,
+            retrain_tx,
+            last_metrics: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn violation_reason(&self, metric: &MetricEvent) -> Option<String> {
+        use MetricKind::*;
+        match metric.kind {
+            Accuracy if metric.value < self.thresholds.accuracy_min => Some(format!(
+                "accuracy {:.2} < {:.2}",
+                metric.value, self.thresholds.accuracy_min
+            )),
+            Latency if metric.value > self.thresholds.latency_max => Some(format!(
+                "latency {:.2}ms > {:.2}ms",
+                metric.value, self.thresholds.latency_max
+            )),
+            Throughput if metric.value < self.thresholds.throughput_min => Some(format!(
+                "throughput {:.2} < {:.2}",
+                metric.value, self.thresholds.throughput_min
+            )),
+            DataDrift if metric.value > self.thresholds.data_drift_max => Some(format!(
+                "data drift {:.2} > {:.2}",
+                metric.value, self.thresholds.data_drift_max
+            )),
+            ConceptDrift if metric.value > self.thresholds.concept_drift_max => Some(format!(
+                "concept drift {:.2} > {:.2}",
+                metric.value, self.thresholds.concept_drift_max
+            )),
+            _ => None,
+        }
+    }
+}
+
+#[async_trait]
+impl MetricsObserver for ThresholdBasedMonitor {
+    #[instrument(skip(self), fields(model = %metric.model_id.0, kind = ?metric.kind))]
+    async fn on_metric(&self, metric: MetricEvent) -> Result<(), MonitorError> {
+        self.last_metrics
+            .lock()
+            .unwrap()
+            .insert((metric.model_id.clone(), metric.kind.clone()), metric.clone());
+
+        if let Some(reason) = self.violation_reason(&metric) {
+            let spec = RetrainingSpec {
+                model_id: metric.model_id.clone(),
+                reason,
+                created_at: Utc::now(),
+            };
+            self.retrain_tx
+                .send(spec)
+                .await
+                .map_err(|_| MonitorError::ObserverSendFailed)?;
+        }
+        Ok(())
+    }
+}
+
+// ==============================================================================================
+// Retraining orchestrator (simplified)
+// ==============================================================================================
+
+/// Listens for `RetrainingSpec`s and launches retraining jobs.
+pub struct RetrainingOrchestrator {
+    rx: mpsc::Receiver<RetrainingSpec>,
+    max_concurrency: usize,
+}
+
+impl RetrainingOrchestrator {
+    pub fn new(rx: mpsc::Receiver<RetrainingSpec>, max_concurrency: usize) -> Self {
+        Self { rx, max_concurrency }
+    }
+
+    pub async fn run(mut self) {
+        let sem = Arc::new(tokio::sync::Semaphore::new(self.max_concurrency));
+        while let Some(spec) = self.rx.recv().await {
+            let permit = match sem.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    error!("Semaphore closed unexpectedly");
+                    break;
+                }
+            };
+            info!(
+                "spawn retraining for model={} (reason: {})",
+                spec.model_id.0, spec.reason
+            );
+
+            tokio::spawn(async move {
+                if let Err(e) = Self::retrain(spec).await {
+                    error!("retraining failed: {e:?}");
+                }
+                drop(permit); // release slot
+            });
+        }
+        info!("retraining orchestrator shutdown – channel closed");
+    }
+
+    #[instrument(skip(spec))]
+    async fn retrain(spec: RetrainingSpec) -> Result<(), anyhow::Error> {
+        // Simulate heavy work
+        time::sleep(Duration::from_secs(5)).await;
+        info!("completed retraining for model={}", spec.model_id.0);
+        Ok(())
+    }
+}
+
+// ==============================================================================================
+// Integration test (can run with `cargo test`)
+// ==============================================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn it_triggers_retraining_on_accuracy_drop() {
+        let _ = fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .try_init();
+
+        let bus = Arc::new(MetricsBus::new(32));
+        let (rtx, rrx) = mpsc::channel(8);
+
+        bus.register(Arc::new(ThresholdBasedMonitor::new(
+            Thresholds::default(),
+            rtx,
+        )))
+        .await;
+
+        // start orchestrator
+        tokio::spawn(RetrainingOrchestrator::new(rrx, 2).run());
+
+        // emit bad accuracy
+        bus.emit(MetricEvent::new(
+            ModelId("model-42".into()),
+            MetricKind::Accuracy,
+            0.75,
+        ))
+        .await;
+
+        // give orchestrator time
+        time::sleep(Duration::from_secs(7)).await;
+    }
+}

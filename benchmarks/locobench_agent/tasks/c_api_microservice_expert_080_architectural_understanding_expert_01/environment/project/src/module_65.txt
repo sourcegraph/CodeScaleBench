@@ -1,0 +1,549 @@
+```c
+/**
+ * MercuryMonolith Commerce Hub – Response Cache
+ *
+ * src/module_65.txt  (compiled as: response_cache.c)
+ *
+ * This module provides a thread–safe, in-memory, LRU response cache with TTL
+ * semantics and Prometheus-compatible metrics.  It is used by the HTTP and
+ * GraphQL gateways to short-circuit backend execution for frequently requested
+ * resources while maintaining strong SLA targets.
+ *
+ * Public API:
+ *   mm_cache_init()
+ *   mm_cache_get()
+ *   mm_cache_put()
+ *   mm_cache_invalidate_route()
+ *   mm_cache_metrics()
+ *   mm_cache_shutdown()
+ *
+ * Compile with:
+ *   cc -std=c11 -pthread -Wall -Wextra -O2 -c response_cache.c
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <time.h>
+#include <errno.h>
+#include <pthread.h>
+
+/* --------------------------------------------------------------------------
+ * Project headers (provided elsewhere in the codebase)
+ * -------------------------------------------------------------------------- */
+#include "mm_log.h"      /* LOG_TRACE, LOG_DEBUG, LOG_WARN, LOG_ERROR */
+#include "mm_metrics.h"  /* mm_metrics_counter_inc(), mm_metrics_gauge_set() */
+
+#ifndef MM_RESPONSE_CACHE_H
+#define MM_RESPONSE_CACHE_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct mm_cache_metrics {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    size_t   current_entries;
+} mm_cache_metrics_t;
+
+int  mm_cache_init(size_t max_entries, uint64_t default_ttl_ms);
+int  mm_cache_get(const char *route,
+                  const char *method,
+                  const char *key,
+                  unsigned char **out_payload,
+                  size_t *out_len,
+                  int *out_status_code);
+
+int  mm_cache_put(const char *route,
+                  const char *method,
+                  const char *key,
+                  const unsigned char *payload,
+                  size_t payload_len,
+                  int status_code,
+                  uint64_t ttl_ms /* 0 == default */);
+
+void mm_cache_invalidate_route(const char *route);
+void mm_cache_metrics(mm_cache_metrics_t *out);
+void mm_cache_shutdown(void);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif /* MM_RESPONSE_CACHE_H */
+
+
+/* --------------------------------------------------------------------------
+ * Internal implementation – Do not rely on these symbols outside this file
+ * -------------------------------------------------------------------------- */
+
+#define MM_CACHE_MIN_TABLE_SIZE   1024U
+#define MM_CACHE_KEY_SEP          '|'
+
+typedef struct cache_entry {
+    char                 *composite_key;   /* route|method|key */
+    unsigned char        *payload;         /* cached body        */
+    size_t                payload_len;
+    int                   status_code;
+    uint64_t              expiry_ts_ms;    /* absolute epoch ms  */
+
+    /* Hash chain + LRU doubly-linked list pointers */
+    struct cache_entry   *hnext;           /* collision chain    */
+    struct cache_entry   *prev, *next;     /* LRU list           */
+} cache_entry_t;
+
+typedef struct response_cache {
+    cache_entry_t      **table;
+    size_t               table_size;
+    size_t               count;            /* number of live entries */
+
+    cache_entry_t       *lru_head;         /* most recently used */
+    cache_entry_t       *lru_tail;         /* least recently used */
+    size_t               max_entries;
+    uint64_t             default_ttl_ms;
+
+    /* metrics */
+    uint64_t             hits;
+    uint64_t             misses;
+    uint64_t             evictions;
+
+    pthread_rwlock_t     lock;
+} response_cache_t;
+
+static response_cache_t g_cache = {
+    .table       = NULL,
+    .table_size  = 0,
+    .count       = 0,
+    .lru_head    = NULL,
+    .lru_tail    = NULL,
+    .max_entries = 0,
+    .default_ttl_ms = 0,
+    .hits        = 0,
+    .misses      = 0,
+    .evictions   = 0,
+    .lock        = PTHREAD_RWLOCK_INITIALIZER
+};
+
+
+/* --------------------------------------------------------------------------
+ * Utility helpers
+ * -------------------------------------------------------------------------- */
+
+/* FNV-1a 32-bit hashing (fast and reasonably good) */
+static inline uint32_t
+hash_string(const char *s)
+{
+    uint32_t h = 2166136261u;
+    for (; *s; ++s) {
+        h ^= (uint8_t)*s;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static inline uint64_t
+epoch_millis(void)
+{
+    struct timespec ts;
+#if defined(CLOCK_REALTIME_COARSE)
+    clock_gettime(CLOCK_REALTIME_COARSE, &ts);
+#else
+    clock_gettime(CLOCK_REALTIME, &ts);
+#endif
+    return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
+
+static char *
+make_composite_key(const char *route, const char *method, const char *key)
+{
+    /* route + sep + method + sep + key + '\0' */
+    size_t len = strlen(route) + strlen(method) + strlen(key) + 3;
+    char *buf = (char *)malloc(len);
+    if (!buf) return NULL;
+
+    snprintf(buf, len, "%s%c%s%c%s",
+             route, MM_CACHE_KEY_SEP,
+             method, MM_CACHE_KEY_SEP,
+             key);
+    return buf;
+}
+
+/* Detach entry from LRU doubly-linked list (no locking) */
+static void
+detach_from_lru(response_cache_t *c, cache_entry_t *e)
+{
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_head == e) c->lru_head = e->next;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    e->prev = e->next = NULL;
+}
+
+/* Insert entry at head (most recently used) */
+static void
+lru_insert_head(response_cache_t *c, cache_entry_t *e)
+{
+    e->prev = NULL;
+    e->next = c->lru_head;
+
+    if (c->lru_head)
+        c->lru_head->prev = e;
+    c->lru_head = e;
+
+    if (!c->lru_tail)
+        c->lru_tail = e;
+}
+
+/* Remove from hash table (no locking) */
+static void
+remove_from_table(response_cache_t *c, cache_entry_t *e)
+{
+    uint32_t hx = hash_string(e->composite_key) & (c->table_size - 1);
+    cache_entry_t *curr = c->table[hx], *prev = NULL;
+    while (curr) {
+        if (curr == e) {
+            if (prev)
+                prev->hnext = curr->hnext;
+            else
+                c->table[hx] = curr->hnext;
+            break;
+        }
+        prev = curr;
+        curr = curr->hnext;
+    }
+}
+
+/* Free an entry and its resources */
+static void
+free_entry(cache_entry_t *e)
+{
+    if (!e) return;
+    free(e->composite_key);
+    free(e->payload);
+    free(e);
+}
+
+/* Evict one entry (tail) */
+static void
+evict_one(response_cache_t *c)
+{
+    if (!c->lru_tail) return;
+
+    cache_entry_t *victim = c->lru_tail;
+
+    detach_from_lru(c, victim);
+    remove_from_table(c, victim);
+
+    free_entry(victim);
+
+    c->count--;
+    c->evictions++;
+}
+
+/* --------------------------------------------------------------------------
+ * Public API implementation
+ * -------------------------------------------------------------------------- */
+
+/**
+ * mm_cache_init
+ * Initialize the global response cache.  Must be called once at boot.
+ * Returns 0 on success, errno on failure.
+ */
+int
+mm_cache_init(size_t max_entries, uint64_t default_ttl_ms)
+{
+    if (max_entries == 0)
+        return EINVAL;
+
+    memset(&g_cache, 0, sizeof(g_cache));
+
+    size_t tsz = 1;
+    while (tsz < max_entries * 2) tsz <<= 1;  /* power-of-two size */
+    if (tsz < MM_CACHE_MIN_TABLE_SIZE)
+        tsz = MM_CACHE_MIN_TABLE_SIZE;
+
+    g_cache.table = calloc(tsz, sizeof(cache_entry_t *));
+    if (!g_cache.table)
+        return ENOMEM;
+
+    g_cache.table_size     = tsz;
+    g_cache.max_entries    = max_entries;
+    g_cache.default_ttl_ms = default_ttl_ms ?: 5000; /* 5s fallback */
+
+    if (pthread_rwlock_init(&g_cache.lock, NULL) != 0)
+        return errno;
+
+    mm_metrics_gauge_set("response_cache_entries", 0);
+    LOG_INFO("[cache] initialized – capacity=%zu, ttl=%llums, table=%zu",
+             max_entries,
+             (unsigned long long)g_cache.default_ttl_ms,
+             tsz);
+    return 0;
+}
+
+/**
+ * mm_cache_get
+ * Look up a cached response.
+ *
+ * If found and not expired, returns 0 and duplicates the payload into
+ * *out_payload (caller must free).  On miss, returns ENOENT.
+ */
+int
+mm_cache_get(const char *route,
+             const char *method,
+             const char *key,
+             unsigned char **out_payload,
+             size_t *out_len,
+             int *out_status_code)
+{
+    if (!route || !method || !key || !out_payload || !out_len || !out_status_code)
+        return EINVAL;
+
+    int rc = ENOENT;
+    char *ckey = make_composite_key(route, method, key);
+    if (!ckey) return ENOMEM;
+
+    pthread_rwlock_wrlock(&g_cache.lock);
+
+    uint32_t hx = hash_string(ckey) & (g_cache.table_size - 1);
+    cache_entry_t *e = g_cache.table[hx];
+
+    while (e && strcmp(e->composite_key, ckey) != 0)
+        e = e->hnext;
+
+    uint64_t now = epoch_millis();
+    if (!e || e->expiry_ts_ms < now) {
+        g_cache.misses++;
+        if (e) {
+            /* expired – purge */
+            LOG_TRACE("[cache] expired entry '%s'", ckey);
+            detach_from_lru(&g_cache, e);
+            remove_from_table(&g_cache, e);
+            free_entry(e);
+            g_cache.count--;
+        }
+        goto out;
+    }
+
+    /* cache hit */
+    g_cache.hits++;
+
+    /* move to head */
+    detach_from_lru(&g_cache, e);
+    lru_insert_head(&g_cache, e);
+
+    *out_payload     = (unsigned char *)malloc(e->payload_len);
+    if (*out_payload == NULL) {
+        rc = ENOMEM;
+        goto out;
+    }
+    memcpy(*out_payload, e->payload, e->payload_len);
+
+    *out_len         = e->payload_len;
+    *out_status_code = e->status_code;
+
+    rc = 0;
+
+out:
+    pthread_rwlock_unlock(&g_cache.lock);
+    free(ckey);
+
+    /* expose metrics lazily – avoid lock contention in hot path */
+    mm_metrics_counter_inc("response_cache_hits",  g_cache.hits);
+    mm_metrics_counter_inc("response_cache_misses",g_cache.misses);
+
+    return rc;
+}
+
+/**
+ * mm_cache_put
+ * Insert/replace a cache entry.
+ */
+int
+mm_cache_put(const char *route,
+             const char *method,
+             const char *key,
+             const unsigned char *payload,
+             size_t payload_len,
+             int status_code,
+             uint64_t ttl_ms)
+{
+    if (!route || !method || !key || !payload || payload_len == 0)
+        return EINVAL;
+
+    char *ckey = make_composite_key(route, method, key);
+    if (!ckey) return ENOMEM;
+
+    int rc = 0;
+    uint64_t expiry = epoch_millis() + (ttl_ms ? ttl_ms : g_cache.default_ttl_ms);
+
+    pthread_rwlock_wrlock(&g_cache.lock);
+
+    uint32_t hx = hash_string(ckey) & (g_cache.table_size - 1);
+    cache_entry_t *e = g_cache.table[hx];
+    cache_entry_t *prev = NULL;
+
+    while (e && strcmp(e->composite_key, ckey) != 0) {
+        prev = e;
+        e = e->hnext;
+    }
+
+    if (e) {
+        /* Replace existing */
+        free(e->payload);
+        e->payload = (unsigned char *)malloc(payload_len);
+        if (!e->payload) { rc = ENOMEM; goto out; }
+
+        memcpy(e->payload, payload, payload_len);
+        e->payload_len   = payload_len;
+        e->status_code   = status_code;
+        e->expiry_ts_ms  = expiry;
+
+        detach_from_lru(&g_cache, e);
+        lru_insert_head(&g_cache, e);
+        goto out;
+    }
+
+    /* Might need to evict first */
+    if (g_cache.count >= g_cache.max_entries)
+        evict_one(&g_cache);
+
+    e = (cache_entry_t *)calloc(1, sizeof(cache_entry_t));
+    if (!e) { rc = ENOMEM; goto out; }
+
+    e->composite_key = ckey;  /* transfer ownership */
+    ckey = NULL;              /* prevent free() below */
+
+    e->payload = (unsigned char *)malloc(payload_len);
+    if (!e->payload) { rc = ENOMEM; free_entry(e); goto out; }
+    memcpy(e->payload, payload, payload_len);
+    e->payload_len  = payload_len;
+    e->status_code  = status_code;
+    e->expiry_ts_ms = expiry;
+
+    /* Insert into hash table */
+    e->hnext = g_cache.table[hx];
+    g_cache.table[hx] = e;
+
+    /* Insert into LRU */
+    lru_insert_head(&g_cache, e);
+
+    g_cache.count++;
+
+out:
+    pthread_rwlock_unlock(&g_cache.lock);
+
+    mm_metrics_gauge_set("response_cache_entries", g_cache.count);
+
+    if (rc == 0)
+        LOG_TRACE("[cache] stored entry '%s' (%zub)", e ? e->composite_key : "(null)", payload_len);
+    else
+        LOG_ERROR("[cache] put failed (%d): %s", rc, strerror(rc));
+
+    if (ckey) free(ckey); /* if not transferred */
+
+    return rc;
+}
+
+/**
+ * mm_cache_invalidate_route
+ * Bulk-invalidate all entries that belong to a given route prefix.
+ * This is invoked by mutating endpoints (POST/PUT/PATCH/DELETE)
+ * to avoid stale reads.
+ */
+void
+mm_cache_invalidate_route(const char *route)
+{
+    if (!route) return;
+    size_t rlen = strlen(route);
+
+    pthread_rwlock_wrlock(&g_cache.lock);
+
+    for (size_t i = 0; i < g_cache.table_size; ++i) {
+        cache_entry_t *curr = g_cache.table[i], *prev = NULL;
+        while (curr) {
+            bool match = strncmp(curr->composite_key, route, rlen) == 0 &&
+                         curr->composite_key[rlen] == MM_CACHE_KEY_SEP;
+
+            if (!match) {
+                prev = curr;
+                curr = curr->hnext;
+                continue;
+            }
+
+            /* remove curr */
+            cache_entry_t *next = curr->hnext;
+
+            detach_from_lru(&g_cache, curr);
+
+            if (prev)
+                prev->hnext = next;
+            else
+                g_cache.table[i] = next;
+
+            free_entry(curr);
+            g_cache.count--;
+
+            curr = next;
+        }
+    }
+
+    pthread_rwlock_unlock(&g_cache.lock);
+    mm_metrics_gauge_set("response_cache_entries", g_cache.count);
+
+    LOG_DEBUG("[cache] invalidated entries for route '%s'", route);
+}
+
+/**
+ * mm_cache_metrics
+ * Copy internal counters into user-supplied struct.
+ */
+void
+mm_cache_metrics(mm_cache_metrics_t *out)
+{
+    if (!out) return;
+
+    pthread_rwlock_rdlock(&g_cache.lock);
+    out->hits            = g_cache.hits;
+    out->misses          = g_cache.misses;
+    out->evictions       = g_cache.evictions;
+    out->current_entries = g_cache.count;
+    pthread_rwlock_unlock(&g_cache.lock);
+}
+
+/**
+ * mm_cache_shutdown
+ * Release all resources held by the cache.  After this point the cache API
+ * must not be used again in the process lifetime.
+ */
+void
+mm_cache_shutdown(void)
+{
+    pthread_rwlock_wrlock(&g_cache.lock);
+
+    for (size_t i = 0; i < g_cache.table_size; ++i) {
+        cache_entry_t *curr = g_cache.table[i];
+        while (curr) {
+            cache_entry_t *next = curr->hnext;
+            free_entry(curr);
+            curr = next;
+        }
+        g_cache.table[i] = NULL;
+    }
+    free(g_cache.table);
+    g_cache.table = NULL;
+    g_cache.table_size = 0;
+    g_cache.count      = 0;
+
+    pthread_rwlock_unlock(&g_cache.lock);
+    pthread_rwlock_destroy(&g_cache.lock);
+
+    LOG_INFO("[cache] shutdown complete");
+}
+
+```

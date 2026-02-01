@@ -1,0 +1,337 @@
+```rust
+//! module_40.rs
+//! -------------------------------------------------------------
+//! LedgerLink Nexus – Response Cache Layer (Redis backend)
+//!
+//! This module offers a small but production-ready, Redis-powered
+//! response cache that can be wired into either REST or GraphQL
+//! handlers.  View-Models can “opt-in” by wrapping their business
+//! logic inside [`ResponseCache::remember`] giving the platform
+//! consistent semantics (status flags, observability events, TTL
+//! handling, stampede protection).
+//!
+//! Patterns demonstrated:
+//!   • Repository / Service abstraction
+//!   • Generic, type-erased error handling
+//!   • Async-compatible Redis connection management
+//!   • Structured logging + metrics hooks
+//! --------------------------------------------------------------
+
+use std::{
+    fmt::{Debug, Display},
+    future::Future,
+    sync::Arc,
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use redis::{aio::ConnectionManager, AsyncCommands};
+use serde::{de::DeserializeOwned, Serialize};
+use thiserror::Error;
+use tokio::sync::Mutex;
+use tracing::{debug, error, instrument, warn};
+
+/// A thin handle that can be cloned and sent across tasks.
+///
+/// Internally wraps an `Arc<Mutex<…>>` because the redis crate’s
+/// `ConnectionManager` is _not_ `Sync`.
+#[derive(Clone)]
+pub struct RedisHandle {
+    inner: Arc<Mutex<ConnectionManager>>,
+}
+
+impl RedisHandle {
+    pub async fn new(redis_url: impl AsRef<str>) -> Result<Self, CacheError> {
+        let client = redis::Client::open(redis_url.as_ref())?;
+        let conn = client.get_tokio_connection_manager().await?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    async fn with_conn<T, F>(&self, fut: F) -> Result<T, CacheError>
+    where
+        F: FnOnce(&mut ConnectionManager) -> Box<dyn Future<Output = Result<T, CacheError>> + Send>
+            + Send,
+        T: Send,
+    {
+        // Single-flight access to the underlying connection so that
+        // commands on the same multiplexed socket are ordered.
+        let mut conn = self.inner.lock().await;
+        fut(&mut conn).await
+    }
+}
+
+/// Enum describing cache result metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheStatus {
+    Hit,
+    Miss,
+    Bypass,
+}
+
+/// Wrapper combining the cached value with meta flags.
+#[derive(Debug, Clone)]
+pub struct CachedResponse<T> {
+    pub value: T,
+    pub status: CacheStatus,
+}
+
+/// Public façade exposed to route handlers or service layer.
+#[derive(Clone)]
+pub struct ResponseCache {
+    redis: RedisHandle,
+    /// Namespace prefix to segregate environments / services.
+    prefix: String,
+}
+
+impl ResponseCache {
+    pub fn new(redis: RedisHandle, prefix: impl Into<String>) -> Self {
+        Self {
+            redis,
+            prefix: prefix.into(),
+        }
+    }
+
+    /// Compose a namespaced key: `<prefix>:<tenant>:<path>|<query>`
+    fn compose_key(&self, parts: &[&str]) -> String {
+        let joined = parts.join("|");
+        format!("{}:{}", self.prefix, joined)
+    }
+
+    /// Main entry point – transparently fetches/creates a value.
+    ///
+    /// Example usage inside a handler:
+    /// ```no_run
+    /// let cached = cache
+    ///     .remember(&["tenant42", "/v1/ledger", "page=2"], 30, || async {
+    ///         Ok(service.list_ledger_entries(params).await?)
+    ///     })
+    ///     .await?;
+    /// if cached.status == CacheStatus::Hit {
+    ///     metrics::increment_counter!("cache_hit");
+    /// }
+    /// Json(cached.value)
+    /// ```
+    #[instrument(skip_all, fields(key_parts = ?key_parts))]
+    pub async fn remember<T, F, Fut>(
+        &self,
+        key_parts: &[&str],
+        ttl_seconds: u64,
+        generator: F,
+    ) -> Result<CachedResponse<T>, CacheError>
+    where
+        T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<T, CacheError>> + Send,
+    {
+        // Quick sanity check – a TTL of 0 disables caching.
+        if ttl_seconds == 0 {
+            let value = generator().await?;
+            return Ok(CachedResponse {
+                value,
+                status: CacheStatus::Bypass,
+            });
+        }
+
+        let key = self.compose_key(key_parts);
+
+        // --------------------
+        //   1. Try to read
+        // --------------------
+        if let Some(serialized) = self
+            .redis
+            .with_conn(|c| {
+                Box::new(async move {
+                    let result: Option<String> = c.get(&key).await?;
+                    Ok(result)
+                })
+            })
+            .await?
+        {
+            match serde_json::from_str::<T>(&serialized) {
+                Ok(value) => {
+                    debug!(%key, "cache hit");
+                    return Ok(CachedResponse {
+                        value,
+                        status: CacheStatus::Hit,
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %e, %key, "cache deserialization failed – purging key");
+                    // Best effort purge; ignore error
+                    let _ = self
+                        .redis
+                        .with_conn(|c| Box::new(async move { c.del(&key).await.map(|_| ()) }))
+                        .await;
+                }
+            }
+        }
+
+        // --------------------
+        //   2. Generate + set
+        // --------------------
+        debug!(%key, "cache miss – generating");
+        let value = generator().await?;
+
+        // Serialize *before* SETEX to avoid holding redis lock
+        // during potentially expensive serde call.
+        let payload =
+            serde_json::to_string(&value).map_err(CacheError::Serialization)?;
+
+        // Stampede protection: SET if not exists (`NX`) then expiry.
+        // If another task won the race we let it populate; no harm.
+        let key_clone = key.clone();
+        let payload_clone = payload.clone();
+        match self
+            .redis
+            .with_conn(|c| {
+                Box::new(async move {
+                    // Use Redis 'SET key value EX <ttl> NX'
+                    let res: Option<String> = redis::cmd("SET")
+                        .arg(&key_clone)
+                        .arg(&payload_clone)
+                        .arg("EX")
+                        .arg(ttl_seconds as usize)
+                        .arg("NX")
+                        .query_async(c)
+                        .await?;
+                    Ok(res)
+                })
+            })
+            .await
+        {
+            Ok(Some(_)) => debug!(%key, ttl_seconds, "cache populated"),
+            Ok(None) => debug!(%key, "another process has populated the cache"),
+            Err(e) => error!(error = %e, %key, "failed to set cache"),
+        };
+
+        Ok(CachedResponse {
+            value,
+            status: CacheStatus::Miss,
+        })
+    }
+}
+
+/// Optional trait that View-Models can implement to provide
+/// canonical cache hints, decoupling endpoints from TTL logic.
+///
+/// Implementors decide their own key components to guarantee
+/// uniqueness across tenants and pagination cursors.
+#[async_trait]
+pub trait Cacheable {
+    /// Unique list of components used to build a cache key.
+    fn cache_key_parts(&self) -> Vec<String>;
+
+    /// Recommended TTL in seconds.
+    fn ttl(&self) -> u64;
+
+    /// Execute the expensive business logic that yields a value
+    /// to cache.  (Usually calls into a Query service.)
+    async fn generate(&self) -> Result<Self::Output, CacheError>;
+
+    type Output: Serialize + DeserializeOwned + Clone + Send + Sync + 'static;
+
+    /// Convenience wrapper that delegates to [`ResponseCache`].
+    async fn into_cached(self, cache: &ResponseCache) -> Result<CachedResponse<Self::Output>, CacheError>
+    where
+        Self: Sized + Send,
+    {
+        let parts = self
+            .cache_key_parts()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        cache
+            .remember(&parts, self.ttl(), || self.generate())
+            .await
+    }
+}
+
+// ----------------------------------------------------------------------
+// Error handling
+// ----------------------------------------------------------------------
+
+#[derive(Error, Debug)]
+pub enum CacheError {
+    #[error("Redis error: {0}")]
+    Redis(#[from] redis::RedisError),
+
+    #[error("Serialization error: {0}")]
+    Serialization(serde_json::Error),
+
+    #[error("{0}")]
+    Other(#[from] anyhow::Error),
+}
+
+impl Display for CacheError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(self, f)
+    }
+}
+
+impl std::error::Error for CacheError {}
+
+// Allow conversions from std::io::Error, sqlx::Error, etc.
+impl From<Box<dyn std::error::Error + Send + Sync>> for CacheError {
+    fn from(e: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        CacheError::Other(anyhow::Error::new(e))
+    }
+}
+
+// ----------------------------------------------------------------------
+// Tests – `cargo test -p api_microservice -- module_40`
+// ----------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use once_cell::sync::Lazy;
+    use serde::{Deserialize, Serialize};
+    use uuid::Uuid;
+
+    static REDIS_URL: Lazy<String> = Lazy::new(|| {
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/0".to_string())
+    });
+
+    #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+    struct Foo {
+        bar: String,
+    }
+
+    #[tokio::test]
+    async fn basic_roundtrip() {
+        // Requires a running local redis – skip otherwise
+        let handle = match RedisHandle::new(&*REDIS_URL).await {
+            Ok(h) => h,
+            Err(_) => return, // dev box without redis, skip.
+        };
+        let cache = ResponseCache::new(handle, "test");
+
+        let unique = Uuid::new_v4().to_string();
+        let generator = || async {
+            Ok::<_, CacheError>(Foo {
+                bar: unique.clone(),
+            })
+        };
+
+        // First call should miss
+        let resp = cache
+            .remember(&["foo", &unique], 5, generator)
+            .await
+            .expect("remember failed");
+        assert_eq!(resp.status, CacheStatus::Miss);
+        assert_eq!(resp.value.bar, unique);
+
+        // Second call should hit
+        let resp2 = cache
+            .remember(&["foo", &unique], 5, || async {
+                Err::<Foo, CacheError>(anyhow::anyhow!("should not be called"))
+            })
+            .await
+            .expect("remember2 failed");
+        assert_eq!(resp2.status, CacheStatus::Hit);
+        assert_eq!(resp2.value.bar, unique);
+    }
+}
+```

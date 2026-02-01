@@ -1,0 +1,469 @@
+```rust
+//! src/module_21.rs
+//!
+//! ChirpPulse – Module 21: Real-Time Enrichment Worker
+//! ---------------------------------------------------
+//! This worker ingests raw social-network chatter from a Kafka topic,
+//! applies one or more enrichment strategies (language detection, toxicity
+//! scoring, etc.), and republishes the enriched event to an outbound topic.
+//!
+//!   • Fully asynchronous, non-blocking implementation (Tokio).
+//!   • Strategy pattern enables hot-swapping enrichment algorithms at run-time.
+//!   • Graceful shutdown & back-pressure aware concurrency limiting.
+//!
+//! NOTE: `Cargo.toml` must include (at minimum):
+//! -------------------------------------------------------------------------
+//! [dependencies]
+//! anyhow      = "1"
+//! async-trait = "0.1"
+//! chrono      = { version = "0.4", features = ["serde"] }
+//! futures     = "0.3"
+//! rdkafka     = { version = "0.34", features = ["tokio"] }
+//! serde       = { version = "1", features = ["derive"] }
+//! serde_json  = "1"
+//! thiserror   = "1"
+//! tokio       = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+//! tracing     = "0.1"
+//! whatlang    = "0.16"
+//! -------------------------------------------------------------------------
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use anyhow::Result;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::{StreamExt, TryFutureExt};
+use rdkafka::{
+    consumer::{CommitMode, Consumer, StreamConsumer},
+    message::{BorrowedMessage, Headers, OwnedHeaders},
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Message,
+};
+use serde::{Deserialize, Serialize};
+use tokio::{select, signal, sync::Semaphore};
+use tracing::{debug, error, info, instrument, warn};
+use whatlang::{detect, Lang};
+
+/// ------------------------------------------------------------------------------------------------
+/// Domain Types
+/// ------------------------------------------------------------------------------------------------
+
+/// Raw event as received from the social ingestion gateway.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RawEvent {
+    pub id: String,
+    pub user: String,
+    pub text: String,
+    pub timestamp: DateTime<Utc>,
+    #[serde(flatten)]
+    pub ext: HashMap<String, serde_json::Value>,
+}
+
+/// Enriched event that will be published downstream.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnrichedEvent {
+    #[serde(flatten)]
+    pub raw: RawEvent,
+    pub enrichment: EnrichmentMetadata,
+    /// UTC timestamp of enrichment completion.
+    pub processed_at: DateTime<Utc>,
+}
+
+/// All enrichment-specific metadata.
+///
+/// Additional fields can be appended without breaking compatibility by making
+/// this struct non-exhaustive.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnrichmentMetadata {
+    pub language: Option<LanguageTag>,
+    pub toxicity: Option<f32>,
+}
+
+/// A subset of BCP-47; only ISO-639-1 + script is stored here.
+#[derive(Debug, Clone, Serialize)]
+pub struct LanguageTag {
+    pub lang: String,
+    pub script: Option<String>,
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Config
+/// ------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkerConfig {
+    // Kafka
+    pub brokers: String,
+    pub group_id: String,
+    pub input_topic: String,
+    pub output_topic: String,
+
+    /// Maximum number of in-flight messages to process concurrently.
+    #[serde(default = "default_parallelism")]
+    pub max_concurrency: usize,
+
+    /// Milliseconds to wait for Kafka futures.
+    #[serde(default = "default_kafka_timeout_ms")]
+    pub kafka_timeout_ms: u64,
+
+    /// Strategy registry.
+    #[serde(default)]
+    pub strategies: StrategyConfig,
+}
+
+fn default_parallelism() -> usize {
+    num_cpus::get().max(4)
+}
+
+fn default_kafka_timeout_ms() -> u64 {
+    5_000
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct StrategyConfig {
+    #[serde(default)]
+    pub lang_detect: Option<LangDetectParameters>,
+    #[serde(default)]
+    pub toxicity: Option<ToxicityParameters>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LangDetectParameters {
+    /// Minimum confidence threshold (0.0–1.0).
+    #[serde(default = "default_lang_confidence")]
+    pub min_confidence: f64,
+}
+
+fn default_lang_confidence() -> f64 {
+    0.2
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToxicityParameters {
+    /// Placeholder for ML model parameters, API keys, etc.
+    #[serde(default)]
+    pub dummy: Option<String>,
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Strategy Pattern
+/// ------------------------------------------------------------------------------------------------
+
+/// Trait implemented by all enrichment strategies.
+#[async_trait]
+pub trait EnrichmentStrategy: Send + Sync {
+    /// Short static name used for logging/metrics.
+    fn name(&self) -> &'static str;
+
+    /// Perform in-place enrichment.
+    async fn enrich(&self, evt: &mut EnrichedEvent) -> Result<()>;
+}
+
+/// Dispatch wrapper for a boxed strategy.
+pub type DynStrategy = Arc<dyn EnrichmentStrategy>;
+
+/// Language detection strategy (WhatLang).
+pub struct LangDetectStrategy {
+    min_confidence: f64,
+}
+
+impl LangDetectStrategy {
+    pub fn new(cfg: LangDetectParameters) -> Self {
+        Self {
+            min_confidence: cfg.min_confidence,
+        }
+    }
+}
+
+#[async_trait]
+impl EnrichmentStrategy for LangDetectStrategy {
+    fn name(&self) -> &'static str {
+        "lang_detect"
+    }
+
+    #[instrument(skip(self, evt), fields(strategy = "lang_detect"))]
+    async fn enrich(&self, evt: &mut EnrichedEvent) -> Result<()> {
+        let info = detect(&evt.raw.text);
+        if let Some(info) = info {
+            if info.confidence() >= self.min_confidence {
+                let tag = LanguageTag {
+                    lang: info.lang().code().to_lowercase(),
+                    script: script_from_lang(info.lang()),
+                };
+                evt.enrichment.language = Some(tag);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Returns a plausible script for the given language.
+/// (For brevity, this table is incomplete.)
+fn script_from_lang(lang: Lang) -> Option<String> {
+    use Lang::*;
+    let script = match lang {
+        Eng | Deu | Fra | Spa | Por => "Latn",
+        Rus | Bel | Ukr => "Cyrl",
+        Ara | Fas => "Arab",
+        Jpn => "Jpan",
+        Zho => "Hans",
+        _ => return None,
+    };
+    Some(script.into())
+}
+
+/// Very naive toxicity detector (placeholder).
+pub struct ToxicityStrategy;
+
+#[async_trait]
+impl EnrichmentStrategy for ToxicityStrategy {
+    fn name(&self) -> &'static str {
+        "toxicity"
+    }
+
+    #[instrument(skip(self, evt), fields(strategy = "toxicity"))]
+    async fn enrich(&self, evt: &mut EnrichedEvent) -> Result<()> {
+        let score = simple_toxicity_heuristic(&evt.raw.text);
+        evt.enrichment.toxicity = Some(score);
+        Ok(())
+    }
+}
+
+/// Counts toxic keywords as a proxy for ML model inference.
+fn simple_toxicity_heuristic(text: &str) -> f32 {
+    const BAD_WORDS: &[&str] = &["hate", "idiot", "stupid", "kill"];
+    let text_lower = text.to_ascii_lowercase();
+    let hits = BAD_WORDS
+        .iter()
+        .filter(|word| text_lower.contains(*word))
+        .count();
+    (hits as f32) / (BAD_WORDS.len() as f32)
+}
+
+/// Build the active strategy chain from configuration.
+fn build_strategies(cfg: &StrategyConfig) -> Vec<DynStrategy> {
+    let mut out: Vec<DynStrategy> = Vec::new();
+
+    if let Some(ld_cfg) = &cfg.lang_detect {
+        out.push(Arc::new(LangDetectStrategy::new(ld_cfg.clone())));
+    }
+
+    if cfg.toxicity.is_some() {
+        out.push(Arc::new(ToxicityStrategy));
+    }
+
+    out
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Worker Runtime
+/// ------------------------------------------------------------------------------------------------
+
+pub struct EnrichmentWorker {
+    cfg: WorkerConfig,
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+    strategies: Vec<DynStrategy>,
+    concurrency: Arc<Semaphore>,
+    kafka_timeout: Duration,
+}
+
+impl EnrichmentWorker {
+    /// Construct worker from external configuration.
+    pub async fn new(cfg: WorkerConfig) -> Result<Self> {
+        // --- Kafka consumer -------------------------------------------------
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.brokers)
+            .set("group.id", &cfg.group_id)
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()?;
+
+        consumer.subscribe(&[&cfg.input_topic])?;
+
+        // --- Kafka producer -------------------------------------------------
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.brokers)
+            .set("message.timeout.ms", &cfg.kafka_timeout_ms.to_string())
+            .create()?;
+
+        let strategies = build_strategies(&cfg.strategies);
+
+        Ok(Self {
+            cfg,
+            consumer,
+            producer,
+            strategies,
+            concurrency: Arc::new(Semaphore::new(default_parallelism())),
+            kafka_timeout: Duration::from_millis(default_kafka_timeout_ms()),
+        })
+    }
+
+    /// Start the asynchronous event-loop; resolves when shutdown is complete.
+    pub async fn run(self) -> Result<()> {
+        info!(
+            worker_group = %self.cfg.group_id,
+            topic = %self.cfg.input_topic,
+            outbound = %self.cfg.output_topic,
+            "Enrichment worker started"
+        );
+
+        // Convert our consumer into a stream of messages.
+        let mut stream = self.consumer.stream();
+        let shutdown_signal = async {
+            signal::ctrl_c()
+                .await
+                .expect("failed listening for shutdown signal");
+        };
+
+        select! {
+            _ = self.event_loop(&mut stream) => {},
+            _ = shutdown_signal => {
+                info!("Shutdown signal received");
+            }
+        }
+
+        self.consumer.commit_consumer_state(CommitMode::Sync)?;
+        info!("Shutdown complete");
+        Ok(())
+    }
+
+    /// Core Processing Loop
+    async fn event_loop(
+        &self,
+        stream: &mut impl StreamExt<Item = Result<BorrowedMessage<'_>, rdkafka::error::KafkaError>>,
+    ) {
+        while let Some(message) = stream.next().await {
+            match message {
+                Ok(msg) => {
+                    let permit = match self.concurrency.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            error!("Semaphore closed – aborting");
+                            break;
+                        }
+                    };
+
+                    // Spawn a task per message to maximise throughput, but bounded
+                    // by the semaphore to avoid blowing up memory under back-pressure.
+                    let strategies = self.strategies.clone();
+                    let producer = self.producer.clone();
+                    let topic = self.cfg.output_topic.clone();
+                    let timeout = self.kafka_timeout;
+
+                    tokio::spawn(async move {
+                        if let Err(err) = process_message(msg, strategies, producer, &topic, timeout).await {
+                            error!(%err, "Failed processing message");
+                        }
+                        // `permit` is dropped at end of scope, releasing it.
+                        drop(permit);
+                    });
+                }
+                Err(err) => {
+                    warn!(%err, "Kafka error");
+                }
+            }
+        }
+    }
+}
+
+/// Handle a single message (deserialise → enrich → publish → commit).
+#[instrument(skip(msg, strategies, producer))]
+async fn process_message(
+    msg: BorrowedMessage<'_>,
+    strategies: Vec<DynStrategy>,
+    producer: FutureProducer,
+    output_topic: &str,
+    timeout: Duration,
+) -> Result<()> {
+    // 1. Deserialize
+    let payload = msg
+        .payload()
+        .ok_or_else(|| anyhow::anyhow!("empty payload"))?;
+    let raw: RawEvent = serde_json::from_slice(payload)?;
+
+    // 2. Enrich
+    let mut enriched = EnrichedEvent {
+        raw,
+        enrichment: EnrichmentMetadata {
+            language: None,
+            toxicity: None,
+        },
+        processed_at: DateTime::<Utc>::from(SystemTime::now()),
+    };
+
+    for strat in &strategies {
+        strat.enrich(&mut enriched).await?;
+    }
+
+    // 3. Serialize
+    let key = enriched.raw.id.clone();
+    let out_buf = serde_json::to_vec(&enriched)?;
+
+    // 4. Produce
+    let produce_future = producer.send(
+        FutureRecord::to(output_topic)
+            .payload(&out_buf)
+            .key(&key)
+            .headers(message_headers(&msg)),
+        timeout,
+    );
+
+    match produce_future.await {
+        Ok(Ok(_delivery)) => {
+            debug!("Published enriched message");
+        }
+        Ok(Err((err, _msg))) | Err((err, _msg)) => {
+            error!(%err, "Failed to deliver message");
+        }
+    }
+
+    // 5. Commit offsets (at-least-once semantics).
+    if let Err(err) = msg
+        .consumer()
+        .commit_message(&msg, CommitMode::Async)
+    {
+        warn!(%err, "Offset commit failed");
+    }
+
+    Ok(())
+}
+
+/// Copy headers from inbound message and append enrichment metadata.
+/// In production this could also inject tracing IDs for distributed tracing.
+fn message_headers(msg: &BorrowedMessage<'_>) -> OwnedHeaders {
+    let mut hdrs = OwnedHeaders::new_with_capacity(msg.headers().map(|h| h.count()).unwrap_or(0) + 1);
+
+    if let Some(src_headers) = msg.headers() {
+        for i in 0..src_headers.count() {
+            if let Some((k, v)) = src_headers.get_as::<str>(i) {
+                hdrs = hdrs.add(k, v.unwrap_or_default());
+            }
+        }
+    }
+
+    // Example custom header.
+    hdrs.add("processed-by", "chirp-pulse/lang-toxic-enricher")
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Bootstrap Convenience
+/// ------------------------------------------------------------------------------------------------
+
+#[cfg(feature = "bin")]
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Placeholder for reading configuration from a file or env vars.
+    let cfg_str = std::fs::read_to_string("config/worker.yaml")?;
+    let cfg: WorkerConfig = serde_yaml::from_str(&cfg_str)?;
+
+    tracing_subscriber::fmt::init();
+
+    let worker = EnrichmentWorker::new(cfg.clone()).await?;
+    worker.run().await
+}
+```

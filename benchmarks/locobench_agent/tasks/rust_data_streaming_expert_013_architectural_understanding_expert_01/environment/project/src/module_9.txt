@@ -1,0 +1,421 @@
+```rust
+//! src/module_9.rs
+//!
+//! Real-time sentiment aggregation micro-service.
+//! -------------------------------------------------
+//! This module is responsible for consuming enriched
+//! social messages from Kafka, applying a pluggable
+//! sentiment-scoring strategy, and emitting rolling
+//! aggregates back to another Kafka topic.  In a real
+//! deployment this micro-service would run in its own
+//! container/pod and be configured via environment
+//! variables or a configuration file loaded at start-up.
+//!
+//! High-level flow
+//! ---------------
+//!  1. Load runtime configuration (brokers, topics, batch size, strategy)
+//!  2. Initialise tracing, metrics and Kafka consumer/producer
+//!  3. Spawn an async task that pulls messages off the input topic
+//!  4. For each message:
+//!       a. Deserialise payload into `Chirp`
+//!       b. Score it via the selected `SentimentStrategy`
+//!       c. Store result in an in-memory window
+//!  5. On every tick (`aggregation_interval`) create a
+//!     `SentimentAggregate` record and push to output topic
+//!
+//! Error handling & robustness
+//! ---------------------------
+//!  * All recoverable errors are logged and turned into
+//!    Prometheus counters for observability.
+//!  * Unexpected panics in the consumer task are caught by
+//!    `tokio::spawn` ‑ restarts are driven by the orchestrator.
+//!
+//! NOTE: This file is intentionally self-contained; in a
+//! real repository you would separate the types, strategies
+//! and runner into their own modules.
+
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use rdkafka::{
+    consumer::{CommitMode, Consumer, StreamConsumer},
+    error::KafkaError,
+    message::{BorrowedMessage, OwnedHeaders},
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::Notify,
+    task::JoinHandle,
+    time::{interval_at, sleep, Interval},
+};
+use tracing::{error, info, instrument, warn};
+
+/// Custom result alias for brevity.
+type Result<T> = std::result::Result<T, AggregatorError>;
+
+/// All possible errors bubble up as this enum so callers
+/// can decide what to do (retry, crash, etc.).
+#[derive(Debug, Error)]
+pub enum AggregatorError {
+    #[error("Kafka error: {0}")]
+    Kafka(#[from] KafkaError),
+    #[error("Serde error: {0}")]
+    SerdeJson(#[from] serde_json::Error),
+    #[error("Sentiment strategy error: {0}")]
+    Strategy(String),
+    #[error("Join error: {0}")]
+    Join(#[from] tokio::task::JoinError),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Runtime configuration, loaded once at boot time.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AggregatorConfig {
+    /// Comma-separated broker list
+    pub brokers: String,
+    /// Source topic containing enriched chirps
+    pub input_topic: String,
+    /// Destination topic for aggregates
+    pub output_topic: String,
+    /// Batch size before committing offsets
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+    /// How often to flush aggregates (seconds)
+    #[serde(with = "humantime_serde", default = "default_interval")]
+    pub aggregation_interval: Duration,
+    /// Chosen sentiment algorithm ("v1", "v2", etc.)
+    #[serde(default = "default_strategy")]
+    pub strategy: String,
+}
+
+fn default_batch_size() -> usize {
+    200
+}
+
+fn default_interval() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn default_strategy() -> String {
+    "v1".to_string()
+}
+
+/// Basic representation of an enriched chirp received from
+/// upstream enrichment pipeline.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Chirp {
+    pub id: String,
+    /// ISO-8601 timestamp
+    pub timestamp: DateTime<Utc>,
+    /// Natural language message text
+    pub text: String,
+    /// Any upstream metadata we care about
+    pub lang: Option<String>,
+    pub user_id: Option<String>,
+}
+
+/// Sentiment-scored chirp, produced by applying a strategy.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScoredChirp {
+    pub id: String,
+    pub timestamp: DateTime<Utc>,
+    pub score: f32,
+}
+
+/// Rolling aggregate computed over a time window.
+#[derive(Debug, Clone, Serialize)]
+pub struct SentimentAggregate {
+    pub window_start: DateTime<Utc>,
+    pub window_end: DateTime<Utc>,
+    /// Average sentiment value within window
+    pub mean_score: f32,
+    /// Total messages considered
+    pub message_count: usize,
+}
+
+/// Factory for obtaining the right strategy at runtime.
+fn make_strategy(name: &str) -> Arc<dyn SentimentStrategy + Send + Sync> {
+    match name {
+        "v2" => Arc::new(V2Sentiment {}),
+        _ => Arc::new(V1Sentiment {}),
+    }
+}
+
+/// Strategy pattern: allows hot-swapping algorithm without
+/// impacting aggregator loop.
+#[async_trait]
+pub trait SentimentStrategy {
+    async fn score(&self, chirp: &Chirp) -> std::result::Result<f32, String>;
+}
+
+/// v1: Trivial implementation — counts positive/negative words.
+/// This is of course oversimplified, but the idea is that the
+/// aggregator does not care how the score is produced.
+pub struct V1Sentiment;
+
+#[async_trait]
+impl SentimentStrategy for V1Sentiment {
+    async fn score(&self, chirp: &Chirp) -> std::result::Result<f32, String> {
+        static POSITIVE: &[&str] = &["good", "great", "love", "excellent"];
+        static NEGATIVE: &[&str] = &["bad", "terrible", "hate", "awful"];
+
+        let mut score = 0.0f32;
+        for token in chirp.text.split_ascii_whitespace() {
+            if POSITIVE.contains(&token) {
+                score += 1.0;
+            } else if NEGATIVE.contains(&token) {
+                score -= 1.0;
+            }
+        }
+        Ok(score)
+    }
+}
+
+/// v2: Imaginary neural inference service call.  We simply
+/// simulate latency with `tokio::sleep`.
+pub struct V2Sentiment;
+
+#[async_trait]
+impl SentimentStrategy for V2Sentiment {
+    async fn score(&self, chirp: &Chirp) -> std::result::Result<f32, String> {
+        // Simulate network hop to ML service with 5ms latency.
+        sleep(Duration::from_millis(5)).await;
+        // Return dummy value for demo purposes.
+        Ok((chirp.text.len() % 64) as f32 / 32.0 - 1.0)
+    }
+}
+
+/// Aggregation state lives in memory; production deployments
+/// should consider a fault-tolerant state store (e.g. RocksDB,
+/// Materialize view, etc.) for recovery.
+struct RollingWindow {
+    /// (score, timestamp)
+    data: VecDeque<(f32, DateTime<Utc>)>,
+    /// How wide the window is.
+    width: Duration,
+}
+
+impl RollingWindow {
+    fn new(width: Duration) -> Self {
+        Self {
+            data: VecDeque::new(),
+            width,
+        }
+    }
+
+    /// Push a new score, evicting stale items.
+    fn push(&mut self, score: f32, timestamp: DateTime<Utc>) {
+        self.data.push_back((score, timestamp));
+        self.evict(timestamp);
+    }
+
+    /// Remove old scores beyond the window width.
+    fn evict(&mut self, now: DateTime<Utc>) {
+        while let Some((_, ts)) = self.data.front() {
+            if (*ts + chrono::Duration::from_std(self.width).unwrap()) < now {
+                self.data.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn aggregate(&self) -> SentimentAggregate {
+        let window_start = self
+            .data
+            .front()
+            .map(|(_, ts)| *ts)
+            .unwrap_or_else(|| Utc::now());
+        let window_end = Utc::now();
+        let message_count = self.data.len();
+        let mean_score = if message_count == 0 {
+            0.0
+        } else {
+            self.data.iter().map(|(s, _)| s).sum::<f32>() / message_count as f32
+        };
+        SentimentAggregate {
+            window_start,
+            window_end,
+            mean_score,
+            message_count,
+        }
+    }
+}
+
+/// Main entry-point: start the async processing loop.
+pub async fn run(config: AggregatorConfig, shutdown: Arc<Notify>) -> Result<()> {
+    info!("Starting SentimentAggregator with config: {:?}", config);
+
+    let strategy = make_strategy(&config.strategy);
+    let consumer = build_consumer(&config)?;
+    let producer = build_producer(&config)?;
+
+    let mut interval = create_interval(config.aggregation_interval);
+    let mut window = RollingWindow::new(config.aggregation_interval);
+
+    let processing_handle = spawn_processing_loop(
+        consumer,
+        strategy,
+        producer.clone(),
+        &config,
+        &mut window,
+        &mut interval,
+        shutdown.clone(),
+    );
+
+    // Wait for either shutdown signal or the processing loop to end (unlikely).
+    select! {
+        _ = shutdown.notified() => {
+            info!("Shutdown signal received in aggregator");
+        },
+        res = processing_handle => {
+            match res {
+                Ok(inner) => inner?,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn build_consumer(config: &AggregatorConfig) -> Result<StreamConsumer> {
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &config.brokers)
+        .set("group.id", "chirp-sentiment-aggregator")
+        .set("enable.partition.eof", "false")
+        .set("session.timeout.ms", "6000")
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "latest")
+        .create()?;
+    consumer.subscribe(&[&config.input_topic])?;
+    Ok(consumer)
+}
+
+fn build_producer(config: &AggregatorConfig) -> Result<FutureProducer> {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &config.brokers)
+        .set("message.timeout.ms", "5000")
+        .create()?;
+    // Pre-emptively create the topic if not already present (idempotent in Kafka).
+    let _ = producer.client().create_topic(&config.output_topic, 3, 1, &[]);
+    Ok(producer)
+}
+
+fn create_interval(dur: Duration) -> Interval {
+    let now = Instant::now();
+    interval_at(now + dur, dur)
+}
+
+#[instrument(skip(consumer, strategy, producer, window, interval, shutdown))]
+fn spawn_processing_loop(
+    consumer: StreamConsumer,
+    strategy: Arc<dyn SentimentStrategy + Send + Sync>,
+    producer: FutureProducer,
+    config: &AggregatorConfig,
+    window: &mut RollingWindow,
+    interval: &mut Interval,
+    shutdown: Arc<Notify>,
+) -> JoinHandle<Result<()>> {
+    let input_topic = config.input_topic.clone();
+    let output_topic = config.output_topic.clone();
+    let batch_size = config.batch_size;
+    let aggregation_interval = config.aggregation_interval;
+    tokio::spawn(async move {
+        let mut processed_since_commit = 0usize;
+
+        loop {
+            select! {
+                _ = shutdown.notified() => {
+                    info!("Processing loop received shutdown");
+                    break;
+                },
+                _ = interval.tick() => {
+                    // Time to flush the current aggregate window.
+                    let aggregate = window.aggregate();
+                    publish_aggregate(&producer, &output_topic, aggregate).await?;
+                },
+                message_result = consumer.recv() => {
+                    match message_result {
+                        Err(e) => {
+                            warn!("Kafka receive error: {e}");
+                            continue;
+                        }
+                        Ok(m) => {
+                            if let Err(e) = handle_message(&m, window, &strategy).await {
+                                error!("Error handling message: {e}");
+                                // Dead-letter queue could be plugged here.
+                            } else {
+                                processed_since_commit += 1;
+                            }
+
+                            if processed_since_commit >= batch_size {
+                                if let Err(e) = consumer.commit_message(&m, CommitMode::Async) {
+                                    warn!("Commit failed: {e}");
+                                }
+                                processed_since_commit = 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // After loop ends, final flush for completeness
+        if !window.data.is_empty() {
+            let aggregate = window.aggregate();
+            publish_aggregate(&producer, &output_topic, aggregate).await?;
+        }
+        Ok(())
+    })
+}
+
+#[instrument(skip(msg, window, strategy))]
+async fn handle_message(
+    msg: &BorrowedMessage<'_>,
+    window: &mut RollingWindow,
+    strategy: &Arc<dyn SentimentStrategy + Send + Sync>,
+) -> Result<()> {
+    let payload = match msg.payload_view::<str>() {
+        None => return Err(AggregatorError::SerdeJson(serde_json::Error::custom("empty payload"))),
+        Some(Ok(json)) => json,
+        Some(Err(e)) => return Err(e.into()),
+    };
+    let chirp: Chirp = serde_json::from_str(payload)?;
+
+    let score = strategy
+        .score(&chirp)
+        .await
+        .map_err(AggregatorError::Strategy)?;
+    window.push(score, chirp.timestamp);
+    Ok(())
+}
+
+#[instrument(skip(producer, aggregate))]
+async fn publish_aggregate(
+    producer: &FutureProducer,
+    topic: &str,
+    aggregate: SentimentAggregate,
+) -> Result<()> {
+    let json = serde_json::to_string(&aggregate)?;
+    let record = FutureRecord::to(topic)
+        .key("aggregate")
+        .payload(&json)
+        .headers(OwnedHeaders::new().add("content_type", "application/json"));
+    // Fire-and-forget; we await up to 0s because this simplifies the happy path.
+    match producer.send(record, Duration::from_secs(0)).await {
+        Ok(_) => Ok(()),
+        Err((e, _)) => Err(AggregatorError::Kafka(e)),
+    }
+}
+```

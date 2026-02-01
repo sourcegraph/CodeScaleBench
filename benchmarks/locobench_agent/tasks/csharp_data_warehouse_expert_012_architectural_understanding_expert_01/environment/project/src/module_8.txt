@@ -1,0 +1,491 @@
+```csharp
+// -----------------------------------------------------------------------------
+//  Project : PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//  File    : src/module_8.txt         (logical source file: Module_8.cs)
+//  Author  : PulseOps Engineering Team
+//  Purpose : Implements the dynamic Transformation-Strategy runtime that powers
+//            pluggable KPI calculations inside the analytics fabric.
+//            Exposes:
+//              • ITransformationStrategy  – canonical strategy contract
+//              • TransformationStrategyAttribute – declarative registration
+//              • StrategyRegistry         – reflection-based discovery/DI glue
+//              • TransformationExecutor   – concurrent orchestration & telemetry
+//              • Example concrete strategy (FocusTimeRatioStrategy)
+//
+//  Note    : Although this file has a .txt path suffix in the repository, the
+//            build pipeline aliases it to a .cs compilation unit. This trick
+//            enables litterate-spec documentation tooling downstream.
+// -----------------------------------------------------------------------------
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Reflection;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.CloudWatch;
+using Amazon.CloudWatch.Model;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using PulseOps.Warehouse.Shared;
+
+// ReSharper disable MemberCanBePrivate.Global
+// ReSharper disable UnusedType.Global
+
+namespace PulseOps.Warehouse.Transformations
+{
+    #region ——— Contracts ————————————————————————————————————————————————————
+
+    /// <summary>
+    /// Canonical contract that every KPI transformation strategy must implement.
+    /// </summary>
+    /// <typeparam name="TIn">Normalized input record.</typeparam>
+    /// <typeparam name="TOut">Enriched / calculated record.</typeparam>
+    public interface ITransformationStrategy<in TIn, TOut>
+    {
+        /// <summary>
+        /// Executes the strategy asynchronously.
+        /// </summary>
+        /// <param name="input">Stream (enumerable) of incoming records.</param>
+        /// <param name="context">Request-scoped metadata, DI container, etc.</param>
+        /// <param name="cancellationToken">Co-operative cancellation token.</param>
+        /// <returns>Transformed records.</returns>
+        IAsyncEnumerable<TOut> TransformAsync(
+            IAsyncEnumerable<TIn> input,
+            TransformationContext context,
+            CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Attribute used to declaratively register a strategy implementation.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Class, AllowMultiple = false)]
+    public sealed class TransformationStrategyAttribute : Attribute
+    {
+        public TransformationStrategyAttribute(string name, string version = "1.0")
+        {
+            Name    = name ?? throw new ArgumentNullException(nameof(name));
+            Version = version;
+        }
+
+        public string Name    { get; }
+        public string Version { get; }
+    }
+
+    /// <summary>
+    /// Bag-object holding request-scoped services, metadata and DI.
+    /// Instances are short-lived and safe for concurrent use.
+    /// </summary>
+    public sealed class TransformationContext
+    {
+        public TransformationContext(
+            Guid requestId,
+            string tenantId,
+            ILogger? logger           = null,
+            IAmazonCloudWatch? cw     = null,
+            IDictionary<string, object>? items = null)
+        {
+            RequestId = requestId;
+            TenantId  = tenantId;
+            Logger    = logger ?? NullLogger.Instance;
+            CloudWatchClient = cw;
+            Items     = new ConcurrentDictionary<string, object>(
+                items ?? new Dictionary<string, object>());
+        }
+
+        public Guid RequestId { get; }
+        public string TenantId { get; }
+        public ILogger Logger { get; }
+        public IAmazonCloudWatch? CloudWatchClient { get; }
+        public ConcurrentDictionary<string, object> Items { get; }
+
+        public T GetOrAdd<T>(string key, Func<string, T> factory) =>
+            (T) Items.GetOrAdd(key, k => factory(k));
+    }
+
+    #endregion
+
+    #region ——— Registry & Discovery ——————————————————————————————————————————
+
+    /// <summary>
+    /// Discovers and caches all <see cref="ITransformationStrategy{TIn,TOut}"/>
+    /// implementations at runtime using reflection. Thread-safe singleton.
+    /// </summary>
+    public sealed class StrategyRegistry
+    {
+        private static readonly Lazy<StrategyRegistry> _lazy =
+            new(() => new StrategyRegistry());
+
+        public static StrategyRegistry Instance => _lazy.Value;
+
+        private readonly ConcurrentDictionary<string, Type> _strategies = new();
+        private readonly ILogger _logger;
+
+        private StrategyRegistry(ILogger? logger = null)
+        {
+            _logger = logger ?? NullLogger.Instance;
+
+            // Scan the current AppDomain once. Subsequent loads (Lambda cold-start)
+            // are negligible.
+            foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    LoadStrategiesFromAssembly(assembly);
+                }
+                catch (ReflectionTypeLoadException e)
+                {
+                    _logger.LogWarning(
+                        e,
+                        "Failed to reflectively load strategy types from assembly {Assembly}. " +
+                        "Loader exceptions: {LoaderExceptions}",
+                        assembly.FullName,
+                        string.Join("; ",
+                            e.LoaderExceptions.Select(le => le.Message)));
+                }
+            }
+
+            _logger.LogInformation(
+                "StrategyRegistry initialized with {Count} strategies.",
+                _strategies.Count);
+        }
+
+        public bool TryResolve(string name, out Type strategyType) =>
+            _strategies.TryGetValue(name, out strategyType);
+
+        private void LoadStrategiesFromAssembly(Assembly assembly)
+        {
+            foreach (Type type in assembly.GetTypes())
+            {
+                if (type.IsAbstract || type.IsInterface) continue;
+
+                var strategyAttr = type.GetCustomAttribute<TransformationStrategyAttribute>();
+                if (strategyAttr == null) continue;
+
+                // Only consider generic type definitions ITransformationStrategy<,>.
+                bool implementsInterface = type
+                    .GetInterfaces()
+                    .Any(i =>
+                        i.IsGenericType &&
+                        i.GetGenericTypeDefinition() == typeof(ITransformationStrategy<,>));
+
+                if (!implementsInterface)
+                {
+                    _logger.LogWarning(
+                        "Type {Type} is decorated with {Attribute} but does not implement " +
+                        "the required ITransformationStrategy<,> contract. Skipped.",
+                        type.FullName,
+                        nameof(TransformationStrategyAttribute));
+                    continue;
+                }
+
+                string key = BuildKey(strategyAttr.Name, strategyAttr.Version);
+                if (!_strategies.TryAdd(key, type))
+                {
+                    _logger.LogWarning(
+                        "Duplicate strategy registration detected for key '{Key}'. " +
+                        "Type {Type} ignored (existing: {Existing}).",
+                        key,
+                        type.FullName,
+                        _strategies[key].FullName);
+                }
+            }
+        }
+
+        private static string BuildKey(string name, string version) => $"{name}:{version}";
+    }
+
+    #endregion
+
+    #region ——— Executor / Orchestration ———————————————————————————————————————
+
+    /// <summary>
+    /// Convenience wrapper around <see cref="StrategyRegistry"/> that handles:
+    ///   • DI-friendly construction
+    ///   • Concurrency throttling (fan-out)
+    ///   • Structured logging & CloudWatch custom metrics
+    ///   • Graceful error propagation (fault-tolerant)
+    /// </summary>
+    public sealed class TransformationExecutor
+    {
+        private readonly ILogger _logger;
+        private readonly int _maxDegreeOfParallelism;
+        private readonly IServiceProvider? _serviceProvider;
+
+        public TransformationExecutor(
+            ILogger? logger = null,
+            int maxDegreeOfParallelism = 4,
+            IServiceProvider? serviceProvider = null)
+        {
+            _logger = logger ?? NullLogger.Instance;
+            _maxDegreeOfParallelism = Math.Max(1, maxDegreeOfParallelism);
+            _serviceProvider = serviceProvider;
+        }
+
+        /// <summary>
+        /// High-level entrypoint used by Lambda handlers and Step-Function tasks.
+        /// </summary>
+        public async Task<IReadOnlyList<object>> ExecuteAsync(
+            string strategyName,
+            string strategyVersion,
+            IAsyncEnumerable<object> stream,
+            TransformationContext context,
+            CancellationToken token = default)
+        {
+            var sw = Stopwatch.StartNew();
+            string key = $"{strategyName}:{strategyVersion}";
+
+            if (!StrategyRegistry.Instance.TryResolve(key, out Type strategyType))
+            {
+                throw new InvalidOperationException(
+                    $"Strategy '{key}' is not registered. " +
+                    "Ensure the assembly containing the strategy is loaded.");
+            }
+
+            // Build the strategy instance via DI or reflection fallback.
+            object? instance = _serviceProvider?.GetService(strategyType)
+                               ?? Activator.CreateInstance(strategyType);
+            if (instance is null)
+                throw new InvalidOperationException(
+                    $"Failed to instantiate strategy '{key}'. " +
+                    "Make sure it has a public parameterless constructor or is registered in DI.");
+
+            // Generic variance gymnastics: use reflection to call TransformAsync and materialize.
+            MethodInfo? transformMethod = strategyType
+                .GetMethod(nameof(ITransformationStrategy<object, object>.TransformAsync));
+            if (transformMethod is null)
+                throw new MissingMethodException(strategyType.FullName,
+                    nameof(ITransformationStrategy<object, object>.TransformAsync));
+
+            _logger.LogInformation(
+                "[{RequestId}] Executing strategy {Strategy} for tenant {Tenant}.",
+                context.RequestId,
+                key,
+                context.TenantId);
+
+            CancellationTokenSource linkedCts = CancellationTokenSource
+                .CreateLinkedTokenSource(token);
+
+            try
+            {
+                var resultStream = (IAsyncEnumerable<object>) transformMethod
+                    .Invoke(instance, new object[] { stream, context, linkedCts.Token })!;
+
+                // Materialize results in parallel to enable fan-out.
+                List<object> results = new();
+                SemaphoreSlim gate = new(_maxDegreeOfParallelism);
+
+                await foreach (object item in resultStream
+                                   .WithCancellation(linkedCts.Token))
+                {
+                    await gate.WaitAsync(linkedCts.Token);
+                    _ = Task.Run(() =>
+                        {
+                            try
+                            {
+                                lock (results)
+                                {
+                                    results.Add(item);
+                                }
+                            }
+                            finally
+                            {
+                                gate.Release();
+                            }
+                        }, linkedCts.Token);
+                }
+
+                // Wait for outstanding tasks to complete.
+                for (int i = 0; i < _maxDegreeOfParallelism; i++)
+                    await gate.WaitAsync(linkedCts.Token);
+
+                sw.Stop();
+                _logger.LogInformation(
+                    "[{RequestId}] Strategy {Strategy} produced {RecordCount} records in {ElapsedMs} ms.",
+                    context.RequestId,
+                    key,
+                    results.Count,
+                    sw.ElapsedMilliseconds);
+
+                await PublishMetricAsync(
+                    metricName: "StrategyLatencyMs",
+                    value: sw.ElapsedMilliseconds,
+                    dimensions: new Dictionary<string, string>
+                    {
+                        ["Strategy"] = strategyName,
+                        ["Tenant"]   = context.TenantId
+                    },
+                    context.CloudWatchClient,
+                    linkedCts.Token);
+
+                return results;
+            }
+            catch (Exception ex) when (!linkedCts.IsCancellationRequested)
+            {
+                _logger.LogError(
+                    ex,
+                    "[{RequestId}] Strategy {Strategy} failed: {Message}",
+                    context.RequestId,
+                    key,
+                    ex.Message);
+                throw;
+            }
+            finally
+            {
+                linkedCts.Dispose();
+            }
+        }
+
+        private static async Task PublishMetricAsync(
+            string metricName,
+            double value,
+            IDictionary<string, string> dimensions,
+            IAmazonCloudWatch? client,
+            CancellationToken token)
+        {
+            if (client == null) return;
+
+            var metricDatum = new MetricDatum
+            {
+                MetricName = metricName,
+                Timestamp  = DateTime.UtcNow,
+                Unit       = StandardUnit.Milliseconds,
+                Value      = value,
+                Dimensions = dimensions.Select(
+                    kv => new Dimension {Name = kv.Key, Value = kv.Value}).ToList()
+            };
+
+            await client.PutMetricDataAsync(new PutMetricDataRequest
+            {
+                Namespace   = "PulseOps/Warehouse",
+                MetricData  = new List<MetricDatum> { metricDatum }
+            }, token);
+        }
+    }
+
+    #endregion
+
+    #region ——— Sample Domain Models ——————————————————————————————————————————
+
+    // NOTE: In the actual repository these live in a shared project. Included
+    // here for self-containment of this code example.
+
+    public sealed record CalendarEvent(
+        DateTime StartUtc,
+        DateTime EndUtc,
+        bool     IsFocusTime);
+
+    public sealed record FocusTimeRatioKpi(
+        DateTime WindowStartUtc,
+        DateTime WindowEndUtc,
+        double   Ratio);
+
+    #endregion
+
+    #region ——— Example Concrete Strategy —————————————————————————————————————
+
+    /// <summary>
+    /// Calculates the "Focus-Time Ratio" KPI for a sliding window.
+    ///
+    /// Business logic:
+    ///   ratio = total_focus_time / total_calendar_time (within window)
+    ///   • Focus slots are identified via input.IsFocusTime
+    ///   • Empty windows yield ratio = 0
+    /// </summary>
+    [TransformationStrategy("FocusTimeRatio", "2.1")]
+    public sealed class FocusTimeRatioStrategy
+        : ITransformationStrategy<CalendarEvent, FocusTimeRatioKpi>
+    {
+        public async IAsyncEnumerable<FocusTimeRatioKpi> TransformAsync(
+            IAsyncEnumerable<CalendarEvent> input,
+            TransformationContext context,
+            [System.Runtime.CompilerServices.EnumeratorCancellation]
+            CancellationToken cancellationToken = default)
+        {
+            var window = new List<CalendarEvent>();
+            TimeSpan windowLength = TimeSpan.FromHours(24); // daily window
+            DateTime? currentWindowStart = null;
+
+            await foreach (CalendarEvent evt in input
+                               .WithCancellation(cancellationToken))
+            {
+                if (currentWindowStart == null)
+                    currentWindowStart = FloorToDay(evt.StartUtc);
+
+                DateTime windowEnd = currentWindowStart.Value + windowLength;
+                if (evt.StartUtc >= windowEnd)
+                {
+                    // Emit KPI for completed window.
+                    yield return Compute(window, currentWindowStart.Value, windowEnd);
+
+                    // Advance window boundary. Assuming chronological order.
+                    currentWindowStart = FloorToDay(evt.StartUtc);
+                    window.Clear();
+                }
+
+                window.Add(evt);
+            }
+
+            // Flush the last window.
+            if (window.Count > 0 && currentWindowStart != null)
+            {
+                DateTime windowEnd = currentWindowStart.Value + windowLength;
+                yield return Compute(window, currentWindowStart.Value, windowEnd);
+            }
+
+            static DateTime FloorToDay(DateTime dt) => dt.Date;
+
+            static FocusTimeRatioKpi Compute(
+                IReadOnlyCollection<CalendarEvent> events,
+                DateTime from,
+                DateTime to)
+            {
+                double focusMinutes = events
+                    .Where(e => e.IsFocusTime)
+                    .Sum(e => (e.EndUtc - e.StartUtc).TotalMinutes);
+
+                double totalMinutes = events
+                    .Sum(e => (e.EndUtc - e.StartUtc).TotalMinutes);
+
+                double ratio = totalMinutes == 0 ? 0 : focusMinutes / totalMinutes;
+
+                return new FocusTimeRatioKpi(from, to, ratio);
+            }
+        }
+    }
+
+    #endregion
+
+    #region ——— Extension-Helpers ——————————————————————————————————————————
+
+    internal static class AsyncEnumerableExtensions
+    {
+        /// <summary>
+        /// Serializes an async-enumerable to NDJSON for debugging/tracing purposes.
+        /// </summary>
+        public static async Task<string> ToJsonLinesAsync<T>(
+            this IAsyncEnumerable<T> source,
+            CancellationToken token = default)
+        {
+            var jsonOptions = new JsonSerializerOptions
+            {
+                WriteIndented = false
+            };
+
+            List<string> lines = new();
+            await foreach (T item in source.WithCancellation(token))
+            {
+                string json = JsonSerializer.Serialize(item, jsonOptions);
+                lines.Add(json);
+            }
+
+            return string.Join(Environment.NewLine, lines);
+        }
+    }
+
+    #endregion
+}
+```

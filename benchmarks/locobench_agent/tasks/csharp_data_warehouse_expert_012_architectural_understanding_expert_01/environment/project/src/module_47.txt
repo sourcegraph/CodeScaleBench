@@ -1,0 +1,355 @@
+```csharp
+// ---------------------------------------------------------------------------------------------------------------------
+// <copyright>
+//   PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//   © 2023–2024 PulseOps, Inc.  All rights reserved.
+// </copyright>
+// <summary>
+//   KpiTransformerFunction.cs
+//
+//   Lambda entry-point that consumes calendar-centric productivity telemetry from
+//   an upstream Kinesis stream, transforms the payloads into actionable KPIs via
+//   pluggable Strategy Pattern, and emits the resulting artifacts into Amazon
+//   Kinesis Data Firehose for durable storage inside the corporate Data Lake.
+//
+//   This module purposefully stands alone (no internal project references) so
+//   that it can be executed in isolation for documentation/demo purposes.
+// </summary>
+// ---------------------------------------------------------------------------------------------------------------------
+
+using System;
+using System.Buffers;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon;
+using Amazon.KinesisFirehose;
+using Amazon.KinesisFirehose.Model;
+using Amazon.Lambda.Core;
+using Amazon.Lambda.KinesisEvents;
+
+// ReSharper disable HeuristicUnreachableCode
+// ReSharper disable TemplateIsNotCompileTimeConstantProblem
+
+[assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
+
+namespace PulseOps.Warehouse.EventTransformations;
+
+/// <summary>
+///     AWS Lambda entry-point that ingests calendar/KPI telemetry from a Kinesis
+///     stream, dispatches each record to a KPI strategy, and writes the
+///     calculated result to Kinesis Data Firehose.
+/// </summary>
+public sealed class KpiTransformerFunction
+{
+    private readonly KpiStrategyResolver _strategyResolver;
+    private readonly IAmazonKinesisFirehose _firehoseClient;
+    private readonly string _outputStreamName;
+    private readonly string _errorStreamName;
+    private const int FirehosePutRecordBatchLimit = 500;
+
+    public KpiTransformerFunction()
+        : this(
+            firehoseClient: new AmazonKinesisFirehoseClient(
+                new AmazonKinesisFirehoseConfig { RegionEndpoint = RegionEndpoint.GetBySystemName(Environment.GetEnvironmentVariable("AWS_REGION") ?? "us-east-1") }
+            ),
+            new KpiStrategyResolver()
+        )
+    {
+        /* no-op — delegates to overload */
+    }
+
+    // For unit-tests + DI
+    internal KpiTransformerFunction(IAmazonKinesisFirehose firehoseClient, KpiStrategyResolver strategyResolver)
+    {
+        _firehoseClient = firehoseClient ?? throw new ArgumentNullException(nameof(firehoseClient));
+        _strategyResolver = strategyResolver ?? throw new ArgumentNullException(nameof(strategyResolver));
+
+        _outputStreamName = Environment.GetEnvironmentVariable("FIREHOSE_STREAM_NAME") ??
+                            throw new InvalidOperationException("FIREHOSE_STREAM_NAME env-var must be defined.");
+
+        _errorStreamName = Environment.GetEnvironmentVariable("FIREHOSE_ERROR_STREAM_NAME") ??
+                           $"{_outputStreamName}-dlq"; // fallback
+    }
+
+    /// <summary>
+    ///     Lambda handler invoked by AWS runtime.
+    /// </summary>
+    /// <param name="kinesisEvent">Batch of Kinesis records.</param>
+    /// <param name="context">Execution context.</param>
+    /// <returns>Async task.</returns>
+    public async Task HandlerAsync(KinesisEvent kinesisEvent, ILambdaContext context)
+    {
+        var logger = context.Logger;
+
+        var successes = new ConcurrentBag<Record>();
+        var failures  = new ConcurrentBag<Record>();
+
+        var processTasks = new List<Task>();
+
+        foreach (var record in kinesisEvent.Records)
+        {
+            processTasks.Add(ProcessRecordAsync(record, successes, failures, logger, context.CancellationToken));
+        }
+
+        await Task.WhenAll(processTasks);
+
+        // Flush successes first
+        if (!successes.IsEmpty)
+        {
+            await FlushBatchAsync(successes, _outputStreamName, logger, context.CancellationToken);
+            logger.LogInformation($"Successfully processed {successes.Count} KPI records.");
+        }
+
+        // Flush failures to dedicated DLQ Firehose stream
+        if (!failures.IsEmpty)
+        {
+            await FlushBatchAsync(failures, _errorStreamName, logger, context.CancellationToken);
+            logger.LogError($"{failures.Count} records failed KPI transformation and were sent to DLQ '{_errorStreamName}'.");
+        }
+    }
+
+    #region ────────────────────────────────── Private helpers ──────────────────────────────────
+
+    private async Task ProcessRecordAsync(
+        KinesisEvent.KinesisEventRecord kinesisRecord,
+        ConcurrentBag<Record> successBag,
+        ConcurrentBag<Record> failureBag,
+        ILambdaLogger logger,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var rawJson = Encoding.UTF8.GetString(kinesisRecord.Kinesis.Data.Span);
+
+            using var jsonDoc = JsonDocument.Parse(rawJson);
+            var root = jsonDoc.RootElement;
+
+            var kpiType = root.GetProperty("kpiType").GetString();
+            if (string.IsNullOrWhiteSpace(kpiType))
+            {
+                throw new JsonException("kpiType property missing or empty.");
+            }
+
+            var strategy = _strategyResolver.Resolve(kpiType);
+            if (strategy is null)
+            {
+                throw new InvalidOperationException($"No strategy registered that can handle KPI type '{kpiType}'.");
+            }
+
+            var result = await strategy.CalculateAsync(root.GetProperty("data"), cancellationToken);
+
+            var resultJson = JsonSerializer.Serialize(result, KpiJsonSerializerContext.Default.KpiResult);
+
+            successBag.Add(new Record
+            {
+                Data = new MemoryStream(Encoding.UTF8.GetBytes(resultJson))
+            });
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, $"Failed to transform event {kinesisRecord.EventId}.");
+
+            var errorPayload = new
+            {
+                error     = ex.Message,
+                stack     = ex.StackTrace,
+                timestamp = DateTimeOffset.UtcNow,
+                original  = Convert.ToBase64String(kinesisRecord.Kinesis.Data.ToArray())
+            };
+
+            var errorJson = JsonSerializer.Serialize(errorPayload);
+            failureBag.Add(new Record
+            {
+                Data = new MemoryStream(Encoding.UTF8.GetBytes(errorJson))
+            });
+        }
+    }
+
+    private async Task FlushBatchAsync(IEnumerable<Record> records, string deliveryStreamName, ILambdaLogger logger, CancellationToken token)
+    {
+        var batch = new List<Record>(FirehosePutRecordBatchLimit);
+
+        foreach (var rec in records)
+        {
+            batch.Add(rec);
+
+            if (batch.Count == FirehosePutRecordBatchLimit)
+            {
+                await PutAsync(batch, deliveryStreamName, logger, token);
+                batch.Clear();
+            }
+        }
+
+        if (batch.Count > 0)
+        {
+            await PutAsync(batch, deliveryStreamName, logger, token);
+        }
+    }
+
+    private async Task PutAsync(IReadOnlyCollection<Record> batch, string streamName, ILambdaLogger logger, CancellationToken token)
+    {
+        var response = await _firehoseClient.PutRecordBatchAsync(
+            new PutRecordBatchRequest(streamName, new List<Record>(batch)),
+            token
+        );
+
+        if (response.FailedPutCount > 0)
+        {
+            logger.LogError($"Firehose PutRecordBatchAsync reported {response.FailedPutCount} failures for stream {streamName}.");
+        }
+    }
+
+    #endregion
+}
+
+/// <summary>
+///     Pluggable KPI strategy abstraction.
+/// </summary>
+internal interface IKpiStrategy
+{
+    bool CanHandle(string kpiType);
+
+    /// <summary>
+    ///     Calculates KPI result for the supplied JSON payload. Implementations
+    ///     must remain pure — no side-effects or network traffic.
+    /// </summary>
+    Task<KpiResult> CalculateAsync(JsonElement data, CancellationToken token);
+}
+
+/// <summary>
+///     Strategy resolver with O(1) lookups.
+/// </summary>
+internal sealed class KpiStrategyResolver
+{
+    private readonly IReadOnlyList<IKpiStrategy> _strategies;
+
+    public KpiStrategyResolver()
+    {
+        _strategies = new IKpiStrategy[]
+        {
+            new FocusTimeRatioStrategy(),
+            new MeetingCostIndexStrategy()
+        };
+    }
+
+    public IKpiStrategy? Resolve(string kpiType)
+    {
+        foreach (var strategy in _strategies)
+        {
+            if (strategy.CanHandle(kpiType))
+            {
+                return strategy;
+            }
+        }
+
+        return null;
+    }
+}
+
+/// <summary>
+///     Result record produced by KPI strategies.
+/// </summary>
+public sealed record KpiResult(
+    string KpiType,
+    double Value,
+    DateTimeOffset CalculatedAtUtc,
+    JsonElement Metadata
+);
+
+#region ─────────────────────────────── Strategy Implementations ───────────────────────────────
+
+/// <summary>
+///     Calculates “Focus-Time Ratio” per event as
+///     1 − (meetingDuration / workingWindowDuration).  For example, a 1-hour
+///     meeting inside an 8-hour day yields 0.875.
+/// </summary>
+internal sealed class FocusTimeRatioStrategy : IKpiStrategy
+{
+    private const string KpiId = "FocusTimeRatio";
+
+    public bool CanHandle(string kpiType) => string.Equals(kpiType, KpiId, StringComparison.OrdinalIgnoreCase);
+
+    public Task<KpiResult> CalculateAsync(JsonElement data, CancellationToken token)
+    {
+        var meetingStart = data.GetProperty("startTime").GetDateTimeOffset();
+        var meetingEnd   = data.GetProperty("endTime").GetDateTimeOffset();
+        var workingWindowMinutes = data.TryGetProperty("workingWindowMinutes", out var windowElement)
+            ? windowElement.GetInt32()
+            : 480; // default 8-hour work-day
+
+        var meetingMinutes = (meetingEnd - meetingStart).TotalMinutes;
+        var ratio          = 1 - (meetingMinutes / workingWindowMinutes);
+
+        ratio = Math.Clamp(ratio, 0, 1);
+
+        return Task.FromResult(new KpiResult(
+            KpiType: KpiId,
+            Value: ratio,
+            CalculatedAtUtc: DateTimeOffset.UtcNow,
+            Metadata: data
+        ));
+    }
+}
+
+/// <summary>
+///     Calculates “Meeting Cost Index” as (# attendees × durationHours × hourlyRate).
+/// </summary>
+internal sealed class MeetingCostIndexStrategy : IKpiStrategy
+{
+    private const string KpiId = "MeetingCostIndex";
+
+    public bool CanHandle(string kpiType) => string.Equals(kpiType, KpiId, StringComparison.OrdinalIgnoreCase);
+
+    public Task<KpiResult> CalculateAsync(JsonElement data, CancellationToken token)
+    {
+        var attendees     = data.GetProperty("attendeesCount").GetInt32();
+        var hourlyRate    = data.TryGetProperty("hourlyRate",   out var rateEl) ? rateEl.GetDouble() : 75.0;
+        var start         = data.GetProperty("startTime").GetDateTimeOffset();
+        var end           = data.GetProperty("endTime").GetDateTimeOffset();
+        var durationHours = (end - start).TotalHours;
+
+        var cost = attendees * durationHours * hourlyRate;
+
+        return Task.FromResult(new KpiResult(
+            KpiType: KpiId,
+            Value: cost,
+            CalculatedAtUtc: DateTimeOffset.UtcNow,
+            Metadata: data
+        ));
+    }
+}
+
+#endregion
+
+#region ──────────────────────────────── Source-Gen Context ───────────────────────────────────
+
+// System.Text.Json source-generator to reduce cold-start overhead.
+[JsonSerializable(typeof(KpiResult))]
+[JsonSourceGenerationOptions(WriteIndented = false)]
+internal partial class KpiJsonSerializerContext : JsonSerializerContext
+{
+    // Intentionally left blank; the partial modifier lets source-gen do the rest.
+}
+
+#endregion
+
+#region ───────────────────────────────────── Extensions ───────────────────────────────────────
+
+internal static class LambdaLoggerExtensions
+{
+    public static void LogError(this ILambdaLogger logger, Exception ex, string message)
+    {
+        logger.LogError($"{message}{Environment.NewLine}{ex}");
+    }
+
+    public static void LogError(this ILambdaLogger logger, string message) => logger.Log($"[ERROR] {message}{Environment.NewLine}");
+    public static void LogInformation(this ILambdaLogger logger, string message) => logger.Log($"[INFO] {message}{Environment.NewLine}");
+}
+
+#endregion
+```

@@ -1,0 +1,398 @@
+```rust
+//! src/module_75.rs
+//!
+//! Real-time analysis worker for ChirpPulse.  
+//! This module implements a microservice that consumes enriched social events
+//! from Kafka, runs one or more pluggable `Analyzer` strategies, aggregates
+//! results, and publishes the derived insights back to a downstream topic.
+//! The design embraces:
+//!   * Strategy pattern for hot-swappable analyzers
+//!   * Robust Kafka consumer / producer with graceful shutdown
+//!   * Comprehensive error handling & observability hooks
+//!
+//! Compile with: `cargo build --release --bin chirp_analyzer`
+//!
+//! NOTE: In a real repository, this file would live in `src/bin/` (binary target)
+//! or a dedicated library crate; it is presented standalone to satisfy exercise
+//! constraints.
+
+use std::{
+    collections::HashMap,
+    env,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use futures::{StreamExt, TryFutureExt};
+use lazy_static::lazy_static;
+use metrics::{counter, gauge, histogram};
+use rdkafka::{
+    config::ClientConfig,
+    consumer::{CommitMode, Consumer, StreamConsumer},
+    message::{BorrowedMessage, OwnedHeaders},
+    producer::{FutureProducer, FutureRecord},
+    Message,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::{
+    select,
+    signal::unix::{signal, SignalKind},
+    sync::RwLock,
+    task,
+    time::sleep,
+};
+
+/// ==========================
+/// Domain-level type aliases
+/// ==========================
+type AnalyzerId = String;
+
+/// Raw event received from upstream enrichment pipeline.
+#[derive(Debug, Deserialize)]
+struct EnrichedEvent {
+    event_id: String,
+    user_id: String,
+    language: String,
+    text: String,
+    toxicity_score: f32,
+    timestamp: u64, // epoch millis
+}
+
+/// Aggregate of all analyzer outputs for a single event.
+#[derive(Debug, Serialize)]
+struct CompositeAnalysis {
+    event_id: String,
+    results: HashMap<AnalyzerId, serde_json::Value>,
+    processed_at: u64,
+}
+
+/// Trait that all pluggable analyzers must implement.
+#[async_trait]
+pub trait Analyzer: Send + Sync {
+    /// Human-readable identifier (should be unique).
+    fn id(&self) -> &'static str;
+
+    /// Perform analysis and return an arbitrary JSON value that will be inserted
+    /// under `CompositeAnalysis.results[id]`.
+    async fn analyze(&self, event: &EnrichedEvent) -> Result<serde_json::Value>;
+}
+
+/// Simple rule-based sentiment analyzer as an example strategy.
+pub struct SentimentAnalyzer;
+
+#[async_trait]
+impl Analyzer for SentimentAnalyzer {
+    fn id(&self) -> &'static str {
+        "sentiment_v1"
+    }
+
+    async fn analyze(&self, event: &EnrichedEvent) -> Result<serde_json::Value> {
+        // Naive scoring: positive minus negative word counts
+        lazy_static! {
+            static ref POSITIVE: Vec<&'static str> =
+                vec!["good", "great", "love", "awesome", "happy", "yay"];
+            static ref NEGATIVE: Vec<&'static str> =
+                vec!["bad", "terrible", "hate", "awful", "sad", "angry"];
+        }
+
+        let mut score: i32 = 0;
+        for token in event.text.split_whitespace() {
+            let token = token.to_lowercase();
+            if POSITIVE.contains(&token.as_str()) {
+                score += 1;
+            }
+            if NEGATIVE.contains(&token.as_str()) {
+                score -= 1;
+            }
+        }
+
+        Ok(json!({ "score": score }))
+    }
+}
+
+/// Registry that maintains active analyzers.  
+/// A `RwLock` allows hot-swapping strategies at runtime without downtime.
+#[derive(Default)]
+pub struct AnalyzerRegistry {
+    inner: RwLock<HashMap<AnalyzerId, Arc<dyn Analyzer>>>,
+}
+
+impl AnalyzerRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register an analyzer implementation. If an analyzer with the same ID
+    /// already exists, it will be replaced.
+    pub async fn register<A: Analyzer + 'static>(&self, analyzer: A) {
+        let mut guard = self.inner.write().await;
+        guard.insert(analyzer.id().to_string(), Arc::new(analyzer));
+    }
+
+    /// Returns snapshot of available analyzers.
+    pub async fn snapshot(&self) -> Vec<Arc<dyn Analyzer>> {
+        let guard = self.inner.read().await;
+        guard.values().cloned().collect()
+    }
+}
+
+/// ===============================
+/// Kafka configuration & helpers
+/// ===============================
+struct KafkaEndpoints {
+    brokers: String,
+    group_id: String,
+    input_topic: String,
+    output_topic: String,
+    dead_letter_topic: String,
+}
+
+impl KafkaEndpoints {
+    fn from_env() -> Self {
+        Self {
+            brokers: env::var("CHIRP_KAFKA_BROKERS")
+                .unwrap_or_else(|_| "localhost:9092".into()),
+            group_id: env::var("CHIRP_KAFKA_GROUP_ID")
+                .unwrap_or_else(|_| "chirp_analyzer_group".into()),
+            input_topic: env::var("CHIRP_KAFKA_INPUT_TOPIC")
+                .unwrap_or_else(|_| "chirp.enriched".into()),
+            output_topic: env::var("CHIRP_KAFKA_OUTPUT_TOPIC")
+                .unwrap_or_else(|_| "chirp.analysis".into()),
+            dead_letter_topic: env::var("CHIRP_KAFKA_DLQ_TOPIC")
+                .unwrap_or_else(|_| "chirp.dlq".into()),
+        }
+    }
+}
+
+/// Build a configured async consumer.
+fn build_consumer(cfg: &KafkaEndpoints) -> Result<StreamConsumer> {
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &cfg.brokers)
+        .set("group.id", &cfg.group_id)
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()
+        .context("failed to create Kafka consumer")?;
+
+    consumer
+        .subscribe(&[&cfg.input_topic])
+        .context("failed to subscribe to topic")?;
+
+    Ok(consumer)
+}
+
+/// Build an async producer.
+fn build_producer(cfg: &KafkaEndpoints) -> Result<FutureProducer> {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &cfg.brokers)
+        .set("message.timeout.ms", "5000")
+        .create()
+        .context("failed to create Kafka producer")?;
+
+    Ok(producer)
+}
+
+/// ===============
+/// Analyzer runner
+/// ===============
+async fn handle_message(
+    msg: &BorrowedMessage<'_>,
+    registry: &AnalyzerRegistry,
+    producer: &FutureProducer,
+    cfg: &KafkaEndpoints,
+) -> Result<()> {
+    let payload = msg
+        .payload_view::<str>()
+        .map_err(|e| anyhow::anyhow!("payload not utf8: {:?}", e))?
+        .ok_or_else(|| anyhow::anyhow!("empty payload"))?;
+
+    let event: EnrichedEvent =
+        serde_json::from_str(payload).context("failed to deserialize EnrichedEvent")?;
+
+    counter!("chirp_analyzer_ingested", 1, "topic" => &cfg.input_topic);
+    gauge!("chirp_event_toxicity", event.toxicity_score as f64);
+
+    // Run all registered analyzers
+    let analyzers = registry.snapshot().await;
+    let mut output_map = HashMap::with_capacity(analyzers.len());
+
+    for analyzer in analyzers {
+        match analyzer.analyze(&event).await {
+            Ok(val) => {
+                output_map.insert(analyzer.id().to_string(), val);
+            }
+            Err(e) => {
+                // Soft failure: capture analysis error but continue others
+                counter!("chirp_analyzer_error", 1, "analyzer" => analyzer.id());
+                eprintln!(
+                    "Analyzer '{}' failed on event {}: {:#}",
+                    analyzer.id(),
+                    event.event_id,
+                    e
+                );
+            }
+        }
+    }
+
+    let result = CompositeAnalysis {
+        event_id: event.event_id.clone(),
+        results: output_map,
+        processed_at: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_millis() as u64,
+    };
+
+    // Publish downstream
+    let payload = serde_json::to_vec(&result).expect("serialization failure cannot happen");
+
+    producer
+        .send(
+            FutureRecord::to(&cfg.output_topic)
+                .payload(&payload)
+                .key(&event.event_id)
+                .headers(OwnedHeaders::new().add("content-type", "application/json")),
+            Duration::from_secs(0),
+        )
+        .map_err(|(e, _)| anyhow::anyhow!("failed to enqueue result: {}", e))?
+        .await
+        .context("timed out publishing result")?;
+
+    counter!("chirp_analyzer_emitted", 1, "topic" => &cfg.output_topic);
+    Ok(())
+}
+
+/// Publish the raw message to the DLQ and commit the offset to skip it.
+async fn handle_poison_message(
+    msg: &BorrowedMessage<'_>,
+    producer: &FutureProducer,
+    cfg: &KafkaEndpoints,
+    reason: &str,
+) -> Result<()> {
+    let payload = msg.payload().unwrap_or_default();
+
+    let envelope = json!({
+        "error": reason,
+        "timestamp": SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+        "original_topic": msg.topic(),
+        "original_partition": msg.partition(),
+        "original_offset": msg.offset(),
+        "payload": String::from_utf8_lossy(payload),
+    });
+
+    producer
+        .send(
+            FutureRecord::to(&cfg.dead_letter_topic)
+                .payload(&serde_json::to_vec(&envelope)?)
+                .key(&format!("{}:{}", msg.topic(), msg.offset())),
+            Duration::from_secs(0),
+        )
+        .map_err(|(e, _)| anyhow::anyhow!("DLQ enqueue failed: {}", e))?
+        .await?;
+
+    counter!("chirp_analyzer_dlq", 1, "topic" => &cfg.dead_letter_topic);
+    Ok(())
+}
+
+/// ===================
+/// Service entrypoint
+/// ===================
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize logging & metrics exporter  (implementation not shown)
+    env_logger::Builder::from_default_env()
+        .format_timestamp_millis()
+        .init();
+    chirp_metrics_exporter::init(); // assume another internal crate
+    println!("ChirpPulse Analyzer starting…");
+
+    // Load configuration
+    let cfg = KafkaEndpoints::from_env();
+
+    // Construct Kafka clients
+    let consumer = build_consumer(&cfg)?;
+    let producer = build_producer(&cfg)?;
+
+    // Build analyzer registry and register default strategies
+    let registry = AnalyzerRegistry::new();
+    registry.register(SentimentAnalyzer).await;
+    // Additional analyzers could be loaded dynamically from WASM, remote modules, etc.
+
+    // Graceful shutdown handling
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
+    // Main processing loop
+    println!(
+        "Consuming from topic '{}' as group '{}'",
+        cfg.input_topic, cfg.group_id
+    );
+
+    loop {
+        select! {
+            _ = sigterm.recv() => {
+                println!("SIGTERM received, shutting down gracefully…");
+                break;
+            }
+            _ = sigint.recv() => {
+                println!("SIGINT received, shutting down gracefully…");
+                break;
+            }
+            maybe_msg = consumer.stream().next() => {
+                match maybe_msg {
+                    Some(Ok(borrowed)) => {
+                        // Handle message in its own task to maximise throughput
+                        let registry = &registry;
+                        let producer = producer.clone();
+                        let cfg = &cfg;
+
+                        // Spawn a Tokio task for concurrent processing
+                        let owned_message = borrowed.detach();
+                        task::spawn(async move {
+                            if let Err(err) = handle_message(&owned_message, registry, &producer, cfg).await {
+                                eprintln!("Message processing error: {:#}", err);
+                                if let Err(e) = handle_poison_message(&owned_message, &producer, cfg, &err.to_string()).await {
+                                    eprintln!("Failed to send message to DLQ: {:#}", e);
+                                }
+                            }
+
+                            // Commit regardless of success/failure to avoid reprocessing poison pills
+                            if let Err(e) = consumer.commit_message(&owned_message, CommitMode::Async) {
+                                eprintln!("Commit failed: {:#}", e);
+                            }
+                        });
+                    }
+                    Some(Err(err)) => {
+                        // Transient broker failure: pause, then continue
+                        eprintln!("Kafka error: {:#}", err);
+                        histogram!("chirp_analyzer_kafka_error", 1.0);
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                    None => {
+                        // Stream exhausted? Unlikely for Kafka; prevent tight loop
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    println!("Analyzer shutdown complete.");
+    Ok(())
+}
+
+/// Dummy metrics exporter – in production this might push to Prometheus/OpenTelemetry.
+/// Here we define a stub module to satisfy the reference above without introducing
+/// extra dependencies. Remove if you already have a metrics exporter crate.
+mod chirp_metrics_exporter {
+    pub fn init() {
+        // No-op exporter: metrics macros still work and collect in-process.
+        println!("Metrics exporter initialized (noop).");
+    }
+}
+```

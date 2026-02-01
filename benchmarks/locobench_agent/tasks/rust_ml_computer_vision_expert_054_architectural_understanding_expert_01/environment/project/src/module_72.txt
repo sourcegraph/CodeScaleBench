@@ -1,0 +1,402 @@
+```rust
+//! src/module_72.rs
+//!
+//! Model Registry + Observer implementation for the VisuTility Orchestrator.
+//!
+//! This module owns:
+//! 1. A strongly-typed, thread-safe in-memory model registry backed by an
+//!    append-only JSON log on disk (WAL).
+//! 2. An event bus that broadcasts model-lifecycle events (`Registered`,
+//!    `Promoted`, `Deprecated`, etc.) to downstream observers (e.g. monitoring,
+//!    auto-retraining, or audit sinks).
+//!
+//! Design goals:
+//! • ACID-like durability without a full database— we use a Write-Ahead Log
+//!   (WAL) to make sure events survive process crashes.
+//! • Zero-cost read path for hot metadata thanks to `Arc<RwLock<..>>`.
+//! • Loosely-coupled observers via the classic Observer pattern implemented
+//!   with async broadcast channels so any subsystem can tap in.
+//!
+//! This file is intentionally self-contained so it can be copied into other
+//! crates if needed. External integration points are expressed via traits.
+
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::{BufReader, BufWriter},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use chrono::{DateTime, Utc};
+use futures::{stream::BoxStream, StreamExt};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, RwLock},
+    task,
+};
+use uuid::Uuid;
+
+/// Minimum number of events kept in-memory before a compaction hint is emitted.
+const COMPACTION_THRESHOLD: usize = 10_000;
+
+/// Human-readable model name used throughout the orchestrator.
+pub type ModelName = String;
+
+/// SemVer-style version string (e.g. "1.0.2").
+pub type SemVer = String;
+
+/// Result type alias local to this module.
+pub type RegistryResult<T> = Result<T, RegistryError>;
+
+/// Errors emitted by the [`ModelRegistry`].
+#[derive(Error, Debug)]
+pub enum RegistryError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("model `{0}` not found")]
+    ModelNotFound(ModelName),
+
+    #[error("version `{0}` for model `{1}` not found")]
+    VersionNotFound(SemVer, ModelName),
+
+    #[error("another async task panicked: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
+/// Strongly-typed wrapper for model metadata.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelMetadata {
+    pub id:        Uuid,
+    pub name:      ModelName,
+    pub version:   SemVer,
+    pub created_at: DateTime<Utc>,
+
+    /// Generic JSON blob for domain-specific metrics (mAP, F1, latency, etc.).
+    #[serde(default)]
+    pub metrics: serde_json::Value,
+
+    /// Arbitrary tags or labels.
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+}
+
+/// Enumeration of registry events—extends naturally if more are required.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ModelEvent {
+    Registered(ModelMetadata),
+    Promoted(ModelMetadata),
+    Deprecated(ModelMetadata),
+}
+
+impl ModelEvent {
+    pub fn model_name(&self) -> &str {
+        match self {
+            ModelEvent::Registered(m)
+            | ModelEvent::Promoted(m)
+            | ModelEvent::Deprecated(m) => &m.name,
+        }
+    }
+
+    pub fn version(&self) -> &str {
+        match self {
+            ModelEvent::Registered(m)
+            | ModelEvent::Promoted(m)
+            | ModelEvent::Deprecated(m) => &m.version,
+        }
+    }
+}
+
+/// Trait implemented by any observer interested in registry events.
+/// This is intentionally synchronous to keep implementors simple; we
+/// off-load concurrency to the event bus.
+pub trait ModelEventObserver: Send + Sync + 'static {
+    /// Called for every event the observer subscribes to.
+    fn on_event(&self, event: &ModelEvent);
+}
+
+/// Thread-safe, observer-friendly model registry.
+///
+/// • Reads are lock-free for most practical purposes (`RwLock`).  
+/// • Mutations go through a single WAL writer guaranteeing ordering.
+#[derive(Debug, Clone)]
+pub struct ModelRegistry {
+    /// In-memory snapshot: ModelName → SemVer → Metadata.
+    index: Arc<RwLock<BTreeMap<ModelName, BTreeMap<SemVer, ModelMetadata>>>>,
+
+    wal_path: PathBuf,
+
+    /// Broadcast channel for observer pattern; cloning the registry clones
+    /// the sender so every instance can emit events cheaply.
+    broadcaster: broadcast::Sender<ModelEvent>,
+}
+
+impl ModelRegistry {
+    /// Create a new registry, loading state from `wal_path` if it exists.
+    pub async fn open<P: AsRef<Path>>(wal_path: P) -> RegistryResult<Self> {
+        let wal_path = wal_path.as_ref().to_path_buf();
+        let (tx, _rx) = broadcast::channel(1024);
+
+        let registry = Self {
+            index: Arc::new(RwLock::new(BTreeMap::new())),
+            wal_path,
+            broadcaster: tx,
+        };
+
+        // Recover state.
+        if registry.wal_path.exists() {
+            registry.replay_wal().await?;
+        }
+
+        // Spawn compaction task
+        registry.spawn_compactor();
+
+        Ok(registry)
+    }
+
+    /// Register or overwrite an existing model version.
+    pub async fn register(&self, metadata: ModelMetadata) -> RegistryResult<()> {
+        // Write ahead
+        self.append_to_wal(&ModelEvent::Registered(metadata.clone()))
+            .await?;
+
+        // Mutate in-memory
+        {
+            let mut idx = self.index.write().await;
+            idx.entry(metadata.name.clone())
+                .or_default()
+                .insert(metadata.version.clone(), metadata.clone());
+        }
+
+        // Broadcast
+        let _ = self.broadcaster.send(ModelEvent::Registered(metadata));
+
+        Ok(())
+    }
+
+    /// Promote an existing version (e.g. mark as "production").
+    pub async fn promote(&self, name: &str, version: &str) -> RegistryResult<()> {
+        let metadata = {
+            let idx = self.index.read().await;
+            idx.get(name)
+                .and_then(|v| v.get(version).cloned())
+                .ok_or_else(|| RegistryError::VersionNotFound(version.into(), name.into()))?
+        };
+
+        self.append_to_wal(&ModelEvent::Promoted(metadata.clone()))
+            .await?;
+        let _ = self.broadcaster.send(ModelEvent::Promoted(metadata));
+        Ok(())
+    }
+
+    /// Deprecate a model version.
+    pub async fn deprecate(&self, name: &str, version: &str) -> RegistryResult<()> {
+        let metadata = {
+            let idx = self.index.read().await;
+            idx.get(name)
+                .and_then(|v| v.get(version).cloned())
+                .ok_or_else(|| RegistryError::VersionNotFound(version.into(), name.into()))?
+        };
+
+        self.append_to_wal(&ModelEvent::Deprecated(metadata.clone()))
+            .await?;
+        let _ = self.broadcaster.send(ModelEvent::Deprecated(metadata));
+        Ok(())
+    }
+
+    /// Retrieve metadata for a particular model version.
+    pub async fn get(&self, name: &str, version: &str) -> RegistryResult<ModelMetadata> {
+        let idx = self.index.read().await;
+        idx.get(name)
+            .and_then(|v| v.get(version).cloned())
+            .ok_or_else(|| RegistryError::VersionNotFound(version.into(), name.into()))
+    }
+
+    /// Returns a read-only snapshot for a given model across versions.
+    pub async fn list_versions(
+        &self,
+        name: &str,
+    ) -> RegistryResult<Vec<ModelMetadata>> {
+        let idx = self.index.read().await;
+        idx.get(name)
+            .map(|versions| versions.values().cloned().collect())
+            .ok_or_else(|| RegistryError::ModelNotFound(name.into()))
+    }
+
+    /// Subscribe to events; each subscriber gets its own stream.
+    pub fn subscribe(&self) -> BoxStream<'static, ModelEvent> {
+        // Downcast to stream so callers can use `while let Some(e) = stream.next().await`.
+        let mut rx = self.broadcaster.subscribe();
+        Box::pin(async_stream::stream! {
+            loop {
+                let ev = rx.recv().await;
+                match ev {
+                    Ok(event) => yield event,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue, // skip
+                }
+            }
+        })
+    }
+
+    // ---------- Internal helpers ---------- //
+
+    async fn replay_wal(&self) -> RegistryResult<()> {
+        let file = File::open(&self.wal_path)?;
+        let reader = BufReader::new(file);
+
+        let stream = serde_json::Deserializer::from_reader(reader).into_iter::<ModelEvent>();
+
+        for ev in stream {
+            let ev = ev?;
+            self.apply_event(ev, false).await?;
+        }
+        Ok(())
+    }
+
+    /// Append event to WAL synchronously; fsync for durability.
+    async fn append_to_wal(&self, event: &ModelEvent) -> RegistryResult<()> {
+        // Ensure directory exists
+        if let Some(parent) = self.wal_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.wal_path)?;
+
+        serde_json::to_writer(&mut file, event)?;
+        // newline delimiter for nicer diffs
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// Apply an event to in-memory state, optionally broadcast.
+    async fn apply_event(&self, ev: ModelEvent, broadcast: bool) -> RegistryResult<()> {
+        match &ev {
+            ModelEvent::Registered(meta) => {
+                let mut idx = self.index.write().await;
+                idx.entry(meta.name.clone())
+                    .or_default()
+                    .insert(meta.version.clone(), meta.clone());
+            }
+            ModelEvent::Promoted(_) | ModelEvent::Deprecated(_) => {
+                // No state mutation other than emitting event— hooks rely on metadata.
+            }
+        }
+
+        if broadcast {
+            let _ = self.broadcaster.send(ev);
+        }
+
+        Ok(())
+    }
+
+    /// Background compactor to truncate WAL periodically.
+    fn spawn_compactor(&self) {
+        let index = Arc::clone(&self.index);
+        let wal_path = self.wal_path.clone();
+        let mut rx = self.broadcaster.subscribe();
+
+        task::spawn(async move {
+            let mut counter = 0usize;
+            loop {
+                select! {
+                    _ = rx.recv() => {
+                        counter += 1;
+                        if counter >= COMPACTION_THRESHOLD {
+                            counter = 0;
+                            if let Err(e) = compact_wal(&wal_path, &index).await {
+                                eprintln!("[registry] WAL compaction failed: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Serialize in-memory index into a fresh WAL file (compaction).
+async fn compact_wal(
+    wal_path: &Path,
+    index: &Arc<RwLock<BTreeMap<ModelName, BTreeMap<SemVer, ModelMetadata>>>>,
+) -> RegistryResult<()> {
+    let tmp_path = wal_path.with_extension("wal.tmp");
+
+    {
+        let idx = index.read().await;
+        let file = File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+
+        for model_map in idx.values() {
+            for meta in model_map.values() {
+                let ev = ModelEvent::Registered(meta.clone());
+                serde_json::to_writer(&mut writer, &ev)?;
+                writer.write_all(b"\n")?;
+            }
+        }
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+    }
+
+    // Atomically replace.
+    fs::rename(&tmp_path, wal_path)?;
+    Ok(())
+}
+
+/// Helper for testing/demo—registers dummy models then listens for events.
+/// Run with `cargo run --example registry_demo`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn smoke_test_registry() -> RegistryResult<()> {
+        let tmp_dir = tempfile::Builder::new()
+            .prefix("registry_test")
+            .tempdir()?;
+        let wal = tmp_dir.path().join("registry.wal");
+
+        let registry = ModelRegistry::open(&wal).await?;
+
+        // Subscribe before writes
+        let mut sub = registry.subscribe();
+
+        let meta = ModelMetadata {
+            id: Uuid::new_v4(),
+            name: "object_detector".into(),
+            version: "1.0.0".into(),
+            created_at: Utc::now(),
+            metrics: serde_json::json!({"mAP":0.83}),
+            tags: [("framework".into(),"yolov8".into())].iter().cloned().collect(),
+        };
+
+        registry.register(meta.clone()).await?;
+        registry.promote(&meta.name, &meta.version).await?;
+
+        // Wait for events
+        let mut received = vec![];
+        for _ in 0..2 {
+            if let Some(ev) = sub.next().await {
+                received.push(ev);
+            }
+        }
+        assert_eq!(received.len(), 2);
+
+        // Query path
+        let fetched = registry.get(&meta.name, &meta.version).await?;
+        assert_eq!(fetched.id, meta.id);
+
+        Ok(())
+    }
+}
+```

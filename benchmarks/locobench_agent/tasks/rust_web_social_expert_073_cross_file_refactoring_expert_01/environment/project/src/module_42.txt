@@ -1,0 +1,444 @@
+```rust
+//! src/module_42.rs
+//!
+//! Event-driven “Learning Pulse” module for EduPulse Live.
+//!
+//! The module demonstrates a realistic service-layer implementation that
+//! – persists domain entities through a repository abstraction,
+//! – publishes strongly-typed domain events to a message broker,
+//! – provides GDPR-ready erase capabilities, and
+//! – enforces authentication/authorization guards.
+//!
+//! It is completely async and ready to be wired into Actix-Web or Axum
+//! controllers.  SQLx is used for interacting with PostgreSQL while NATS
+//! (or NATS-compatible brokers such as JetStream) is leveraged for the
+//! ultra-low-latency event mesh.
+//!
+//! ──────────────────────────────────────────────────────────────────────────────
+//! NOTE: this file is self-contained; external crates appear in the `Cargo.toml`
+//!       but are shown here in `use` statements for clarity.
+//! ──────────────────────────────────────────────────────────────────────────────
+
+use async_nats::jetstream;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use nanoid::nanoid;
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgRow, PgPool, Row};
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::time::{timeout, Duration};
+
+/// A short-lived learning activity created by an educator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningPulse {
+    pub id: String,
+    pub author_id: String,
+    pub title: String,
+    pub prompt: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// A response submitted by a learner for a pulse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseResponse {
+    pub id: String,
+    pub pulse_id: String,
+    pub author_id: String,
+    pub payload: String, // Could be JSON w/ attachments, code, etc.
+    pub submitted_at: DateTime<Utc>,
+}
+
+/* ───────────────────────────────────────────────────────────────────────── */
+/*                               Domain Events                              */
+/* ───────────────────────────────────────────────────────────────────────── */
+
+/// Marker trait for all events emitted by the domain layer.
+pub trait DomainEvent: Send + Sync + 'static {
+    /// Topic used by the broker.
+    fn topic() -> &'static str
+    where
+        Self: Sized;
+}
+
+/// Event raised once a pulse has been created.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseCreated {
+    pub pulse: LearningPulse,
+}
+
+impl DomainEvent for PulseCreated {
+    fn topic() -> &'static str {
+        "edu.pulse.created"
+    }
+}
+
+/// Event raised when a learner submits a response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseResponseSubmitted {
+    pub response: PulseResponse,
+}
+
+impl DomainEvent for PulseResponseSubmitted {
+    fn topic() -> &'static str {
+        "edu.pulse.response_submitted"
+    }
+}
+
+/* ───────────────────────────────────────────────────────────────────────── */
+/*                              Error Handling                              */
+/* ───────────────────────────────────────────────────────────────────────── */
+
+#[derive(Debug, Error)]
+pub enum PulseError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("message broker error: {0}")]
+    Broker(#[from] async_nats::Error),
+    #[error("timeout elapsed")]
+    Timeout,
+    #[error("pulse not found")]
+    NotFound,
+    #[error("permissions denied")]
+    PermissionDenied,
+    #[error("unknown error: {0}")]
+    Unknown(String),
+}
+
+pub type Result<T, E = PulseError> = std::result::Result<T, E>;
+
+/* ───────────────────────────────────────────────────────────────────────── */
+/*                          Repository Abstractions                         */
+/* ───────────────────────────────────────────────────────────────────────── */
+
+#[async_trait]
+pub trait PulseRepository: Send + Sync {
+    async fn create(&self, pulse: &LearningPulse) -> Result<()>;
+    async fn insert_response(&self, response: &PulseResponse) -> Result<()>;
+    async fn find_by_id(&self, pulse_id: &str) -> Result<LearningPulse>;
+    async fn erase(&self, pulse_id: &str) -> Result<()>;
+}
+
+/// Postgres implementation using SQLx.  In production, this could be in its
+/// own crate or feature-gated behind `#[cfg(feature = "postgres_repo")]`.
+pub struct PostgresPulseRepository {
+    pool: PgPool,
+}
+
+impl PostgresPulseRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl PulseRepository for PostgresPulseRepository {
+    async fn create(&self, pulse: &LearningPulse) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO learning_pulse (id, author_id, title, prompt, created_at, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+        "#,
+        )
+        .bind(&pulse.id)
+        .bind(&pulse.author_id)
+        .bind(&pulse.title)
+        .bind(&pulse.prompt)
+        .bind(pulse.created_at)
+        .bind(pulse.expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_response(&self, response: &PulseResponse) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO pulse_response (id, pulse_id, author_id, payload, submitted_at)
+            VALUES ($1, $2, $3, $4, $5)
+        "#,
+        )
+        .bind(&response.id)
+        .bind(&response.pulse_id)
+        .bind(&response.author_id)
+        .bind(&response.payload)
+        .bind(response.submitted_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn find_by_id(&self, pulse_id: &str) -> Result<LearningPulse> {
+        let row: PgRow = sqlx::query(
+            r#"
+            SELECT id, author_id, title, prompt, created_at, expires_at
+            FROM learning_pulse
+            WHERE id = $1
+        "#,
+        )
+        .bind(pulse_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(LearningPulse {
+            id: row.try_get("id")?,
+            author_id: row.try_get("author_id")?,
+            title: row.try_get("title")?,
+            prompt: row.try_get("prompt")?,
+            created_at: row.try_get("created_at")?,
+            expires_at: row.try_get("expires_at")?,
+        })
+    }
+
+    async fn erase(&self, pulse_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM pulse_response WHERE pulse_id = $1")
+            .bind(pulse_id)
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query("DELETE FROM learning_pulse WHERE id = $1")
+            .bind(pulse_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+}
+
+/* ───────────────────────────────────────────────────────────────────────── */
+/*                              Event Publisher                             */
+/* ───────────────────────────────────────────────────────────────────────── */
+
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish<E: DomainEvent + Serialize + ?Sized>(&self, event: &E) -> Result<()>;
+}
+
+/// NATS JetStream implementation.
+pub struct NatsPublisher {
+    client: jetstream::Context, // JetStream supports durable streams, A-C-I.
+}
+
+impl NatsPublisher {
+    pub async fn connect(nats_url: &str) -> Result<Self> {
+        let connection = async_nats::connect(nats_url).await?;
+        let client = jetstream::new(connection);
+
+        Ok(Self { client })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for NatsPublisher {
+    async fn publish<E: DomainEvent + Serialize + ?Sized>(&self, event: &E) -> Result<()> {
+        let payload = serde_json::to_vec(event).map_err(|e| PulseError::Unknown(e.to_string()))?;
+        let subject = E::topic();
+        // 500 ms is plenty for local brokers; adjust for production.
+        timeout(Duration::from_millis(500), self.client.publish(subject, payload.into()))
+            .await
+            .map_err(|_| PulseError::Timeout)??;
+        Ok(())
+    }
+}
+
+/* ───────────────────────────────────────────────────────────────────────── */
+/*                              Service Layer                               */
+/* ───────────────────────────────────────────────────────────────────────── */
+
+/// Guards that verify a user is allowed to perform an action.
+pub trait AuthGuard {
+    fn ensure_can_create(&self, user_id: &str) -> Result<()>;
+    fn ensure_can_respond(&self, user_id: &str, pulse: &LearningPulse) -> Result<()>;
+}
+
+/// Dummy guard used for demonstration.
+pub struct NoopAuthGuard;
+impl AuthGuard for NoopAuthGuard {
+    fn ensure_can_create(&self, _user_id: &str) -> Result<()> {
+        Ok(())
+    }
+    fn ensure_can_respond(&self, _user_id: &str, _pulse: &LearningPulse) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Primary entrypoint for application/business logic related to Learning Pulses.
+pub struct LearningPulseService<G: AuthGuard> {
+    repo: Arc<dyn PulseRepository>,
+    publisher: Arc<dyn EventPublisher>,
+    guard: G,
+}
+
+impl<G: AuthGuard> LearningPulseService<G> {
+    pub fn new(
+        repo: Arc<dyn PulseRepository>,
+        publisher: Arc<dyn EventPublisher>,
+        guard: G,
+    ) -> Self {
+        Self {
+            repo,
+            publisher,
+            guard,
+        }
+    }
+
+    /// Creates a new pulse and publishes an event.
+    pub async fn create_pulse(
+        &self,
+        author_id: &str,
+        title: &str,
+        prompt: &str,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<LearningPulse> {
+        self.guard.ensure_can_create(author_id)?;
+
+        let pulse = LearningPulse {
+            id: nanoid!(),
+            author_id: author_id.to_owned(),
+            title: title.to_owned(),
+            prompt: prompt.to_owned(),
+            created_at: Utc::now(),
+            expires_at,
+        };
+
+        self.repo.create(&pulse).await?;
+        self.publisher.publish(&PulseCreated { pulse: pulse.clone() }).await?;
+        Ok(pulse)
+    }
+
+    /// Submits a learner’s response and publishes an event.
+    pub async fn submit_response(
+        &self,
+        learner_id: &str,
+        pulse_id: &str,
+        payload: &str,
+    ) -> Result<PulseResponse> {
+        let pulse = self.repo.find_by_id(pulse_id).await?;
+        self.guard.ensure_can_respond(learner_id, &pulse)?;
+
+        let response = PulseResponse {
+            id: nanoid!(),
+            pulse_id: pulse_id.to_owned(),
+            author_id: learner_id.to_owned(),
+            payload: payload.to_owned(),
+            submitted_at: Utc::now(),
+        };
+
+        self.repo.insert_response(&response).await?;
+        self.publisher
+            .publish(&PulseResponseSubmitted {
+                response: response.clone(),
+            })
+            .await?;
+        Ok(response)
+    }
+
+    /// GDPR-ready erase of a pulse and all its responses.  Emits *no* event to
+    /// respect “right to be forgotten” semantics.
+    pub async fn erase_pulse(&self, pulse_id: &str, requester_id: &str) -> Result<()> {
+        let pulse = self.repo.find_by_id(pulse_id).await?;
+        // Only the author or an admin could delete.
+        if pulse.author_id != requester_id {
+            return Err(PulseError::PermissionDenied);
+        }
+        self.repo.erase(pulse_id).await?;
+        Ok(())
+    }
+}
+
+/* ───────────────────────────────────────────────────────────────────────── */
+/*                              Integration Test                            */
+/* ───────────────────────────────────────────────────────────────────────── */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use tokio::sync::Mutex;
+
+    struct MemoryPublisher {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MemoryPublisher {
+        fn new(events: Arc<Mutex<Vec<String>>>) -> Self {
+            Self { events }
+        }
+    }
+
+    #[async_trait]
+    impl EventPublisher for MemoryPublisher {
+        async fn publish<E: DomainEvent + Serialize + ?Sized>(&self, event: &E) -> Result<()> {
+            let json = serde_json::to_string(event).unwrap();
+            self.events.lock().await.push(json);
+            Ok(())
+        }
+    }
+
+    // Repository stub backed by in-memory hashmaps.
+    struct InMemoryRepo {
+        pulses: Arc<Mutex<Vec<LearningPulse>>>,
+        responses: Arc<Mutex<Vec<PulseResponse>>>,
+    }
+
+    impl InMemoryRepo {
+        fn new() -> Self {
+            Self {
+                pulses: Arc::new(Mutex::new(Vec::new())),
+                responses: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PulseRepository for InMemoryRepo {
+        async fn create(&self, pulse: &LearningPulse) -> Result<()> {
+            self.pulses.lock().await.push(pulse.clone());
+            Ok(())
+        }
+        async fn insert_response(&self, response: &PulseResponse) -> Result<()> {
+            self.responses.lock().await.push(response.clone());
+            Ok(())
+        }
+        async fn find_by_id(&self, id: &str) -> Result<LearningPulse> {
+            self.pulses
+                .lock()
+                .await
+                .iter()
+                .find(|p| p.id == id)
+                .cloned()
+                .ok_or(PulseError::NotFound)
+        }
+        async fn erase(&self, id: &str) -> Result<()> {
+            self.pulses.lock().await.retain(|p| p.id != id);
+            self.responses.lock().await.retain(|r| r.pulse_id != id);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn smoke_test_create_and_response_flow() -> Result<()> {
+        let repo = Arc::new(InMemoryRepo::new());
+        let events_store = Arc::new(Mutex::new(Vec::new()));
+        let publisher = Arc::new(MemoryPublisher::new(events_store.clone()));
+        let service = LearningPulseService::new(repo, publisher, NoopAuthGuard);
+
+        let pulse = service
+            .create_pulse("teacher-1", "Binary Trees", "Explain inorder traversal", None)
+            .await?;
+
+        service
+            .submit_response(
+                "student-88",
+                &pulse.id,
+                r#"{"code":"fn inorder(...) {}", "explanation":"Here is my solution"}"#,
+            )
+            .await?;
+
+        let evts = events_store.lock().await;
+        assert_eq!(evts.len(), 2); // PulseCreated + PulseResponseSubmitted
+        Ok(())
+    }
+}
+```

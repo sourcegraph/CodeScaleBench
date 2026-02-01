@@ -1,0 +1,470 @@
+```rust
+//! src/module_64.rs
+//!
+//! Model–Monitoring and Automated-Retraining subsystem.
+//!
+//! This module implements a minimal, yet production-grade, monitoring layer
+//! that listens to live inference traffic, evaluates a configurable set of
+//! quality metrics, detects model drift, and triggers retraining events via
+//! an Observer pattern.  The Strategy pattern is used to allow pluggable
+//! drift–detection / retraining policies.
+//!
+//! The code is `tokio`-aware but does **not** require the entire application
+//! to be async; synchronous producers can still send records via an
+//! `mpsc::Sender`.  All public structs are `Send + Sync`, making them easy to
+//! embed in multi-threaded services.
+//!
+//! # High-Level Design
+//!
+//! 1. `InferenceRecord`          – A single online-inference observation.
+//! 2. `Metric` + implementations – Custom quality/latency metrics.
+//! 3. `SystemEvent`              – Events flowing through the system
+//! 4. `EventBus`                 – Broadcast hub (Observer).
+//! 5. `RetrainingStrategy`       – Strategy for when to retrain.
+//! 6. `ModelMonitor`             – Orchestrates all of the above.
+//!
+//! ## Typical Usage
+//! ```no_run
+//! use visu_tility_orchestrator::module_64::*;
+//! use tokio::sync::mpsc;
+//!
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     // 1) Create channels
+//!     let (tx, rx) = mpsc::channel(128);
+//!
+//!     // 2) Build monitor
+//!     let monitor = ModelMonitor::builder()
+//!         .with_default_metrics()
+//!         .with_strategy(Box::new(ThresholdStrategy::new(0.85)))
+//!         .build(rx)?;
+//!
+//!     // 3) Spawn monitor task
+//!     tokio::spawn(monitor.run());
+//!
+//!     // 4) Simulate inference traffic
+//!     tx.send(InferenceRecord::dummy_ok()).await?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! In a full deployment, upstream pipelines feed `InferenceRecord`s into the
+//! `tx` channel, while downstream components subscribe to `EventBus` for
+//! `SystemEvent::RetrainRequested` notifications.
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, RwLock},
+};
+use tokio::sync::{broadcast, mpsc};
+
+/// The maximum number of events that can be queued in the broadcast channel.
+/// When the buffer overflows, the oldest messages are dropped.
+/// Keeping this fairly small ensures consumers catch up quickly.
+const BROADCAST_BUFFER: usize = 32;
+
+/// Represents a single inference observation flowing through the monitoring
+/// pipeline.
+///
+/// Each record **may** include a ground-truth `label`; when omitted, the
+/// accuracy metric yields `None` for that sample.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceRecord {
+    pub model_version: String,
+    pub predicted_label: String,
+    pub ground_truth_label: Option<String>,
+    pub latency_ms: u128,
+    pub created_at: DateTime<Utc>,
+    // Using an opaque JSON blob for extensibility (e.g. feature vectors).
+    pub metadata: serde_json::Value,
+}
+
+impl InferenceRecord {
+    /// Convenience constructor for tests / examples.
+    pub fn dummy_ok() -> Self {
+        Self {
+            model_version: "v1.0.0".into(),
+            predicted_label: "ok".into(),
+            ground_truth_label: Some("ok".into()),
+            latency_ms: 42,
+            created_at: Utc::now(),
+            metadata: serde_json::Value::Null,
+        }
+    }
+}
+
+/* --------------------------------------------------------------------------
+ *                                Metrics
+ * ----------------------------------------------------------------------- */
+
+/// Public trait for any online metric.
+///
+/// Implementors must be `Send + Sync` because they’ll be shared across
+/// multiple tasks/threads.
+pub trait Metric: Send + Sync {
+    /// Human-readable identifier.
+    fn name(&self) -> &'static str;
+
+    /// Feed a single record and possibly emit an event.
+    ///
+    /// Returning `Some(SystemEvent::MetricUpdated { .. })` is the canonical
+    /// way of sending data further downstream.
+    fn on_record(&mut self, record: &InferenceRecord) -> Option<SystemEvent>;
+}
+
+/// Accuracy over a sliding window of N observations.
+pub struct AccuracyMetric {
+    window: usize,
+    history: VecDeque<bool>,
+}
+
+impl AccuracyMetric {
+    pub fn new(window: usize) -> Self {
+        Self {
+            window,
+            history: VecDeque::with_capacity(window),
+        }
+    }
+}
+
+impl Metric for AccuracyMetric {
+    fn name(&self) -> &'static str {
+        "accuracy"
+    }
+
+    fn on_record(&mut self, record: &InferenceRecord) -> Option<SystemEvent> {
+        if let Some(gt) = &record.ground_truth_label {
+            let correct = *gt == record.predicted_label;
+            if self.history.len() == self.window {
+                self.history.pop_front();
+            }
+            self.history.push_back(correct);
+            let accuracy =
+                self.history.iter().filter(|v| **v).count() as f64 / self.history.len() as f64;
+
+            Some(SystemEvent::MetricUpdated(MetricEvent {
+                name: self.name().into(),
+                value: accuracy,
+                model_version: record.model_version.clone(),
+                created_at: record.created_at,
+            }))
+        } else {
+            None
+        }
+    }
+}
+
+/// Simple latency metric (EWMA).
+pub struct LatencyMetric {
+    alpha: f64,
+    ewma: Option<f64>,
+}
+
+impl LatencyMetric {
+    pub fn new(alpha: f64) -> Self {
+        Self { alpha, ewma: None }
+    }
+}
+
+impl Metric for LatencyMetric {
+    fn name(&self) -> &'static str {
+        "latency_ms_ewma"
+    }
+
+    fn on_record(&mut self, record: &InferenceRecord) -> Option<SystemEvent> {
+        let sample = record.latency_ms as f64;
+        let ewma = match self.ewma {
+            None => sample,
+            Some(prev) => self.alpha * sample + (1.0 - self.alpha) * prev,
+        };
+        self.ewma = Some(ewma);
+
+        Some(SystemEvent::MetricUpdated(MetricEvent {
+            name: self.name().into(),
+            value: ewma,
+            model_version: record.model_version.clone(),
+            created_at: record.created_at,
+        }))
+    }
+}
+
+/* --------------------------------------------------------------------------
+ *                             System Events
+ * ----------------------------------------------------------------------- */
+
+/// Metric update payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricEvent {
+    pub name: String,
+    pub value: f64,
+    pub model_version: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// High-level event types flowing through the EventBus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SystemEvent {
+    MetricUpdated(MetricEvent),
+    DriftDetected(DriftEvent),
+    RetrainRequested(RetrainEvent),
+}
+
+/// Statistical drift detection event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriftEvent {
+    pub affected_model: String,
+    pub metric: String,
+    pub threshold: f64,
+    pub observed: f64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Retraining trigger event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrainEvent {
+    pub model_version: String,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/* --------------------------------------------------------------------------
+ *                           EventBus (Observer)
+ * ----------------------------------------------------------------------- */
+
+/// A thin wrapper around `tokio::broadcast` so that multiple subscribers can
+/// listen to monitoring updates without blocking the producer.
+#[derive(Clone)]
+pub struct EventBus {
+    tx: broadcast::Sender<SystemEvent>,
+}
+
+impl Default for EventBus {
+    fn default() -> Self {
+        let (tx, _) = broadcast::channel(BROADCAST_BUFFER);
+        Self { tx }
+    }
+}
+
+impl EventBus {
+    /// Broadcast an event.
+    pub fn emit(&self, event: SystemEvent) -> Result<()> {
+        // Ignore lagging receivers–dropping them is fine.
+        let _ = self.tx.send(event);
+        Ok(())
+    }
+
+    /// Obtain a new read-only channel to listen for events.
+    pub fn subscribe(&self) -> broadcast::Receiver<SystemEvent> {
+        self.tx.subscribe()
+    }
+}
+
+/* --------------------------------------------------------------------------
+ *                        Strategy: RetrainingPolicy
+ * ----------------------------------------------------------------------- */
+
+/// Pluggable strategy for deciding when to retrain.
+///
+/// Implementors **must** be thread-safe because the monitor forwards events
+/// from a multithreaded context.
+pub trait RetrainingStrategy: Send + Sync {
+    /// React to the stream of `SystemEvent`s.
+    fn on_event(&self, event: &SystemEvent) -> Option<SystemEvent>;
+}
+
+/// A naive strategy: Request retraining when accuracy < threshold.
+///
+/// Suitable for demos; production systems should use more robust drift
+/// detection (e.g., KS-test, PSI, CUPED).
+pub struct ThresholdStrategy {
+    threshold: f64,
+}
+
+impl ThresholdStrategy {
+    pub fn new(threshold: f64) -> Self {
+        Self { threshold }
+    }
+}
+
+impl RetrainingStrategy for ThresholdStrategy {
+    fn on_event(&self, event: &SystemEvent) -> Option<SystemEvent> {
+        if let SystemEvent::MetricUpdated(metric) = event {
+            if metric.name == "accuracy" && metric.value < self.threshold {
+                return Some(SystemEvent::RetrainRequested(RetrainEvent {
+                    model_version: metric.model_version.clone(),
+                    reason: format!(
+                        "Accuracy dropped below {:.2}: observed {:.4}",
+                        self.threshold, metric.value
+                    ),
+                    created_at: Utc::now(),
+                }));
+            }
+        }
+        None
+    }
+}
+
+/* --------------------------------------------------------------------------
+ *                             Model Monitor
+ * ----------------------------------------------------------------------- */
+
+/// Builder for `ModelMonitor` to make construction ergonomic.
+pub struct ModelMonitorBuilder {
+    metrics: Vec<Box<dyn Metric>>,
+    strategy: Option<Box<dyn RetrainingStrategy>>,
+    bus: Option<EventBus>,
+}
+
+impl ModelMonitorBuilder {
+    pub fn with_default_metrics(mut self) -> Self {
+        self.metrics.push(Box::new(AccuracyMetric::new(100)));
+        self.metrics.push(Box::new(LatencyMetric::new(0.3)));
+        self
+    }
+
+    pub fn with_metric(mut self, metric: Box<dyn Metric>) -> Self {
+        self.metrics.push(metric);
+        self
+    }
+
+    pub fn with_strategy(mut self, strategy: Box<dyn RetrainingStrategy>) -> Self {
+        self.strategy = Some(strategy);
+        self
+    }
+
+    pub fn with_bus(mut self, bus: EventBus) -> Self {
+        self.bus = Some(bus);
+        self
+    }
+
+    pub fn build(self, rx: mpsc::Receiver<InferenceRecord>) -> Result<ModelMonitor> {
+        Ok(ModelMonitor {
+            metrics: self.metrics,
+            strategy: self
+                .strategy
+                .context("Retraining strategy must be provided")?,
+            bus: self.bus.unwrap_or_default(),
+            rx,
+        })
+    }
+}
+
+impl Default for ModelMonitorBuilder {
+    fn default() -> Self {
+        Self {
+            metrics: Vec::new(),
+            strategy: None,
+            bus: None,
+        }
+    }
+}
+
+/// Consumes `InferenceRecord`s, updates metrics, and publishes events.
+///
+/// The struct is `Send + Sync`; however, its `run` method should be executed
+/// within an async runtime (e.g., `tokio`) because it awaits messages.
+pub struct ModelMonitor {
+    metrics: Vec<Box<dyn Metric>>,
+    strategy: Box<dyn RetrainingStrategy>,
+    bus: EventBus,
+    rx: mpsc::Receiver<InferenceRecord>,
+}
+
+impl ModelMonitor {
+    pub fn builder() -> ModelMonitorBuilder {
+        ModelMonitorBuilder::default()
+    }
+
+    /// Spawn the monitoring loop.
+    ///
+    /// The task terminates gracefully when the `InferenceRecord` sender is
+    /// dropped and the channel is closed.
+    pub async fn run(mut self) -> Result<()> {
+        while let Some(record) = self.rx.recv().await {
+            // 1) Compute metrics
+            for metric in &mut self.metrics {
+                if let Some(event) = metric.on_record(&record) {
+                    self.bus.emit(event.clone())?;
+
+                    // 2) Apply strategy
+                    if let Some(trigger) = self.strategy.on_event(&event) {
+                        self.bus.emit(trigger)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Subscribe to the underlying `EventBus`.
+    pub fn subscribe(&self) -> broadcast::Receiver<SystemEvent> {
+        self.bus.subscribe()
+    }
+}
+
+/* --------------------------------------------------------------------------
+ *                          Example Unit Tests
+ * ----------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{self, Duration};
+
+    #[tokio::test]
+    async fn test_monitor_triggers_retraining() -> Result<()> {
+        let (tx, rx) = mpsc::channel(8);
+
+        let monitor = ModelMonitor::builder()
+            .with_default_metrics()
+            .with_strategy(Box::new(ThresholdStrategy::new(0.90)))
+            .build(rx)?;
+
+        let mut sub = monitor.subscribe();
+
+        // Spawn monitor
+        tokio::spawn(monitor.run());
+
+        // Send bad accuracy records
+        for _ in 0..120 {
+            tx.send(InferenceRecord {
+                ground_truth_label: Some("bad".into()),
+                predicted_label: "ok".into(), // Wrong prediction.
+                ..InferenceRecord::dummy_ok()
+            })
+            .await?;
+        }
+
+        // Listen for RetrainRequested event
+        let mut found = false;
+        let timeout = Duration::from_secs(2);
+        let start = time::Instant::now();
+        while start.elapsed() < timeout {
+            if let Ok(event) = sub.try_recv() {
+                if matches!(event, SystemEvent::RetrainRequested(_)) {
+                    found = true;
+                    break;
+                }
+            }
+            time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(found, "Retraining event should have been triggered");
+        Ok(())
+    }
+}
+
+/* --------------------------------------------------------------------------
+ *                         Public Re-exports (optional)
+ * ----------------------------------------------------------------------- */
+
+pub use {
+    AccuracyMetric, DriftEvent, EventBus, InferenceRecord, LatencyMetric, Metric, MetricEvent,
+    ModelMonitor, ModelMonitorBuilder, RetrainEvent, RetrainingStrategy, SystemEvent,
+    ThresholdStrategy,
+};
+```

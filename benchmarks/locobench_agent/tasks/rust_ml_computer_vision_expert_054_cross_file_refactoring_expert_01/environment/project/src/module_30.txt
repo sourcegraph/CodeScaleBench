@@ -1,0 +1,512 @@
+```rust
+//! src/module_30.rs
+//!
+//! Model-Monitoring subsystem (Model Ops layer)
+//!
+//! Responsibilities
+//! ----------------
+//! • Periodically ingest real-time or batch inference metrics from the Serving layer  
+//! • Run drift, performance, and stability checks via plug-in `DriftDetector`s  
+//! • Emit strongly-typed `MonitorEvent`s to an asynchronous Observer bus  
+//! • Optionally trigger downstream actions such as automated re-training
+//!
+//! Design
+//! ------
+//! • Strategy Pattern – each `DriftDetector` encapsulates a distinct statistical test  
+//! • Observer Pattern  – lightweight broadcast channel decouples producers/consumers  
+//! • Async/await       – monitoring runs in its own Tokio task with graceful shutdown
+//!
+//! This module is self-contained; embedders only need to depend on the public traits.
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc, Mutex},
+    task::JoinHandle,
+    time::sleep,
+};
+
+/// Maximum number of events buffered in the internal broadcast channel
+const EVENT_CHANNEL_SIZE: usize = 128;
+
+/// Frequency at which metrics should be collected
+const DEFAULT_SAMPLING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Type-alias for downstream consumers to subscribe to monitoring events
+pub type EventReceiver = broadcast::Receiver<MonitorEvent>;
+
+/// Errors surfaced by the Model Monitor
+#[derive(Debug, Error)]
+pub enum MonitorError {
+    #[error("collector '{0}' failed: {1}")]
+    CollectorError(String, #[source] anyhow::Error),
+
+    #[error("drift detector '{0}' failed: {1}")]
+    DetectorError(String, #[source] anyhow::Error),
+
+    #[error("internal channel closed")]
+    ChannelClosed,
+
+    #[error("monitor has been stopped")]
+    Stopped,
+}
+
+/// Metrics emitted by the online inference service.
+/// These should be consistent with whatever telemetry the serving layer publishes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceMetrics {
+    pub model_name: String,
+    pub model_version: String,
+    pub timestamp: DateTime<Utc>,
+
+    /// Model confidence distribution statistics for the last window
+    pub confidence_mean: f32,
+    pub confidence_std: f32,
+
+    /// Running latency statistics
+    pub p50_latency_ms: f32,
+    pub p95_latency_ms: f32,
+    pub p99_latency_ms: f32,
+}
+
+/// Monitor events broadcast to observers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MonitorEvent {
+    MetricsSnapshot(InferenceMetrics),
+
+    /// A drift alert wraps the offending metrics plus detector metadata
+    DriftAlert {
+        metrics: InferenceMetrics,
+        detector: String,
+        detail: String,
+    },
+
+    /// A performance degradation alert
+    PerformanceAlert {
+        metrics: InferenceMetrics,
+        detail: String,
+    },
+}
+
+/// Collects metrics from an external source (e.g. Prometheus, Kafka, gRPC).
+#[async_trait]
+pub trait MetricCollector: Send + Sync {
+    /// Human-readable collector name
+    fn name(&self) -> &'static str;
+
+    /// Pull a fresh snapshot. Implementations should time-bound internally.
+    async fn collect(&self) -> anyhow::Result<InferenceMetrics>;
+}
+
+/// Algorithm that decides whether a batch of metrics indicates drift or anomalies.
+pub trait DriftDetector: Send + Sync {
+    /// Name of the detector implementation
+    fn name(&self) -> &'static str;
+
+    /// Returns `Some(alert_detail)` if drift has been detected.
+    fn detect(&self, metrics: &InferenceMetrics) -> anyhow::Result<Option<String>>;
+}
+
+/// Public, cheap clone handle to start/stop monitoring and subscribe to events.
+///
+/// Internally, this acts as a façade over the spawned Tokio task.
+#[derive(Clone)]
+pub struct ModelMonitor {
+    command_tx: mpsc::Sender<MonitorCommand>,
+    event_tx: broadcast::Sender<MonitorEvent>,
+}
+
+impl ModelMonitor {
+    /// Spin up a new monitor with the given collectors and detectors.
+    pub fn new(
+        collectors: Vec<Arc<dyn MetricCollector>>,
+        detectors: Vec<Arc<dyn DriftDetector>>,
+        sampling_interval: Option<Duration>,
+    ) -> Self {
+        let (command_tx, command_rx) = mpsc::channel::<MonitorCommand>(16);
+        let (event_tx, _) = broadcast::channel::<MonitorEvent>(EVENT_CHANNEL_SIZE);
+
+        let inner = InnerMonitor {
+            collectors,
+            detectors,
+            sampling_interval: sampling_interval.unwrap_or(DEFAULT_SAMPLING_INTERVAL),
+            command_rx,
+            event_tx: event_tx.clone(),
+            last_runtime_error: Arc::new(Mutex::new(None)),
+        };
+
+        tokio::spawn(inner.run());
+
+        Self { command_tx, event_tx }
+    }
+
+    /// Returns a subscribed receiver to listen for `MonitorEvent`s.
+    pub fn subscribe(&self) -> EventReceiver {
+        self.event_tx.subscribe()
+    }
+
+    /// Gracefully shuts down the monitoring loop.
+    pub async fn stop(&self) -> Result<(), MonitorError> {
+        self.command_tx
+            .send(MonitorCommand::Stop)
+            .await
+            .map_err(|_| MonitorError::ChannelClosed)
+    }
+}
+
+enum MonitorCommand {
+    Stop,
+}
+
+/// Encapsulates the state and async loop of the monitor.
+struct InnerMonitor {
+    collectors: Vec<Arc<dyn MetricCollector>>,
+    detectors: Vec<Arc<dyn DriftDetector>>,
+    sampling_interval: Duration,
+    command_rx: mpsc::Receiver<MonitorCommand>,
+    event_tx: broadcast::Sender<MonitorEvent>,
+    last_runtime_error: Arc<Mutex<Option<MonitorError>>>,
+}
+
+impl InnerMonitor {
+    async fn run(mut self) -> Result<(), MonitorError> {
+        let mut ticker = tokio::time::interval(self.sampling_interval);
+        loop {
+            select! {
+                _ = ticker.tick() => {
+                    if let Err(err) = self.tick().await {
+                        *self.last_runtime_error.lock().await = Some(err);
+                    }
+                }
+                cmd = self.command_rx.recv() => {
+                    match cmd {
+                        Some(MonitorCommand::Stop) | None => break,
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn tick(&self) -> Result<(), MonitorError> {
+        // Iterate over collectors sequentially;
+        // consider using FuturesUnordered for true parallelism.
+        for collector in &self.collectors {
+            let start = Instant::now();
+            match collector.collect().await {
+                Ok(metrics) => {
+                    // Publish raw snapshot
+                    let _ = self.event_tx.send(MonitorEvent::MetricsSnapshot(metrics.clone()));
+
+                    // Evaluate detectors
+                    for detector in &self.detectors {
+                        match detector.detect(&metrics) {
+                            Ok(Some(detail)) => {
+                                let _ = self.event_tx.send(MonitorEvent::DriftAlert {
+                                    metrics: metrics.clone(),
+                                    detector: detector.name().to_owned(),
+                                    detail,
+                                });
+                            }
+                            Ok(None) => {}, // No alert
+                            Err(err) => {
+                                return Err(MonitorError::DetectorError(detector.name().into(), err))
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    return Err(MonitorError::CollectorError(collector.name().into(), err));
+                }
+            }
+            let elapsed_ms = start.elapsed().as_millis();
+            // Optionally: emit debug logs via tracing crate
+            if elapsed_ms > self.sampling_interval.as_millis() {
+                tracing::warn!(
+                    collector = collector.name(),
+                    elapsed_ms,
+                    "metric collection exceeded sampling interval"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Example Implementations
+// ---------------------------------------------------------------------------
+
+/// Placeholder Prometheus collector demonstrating an external pull model.
+pub struct PrometheusCollector {
+    client: reqwest::Client,
+    endpoint: String,
+}
+
+impl PrometheusCollector {
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            endpoint: endpoint.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl MetricCollector for PrometheusCollector {
+    fn name(&self) -> &'static str {
+        "prometheus_collector"
+    }
+
+    async fn collect(&self) -> anyhow::Result<InferenceMetrics> {
+        // In real code: query PromQL, parse response.
+        // Here we simulate dummy data for brevity.
+        let now = Utc::now();
+        Ok(InferenceMetrics {
+            model_name: "defect_classifier".into(),
+            model_version: "v1.2.3".into(),
+            timestamp: now,
+            confidence_mean: 0.87,
+            confidence_std: 0.05,
+            p50_latency_ms: 12.3,
+            p95_latency_ms: 18.7,
+            p99_latency_ms: 27.4,
+        })
+    }
+}
+
+/// Simple z-score drift detector as a proof-of-concept
+pub struct ZScoreDriftDetector {
+    baseline_mean: f32,
+    baseline_std: f32,
+    z_threshold: f32,
+}
+
+impl ZScoreDriftDetector {
+    pub fn new(baseline_mean: f32, baseline_std: f32, z_threshold: f32) -> Self {
+        Self {
+            baseline_mean,
+            baseline_std,
+            z_threshold,
+        }
+    }
+}
+
+impl DriftDetector for ZScoreDriftDetector {
+    fn name(&self) -> &'static str {
+        "z_score_drift_detector"
+    }
+
+    fn detect(&self, metrics: &InferenceMetrics) -> anyhow::Result<Option<String>> {
+        let z = (metrics.confidence_mean - self.baseline_mean) / self.baseline_std.max(1e-6);
+        if z.abs() >= self.z_threshold {
+            Ok(Some(format!(
+                "Z-score {:.2} exceeded threshold {:.2}",
+                z, self.z_threshold
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Convenience builder for end-users
+// ---------------------------------------------------------------------------
+
+/// Factory that constructs a best-effort monitor with sensible defaults.
+///
+/// Example:
+/// ```ignore
+/// let monitor = MonitorBuilder::default()
+///     .with_prometheus_endpoint("http://localhost:9090")
+///     .with_z_score_detector(0.85, 0.03, 3.0)
+///     .spawn();
+///
+/// let mut rx = monitor.subscribe();
+/// tokio::spawn(async move {
+///     while let Ok(event) = rx.recv().await {
+///         println!("Monitor event: {:?}", event);
+///     }
+/// });
+/// ```
+#[derive(Default)]
+pub struct MonitorBuilder {
+    collectors: Vec<Arc<dyn MetricCollector>>,
+    detectors: Vec<Arc<dyn DriftDetector>>,
+    sampling_interval: Option<Duration>,
+}
+
+impl MonitorBuilder {
+    pub fn with_sampling_interval(mut self, interval: Duration) -> Self {
+        self.sampling_interval = Some(interval);
+        self
+    }
+
+    pub fn with_collector<C>(mut self, collector: C) -> Self
+    where
+        C: MetricCollector + 'static,
+    {
+        self.collectors.push(Arc::new(collector));
+        self
+    }
+
+    pub fn with_detector<D>(mut self, detector: D) -> Self
+    where
+        D: DriftDetector + 'static,
+    {
+        self.detectors.push(Arc::new(detector));
+        self
+    }
+
+    /// Convenience wrapper for a Prometheus collector
+    pub fn with_prometheus_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.collectors
+            .push(Arc::new(PrometheusCollector::new(endpoint)));
+        self
+    }
+
+    /// Convenience wrapper for a baseline z-score detector
+    pub fn with_z_score_detector(
+        mut self,
+        baseline_mean: f32,
+        baseline_std: f32,
+        z_threshold: f32,
+    ) -> Self {
+        self.detectors
+            .push(Arc::new(ZScoreDriftDetector::new(
+                baseline_mean,
+                baseline_std,
+                z_threshold,
+            )));
+        self
+    }
+
+    /// Spawn the backing task and acquire a `ModelMonitor` handle
+    pub fn spawn(self) -> ModelMonitor {
+        ModelMonitor::new(self.collectors, self.detectors, self.sampling_interval)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-retraining Observer Example
+// ---------------------------------------------------------------------------
+
+/// Observer that triggers a retrain job whenever a drift alert is emitted.
+///
+/// In real deployments this would call into a Job Orchestrator (e.g., Argo Workflows,
+/// Airflow, or Kubernetes Jobs) or a Model-Registry to bump the model version.
+pub struct RetrainTrigger {
+    monitor_rx: EventReceiver,
+    handle: JoinHandle<()>,
+}
+
+impl RetrainTrigger {
+    pub fn new(monitor: &ModelMonitor) -> Self {
+        let mut rx = monitor.subscribe();
+        let handle = tokio::spawn(async move {
+            while let Ok(event) = rx.recv().await {
+                match event {
+                    MonitorEvent::DriftAlert { metrics, .. } => {
+                        tracing::info!(
+                            model = metrics.model_name,
+                            version = metrics.model_version,
+                            "Drift detected – scheduling retrain"
+                        );
+                        // TODO: enqueue job on orchestrator
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        Self {
+            monitor_rx: rx,
+            handle,
+        }
+    }
+
+    /// Optional: Wait until the listener task completes
+    pub async fn join(self) {
+        let _ = self.handle.await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests (can be run with `cargo test --lib --all-targets`)
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Basic smoke test using dummy in-memory collector
+    struct DummyCollector {
+        call_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl MetricCollector for DummyCollector {
+        fn name(&self) -> &'static str {
+            "dummy_collector"
+        }
+
+        async fn collect(&self) -> anyhow::Result<InferenceMetrics> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(InferenceMetrics {
+                model_name: "test".into(),
+                model_version: "v0".into(),
+                timestamp: Utc::now(),
+                confidence_mean: 0.5,
+                confidence_std: 0.1,
+                p50_latency_ms: 10.0,
+                p95_latency_ms: 20.0,
+                p99_latency_ms: 30.0,
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn monitor_collects_and_publishes_metrics() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let collector = DummyCollector {
+            call_count: call_count.clone(),
+        };
+        let monitor = MonitorBuilder::default()
+            .with_collector(collector)
+            .with_sampling_interval(Duration::from_millis(100))
+            .spawn();
+
+        let mut rx = monitor.subscribe();
+
+        // Expect at least 3 ticks within 350ms
+        sleep(Duration::from_millis(350)).await;
+        assert!(call_count.load(Ordering::SeqCst) >= 3);
+
+        // Ensure we received some events
+        let mut snapshot_received = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                MonitorEvent::MetricsSnapshot(_) => {
+                    snapshot_received = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(snapshot_received, "did not receive metrics snapshot");
+
+        // Clean up
+        monitor.stop().await.unwrap();
+    }
+}
+```

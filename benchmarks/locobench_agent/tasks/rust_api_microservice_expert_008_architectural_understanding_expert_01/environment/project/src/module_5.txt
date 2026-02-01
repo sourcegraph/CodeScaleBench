@@ -1,0 +1,334 @@
+```rust
+//! src/module_5.rs
+//!
+//! Account Snapshot service layer (Command/Query) with
+//! pagination, Redis response-caching, request validation,
+//! structured logging and authorization enforcement.
+//!
+//! This module purposefully bundles Service + Repository traits
+//! in the same file to keep the example self-contained.  In a
+//! real project these would live in dedicated crates/modules.
+
+#![allow(clippy::unused_async)] // Example-only suppressions.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sqlx::{postgres::PgRow, PgPool, Row};
+use thiserror::Error;
+use tokio::time::timeout;
+use tracing::{error, instrument, warn};
+use uuid::Uuid;
+use validator::{Validate, ValidationErrors};
+
+// -------------------------------------------------------------------------------------------------
+// Domain model
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountSnapshot {
+    pub id:                Uuid,
+    pub tenant_id:         Uuid,
+    pub account_id:        Uuid,
+    pub balance_cents:     i64,
+    pub captured_at:       DateTime<Utc>,
+}
+
+// -------------------------------------------------------------------------------------------------
+// View-Model (DTO) returned to API gateway / controllers
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountSnapshotViewModel {
+    pub id:            Uuid,
+    pub balance_cents: i64,
+    pub captured_at:   DateTime<Utc>,
+}
+
+impl From<AccountSnapshot> for AccountSnapshotViewModel {
+    fn from(snap: AccountSnapshot) -> Self {
+        Self {
+            id: snap.id,
+            balance_cents: snap.balance_cents,
+            captured_at: snap.captured_at,
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Pagination helpers
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Validate)]
+pub struct PageRequest {
+    #[validate(range(min = 1, max = 500))]
+    pub page_size:  u16,
+
+    #[validate(range(min = 0))]
+    pub page_index: u64,
+}
+
+impl Default for PageRequest {
+    fn default() -> Self {
+        Self { page_size: 50, page_index: 0 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Paginated<T> {
+    pub items:      Vec<T>,
+    pub total:      u64,
+    pub page_index: u64,
+    pub page_size:  u16,
+}
+
+// -------------------------------------------------------------------------------------------------
+// AuthN + AuthZ context injected by API-gateway middleware
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct UserContext {
+    pub tenant_id: Uuid,
+    pub user_id:   Uuid,
+    pub roles:     Vec<String>,
+}
+
+// -------------------------------------------------------------------------------------------------
+// Errors
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation error")]
+    Validation(#[from] ValidationErrors),
+
+    #[error("forbidden")]
+    Forbidden,
+
+    #[error("database error")]
+    Db(#[from] sqlx::Error),
+
+    #[error("cache error: {0}")]
+    Cache(String),
+
+    #[error("unexpected error")]
+    Unexpected(#[from] anyhow::Error),
+}
+
+// -------------------------------------------------------------------------------------------------
+// Repository abstraction
+// -------------------------------------------------------------------------------------------------
+
+#[async_trait]
+pub trait AccountSnapshotRepository: Send + Sync {
+    async fn fetch_paginated(
+        &self,
+        tenant_id: Uuid,
+        account_id: Uuid,
+        page: &PageRequest,
+    ) -> Result<(Vec<AccountSnapshot>, u64 /* total */), sqlx::Error>;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Postgres implementation
+// -------------------------------------------------------------------------------------------------
+
+pub struct PgAccountSnapshotRepository {
+    pool: PgPool,
+}
+
+impl PgAccountSnapshotRepository {
+    pub fn new(pool: PgPool) -> Self { Self { pool } }
+}
+
+#[async_trait]
+impl AccountSnapshotRepository for PgAccountSnapshotRepository {
+    #[instrument(skip(self))]
+    async fn fetch_paginated(
+        &self,
+        tenant_id: Uuid,
+        account_id: Uuid,
+        page: &PageRequest,
+    ) -> Result<(Vec<AccountSnapshot>, u64), sqlx::Error> {
+        // sqlx doesn't support OFFSET with u64 directly; cast safely.
+        let offset = (page.page_index * page.page_size as u64) as i64;
+        let limit  = page.page_size as i64;
+
+        // Fetch total count & data in a single round-trip (CTE).
+        let rows: Vec<PgRow> = sqlx::query(
+            r#"
+            WITH cte AS (
+                SELECT *
+                FROM account_snapshots
+                WHERE tenant_id  = $1
+                  AND account_id = $2
+                ORDER BY captured_at DESC
+                OFFSET $3 LIMIT $4
+            )
+            SELECT
+                (SELECT COUNT(*) FROM account_snapshots WHERE tenant_id = $1 AND account_id = $2) AS total,
+                id,
+                balance_cents,
+                captured_at
+            FROM cte;
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(account_id)
+        .bind(offset)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let total = rows.get(0).map(|r| r.get::<i64, _>("total") as u64).unwrap_or(0);
+
+        let items = rows
+            .into_iter()
+            .map(|r| AccountSnapshot {
+                id:            r.get("id"),
+                tenant_id,
+                account_id,
+                balance_cents: r.get("balance_cents"),
+                captured_at:   r.get("captured_at"),
+            })
+            .collect();
+
+        Ok((items, total))
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Redis Caching
+// -------------------------------------------------------------------------------------------------
+
+pub struct RedisCache {
+    conn: redis::aio::ConnectionManager,
+}
+
+impl RedisCache {
+    pub async fn new(redis_url: &str) -> Result<Self, redis::RedisError> {
+        let client = redis::Client::open(redis_url)?;
+        let conn   = redis::aio::ConnectionManager::new(client).await?;
+        Ok(Self { conn })
+    }
+
+    async fn get<T: serde::de::DeserializeOwned>(&mut self, key: &str) -> redis::RedisResult<Option<T>> {
+        let val: Option<Vec<u8>> = self.conn.get(key).await?;
+        Ok(val.map(|raw| bincode::deserialize(&raw).ok()).flatten())
+    }
+
+    async fn set<T: Serialize>(&mut self, key: &str, value: &T, ttl: Duration) -> redis::RedisResult<()> {
+        let payload = bincode::serialize(value).map_err(|e| redis::RedisError::from((redis::ErrorKind::TypeError, e.to_string())))?;
+        self.conn.set_ex(key, payload, ttl.as_secs() as usize).await
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// AccountSnapshotService
+// -------------------------------------------------------------------------------------------------
+
+pub struct AccountSnapshotService<R: AccountSnapshotRepository> {
+    repo:  Arc<R>,
+    cache: Arc<tokio::sync::Mutex<RedisCache>>,
+}
+
+impl<R: AccountSnapshotRepository> AccountSnapshotService<R> {
+    pub fn new(repo: Arc<R>, cache: Arc<tokio::sync::Mutex<RedisCache>>) -> Self {
+        Self { repo, cache }
+    }
+
+    /// Returns paginated snapshots for a given account with
+    /// request-scoped caching (idempotent GET semantics).
+    #[instrument(skip_all, fields(tenant=%ctx.tenant_id, account=%account_id))]
+    pub async fn get_snapshots(
+        &self,
+        ctx: &UserContext,
+        account_id: Uuid,
+        page: PageRequest,
+    ) -> Result<Paginated<AccountSnapshotViewModel>, ServiceError> {
+        page.validate()?; // 1. request validation
+
+        // 2. Authorization check (make sure user is in the right tenant)
+        if ctx.tenant_id.is_nil() || ctx.tenant_id != ctx.tenant_id {
+            warn!("tenant id mismatch or nil");
+            return Err(ServiceError::Forbidden);
+        }
+
+        // 3. Build a deterministic cache key
+        let cache_key = {
+            let mut hasher = Sha256::new();
+            hasher.update(b"snapshots:");
+            hasher.update(ctx.tenant_id.as_bytes());
+            hasher.update(account_id.as_bytes());
+            hasher.update(page.page_size.to_be_bytes());
+            hasher.update(page.page_index.to_be_bytes());
+            format!("snapshots:{:x}", hasher.finalize())
+        };
+
+        // 4. Try Redis cache first
+        if let Ok(mut cache_guard) = self.cache.try_lock() {
+            match timeout(Duration::from_millis(20), cache_guard.get::<Paginated<AccountSnapshotViewModel>>(&cache_key)).await {
+                Ok(Ok(Some(cached))) => {
+                    tracing::debug!("cache hit");
+                    return Ok(cached);
+                }
+                Ok(Ok(None)) => tracing::debug!("cache miss"),
+                Ok(Err(e))   => error!(error = %e, "cache read error"),
+                Err(_)       => warn!("cache read timed out"),
+            }
+        }
+
+        // 5. Fallback to repository (Postgres)
+        let (records, total) = self
+            .repo
+            .fetch_paginated(ctx.tenant_id, account_id, &page)
+            .await
+            .map_err(ServiceError::Db)?;
+
+        let paginated = Paginated {
+            total,
+            page_index: page.page_index,
+            page_size:  page.page_size,
+            items:      records.into_iter().map(AccountSnapshotViewModel::from).collect(),
+        };
+
+        // 6. Populate cache asynchronously (fire-and-forget)
+        let cache_clone = Arc::clone(&self.cache);
+        let key_clone   = cache_key.clone();
+        let value_clone = paginated.clone();
+        tokio::spawn(async move {
+            if let Ok(mut cache) = cache_clone.lock().await.try_clone() {
+                if let Err(e) = cache.set(&key_clone, &value_clone, Duration::from_secs(30)).await {
+                    error!(error = %e, "failed to populate cache");
+                }
+            }
+        });
+
+        Ok(paginated)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Helper: Clone redis cache manager (hacky, but sufficient for example).
+// -------------------------------------------------------------------------------------------------
+
+trait CloneableRedisCache {
+    fn try_clone(&self) -> Result<RedisCache, redis::RedisError>;
+}
+
+impl CloneableRedisCache for RedisCache {
+    fn try_clone(&self) -> Result<RedisCache, redis::RedisError> {
+        // Redis client is cheaply cloneable; connection manager isn't, so we create a new manager
+        // using the original client's address.  This is a simplified implementation, suitable for
+        // demonstration purposes only.
+        let addr = self.conn.connection_info().addr.to_string();
+        futures::executor::block_on(Self::new(&addr))
+    }
+}
+```

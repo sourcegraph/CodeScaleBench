@@ -1,0 +1,286 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.SecretsManager;
+using Amazon.SecretsManager.Model;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformations.Strategies
+{
+    /// <summary>
+    /// Computes the "meeting cost index" from raw calendar events and enriches the payload with the
+    /// cost projection so that downstream KPI calculators can aggregate and surface the metric
+    /// in dashboards.
+    /// </summary>
+    public sealed class MeetingCostTransformationStrategy : ITransformationStrategy, IDisposable
+    {
+        private const string DefaultCurrency = "USD";
+
+        private readonly IAmazonSecretsManager _secretsManager;
+        private readonly ILogger<MeetingCostTransformationStrategy> _logger;
+        private readonly IEmployeeHourlyRateProvider _hourlyRateProvider;
+        private readonly JsonSerializerOptions _serializerOptions;
+        private bool _disposed;
+
+        public MeetingCostTransformationStrategy(
+            IAmazonSecretsManager secretsManager,
+            ILogger<MeetingCostTransformationStrategy> logger)
+            : this(secretsManager, logger, new CachedEmployeeHourlyRateProvider(secretsManager, logger))
+        {
+        }
+
+        internal MeetingCostTransformationStrategy(
+            IAmazonSecretsManager secretsManager,
+            ILogger<MeetingCostTransformationStrategy> logger,
+            IEmployeeHourlyRateProvider hourlyRateProvider)
+        {
+            _secretsManager = secretsManager ?? throw new ArgumentNullException(nameof(secretsManager));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _hourlyRateProvider = hourlyRateProvider ?? throw new ArgumentNullException(nameof(hourlyRateProvider));
+
+            _serializerOptions = new JsonSerializerOptions
+            {
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                WriteIndented = false
+            };
+        }
+
+        /// <inheritdoc />
+        public async ValueTask TransformAsync(Stream input, Stream output, CancellationToken token = default)
+        {
+            if (input is null) throw new ArgumentNullException(nameof(input));
+            if (output is null) throw new ArgumentNullException(nameof(output));
+
+            try
+            {
+                token.ThrowIfCancellationRequested();
+
+                var calendarEvent =
+                    await JsonSerializer.DeserializeAsync<CalendarEvent>(input, _serializerOptions, token)
+                    ?? throw new InvalidDataException(
+                        "Input stream does not contain a valid CalendarEvent JSON payload.");
+
+                token.ThrowIfCancellationRequested();
+
+                var cost = await CalculateCostAsync(calendarEvent, token);
+
+                var enriched = CalendarEventCostEnrichment.From(calendarEvent, cost, DefaultCurrency);
+
+                await JsonSerializer.SerializeAsync(output, enriched, _serializerOptions, token);
+
+                _logger.LogDebug(
+                    "Successfully transformed CalendarEvent {EventId} ⇒ Cost {Cost} {Currency}",
+                    calendarEvent.EventId,
+                    cost.ToString("C", CultureInfo.InvariantCulture),
+                    DefaultCurrency);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException ||
+                                       ex is InvalidDataException ||
+                                       ex is JsonException)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Unable to transform calendar event due to recoverable exception. The payload will be routed to DLQ.");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Fatal error while transforming calendar event.");
+                throw;
+            }
+        }
+
+        private async Task<decimal> CalculateCostAsync(CalendarEvent calendarEvent, CancellationToken token)
+        {
+            if (calendarEvent is null) throw new ArgumentNullException(nameof(calendarEvent));
+
+            if (calendarEvent.Attendees is null || calendarEvent.Attendees.Count == 0)
+            {
+                _logger.LogDebug(
+                    "CalendarEvent {EventId} has no attendees. Cost evaluation returns zero.",
+                    calendarEvent.EventId);
+                return 0m;
+            }
+
+            var duration = calendarEvent.EndUtc - calendarEvent.StartUtc;
+            if (duration <= TimeSpan.Zero)
+            {
+                _logger.LogDebug(
+                    "CalendarEvent {EventId} has invalid duration ({Duration}). Cost evaluation returns zero.",
+                    calendarEvent.EventId,
+                    duration);
+                return 0m;
+            }
+
+            decimal totalHourlyRate = 0m;
+            foreach (var attendee in calendarEvent.Attendees)
+            {
+                var rate = await _hourlyRateProvider.GetHourlyRateAsync(attendee.Email, token);
+                totalHourlyRate += rate;
+            }
+
+            var cost = totalHourlyRate * (decimal)duration.TotalHours;
+
+            _logger.LogTrace(
+                "Calculated cost {Cost} for CalendarEvent {EventId} (Duration: {Duration} hours, TotalHourlyRate: {Rate})",
+                cost,
+                calendarEvent.EventId,
+                duration.TotalHours,
+                totalHourlyRate);
+
+            return Math.Round(cost, 2, MidpointRounding.AwayFromZero);
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            (_hourlyRateProvider as IDisposable)?.Dispose();
+            _disposed = true;
+        }
+    }
+
+    /// <summary>
+    /// Provides the hourly rate for a given employee e-mail, pulling data from a secure secret
+    /// or cache to minimize API calls and latency.
+    /// </summary>
+    public interface IEmployeeHourlyRateProvider
+    {
+        Task<decimal> GetHourlyRateAsync(string employeeEmail, CancellationToken token = default);
+    }
+
+    /// <summary>
+    /// Implementation that caches results for 15 minutes to avoid hitting AWS Secrets Manager
+    /// for every invocation.
+    /// </summary>
+    internal sealed class CachedEmployeeHourlyRateProvider : IEmployeeHourlyRateProvider, IDisposable
+    {
+        private const string SecretName = "pulseops/employee/hourly-rates";
+        private static readonly TimeSpan CacheTtl = TimeSpan.FromMinutes(15);
+
+        private readonly IAmazonSecretsManager _secretsManager;
+        private readonly ILogger _logger;
+        private readonly Dictionary<string, (decimal Rate, DateTime ExpiresAtUtc)> _cache =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        private bool _disposed;
+
+        public CachedEmployeeHourlyRateProvider(IAmazonSecretsManager secretsManager, ILogger logger)
+        {
+            _secretsManager = secretsManager ?? throw new ArgumentNullException(nameof(secretsManager));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        public async Task<decimal> GetHourlyRateAsync(string employeeEmail, CancellationToken token = default)
+        {
+            if (string.IsNullOrWhiteSpace(employeeEmail))
+                throw new ArgumentException("Employee e-mail must be supplied.", nameof(employeeEmail));
+
+            token.ThrowIfCancellationRequested();
+
+            if (_cache.TryGetValue(employeeEmail, out var cached) && cached.ExpiresAtUtc > DateTime.UtcNow)
+            {
+                return cached.Rate;
+            }
+
+            var rate = await FetchHourlyRateFromSecretAsync(employeeEmail, token);
+            _cache[employeeEmail] = (rate, DateTime.UtcNow.Add(CacheTtl));
+            return rate;
+        }
+
+        private async Task<decimal> FetchHourlyRateFromSecretAsync(string employeeEmail, CancellationToken token)
+        {
+            try
+            {
+                var response = await _secretsManager.GetSecretValueAsync(
+                    new GetSecretValueRequest { SecretId = SecretName },
+                    token);
+
+                var dict = JsonSerializer.Deserialize<Dictionary<string, decimal>>(response.SecretString)
+                           ?? new(StringComparer.OrdinalIgnoreCase);
+
+                if (!dict.TryGetValue(employeeEmail, out var rate))
+                {
+                    _logger.LogWarning(
+                        "Hourly rate for e-mail {Email} not found in secret {SecretName}. Defaulting to 0.",
+                        employeeEmail,
+                        SecretName);
+                    return 0m;
+                }
+
+                return rate;
+            }
+            catch (ResourceNotFoundException ex)
+            {
+                _logger.LogError(ex, "Secret {SecretName} not found.", SecretName);
+                return 0m;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error while fetching secret {SecretName}.", SecretName);
+                throw;
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+        }
+    }
+
+    /// <summary>
+    /// Domain model representing a calendar event in PulseOps.
+    /// </summary>
+    /// <param name="EventId">Unique identifier of the event.</param>
+    /// <param name="StartUtc">Start timestamp (UTC).</param>
+    /// <param name="EndUtc">End timestamp (UTC).</param>
+    /// <param name="Attendees">Collection of attendees.</param>
+    public sealed record CalendarEvent(
+        string EventId,
+        DateTime StartUtc,
+        DateTime EndUtc,
+        List<CalendarAttendee> Attendees);
+
+    /// <summary>
+    /// Domain model representing a calendar event attendee.
+    /// </summary>
+    /// <param name="Email">Attendee e-mail address.</param>
+    public sealed record CalendarAttendee(string Email);
+
+    /// <summary>
+    /// DTO emitted after transformation adding cost information.
+    /// </summary>
+    public sealed record CalendarEventCostEnrichment
+    {
+        public string EventId { get; init; } = null!;
+        public DateTime StartUtc { get; init; }
+        public DateTime EndUtc { get; init; }
+        public IReadOnlyCollection<CalendarAttendee> Attendees { get; init; } = Array.Empty<CalendarAttendee>();
+        public decimal Cost { get; init; }
+        public string Currency { get; init; } = null!;
+
+        public static CalendarEventCostEnrichment From(CalendarEvent source, decimal cost, string currency) =>
+            new()
+            {
+                EventId = source.EventId,
+                StartUtc = source.StartUtc,
+                EndUtc = source.EndUtc,
+                Attendees = source.Attendees,
+                Cost = cost,
+                Currency = currency
+            };
+    }
+
+    /// <summary>
+    /// Contract every transformation strategy must implement so the ETL pipeline can
+    /// dynamically resolve and execute the correct business rule at runtime.
+    /// </summary>
+    public interface ITransformationStrategy
+    {
+        ValueTask TransformAsync(Stream input, Stream output, CancellationToken token = default);
+    }
+}

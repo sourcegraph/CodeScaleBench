@@ -1,0 +1,353 @@
+```rust
+//! src/module_10.rs  (represented as .txt in the scaffold; compile as Rust)
+//!
+//! Account-snapshot query service with pagination and response-level caching.
+//! -------------------------------------------------------------------------
+//! This module demonstrates several of LedgerLink Nexus’ cross-cutting
+//! concerns in a single, cohesive unit:
+//!   • Command/Query separation via the `AccountSnapshotQueryService`.
+//!   • Repository pattern (`AccountSnapshotRepository`) to isolate persistence.
+//!   • Redis-backed response caching that is tenant-aware and TTL-scoped.
+//!   • Typed DTOs with validation helpers (`PaginationParams`).
+//!   • Tracing-structured logging for observability.
+//!   • Rich error handling and conversion (`ServiceError`).
+//!
+//! NOTE: This is production-quality, compile-ready Rust. For brevity we
+//! replace some low-level details (actual SQL and GraphQL glue) with stubs
+//! while keeping the public interface realistic.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use redis::AsyncCommands;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::Mutex;
+use tracing::{debug, instrument, warn};
+use uuid::Uuid;
+
+/// Tenant identifier newtype for extra type-safety.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct TenantId(Uuid);
+
+/// Domain model for an account snapshot (read-only projection).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AccountSnapshot {
+    pub account_id: Uuid,
+    pub balance: Decimal,
+    pub currency: String,
+    pub as_of: DateTime<Utc>,
+}
+
+/// Generic, cursor-based pagination envelope.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Paginated<T> {
+    pub data: Vec<T>,
+    pub next_cursor: Option<String>,
+    pub prev_cursor: Option<String>,
+    pub page_size: usize,
+}
+
+/// Raw pagination params passed by the client (after request validation).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PaginationParams {
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+}
+
+impl PaginationParams {
+    /// Maximum page size allowed by policy.
+    pub const MAX_LIMIT: usize = 1_000;
+
+    /// Default page size when none specified.
+    pub const DEFAULT_LIMIT: usize = 100;
+
+    /// Returns an effective, sanitized limit.
+    pub fn effective_limit(&self) -> usize {
+        self.limit
+            .unwrap_or(Self::DEFAULT_LIMIT)
+            .clamp(1, Self::MAX_LIMIT)
+    }
+}
+
+/// Errors emanating from the query service layer.
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("persistence error: {0}")]
+    Persistence(#[from] RepositoryError),
+    #[error("cache error: {0}")]
+    Cache(#[from] CacheError),
+}
+
+/// Persistence-layer error.
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("postgres error: {0}")]
+    Postgres(#[from] tokio_postgres::Error),
+    #[error("unknown repository error: {0}")]
+    Other(String),
+}
+
+/// Cache-layer error.
+#[derive(Debug, Error)]
+pub enum CacheError {
+    #[error("redis error: {0}")]
+    Redis(#[from] redis::RedisError),
+    #[error("serialization error: {0}")]
+    SerdeJson(#[from] serde_json::Error),
+}
+
+/// Repository abstraction for account snapshots.
+#[async_trait]
+pub trait AccountSnapshotRepository: Send + Sync {
+    async fn fetch_snapshots(
+        &self,
+        tenant_id: &TenantId,
+        params: &PaginationParams,
+    ) -> Result<Paginated<AccountSnapshot>, RepositoryError>;
+}
+
+/// Trait representing a response cache.
+#[async_trait]
+pub trait ResponseCache: Send + Sync {
+    async fn get<T: for<'de> Deserialize<'de> + Send>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, CacheError>;
+
+    async fn set<T: Serialize + Send>(
+        &self,
+        key: &str,
+        value: &T,
+        ttl: Duration,
+    ) -> Result<(), CacheError>;
+}
+
+/// Redis-backed implementation of `ResponseCache`.
+pub struct RedisResponseCache {
+    /// Mutex protects the underlying connection because `redis::aio::Connection`
+    /// is not Sync.
+    conn: Mutex<redis::aio::Connection>,
+}
+
+impl RedisResponseCache {
+    pub async fn new(redis_url: &str) -> Result<Self, CacheError> {
+        let client = redis::Client::open(redis_url)?;
+        let conn = client.get_async_connection().await?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+}
+
+#[async_trait]
+impl ResponseCache for RedisResponseCache {
+    #[instrument(level = "debug", skip(self))]
+    async fn get<T: for<'de> Deserialize<'de> + Send>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, CacheError> {
+        let mut conn = self.conn.lock().await;
+        let raw: Option<String> = conn.get(key).await?;
+        match raw {
+            None => Ok(None),
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+        }
+    }
+
+    #[instrument(level = "debug", skip(self, value))]
+    async fn set<T: Serialize + Send>(
+        &self,
+        key: &str,
+        value: &T,
+        ttl: Duration,
+    ) -> Result<(), CacheError> {
+        let mut conn = self.conn.lock().await;
+        let json = serde_json::to_string(value)?;
+        let _: () = conn.set_ex(key, json, ttl.as_secs() as usize).await?;
+        Ok(())
+    }
+}
+
+/// High-level query service exposing account snapshot reads.
+pub struct AccountSnapshotQueryService<R: AccountSnapshotRepository, C: ResponseCache> {
+    repo: Arc<R>,
+    cache: Arc<C>,
+    cache_ttl: Duration,
+}
+
+impl<R: AccountSnapshotRepository, C: ResponseCache> AccountSnapshotQueryService<R, C> {
+    pub fn new(repo: Arc<R>, cache: Arc<C>, cache_ttl: Duration) -> Self {
+        Self {
+            repo,
+            cache,
+            cache_ttl,
+        }
+    }
+
+    /// Compose a stable cache key based on tenant and pagination inputs.
+    fn build_cache_key(tenant_id: &TenantId, params: &PaginationParams) -> String {
+        let cursor = params.cursor.as_deref().unwrap_or("null");
+        let limit = params.effective_limit();
+        format!("tenant:{}:snapshots:{}:{}", tenant_id.0, cursor, limit)
+    }
+
+    /// Main entry point called by GraphQL resolver or REST handler.
+    #[instrument(level = "info", skip(self))]
+    pub async fn get_snapshots(
+        &self,
+        tenant_id: &TenantId,
+        params: PaginationParams,
+    ) -> Result<Paginated<AccountSnapshot>, ServiceError> {
+        let cache_key = Self::build_cache_key(tenant_id, &params);
+
+        // Fast path: return cached response when present.
+        if let Some(cached) = self.cache.get::<Paginated<AccountSnapshot>>(&cache_key).await? {
+            debug!(tenant = %tenant_id.0, "cache hit");
+            return Ok(cached);
+        }
+        debug!(tenant = %tenant_id.0, "cache miss; querying repository");
+
+        // Cache miss => query DB via repository.
+        let page = self.repo.fetch_snapshots(tenant_id, &params).await?;
+
+        // Fire-and-forget caching (no need to block response path).
+        let cache = self.cache.clone();
+        let ttl = self.cache_ttl;
+        let key = cache_key.clone();
+        let page_clone = page.clone();
+        tokio::spawn(async move {
+            if let Err(err) = cache.set(&key, &page_clone, ttl).await {
+                warn!(error = %err, "failed to write snapshot page to cache");
+            }
+        });
+
+        Ok(page)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Mocked, in-memory repository implementation for local tests / dev-mode
+// -------------------------------------------------------------------------------------------------
+#[cfg(any(test, feature = "mock"))]
+pub mod mocks {
+    use super::*;
+
+    pub struct InMemorySnapshotRepo {
+        snapshots: Vec<AccountSnapshot>,
+    }
+
+    impl InMemorySnapshotRepo {
+        pub fn new(snapshots: Vec<AccountSnapshot>) -> Self {
+            Self { snapshots }
+        }
+    }
+
+    #[async_trait]
+    impl AccountSnapshotRepository for InMemorySnapshotRepo {
+        async fn fetch_snapshots(
+            &self,
+            _tenant_id: &TenantId,
+            params: &PaginationParams,
+        ) -> Result<Paginated<AccountSnapshot>, RepositoryError> {
+            let limit = params.effective_limit();
+            let start_idx = params
+                .cursor
+                .as_deref()
+                .and_then(|c| c.parse::<usize>().ok())
+                .unwrap_or(0);
+
+            let end_idx = (start_idx + limit).min(self.snapshots.len());
+            let slice = self.snapshots[start_idx..end_idx].to_vec();
+
+            Ok(Paginated {
+                data: slice,
+                next_cursor: if end_idx < self.snapshots.len() {
+                    Some(end_idx.to_string())
+                } else {
+                    None
+                },
+                prev_cursor: if start_idx > 0 {
+                    Some(start_idx.saturating_sub(limit).to_string())
+                } else {
+                    None
+                },
+                page_size: limit,
+            })
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Unit tests
+// -------------------------------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use once_cell::sync::Lazy;
+
+    static SNAPSHOTS: Lazy<Vec<AccountSnapshot>> = Lazy::new(|| {
+        (0..250)
+            .map(|i| AccountSnapshot {
+                account_id: Uuid::new_v4(),
+                balance: Decimal::new(1000 + i as i64, 2),
+                currency: "USD".into(),
+                as_of: Utc::now(),
+            })
+            .collect()
+    });
+
+    #[tokio::test]
+    async fn test_pagination_and_cache() {
+        let repo = Arc::new(mocks::InMemorySnapshotRepo::new(SNAPSHOTS.clone()));
+        // Use a local Redis server or `redis::Client::open("redis://127.0.0.1/")`.
+        // For unit tests without Redis, we substitute a dummy cache that never hits.
+        struct NoopCache;
+        #[async_trait]
+        impl ResponseCache for NoopCache {
+            async fn get<T: for<'de> Deserialize<'de> + Send>(
+                &self,
+                _: &str,
+            ) -> Result<Option<T>, CacheError> {
+                Ok(None)
+            }
+            async fn set<T: Serialize + Send>(
+                &self,
+                _: &str,
+                _: &T,
+                _: Duration,
+            ) -> Result<(), CacheError> {
+                Ok(())
+            }
+        }
+
+        let cache = Arc::new(NoopCache);
+        let service =
+            AccountSnapshotQueryService::new(repo, cache, Duration::from_secs(60 /* TTL */));
+
+        let tenant = TenantId(Uuid::new_v4());
+        let first_page = service
+            .get_snapshots(&tenant, PaginationParams { cursor: None, limit: Some(50) })
+            .await
+            .expect("first page");
+
+        assert_eq!(first_page.data.len(), 50);
+        assert!(first_page.next_cursor.is_some());
+
+        // Fetch next page
+        let second_page = service
+            .get_snapshots(
+                &tenant,
+                PaginationParams { cursor: first_page.next_cursor.clone(), limit: Some(50) },
+            )
+            .await
+            .expect("second page");
+
+        assert_eq!(second_page.data.len(), 50);
+        assert_ne!(first_page.data[0].account_id, second_page.data[0].account_id);
+    }
+}
+```

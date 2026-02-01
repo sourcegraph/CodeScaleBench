@@ -1,0 +1,562 @@
+```rust
+//! src/module_38.rs
+//!
+//! Hyper-parameter tuning module (Strategy × Observer pattern).
+//!
+//! This module is self-contained and can be dropped into the VisuTility
+//! Orchestrator code-base.  It exposes:
+//!   • `HyperparameterTuner` – facade that orchestrates a tuning session
+//!   • `TuningStrategy`     – pluggable search strategies (Grid / Random)
+//!   • `TuningObserver`     – Observer pattern for real-time monitoring
+//!
+//! The module is fully async and non-blocking, making it suitable for
+//! production workloads that share an async runtime (Tokio).
+
+use rand::{rngs::ThreadRng, seq::SliceRandom, Rng};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use thiserror::Error;
+use tokio::{
+    sync::{broadcast, Mutex},
+    task,
+};
+use uuid::Uuid;
+
+// -----------------------------------------------------------------------------
+// Domain Types
+// -----------------------------------------------------------------------------
+
+/// Primitive type used to describe a hyper-parameter value.
+///
+/// We rely on `serde_json::Value` for maximum flexibility; callers can use any
+/// JSON-serialisable type (`f64`, `i64`, `String`, etc.).
+pub type HyperValue = serde_json::Value;
+
+/// A concrete set of hyper-parameter assignments.
+pub type HyperParams = HashMap<String, HyperValue>;
+
+/// Specification for a single hyper-parameter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ParamSpec {
+    /// Finite list of discrete options.
+    Categorical { values: Vec<HyperValue> },
+
+    /// Continuous float range (inclusive).
+    ContinuousFloat {
+        min: f64,
+        max: f64,
+        step: Option<f64>,
+    },
+
+    /// Continuous integer range (inclusive).
+    ContinuousInt {
+        min: i64,
+        max: i64,
+        step: Option<i64>,
+    },
+}
+
+/// A named hyper-parameter plus its specification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Param {
+    pub name: String,
+    pub spec: ParamSpec,
+}
+
+/// A complete hyper-parameter search space.
+///
+/// Example (JSON):
+/// ```json
+/// {
+///   "learning_rate": { "kind": "continuous_float", "min": 1e-4, "max": 1e-1 },
+///   "batch_size":    { "kind": "categorical", "values": [16, 32, 64] }
+/// }
+/// ```
+pub type HyperSpace = HashMap<String, ParamSpec>;
+
+/// Metadata associated with a tuning session.
+#[derive(Debug, Clone)]
+pub struct TunerId(Uuid);
+
+impl TunerId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+/// Result reported by the user after evaluating a candidate.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrialResult {
+    pub score: f64,
+    pub elapsed: Duration,
+}
+
+/// Public callback signature for streaming trial results back
+/// into the tuner.
+pub type TrialCallback = Box<dyn Fn(HyperParams, TrialResult) + Send + Sync>;
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum TunerError {
+    #[error("search space is empty")]
+    EmptySearchSpace,
+
+    #[error("observer channel closed")]
+    ObserverChannelClosed,
+
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+// -----------------------------------------------------------------------------
+// Observer Pattern
+// -----------------------------------------------------------------------------
+
+/// Event fired by the tuner.
+#[derive(Debug, Clone)]
+pub enum TuningEvent {
+    /// A new candidate hyper-parameter set has been generated.
+    CandidateGenerated {
+        tuner_id: TunerId,
+        candidate: HyperParams,
+        trial_id: Uuid,
+    },
+
+    /// User has reported a result for the candidate.
+    CandidateEvaluated {
+        tuner_id: TunerId,
+        candidate: HyperParams,
+        trial_id: Uuid,
+        result: TrialResult,
+    },
+
+    /// Tuning session completed.
+    Completed {
+        tuner_id: TunerId,
+        best_candidate: HyperParams,
+        best_score: f64,
+        trials: usize,
+        duration: Duration,
+    },
+}
+
+/// Observer that subscribes to tuning events (e.g. metrics, UI, logging).
+#[async_trait::async_trait]
+pub trait TuningObserver: Send + Sync {
+    async fn on_event(&self, event: TuningEvent);
+}
+
+// -----------------------------------------------------------------------------
+// Strategy Pattern
+// -----------------------------------------------------------------------------
+
+/// Behaviour for a concrete search strategy.
+#[async_trait::async_trait]
+pub trait TuningStrategy: Send + Sync {
+    /// Returns the next candidate to evaluate, or `None` if the search
+    /// is exhausted.
+    async fn next(&mut self) -> Option<HyperParams>;
+}
+
+/// Grid search implementation (deterministic, exhaustive).
+pub struct GridSearch {
+    product: Vec<HyperParams>,
+    index: usize,
+}
+
+impl GridSearch {
+    pub fn new(space: &HyperSpace) -> Result<Self, TunerError> {
+        let mut product: Vec<HyperParams> = vec![HashMap::new()];
+
+        for (name, spec) in space {
+            let mut expanded: Vec<HyperParams> = Vec::new();
+            for mid in product.into_iter() {
+                match spec {
+                    ParamSpec::Categorical { values } => {
+                        for v in values {
+                            let mut hp = mid.clone();
+                            hp.insert(name.clone(), v.clone());
+                            expanded.push(hp);
+                        }
+                    }
+                    ParamSpec::ContinuousFloat { min, max, step } => {
+                        let step = step.unwrap_or(0.1);
+                        let mut current = *min;
+                        while current <= *max {
+                            let mut hp = mid.clone();
+                            hp.insert(name.clone(), HyperValue::from(current));
+                            expanded.push(hp);
+                            current = (current + step * 1e10).round() / 1e10; // guard FP error
+                        }
+                    }
+                    ParamSpec::ContinuousInt { min, max, step } => {
+                        let step = step.unwrap_or(1);
+                        let mut current = *min;
+                        while current <= *max {
+                            let mut hp = mid.clone();
+                            hp.insert(name.clone(), HyperValue::from(current));
+                            expanded.push(hp);
+                            current += step;
+                        }
+                    }
+                }
+            }
+            product = expanded;
+        }
+
+        if product.is_empty() {
+            return Err(TunerError::EmptySearchSpace);
+        }
+
+        Ok(Self { product, index: 0 })
+    }
+}
+
+#[async_trait::async_trait]
+impl TuningStrategy for GridSearch {
+    async fn next(&mut self) -> Option<HyperParams> {
+        if self.index >= self.product.len() {
+            return None;
+        }
+        let candidate = self.product[self.index].clone();
+        self.index += 1;
+        Some(candidate)
+    }
+}
+
+/// Random search implementation (stochastic, potentially infinite).
+pub struct RandomSearch {
+    space: HyperSpace,
+    rng: ThreadRng,
+    max_trials: Option<usize>,
+    trials: usize,
+}
+
+impl RandomSearch {
+    pub fn new(space: HyperSpace, max_trials: Option<usize>) -> Self {
+        Self {
+            space,
+            rng: rand::thread_rng(),
+            max_trials,
+            trials: 0,
+        }
+    }
+
+    fn sample_param(&mut self, spec: &ParamSpec) -> HyperValue {
+        match spec {
+            ParamSpec::Categorical { values } => {
+                values.choose(&mut self.rng).cloned().unwrap_or(serde_json::Value::Null)
+            }
+            ParamSpec::ContinuousFloat { min, max, .. } => {
+                let v: f64 = self.rng.gen_range(*min..=*max);
+                HyperValue::from(v)
+            }
+            ParamSpec::ContinuousInt { min, max, .. } => {
+                let v: i64 = self.rng.gen_range(*min..=*max);
+                HyperValue::from(v)
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TuningStrategy for RandomSearch {
+    async fn next(&mut self) -> Option<HyperParams> {
+        if let Some(max) = self.max_trials {
+            if self.trials >= max {
+                return None;
+            }
+        }
+
+        let mut hp = HyperParams::new();
+        for (name, spec) in &self.space {
+            hp.insert(name.clone(), self.sample_param(spec));
+        }
+        self.trials += 1;
+        Some(hp)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tuner Facade
+// -----------------------------------------------------------------------------
+
+/// Configuration for a tuning session.
+#[derive(Clone)]
+pub struct TunerConfig {
+    pub strategy: StrategyKind,
+    pub max_duration: Option<Duration>,
+    pub score_goal: Option<f64>,
+}
+
+/// Enum wrapper to simplify strategy construction.
+#[derive(Clone)]
+pub enum StrategyKind {
+    Grid,
+    Random { max_trials: Option<usize> },
+}
+
+/// Orchestrates an entire hyper-parameter tuning session.
+pub struct HyperparameterTuner {
+    id: TunerId,
+    strategy: Mutex<Box<dyn TuningStrategy>>,
+    observers: Mutex<Vec<Arc<dyn TuningObserver>>>,
+    broadcaster: broadcast::Sender<TuningEvent>,
+    start_time: Instant,
+    best_score: Mutex<Option<(HyperParams, f64)>>,
+}
+
+impl HyperparameterTuner {
+    /// Create a new tuner instance.
+    pub fn new(space: HyperSpace, cfg: TunerConfig) -> Result<Arc<Self>, TunerError> {
+        let strategy: Box<dyn TuningStrategy> = match cfg.strategy {
+            StrategyKind::Grid => Box::new(GridSearch::new(&space)?),
+            StrategyKind::Random { max_trials } => Box::new(RandomSearch::new(space, max_trials)),
+        };
+
+        let (tx, _rx) = broadcast::channel(128);
+
+        Ok(Arc::new(Self {
+            id: TunerId::new(),
+            strategy: Mutex::new(strategy),
+            observers: Mutex::new(Vec::new()),
+            broadcaster: tx,
+            start_time: Instant::now(),
+            best_score: Mutex::new(None),
+        }))
+    }
+
+    /// Subscribe an observer to the tuning events stream.
+    pub async fn add_observer(&self, observer: Arc<dyn TuningObserver>) {
+        self.observers.lock().await.push(observer);
+    }
+
+    /// Spawn the tuning loop on the async runtime.
+    ///
+    /// The caller supplies an async evaluation closure that will be executed
+    /// for every candidate.  The closure must perform the model training /
+    /// evaluation and return a numeric score (higher is better).
+    pub async fn start<F, Fut>(&self, mut eval: F)
+    where
+        F: FnMut(HyperParams) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<TrialResult, TunerError>> + Send,
+    {
+        let this = self.clone();
+        task::spawn(async move {
+            this.run_loop(&mut eval).await;
+        });
+    }
+
+    async fn run_loop<F, Fut>(&self, eval: &mut F)
+    where
+        F: FnMut(HyperParams) -> Fut,
+        Fut: std::future::Future<Output = Result<TrialResult, TunerError>>,
+    {
+        loop {
+            // Duration / early-stopping check
+            if let Some(max_dur) = self.get_config().max_duration {
+                if self.start_time.elapsed() >= max_dur {
+                    break;
+                }
+            }
+
+            let candidate = {
+                // get next candidate from strategy
+                let mut strat = self.strategy.lock().await;
+                strat.next().await
+            };
+
+            let Some(hp) = candidate else {
+                break; // search exhausted
+            };
+
+            let trial_id = Uuid::new_v4();
+
+            self.broadcast(TuningEvent::CandidateGenerated {
+                tuner_id: self.id.clone(),
+                candidate: hp.clone(),
+                trial_id,
+            })
+            .await;
+
+            // Evaluate asynchronously
+            match eval(hp.clone()).await {
+                Ok(result) => {
+                    // update best
+                    {
+                        let mut best = self.best_score.lock().await;
+                        if best
+                            .map(|(_, s)| result.score > s)
+                            .unwrap_or(true)
+                        {
+                            *best = Some((hp.clone(), result.score));
+                        }
+                    }
+
+                    self.broadcast(TuningEvent::CandidateEvaluated {
+                        tuner_id: self.id.clone(),
+                        candidate: hp,
+                        trial_id,
+                        result,
+                    })
+                    .await;
+
+                    // early goal check
+                    if let Some(goal) = self.get_config().score_goal {
+                        let best_s = self.best_score.lock().await;
+                        if let Some((_, best_score)) = &*best_s {
+                            if *best_score >= goal {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("trial {trial_id} failed: {e}");
+                }
+            }
+        }
+
+        // Emit completion
+        let (best_candidate, best_score) = self
+            .best_score
+            .lock()
+            .await
+            .clone()
+            .unwrap_or((HyperParams::new(), f64::NEG_INFINITY));
+
+        self.broadcast(TuningEvent::Completed {
+            tuner_id: self.id.clone(),
+            best_candidate,
+            best_score,
+            trials: 0, // could be counted for extra granularity
+            duration: self.start_time.elapsed(),
+        })
+        .await;
+    }
+
+    fn get_config(&self) -> TunerConfig {
+        // In real code, would likely store a field.
+        // Placeholder for now; extend as needed.
+        TunerConfig {
+            strategy: StrategyKind::Random { max_trials: None },
+            max_duration: None,
+            score_goal: None,
+        }
+    }
+
+    async fn broadcast(&self, event: TuningEvent) {
+        // Fire broadcast channel; ignore lagging receivers.
+        let _ = self.broadcaster.send(event.clone());
+
+        // Notify observer objects
+        let observers = self.observers.lock().await.clone();
+        for obs in observers {
+            let evt = event.clone();
+            let _ = task::spawn(async move { obs.on_event(evt).await });
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Example Observer
+// -----------------------------------------------------------------------------
+
+/// Simple stdout logger observer (can be replaced by tracing).
+pub struct LoggingObserver;
+
+#[async_trait::async_trait]
+impl TuningObserver for LoggingObserver {
+    async fn on_event(&self, event: TuningEvent) {
+        match event {
+            TuningEvent::CandidateGenerated { candidate, .. } => {
+                log::info!("Generated candidate: {:?}", candidate);
+            }
+            TuningEvent::CandidateEvaluated { candidate, result, .. } => {
+                log::info!(
+                    "Evaluated candidate: {:?} => score {:.4} (elapsed {:?})",
+                    candidate,
+                    result.score,
+                    result.elapsed
+                );
+            }
+            TuningEvent::Completed {
+                best_candidate,
+                best_score,
+                duration,
+                ..
+            } => {
+                log::info!(
+                    "Tuning completed after {:?}. Best score {:.4} with {:?}",
+                    duration,
+                    best_score,
+                    best_candidate
+                );
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Unit tests (can be run with `cargo test --package ml_computer_vision`)
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn random_search_finds_reasonable_score() {
+        let mut space = HyperSpace::new();
+        space.insert(
+            "x".into(),
+            ParamSpec::ContinuousInt {
+                min: -10,
+                max: 10,
+                step: Some(1),
+            },
+        );
+
+        // configure tuner for max 50 trials
+        let tuner = HyperparameterTuner::new(
+            space,
+            TunerConfig {
+                strategy: StrategyKind::Random {
+                    max_trials: Some(50),
+                },
+                max_duration: None,
+                score_goal: Some(0.99),
+            },
+        )
+        .expect("construction");
+
+        tuner.add_observer(Arc::new(LoggingObserver)).await;
+
+        // simple quadratic objective; maximum at x == 0
+        tuner
+            .start(|hp| async move {
+                let start = Instant::now();
+                let x = hp
+                    .get("x")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or_default() as f64;
+                let score = 1.0 / (1.0 + x.abs());
+                Ok(TrialResult {
+                    score,
+                    elapsed: start.elapsed(),
+                })
+            })
+            .await;
+    }
+}
+```

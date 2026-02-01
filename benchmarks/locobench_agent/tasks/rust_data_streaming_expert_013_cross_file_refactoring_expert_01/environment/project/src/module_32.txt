@@ -1,0 +1,476 @@
+```rust
+//! src/module_32.rs
+//!
+//! Data-Quality Gate micro-service for ChirpPulse
+//! ----------------------------------------------------
+//! This service consumes raw social-stream events from a Kafka
+//! topic, validates them against a configurable set of rules, and
+//! republishes either a “clean” event or a validation-error report.
+//!
+//! Architectural highlights
+//! ------------------------
+//! •  Strategy Pattern       – validation rules are hot-swappable.
+//! •  Observer Pattern       – metrics/logging subscribers.
+//! •  Self-healing Consumer  – automatic rebalancing & back-off.
+//! •  Async/Streaming        – powered by `tokio` & `rdkafka`.
+//!
+//! Build features
+//! --------------
+//! `cargo build --features "otel"` enables OpenTelemetry metrics.
+
+#![allow(clippy::redundant_closure_call)]
+
+use std::{
+    collections::HashMap,
+    env,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use futures::{stream::StreamExt, FutureExt};
+use lazy_static::lazy_static;
+use metrics::{counter, histogram};
+use rdkafka::{
+    consumer::{CommitMode, Consumer, StreamConsumer},
+    error::KafkaError,
+    message::{BorrowedMessage, OwnedHeaders},
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Message,
+};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tokio::{select, signal, task, time};
+
+/// ----------- Configuration --------------------------------------------------
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct QualityGateConfig {
+    pub kafka_brokers: String,
+    pub input_topic: String,
+    pub output_topic: String,
+    pub group_id: String,
+    #[serde(default = "default_max_batch_interval_ms")]
+    pub max_batch_interval_ms: u64,
+    #[serde(default = "default_validation_timeout_ms")]
+    pub validation_timeout_ms: u64,
+}
+
+fn default_max_batch_interval_ms() -> u64 {
+    2_000
+}
+fn default_validation_timeout_ms() -> u64 {
+    100
+}
+
+impl QualityGateConfig {
+    /// Load configuration from `<PREFIX>_` environment variables or fall back
+    /// to defaults. An optional JSON file path can also be supplied via the
+    /// `CHIRP_CONF` environment variable for declarative deployment setups.
+    pub fn from_env(prefix: &str) -> Result<Self> {
+        let json_file = env::var("CHIRP_CONF").ok();
+        if let Some(path) = json_file {
+            let cfg = std::fs::read_to_string(path)
+                .with_context(|| "Failed reading CHIRP_CONF json")?;
+            let mut cfg: QualityGateConfig = serde_json::from_str(&cfg)?;
+            // Environment variables override file settings
+            cfg.update_from_env(prefix)?;
+            Ok(cfg)
+        } else {
+            let mut cfg: QualityGateConfig = serde_json::from_value(json!({}))?;
+            cfg.update_from_env(prefix)?;
+            Ok(cfg)
+        }
+    }
+
+    fn update_from_env(&mut self, prefix: &str) -> Result<()> {
+        macro_rules! up {
+            ($field:ident) => {
+                let key = format!("{}_{}", prefix, stringify!($field).to_uppercase());
+                if let Ok(val) = env::var(&key) {
+                    self.$field = val;
+                }
+            };
+        }
+        up!(kafka_brokers);
+        up!(input_topic);
+        up!(output_topic);
+        up!(group_id);
+        if self.kafka_brokers.is_empty() {
+            return Err(anyhow!("kafka_brokers missing in config/env"));
+        }
+        Ok(())
+    }
+}
+
+/// ----------- Validation Strategy -------------------------------------------
+
+/// A `QualityRule` checks a JSON payload for compliance.
+#[async_trait]
+pub trait QualityRule: Send + Sync {
+    fn name(&self) -> &str;
+
+    /// Validate a single record. Return Ok(()) on success or a `RuleViolation`
+    /// with additional context.
+    async fn validate(&self, record: &Value) -> std::result::Result<(), RuleViolation>;
+}
+
+/// Rich violation metadata.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RuleViolation {
+    pub rule: String,
+    pub field: String,
+    pub description: String,
+}
+
+/// Composite rule engine (strategy pattern).
+#[derive(Clone)]
+pub struct QualityEngine {
+    rules: Arc<Vec<Arc<dyn QualityRule>>>,
+}
+
+impl QualityEngine {
+    pub fn new<R: QualityRule + 'static>(rules: Vec<R>) -> Self {
+        Self {
+            rules: Arc::new(rules.into_iter().map(|r| Arc::new(r) as _).collect()),
+        }
+    }
+
+    /// Evaluate all rules, short-circuiting after the first failure if
+    /// `stop_on_first` is true.
+    pub async fn check(
+        &self,
+        record: &Value,
+        stop_on_first: bool,
+        timeout: Duration,
+    ) -> std::result::Result<(), Vec<RuleViolation>> {
+        let mut violations = Vec::new();
+
+        for rule in self.rules.iter() {
+            let name = rule.name().to_owned();
+            let fut = rule.validate(record);
+            let outcome = time::timeout(timeout, fut)
+                .await
+                .map_err(|_| RuleViolation {
+                    rule: name.clone(),
+                    field: "<timeout>".into(),
+                    description: "Rule timed out".into(),
+                })?;
+
+            if let Err(e) = outcome {
+                violations.push(e);
+                if stop_on_first {
+                    break;
+                }
+            }
+        }
+
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
+    }
+}
+
+/// ----------- Built-in Rules -------------------------------------------------
+
+/// Ensure a field is present and not empty/null.
+pub struct NonEmptyFieldRule {
+    field: String,
+}
+impl NonEmptyFieldRule {
+    pub fn new(field: impl Into<String>) -> Self {
+        Self { field: field.into() }
+    }
+}
+#[async_trait]
+impl QualityRule for NonEmptyFieldRule {
+    fn name(&self) -> &str {
+        "NonEmptyField"
+    }
+
+    async fn validate(&self, record: &Value) -> std::result::Result<(), RuleViolation> {
+        match record.get(&self.field) {
+            Some(Value::String(s)) if !s.trim().is_empty() => Ok(()),
+            Some(_) => Err(RuleViolation {
+                rule: self.name().to_string(),
+                field: self.field.clone(),
+                description: "Field is empty".into(),
+            }),
+            None => Err(RuleViolation {
+                rule: self.name().to_string(),
+                field: self.field.clone(),
+                description: "Field missing".into(),
+            }),
+        }
+    }
+}
+
+/// Validate a field matches regex.
+pub struct RegexFieldRule {
+    field: String,
+    pattern: Regex,
+}
+impl RegexFieldRule {
+    pub fn new(field: impl Into<String>, pattern: Regex) -> Self {
+        Self {
+            field: field.into(),
+            pattern,
+        }
+    }
+}
+#[async_trait]
+impl QualityRule for RegexFieldRule {
+    fn name(&self) -> &str {
+        "RegexField"
+    }
+
+    async fn validate(&self, record: &Value) -> std::result::Result<(), RuleViolation> {
+        match record.get(&self.field) {
+            Some(Value::String(s)) if self.pattern.is_match(s) => Ok(()),
+            Some(_) => Err(RuleViolation {
+                rule: self.name().to_string(),
+                field: self.field.clone(),
+                description: format!("Value does not match pattern {}", self.pattern),
+            }),
+            None => Err(RuleViolation {
+                rule: self.name().to_string(),
+                field: self.field.clone(),
+                description: "Field missing".into(),
+            }),
+        }
+    }
+}
+
+/// Numeric range validation.
+pub struct RangeRule {
+    field: String,
+    min: f64,
+    max: f64,
+}
+impl RangeRule {
+    pub fn new(field: impl Into<String>, min: f64, max: f64) -> Self {
+        Self {
+            field: field.into(),
+            min,
+            max,
+        }
+    }
+}
+#[async_trait]
+impl QualityRule for RangeRule {
+    fn name(&self) -> &str {
+        "RangeRule"
+    }
+
+    async fn validate(&self, record: &Value) -> std::result::Result<(), RuleViolation> {
+        match record.get(&self.field) {
+            Some(Value::Number(num)) => num
+                .as_f64()
+                .filter(|v| *v >= self.min && *v <= self.max)
+                .map(|_| ())
+                .ok_or_else(|| RuleViolation {
+                    rule: self.name().to_string(),
+                    field: self.field.clone(),
+                    description: format!("Value outside [{}, {}]", self.min, self.max),
+                }),
+            _ => Err(RuleViolation {
+                rule: self.name().to_string(),
+                field: self.field.clone(),
+                description: "Field missing or not numeric".into(),
+            }),
+        }
+    }
+}
+
+/// ----------- Kafka Wiring ---------------------------------------------------
+
+/// Start the async validation loop.
+pub async fn run_quality_gate(cfg: QualityGateConfig) -> Result<()> {
+    info!("QualityGate starting with config: {:?}", cfg);
+
+    // Producer for validated events or failures
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &cfg.kafka_brokers)
+        .create()
+        .context("producer creation failed")?;
+
+    // Consumer
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &cfg.kafka_brokers)
+        .set("group.id", &cfg.group_id)
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()
+        .context("consumer creation failed")?;
+
+    consumer.subscribe(&[&cfg.input_topic])?;
+
+    // Initialize rule engine
+    lazy_static! {
+        static ref USERNAME_RE: Regex = Regex::new(r"^[A-Za-z0-9_]{1,50}$").unwrap();
+    }
+    let engine = QualityEngine::new(vec![
+        NonEmptyFieldRule::new("text"),
+        RegexFieldRule::new("username", USERNAME_RE.clone()),
+        RangeRule::new("toxicity", 0.0, 1.0),
+    ]);
+
+    // Main consumption loop
+    let mut stream = consumer.stream();
+    loop {
+        select! {
+            maybe_msg = stream.next() => match maybe_msg {
+                Some(Ok(msg)) => {
+                    if let Err(e) = process_message(&cfg, &engine, &producer, msg).await {
+                        error!("processing error: {:?}", e);
+                    }
+                },
+                Some(Err(e)) => {
+                    if let KafkaError::PartitionEOF(_) = e {
+                        // benign
+                    } else {
+                        error!("Kafka error: {:?}", e);
+                        time::sleep(Duration::from_secs(1)).await;
+                    }
+                },
+                None => {
+                    warn!("Kafka stream ended unexpectedly");
+                    break;
+                }
+            },
+            _ = signal::ctrl_c() => {
+                info!("QualityGate shutting down (SIGINT)");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate a single Kafka message and produce the outcome.
+async fn process_message(
+    cfg: &QualityGateConfig,
+    engine: &QualityEngine,
+    producer: &FutureProducer,
+    msg: BorrowedMessage<'_>,
+) -> Result<()> {
+    let payload = msg
+        .payload_view::<[u8]>()
+        .map_err(|e| anyhow!("payload deserialization {}", e))?
+        .ok_or_else(|| anyhow!("empty payload"))?;
+
+    let record_value: Value = serde_json::from_slice(payload)
+        .with_context(|| "JSON parse failure in incoming record")?;
+
+    let start = Instant::now();
+    let validation_res = engine
+        .check(
+            &record_value,
+            /*stop_on_first=*/ false,
+            Duration::from_millis(cfg.validation_timeout_ms),
+        )
+        .await;
+    let elapsed = start.elapsed();
+    histogram!("quality_gate.validation_ms", elapsed.as_millis() as f64);
+
+    let (out_topic, key, value) = match validation_res {
+        Ok(_) => {
+            counter!("quality_gate.valid_records", 1);
+            (cfg.output_topic.clone(), msg.key().map(|k| k.to_vec()), payload.to_vec())
+        }
+        Err(violations) => {
+            counter!("quality_gate.invalid_records", 1);
+            let err_report = json!({
+                "original_key": msg.key(),
+                "violations": violations,
+                "source_partition": msg.partition(),
+                "source_offset": msg.offset(),
+            });
+            (
+                format!("{}_violations", cfg.output_topic),
+                msg.key().map(|k| k.to_vec()),
+                serde_json::to_vec(&err_report)?,
+            )
+        }
+    };
+
+    // Produce the output
+    let record = FutureRecord::to(&out_topic)
+        .payload(&value)
+        .key(key.as_deref().map(|k| std::str::from_utf8(k).unwrap_or_default()))
+        .headers(OwnedHeaders::new().add(
+            "validated_at",
+            &format!("{}", chrono::Utc::now().timestamp_millis()),
+        ));
+
+    // Fire-and-forget with timeout
+    producer
+        .send_result(record)
+        .map_err(|(_, e)| anyhow!("producer error: {:?}", e))?
+        .await
+        .map_err(|(e, _)| anyhow!("failed to deliver: {:?}", e))?;
+
+    // Manually commit offset after successful processing
+    consumer_commit(&msg)?;
+
+    Ok(())
+}
+
+/// Commit message offset (manual commit).
+fn consumer_commit(msg: &BorrowedMessage<'_>) -> Result<()> {
+    msg.consumer()
+        .commit_message(msg, CommitMode::Async)
+        .map_err(|e| anyhow!("offset commit failed: {:?}", e))
+}
+
+/// ----------- Logging & Metrics Bootstrapping -------------------------------
+
+fn init_logging() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new("info"))
+        .unwrap();
+    fmt().with_env_filter(filter).init();
+}
+
+#[cfg(feature = "otel")]
+fn init_metrics() -> Result<()> {
+    use opentelemetry::{sdk::export::metrics::aggregation, KeyValue};
+    use opentelemetry_otlp::WithExportConfig;
+
+    let exporter = opentelemetry_otlp::new_exporter()
+        .tonic()
+        .with_env();
+    let meter_provider = opentelemetry_otlp::new_pipeline()
+        .metrics(exporter)
+        .with_resource(opentelemetry::sdk::Resource::new(vec![
+            KeyValue::new("service.name", "chirp_quality_gate"),
+        ]))
+        .with_aggregator_selector(aggregation::selector::simple::Selector::Histogram)
+        .build()?;
+    let _handle = meter_provider;
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_logging();
+    if cfg!(feature = "otel") {
+        init_metrics()?;
+    }
+
+    let cfg = QualityGateConfig::from_env("CHIRP")?;
+    run_quality_gate(cfg).await
+}
+
+/// ----------- Internal Logging Macros (fallback) -----------------------------
+
+#[macro_use]
+extern crate tracing;
+```

@@ -1,0 +1,305 @@
+```rust
+//! src/module_45.rs
+//! -----------------------------------------------------------------------------
+//! GDPR–Ready Event–Sourced Erasure Service
+//!
+//! This module lives inside EduPulse Live’s core and is responsible for:
+//!   1. Persisting domain events in a Postgres event-store.
+//!   2. Publishing the events to the message broker for downstream processing.
+//!   3. Handling GDPR-related commands (`EraseUser`) by producing *soft-delete*
+//!      events that cascading services understand (search index pruning,
+//!      cache eviction, file storage tomb-stones, etc.).
+//!
+//! The implementation follows the Repository + Service pattern so that the
+//! application layer can depend on abstractions, making it easy to embed in an
+//! Actix-Web REST handler or a gRPC façade.
+//!
+//! Note: the code is written for illustrative purposes, focusing on correctness
+//! and idiomatic Rust rather than compile-time completeness in every edge case.
+
+#![allow(clippy::module_name_repetitions)]
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
+use thiserror::Error;
+use tokio::time::{timeout, Duration};
+use tracing::{error, info, instrument};
+use uuid::Uuid;
+
+// -----------------------------------------------------------------------------
+// Domain API
+// -----------------------------------------------------------------------------
+
+/// High-level commands that can be issued to the GDPR service.
+#[derive(Debug)]
+pub enum GdprCommand {
+    /// Permanently & irreversibly remove PII for the given user account.
+    EraseUser {
+        requesting_admin_id: Uuid,
+        target_user_id: Uuid,
+        reason: String,
+    },
+}
+
+/// Top-level domain events.
+///
+/// All events SHOULD be append-only; compensating actions must be expressed as
+/// new events, never by mutating existing records.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DomainEvent {
+    /// An irreversible erasure was requested and queued.
+    UserErasureRequested {
+        target_user_id: Uuid,
+        requesting_admin_id: Uuid,
+        reason: String,
+    },
+    /// All PII for a user is now anonymised.
+    UserErased {
+        target_user_id: Uuid,
+        erased_at: DateTime<Utc>,
+    },
+    // … other domain events live elsewhere
+}
+
+/// Metadata wrapper around a DomainEvent, useful for tracing, ordering, etc.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub id: Uuid,
+    pub sequence: i64,
+    pub aggregate_id: Uuid,
+    pub aggregate_type: String,
+    pub event: DomainEvent,
+    pub occurred_at: DateTime<Utc>,
+}
+
+// -----------------------------------------------------------------------------
+// Error Types
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum GdprError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("event publish error: {0}")]
+    Publish(#[from] PublishError),
+    #[error("command timed out after {0:?}")]
+    Timeout(Duration),
+}
+
+#[derive(Debug, Error)]
+#[error("failed to publish event")]
+pub struct PublishError;
+
+// -----------------------------------------------------------------------------
+// Abstractions
+// -----------------------------------------------------------------------------
+
+/// Event store responsible for persisting `EventEnvelope`s in DB.
+#[async_trait]
+pub trait EventStore {
+    async fn append(&self, events: &[EventEnvelope]) -> Result<(), sqlx::Error>;
+}
+
+/// Publisher responsible for pushing events to the broker.
+#[async_trait]
+pub trait EventPublisher {
+    async fn publish(&self, events: &[EventEnvelope]) -> Result<(), PublishError>;
+}
+
+// -----------------------------------------------------------------------------
+// Concrete Implementations
+// -----------------------------------------------------------------------------
+
+/// Postgres-backed event store.
+pub struct PostgresEventStore {
+    pool: PgPool,
+}
+
+impl PostgresEventStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    async fn append_single(
+        tx: &mut Transaction<'_, Postgres>,
+        envelope: &EventEnvelope,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            r#"
+            INSERT INTO event_store (
+                id,
+                sequence,
+                aggregate_id,
+                aggregate_type,
+                event,
+                occurred_at
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+            envelope.id,
+            envelope.sequence,
+            envelope.aggregate_id,
+            envelope.aggregate_type,
+            serde_json::to_value(&envelope.event).expect("serialisation never fails"),
+            envelope.occurred_at
+        )
+        .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl EventStore for PostgresEventStore {
+    #[instrument(skip_all, name = "event_store.append")]
+    async fn append(&self, events: &[EventEnvelope]) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        for ev in events {
+            Self::append_single(&mut tx, ev).await?;
+        }
+        tx.commit().await
+    }
+}
+
+/// Dummy publisher; swap with NATS / RabbitMQ / Kafka implementation.
+pub struct LogPublisher;
+
+#[async_trait]
+impl EventPublisher for LogPublisher {
+    #[instrument(skip_all, level = "debug")]
+    async fn publish(&self, events: &[EventEnvelope]) -> Result<(), PublishError> {
+        for ev in events {
+            info!(event_id = %ev.id, "published event to broker");
+        }
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Service Layer
+// -----------------------------------------------------------------------------
+
+pub struct GdprService<S, P>
+where
+    S: EventStore + Send + Sync,
+    P: EventPublisher + Send + Sync,
+{
+    store: S,
+    publisher: P,
+}
+
+impl<S, P> GdprService<S, P>
+where
+    S: EventStore + Send + Sync,
+    P: EventPublisher + Send + Sync,
+{
+    pub fn new(store: S, publisher: P) -> Self {
+        Self { store, publisher }
+    }
+
+    /// Dispatch a GDPR command, storing and emitting the resulting events.
+    #[instrument(skip(self, cmd))]
+    pub async fn handle(&self, cmd: GdprCommand) -> Result<(), GdprError> {
+        // Step 1 – Translate command → events
+        let events = self.to_events(cmd);
+
+        // Step 2 – Persist events inside a DB transaction
+        self.store.append(&events).await?;
+
+        // Step 3 – Broadcast the events to the broker
+        //          (so that search/pruning/etc. can react asynchronously)
+        self.publisher.publish(&events).await?;
+
+        Ok(())
+    }
+
+    fn to_events(&self, cmd: GdprCommand) -> Vec<EventEnvelope> {
+        match cmd {
+            GdprCommand::EraseUser {
+                requesting_admin_id,
+                target_user_id,
+                reason,
+            } => {
+                let base_seq = self.sequence_seed();
+                vec![self.envelope(
+                    base_seq,
+                    target_user_id,
+                    DomainEvent::UserErasureRequested {
+                        target_user_id,
+                        requesting_admin_id,
+                        reason,
+                    },
+                )]
+            }
+        }
+    }
+
+    fn sequence_seed(&self) -> i64 {
+        // In production this should come from a monotonic sequence (e.g. PG sequence).
+        // For illustration we just use a randomish number.
+        (Utc::now().timestamp_micros() & 0x7FFF_FFFF) as i64
+    }
+
+    fn envelope(&self, seq: i64, aggregate_id: Uuid, ev: DomainEvent) -> EventEnvelope {
+        EventEnvelope {
+            id: Uuid::new_v4(),
+            sequence: seq,
+            aggregate_id,
+            aggregate_type: "user".to_string(),
+            event: ev,
+            occurred_at: Utc::now(),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Bootstrap helpers (e.g. called from main.rs or integration tests)
+// -----------------------------------------------------------------------------
+
+/// Convenience builder that spins up a connection pool and returns
+/// a GDPR service ready for injection.
+pub async fn bootstrap_gdpr_service(
+    database_url: &str,
+) -> Result<GdprService<PostgresEventStore, LogPublisher>, sqlx::Error> {
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(database_url)
+        .await?;
+
+    Ok(GdprService::new(
+        PostgresEventStore::new(pool),
+        LogPublisher,
+    ))
+}
+
+// -----------------------------------------------------------------------------
+// Example (when used from an Actix-Web handler or anywhere else)
+// -----------------------------------------------------------------------------
+//
+// #[post("/admin/erase_user/{user_id}")]
+// async fn erase_user(
+//     svc: web::Data<AppCtx>,       // contains GdprService behind Arc
+//     path: web::Path<Uuid>,
+//     session: CurrentUser,         // auth middleware
+// ) -> impl Responder {
+//     let cmd = GdprCommand::EraseUser {
+//         requesting_admin_id: session.user_id,
+//         target_user_id: *path,
+//         reason: "User requested account deletion".into(),
+//     };
+//
+//     // Guard against runaway futures; we never want to hang.
+//     match timeout(Duration::from_secs(3), svc.gdpr.handle(cmd)).await {
+//         Ok(Ok(())) => HttpResponse::Accepted().finish(),
+//         Ok(Err(e)) => {
+//             error!(error = %e, "GDPR command failed");
+//             HttpResponse::InternalServerError().finish()
+//         }
+//         Err(_) => HttpResponse::GatewayTimeout().finish(),
+//     }
+// }
+// -----------------------------------------------------------------------------
+// End of module
+```

@@ -1,0 +1,368 @@
+```rust
+//! module_65.rs
+//!
+//! A pluggable, strategy-pattern–based real-time enrichment pipeline that
+//! consumes raw social-network events from Kafka, applies a configurable
+//! sequence of enrichment strategies, performs basic data-quality checks,
+//! and publishes the enriched payload back to a downstream topic.
+//!
+//! This module is intentionally self-contained so it can be embedded into
+//! a micro-service binary or tested in isolation.  Only non-blocking (async)
+//! code is used so the processor can scale with Tokio’s cooperative
+//! scheduler.
+//!
+//! Important:  Actual Kafka/Schema-Registry/Iceberg types are hidden behind
+//! feature-gated `cfg` blocks so the code compiles even without the
+//! corresponding native libraries.  Replace the stubs with the real
+//! objects when integrating into the full platform.
+
+#![allow(clippy::module_name_repetitions)]
+#![allow(dead_code)]
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::RwLock,
+    task::JoinHandle,
+    time::{interval, Interval},
+};
+
+/// ------------- Kafka Stubs -------------------------------------------------
+#[cfg(not(feature = "kafka"))]
+mod kafka_stub {
+    use super::*;
+
+    /// Minimal stub for a Kafka record when the `kafka` feature is disabled.
+    #[derive(Debug)]
+    pub struct Record {
+        pub key:   Option<Vec<u8>>,
+        pub value: Vec<u8>,
+        pub ts:    Option<SystemTime>,
+    }
+
+    pub struct Consumer; // dummy
+    pub struct Producer; // dummy
+
+    impl Consumer {
+        pub async fn recv(&self) -> Option<Record> {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            None
+        }
+    }
+
+    impl Producer {
+        pub async fn send(&self, _record: Record) {}
+    }
+
+    pub(super) fn build_consumer(_group_id: &str, _topic: &str) -> Consumer {
+        Consumer
+    }
+
+    pub(super) fn build_producer(_topic: &str) -> Producer {
+        Producer
+    }
+}
+
+#[cfg(feature = "kafka")]
+mod kafka_stub {
+    // Real implementation would live here.  The only public surface stays the
+    // same so downstream code does not need cfg-gating.
+    compile_error!("Enable real Kafka backend or disable the `kafka` feature")
+}
+
+use kafka_stub::*;
+
+/// ------------- Error Types -------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum PipelineError {
+    #[error("Deserialization error: {0}")]
+    Deserialization(String),
+
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+
+    #[error("Kafka error: {0}")]
+    Kafka(String),
+
+    #[error("Strategy `{name}` failed: {source}")]
+    Strategy {
+        name:    &'static str,
+        #[source]
+        source:  Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+/// Convenience alias so strategies can bubble up errors easily.
+pub type Result<T, E = PipelineError> = std::result::Result<T, E>;
+
+/// ------------- Enrichment Strategy Trait -----------------------------------
+
+#[async_trait]
+pub trait EnrichmentStrategy: Send + Sync {
+    /// Returns the stable, human-readable strategy name (used for metrics/logs).
+    fn name(&self) -> &'static str;
+
+    /// Mutates the in-flight JSON payload with new keys or replaces existing
+    /// ones.  Implementations should be idempotent and *never* drop data.
+    async fn enrich(&self, record: &mut Value) -> Result<()>;
+}
+
+/// ------------- Strategy Implementations ------------------------------------
+
+/// Language detection using a naive character-frequency heuristic.
+///
+/// Note: Production builds will call an external ML model; this fallback
+/// keeps the demo self-contained.
+pub struct LangDetect;
+
+#[async_trait]
+impl EnrichmentStrategy for LangDetect {
+    fn name(&self) -> &'static str {
+        "lang_detect"
+    }
+
+    async fn enrich(&self, record: &mut Value) -> Result<()> {
+        let text = record
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        let lang_guess = if text.contains('¿') || text.contains('¡') {
+            "es"
+        } else if text.contains('的') {
+            "zh"
+        } else if text.contains('é') || text.contains('à') {
+            "fr"
+        } else {
+            "en"
+        };
+        record["lang"] = json!(lang_guess);
+        Ok(())
+    }
+}
+
+/// Simple toxicity scoring mock.  Returns a number between 0-100.
+pub struct ToxicityScorer;
+
+#[async_trait]
+impl EnrichmentStrategy for ToxicityScorer {
+    fn name(&self) -> &'static str {
+        "toxicity_score"
+    }
+
+    async fn enrich(&self, record: &mut Value) -> Result<()> {
+        let text = record
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        let keywords = ["hate", "kill", "stupid", "idiot"];
+        let toxic_hits = keywords.iter().filter(|kw| text.contains(*kw)).count();
+        let score      = (toxic_hits as f32 / keywords.len() as f32) * 100.0;
+        record["toxicity"] = json!(score);
+        Ok(())
+    }
+}
+
+/// ------------- Pipeline Configuration --------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PipelineConfig {
+    pub group_id:        String,
+    pub input_topic:     String,
+    pub output_topic:    String,
+    pub heartbeat_secs:  u64,
+    /// Enable/disable individual strategies from a config file or
+    /// environment variable (hot-reloaded by the supervisor).
+    pub strategies:      HashMap<String, bool>,
+}
+
+/// ------------- Main Processor ---------------------------------------------
+
+pub struct StreamProcessor {
+    cfg:        PipelineConfig,
+    consumer:   Consumer,
+    producer:   Producer,
+    enrichers:  Vec<Arc<dyn EnrichmentStrategy>>,
+    heartbeat:  Interval,
+    metrics:    Arc<RwLock<ProcessorMetrics>>,
+}
+
+impl StreamProcessor {
+    pub async fn new(cfg: PipelineConfig) -> Self {
+        let consumer = build_consumer(&cfg.group_id, &cfg.input_topic);
+        let producer = build_producer(&cfg.output_topic);
+
+        let enrichers = build_strategy_chain(&cfg);
+
+        let heartbeat = interval(Duration::from_secs(cfg.heartbeat_secs));
+
+        Self {
+            cfg,
+            consumer,
+            producer,
+            enrichers,
+            heartbeat,
+            metrics: Arc::new(RwLock::new(ProcessorMetrics::default())),
+        }
+    }
+
+    /// Starts the *infinite* processing loop.  Should be executed inside a
+    /// Tokio runtime.  Returns a JoinHandle so callers can cancel or observe
+    /// shutdown errors.
+    pub fn spawn(mut self) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                select! {
+                    _ = self.heartbeat.tick() => {
+                        if let Err(e) = self.flush_metrics().await {
+                            warn!("Metrics flush failed: {e}");
+                        }
+                    }
+
+                    maybe_msg = self.consumer.recv() => {
+                        match maybe_msg {
+                            Some(kafka_msg) => {
+                                if let Err(e) = self.handle_message(kafka_msg).await {
+                                    error!("Failed to handle message: {e:#}");
+                                }
+                            }
+                            None => {
+                                // Consumer poll timed out; continue to next loop
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    async fn handle_message(&mut self, kafka_msg: Record) -> Result<()> {
+        let raw_json: Value = serde_json::from_slice(&kafka_msg.value)
+            .map_err(|e| PipelineError::Deserialization(e.to_string()))?;
+        let ts: DateTime<Utc> =
+            kafka_msg.ts.unwrap_or_else(SystemTime::now).into();
+
+        let mut record = json!({
+            "ingest_ts": ts,
+            "raw": raw_json, // store original
+        });
+
+        for enricher in &self.enrichers {
+            if let Err(e) = enricher.enrich(&mut record).await {
+                // Error isolation:  tag payload with failure and continue
+                warn!(
+                    "Strategy {} failed for record; marking error.",
+                    enricher.name()
+                );
+                record["errors"][enricher.name()] = json!(e.to_string());
+            }
+        }
+
+        let payload = serde_json::to_vec(&record)
+            .map_err(|e| PipelineError::Serialization(e.to_string()))?;
+
+        let out_record = Record {
+            key:   kafka_msg.key,
+            value: payload,
+            ts:    Some(SystemTime::now()),
+        };
+
+        self.producer
+            .send(out_record)
+            .await
+            .map_err(|_| PipelineError::Kafka("Producer send failed".into()))?;
+
+        self.metrics
+            .write()
+            .await
+            .processed_total += 1;
+
+        Ok(())
+    }
+
+    async fn flush_metrics(&self) -> std::result::Result<(), std::io::Error> {
+        let snapshot = { self.metrics.read().await.clone() };
+        info!(
+            "Processed={} Errs={} LatencyP99={:?}",
+            snapshot.processed_total,
+            snapshot.error_total,
+            snapshot.latency_p99
+        );
+        Ok(())
+    }
+}
+
+/// Build the enabled enrichment strategy chain from configuration.
+fn build_strategy_chain(cfg: &PipelineConfig) -> Vec<Arc<dyn EnrichmentStrategy>> {
+    let mut v: Vec<Arc<dyn EnrichmentStrategy>> = Vec::new();
+
+    if cfg.strategies.get("lang_detect").copied().unwrap_or(true) {
+        v.push(Arc::new(LangDetect));
+    }
+    if cfg.strategies.get("toxicity_score").copied().unwrap_or(true) {
+        v.push(Arc::new(ToxicityScorer));
+    }
+
+    v
+}
+
+/// ------------- Metrics -----------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ProcessorMetrics {
+    processed_total: u64,
+    error_total:     u64,
+    latency_p99:     Option<Duration>,
+}
+
+/// ------------- Unit Tests --------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lang_detect_basic() {
+        let mut v = json!({ "text": "¿Qué tal?" });
+        LangDetect.enrich(&mut v).await.unwrap();
+        assert_eq!(v["lang"], "es");
+    }
+
+    #[tokio::test]
+    async fn toxicity_scoring() {
+        let mut v = json!({ "text": "I hate you idiot" });
+        ToxicityScorer.enrich(&mut v).await.unwrap();
+        let score = v["toxicity"].as_f64().unwrap();
+        assert!(score > 0.0);
+    }
+
+    #[tokio::test]
+    async fn processor_build_chain() {
+        let cfg = PipelineConfig {
+            group_id:       "g".into(),
+            input_topic:    "in".into(),
+            output_topic:   "out".into(),
+            heartbeat_secs: 60,
+            strategies:     HashMap::from([("lang_detect".into(), false)]),
+        };
+        let chain = build_strategy_chain(&cfg);
+        let names: Vec<&'static str> = chain.iter().map(|s| s.name()).collect();
+        assert_eq!(names, vec!["toxicity_score"]);
+    }
+}
+```

@@ -1,0 +1,435 @@
+```rust
+//! src/module_57.rs
+//!
+//! Event–driven “Learning-Pulse” domain module for EduPulse Live.
+//!
+//! This module exposes a production-ready service layer that
+//!  1. Persists Learning-Pulse aggregates and their responses into PostgreSQL
+//!  2. Emits strongly-typed domain events onto NATS
+//!  3. Applies layered error handling + structured tracing
+//!
+//! The code purposefully avoids framework lock-in: repository and publisher
+//! interfaces are expressed as traits so they can be swapped at compile-time
+//! (e.g. for unit tests or a Kafka back-end).
+
+use std::sync::Arc;
+
+use async_nats::{self, Client as NatsClient};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use thiserror::Error;
+use tokio::task::JoinHandle;
+use tracing::{error, info, instrument};
+use uuid::Uuid;
+
+/* -------------------------------------------------------------------------- */
+/*                              Domain Aggregate                              */
+/* -------------------------------------------------------------------------- */
+
+/// A Learning Pulse is a short-form activity or challenge created by a teacher.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningPulse {
+    pub id:           Uuid,
+    pub course_id:    Uuid,
+    pub author_id:    Uuid,
+    pub title:        String,
+    pub description:  String,
+    pub created_at:   DateTime<Utc>,
+    pub expires_at:   Option<DateTime<Utc>>,
+}
+
+/// A student response to a `LearningPulse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseResponse {
+    pub id:         Uuid,
+    pub pulse_id:   Uuid,
+    pub respondent: Uuid,
+    pub payload:    String, // Could be JSON, markdown, or a blob reference
+    pub created_at: DateTime<Utc>,
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                  Events                                    */
+/* -------------------------------------------------------------------------- */
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event_type", content = "payload")]
+pub enum DomainEvent {
+    PulseCreated {
+        pulse_id:   Uuid,
+        course_id:  Uuid,
+        author_id:  Uuid,
+        occurred_at: DateTime<Utc>,
+    },
+    PulseResponded {
+        pulse_id:    Uuid,
+        response_id: Uuid,
+        respondent:  Uuid,
+        occurred_at: DateTime<Utc>,
+    },
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                  Errors                                    */
+/* -------------------------------------------------------------------------- */
+
+#[derive(Error, Debug)]
+pub enum PulseError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("messaging error: {0}")]
+    Messaging(#[from] async_nats::Error),
+
+    #[error("pulse `{0}` not found")]
+    PulseNotFound(Uuid),
+
+    #[error("unknown error: {0}")]
+    Other(String),
+}
+
+/* -------------------------------------------------------------------------- */
+/*                          Repository & Persistence                          */
+/* -------------------------------------------------------------------------- */
+
+#[async_trait]
+pub trait PulseRepository: Send + Sync {
+    async fn insert_pulse(&self, pulse: &LearningPulse) -> Result<(), PulseError>;
+    async fn insert_response(&self, resp: &PulseResponse) -> Result<(), PulseError>;
+    async fn exists_pulse(&self, pulse_id: Uuid) -> Result<bool, PulseError>;
+}
+
+/// PostgreSQL implementation using `sqlx`.
+pub struct PgPulseRepository {
+    pool: PgPool,
+}
+
+impl PgPulseRepository {
+    pub async fn connect(pg_dsn: &str, max_connections: u32) -> Result<Self, PulseError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(pg_dsn)
+            .await?;
+        Ok(Self { pool })
+    }
+}
+
+#[async_trait]
+impl PulseRepository for PgPulseRepository {
+    #[instrument(skip_all, fields(pulse_id = %pulse.id))]
+    async fn insert_pulse(&self, pulse: &LearningPulse) -> Result<(), PulseError> {
+        sqlx::query(
+            r#"
+            INSERT INTO learning_pulses (
+                id, course_id, author_id,
+                title, description, created_at, expires_at
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7)
+            "#,
+        )
+        .bind(pulse.id)
+        .bind(pulse.course_id)
+        .bind(pulse.author_id)
+        .bind(&pulse.title)
+        .bind(&pulse.description)
+        .bind(pulse.created_at)
+        .bind(pulse.expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    #[instrument(skip_all, fields(response_id = %resp.id))]
+    async fn insert_response(&self, resp: &PulseResponse) -> Result<(), PulseError> {
+        sqlx::query(
+            r#"
+            INSERT INTO pulse_responses (
+                id, pulse_id, respondent,
+                payload, created_at
+            )
+            VALUES ($1,$2,$3,$4,$5)
+            "#,
+        )
+        .bind(resp.id)
+        .bind(resp.pulse_id)
+        .bind(resp.respondent)
+        .bind(&resp.payload)
+        .bind(resp.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    async fn exists_pulse(&self, pulse_id: Uuid) -> Result<bool, PulseError> {
+        let row = sqlx::query("SELECT 1 FROM learning_pulses WHERE id = $1")
+            .bind(pulse_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            Messaging / Publisher                           */
+/* -------------------------------------------------------------------------- */
+
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, event: &DomainEvent) -> Result<(), PulseError>;
+}
+
+/// NATS implementation for `EventPublisher`.
+pub struct NatsPublisher {
+    client: NatsClient,
+    subject: String,
+}
+
+impl NatsPublisher {
+    pub async fn connect(nats_url: &str, subject: impl Into<String>) -> Result<Self, PulseError> {
+        let client = async_nats::connect(nats_url).await?;
+        Ok(Self {
+            client,
+            subject: subject.into(),
+        })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for NatsPublisher {
+    #[instrument(skip_all, fields(subject = %self.subject))]
+    async fn publish(&self, event: &DomainEvent) -> Result<(), PulseError> {
+        let payload = serde_json::to_vec(event).expect("serializing DomainEvent never fails");
+        self.client
+            .publish(self.subject.clone(), payload.into())
+            .await?;
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              Service Layer                                 */
+/* -------------------------------------------------------------------------- */
+
+/// Business logic facade: uses DI to stay fully testable.
+pub struct PulseService<R, P>
+where
+    R: PulseRepository,
+    P: EventPublisher,
+{
+    repo: Arc<R>,
+    publisher: Arc<P>,
+}
+
+impl<R, P> PulseService<R, P>
+where
+    R: PulseRepository + 'static,
+    P: EventPublisher + 'static,
+{
+    pub fn new(repo: Arc<R>, publisher: Arc<P>) -> Self {
+        Self { repo, publisher }
+    }
+
+    /// Create a new Learning Pulse, persist it, and emit a `PulseCreated` event.
+    #[instrument(skip_all, fields(course_id = %course_id, author_id = %author_id))]
+    pub async fn create_pulse(
+        &self,
+        course_id: Uuid,
+        author_id: Uuid,
+        title: String,
+        description: String,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<LearningPulse, PulseError> {
+        let pulse = LearningPulse {
+            id: Uuid::new_v4(),
+            course_id,
+            author_id,
+            title,
+            description,
+            created_at: Utc::now(),
+            expires_at,
+        };
+
+        self.repo.insert_pulse(&pulse).await?;
+
+        let event = DomainEvent::PulseCreated {
+            pulse_id: pulse.id,
+            course_id,
+            author_id,
+            occurred_at: pulse.created_at,
+        };
+        self.publisher.publish(&event).await?;
+
+        Ok(pulse)
+    }
+
+    /// Append a response to an existing pulse and emit a `PulseResponded` event.
+    #[instrument(skip_all, fields(pulse_id = %pulse_id, respondent = %respondent))]
+    pub async fn respond_to_pulse(
+        &self,
+        pulse_id: Uuid,
+        respondent: Uuid,
+        payload: String,
+    ) -> Result<PulseResponse, PulseError> {
+        if !self.repo.exists_pulse(pulse_id).await? {
+            return Err(PulseError::PulseNotFound(pulse_id));
+        }
+
+        let response = PulseResponse {
+            id: Uuid::new_v4(),
+            pulse_id,
+            respondent,
+            payload,
+            created_at: Utc::now(),
+        };
+
+        self.repo.insert_response(&response).await?;
+
+        let event = DomainEvent::PulseResponded {
+            pulse_id,
+            response_id: response.id,
+            respondent,
+            occurred_at: response.created_at,
+        };
+        self.publisher.publish(&event).await?;
+
+        Ok(response)
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                               Bootstrapping                                */
+/* -------------------------------------------------------------------------- */
+
+/// Utility helper that spins up the repository & publisher, returning a
+/// ready-to-use `PulseService`.
+///
+/// This function can be invoked from an Actix-Web `main()` or within
+/// integration tests. It hides async‐runtime juggling by spawning a task
+/// that keeps the NATS connection alive.
+pub async fn bootstrap_service(
+    pg_dsn: &str,
+    nats_url: &str,
+) -> Result<(PulseService<PgPulseRepository, NatsPublisher>, JoinHandle<()>), PulseError> {
+    // Open Postgres pool
+    let repo = Arc::new(PgPulseRepository::connect(pg_dsn, 5).await?);
+
+    // Connect to NATS
+    let nats_pub = Arc::new(NatsPublisher::connect(nats_url, "eduPulselive.events").await?);
+
+    // Keep NATS connection alive in a background task (optional)
+    let nats_client = nats_pub.client.clone();
+    let handle = tokio::spawn(async move {
+        // Simple ping loop—production-grade apps would implement
+        // reconnect logic & TLS options here.
+        loop {
+            if let Err(err) = nats_client.flush().await {
+                error!("NATS flush error: {err}");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+
+    Ok((PulseService::new(repo, nats_pub), handle))
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                  Tests                                     */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use tokio::sync::Mutex;
+
+    /// In-memory publisher which captures events for assertions.
+    struct MemoryPublisher {
+        events: Mutex<VecDeque<DomainEvent>>,
+    }
+
+    impl MemoryPublisher {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(VecDeque::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EventPublisher for MemoryPublisher {
+        async fn publish(&self, event: &DomainEvent) -> Result<(), PulseError> {
+            self.events.lock().await.push_back(event.clone());
+            Ok(())
+        }
+    }
+
+    /// In-memory repo backed by hashmaps (skips persistence).
+    struct MemoryRepo {
+        pulses: Mutex<Vec<LearningPulse>>,
+        responses: Mutex<Vec<PulseResponse>>,
+    }
+
+    impl MemoryRepo {
+        fn new() -> Self {
+            Self {
+                pulses: Mutex::new(vec![]),
+                responses: Mutex::new(vec![]),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PulseRepository for MemoryRepo {
+        async fn insert_pulse(&self, pulse: &LearningPulse) -> Result<(), PulseError> {
+            self.pulses.lock().await.push(pulse.clone());
+            Ok(())
+        }
+
+        async fn insert_response(&self, resp: &PulseResponse) -> Result<(), PulseError> {
+            self.responses.lock().await.push(resp.clone());
+            Ok(())
+        }
+
+        async fn exists_pulse(&self, pulse_id: Uuid) -> Result<bool, PulseError> {
+            Ok(self
+                .pulses
+                .lock()
+                .await
+                .iter()
+                .any(|p| p.id == pulse_id))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pulse_lifecycle() -> Result<(), PulseError> {
+        let repo = Arc::new(MemoryRepo::new());
+        let publisher = Arc::new(MemoryPublisher::new());
+        let service = PulseService::new(repo, publisher.clone());
+
+        let course_id = Uuid::new_v4();
+        let author_id = Uuid::new_v4();
+        let pulse = service
+            .create_pulse(
+                course_id,
+                author_id,
+                "Test Pulse".into(),
+                "Describe quantum tunneling.".into(),
+                None,
+            )
+            .await?;
+
+        let respondent = Uuid::new_v4();
+        let _resp = service
+            .respond_to_pulse(pulse.id, respondent, "My answer".into())
+            .await?;
+
+        // Verify events were captured
+        let events = publisher.events.lock().await;
+        assert_eq!(events.len(), 2);
+        Ok(())
+    }
+}
+```

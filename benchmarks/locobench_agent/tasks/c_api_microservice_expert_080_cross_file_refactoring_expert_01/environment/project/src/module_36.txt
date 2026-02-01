@@ -1,0 +1,458 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * Module 36 — In-memory Response Cache (LRU + TTL)
+ *
+ * This module implements a thread-safe, size-bounded, in-memory cache intended
+ * for HTTP / GraphQL response caching.  It exposes a small API that other
+ * layers of the monolith can rely on while remaining agnostic of *how* the
+ * caching is performed internally.
+ *
+ * Design choices:
+ *   - LRU eviction strategy, O(1) for get/put.
+ *   - TTL per entry.  Expired entries are lazily purged on access.
+ *   - Hash table implemented via the public-domain “uthash” project.
+ *   - Single pthread mutex per cache instance (coarse-grained, good enough for
+ *     typical request rates; can be upgraded to sharded locks if contention
+ *     arises).
+ *   - Prometheus-style metrics hooks (NO-OP if monitoring subsystem disabled).
+ *
+ * Compile unit: src/module_36.txt   (named *.txt to avoid symbol collisions in
+ *                                     generated demo; treat it as *.c)
+ */
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <time.h>
+#include <sys/time.h>
+#include <pthread.h>
+
+/*------------------------------------------------------------------------------
+ * Project-wide includes (may be stubbed if the corresponding component is
+ * disabled during unit tests).
+ *----------------------------------------------------------------------------*/
+
+#include "mm_logger.h"      /* central structured logger               */
+#include "mm_metrics.h"     /* Prometheus-compatible monitoring API    */
+
+#ifndef MM_LOG_DEBUG
+/* Fallback stubs so unit tests can compile this file in isolation. */
+#   define MM_LOG_DEBUG(fmt, ...)   fprintf(stderr, "[DBG] " fmt "\n", ##__VA_ARGS__)
+#   define MM_LOG_INFO(fmt, ...)    fprintf(stderr, "[INF] " fmt "\n", ##__VA_ARGS__)
+#   define MM_LOG_WARN(fmt, ...)    fprintf(stderr, "[WRN] " fmt "\n", ##__VA_ARGS__)
+#   define MM_LOG_ERROR(fmt, ...)   fprintf(stderr, "[ERR] " fmt "\n", ##__VA_ARGS__)
+#endif
+
+#ifndef MM_METRIC_COUNTER_INC
+#   define MM_METRIC_COUNTER_INC(name)          (void)0
+#   define MM_METRIC_GAUGE_SET(name, value)     (void)0
+#endif
+
+/*------------------------------------------------------------------------------
+ * uthash — public domain hash map
+ * Simplified single-file include for this compilation unit.
+ *----------------------------------------------------------------------------*/
+#define uthash_malloc(sz) malloc(sz)
+#define uthash_free(ptr,sz) free(ptr)
+#define HASH_BLOOM 16
+#define HASH_FUNCTION(keyptr, keylen, hashv)                                   \
+    do {                                                                       \
+        const unsigned char *_ptr = (const unsigned char*)(keyptr);            \
+        size_t _i;                                                             \
+        (hashv) = 0xcbf29ce484222325ULL;                                       \
+        for(_i = 0; _i < (keylen); _i++)                                       \
+            (hashv) = ((hashv) * 0x100000001b3ULL) ^ (uint64_t)_ptr[_i];       \
+    } while (0)
+#define HASH_KEYCMP(a,alen,b,blen)                                             \
+    (((alen)==(blen)) ? memcmp((a),(b),(alen)) : 1)
+#include "uthash.h"
+
+/*------------------------------------------------------------------------------
+ * Public Interface
+ *----------------------------------------------------------------------------*/
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct mm_cache mm_cache_t;
+
+/* Return codes */
+typedef enum {
+    MM_CACHE_OK = 0,
+    MM_CACHE_NOT_FOUND,
+    MM_CACHE_BUFFER_TOO_SMALL,
+    MM_CACHE_ERROR          /* generic failure */
+} mm_cache_rc_t;
+
+/*
+ * Create a new cache namespace.
+ *
+ * namespace   – logical name for metrics/logging (“orders”, “products”…)
+ * capacity    – max number of entries before eviction starts.
+ * ttl_ms      – time-to-live in milliseconds (applied uniformly per entry).
+ *
+ * Returns pointer to cache handle, or NULL on allocation failure.
+ */
+mm_cache_t *mm_cache_create(const char *namespace,
+                            size_t      capacity,
+                            uint32_t    ttl_ms);
+
+/* Destroy cache and free all associated resources. */
+void mm_cache_destroy(mm_cache_t *cache);
+
+/*
+ * Insert or update an entry.
+ * key         – zero-terminated string (UTF-8).  Internally duplicated.
+ * data        – pointer to binary payload.
+ * len         – payload length in bytes.
+ *
+ * Returns MM_CACHE_OK or MM_CACHE_ERROR.
+ */
+mm_cache_rc_t mm_cache_put(mm_cache_t *cache,
+                           const char *key,
+                           const void *data,
+                           size_t      len);
+
+/*
+ * Retrieve an entry.
+ * key         – zero-terminated key
+ * out_buf     – caller provided buffer (may be NULL to query length)
+ * inout_len   – IN: buf capacity, OUT: bytes copied / required
+ *
+ * Returns MM_CACHE_OK, MM_CACHE_NOT_FOUND, MM_CACHE_BUFFER_TOO_SMALL.
+ */
+mm_cache_rc_t mm_cache_get(mm_cache_t *cache,
+                           const char *key,
+                           void       *out_buf,
+                           size_t     *inout_len);
+
+/* Remove a single key (returns OK if key absent). */
+mm_cache_rc_t mm_cache_invalidate(mm_cache_t *cache, const char *key);
+
+/* Flush all records immediately. */
+void mm_cache_clear(mm_cache_t *cache);
+
+#ifdef __cplusplus
+}
+#endif
+
+/*------------------------------------------------------------------------------
+ * Implementation Details (private)
+ *----------------------------------------------------------------------------*/
+
+typedef struct cache_entry {
+    char              *key;            /* heap-allocated key */
+    void              *payload;        /* heap-allocated data */
+    size_t             bytes;
+
+    uint64_t           expiry_epoch_ms;
+
+    /* LRU doubly-linked list */
+    struct cache_entry *prev, *next;
+
+    /* uthash handle */
+    UT_hash_handle     hh;
+} cache_entry_t;
+
+struct mm_cache {
+    char        ns[48];        /* namespace label */
+    size_t      capacity;      /* absolute entry limit */
+    uint32_t    ttl_ms;        /* default TTL */
+    size_t      n_entries;
+
+    /* Hash root + LRU head/tail (most-recent at head) */
+    cache_entry_t *map;
+    cache_entry_t *lru_head;
+    cache_entry_t *lru_tail;
+
+    pthread_mutex_t mtx;
+};
+
+/*-------------------------------------------------- Helpers ------------*/
+
+static uint64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME_COARSE, &ts);
+    return ((uint64_t)ts.tv_sec * 1000ULL) + (ts.tv_nsec / 1000000ULL);
+}
+
+static void lru_move_to_front(mm_cache_t *c, cache_entry_t *e)
+{
+    if (c->lru_head == e) return;
+
+    /* unlink */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    /* push front */
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+static void lru_append_front(mm_cache_t *c, cache_entry_t *e)
+{
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+static void lru_remove(mm_cache_t *c, cache_entry_t *e)
+{
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_head == e) c->lru_head = e->next;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    e->prev = e->next = NULL;
+}
+
+static void evict_lru(mm_cache_t *c)
+{
+    if (!c || !c->lru_tail) return;
+    cache_entry_t *victim = c->lru_tail;
+    MM_LOG_DEBUG("[cache:%s] Evicting LRU key=%s", c->ns, victim->key);
+
+    lru_remove(c, victim);
+    HASH_DEL(c->map, victim);
+    c->n_entries--;
+
+    free(victim->key);
+    free(victim->payload);
+    free(victim);
+
+    MM_METRIC_COUNTER_INC(cache_evictions_total);
+    MM_METRIC_GAUGE_SET(cache_entries, c->n_entries);
+}
+
+static cache_entry_t *entry_create(const char *key,
+                                   const void *data,
+                                   size_t      len,
+                                   uint32_t    ttl_ms)
+{
+    cache_entry_t *e = (cache_entry_t *)calloc(1, sizeof(*e));
+    if (!e) return NULL;
+
+    e->key = strdup(key);
+    if (!e->key) { free(e); return NULL; }
+
+    e->payload = malloc(len);
+    if (!e->payload) { free(e->key); free(e); return NULL; }
+
+    memcpy(e->payload, data, len);
+    e->bytes = len;
+    e->expiry_epoch_ms = now_ms() + ttl_ms;
+
+    return e;
+}
+
+static void entry_replace_payload(cache_entry_t *e,
+                                  const void   *data,
+                                  size_t        len,
+                                  uint32_t      ttl_ms)
+{
+    void *newbuf = malloc(len);
+    if (!newbuf) return; /* keep old payload on OOM */
+
+    free(e->payload);
+    e->payload = newbuf;
+    memcpy(e->payload, data, len);
+    e->bytes = len;
+    e->expiry_epoch_ms = now_ms() + ttl_ms;
+}
+
+/*------------------------------------------------ Public API ----------*/
+
+mm_cache_t *mm_cache_create(const char *namespace,
+                            size_t      capacity,
+                            uint32_t    ttl_ms)
+{
+    if (!namespace || capacity == 0) return NULL;
+    mm_cache_t *c = (mm_cache_t *)calloc(1, sizeof(*c));
+    if (!c) return NULL;
+
+    strncpy(c->ns, namespace, sizeof(c->ns)-1);
+    c->capacity = capacity;
+    c->ttl_ms   = ttl_ms;
+    pthread_mutex_init(&c->mtx, NULL);
+
+    MM_LOG_INFO("[cache:%s] Created (cap=%zu, ttl=%ums)",
+                c->ns, capacity, ttl_ms);
+
+    return c;
+}
+
+void mm_cache_destroy(mm_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_mutex_lock(&c->mtx);
+
+    cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, c->map, cur, tmp) {
+        HASH_DEL(c->map, cur);
+        free(cur->key);
+        free(cur->payload);
+        free(cur);
+    }
+    c->lru_head = c->lru_tail = NULL;
+    c->n_entries = 0;
+
+    pthread_mutex_unlock(&c->mtx);
+    pthread_mutex_destroy(&c->mtx);
+
+    MM_LOG_INFO("[cache:%s] Destroyed", c->ns);
+    free(c);
+}
+
+mm_cache_rc_t mm_cache_put(mm_cache_t *c,
+                           const char *key,
+                           const void *data,
+                           size_t      len)
+{
+    if (!c || !key || !data || len == 0) return MM_CACHE_ERROR;
+
+    pthread_mutex_lock(&c->mtx);
+
+    cache_entry_t *e;
+    HASH_FIND_STR(c->map, key, e);
+
+    if (e) {
+        /* Overwrite existing entry. */
+        entry_replace_payload(e, data, len, c->ttl_ms);
+        lru_move_to_front(c, e);
+        MM_METRIC_COUNTER_INC(cache_updates_total);
+    } else {
+        if (c->n_entries >= c->capacity) {
+            evict_lru(c);
+        }
+        e = entry_create(key, data, len, c->ttl_ms);
+        if (!e) {
+            pthread_mutex_unlock(&c->mtx);
+            return MM_CACHE_ERROR;
+        }
+        HASH_ADD_STR(c->map, key, e);
+        lru_append_front(c, e);
+        c->n_entries++;
+
+        MM_METRIC_COUNTER_INC(cache_inserts_total);
+        MM_METRIC_GAUGE_SET(cache_entries, c->n_entries);
+    }
+
+    pthread_mutex_unlock(&c->mtx);
+    return MM_CACHE_OK;
+}
+
+mm_cache_rc_t mm_cache_get(mm_cache_t *c,
+                           const char *key,
+                           void       *out_buf,
+                           size_t     *inout_len)
+{
+    if (!c || !key || !inout_len) return MM_CACHE_ERROR;
+
+    pthread_mutex_lock(&c->mtx);
+
+    cache_entry_t *e;
+    HASH_FIND_STR(c->map, key, e);
+
+    if (!e) {
+        MM_METRIC_COUNTER_INC(cache_miss_total);
+        pthread_mutex_unlock(&c->mtx);
+        return MM_CACHE_NOT_FOUND;
+    }
+
+    /* Expired? */
+    uint64_t now = now_ms();
+    if (now >= e->expiry_epoch_ms) {
+        MM_METRIC_COUNTER_INC(cache_expired_total);
+        MM_LOG_DEBUG("[cache:%s] Key '%s' expired – purging", c->ns, key);
+
+        lru_remove(c, e);
+        HASH_DEL(c->map, e);
+        c->n_entries--;
+
+        free(e->key);
+        free(e->payload);
+        free(e);
+
+        pthread_mutex_unlock(&c->mtx);
+        return MM_CACHE_NOT_FOUND;
+    }
+
+    /* Buffer size check */
+    if (*inout_len < e->bytes) {
+        *inout_len = e->bytes;
+        pthread_mutex_unlock(&c->mtx);
+        return MM_CACHE_BUFFER_TOO_SMALL;
+    }
+
+    memcpy(out_buf, e->payload, e->bytes);
+    *inout_len = e->bytes;
+
+    lru_move_to_front(c, e);
+
+    MM_METRIC_COUNTER_INC(cache_hit_total);
+
+    pthread_mutex_unlock(&c->mtx);
+    return MM_CACHE_OK;
+}
+
+mm_cache_rc_t mm_cache_invalidate(mm_cache_t *c, const char *key)
+{
+    if (!c || !key) return MM_CACHE_ERROR;
+
+    pthread_mutex_lock(&c->mtx);
+
+    cache_entry_t *e;
+    HASH_FIND_STR(c->map, key, e);
+    if (e) {
+        lru_remove(c, e);
+        HASH_DEL(c->map, e);
+        c->n_entries--;
+
+        free(e->key);
+        free(e->payload);
+        free(e);
+
+        MM_METRIC_COUNTER_INC(cache_invalidate_total);
+        MM_METRIC_GAUGE_SET(cache_entries, c->n_entries);
+    }
+
+    pthread_mutex_unlock(&c->mtx);
+    return MM_CACHE_OK;
+}
+
+void mm_cache_clear(mm_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_mutex_lock(&c->mtx);
+
+    cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, c->map, cur, tmp) {
+        HASH_DEL(c->map, cur);
+        free(cur->key);
+        free(cur->payload);
+        free(cur);
+    }
+    c->lru_head = c->lru_tail = NULL;
+    c->n_entries = 0;
+    MM_METRIC_COUNTER_INC(cache_flush_total);
+    MM_METRIC_GAUGE_SET(cache_entries, 0);
+
+    pthread_mutex_unlock(&c->mtx);
+
+    MM_LOG_INFO("[cache:%s] Cleared all entries", c->ns);
+}
+
+/*------------------------------------------------------------------------------
+ * End of file
+ *----------------------------------------------------------------------------*/

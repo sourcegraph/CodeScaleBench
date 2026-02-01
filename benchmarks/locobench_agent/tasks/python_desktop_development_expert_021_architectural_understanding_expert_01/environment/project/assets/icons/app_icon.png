@@ -1,0 +1,411 @@
+```python
+"""
+FlockDesk – Icon Sub-System
+===========================
+
+This module encapsulates *everything* related to icon discovery, loading, theme
+switching and high-DPI handling for the desktop client.  Although it primarily
+targets Qt/PySide6, it keeps GUI-free fallbacks so that head-less unit-tests
+can still exercise the code-paths without loading a full Qt stack.
+
+Key Responsibilities
+--------------------
+1. Discover icons from multiple sources (plugins, user overrides, packaged
+   resources) while honouring the user’s preferred icon-theme (light/dark).
+2. Provide caching to avoid recreating QIcon/QPixmap objects.
+3. Broadcast theme change events through a tiny, local event-bus so that any
+   widget/view-model can refresh itself without a tight coupling.
+4. Offer an opt-in file-watcher (watchdog) to *hot-reload* icons a designer
+   just overwrote on disk—super useful in development mode.
+
+The concrete icon this module ultimately exposes is
+``assets/icons/app_icon.png``, but the API is generic enough to be reused
+throughout the whole application.
+
+Usage
+-----
+>>> from flockdesk.assets.icons import icon_hub
+>>> main_window.setWindowIcon(icon_hub.get_app_icon())
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+import threading
+from functools import lru_cache
+from pathlib import Path
+from typing import Callable, Dict, Final, Iterable, List, Optional, Tuple
+
+# --------------------------------------------------------------------------- #
+# Optional imports—keep the module importable in non-GUI contexts (CI, etc.). #
+# --------------------------------------------------------------------------- #
+try:
+    from PySide6.QtGui import QIcon, QPixmap  # type: ignore
+    from PySide6.QtCore import QObject, Signal, Slot  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover – headless envs
+    # Cheap stand-ins so the rest of the module keeps working.
+    class _Dummy:  # pylint: disable=too-few-public-methods
+        def __getattr__(self, item):  # noqa: D401
+            raise RuntimeError(
+                "Qt bindings are unavailable.  "
+                "Install 'PySide6' or run in GUI-enabled environment."
+            )
+
+    QIcon = QPixmap = QObject = _Dummy  # type: ignore
+    Signal = lambda *_, **__: None  # type: ignore  # noqa: E731
+    Slot = lambda *_, **__: None  # type: ignore  # noqa: E731
+
+try:
+    from watchdog.events import FileSystemEventHandler  # type: ignore
+    from watchdog.observers import Observer as _FsObserver  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover – optional feature
+    FileSystemEventHandler = object  # type: ignore
+    _FsObserver = None  # type: ignore
+
+try:
+    from importlib import resources as importlib_resources
+except ImportError:  # Py<3.9
+    import importlib_resources  # type: ignore
+
+# --------------------------------------------------------------------------- #
+# Logging                                                                     #
+# --------------------------------------------------------------------------- #
+LOG = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Public Re-exports                                                           #
+# --------------------------------------------------------------------------- #
+__all__ = [
+    "IconHub",
+    "icon_hub",
+    "get_app_icon",
+]
+
+# --------------------------------------------------------------------------- #
+# Constants & Types                                                           #
+# --------------------------------------------------------------------------- #
+_EVENT_ICON_THEME_CHANGED: Final[str] = "icon.theme.changed"
+_DEFAULT_ICON_THEME: Final[str] = "light"
+
+# Name used throughout the codebase to request the “main application icon”.
+_APP_ICON_NAME: Final[str] = "app_icon"
+
+# Candidate file-extensions in priority order
+_ICON_EXTENSIONS: Tuple[str, ...] = (".svg", ".png", ".ico")
+
+# --------------------------------------------------------------------------- #
+# Simple, in-process event bus – sufficient for icon theme changes.           #
+# --------------------------------------------------------------------------- #
+class _LocalEventBus:
+    """A *very* small pub/sub facility for messages that never leave the
+    current process.  We purposefully keep it synchronous to keep reasoning
+    about side-effects simple.
+    """
+
+    _subscribers: Dict[str, List[Callable[..., None]]] = {}
+
+    @classmethod
+    def subscribe(cls, event: str, callback: Callable[..., None]) -> None:
+        LOG.debug("Subscribing %s to event '%s'", callback, event)
+        cls._subscribers.setdefault(event, []).append(callback)
+
+    @classmethod
+    def publish(cls, event: str, *args, **kwargs) -> None:
+        LOG.debug("Publishing event '%s' to %d listeners", event, len(cls._subscribers.get(event, [])))
+        for callback in list(cls._subscribers.get(event, [])):
+            try:
+                callback(*args, **kwargs)
+            except Exception:  # pylint: disable=broad-except
+                LOG.exception("Unhandled exception in event-handler '%s'", callback)
+
+
+# --------------------------------------------------------------------------- #
+# IconHub – public façade                                                     #
+# --------------------------------------------------------------------------- #
+class IconHub(QObject):  # type: ignore[misc]
+    """
+    Central registry + cache for QIcon/QPixmap objects.
+
+    Do *not* instantiate directly—use the singleton ``icon_hub`` defined at the
+    bottom of the module to keep one authoritative cache alive for the running
+    process.
+    """
+
+    themeChanged = Signal(str)  # Qt signal for Qt-only listeners
+
+    # Location search-order for icon files:
+    # 1. Explicit paths via env-var  FLOCKDESK_ICON_PATHS   (colon-separated)
+    # 2. Plugin override directories (registered at runtime)
+    # 3. App-bundled package data   ``flockdesk.assets.icons``
+    _PLUGIN_PATHS: List[Path] = []
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._theme: str = os.environ.get("FLOCKDESK_ICON_THEME", _DEFAULT_ICON_THEME)
+        self._fs_observer: Optional[_FsObserver] = None
+
+        # Kick off file-watcher in development mode
+        if os.environ.get("FLOCKDESK_DEV_MODE", "").lower() == "1":
+            self._maybe_start_fs_observer()
+
+        # Relay bus-events so that non-Qt code can still listen
+        _LocalEventBus.subscribe(_EVENT_ICON_THEME_CHANGED, self._on_theme_change)
+
+    # ------------------------------------------------------------------ #
+    # Public API                                                         #
+    # ------------------------------------------------------------------ #
+    def set_theme(self, theme: str, *, persist: bool = False) -> None:
+        """Switch between predefined icon themes (e.g. 'light' / 'dark').
+
+        If ``persist`` is *True*, the preference is stored in the OS-specific
+        config-backend.  We do not implement that here to keep the module
+        dependency-free – higher layers can subscribe to the same event and
+        take care of persistence.
+        """
+        if theme == self._theme:
+            LOG.debug("Icon theme unchanged ('%s') – ignoring request.", theme)
+            return
+
+        LOG.info("Switching icon-theme from '%s' to '%s'", self._theme, theme)
+        self._theme = theme
+
+        # Clear memoised loaders
+        self._invalidate_caches()
+
+        # Notify listeners
+        self.themeChanged.emit(theme)
+        _LocalEventBus.publish(_EVENT_ICON_THEME_CHANGED, theme=theme)
+
+    def get_theme(self) -> str:
+        return self._theme
+
+    # ------------------------------- #
+    # Icon retrieval helpers          #
+    # ------------------------------- #
+    @lru_cache(maxsize=256)
+    def get_icon(self, name: str) -> QIcon:
+        """
+        Return a Qt :class:`~PySide6.QtGui.QIcon` for the requested *logical*
+        icon-name (no extension).
+
+        Examples
+        --------
+        >>> save_icon = icon_hub.get_icon("save")
+        >>> save_as_icon = icon_hub.get_icon("save_as")
+        """
+        file_path = self._resolve_icon_path(name)
+        pix = QPixmap(str(file_path))
+        if pix.isNull():
+            LOG.warning("Failed to load icon '%s' from %s", name, file_path)
+            return QIcon()
+        return QIcon(pix)
+
+    @lru_cache(maxsize=256)
+    def get_pixmap(self, name: str) -> QPixmap:
+        """Return a (cached) :class:`~PySide6.QtGui.QPixmap`."""
+        file_path = self._resolve_icon_path(name)
+        pix = QPixmap(str(file_path))
+        if pix.isNull():
+            LOG.warning("Failed to load pixmap '%s' from %s", name, file_path)
+        return pix
+
+    # Convenience wrapper for the most commonly used icon in the suite.
+    def get_app_icon(self) -> QIcon:
+        return self.get_icon(_APP_ICON_NAME)
+
+    # ------------------------------- #
+    # Plugin & Path Registration      #
+    # ------------------------------- #
+    @classmethod
+    def register_plugin_icons(cls, directory: Path) -> None:
+        """Allow plugins to contribute their own icons by pointing to a
+        directory that follows the same theme structure as the core bundle:
+
+            <plugin-dir>/<theme>/<icon_name>.<ext>
+        """
+        if not directory.exists():
+            raise FileNotFoundError(f"Plugin-icon directory '{directory}' does not exist.")
+        cls._PLUGIN_PATHS.append(directory)
+        LOG.info("Registered plugin icon-path: %s", directory)
+
+    # ------------------------------------------------------------------ #
+    # Internals                                                          #
+    # ------------------------------------------------------------------ #
+    def _invalidate_caches(self) -> None:
+        self.get_icon.cache_clear()  # type: ignore[attr-defined]
+        self.get_pixmap.cache_clear()  # type: ignore[attr-defined]
+
+    # ------------------------------- #
+    # Path Resolution                 #
+    # ------------------------------- #
+    def _resolve_icon_path(self, name: str) -> Path:
+        """
+        Try all known sources until we find a hit.  The resolution order is:
+
+            1. FLOCKDESK_ICON_PATHS env-var (most specific, user override)
+            2. Registered plugin paths
+            3. Package resources (fallback, always available)
+
+        Raises
+        ------
+        FileNotFoundError
+            If no matching file could be located at all.
+        """
+        candidates = list(self._iter_possible_files(name))
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        LOG.error("Could not locate icon '%s' in any known location.", name)
+        raise FileNotFoundError(f"Icon '{name}' not found among {candidates}")
+
+    def _iter_possible_files(self, name: str) -> Iterable[Path]:
+        theme_dirname = self._theme.lower()
+
+        # 1. Paths from environment variable
+        env_paths = os.environ.get("FLOCKDESK_ICON_PATHS", "")
+        for root in filter(None, env_paths.split(os.pathsep)):
+            yield from self._yield_icon_variants(Path(root) / theme_dirname, name)
+
+        # 2. Plugin-supplied icon directories
+        for plugin_root in self._PLUGIN_PATHS:
+            yield from self._yield_icon_variants(plugin_root / theme_dirname, name)
+
+        # 3. Packaged fallback (importlib.resources)
+        try:
+            with importlib_resources.path("flockdesk.assets.icons", "") as pkg_root:
+                yield from self._yield_icon_variants(pkg_root / theme_dirname, name)
+        except (ImportError, FileNotFoundError):
+            # The package may not be installed as real files (e.g. inside a zip)
+            # In that case we fall back to an *extracted* temporary path.
+            pass
+
+    @staticmethod
+    def _yield_icon_variants(folder: Path, name: str) -> Iterable[Path]:
+        for ext in _ICON_EXTENSIONS:
+            candidate = folder / f"{name}{ext}"
+            yield candidate
+
+    # ------------------------------- #
+    # Event Bus Relay                 #
+    # ------------------------------- #
+    def _on_theme_change(self, *, theme: str) -> None:  # noqa: D401
+        """Relay bus event into Qt signal handlers."""
+        if theme != self._theme:
+            self._theme = theme
+            self._invalidate_caches()
+            self.themeChanged.emit(theme)  # Qt side
+
+    # ------------------------------------------------------------------ #
+    # Development Support – Hot Reloading                                #
+    # ------------------------------------------------------------------ #
+    def _maybe_start_fs_observer(self) -> None:
+        if _FsObserver is None:
+            LOG.debug("watchdog not available – icon hot-reload disabled.")
+            return
+
+        watch_dirs: List[Path] = []
+
+        env_paths = os.environ.get("FLOCKDESK_ICON_PATHS", "")
+        watch_dirs.extend(Path(p) / self._theme for p in env_paths.split(os.pathsep) if p)
+
+        watch_dirs.extend(p / self._theme for p in self._PLUGIN_PATHS)
+
+        try:
+            with importlib_resources.path("flockdesk.assets.icons", "") as pkg_root:
+                watch_dirs.append(pkg_root / self._theme)
+        except (ImportError, FileNotFoundError):
+            pass
+
+        watch_dirs = [d for d in watch_dirs if d.exists()]
+        if not watch_dirs:
+            LOG.debug("No watchable icon dirs – hot-reload disabled.")
+            return
+
+        # Start file-system observer in another thread to avoid blocking Qt.
+        self._fs_observer = _FsObserver()
+        for directory in watch_dirs:
+            self._fs_observer.schedule(_IconChangeHandler(self), str(directory), recursive=False)
+
+        LOG.info("Starting icon hot-reload watcher for %d directories.", len(watch_dirs))
+        self._fs_observer.start()
+
+    def __del__(self) -> None:  # pragma: no cover
+        if self._fs_observer:
+            self._fs_observer.stop()
+            self._fs_observer.join(timeout=2)
+
+
+class _IconChangeHandler(FileSystemEventHandler):  # type: ignore
+    """File-system callback used in development mode to invalidate the icon
+    cache whenever a designer tweaks an SVG/PNG on disk.
+    """
+
+    _DEBOUNCE_SEC: Final[float] = 0.25
+
+    def __init__(self, hub: IconHub) -> None:
+        super().__init__()
+        self._hub = hub
+        self._timer: Optional[threading.Timer] = None
+
+    # One unified handler for create/modify/delete events
+    def on_any_event(self, event):  # type: ignore[override]
+        LOG.debug("Icon file-system event: %s", event)
+        # Debounce quick succession of events
+        if self._timer and self._timer.is_alive():
+            self._timer.cancel()
+
+        self._timer = threading.Timer(self._DEBOUNCE_SEC, self._invalidate)
+        self._timer.start()
+
+    def _invalidate(self) -> None:
+        LOG.info("Icon files changed on disk – clearing caches.")
+        self._hub._invalidate_caches()  # pylint: disable=protected-access
+        _LocalEventBus.publish(_EVENT_ICON_THEME_CHANGED, theme=self._hub.get_theme())
+
+
+# --------------------------------------------------------------------------- #
+# Instantiate singleton for app-wide reuse                                    #
+# --------------------------------------------------------------------------- #
+icon_hub: Final[IconHub] = IconHub()
+
+# Public wrapper so client code does not need to import the full hub
+def get_app_icon() -> QIcon:
+    """
+    Shorthand for the main application window (and splash screen) to get the
+    *one* icon that represents FlockDesk.
+
+    Returns
+    -------
+    QIcon
+        A fully prepared Qt icon object that can be passed into
+        ``QApplication.setWindowIcon`` or ``QWidget.setWindowIcon``.
+    """
+    return icon_hub.get_app_icon()
+
+
+# --------------------------------------------------------------------------- #
+# CLI helper for quick manual inspection                                      #
+# --------------------------------------------------------------------------- #
+def _debug_cli() -> None:  # pragma: no cover
+    """Drop-in CLI debugger to visually inspect icons without launching the
+    whole client."""
+    if "PySide6" not in sys.modules:
+        print("Qt not available – cannot run GUI debugger.")
+        sys.exit(1)
+
+    from PySide6.QtWidgets import QApplication, QLabel  # type: ignore
+
+    app = QApplication(sys.argv)  # noqa:  # pylint: disable=invalid-name
+    lbl = QLabel()
+    lbl.setPixmap(icon_hub.get_pixmap(_APP_ICON_NAME))
+    lbl.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":  # pragma: no cover
+    logging.basicConfig(level=logging.DEBUG)
+    _debug_cli()
+```

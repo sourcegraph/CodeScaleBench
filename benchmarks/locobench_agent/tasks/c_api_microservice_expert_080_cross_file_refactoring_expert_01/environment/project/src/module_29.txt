@@ -1,0 +1,467 @@
+```c
+/**
+ * MercuryMonolith Commerce Hub
+ * ===================================
+ * Module 29  –  Response Caching (in-memory, LRU)
+ *
+ * This compilation unit implements a thread-safe, TTL-aware, size-bounded
+ * response cache that is shared by REST & GraphQL presentation layers.
+ *
+ * The implementation relies only on libc + pthreads and does not require
+ * third-party hash-table libraries.  A chained-bucket hash map backed by
+ * a doubly-linked list provides O(1) inserts/lookups while maintaining a
+ * global LRU eviction order.  All public calls are protected by an
+ * RW-lock so read-heavy workloads are not hammered by contention.
+ *
+ * Metrics are exported through the lightweight “mm_metrics.h” façade
+ * (Prometheus exposition happens elsewhere).
+ *
+ * File path: src/module_29.c         (declared “.txt” in manifest)
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <pthread.h>
+#include <time.h>
+#include <errno.h>
+
+#include "mm_logging.h"     /* MERCURY_LOG_* macros                */
+#include "mm_metrics.h"     /* mm_metrics_counter_* wrappers       */
+#include "mm_mem.h"         /* safe malloc/realloc helpers         */
+#include "response_cache.h" /* public interface for this module    */
+
+/* -------------------------------------------------------------------------- */
+/*                              Private definitions                           */
+/* -------------------------------------------------------------------------- */
+
+#define CACHE_HASHTABLE_INITIAL_BUCKETS  1024U  /* must be power of two       */
+#define LRU_SENTINEL_KEY                "__LRU_ANCHOR__"
+
+/* Forward decl for intrusive list nodes */
+typedef struct cache_entry_s cache_entry_t;
+
+/* Doubly-linked list of cache entries (for LRU walk) */
+struct cache_entry_s {
+    char            *key;
+    void            *value;
+    size_t           value_size;
+
+    uint32_t         ttl_sec;
+    time_t           ts_insert;   /* time at insert (epoch seconds) */
+
+    /* intrusive list + hash collision chain */
+    cache_entry_t   *prev, *next;
+    cache_entry_t   *hnext;
+};
+
+/* Hash-table bucket */
+typedef struct bucket_s {
+    cache_entry_t *chain;
+} bucket_t;
+
+/* Complete cache instance */
+struct mercury_cache_s {
+    char           namespace[64];      /* e.g. “catalog/v1”                */
+
+    size_t         capacity;           /* hard limit on # entries          */
+    size_t         size;               /* current population               */
+
+    uint32_t       default_ttl_sec;
+
+    /* Metrics counters (local copy, published periodically) */
+    uint64_t       hits;
+    uint64_t       misses;
+    uint64_t       evictions;
+
+    /* Hash map + mod-mask for fast index */
+    bucket_t      *buckets;
+    size_t         bucket_count;
+    size_t         bucket_mask;
+
+    /* global LRU list (newest at head) */
+    cache_entry_t  lru_head;           /* sentinel/anchor node             */
+
+    pthread_rwlock_t rwlock;           /* readers = parallel; writers = exclusive */
+};
+
+/* -------------------------------------------------------------------------- */
+/*                            Utility / helpers                               */
+/* -------------------------------------------------------------------------- */
+
+static inline size_t
+hash_key(const char *key)
+{
+    /* Fowler/Noll/Vo FNV-1a 64-bit hash */
+    uint64_t h = 14695981039346656037ULL;
+    for (; *key; ++key) {
+        h ^= (uint64_t)(unsigned char)(*key);
+        h *= 1099511628211ULL;
+    }
+    return (size_t)h;
+}
+
+static inline time_t
+epoch_now(void)
+{
+    return (time_t)time(NULL);
+}
+
+static void
+lru_insert_front(mercury_cache_t *c, cache_entry_t *e)
+{
+    /* Insert right after sentinel (MRU) */
+    e->next            = c->lru_head.next;
+    e->prev            = &c->lru_head;
+    c->lru_head.next->prev = e;
+    c->lru_head.next   = e;
+}
+
+static void
+lru_remove(cache_entry_t *e)
+{
+    e->prev->next = e->next;
+    e->next->prev = e->prev;
+}
+
+static void
+evict_tail(mercury_cache_t *c)
+{
+    cache_entry_t *victim = c->lru_head.prev;
+    if (victim == &c->lru_head) return; /* empty */
+
+    /* unlink from LRU and bucket chain */
+    lru_remove(victim);
+
+    size_t idx = hash_key(victim->key) & c->bucket_mask;
+    cache_entry_t **pp = &c->buckets[idx].chain;
+    while (*pp && *pp != victim) pp = &(*pp)->hnext;
+    if (*pp) *pp = victim->hnext;
+
+    free(victim->key);
+    free(victim->value);
+    free(victim);
+
+    c->size--;
+    c->evictions++;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            Public API implementation                       */
+/* -------------------------------------------------------------------------- */
+
+mercury_cache_t *
+mm_cache_create(const char *namespace,
+                size_t      capacity,
+                uint32_t    default_ttl_sec)
+{
+    if (!namespace || capacity == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    mercury_cache_t *c = mm_calloc(1, sizeof(*c));
+    if (!c) return NULL;
+
+    strncpy(c->namespace, namespace, sizeof(c->namespace)-1);
+    c->capacity         = capacity;
+    c->default_ttl_sec  = default_ttl_sec ? default_ttl_sec : 60;
+
+    /* allocate buckets – keep count power-of-two, at least 1024 */
+    c->bucket_count = CACHE_HASHTABLE_INITIAL_BUCKETS;
+    while (c->bucket_count < (capacity * 2))
+        c->bucket_count <<= 1;
+
+    c->bucket_mask  = c->bucket_count - 1;
+    c->buckets      = mm_calloc(c->bucket_count, sizeof(bucket_t));
+    if (!c->buckets) {
+        free(c);
+        return NULL;
+    }
+
+    /* init sentinel */
+    c->lru_head.key  = (char*)LRU_SENTINEL_KEY;
+    c->lru_head.prev = c->lru_head.next = &c->lru_head;
+
+    if (pthread_rwlock_init(&c->rwlock, NULL) != 0) {
+        mm_free(c->buckets);
+        mm_free(c);
+        return NULL;
+    }
+
+    MERCURY_LOG_INFO("[cache] [%s] initialized with capacity=%zu, buckets=%zu",
+                     c->namespace, c->capacity, c->bucket_count);
+    return c;
+}
+
+void
+mm_cache_destroy(mercury_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    /* free all entries */
+    for (size_t i = 0; i < c->bucket_count; ++i) {
+        cache_entry_t *cur = c->buckets[i].chain;
+        while (cur) {
+            cache_entry_t *next = cur->hnext;
+            free(cur->key);
+            free(cur->value);
+            free(cur);
+            cur = next;
+        }
+    }
+
+    free(c->buckets);
+    pthread_rwlock_unlock(&c->rwlock);
+    pthread_rwlock_destroy(&c->rwlock);
+
+    mm_metrics_counter_add("cache_evictions_total", c->namespace, c->evictions);
+
+    free(c);
+}
+
+static cache_entry_t *
+find_entry(mercury_cache_t *c, const char *key, size_t idx)
+{
+    cache_entry_t *e = c->buckets[idx].chain;
+    while (e) {
+        if (strcmp(e->key, key) == 0)
+            return e;
+        e = e->hnext;
+    }
+    return NULL;
+}
+
+bool
+mm_cache_get(mercury_cache_t *c,
+             const char      *key,
+             void           **out_value,
+             size_t          *out_value_size)
+{
+    if (!c || !key) {
+        errno = EINVAL;
+        return false;
+    }
+
+    bool found = false;
+
+    pthread_rwlock_rdlock(&c->rwlock);
+    size_t idx = hash_key(key) & c->bucket_mask;
+    cache_entry_t *e = find_entry(c, key, idx);
+    if (e) {
+        /* check TTL */
+        time_t now = epoch_now();
+        if (e->ttl_sec == 0 || (now - e->ts_insert) < e->ttl_sec) {
+            found = true;
+            if (out_value)      *out_value      = e->value;
+            if (out_value_size) *out_value_size = e->value_size;
+            c->hits++;
+        } else {
+            /* expired – will be purged by writer path later */
+        }
+    }
+    if (!found) c->misses++;
+
+    pthread_rwlock_unlock(&c->rwlock);
+
+    /* If we found, we need to promote to MRU (requires write lock) */
+    if (found && pthread_rwlock_wrlock(&c->rwlock) == 0) {
+        /* element might have moved – verify */
+        e = find_entry(c, key, idx);
+        if (e) {
+            lru_remove(e);
+            lru_insert_front(c, e);
+        }
+        pthread_rwlock_unlock(&c->rwlock);
+    }
+    return found;
+}
+
+bool
+mm_cache_put(mercury_cache_t *c,
+             const char      *key,
+             const void      *value,
+             size_t           value_size,
+             uint32_t         ttl_sec)
+{
+    if (!c || !key || !value || value_size == 0) {
+        errno = EINVAL;
+        return false;
+    }
+
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    size_t idx = hash_key(key) & c->bucket_mask;
+    cache_entry_t *e = find_entry(c, key, idx);
+
+    if (e) {
+        /* overwrite existing */
+        free(e->value);
+        e->value      = mm_memdup(value, value_size);
+        if (!e->value) goto oom;
+
+        e->value_size = value_size;
+        e->ttl_sec    = ttl_sec ? ttl_sec : c->default_ttl_sec;
+        e->ts_insert  = epoch_now();
+
+        lru_remove(e);
+        lru_insert_front(c, e);
+
+        pthread_rwlock_unlock(&c->rwlock);
+        return true;
+    }
+
+    /* new entry */
+    if (c->size >= c->capacity)
+        evict_tail(c);
+
+    e = mm_calloc(1, sizeof(*e));
+    if (!e) goto oom;
+
+    e->key        = strdup(key);
+    e->value      = mm_memdup(value, value_size);
+    if (!e->key || !e->value) goto oom;
+
+    e->value_size = value_size;
+    e->ttl_sec    = ttl_sec ? ttl_sec : c->default_ttl_sec;
+    e->ts_insert  = epoch_now();
+
+    /* insert into bucket chain */
+    e->hnext                = c->buckets[idx].chain;
+    c->buckets[idx].chain   = e;
+
+    /* insert into LRU front */
+    lru_insert_front(c, e);
+
+    c->size++;
+
+    pthread_rwlock_unlock(&c->rwlock);
+    return true;
+
+oom:
+    if (e) {
+        free(e->key);
+        free(e->value);
+        free(e);
+    }
+    pthread_rwlock_unlock(&c->rwlock);
+    errno = ENOMEM;
+    return false;
+}
+
+bool
+mm_cache_invalidate(mercury_cache_t *c, const char *key)
+{
+    if (!c || !key) {
+        errno = EINVAL;
+        return false;
+    }
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    size_t idx = hash_key(key) & c->bucket_mask;
+    cache_entry_t *e = find_entry(c, key, idx);
+    if (!e) {
+        pthread_rwlock_unlock(&c->rwlock);
+        return false;
+    }
+
+    /* remove from chains */
+    lru_remove(e);
+
+    cache_entry_t **pp = &c->buckets[idx].chain;
+    while (*pp && *pp != e) pp = &(*pp)->hnext;
+    if (*pp) *pp = e->hnext;
+
+    free(e->key);
+    free(e->value);
+    free(e);
+    c->size--;
+
+    pthread_rwlock_unlock(&c->rwlock);
+    return true;
+}
+
+void
+mm_cache_clear(mercury_cache_t *c)
+{
+    if (!c) return;
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    for (size_t i = 0; i < c->bucket_count; ++i) {
+        cache_entry_t *cur = c->buckets[i].chain;
+        while (cur) {
+            cache_entry_t *next = cur->hnext;
+            free(cur->key);
+            free(cur->value);
+            free(cur);
+            cur = next;
+        }
+        c->buckets[i].chain = NULL;
+    }
+    c->lru_head.prev = c->lru_head.next = &c->lru_head;
+    c->size = 0;
+
+    pthread_rwlock_unlock(&c->rwlock);
+}
+
+void
+mm_cache_expose_metrics(mercury_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_rwlock_rdlock(&c->rwlock);
+    uint64_t hits      = c->hits;
+    uint64_t misses    = c->misses;
+    uint64_t evictions = c->evictions;
+    pthread_rwlock_unlock(&c->rwlock);
+
+    mm_metrics_gauge_set("cache_size",        c->namespace, c->size);
+    mm_metrics_gauge_set("cache_capacity",    c->namespace, c->capacity);
+    mm_metrics_counter_add("cache_hits_total",      c->namespace, hits);
+    mm_metrics_counter_add("cache_misses_total",    c->namespace, misses);
+    mm_metrics_counter_add("cache_evictions_total", c->namespace, evictions);
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                Debug helpers                               */
+/* -------------------------------------------------------------------------- */
+
+#ifdef MERCURY_CACHE_TEST
+#include <assert.h>
+
+static void
+self_test(void)
+{
+    mercury_cache_t *c = mm_cache_create("unit_test", 3, 1);
+    assert(c);
+
+    int a = 1, b = 2, d = 4;
+    assert(mm_cache_put(c, "a", &a, sizeof a, 0));
+    assert(mm_cache_put(c, "b", &b, sizeof b, 0));
+    assert(mm_cache_put(c, "d", &d, sizeof d, 0));
+
+    int *out = NULL; size_t sz = 0;
+
+    assert(mm_cache_get(c, "a", (void*)&out, &sz));
+    assert(*out == 1);
+
+    /* cause eviction */
+    int e = 5;
+    assert(mm_cache_put(c, "e", &e, sizeof e, 0));
+    assert(!mm_cache_get(c, "b", NULL, NULL)); /* b should be evicted */
+
+    mm_cache_destroy(c);
+    MERCURY_LOG_INFO("[cache] self-test passed");
+}
+
+__attribute__((constructor))
+static void
+run_tests(void)
+{
+    self_test();
+}
+#endif
+```

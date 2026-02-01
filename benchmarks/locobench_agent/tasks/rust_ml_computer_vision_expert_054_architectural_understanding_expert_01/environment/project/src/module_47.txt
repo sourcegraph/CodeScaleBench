@@ -1,0 +1,398 @@
+```rust
+//! Module 47 – Model-Monitoring & Automated-Retraining Observer
+//!
+//! This module wires together an event-driven “Observer”-powered monitoring
+//! service that listens to model-performance metrics, detects drift or
+//! anomalies, and schedules automated retraining jobs through an internal
+//! scheduler queue.  Although self-contained, the abstractions are fully
+//! compatible with the broader VisuTility Orchestrator architecture:
+//!
+//! • Observer Pattern – `MetricObserver` + `MonitorHub`  
+//! • Strategy Pattern – multiple detector strategies via `DetectorStrategy`  
+//! • Factory Pattern  – `DetectorFactory` chooses an implementation at runtime  
+//! • MLOps Layering  – publishes `RetrainJob` to Model-Ops scheduler queue  
+//!
+//! The code is `#![no_std]`-friendly except for the `alloc` gate.  You can
+//! compile it in `std` mode (default) or `no_std` by disabling the default
+//! features in `Cargo.toml`.
+//!
+//! # Example
+//! ```no_run
+//! use visu_tility_monitoring::*;
+//! use chrono::Utc;
+//!
+//! #[tokio::main(flavor = "current_thread")]
+//! async fn main() -> Result<(), MonitoringError> {
+//!     let (hub, mut retrain_rx) = MonitorHub::new();
+//!
+//!     // Register an off-the-shelf drift detector
+//!     let detector = DetectorFactory::drift_detector("accuracy", 0.15, 100);
+//!     hub.register(detector).await?;
+//!
+//!     // Simulate publishing a metric                                                          
+//!     hub.publish(MetricEvent::new("model-abc", "accuracy", 0.71)).await?;
+//!
+//!     // Handle retrain jobs
+//!     if let Some(job) = retrain_rx.recv().await {
+//!         println!("📦 Scheduled job: {job:?}");
+//!     }
+//!     Ok(())
+//! }
+//! ```
+
+#![allow(clippy::module_name_repetitions)]
+#![deny(missing_docs)]
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use log::{debug, error, info, warn};
+use tokio::sync::{mpsc, Mutex};
+use uuid::Uuid;
+
+/// The capacity of the internal scheduler queue.
+///
+/// A production deployment would likely make this configurable through the
+/// platform’s global configuration provider.
+const RETRAIN_QUEUE_SIZE: usize = 128;
+
+/// An opaque identifier for a model version, compatible with the Model
+/// Registry.
+pub type ModelId = String;
+
+/// Observe-able metric names are left free-form, but for production you should
+/// either constrain them to an enum or a metric-schema registry.
+pub type MetricName = String;
+
+/// A single data point captured by the Serving-Ops layer.
+#[derive(Debug, Clone)]
+pub struct MetricEvent {
+    /// UTC timestamp at point of measurement.
+    pub ts: DateTime<Utc>,
+    /// The logical model identity.
+    pub model_id: ModelId,
+    /// The metric being measured, e.g. "accuracy" or "latency_p99".
+    pub metric: MetricName,
+    /// The numeric value of the metric.
+    pub value: f64,
+}
+
+impl MetricEvent {
+    /// Convenience constructor that auto-populates `ts`.
+    pub fn new<M: Into<ModelId>, N: Into<MetricName>>(model_id: M, metric: N, value: f64) -> Self {
+        Self {
+            ts: Utc::now(),
+            model_id: model_id.into(),
+            metric: metric.into(),
+            value,
+        }
+    }
+}
+
+/// All domain-level errors emitted by this module.
+#[derive(thiserror::Error, Debug)]
+pub enum MonitoringError {
+    /// Wrapper around dynamic errors.
+    #[error(transparent)]
+    Anyhow(#[from] anyhow::Error),
+
+    /// The internal scheduler was closed unexpectedly.
+    #[error("retrain scheduler channel closed")]
+    SchedulerClosed,
+}
+
+/// Consumers interested in metric events implement this trait.
+#[async_trait]
+pub trait MetricObserver: Send + Sync {
+    /// Handle a metric event.
+    async fn on_event(&self, event: &MetricEvent) -> Result<(), MonitoringError>;
+}
+
+/// Hub that dispatches events to registered observers.
+#[derive(Clone)]
+pub struct MonitorHub {
+    inner: Arc<HubInner>,
+    /// Sender side of the scheduler queue.
+    job_tx: mpsc::Sender<RetrainJob>,
+}
+
+/// The internal hub state.
+struct HubInner {
+    observers: Mutex<Vec<Arc<dyn MetricObserver>>>,
+}
+
+impl MonitorHub {
+    /// Returns a new hub and a receiver to consume retraining jobs.
+    pub fn new() -> (Self, mpsc::Receiver<RetrainJob>) {
+        let (job_tx, job_rx) = mpsc::channel(RETRAIN_QUEUE_SIZE);
+        let inner = HubInner {
+            observers: Mutex::new(Vec::new()),
+        };
+        (Self { inner: Arc::new(inner), job_tx }, job_rx)
+    }
+
+    /// Register a new observer.
+    pub async fn register<O>(&self, observer: O) -> Result<(), MonitoringError>
+    where
+        O: MetricObserver + 'static,
+    {
+        let mut guard = self.inner.observers.lock().await;
+        guard.push(Arc::new(observer));
+        info!("Registered observer – total_observers={}", guard.len());
+        Ok(())
+    }
+
+    /// Publish a metric event to all observers.
+    pub async fn publish(&self, event: MetricEvent) -> Result<(), MonitoringError> {
+        let observers = {
+            // clone list to avoid locking during await
+            let guard = self.inner.observers.lock().await;
+            guard.clone()
+        };
+
+        for obs in observers {
+            if let Err(e) = obs.on_event(&event).await {
+                // Log error but continue with other observers
+                error!("observer error: {e:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Low-level API for observers to enqueue a retraining job.
+    async fn enqueue_retrain(&self, job: RetrainJob) -> Result<(), MonitoringError> {
+        self.job_tx
+            .send(job)
+            .await
+            .map_err(|_| MonitoringError::SchedulerClosed)
+    }
+}
+
+/// A retraining job to be consumed by Model-Ops.
+#[derive(Debug, Clone)]
+pub struct RetrainJob {
+    /// Unique job id
+    pub job_id: Uuid,
+    /// Which model should be retrained
+    pub model_id: ModelId,
+    /// The strategy that requested the retraining
+    pub reason: RetrainReason,
+}
+
+impl RetrainJob {
+    fn new(model_id: ModelId, reason: RetrainReason) -> Self {
+        Self { job_id: Uuid::new_v4(), model_id, reason }
+    }
+}
+
+/// Different triggers that may schedule a retraining job.
+#[derive(Debug, Clone)]
+pub enum RetrainReason {
+    /// Concept drift or performance degradation.
+    DriftDetected { metric: MetricName, delta: f64 },
+    /// Placeholder for other reasons (manual, scheduled, etc.).
+    Other(String),
+}
+
+/* -------------------------------------------------------------------------
+   Detector Strategies
+   ---------------------------------------------------------------------- */
+
+/// The behaviour that decides whether a retraining job should be fired.
+#[async_trait]
+pub trait DetectorStrategy: Send + Sync {
+    /// Consume a metric event and maybe schedule a retraining job.
+    async fn consume(
+        &self,
+        hub: &MonitorHub,
+        event: &MetricEvent,
+    ) -> Result<(), MonitoringError>;
+}
+
+/// Sliding-window drift detector that compares the live metric to a reference
+/// distribution using a simple “population mean delta” heuristic.
+///
+/// Notes:
+/// 1.  The algorithm is intentionally simple; swap it out for a Kolmogorov-Smirnov,
+///     PSI, or ADWIN detector to achieve production-grade drift detection.
+/// 2.  The impl is thread-safe via internal `Mutex`.
+pub struct MeanDriftDetector {
+    metric: MetricName,
+    threshold: f64,
+    window: usize,
+    state: Mutex<DetectorState>,
+}
+
+struct DetectorState {
+    history: VecDeque<f64>,
+}
+
+impl MeanDriftDetector {
+    fn new(metric: MetricName, threshold: f64, window: usize) -> Self {
+        Self {
+            metric,
+            threshold,
+            window,
+            state: Mutex::new(DetectorState { history: VecDeque::with_capacity(window) }),
+        }
+    }
+}
+
+#[async_trait]
+impl DetectorStrategy for MeanDriftDetector {
+    async fn consume(&self, hub: &MonitorHub, event: &MetricEvent) -> Result<(), MonitoringError> {
+        if event.metric != self.metric {
+            // Not interested in this metric
+            return Ok(());
+        }
+
+        let delta_opt = {
+            let mut guard = self.state.lock().await;
+            guard.history.push_back(event.value);
+            if guard.history.len() > self.window {
+                guard.history.pop_front();
+            }
+
+            // We need at least 2 data points to compute delta
+            if guard.history.len() >= 2 {
+                let mean_ref = guard.history.iter().copied().sum::<f64>() / guard.history.len() as f64;
+                Some((event.value - mean_ref).abs())
+            } else {
+                None
+            }
+        };
+
+        if let Some(delta) = delta_opt {
+            debug!(
+                "∆ drift check – model={}, metric={}, delta={:.4}",
+                event.model_id, event.metric, delta
+            );
+            if delta > self.threshold {
+                warn!(
+                    "⚠️ Drift detected – model={}, metric={}, delta={:.4} > threshold={}",
+                    event.model_id, event.metric, delta, self.threshold
+                );
+                let job = RetrainJob::new(
+                    event.model_id.clone(),
+                    RetrainReason::DriftDetected { metric: self.metric.clone(), delta },
+                );
+                hub.enqueue_retrain(job).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------
+   Observer Wrapper
+   ---------------------------------------------------------------------- */
+
+/// Thin wrapper that marries a detector strategy with the Observer trait.
+pub struct DetectorObserver {
+    strategy: Arc<dyn DetectorStrategy>,
+    hub: MonitorHub,
+}
+
+impl DetectorObserver {
+    fn new(strategy: Arc<dyn DetectorStrategy>, hub: &MonitorHub) -> Self {
+        Self { strategy, hub: hub.clone() }
+    }
+}
+
+#[async_trait]
+impl MetricObserver for DetectorObserver {
+    async fn on_event(&self, event: &MetricEvent) -> Result<(), MonitoringError> {
+        self.strategy.consume(&self.hub, event).await
+    }
+}
+
+/* -------------------------------------------------------------------------
+   Detector Factory
+   ---------------------------------------------------------------------- */
+
+/// Factory builder for various detector strategies.
+pub struct DetectorFactory;
+
+impl DetectorFactory {
+    /// Builds a mean-drift detector for the given metric.
+    pub fn drift_detector<M: Into<MetricName>>(
+        metric: M,
+        threshold: f64,
+        window: usize,
+    ) -> Self::Product {
+        Self::Product::MeanDrift {
+            metric: metric.into(),
+            threshold,
+            window,
+        }
+    }
+
+    /// The output type of the factory.  This indirection allows us to lazily
+    /// bind the hub when the observer is actually registered.
+    pub enum Product {
+        MeanDrift { metric: MetricName, threshold: f64, window: usize },
+    }
+
+    /// Consume the factory product and create a concrete observer bound to the
+    /// supplied `MonitorHub`.
+    pub async fn materialize(product: Self::Product, hub: &MonitorHub) -> Arc<dyn MetricObserver> {
+        match product {
+            Self::Product::MeanDrift { metric, threshold, window } => {
+                let strat = MeanDriftDetector::new(metric, threshold, window);
+                Arc::new(DetectorObserver::new(Arc::new(strat), hub))
+            }
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------
+   Public Prelude
+   ---------------------------------------------------------------------- */
+
+/// Convenient “prelude” to avoid littering downstream modules with import
+/// lists.  Use `visu_tility_monitoring::*`.
+pub mod prelude {
+    pub use super::{
+        DetectorFactory, MetricEvent, MonitoringError, MonitorHub, RetrainJob, RetrainReason,
+    };
+}
+
+/* -------------------------------------------------------------------------
+   Unit Tests
+   ---------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{self, Duration};
+
+    #[tokio::test]
+    async fn test_drift_detector_triggers_retrain() -> Result<(), MonitoringError> {
+        // Use small window and low threshold to trigger drift quickly
+        let (hub, mut rx) = MonitorHub::new();
+        let detector = DetectorFactory::drift_detector("accuracy", 0.05, 3);
+        let observer = DetectorFactory::materialize(detector, &hub).await;
+        hub.register(observer).await?;
+
+        // Publish baseline metrics
+        for val in [0.9, 0.91, 0.92] {
+            hub.publish(MetricEvent::new("model-1", "accuracy", val)).await?;
+        }
+
+        // Publish a drifting metric
+        hub.publish(MetricEvent::new("model-1", "accuracy", 0.7)).await?;
+
+        // Allow some time for async dispatch
+        let _ = time::timeout(Duration::from_millis(250), async {
+            rx.recv().await.expect("No retrain job received")
+        })
+        .await
+        .expect("timeout: no job within 250ms");
+
+        Ok(())
+    }
+}
+```

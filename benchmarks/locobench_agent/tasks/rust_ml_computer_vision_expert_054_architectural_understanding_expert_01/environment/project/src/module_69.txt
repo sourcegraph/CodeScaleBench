@@ -1,0 +1,321 @@
+```rust
+//! VisuTility Orchestrator – Model-Monitoring & Automated-Retraining module
+//! -----------------------------------------------------------------------
+//! This module lives in the “Model Ops” layer and realises an Observer / Strategy
+//! blend that continuously listens to model-level telemetry and decides—at run time—
+//! whether a model instance requires automated retraining.  The component is generic
+//! and may therefore be embedded into any stream / batch pipeline segment that
+//! exposes [`ModelEvent`]s.
+//!
+//! High-level design
+//! -----------------
+//! • `ModelEvent`           – Enumeration of model telemetry signals.                        (Observable)
+//! • `ModelSubject`         – Holds the model-instance context and notifies observers.      (Subject)
+//! • `RetrainObserver`      – Observer implementation that evaluates the events.            (Observer)
+//! • `RetrainStrategy`      – Pluggable strategy (Stat/ML-based, heuristic, etc.).          (Strategy)
+//!
+//! The module purposefully does not perform the heavy-weight retraining by itself; it
+//! only *requests* retraining via the [`RetrainRequest`] message which is expected to be
+//! consumed by higher-level orchestration services (e.g. *Pipeline Coordinator*).
+//!
+//! ```text
+//!                 +-----------------+
+//!                 | ModelSubject    |  produces
+//!                 |  (running mdl)  |-------+
+//!                 +-----------------+       |
+//!                                            | ModelEvent
+//!                                            v
+//!  +---------------------------------------------------+      send()      +------------------+
+//!  | RetrainObserver   +---------------------------+   |  retrain_req_tx  |  Pipeline-Coord. |
+//!  |                   | retrain_strategy.analyse |---+-----------------> |  (consumer)      |
+//!  +-------------------+---------------------------+                      +------------------+
+//! ```
+//! For unit isolation no external async-runtime is assumed. `crossbeam_channel` is used
+//! for thread-safe message passing. Replace with `tokio::sync::mpsc` if you are within a
+//! Tokio context.
+
+use std::fmt::Debug;
+use std::sync::{Arc, Mutex};
+
+use chrono::{DateTime, Utc};
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Domain identifier for a running model instance.
+///
+/// The triple (project, pipeline, version) is usually enough to uniquely
+/// identify a model within the VisuTility platform.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModelKey {
+    pub project:  String,
+    pub pipeline: String,
+    pub version:  String,
+}
+
+/// Runtime telemetry that surfaces from within the model-serving container.
+/// Additional variants can be added over time without breaking existing observers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ModelEvent {
+    /// Inference latency of a single prediction or batch (milliseconds).
+    Latency {
+        value_ms: f64,
+        timestamp: DateTime<Utc>,
+    },
+    /// Observed data-drift score in the [0.0, 1.0] range (higher == stronger drift).
+    Drift {
+        p_value:  f64,
+        timestamp: DateTime<Utc>,
+    },
+    /// The model produced an error (e.g. invalid input tensor).
+    InferenceError {
+        message:   String,
+        timestamp: DateTime<Utc>,
+    },
+    /// Custom user metric – encoded as arbitrary JSON payload.
+    Custom {
+        name:      String,
+        payload:   serde_json::Value,
+        timestamp: DateTime<Utc>,
+    },
+}
+
+/// Outgoing message that formally requests a (partial) retraining.
+/// The Pipeline Coordinator listens for these on a dedicated channel.
+///
+/// NOTE: The receiving end might bundle multiple requests before spinning-up an
+///       expensive training job.  The struct therefore keeps the minimal
+///       business context but does not enforce scheduling semantics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrainRequest {
+    pub model:     ModelKey,
+    pub reason:    String,
+    pub triggered_at: DateTime<Utc>,
+}
+
+/// Error type for strategy evaluation problems.
+#[derive(Debug, Error)]
+pub enum StrategyError {
+    #[error("missing input data for strategy analysis")]
+    MissingData,
+    #[error("internal computation error: {0}")]
+    Internal(String),
+}
+
+/// Strategy interface (Strategy Pattern).
+///
+/// Different production environments might require radically different
+/// retraining logic:
+///  • Purely heuristic thresholds.
+///  • Statistical tests (e.g. Kolmogorov–Smirnov drift).
+///  • Meta-model that predicts model decay.
+///
+/// All of these can be expressed by implementing this trait.
+pub trait RetrainStrategy: Send + Sync + Debug + 'static {
+    /// Analyse incoming event and determine whether it warrants a retraining.
+    ///
+    /// On `Ok(Some(req))` the observer must forward the request;
+    /// `Ok(None)` means “no-op for now”.
+    fn analyse(
+        &self,
+        model: &ModelKey,
+        event: &ModelEvent,
+    ) -> Result<Option<RetrainRequest>, StrategyError>;
+}
+
+/// Simple threshold-based default strategy.
+///
+/// In many cases conservative thresholds are good enough to get started and
+/// can later be replaced by more elaborate strategies.
+#[derive(Debug, Clone)]
+pub struct ThresholdStrategy {
+    pub max_latency_ms: Option<f64>,
+    pub max_drift_p:    Option<f64>,
+}
+
+impl RetrainStrategy for ThresholdStrategy {
+    fn analyse(
+        &self,
+        model: &ModelKey,
+        event: &ModelEvent,
+    ) -> Result<Option<RetrainRequest>, StrategyError> {
+        match event {
+            ModelEvent::Latency { value_ms, .. } => {
+                if let Some(max) = self.max_latency_ms {
+                    if *value_ms > max {
+                        info!(
+                            "latency {:.2}ms exceeds configured {:.2}ms; flagging retrain",
+                            value_ms, max
+                        );
+                        return Ok(Some(RetrainRequest {
+                            model: model.clone(),
+                            reason: format!(
+                                "Latency {:.2}ms exceeds configured {:.2}ms",
+                                value_ms, max
+                            ),
+                            triggered_at: Utc::now(),
+                        }));
+                    }
+                }
+                Ok(None)
+            }
+            ModelEvent::Drift { p_value, .. } => {
+                if let Some(max) = self.max_drift_p {
+                    if *p_value > max {
+                        info!(
+                            "drift p-value {:.3} exceeds configured {:.3}; flagging retrain",
+                            p_value, max
+                        );
+                        return Ok(Some(RetrainRequest {
+                            model: model.clone(),
+                            reason: format!(
+                                "Drift p-value {:.3} exceeds configured {:.3}",
+                                p_value, max
+                            ),
+                            triggered_at: Utc::now(),
+                        }));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None), // Custom events/Errors need specialised strategies.
+        }
+    }
+}
+
+/// Observer / Listener that wires a [`RetrainStrategy`] to a running model.
+///
+/// The subject pushes events into the observer via `receive_event`.
+/// On affirmative analysis the observer sends a `RetrainRequest` to the
+/// `retrain_req_tx` channel.
+pub struct RetrainObserver {
+    model_key:       ModelKey,
+    strategy:        Arc<dyn RetrainStrategy>,
+    retrain_req_tx:  Sender<RetrainRequest>,
+}
+
+impl RetrainObserver {
+    pub fn new(
+        model_key: ModelKey,
+        strategy: Arc<dyn RetrainStrategy>,
+        retrain_req_tx: Sender<RetrainRequest>,
+    ) -> Self {
+        Self {
+            model_key,
+            strategy,
+            retrain_req_tx,
+        }
+    }
+
+    /// External entry point used by subjects to push events.
+    pub fn receive_event(&self, event: &ModelEvent) {
+        match self.strategy.analyse(&self.model_key, event) {
+            Ok(Some(req)) => {
+                debug!(
+                    "RetrainObserver for {:?} produced request: {:?}",
+                    self.model_key, req
+                );
+                if let Err(e) = self.retrain_req_tx.send(req) {
+                    error!("Failed to send RetrainRequest: {}", e);
+                }
+            }
+            Ok(None) => { /* nothing to do */ }
+            Err(e) => {
+                warn!(
+                    "Strategy failed for model {:?} with error: {}",
+                    self.model_key, e
+                );
+            }
+        }
+    }
+}
+
+/// Subject that generates `ModelEvent`s and notifies its registered observers.
+///
+/// A real subject would likely live inside a gRPC or REST inference server and
+/// call `notify(event)` whenever new telemetry becomes available.  To keep the
+/// demo self-contained the subject only stores an in-memory observer list.
+pub struct ModelSubject {
+    observers: Vec<Arc<RetrainObserver>>,
+}
+
+impl ModelSubject {
+    pub fn new() -> Self {
+        Self {
+            observers: Vec::new(),
+        }
+    }
+
+    /// Register an observer.  No deduplication is applied on purpose—the caller
+    /// must guarantee uniqueness.
+    pub fn attach(&mut self, observer: Arc<RetrainObserver>) {
+        self.observers.push(observer);
+    }
+
+    /// Notify observers about a newly arrived event.
+    pub fn notify(&self, event: ModelEvent) {
+        for obs in &self.observers {
+            obs.receive_event(&event);
+        }
+    }
+}
+
+/* --------------------------------------------------------------------------
+   Example usage / smoke test
+   --------------------------------------------------------------------------
+   The following code demonstrates end-to-end wiring.  In real production code
+   this would live in integration tests or the pipeline bootstrapper, not in
+   the library module itself.  Enabled with the "test" feature to keep the
+   compiled footprint minimal.
+---------------------------------------------------------------------------*/
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn end_to_end_retrain_trigger() {
+        // Channels for receiver verification
+        let (tx, rx): (Sender<RetrainRequest>, Receiver<RetrainRequest>) = unbounded();
+
+        // Create model identifier
+        let model_key = ModelKey {
+            project:  "demo_project".into(),
+            pipeline: "object_detection".into(),
+            version:  "v1.2.3".into(),
+        };
+
+        // Strategy: Retrain if latency > 200ms or drift > 0.6
+        let strat = Arc::new(ThresholdStrategy {
+            max_latency_ms: Some(200.0),
+            max_drift_p: Some(0.6),
+        });
+
+        // Observer
+        let observer = Arc::new(RetrainObserver::new(model_key.clone(), strat, tx));
+
+        // Subject
+        let mut subject = ModelSubject::new();
+        subject.attach(observer);
+
+        // 1) Send latency below threshold – should NOT trigger
+        subject.notify(ModelEvent::Latency {
+            value_ms: 123.0,
+            timestamp: Utc::now(),
+        });
+        assert!(rx.try_recv().is_err());
+
+        // 2) Send drift above threshold – SHOULD trigger
+        subject.notify(ModelEvent::Drift {
+            p_value: 0.702,
+            timestamp: Utc::now(),
+        });
+
+        // Wait for message
+        let req = rx.recv_timeout(std::time::Duration::from_secs(1))
+            .expect("expected RetrainRequest");
+        assert_eq!(req.model, model_key);
+        assert!(req.reason.contains("Drift"));
+    }
+}
+```

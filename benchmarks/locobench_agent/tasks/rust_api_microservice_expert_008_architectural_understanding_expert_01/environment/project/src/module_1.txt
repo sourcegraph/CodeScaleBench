@@ -1,0 +1,343 @@
+```rust
+//! LedgerLink Nexus – Ledger Entry query pipeline
+//!
+//! This module contains everything required to expose a paginated,
+//! cache-aware “GET /v1/{tenant}/ledger-entries” REST/GraphQL endpoint.
+//! It demonstrates the MVVM-inspired layout used throughout the code
+//! base: View <-> View-Model <-> Domain Model <-> Repository.
+//!
+//! Dependencies (Cargo.toml excerpt for reference):
+//! ------------------------------------------------
+//! [dependencies]
+//! actix-web     = "4"
+//! async-trait   = "0.1"
+//! redis         = { version = "0.23", features = ["tokio-comp"] }
+//! rust_decimal  = { version = "1", features = ["serde-rust-false"] }
+//! serde         = { version = "1", features = ["derive"] }
+//! sqlx          = { version = "0.7", features = ["postgres", "runtime-tokio-native-tls", "uuid", "chrono", "macros"] }
+//! thiserror     = "1"
+//! tracing       = "0.1"
+//! uuid          = { version = "1", features = ["serde", "v4"] }
+//! validator     = { version = "0.16", features = ["derive"] }
+
+use std::time::Duration;
+
+use actix_web::{
+    http::header::{CacheControl, CacheDirective},
+    web, HttpRequest, HttpResponse, Responder,
+};
+use async_trait::async_trait;
+use redis::AsyncCommands;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgRow, PgPool, Row};
+use thiserror::Error;
+use tracing::{debug, instrument};
+use uuid::Uuid;
+use validator::Validate;
+
+// ---------- Constants & helpers ---------------------------------------------------------------
+
+const DEFAULT_PAGE_SIZE: u32 = 50;
+const MAX_PAGE_SIZE: u32 = 500;
+const CACHE_TTL_SECONDS: usize = 45; // short-lived cache, safe for real-time ledgers
+
+// ---------- API View --------------------------------------------------------------------------
+
+/// Public wire format delivered to clients.
+#[derive(Debug, Serialize)]
+pub struct LedgerEntryView {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub amount: Decimal,
+    pub currency: String,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub booked_at: chrono::NaiveDateTime,
+}
+
+/// Envelope wrapper with pagination metadata.
+#[derive(Debug, Serialize)]
+pub struct Paged<T> {
+    pub data: Vec<T>,
+    pub page: u32,
+    pub per_page: u32,
+    pub next_page: Option<u32>,
+}
+
+// ---------- View-Model ------------------------------------------------------------------------
+
+/// Validated query parameters coming from the client.
+#[derive(Debug, Deserialize, Validate)]
+pub struct LedgerEntryQuery {
+    #[validate(range(min = 1))]
+    #[serde(default = "default_page")]
+    pub page: u32,
+
+    #[validate(range(min = 1, max = 500))]
+    #[serde(default = "default_per_page")]
+    pub per_page: u32,
+}
+
+fn default_page() -> u32 {
+    1
+}
+fn default_per_page() -> u32 {
+    DEFAULT_PAGE_SIZE
+}
+
+impl LedgerEntryQuery {
+    pub fn offset_limit(&self) -> (i64, i64) {
+        let offset = ((self.page.saturating_sub(1)) * self.per_page) as i64;
+        let limit = self.per_page as i64;
+        (offset, limit)
+    }
+}
+
+// ---------- Domain Model ----------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub account_id: Uuid,
+    pub amount: Decimal,
+    pub currency: String,
+    pub booked_at: chrono::NaiveDateTime,
+}
+
+impl From<LedgerEntry> for LedgerEntryView {
+    fn from(e: LedgerEntry) -> Self {
+        LedgerEntryView {
+            id: e.id,
+            account_id: e.account_id,
+            amount: e.amount,
+            currency: e.currency,
+            booked_at: e.booked_at,
+        }
+    }
+}
+
+// ---------- Errors ----------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation error: {0}")]
+    Validation(#[from] validator::ValidationErrors),
+
+    #[error("repository error: {0}")]
+    Repository(#[from] RepositoryError),
+
+    #[error("cache error: {0}")]
+    Cache(#[from] redis::RedisError),
+}
+
+impl actix_web::ResponseError for ServiceError {}
+
+// ---------- Repository layer ------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync + 'static {
+    async fn fetch_page(
+        &self,
+        tenant_id: Uuid,
+        query: &LedgerEntryQuery,
+    ) -> Result<Vec<LedgerEntry>, RepositoryError>;
+}
+
+pub struct PostgresLedgerEntryRepository {
+    pool: PgPool,
+}
+
+impl PostgresLedgerEntryRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for PostgresLedgerEntryRepository {
+    #[instrument(skip_all, fields(tenant_id=%tenant_id, page=query.page, per_page=query.per_page))]
+    async fn fetch_page(
+        &self,
+        tenant_id: Uuid,
+        query: &LedgerEntryQuery,
+    ) -> Result<Vec<LedgerEntry>, RepositoryError> {
+        let (offset, limit) = query.offset_limit();
+        let rows: Vec<PgRow> = sqlx::query(
+            r#"
+            SELECT  id,
+                    tenant_id,
+                    account_id,
+                    amount,
+                    currency,
+                    booked_at
+            FROM ledger_entries
+            WHERE tenant_id = $1
+            ORDER BY booked_at DESC
+            OFFSET $2 LIMIT $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(offset)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let entries = rows
+            .into_iter()
+            .map(|row| LedgerEntry {
+                id: row.get("id"),
+                tenant_id: row.get("tenant_id"),
+                account_id: row.get("account_id"),
+                amount: row.get("amount"),
+                currency: row.get("currency"),
+                booked_at: row.get("booked_at"),
+            })
+            .collect();
+
+        Ok(entries)
+    }
+}
+
+// ---------- Cache layer -----------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct RedisCache {
+    client: redis::Client,
+}
+
+impl RedisCache {
+    pub fn new(client: redis::Client) -> Self {
+        Self { client }
+    }
+
+    async fn set_json<T: Serialize>(&self, key: &str, value: &T) -> redis::RedisResult<()> {
+        let mut conn = self.client.get_tokio_connection_manager().await?;
+        let payload = serde_json::to_string(value)?;
+        conn.set_ex(key, payload, CACHE_TTL_SECONDS).await
+    }
+
+    async fn get_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        key: &str,
+    ) -> redis::RedisResult<Option<T>> {
+        let mut conn = self.client.get_tokio_connection_manager().await?;
+        let res: Option<String> = conn.get(key).await?;
+        if let Some(s) = res {
+            Ok(Some(serde_json::from_str(&s)?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+// ---------- Query Service ---------------------------------------------------------------------
+
+pub struct LedgerEntryQueryService<R: LedgerEntryRepository> {
+    repo: R,
+    cache: RedisCache,
+}
+
+impl<R: LedgerEntryRepository> LedgerEntryQueryService<R> {
+    pub fn new(repo: R, cache: RedisCache) -> Self {
+        Self { repo, cache }
+    }
+
+    fn cache_key(tenant_id: Uuid, query: &LedgerEntryQuery) -> String {
+        format!(
+            "ledger_entries:{}:{}:{}",
+            tenant_id, query.page, query.per_page
+        )
+    }
+
+    #[instrument(skip_all)]
+    pub async fn paged_view(
+        &self,
+        tenant_id: Uuid,
+        query: LedgerEntryQuery,
+    ) -> Result<Paged<LedgerEntryView>, ServiceError> {
+        query.validate()?;
+        let cache_key = Self::cache_key(tenant_id, &query);
+
+        // Try cache first
+        if let Some(cached) = self.cache.get_json::<Paged<LedgerEntryView>>(&cache_key).await? {
+            debug!("Cache hit for key {cache_key}");
+            return Ok(cached);
+        }
+
+        // Fallback to repository
+        let entries = self.repo.fetch_page(tenant_id, &query).await?;
+        let next_page = if entries.len() as u32 == query.per_page {
+            Some(query.page + 1)
+        } else {
+            None
+        };
+
+        let view = Paged {
+            data: entries.into_iter().map(Into::into).collect(),
+            page: query.page,
+            per_page: query.per_page,
+            next_page,
+        };
+
+        // Fire-and-forget cache population; do not block response if it fails.
+        let cache_clone = self.cache.clone();
+        tokio::spawn(async move {
+            if let Err(err) = cache_clone.set_json(&cache_key, &view).await {
+                tracing::warn!("Failed to set cache: {err}");
+            }
+        });
+
+        Ok(view)
+    }
+}
+
+// ---------- Actix-web handler -----------------------------------------------------------------
+
+/// Extract tenant ID from request path/claims (placeholder).
+fn extract_tenant_id(req: &HttpRequest) -> Result<Uuid, ServiceError> {
+    // In production, integrate with auth middleware (e.g., JWT, API Key)
+    req.match_info()
+        .get("tenant_id")
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| ServiceError::Validation(validator::ValidationErrors::new()))
+}
+
+/// `GET /v1/{tenant_id}/ledger-entries`
+#[instrument(skip_all)]
+pub async fn get_ledger_entries<R: LedgerEntryRepository>(
+    req: HttpRequest,
+    query: web::Query<LedgerEntryQuery>,
+    data: web::Data<LedgerEntryQueryService<R>>,
+) -> Result<impl Responder, ServiceError> {
+    let tenant_id = extract_tenant_id(&req)?;
+    let paged = data
+        .paged_view(tenant_id, query.into_inner())
+        .await?;
+
+    Ok(HttpResponse::Ok()
+        .insert_header(CacheControl(vec![
+            CacheDirective::Public,
+            CacheDirective::MaxAge(CACHE_TTL_SECONDS as u32),
+        ]))
+        .json(paged))
+}
+
+// ---------- Wiring helpers (for main.rs / tests) ----------------------------------------------
+
+/// Helper to create the service object; consumes a Postgres pool and Redis client.
+pub fn build_service(
+    pg_pool: PgPool,
+    redis_client: redis::Client,
+) -> impl LedgerEntryQueryService<PostgresLedgerEntryRepository> {
+    let repo = PostgresLedgerEntryRepository::new(pg_pool);
+    let cache = RedisCache::new(redis_client);
+    LedgerEntryQueryService::new(repo, cache)
+}
+```

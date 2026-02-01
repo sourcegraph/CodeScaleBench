@@ -1,0 +1,471 @@
+```c
+/*
+ * MercuryMonolith Commerce Hub
+ * ----------------------------------------------
+ * Module: src/module_61.txt   (Response Cache)
+ *
+ * A thread–safe, size-bounded, TTL-aware, LRU response cache that can be shared
+ * between the REST & GraphQL layers.  The implementation is intentionally
+ * standalone (no other project headers) so it can be embedded in unit tests
+ * and fuzzers without pulling the entire monolith.
+ *
+ * Key Features
+ * ------------
+ *  • O(1) get/put/erase operations via hash-table + doubly-linked list
+ *  • TTL (time-to-live) enforcement on reads (lazy) and optional background
+ *    janitor thread for aggressive eviction
+ *  • Capacity expressed in number-of-entries, not bytes, to keep the code
+ *    simple and portable.  (Byte-bound variants can be built on top.)
+ *  • Prometheus-style metrics hooks (counters & gauges) with weak symbols so
+ *    the module degrades gracefully when the metrics subsystem is disabled.
+ *  • syslog-compatible structured logging macros
+ *
+ * Build
+ * -----
+ *   cc -pthread -std=c11 -Wall -Wextra -pedantic -O2 -c mm_response_cache.c
+ *
+ * External Dependencies
+ * ---------------------
+ *   – uthash (https://troydhanson.github.io/uthash/)   -> header-only; MIT
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+#define _GNU_SOURCE
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "uthash.h"     /* hash-table (header-only) */
+
+/* ------------------------------------------------------------------------- */
+/*                        Forward declarations / macros                      */
+/* ------------------------------------------------------------------------- */
+
+/* Structured logging macros (weak symbols – optional). */
+__attribute__((weak)) void mm_log_debug(const char *fmt, ...)  { (void)fmt; }
+__attribute__((weak)) void mm_log_info (const char *fmt, ...)  { (void)fmt; }
+__attribute__((weak)) void mm_log_warn (const char *fmt, ...)  { (void)fmt; }
+__attribute__((weak)) void mm_log_error(const char *fmt, ...)  { (void)fmt; }
+
+/* Prometheus-compatible metrics hooks (weak). */
+__attribute__((weak)) void mm_metrics_inc_counter(const char *name) { (void)name; }
+__attribute__((weak)) void mm_metrics_dec_gauge  (const char *name) { (void)name; }
+__attribute__((weak)) void mm_metrics_inc_gauge  (const char *name) { (void)name; }
+
+/* Reasonable defaults for optional janitor thread. */
+#define JANITOR_SWEEP_INTERVAL_SEC 5U
+
+/* ------------------------------------------------------------------------- */
+/*                                 Types                                     */
+/* ------------------------------------------------------------------------- */
+
+/* Public opaque handle */
+typedef struct mm_cache mm_cache_t;
+
+/* Statistic snapshot */
+typedef struct {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    uint64_t expired;
+    uint32_t resident;     /* current # entries */
+    uint32_t capacity;     /* max # entries     */
+} mm_cache_stats_t;
+
+/* Internal cache node */
+typedef struct cache_entry {
+    char                *key;        /* deep-copied key                       */
+    size_t               klen;
+    void                *blob;       /* caller-owned opaque byte blob         */
+    size_t               blen;
+    time_t               expiry;     /* epoch seconds                         */
+
+    struct cache_entry  *prev, *next;/* intrusive LRU list                    */
+    UT_hash_handle       hh;         /* uthash handle                         */
+} cache_entry_t;
+
+struct mm_cache {
+    pthread_mutex_t      mtx;
+    cache_entry_t       *hash;       /* key -> cache_entry                    */
+    cache_entry_t       *lru_head;   /* MRU at head, LRU at tail              */
+    cache_entry_t       *lru_tail;
+    uint32_t             capacity;
+    uint64_t             hits, misses, evictions, expired;
+    bool                 stop_janitor;
+    pthread_t            janitor_tid;
+    uint32_t             default_ttl;/* seconds; 0 = forever                  */
+};
+
+/* ------------------------------------------------------------------------- */
+/*                   Utility / Internal helper prototypes                    */
+/* ------------------------------------------------------------------------- */
+
+static inline time_t _now_sec(void) { return time(NULL); }
+
+static cache_entry_t *_entry_new(const char *key, size_t klen,
+                                 const void *blob, size_t blen,
+                                 uint32_t ttl);
+
+static void _entry_free(cache_entry_t *e);
+
+static void _lru_move_to_front(mm_cache_t *c, cache_entry_t *e);
+
+static void _lru_append_front(mm_cache_t *c, cache_entry_t *e);
+
+static void _lru_remove(mm_cache_t *c, cache_entry_t *e);
+
+static void *_janitor_loop(void *arg);
+
+/* ------------------------------------------------------------------------- */
+/*                            Public interface                               */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Create an LRU cache.  Returns NULL when pthread primitives cannot be
+ * initialized or capacity == 0.
+ */
+mm_cache_t *mm_cache_create(uint32_t capacity, uint32_t default_ttl,
+                            bool spawn_janitor)
+{
+    if (capacity == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    mm_cache_t *c = calloc(1, sizeof(*c));
+    if (!c) {
+        return NULL;
+    }
+
+    c->capacity     = capacity;
+    c->default_ttl  = default_ttl;
+
+    int rc = pthread_mutex_init(&c->mtx, NULL);
+    if (rc != 0) {
+        free(c);
+        errno = rc;
+        return NULL;
+    }
+
+    if (spawn_janitor) {
+        if (pthread_create(&c->janitor_tid, NULL, _janitor_loop, c) != 0) {
+            mm_log_warn("[cache] unable to start janitor thread: %s",
+                        strerror(errno));
+        } else {
+            pthread_detach(c->janitor_tid);
+        }
+    }
+
+    mm_log_info("[cache] initialized (capacity=%u, defaultTTL=%us)",
+                capacity, default_ttl);
+    return c;
+}
+
+/*
+ * Destroy the cache and free all associated memory.  Caller must ensure no
+ * other threads are still performing mm_cache_* calls.
+ */
+void mm_cache_destroy(mm_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_mutex_lock(&c->mtx);
+    c->stop_janitor = true;
+    pthread_mutex_unlock(&c->mtx);
+
+    /* No join needed – janitor is detached. */
+
+    /* Drain all entries */
+    cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, c->hash, cur, tmp)
+    {
+        HASH_DEL(c->hash, cur);
+        _entry_free(cur);
+    }
+
+    pthread_mutex_destroy(&c->mtx);
+    free(c);
+
+    mm_log_info("[cache] destroyed");
+}
+
+/*
+ * Retrieve a copy of the cached blob.  The caller receives ownership of the
+ * returned buffer and must free() it.  Returns NULL on miss/expiry/error.
+ * 'out_len' will hold the length of the returned blob (0 for miss).
+ */
+void *mm_cache_get(mm_cache_t *c, const char *key, size_t klen,
+                   size_t *out_len)
+{
+    if (!c || !key) {
+        errno = EINVAL;
+        if (out_len) *out_len = 0;
+        return NULL;
+    }
+
+    pthread_mutex_lock(&c->mtx);
+
+    cache_entry_t *e = NULL;
+    HASH_FIND(hh, c->hash, key, (unsigned)klen, e);
+
+    if (!e) {
+        c->misses++;
+        mm_metrics_inc_counter("cache_miss_total");
+        pthread_mutex_unlock(&c->mtx);
+        if (out_len) *out_len = 0;
+        return NULL;
+    }
+
+    /* Expired? */
+    if (e->expiry && e->expiry <= _now_sec()) {
+        c->expired++;
+        mm_metrics_inc_counter("cache_expired_total");
+
+        _lru_remove(c, e);
+        HASH_DEL(c->hash, e);
+        _entry_free(e);
+
+        pthread_mutex_unlock(&c->mtx);
+        if (out_len) *out_len = 0;
+        return NULL;
+    }
+
+    /* Hit */
+    c->hits++;
+    mm_metrics_inc_counter("cache_hit_total");
+
+    /* Promote to MRU */
+    _lru_move_to_front(c, e);
+
+    /* Deep copy */
+    void *ret = malloc(e->blen);
+    if (!ret) {
+        pthread_mutex_unlock(&c->mtx);
+        if (out_len) *out_len = 0;
+        return NULL;
+    }
+    memcpy(ret, e->blob, e->blen);
+    if (out_len) *out_len = e->blen;
+
+    pthread_mutex_unlock(&c->mtx);
+    return ret;
+}
+
+/*
+ * Insert or replace an entry.
+ */
+int mm_cache_put(mm_cache_t *c, const char *key, size_t klen,
+                 const void *blob, size_t blen, uint32_t ttl)
+{
+    if (!c || !key || !blob) return EINVAL;
+    if (klen == 0 || blen == 0) return EINVAL;
+
+    pthread_mutex_lock(&c->mtx);
+
+    cache_entry_t *e = NULL;
+    HASH_FIND(hh, c->hash, key, (unsigned)klen, e);
+
+    if (e) {
+        /* Replace existing entry */
+        _lru_remove(c, e);
+        HASH_DEL(c->hash, e);
+        _entry_free(e);
+        c->evictions++;
+        mm_metrics_inc_counter("cache_eviction_total");
+    }
+
+    e = _entry_new(key, klen, blob, blen, ttl ? ttl : c->default_ttl);
+    if (!e) {
+        pthread_mutex_unlock(&c->mtx);
+        return ENOMEM;
+    }
+
+    HASH_ADD_KEYPTR(hh, c->hash, e->key, (unsigned)e->klen, e);
+    _lru_append_front(c, e);
+    mm_metrics_inc_gauge("cache_entries");
+
+    /* Evict LRU if over capacity */
+    while (HASH_COUNT(c->hash) > c->capacity) {
+        cache_entry_t *victim = c->lru_tail;
+        if (!victim) break; /* shouldn't happen */
+
+        _lru_remove(c, victim);
+        HASH_DEL(c->hash, victim);
+        _entry_free(victim);
+        c->evictions++;
+        mm_metrics_inc_counter("cache_eviction_total");
+    }
+
+    pthread_mutex_unlock(&c->mtx);
+    return 0;
+}
+
+/*
+ * Remove a key from cache.  (Non-fatal if key is absent.)
+ */
+void mm_cache_invalidate(mm_cache_t *c, const char *key, size_t klen)
+{
+    if (!c || !key) return;
+
+    pthread_mutex_lock(&c->mtx);
+
+    cache_entry_t *e = NULL;
+    HASH_FIND(hh, c->hash, key, (unsigned)klen, e);
+    if (e) {
+        _lru_remove(c, e);
+        HASH_DEL(c->hash, e);
+        _entry_free(e);
+        mm_metrics_dec_gauge("cache_entries");
+    }
+
+    pthread_mutex_unlock(&c->mtx);
+}
+
+/*
+ * Invalidate all entries (flush).
+ */
+void mm_cache_clear(mm_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_mutex_lock(&c->mtx);
+
+    cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, c->hash, cur, tmp)
+    {
+        HASH_DEL(c->hash, cur);
+        _entry_free(cur);
+    }
+    c->lru_head = c->lru_tail = NULL;
+    mm_metrics_dec_gauge("cache_entries"); /* gauge underflows are safe */
+
+    pthread_mutex_unlock(&c->mtx);
+}
+
+/*
+ * Snapshot statistics.  (Cheap – only grabs mutex briefly.)
+ */
+void mm_cache_stats(mm_cache_t *c, mm_cache_stats_t *out)
+{
+    if (!c || !out) return;
+
+    pthread_mutex_lock(&c->mtx);
+    out->hits      = c->hits;
+    out->misses    = c->misses;
+    out->evictions = c->evictions;
+    out->expired   = c->expired;
+    out->resident  = HASH_COUNT(c->hash);
+    out->capacity  = c->capacity;
+    pthread_mutex_unlock(&c->mtx);
+}
+
+/* ------------------------------------------------------------------------- */
+/*                         Internal helper functions                         */
+/* ------------------------------------------------------------------------- */
+
+static cache_entry_t *_entry_new(const char *key, size_t klen,
+                                 const void *blob, size_t blen,
+                                 uint32_t ttl)
+{
+    cache_entry_t *e = calloc(1, sizeof(*e));
+    if (!e) return NULL;
+
+    e->key = malloc(klen);
+    e->blob = malloc(blen);
+    if (!e->key || !e->blob) {
+        _entry_free(e);
+        return NULL;
+    }
+
+    memcpy(e->key, key, klen);
+    memcpy(e->blob, blob, blen);
+    e->klen  = klen;
+    e->blen  = blen;
+    e->expiry = ttl ? _now_sec() + ttl : 0;
+
+    return e;
+}
+
+static void _entry_free(cache_entry_t *e)
+{
+    if (!e) return;
+    free(e->key);
+    free(e->blob);
+    free(e);
+}
+
+static void _lru_append_front(mm_cache_t *c, cache_entry_t *e)
+{
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head)
+        c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail)
+        c->lru_tail = e;
+}
+
+static void _lru_move_to_front(mm_cache_t *c, cache_entry_t *e)
+{
+    if (c->lru_head == e) return;
+
+    _lru_remove(c, e);
+    _lru_append_front(c, e);
+}
+
+static void _lru_remove(mm_cache_t *c, cache_entry_t *e)
+{
+    if (e->prev)
+        e->prev->next = e->next;
+    else
+        c->lru_head = e->next;
+
+    if (e->next)
+        e->next->prev = e->prev;
+    else
+        c->lru_tail = e->prev;
+
+    e->prev = e->next = NULL;
+}
+
+/* ------------------------------------------------------------------------- */
+/*                           Janitor background thread                       */
+/* ------------------------------------------------------------------------- */
+
+static void *_janitor_loop(void *arg)
+{
+    mm_cache_t *c = arg;
+    pthread_setname_np(pthread_self(), "mm_cache_janitor");
+
+    while (1) {
+        sleep(JANITOR_SWEEP_INTERVAL_SEC);
+        pthread_mutex_lock(&c->mtx);
+        if (c->stop_janitor) {
+            pthread_mutex_unlock(&c->mtx);
+            pthread_exit(NULL);
+        }
+
+        time_t now = _now_sec();
+        cache_entry_t *cur, *tmp;
+        HASH_ITER(hh, c->hash, cur, tmp)
+        {
+            if (cur->expiry && cur->expiry <= now) {
+                _lru_remove(c, cur);
+                HASH_DEL(c->hash, cur);
+                _entry_free(cur);
+                c->expired++;
+                mm_metrics_inc_counter("cache_expired_total");
+                mm_metrics_dec_gauge("cache_entries");
+            }
+        }
+        pthread_mutex_unlock(&c->mtx);
+    }
+    return NULL;
+}
+```

@@ -1,0 +1,416 @@
+/*
+ *  LexiLearn MVC Orchestrator – Runtime License Validator
+ *
+ *  File:        LICENSE.c
+ *  Location:    lexilearn_orchestrator/LICENSE
+ *  Language:    ISO-C17
+ *  Dependencies:
+ *      - OpenSSL   (crypto, evp, bio, pem, err)
+ *
+ *  Description:
+ *      Production-grade module that loads, parses, and validates a
+ *      LexiLearn binary license at application start-up.  The license
+ *      is signed on the vendor side with an RSA private key; this
+ *      module verifies the license payload against the bundled/public
+ *      key and exposes helper APIs so that upper-layer components may
+ *      refuse to start if the license is invalid or expired.
+ *
+ *      The module can be linked as a standalone static library or
+ *      built directly into the Orchestrator.  Compile with:
+ *
+ *          cc -std=c17 -Wall -Wextra -pedantic -O2 \
+ *             -I/usr/include/openssl  LICENSE.c -o license \
+ *             -lcrypto
+ *
+ *  License File Format (PEM-like):
+ *
+ *      -----BEGIN LEXILEARN LICENSE-----
+ *      Licensee: University of Foo
+ *      Product:  LexiLearn MVC Orchestrator
+ *      Issue-Date: 2023-09-01
+ *      Expiry-Date: 2025-09-01
+ *      Signature: LS0tLS1CRUdJTiB...
+ *      -----END LEXILEARN LICENSE-----
+ *
+ *      Field ‘Signature’ is base64-encoded DER of RSA-SHA256 signature
+ *      over the concatenation of the previous key/value lines *in the
+ *      given order* including newline separators.
+ *
+ *  Author:      LexiLearn Engineering <eng@lexilearn.ai>
+ *  Copyright:   (c) 2024, LexiLearn Inc.  All rights reserved.
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include <errno.h>
+
+/* OpenSSL */
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/err.h>
+
+/* —————————————————————————————————————————— Constants & Macros ———————— */
+
+#define LL_LICENSE_BEGIN      "-----BEGIN LEXILEARN LICENSE-----"
+#define LL_LICENSE_END        "-----END LEXILEARN LICENSE-----"
+
+#define LL_MAX_LINE           1024
+#define LL_MAX_PAYLOAD        4096
+#define LL_MAX_SIG_BYTES      512    /* accommodates 4096-bit key */
+
+/* Error codes returned by public API */
+typedef enum {
+    LL_LIC_SUCCESS           =  0,
+    LL_LIC_EINVAL            = -1,   /* invalid argument */
+    LL_LIC_EIO               = -2,   /* I/O error */
+    LL_LIC_EFORMAT           = -3,   /* malformed license file */
+    LL_LIC_ESIGNATURE        = -4,   /* signature verification failure */
+    LL_LIC_EEXPIRED          = -5,   /* license expired */
+    LL_LIC_ECRYPTO           = -6    /* crypto subsystem error */
+} ll_lic_rc_t;
+
+/* —————————————————————————————————————————— Data Structures ————————— */
+
+typedef struct ll_license_s
+{
+    char   licensee[256];
+    char   product[128];
+    time_t issue_date;                       /* seconds since epoch  */
+    time_t expiry_date;                      /* seconds since epoch  */
+
+    unsigned char signature[LL_MAX_SIG_BYTES];
+    size_t        sig_len;                   /* bytes                */
+
+    /* Raw textual payload on which signature was created           */
+    char   raw_payload[LL_MAX_PAYLOAD];
+    size_t raw_len;
+} ll_license_t;
+
+/* —————————————————————————————————— Internal Helper Prototypes ———— */
+
+static int  ll_parse_license_file(const char *path, ll_license_t *lic);
+static int  ll_verify_signature(const ll_license_t *lic,
+                                const char       *pubkey_path);
+static int  ll_base64_decode(const char *b64, unsigned char *out, size_t *outlen);
+static void ll_openssl_errlog(const char *ctx);
+
+/* —————————————————————————————————————— Public API ——————————————— */
+
+/*
+ *  ll_license_check
+ *  ------------------------------------------------------------
+ *  Reads license file, validates signature, and checks date.
+ *
+ *  Parameters:
+ *      license_path  – path to license file on disk.
+ *      pubkey_path   – path to vendor-provided RSA public key (PEM).
+ *
+ *  Returns:
+ *      LL_LIC_SUCCESS on success, or a negative ll_lic_rc_t on error.
+ */
+int ll_license_check(const char *license_path, const char *pubkey_path)
+{
+    if (!license_path || !pubkey_path)
+        return LL_LIC_EINVAL;
+
+    ll_license_t lic = {0};
+
+    int rc = ll_parse_license_file(license_path, &lic);
+    if (rc != LL_LIC_SUCCESS) return rc;
+
+    rc = ll_verify_signature(&lic, pubkey_path);
+    if (rc != LL_LIC_SUCCESS) return rc;
+
+    /* ------------- Date validation ------------------------------------ */
+    time_t now = time(NULL);
+    if (now == (time_t)-1)
+        return LL_LIC_EIO;
+
+    if (now < lic.issue_date || now > lic.expiry_date)
+        return LL_LIC_EEXPIRED;
+
+    return LL_LIC_SUCCESS;
+}
+
+/* —————————————————————————————————— Implementation ——————————————— */
+
+static int ll_expect_prefix(const char *src, const char *prefix,
+                            char *value_out, size_t max_len)
+{
+    size_t p_len = strlen(prefix);
+    if (strncmp(src, prefix, p_len) != 0)
+        return -1;
+    const char *val = src + p_len;
+    while (*val == ' ') ++val;               /* trim single space after ':' */
+    size_t v_len = strcspn(val, "\r\n");
+    if (v_len >= max_len)
+        return -1;
+    memcpy(value_out, val, v_len);
+    value_out[v_len] = '\0';
+    return 0;
+}
+
+/*
+ *  ll_parse_license_file
+ *  ------------------------------------------------------------
+ *  Internal parser; populates ll_license_t structure.  On success,
+ *  returns LL_LIC_SUCCESS.  The function preserves the *exact* text
+ *  between BEGIN/END headers (excluding Signature line) as raw_payload
+ *  for signature verification later.
+ */
+static int ll_parse_license_file(const char *path, ll_license_t *lic)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return LL_LIC_EIO;
+
+    char line[LL_MAX_LINE];
+    int in_body = 0;
+    size_t payload_off = 0;
+    int fields_parsed = 0;
+
+    while (fgets(line, sizeof line, fp))
+    {
+        if (!in_body)
+        {
+            if (strncmp(line, LL_LICENSE_BEGIN, strlen(LL_LICENSE_BEGIN)) == 0)
+                in_body = 1;
+            continue;
+        }
+
+        if (strncmp(line, LL_LICENSE_END, strlen(LL_LICENSE_END)) == 0)
+            break;  /* reached footer */
+
+        /* Remove trailing newline for parsing convenience (but keep copy) */
+        char tmp_line[LL_MAX_LINE];
+        strncpy(tmp_line, line, sizeof tmp_line);
+        tmp_line[sizeof(tmp_line)-1] = '\0';   /* ensure NUL */
+
+        /* key/value lines */
+        if (strncasecmp(tmp_line, "Licensee:", 9) == 0)
+        {
+            if (ll_expect_prefix(tmp_line, "Licensee:", lic->licensee,
+                                 sizeof lic->licensee) != 0)
+                goto format_error;
+            fields_parsed++;
+        }
+        else if (strncasecmp(tmp_line, "Product:", 8) == 0)
+        {
+            if (ll_expect_prefix(tmp_line, "Product:", lic->product,
+                                 sizeof lic->product) != 0)
+                goto format_error;
+            fields_parsed++;
+        }
+        else if (strncasecmp(tmp_line, "Issue-Date:", 11) == 0)
+        {
+            char buf[32];
+            if (ll_expect_prefix(tmp_line, "Issue-Date:", buf, sizeof buf) != 0)
+                goto format_error;
+            struct tm tm = {0};
+            if (!strptime(buf, "%Y-%m-%d", &tm))
+                goto format_error;
+            lic->issue_date = timegm(&tm);
+            fields_parsed++;
+        }
+        else if (strncasecmp(tmp_line, "Expiry-Date:", 12) == 0)
+        {
+            char buf[32];
+            if (ll_expect_prefix(tmp_line, "Expiry-Date:", buf, sizeof buf) != 0)
+                goto format_error;
+            struct tm tm = {0};
+            if (!strptime(buf, "%Y-%m-%d", &tm))
+                goto format_error;
+            lic->expiry_date = timegm(&tm);
+            fields_parsed++;
+        }
+        else if (strncasecmp(tmp_line, "Signature:", 10) == 0)
+        {
+            char b64[LL_MAX_SIG_BYTES*2];  /* more than enough */
+            if (ll_expect_prefix(tmp_line, "Signature:", b64, sizeof b64) != 0)
+                goto format_error;
+            size_t sig_len = sizeof lic->signature;
+            if (ll_base64_decode(b64, lic->signature, &sig_len) != 0)
+                goto format_error;
+            lic->sig_len = sig_len;
+            fields_parsed++;
+        }
+        else if (*tmp_line == '\0' || *tmp_line == '\n' || *tmp_line == '\r')
+        {
+            /* Skip blank lines inside body (not counted in payload) */
+        }
+        else
+        {
+            goto format_error;
+        }
+
+        /* Reconstruct exact payload for signature (every line except Signature)*/
+        if (strncasecmp(tmp_line, "Signature:", 10) != 0)
+        {
+            size_t len = strlen(tmp_line);
+            if (payload_off + len + 1 >= sizeof lic->raw_payload)
+                goto format_error;
+            memcpy(lic->raw_payload + payload_off, tmp_line, len);
+            payload_off += len;
+            lic->raw_payload[payload_off++] = '\n';  /* canonical newline */
+        }
+    }
+
+    fclose(fp);
+    lic->raw_len = payload_off;
+
+    if (fields_parsed < 5)
+        return LL_LIC_EFORMAT;
+
+    return LL_LIC_SUCCESS;
+
+format_error:
+    fclose(fp);
+    return LL_LIC_EFORMAT;
+}
+
+/*
+ *  ll_verify_signature
+ *  ------------------------------------------------------------
+ *  Uses OpenSSL EVP (RSA-SHA256) to verify that license->signature
+ *  signs license->raw_payload using the vendor public key.
+ */
+static int ll_verify_signature(const ll_license_t *lic,
+                               const char         *pubkey_path)
+{
+    int rc = LL_LIC_SUCCESS;
+    EVP_PKEY *pkey = NULL;
+    EVP_MD_CTX *ctx = NULL;
+    BIO *bio = NULL;
+
+    OpenSSL_add_all_algorithms();   /* legacy but safe */
+    ERR_load_crypto_strings();
+
+    /* Load public key */
+    bio = BIO_new_file(pubkey_path, "r");
+    if (!bio)
+    {
+        rc = LL_LIC_EIO;
+        goto cleanup;
+    }
+    pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+    if (!pkey)
+    {
+        ll_openssl_errlog("PEM_read_bio_PUBKEY");
+        rc = LL_LIC_ECRYPTO;
+        goto cleanup;
+    }
+
+    /* Init digest verify */
+    ctx = EVP_MD_CTX_new();
+    if (!ctx)
+    {
+        rc = LL_LIC_ECRYPTO;
+        goto cleanup;
+    }
+    if (EVP_DigestVerifyInit(ctx, NULL, EVP_sha256(), NULL, pkey) <= 0)
+    {
+        ll_openssl_errlog("EVP_DigestVerifyInit");
+        rc = LL_LIC_ECRYPTO;
+        goto cleanup;
+    }
+
+    if (EVP_DigestVerifyUpdate(ctx, lic->raw_payload, lic->raw_len) <= 0)
+    {
+        ll_openssl_errlog("EVP_DigestVerifyUpdate");
+        rc = LL_LIC_ECRYPTO;
+        goto cleanup;
+    }
+
+    int v = EVP_DigestVerifyFinal(ctx, lic->signature, lic->sig_len);
+    if (v == 1)
+        rc = LL_LIC_SUCCESS;
+    else if (v == 0)
+        rc = LL_LIC_ESIGNATURE;
+    else
+    {
+        ll_openssl_errlog("EVP_DigestVerifyFinal");
+        rc = LL_LIC_ECRYPTO;
+    }
+
+cleanup:
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    BIO_free(bio);
+    EVP_cleanup();
+    ERR_free_strings();
+    return rc;
+}
+
+/* —————————————————————————————————— Utilities ——————————————— */
+
+static void ll_openssl_errlog(const char *ctx)
+{
+    unsigned long err;
+    fprintf(stderr, "[LexiLearn-License] OpenSSL error at %s:\n", ctx);
+    while ((err = ERR_get_error()))
+        fprintf(stderr, "   • %s\n", ERR_error_string(err, NULL));
+}
+
+static int ll_base64_decode(const char *b64, unsigned char *out, size_t *outlen)
+{
+    BIO *bmem = NULL, *b64bio = NULL;
+    int rc = -1;
+
+    size_t len = strlen(b64);
+    if (len == 0 || !out || !outlen)
+        return -1;
+
+    b64bio = BIO_new(BIO_f_base64());
+    if (!b64bio) goto cleanup;
+    BIO_set_flags(b64bio, BIO_FLAGS_BASE64_NO_NL);
+
+    bmem = BIO_new_mem_buf((void*)b64, (int)len);
+    if (!bmem) goto cleanup;
+
+    bmem = BIO_push(b64bio, bmem);
+    int decoded = BIO_read(bmem, out, (int)*outlen);
+    if (decoded <= 0) goto cleanup;
+
+    *outlen = (size_t)decoded;
+    rc = 0;
+
+cleanup:
+    if (bmem) BIO_free_all(bmem);
+    return rc;
+}
+
+/* ———————————————————————————————————— Self-Test Harness ——————————— */
+#ifdef LL_LICENSE_STANDALONE_TEST
+
+static const char *rc2str(int rc)
+{
+    switch (rc) {
+        case LL_LIC_SUCCESS:     return "SUCCESS";
+        case LL_LIC_EINVAL:      return "EINVAL";
+        case LL_LIC_EIO:         return "EIO";
+        case LL_LIC_EFORMAT:     return "EFORMAT";
+        case LL_LIC_ESIGNATURE:  return "ESIGNATURE";
+        case LL_LIC_EEXPIRED:    return "EEXPIRED";
+        case LL_LIC_ECRYPTO:     return "ECRYPTO";
+        default:                 return "UNKNOWN";
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc != 3)
+    {
+        fprintf(stderr, "Usage: %s <license_file> <public_key_pem>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    int rc = ll_license_check(argv[1], argv[2]);
+    printf("License check: %s (%d)\n", rc2str(rc), rc);
+    return rc == LL_LIC_SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+#endif /* LL_LICENSE_STANDALONE_TEST */
+
+/* ————————————————————————————— End of LICENSE.c ———————————————— */

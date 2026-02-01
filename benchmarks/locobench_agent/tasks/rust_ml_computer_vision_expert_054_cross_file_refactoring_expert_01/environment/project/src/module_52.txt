@@ -1,0 +1,418 @@
+```rust
+//! module_52.rs
+//!
+//! Reactive model-monitoring layer implementing an Observer Pattern on top
+//! of VisuTility’s internal metrics bus.  The module consumes `MetricEvent`s
+//! published by inference runtimes, applies rule-based or statistical
+//! monitors, and emits `ObserverAction`s such as triggering automated
+//! retraining jobs or paging on-call.
+//!
+//! Compile-time features
+//! ---------------------
+//! automated_retraining – enables `RetrainScheduler` integration
+//! hyperparameter_tuning – enables extra tuning metadata when a retrain
+//!                         action is scheduled
+//!
+//! # Examples
+//! ```no_run
+//! use visu_tility::monitoring::*;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), ObserverError> {
+//!     let mut manager = ObserverManager::default();
+//!     manager.register(Box::new(DriftDetector::default()));
+//!     manager.register(Box::new(PerformanceDegrader::new(0.85)?));
+//!
+//!     let event = MetricEvent::new("model_xyz", MetricKind::Accuracy, 0.81)?;
+//!     manager.dispatch(event).await?;
+//!     Ok(())
+//! }
+//! ```
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::{mpsc, Mutex};
+
+/// Error type for the monitoring subsystem.
+#[derive(Debug, Error)]
+pub enum ObserverError {
+    #[error("configuration error: {0}")]
+    Config(String),
+    #[error("channel error: {0}")]
+    Channel(String),
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+/// Enumeration of supported metric kinds.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub enum MetricKind {
+    Accuracy,
+    Precision,
+    Recall,
+    F1,
+    LatencyMs,
+    DriftScore,
+}
+
+/// Event representing a single metric data-point emitted from the Serving
+/// layer.  Every event targets a concrete (model_id, version) pair.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MetricEvent {
+    pub model_id: String,
+    pub version: String,
+    pub ts: DateTime<Utc>,
+    pub kind: MetricKind,
+    pub value: f64,
+}
+
+impl MetricEvent {
+    pub fn new<M: Into<String>>(
+        model_id: M,
+        kind: MetricKind,
+        value: f64,
+    ) -> Result<Self, ObserverError> {
+        Ok(Self {
+            model_id: model_id.into(),
+            version: "latest".into(),
+            ts: Utc::now(),
+            kind,
+            value,
+        })
+    }
+}
+
+/// Reactive action emitted by observers.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum ObserverAction {
+    NoOp,
+    Alert { message: String },
+    #[cfg(feature = "automated_retraining")]
+    Retrain { model_id: String, reason: String },
+}
+
+/// Core trait every observer must implement.
+#[async_trait::async_trait]
+pub trait MetricObserver: Send + Sync {
+    /// Mutates internal state with the new event and returns zero or more
+    /// actions to be executed by the `ObserverManager`.
+    async fn on_metric(
+        &mut self,
+        event: &MetricEvent,
+    ) -> Result<Vec<ObserverAction>, ObserverError>;
+
+    /// Friendly name used for logging & metrics.
+    fn name(&self) -> &'static str;
+}
+
+/// Thread-safe composite observer manager.
+///
+/// Internally the manager holds a set of boxed observers and forwards incoming
+/// `MetricEvent`s to every subscriber.  Actions are executed in the order they
+/// are produced.
+#[derive(Default)]
+pub struct ObserverManager {
+    observers: Vec<Box<dyn MetricObserver>>,
+    #[cfg(feature = "automated_retraining")]
+    retrain_tx: Option<mpsc::Sender<RetrainRequest>>,
+}
+
+impl ObserverManager {
+    pub fn register(&mut self, observer: Box<dyn MetricObserver>) {
+        info!("Registering observer '{}'", observer.name());
+        self.observers.push(observer);
+    }
+
+    pub async fn dispatch(&mut self, event: MetricEvent) -> Result<(), ObserverError> {
+        debug!(
+            "Dispatching metric: model={}, kind={:?}, value={}",
+            event.model_id, event.kind, event.value
+        );
+
+        for obs in self.observers.iter_mut() {
+            let actions = obs.on_metric(&event).await?;
+            for action in actions {
+                self.handle_action(action).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_action(&self, action: ObserverAction) -> Result<(), ObserverError> {
+        match action {
+            ObserverAction::NoOp => {}
+            ObserverAction::Alert { message } => {
+                warn!("ALERT: {}", message);
+                // TODO: Integrate with paging/alerting provider
+            }
+            #[cfg(feature = "automated_retraining")]
+            ObserverAction::Retrain { model_id, reason } => {
+                if let Some(tx) = &self.retrain_tx {
+                    tx.send(RetrainRequest { model_id, reason })
+                        .await
+                        .map_err(|e| ObserverError::Channel(e.to_string()))?;
+                } else {
+                    error!("Retrain requested but retrain scheduler disabled");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "automated_retraining")]
+    pub fn attach_retrainer(&mut self, scheduler: RetrainScheduler) {
+        self.retrain_tx = Some(scheduler.sender());
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                               IMPLEMENTATIONS                              */
+/* -------------------------------------------------------------------------- */
+
+/// Observer that monitors distribution shift through a running drift score.
+///
+/// For demo purposes, a trivial threshold-based drift detector is used.  In
+/// real deployments this would ingest embedding distances, PSI, or KL-Div.
+#[derive(Debug)]
+pub struct DriftDetector {
+    threshold: f64,
+}
+
+impl Default for DriftDetector {
+    fn default() -> Self {
+        Self { threshold: 0.3 }
+    }
+}
+
+#[async_trait::async_trait]
+impl MetricObserver for DriftDetector {
+    async fn on_metric(
+        &mut self,
+        event: &MetricEvent,
+    ) -> Result<Vec<ObserverAction>, ObserverError> {
+        if event.kind != MetricKind::DriftScore {
+            return Ok(vec![ObserverAction::NoOp]);
+        }
+
+        if event.value > self.threshold {
+            let msg = format!(
+                "Drift detected for model '{}' (score {:.3} > {:.3})",
+                event.model_id, event.value, self.threshold
+            );
+            #[cfg(feature = "automated_retraining")]
+            {
+                Ok(vec![ObserverAction::Retrain {
+                    model_id: event.model_id.clone(),
+                    reason: msg,
+                }])
+            }
+            #[cfg(not(feature = "automated_retraining"))]
+            {
+                Ok(vec![ObserverAction::Alert { message: msg }])
+            }
+        } else {
+            Ok(vec![ObserverAction::NoOp])
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "DriftDetector"
+    }
+}
+
+/// Observer that watches for accuracy degradation.
+///
+/// Keeps an exponential moving average per (model_id, version) pair and triggers
+/// when the EMA drops below `min_accuracy`.
+pub struct PerformanceDegrader {
+    min_accuracy: f64,
+    smoothing: f64,
+    state: HashMap<String, f64>,
+}
+
+impl PerformanceDegrader {
+    pub fn new(min_accuracy: f64) -> Result<Self, ObserverError> {
+        if !(0.0..=1.0).contains(&min_accuracy) {
+            return Err(ObserverError::Config(
+                "min_accuracy must be within [0,1]".into(),
+            ));
+        }
+        Ok(Self {
+            min_accuracy,
+            smoothing: 0.2,
+            state: HashMap::new(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl MetricObserver for PerformanceDegrader {
+    async fn on_metric(
+        &mut self,
+        event: &MetricEvent,
+    ) -> Result<Vec<ObserverAction>, ObserverError> {
+        if event.kind != MetricKind::Accuracy {
+            return Ok(vec![ObserverAction::NoOp]);
+        }
+
+        let key = format!("{}:{}", event.model_id, event.version);
+        let prev = *self.state.get(&key).unwrap_or(&event.value);
+        let ema = self.smoothing * event.value + (1.0 - self.smoothing) * prev;
+        self.state.insert(key.clone(), ema);
+
+        debug!(
+            "Ema accuracy for {} updated to {:.4} (raw {:.4})",
+            key, ema, event.value
+        );
+
+        if ema < self.min_accuracy {
+            let msg = format!(
+                "Accuracy degraded for model '{}' (EMA {:.4} < {:.2})",
+                event.model_id, ema, self.min_accuracy
+            );
+            #[cfg(feature = "automated_retraining")]
+            {
+                Ok(vec![ObserverAction::Retrain {
+                    model_id: event.model_id.clone(),
+                    reason: msg,
+                }])
+            }
+            #[cfg(not(feature = "automated_retraining"))]
+            {
+                Ok(vec![ObserverAction::Alert { message: msg }])
+            }
+        } else {
+            Ok(vec![ObserverAction::NoOp])
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "PerformanceDegrader"
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                        AUTOMATED RETRAINING SCHEDULER                      */
+/* -------------------------------------------------------------------------- */
+#[cfg(feature = "automated_retraining")]
+#[derive(Debug)]
+struct RetrainRequest {
+    model_id: String,
+    reason: String,
+}
+
+/// Simple retraining scheduler backed by an in-memory priority queue.  In a
+/// real environment this would post to a distributed work-queue or a
+/// serverless cron orchestrator.
+#[cfg(feature = "automated_retraining")]
+#[derive(Clone)]
+pub struct RetrainScheduler {
+    tx: mpsc::Sender<RetrainRequest>,
+}
+
+#[cfg(feature = "automated_retraining")]
+impl RetrainScheduler {
+    pub fn new(capacity: usize) -> Self {
+        let (tx, mut rx) = mpsc::channel::<RetrainRequest>(capacity);
+        let queue = Arc::new(Mutex::new(Vec::<RetrainRequest>::new()));
+
+        // Spawn background worker
+        let worker_queue = queue.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Some(req) => {
+                        info!("Queued retrain: {:?}, reason: {}", req.model_id, req.reason);
+                        let mut q = worker_queue.lock().await;
+                        q.push(req);
+                    }
+                    None => {
+                        warn!("Retrain scheduler channel closed");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Spawn executor that drains the queue every N seconds
+        let executor_queue = queue.clone();
+        tokio::spawn(async move {
+            use tokio::time::{sleep, Duration};
+            loop {
+                sleep(Duration::from_secs(30)).await;
+                let mut q = executor_queue.lock().await;
+                if let Some(req) = q.pop() {
+                    drop(q); // release lock before heavy work
+                    if let Err(e) = Self::execute_retrain(req).await {
+                        error!("Retrain execution failed: {:?}", e);
+                    }
+                }
+            }
+        });
+
+        Self { tx }
+    }
+
+    #[inline]
+    fn sender(&self) -> mpsc::Sender<RetrainRequest> {
+        self.tx.clone()
+    }
+
+    async fn execute_retrain(req: RetrainRequest) -> Result<(), ObserverError> {
+        info!("Executing retrain for model '{}'", req.model_id);
+
+        // 1. Pull latest training data snapshot
+        // 2. Run pipeline with hyperparameter sweeps if enabled
+        // 3. Register new model artifact into Model Registry
+        // 4. Deploy canary automatically
+        //
+        // Placeholder implementation:
+        #[cfg(feature = "hyperparameter_tuning")]
+        {
+            info!(
+                "Hyperparameter tuning enabled; performing Bayesian search for '{}'",
+                req.model_id
+            );
+        }
+
+        // Simulate success
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                   TESTS                                    */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_degrader_triggers_alert() {
+        let mut degrader = PerformanceDegrader::new(0.9).unwrap();
+        let mut event = MetricEvent::new("model_a", MetricKind::Accuracy, 0.95).unwrap();
+        assert_eq!(
+            degrader.on_metric(&event).await.unwrap(),
+            vec![ObserverAction::NoOp]
+        );
+
+        event.value = 0.85;
+        let actions = degrader.on_metric(&event).await.unwrap();
+        assert!(!actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_drift_detector_trigger() {
+        let mut drift = DriftDetector::default();
+        let event = MetricEvent::new("m1", MetricKind::DriftScore, 0.5).unwrap();
+        let actions = drift.on_metric(&event).await.unwrap();
+        assert!(actions.iter().any(|a| matches!(a, ObserverAction::Alert { .. })));
+    }
+}
+```

@@ -1,0 +1,498 @@
+```rust
+//! src/module_18.txt
+//!
+//! Module 18 – Schema Guard & Quality Gate
+//! ---------------------------------------
+//! This module provides _executable data-quality checks_ that are applied to
+//! every message that flows through ChirpPulse’s real-time pipelines.  The main
+//! responsibility is to guarantee that records entering the lake respect the
+//! agreed-upon contracts (schemas) while allowing **automatic forward /
+!   backward compatibility** through online schema evolution.
+//!
+//! High-level overview
+//! -------------------
+//! 1. Pull the latest registered JSONSchema/Avro schema for a _subject_ from
+//!    the central Schema Registry (Confluent-compatible API).
+//! 2. Compile and cache the schema in memory, tracking ETags + TTL.
+//! 3. Validate incoming records (raw bytes or JSON) in a streaming fashion.
+//! 4. Emit structured diagnostics and route poison-pill messages to a
+//!    quarantine topic for further inspection.
+//!
+//! The entire module is asynchronous, thread-safe, and ready to be injected
+//! into the Tokio-based streaming runtimes used across other micro-services.
+//!
+//! Note: The code uses `jsonschema` for JSON payloads.  Avro support is
+//! stubbed but shows extension points.
+
+use std::{
+    collections::HashMap,
+    fmt::{self, Display},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use jsonschema::{Draft, JSONSchema};
+use reqwest::{header::IF_NONE_MATCH, Client, Url};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::Value;
+use tokio::{
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore},
+    task::JoinHandle,
+    time::sleep,
+};
+
+/// Errors that can occur during schema fetching or validation.
+#[derive(thiserror::Error, Debug)]
+pub enum SchemaError {
+    #[error("network error: {0}")]
+    Network(#[from] reqwest::Error),
+
+    #[error("schema not found for subject `{0}`")]
+    NotFound(String),
+
+    #[error("invalid schema returned by registry: {0}")]
+    InvalidSchema(String),
+
+    #[error("validation failed: {0}")]
+    Validation(String),
+
+    #[error("serde error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+/// An opaque JSON/Avro schema as returned by the remote registry.
+#[derive(Clone, Debug)]
+pub struct SchemaDocument {
+    raw: String,
+    etag: Option<String>,
+}
+
+impl SchemaDocument {
+    pub fn new(raw: String, etag: Option<String>) -> Self {
+        Self { raw, etag }
+    }
+}
+
+/// Responsible for fetching (and possibly caching) schemas.
+///
+/// A real implementation would also handle auth, SSL pinning, circuit-breakers,
+/// retries w/ backoff, etc.  Those aspects are beyond the scope of this file.
+#[async_trait]
+pub trait SchemaRepository: Send + Sync {
+    /// Fetch a schema for `subject` at a given `version`.  If `None`, the
+    /// latest version will be returned.
+    async fn fetch_schema(
+        &self,
+        subject: &str,
+        version: Option<u32>,
+        etag: Option<&str>,
+    ) -> Result<Option<SchemaDocument>, SchemaError>;
+}
+
+/// HTTP client backed by a Confluent-compatible registry.
+pub struct HttpSchemaRegistry {
+    base_url: Url,
+    client: Client,
+    /// Limit concurrent in-flight HTTP requests to avoid self-DOS.
+    guard: Arc<Semaphore>,
+}
+
+impl HttpSchemaRegistry {
+    pub fn new<U: Into<Url>>(base: U, max_inflight: usize) -> Self {
+        Self {
+            base_url: base.into(),
+            client: Client::builder()
+                .user_agent("ChirpPulse-SchemaGuard/1.0")
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("failed to build reqwest client"),
+            guard: Arc::new(Semaphore::new(max_inflight)),
+        }
+    }
+
+    async fn get_with_guard(
+        &self,
+        url: Url,
+        etag: Option<&str>,
+    ) -> Result<Option<SchemaDocument>, SchemaError> {
+        let _permit: OwnedSemaphorePermit = self.guard.clone().acquire_owned().await.unwrap();
+
+        let mut req = self.client.get(url);
+        if let Some(tag) = etag {
+            req = req.header(IF_NONE_MATCH, tag);
+        }
+
+        let res = req.send().await?;
+        match res.status().as_u16() {
+            200 => {
+                let tag = res
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(ToOwned::to_owned);
+
+                let raw = res.text().await?;
+                Ok(Some(SchemaDocument::new(raw, tag)))
+            }
+            304 => Ok(None), // Not Modified
+            404 => Err(SchemaError::NotFound("subject".into())),
+            status => Err(SchemaError::Network(
+                reqwest::Error::new(
+                    reqwest::StatusCode::from_u16(status).unwrap(),
+                    format!("unexpected status {status}"),
+                ),
+            )),
+        }
+    }
+}
+
+#[async_trait]
+impl SchemaRepository for HttpSchemaRegistry {
+    async fn fetch_schema(
+        &self,
+        subject: &str,
+        version: Option<u32>,
+        etag: Option<&str>,
+    ) -> Result<Option<SchemaDocument>, SchemaError> {
+        let version_path = version
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "latest".into());
+
+        let mut url = self
+            .base_url
+            .join(&format!("subjects/{subject}/versions/{version_path}"))
+            .expect("invalid base url");
+
+        // Confluent returns { "schema": "{...}" }. We request the "schema"
+        // property only to keep it simple here.
+        url.query_pairs_mut().append_pair("cached", "true");
+
+        self.get_with_guard(url, etag).await
+    }
+}
+
+/// Holds an in-memory, thread-safe cache for compiled schemas.
+#[derive(Clone)]
+pub struct SchemaCache {
+    /// subject -> compiled schema
+    inner: Arc<RwLock<HashMap<String, CachedEntry>>>,
+    ttl: Duration,
+}
+
+struct CachedEntry {
+    compiled: Arc<JSONSchema>,
+    etag: Option<String>,
+    expiry: Instant,
+}
+
+impl SchemaCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+            ttl,
+        }
+    }
+
+    async fn get(&self, subject: &str) -> Option<Arc<JSONSchema>> {
+        let guard = self.inner.read().await;
+        guard.get(subject).and_then(|entry| {
+            if entry.expiry > Instant::now() {
+                Some(entry.compiled.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn put(
+        &self,
+        subject: String,
+        compiled: JSONSchema,
+        etag: Option<String>,
+        ttl: Duration,
+    ) {
+        let mut guard = self.inner.write().await;
+        guard.insert(
+            subject,
+            CachedEntry {
+                compiled: Arc::new(compiled),
+                etag,
+                expiry: Instant::now() + ttl,
+            },
+        );
+    }
+}
+
+/// Public façade combining cache + remote fetch logic.
+#[derive(Clone)]
+pub struct SchemaGuard<R: SchemaRepository + 'static> {
+    repo: Arc<R>,
+    cache: SchemaCache,
+    background_refresh: JoinHandle<()>,
+}
+
+impl<R: SchemaRepository + 'static> SchemaGuard<R> {
+    pub fn new(repo: R, ttl: Duration, refresh_every: Duration) -> Self {
+        let cache = SchemaCache::new(ttl);
+        let repo_arc = Arc::new(repo);
+
+        let refresh_cache = cache.clone();
+        let repo_clone = repo_arc.clone();
+        let bg = tokio::spawn(async move {
+            loop {
+                sleep(refresh_every).await;
+                let keys: Vec<String> = {
+                    let guard = refresh_cache.inner.read().await;
+                    guard.keys().cloned().collect()
+                };
+                // Fire-and-forget refreshes
+                for subject in keys {
+                    let repo_ref = repo_clone.clone();
+                    let cache_ref = refresh_cache.clone();
+                    tokio::spawn(async move {
+                        // Swallow errors; they'll be retried on demand.
+                        let _ = Self::refresh_subject(&subject, repo_ref, cache_ref).await;
+                    });
+                }
+            }
+        });
+
+        Self {
+            repo: repo_arc,
+            cache,
+            background_refresh: bg,
+        }
+    }
+
+    /// Fetch a schema, using cache if possible, otherwise hitting the registry.
+    pub async fn schema(&self, subject: &str) -> Result<Arc<JSONSchema>, SchemaError> {
+        if let Some(compiled) = self.cache.get(subject).await {
+            return Ok(compiled);
+        }
+
+        // Not in cache or expired -> fetch & compile.
+        Self::refresh_subject(subject, self.repo.clone(), self.cache.clone()).await
+    }
+
+    async fn refresh_subject(
+        subject: &str,
+        repo: Arc<R>,
+        cache: SchemaCache,
+    ) -> Result<Arc<JSONSchema>, SchemaError> {
+        // Try conditional GET with ETag if we have one.
+        let etag_opt = {
+            let guard = cache.inner.read().await;
+            guard.get(subject).and_then(|c| c.etag.clone())
+        };
+
+        match repo.fetch_schema(subject, None, etag_opt.as_deref()).await? {
+            Some(doc) => {
+                // For demo we assume JSON schema. Avro support left as exercise.
+                let schema_json: Value = serde_json::from_str(&doc.raw)?;
+                let compiled =
+                    JSONSchema::options().with_draft(Draft::Draft7).compile(&schema_json).map_err(
+                        |e| SchemaError::InvalidSchema(format!("{e:?}")),
+                    )?;
+
+                let compiled_arc = Arc::new(compiled);
+                cache
+                    .put(
+                        subject.to_owned(),
+                        compiled_arc.as_ref().clone(),
+                        doc.etag,
+                        cache.ttl,
+                    )
+                    .await;
+
+                Ok(compiled_arc)
+            }
+            None => {
+                // Not modified -> pull from cache again, must exist.
+                cache
+                    .get(subject)
+                    .await
+                    .ok_or_else(|| SchemaError::NotFound(subject.into()))
+            }
+        }
+    }
+
+    /// Validate a generic JSON payload against the cached schema.
+    pub async fn validate_json<T: Serialize + ?Sized>(
+        &self,
+        subject: &str,
+        payload: &T,
+    ) -> Result<(), SchemaError> {
+        let schema = self.schema(subject).await?;
+        let value = serde_json::to_value(payload)?;
+        match schema.validate(&value) {
+            Ok(_) => Ok(()),
+            Err(iter) => {
+                let msgs: Vec<String> = iter.map(|e| e.to_string()).collect();
+                Err(SchemaError::Validation(msgs.join("; ")))
+            }
+        }
+    }
+}
+
+/// Example of what a downstream consumer would receive after validation.
+///
+/// If validation fails, the record will be published to a dedicated
+/// "chirppulse.dlq" topic with `reason` populated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatedRecord<T> {
+    pub subject: String,
+    pub payload: T,
+    pub arrival_ts: u64,
+    pub valid: bool,
+    pub reason: Option<String>,
+}
+
+impl<T> ValidatedRecord<T> {
+    pub fn ok(subject: String, payload: T, arrival_ts: u64) -> Self {
+        Self {
+            subject,
+            payload,
+            arrival_ts,
+            valid: true,
+            reason: None,
+        }
+    }
+
+    pub fn error(subject: String, payload: T, arrival_ts: u64, reason: String) -> Self {
+        Self {
+            subject,
+            payload,
+            arrival_ts,
+            valid: false,
+            reason: Some(reason),
+        }
+    }
+}
+
+/// A convenience wrapper that can be used as `Stream<Item = ValidatedRecord<_>>`
+/// inside async-streams, letting the calling service decide how to route
+/// invalid records (drop, DLQ, metrics, …).
+pub struct RecordValidator<R: SchemaRepository + 'static> {
+    guard: SchemaGuard<R>,
+}
+
+impl<R: SchemaRepository + 'static> RecordValidator<R> {
+    pub fn new(guard: SchemaGuard<R>) -> Self {
+        Self { guard }
+    }
+
+    /// Validate a single record, returning a structured `ValidatedRecord`.
+    pub async fn validate<T>(
+        &self,
+        subject: &str,
+        payload: T,
+        arrival_ts: u64,
+    ) -> ValidatedRecord<T>
+    where
+        T: Serialize + Clone,
+    {
+        match self.guard.validate_json(subject, &payload).await {
+            Ok(_) => ValidatedRecord::ok(subject.to_string(), payload, arrival_ts),
+            Err(e) => ValidatedRecord::error(
+                subject.to_string(),
+                payload,
+                arrival_ts,
+                e.to_string(),
+            ),
+        }
+    }
+}
+
+/// Example of integrating the validator into a Tokio task that consumes from
+/// Kafka (pseudo-code, no Kafka deps to keep the file self-contained).
+///
+/// ```ignore
+/// let registry   = HttpSchemaRegistry::new("http://schema-registry:8081/", 32);
+/// let guard      = SchemaGuard::new(registry, Duration::from_secs(300), Duration::from_secs(60));
+/// let validator  = RecordValidator::new(guard);
+///
+/// while let Some((subject, raw_json, ts)) = kafka_stream.next().await {
+///     match serde_json::from_slice::<serde_json::Value>(&raw_json) {
+///         Ok(value) => {
+///             let validated = validator.validate(&subject, value, ts).await;
+///             if validated.valid {
+///                 forward_to_pipeline(validated).await;
+///             } else {
+///                 publish_to_dlq(validated).await;
+///             }
+///         }
+///         Err(err) => {
+///             metrics::increment_counter!("malformed_json");
+///             // Publish raw bytes to DLQ, etc.
+///         }
+///     }
+/// }
+/// ```
+impl Display for SchemaGuard<HttpSchemaRegistry> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cache_size = self.cache.inner.blocking_read().len();
+        write!(f, "SchemaGuard(cache_size={cache_size})")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    #[tokio::test]
+    async fn simple_validation_flow() {
+        let server = MockServer::start().await;
+        let subject = "tweet";
+
+        // Crafted minimal schema
+        let schema_body = json!({
+            "type": "object",
+            "properties": { "id": { "type": "integer" }, "text": { "type": "string" } },
+            "required": [ "id", "text" ]
+        })
+        .to_string();
+
+        // The registry payload wraps the schema
+        let response = json!({ "schema": schema_body }).to_string();
+
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/subjects/{}/versions/latest",
+                subject
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_string(schema_body.clone()))
+            .mount(&server)
+            .await;
+
+        let registry = HttpSchemaRegistry::new(server.uri(), 4);
+        let guard = SchemaGuard::new(registry, Duration::from_secs(30), Duration::from_secs(60));
+        let validator = RecordValidator::new(guard);
+
+        // Valid record
+        let payload = json!({ "id": 1, "text": "hello" });
+        let res = validator
+            .validate(subject, payload.clone(), 123)
+            .await;
+        assert!(res.valid, "record should be valid");
+
+        // Invalid record (missing text)
+        let bad_payload = json!({ "id": 2 });
+        let res = validator.validate(subject, bad_payload.clone(), 124).await;
+        assert!(
+            !res.valid,
+            "record should fail validation due to missing field"
+        );
+        assert!(
+            res.reason.unwrap().contains("required"),
+            "error reason should mention required field"
+        );
+    }
+}
+```

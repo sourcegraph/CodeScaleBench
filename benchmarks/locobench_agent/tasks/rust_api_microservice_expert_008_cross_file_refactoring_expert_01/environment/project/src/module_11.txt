@@ -1,0 +1,459 @@
+```rust
+//! module_11.rs – Pagination & Response-Caching utilities
+//!
+//! This module centralises two cross-cutting concerns that are used by most
+//! REST/GraphQL resolvers in LedgerLink Nexus.
+//!
+//! 1. `Pagination`: Typed, validated query extractor + helpers for database
+//!    queries and OpenAPI documentation.
+//! 2. `ResponseCache`: Strong/weak ETag generation and Redis-backed HTTP
+//!    response caching middleware.
+//!
+//! Both sub-modules are **framework-agnostic** with thin glue for Actix-Web
+//! (our current HTTP stack).  They can be reused by background workers or
+//! CLI tooling that needs identical semantics.
+
+#![allow(clippy::missing_errors_doc)]
+
+use std::{
+    future::{ready, Ready},
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
+
+use actix_web::{
+    body::MessageBody,
+    dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
+    error::{ErrorBadRequest, ErrorInternalServerError},
+    http::{
+        header::{
+            self, EntityTag, HeaderName, HeaderValue, CACHE_CONTROL, ETAG, IF_NONE_MATCH,
+            VARY,
+        },
+        StatusCode,
+    },
+    FromRequest, HttpMessage, HttpRequest, HttpResponse,
+};
+use anyhow::Context as _;
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::future::LocalBoxFuture;
+use redis::AsyncCommands;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use thiserror::Error;
+use tracing::{debug, instrument, warn};
+
+/// Default page size when none is supplied by the client.
+pub const DEFAULT_PER_PAGE: u32 = 50;
+/// Maximum allowable items per page to safeguard DB/IO and DoS vectors.
+pub const MAX_PER_PAGE: u32 = 250;
+
+/// Query-string pagination payload.
+///
+/// Example:
+///   ?page=2&per_page=100
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+pub struct Pagination {
+    /// 1-based page number.
+    pub page: u32,
+    /// Items per page, truncated to [`MAX_PER_PAGE`].
+    pub per_page: u32,
+}
+
+impl Default for Pagination {
+    fn default() -> Self {
+        Self {
+            page: 1,
+            per_page: DEFAULT_PER_PAGE,
+        }
+    }
+}
+
+impl Pagination {
+    /// Calculate SQL OFFSET given validated pagination.
+    #[must_use]
+    pub fn offset(self) -> u32 {
+        (self.page.saturating_sub(1)) * self.per_page
+    }
+
+    /// Calculate LIMIT given validated pagination.
+    #[must_use]
+    pub const fn limit(self) -> u32 {
+        self.per_page
+    }
+
+    /// Clamp page & per_page to safe ranges.  
+    /// Returns validated [`Pagination`] or a formatted error string.
+    pub fn validate(self) -> Result<Self, PaginationError> {
+        if self.page == 0 {
+            return Err(PaginationError::PageMustBePositive);
+        }
+        if self.per_page == 0 {
+            return Err(PaginationError::PerPageMustBePositive);
+        }
+        if self.per_page > MAX_PER_PAGE {
+            return Err(PaginationError::PerPageExceedsMax {
+                supplied: self.per_page,
+                max: MAX_PER_PAGE,
+            });
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum PaginationError {
+    #[error("query parameter `page` must be ≥ 1")]
+    PageMustBePositive,
+    #[error("query parameter `per_page` must be ≥ 1")]
+    PerPageMustBePositive,
+    #[error("query parameter `per_page`={supplied} exceeds max of {max}")]
+    PerPageExceedsMax { supplied: u32, max: u32 },
+}
+
+impl actix_web::ResponseError for PaginationError {
+    fn status_code(&self) -> StatusCode {
+        StatusCode::BAD_REQUEST
+    }
+}
+
+/// Actix-Web query extractor — will automatically validate.
+impl FromRequest for Pagination {
+    type Error = actix_web::Error;
+    type Future = Ready<Result<Self, actix_web::Error>>;
+
+    fn from_request(req: &HttpRequest, _: &mut actix_web::dev::Payload) -> Self::Future {
+        let parsed: Result<Self, _> = serde_qs::from_str(req.query_string());
+        ready(match parsed {
+            Ok(p) => p.validate().map_err(ErrorBadRequest),
+            Err(e) => {
+                warn!(err = %e, "malformed pagination query");
+                Err(ErrorBadRequest("invalid pagination query"))
+            }
+        })
+    }
+}
+
+/* ---------------------------------------------------------------- *\
+ *                  Pagination Metadata Envelope                     *
+\* ---------------------------------------------------------------- */
+
+/// Generic paginated payload returned by controllers or GraphQL resolvers.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Paginated<T>
+where
+    T: Serialize,
+{
+    pub items: Vec<T>,
+    pub page: u32,
+    pub per_page: u32,
+    pub total_items: Option<u64>,
+    pub total_pages: Option<u32>,
+}
+
+impl<T> Paginated<T>
+where
+    T: Serialize,
+{
+    #[must_use]
+    pub fn new(items: Vec<T>, pagination: Pagination, total_items: Option<u64>) -> Self {
+        let total_pages = total_items.map(|total| {
+            let pages = total as f64 / pagination.per_page as f64;
+            pages.ceil() as u32
+        });
+
+        Self {
+            items,
+            page: pagination.page,
+            per_page: pagination.per_page,
+            total_items,
+            total_pages,
+        }
+    }
+}
+
+/* ---------------------------------------------------------------- *\
+ *                     HTTP Response Caching                         *
+\* ---------------------------------------------------------------- */
+
+/// High-level cache-control policies we recognise and emit.
+#[derive(Debug, Clone, Copy)]
+pub enum CacheScope {
+    Public,
+    Private,
+}
+
+/// Declarative caching hint produced by service layer.
+#[derive(Debug, Clone)]
+pub struct CacheHint {
+    pub scope: CacheScope,
+    pub max_age: Duration,
+    pub vary_headers: &'static [&'static str],
+}
+
+impl CacheHint {
+    /// Translate to HTTP header values.
+    #[must_use]
+    pub fn to_header_value(&self) -> HeaderValue {
+        let dir = match self.scope {
+            CacheScope::Public => "public",
+            CacheScope::Private => "private",
+        };
+        let max_age = format!("{dir}, max-age={}", self.max_age.as_secs());
+        HeaderValue::from_str(&max_age).expect("valid header")
+    }
+}
+
+/// Trait for a response-cache repository backend.
+#[async_trait]
+pub trait ResponseCacheRepo: Clone + Send + Sync + 'static {
+    async fn get(&self, key: &str) -> Result<Option<Bytes>, anyhow::Error>;
+    async fn set(&self, key: &str, value: Bytes, ttl: Duration) -> Result<(), anyhow::Error>;
+}
+
+/// Redis-based implementation for the cache repo.
+#[derive(Clone)]
+pub struct RedisCacheRepo {
+    client: redis::Client,
+}
+
+impl RedisCacheRepo {
+    pub fn new(client: redis::Client) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl ResponseCacheRepo for RedisCacheRepo {
+    async fn get(&self, key: &str) -> Result<Option<Bytes>, anyhow::Error> {
+        let mut conn = self
+            .client
+            .get_async_connection()
+            .await
+            .context("redis connection")?;
+        let data: Option<Vec<u8>> = conn.get(key).await?;
+        Ok(data.map(Bytes::from))
+    }
+
+    async fn set(&self, key: &str, value: Bytes, ttl: Duration) -> Result<(), anyhow::Error> {
+        let mut conn = self
+            .client
+            .get_async_connection()
+            .await
+            .context("redis connection")?;
+        let _: () = conn
+            .set_ex(key, &*value, ttl.as_secs() as usize)
+            .await
+            .context("redis set_ex")?;
+        Ok(())
+    }
+}
+
+/* ---------------------------------------------------------------- *\
+ *                    Cache Middleware for Actix                    *
+\* ---------------------------------------------------------------- */
+
+pub struct ResponseCache<R> {
+    repo: R,
+    default_ttl: Duration,
+}
+
+impl<R> ResponseCache<R> {
+    pub fn new(repo: R, default_ttl: Duration) -> Self {
+        Self { repo, default_ttl }
+    }
+}
+
+impl<S, B, R> Transform<S, ServiceRequest> for ResponseCache<R>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = actix_web::Error>
+        + 'static,
+    S::Future: 'static,
+    B: MessageBody + 'static,
+    R: ResponseCacheRepo,
+{
+    type Response = ServiceResponse;
+    type Error = actix_web::Error;
+    type InitError = ();
+    type Transform = ResponseCacheMiddleware<S, R>;
+    type Future = Ready<Result<Self::Transform, Self::InitError>>;
+
+    fn new_transform(&self, service: S) -> Self::Future {
+        ready(Ok(ResponseCacheMiddleware {
+            service,
+            repo: self.repo.clone(),
+            default_ttl: self.default_ttl,
+        }))
+    }
+}
+
+pub struct ResponseCacheMiddleware<S, R> {
+    service: S,
+    repo: R,
+    default_ttl: Duration,
+}
+
+impl<S, B, R> Service<ServiceRequest> for ResponseCacheMiddleware<S, R>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = actix_web::Error>
+        + 'static,
+    S::Future: 'static,
+    B: MessageBody + 'static,
+    R: ResponseCacheRepo,
+{
+    type Response = ServiceResponse;
+    type Error = actix_web::Error;
+    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    forward_ready!(service);
+
+    fn call(&self, mut req: ServiceRequest) -> Self::Future {
+        // Only cache safe (GET/HEAD) requests
+        let is_cacheable_method = req.method() == actix_web::http::Method::GET
+            || req.method() == actix_web::http::Method::HEAD;
+
+        if !is_cacheable_method {
+            return Box::pin(self.service.call(req));
+        }
+
+        // Build cache key: method:path?query
+        let cache_key = format!(
+            "{}:{}?{}",
+            req.method(),
+            req.path(),
+            req.query_string()
+        );
+
+        // Clone references to move into async block
+        let repo = self.repo.clone();
+        let default_ttl = self.default_ttl;
+        let mut svc = self.service.call(req);
+
+        Box::pin(async move {
+            // Try Redis first
+            if let Ok(Some(blob)) = repo.get(&cache_key).await {
+                debug!(key = %cache_key, "cache hit");
+                let response = HttpResponse::Ok()
+                    .insert_header((header::CONTENT_TYPE, "application/json"))
+                    .insert_header((
+                        header::HeaderName::from_static("x-cache-status"),
+                        HeaderValue::from_static("HIT"),
+                    ))
+                    .body(blob);
+
+                return Ok(ServiceResponse::new(
+                    svc.as_mut().as_mut().request().clone(),
+                    response.map_into_right_body(),
+                ));
+            }
+
+            // Miss – call downstream service
+            let mut res = svc.await?.map_into_left_body();
+
+            // Capture body for caching (only for 200 OK)
+            if res.status() == StatusCode::OK {
+                let (head, body) = res.into_parts();
+
+                let body_bytes = actix_web::body::to_bytes(body).await?;
+                repo.set(&cache_key, body_bytes.clone(), default_ttl)
+                    .await
+                    .map_err(ErrorInternalServerError)?;
+
+                let mut final_res = HttpResponse::build(head.status)
+                    .set_header(CACHE_CONTROL, format!("max-age={}", default_ttl.as_secs()))
+                    .set_header(
+                        HeaderName::from_static("x-cache-status"),
+                        HeaderValue::from_static("MISS"),
+                    )
+                    .body(body_bytes);
+
+                // Generate weak ETag
+                let etag = EntityTag::weak(format!("{:x}", blake3::hash(&body_bytes)));
+                final_res.headers_mut().insert(
+                    ETAG,
+                    HeaderValue::from_str(&etag.to_string()).expect("etag header"),
+                );
+
+                return Ok(ServiceResponse::new(head.into_parts().0, final_res));
+            }
+
+            Ok(res.map_into_right_body())
+        })
+    }
+}
+
+/* ---------------------------------------------------------------- *\
+ *                          Test helpers                             *
+\* ---------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{test, web, App};
+
+    #[actix_web::test]
+    async fn pagination_validation() {
+        // Valid
+        let query = "page=2&per_page=100";
+        let req = test::TestRequest::with_uri(&format!("/foobar?{query}")).to_http_request();
+        let pg: Pagination = Pagination::from_request(&req, &mut actix_web::dev::Payload::None)
+            .await
+            .unwrap();
+        assert_eq!(
+            pg,
+            Pagination {
+                page: 2,
+                per_page: 100
+            }
+        );
+
+        // Invalid
+        let query = "page=0&per_page=1000";
+        let req = test::TestRequest::with_uri(&format!("/foobar?{query}")).to_http_request();
+        assert!(Pagination::from_request(&req, &mut actix_web::dev::Payload::None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn redis_roundtrip() {
+        let client = redis::Client::open("redis://127.0.0.1/").expect("redis");
+        let repo = RedisCacheRepo::new(client);
+        let key = "ledgerlink:test";
+        let val = Bytes::from_static(b"hello");
+        repo.set(key, val.clone(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        let got = repo.get(key).await.unwrap().unwrap();
+        assert_eq!(got, val);
+    }
+
+    #[actix_web::test]
+    async fn middleware_flow() {
+        let client = redis::Client::open("redis://127.0.0.1/").expect("redis");
+        let app = test::init_service(
+            App::new()
+                .wrap(ResponseCache::new(
+                    RedisCacheRepo::new(client),
+                    Duration::from_secs(5),
+                ))
+                .route(
+                    "/hello",
+                    web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"hi": "there"})) }),
+                ),
+        )
+        .await;
+
+        // First call – MISS
+        let req = test::TestRequest::with_uri("/hello").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.headers().get("x-cache-status").unwrap(), "MISS");
+
+        // Second call – HIT
+        let req = test::TestRequest::with_uri("/hello").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.headers().get("x-cache-status").unwrap(), "HIT");
+    }
+}
+```

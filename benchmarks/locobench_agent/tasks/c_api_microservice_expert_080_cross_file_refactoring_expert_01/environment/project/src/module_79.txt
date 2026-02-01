@@ -1,0 +1,458 @@
+```c
+/**
+ * MercuryMonolith Commerce Hub
+ * Module: Response Cache (LRU + TTL)
+ *
+ * File:    src/module_79.txt    (compiled as C source)
+ * Project: api_microservice
+ *
+ * This module implements an in-process response cache with:
+ *   • O(1) look-ups (hash table powered by uthash)
+ *   • LRU eviction policy
+ *   • Per-entry TTL support
+ *   • Thread-safety via POSIX read-write locks
+ *   • Built-in instrumentation for Prometheus-compatible metrics
+ *   • Structured logging hooks
+ *
+ * The cache is intentionally generic (void* value) so that higher-level
+ * layers (REST / GraphQL gateway, repository, etc.) can reuse it for
+ * response caching, heavy DAO result caching, feature-flag configs, etc.
+ */
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+
+#include "uthash.h"          /* https://troydhanson.github.io/uthash/ */
+#include "mm_logger.h"       /* Internal structured logging facade    */
+#include "mm_metrics.h"      /* Prometheus counter/gauge abstractions */
+#include "mm_memory.h"       /* Safe wrappers, leak-tracking, etc.    */
+
+#define MM_RCACHE_DEFAULT_MAX_ENTRIES  4096U
+#define MM_RCACHE_METRIC_NS            "mm_response_cache"
+
+/* -------------------------------------------------------------
+ * Type definitions
+ * -------------------------------------------------------------*/
+
+/* Cache node / entry */
+typedef struct mm_cache_entry {
+    char                    *key;        /* NULL-terminated */
+    void                    *value;      /* Arbitrary blob  */
+    size_t                   value_sz;   /* Size in bytes   */
+    time_t                   expire_at;  /* Epoch seconds   */
+
+    /* LRU doubly-linked list */
+    struct mm_cache_entry   *prev;
+    struct mm_cache_entry   *next;
+
+    UT_hash_handle           hh;         /* uthash handle   */
+} mm_cache_entry_t;
+
+/* Cache instance (singleton in practice, but kept generic) */
+typedef struct mm_response_cache {
+    mm_cache_entry_t        *table;        /* Hash map root           */
+    mm_cache_entry_t        *lru_head;     /* Most recently used      */
+    mm_cache_entry_t        *lru_tail;     /* Least recently used     */
+    size_t                   count;        /* Current # of entries    */
+    size_t                   max_entries;  /* Cap before eviction     */
+
+    pthread_rwlock_t         lock;         /* Readers-writers lock    */
+
+    /* Instrumentation handles */
+    mm_metric_counter_t      hit_ctr;
+    mm_metric_counter_t      miss_ctr;
+    mm_metric_gauge_t        size_gauge;
+} mm_response_cache_t;
+
+
+/* -------------------------------------------------------------
+ * Internal helpers
+ * -------------------------------------------------------------*/
+
+/* Forward declarations */
+static inline void  rcache__lru_move_front(mm_response_cache_t *, mm_cache_entry_t *);
+static void         rcache__evict_tail(mm_response_cache_t *);
+static void         rcache__unlink(mm_response_cache_t *, mm_cache_entry_t *);
+static void         rcache__free_entry(mm_cache_entry_t *e);
+
+/* Timestamp helper */
+static inline time_t unix_now(void)
+{
+    return (time_t)time(NULL);
+}
+
+/* Allocate zero-initialized memory that aborts on OOM */
+static inline void *xcalloc(size_t n, size_t sz)
+{
+    void *p = calloc(n, sz);
+    if (!p) {
+        MM_LOG_FATAL("Out of memory (calloc %zu x %zu)", n, sz);
+        abort();
+    }
+    return p;
+}
+
+/* Duplicate C-string with abort on failure */
+static inline char *xstrdup(const char *s)
+{
+    char *d = strdup(s);
+    if (!d) {
+        MM_LOG_FATAL("Out of memory (strdup)");
+        abort();
+    }
+    return d;
+}
+
+/* -------------------------------------------------------------
+ * Public API
+ * -------------------------------------------------------------*/
+
+/**
+ * mm_response_cache_init
+ * @param max_entries   Hard cap. If 0, defaults to
+ *                      MM_RCACHE_DEFAULT_MAX_ENTRIES.
+ * @return pointer to initialised cache instance.
+ */
+mm_response_cache_t *mm_response_cache_init(size_t max_entries)
+{
+    mm_response_cache_t *c = xcalloc(1, sizeof(*c));
+
+    c->max_entries = max_entries ? max_entries
+                                 : MM_RCACHE_DEFAULT_MAX_ENTRIES;
+
+    pthread_rwlock_init(&c->lock, NULL);
+
+    /* Register metrics */
+    c->hit_ctr   = mm_metrics_counter_create(MM_RCACHE_METRIC_NS, "hits",
+                                             "Total cache hits");
+    c->miss_ctr  = mm_metrics_counter_create(MM_RCACHE_METRIC_NS, "misses",
+                                             "Total cache misses");
+    c->size_gauge = mm_metrics_gauge_create(MM_RCACHE_METRIC_NS, "entries",
+                                            "Current number of entries");
+
+    MM_LOG_INFO("Response cache initialised [max=%zu]", c->max_entries);
+    return c;
+}
+
+/**
+ * mm_response_cache_free
+ * Destroys the cache, freeing all entries.
+ */
+void mm_response_cache_free(mm_response_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_rwlock_wrlock(&c->lock);
+
+    mm_cache_entry_t *it, *tmp;
+    HASH_ITER(hh, c->table, it, tmp) {
+        HASH_DEL(c->table, it);
+        rcache__free_entry(it);
+    }
+    c->lru_head = c->lru_tail = NULL;
+
+    pthread_rwlock_unlock(&c->lock);
+    pthread_rwlock_destroy(&c->lock);
+
+    /* Unregister metrics */
+    mm_metrics_counter_destroy(c->hit_ctr);
+    mm_metrics_counter_destroy(c->miss_ctr);
+    mm_metrics_gauge_destroy(c->size_gauge);
+
+    MM_LOG_INFO("Response cache destroyed");
+    free(c);
+}
+
+/**
+ * mm_response_cache_put
+ *
+ * Stores (or overwrites) an item in the cache.
+ *
+ * @param ttl_sec   Time-to-live in seconds (0 => no expiry)
+ * @return 0 on success, ‑1 on allocation failure.
+ */
+int mm_response_cache_put(mm_response_cache_t *c,
+                          const char *key,
+                          const void *value,
+                          size_t value_sz,
+                          uint32_t ttl_sec)
+{
+    if (!c || !key || !value || value_sz == 0) {
+        MM_LOG_WARN("Attempt to cache invalid item (key=%p, value=%p, size=%zu)",
+                    key, value, value_sz);
+        return -1;
+    }
+
+    pthread_rwlock_wrlock(&c->lock);
+
+    mm_cache_entry_t *e = NULL;
+    HASH_FIND_STR(c->table, key, e);
+
+    if (e) {
+        /* Overwrite existing entry */
+        rcache__unlink(c, e);
+
+        free(e->value);
+        e->value = mm_memdup(value, value_sz);
+        if (!e->value) goto oom;
+
+        e->value_sz  = value_sz;
+        e->expire_at = ttl_sec ? unix_now() + ttl_sec : 0;
+    } else {
+        /* Create new entry */
+        e = xcalloc(1, sizeof(*e));
+        e->key       = xstrdup(key);
+        e->value     = mm_memdup(value, value_sz);
+        if (!e->value) goto oom;
+
+        e->value_sz  = value_sz;
+        e->expire_at = ttl_sec ? unix_now() + ttl_sec : 0;
+
+        HASH_ADD_KEYPTR(hh, c->table, e->key, strlen(e->key), e);
+        c->count++;
+    }
+
+    /* Move to front of LRU */
+    rcache__lru_move_front(c, e);
+
+    /* Evict if over capacity */
+    while (c->count > c->max_entries) {
+        rcache__evict_tail(c);
+    }
+
+    mm_metrics_gauge_set(c->size_gauge, (double)c->count);
+    pthread_rwlock_unlock(&c->lock);
+    return 0;
+
+oom:
+    MM_LOG_ERROR("Failed to allocate cache entry for key='%s'", key);
+    pthread_rwlock_unlock(&c->lock);
+    rcache__free_entry(e);
+    return -1;
+}
+
+/**
+ * mm_response_cache_get
+ *
+ * Retrieves an item. The caller must free() the returned pointer when done.
+ * Returns NULL on miss or expired item.
+ */
+void *mm_response_cache_get(mm_response_cache_t *c,
+                            const char *key,
+                            size_t *out_size)
+{
+    if (!c || !key) return NULL;
+
+    pthread_rwlock_rdlock(&c->lock);
+
+    mm_cache_entry_t *e = NULL;
+    HASH_FIND_STR(c->table, key, e);
+
+    if (!e) {
+        mm_metrics_counter_inc(c->miss_ctr);
+        pthread_rwlock_unlock(&c->lock);
+        return NULL; /* Not found */
+    }
+
+    /* Check TTL */
+    if (e->expire_at && e->expire_at <= unix_now()) {
+        /* Upgrade lock: need write access to remove */
+        pthread_rwlock_unlock(&c->lock);
+        pthread_rwlock_wrlock(&c->lock);
+
+        /* Re-check in case another thread removed it */
+        HASH_FIND_STR(c->table, key, e);
+        if (e) {
+            MM_LOG_DEBUG("Cache entry expired (key='%s')", key);
+            HASH_DEL(c->table, e);
+            rcache__unlink(c, e);
+            c->count--;
+            mm_metrics_gauge_set(c->size_gauge, (double)c->count);
+            rcache__free_entry(e);
+        }
+
+        mm_metrics_counter_inc(c->miss_ctr);
+        pthread_rwlock_unlock(&c->lock);
+        return NULL;
+    }
+
+    /* Copy value to return outside lock */
+    void *dup = mm_memdup(e->value, e->value_sz);
+    if (!dup) {
+        pthread_rwlock_unlock(&c->lock);
+        MM_LOG_ERROR("Out of memory duplicating cache value (key='%s')", key);
+        return NULL;
+    }
+    if (out_size) *out_size = e->value_sz;
+
+    /* LRU update requires write lock */
+    rcache__lru_move_front(c, e);
+    mm_metrics_counter_inc(c->hit_ctr);
+    pthread_rwlock_unlock(&c->lock);
+
+    return dup;
+}
+
+/**
+ * mm_response_cache_evict
+ *
+ * Removes a given key from the cache (if present).
+ */
+void mm_response_cache_evict(mm_response_cache_t *c, const char *key)
+{
+    if (!c || !key) return;
+
+    pthread_rwlock_wrlock(&c->lock);
+
+    mm_cache_entry_t *e = NULL;
+    HASH_FIND_STR(c->table, key, e);
+    if (e) {
+        HASH_DEL(c->table, e);
+        rcache__unlink(c, e);
+        c->count--;
+        mm_metrics_gauge_set(c->size_gauge, (double)c->count);
+        rcache__free_entry(e);
+        MM_LOG_DEBUG("Manually evicted cache entry (key='%s')", key);
+    }
+
+    pthread_rwlock_unlock(&c->lock);
+}
+
+/**
+ * mm_response_cache_flush
+ *
+ * Removes ALL entries (e.g., during deploys, schema migrations, etc.).
+ */
+void mm_response_cache_flush(mm_response_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_rwlock_wrlock(&c->lock);
+
+    mm_cache_entry_t *it, *tmp;
+    HASH_ITER(hh, c->table, it, tmp) {
+        HASH_DEL(c->table, it);
+        rcache__free_entry(it);
+    }
+    c->lru_head = c->lru_tail = NULL;
+    c->count = 0;
+    mm_metrics_gauge_set(c->size_gauge, 0);
+
+    pthread_rwlock_unlock(&c->lock);
+    MM_LOG_INFO("Response cache flushed");
+}
+
+/* -------------------------------------------------------------
+ * Internal LRU helpers
+ * -------------------------------------------------------------*/
+
+static inline void rcache__lru_move_front(mm_response_cache_t *c,
+                                          mm_cache_entry_t *e)
+{
+    if (c->lru_head == e) return; /* Already most-recent */
+
+    /* Unlink from current position */
+    rcache__unlink(c, e);
+
+    /* Insert at head */
+    e->prev = NULL;
+    e->next = c->lru_head;
+
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+static void rcache__evict_tail(mm_response_cache_t *c)
+{
+    if (!c->lru_tail) return;
+
+    mm_cache_entry_t *e = c->lru_tail;
+
+    HASH_DEL(c->table, e);
+    rcache__unlink(c, e);
+    c->count--;
+
+    mm_metrics_gauge_set(c->size_gauge, (double)c->count);
+    MM_LOG_DEBUG("Evicted LRU entry (key='%s')", e->key);
+    rcache__free_entry(e);
+}
+
+/* Remove from LRU list but NOT from hash */
+static void rcache__unlink(mm_response_cache_t *c, mm_cache_entry_t *e)
+{
+    if (!e) return;
+
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+
+    if (c->lru_head == e) c->lru_head = e->next;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    e->prev = e->next = NULL;
+}
+
+static void rcache__free_entry(mm_cache_entry_t *e)
+{
+    if (!e) return;
+    free(e->key);
+    free(e->value);
+    free(e);
+}
+
+/* -------------------------------------------------------------
+ * Optional: Periodic janitor thread
+ * -------------------------------------------------------------
+ * If compiled with ‑DMM_RCACHE_ENABLE_JANITOR, a thread will clean
+ * up expired items every 60 seconds to avoid lazy eviction bursts.
+ * -------------------------------------------------------------*/
+#ifdef MM_RCACHE_ENABLE_JANITOR
+
+#include <signal.h>
+
+static void *rcache__janitor_thread(void *arg)
+{
+    mm_response_cache_t *c = arg;
+    const int interval_sec = 60;
+
+    while (1) {
+        sleep(interval_sec);
+
+        time_t now = unix_now();
+        pthread_rwlock_wrlock(&c->lock);
+
+        mm_cache_entry_t *it, *tmp;
+        HASH_ITER(hh, c->table, it, tmp) {
+            if (it->expire_at && it->expire_at <= now) {
+                HASH_DEL(c->table, it);
+                rcache__unlink(c, it);
+                c->count--;
+                rcache__free_entry(it);
+            }
+        }
+        mm_metrics_gauge_set(c->size_gauge, (double)c->count);
+        pthread_rwlock_unlock(&c->lock);
+    }
+    return NULL;
+}
+
+/* Call once after init to enable janitor */
+void mm_response_cache_start_janitor(mm_response_cache_t *c)
+{
+    pthread_t tid;
+    int rc = pthread_create(&tid, NULL, rcache__janitor_thread, c);
+    if (rc == 0) {
+        pthread_detach(tid);
+        MM_LOG_INFO("Response cache janitor thread started");
+    } else {
+        MM_LOG_WARN("Failed to start janitor thread (errno=%d)", rc);
+    }
+}
+
+#endif /* MM_RCACHE_ENABLE_JANITOR */
+```

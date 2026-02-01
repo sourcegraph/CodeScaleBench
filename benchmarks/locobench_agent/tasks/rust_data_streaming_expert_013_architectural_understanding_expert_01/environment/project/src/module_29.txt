@@ -1,0 +1,366 @@
+```rust
+//! ChirpPulse – Data-Quality & Monitoring Module
+//! ---------------------------------------------
+//! `module_29` is responsible for executing a configurable chain of
+//! data-quality checks against streaming social records and exposing
+//! real-time metrics about their outcome.  Checks can be swapped or
+//! re-configured at run-time without stopping the stream.
+//!
+//! Key capabilities
+//! • Strategy pattern for pluggable checks  
+//! • Parallel record validation (Rayon)  
+//! • Async stream wiring (Tokio)  
+//! • Metrics emission (metrics crate)  
+//! • Hot-reloadable configuration (watch channel)
+
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use parking_lot::RwLock;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{mpsc, watch},
+    task,
+    time,
+};
+
+/// A single social message after initial ingestion.
+/// Lightweight by design; heavy payloads live in object storage.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SocialRecord {
+    pub id: String,
+    pub timestamp: SystemTime,
+    pub text: String,
+    pub lang: Option<String>,
+    pub toxicity_score: Option<f32>,
+}
+
+/// Top-level error for any data-quality violation.
+#[derive(Debug, Error)]
+pub enum QualityError {
+    #[error("field `{0}` missing")]
+    MissingField(&'static str),
+
+    #[error("invalid language code `{0}`")]
+    InvalidLanguage(String),
+
+    #[error("toxicity {actual:.2} exceeds threshold {max:.2}")]
+    ToxicityExceeded { actual: f32, max: f32 },
+
+    #[error("unknown validation error")]
+    Other(#[from] anyhow::Error),
+}
+
+/// Strategy: anything that can validate a record.
+pub trait DataQualityCheck: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn check(&self, record: &SocialRecord) -> Result<(), QualityError>;
+}
+
+/// Ensures mandatory fields are present.
+pub struct SchemaCheck;
+
+impl DataQualityCheck for SchemaCheck {
+    fn name(&self) -> &'static str {
+        "schema_check"
+    }
+
+    fn check(&self, record: &SocialRecord) -> Result<(), QualityError> {
+        if record.id.is_empty() {
+            return Err(QualityError::MissingField("id"));
+        }
+        if record.text.is_empty() {
+            return Err(QualityError::MissingField("text"));
+        }
+        Ok(())
+    }
+}
+
+/// Verifies language tag is ISO-639 compliant.
+pub struct LanguageCheck;
+
+impl DataQualityCheck for LanguageCheck {
+    fn name(&self) -> &'static str {
+        "language_check"
+    }
+
+    fn check(&self, record: &SocialRecord) -> Result<(), QualityError> {
+        if let Some(ref lang) = record.lang {
+            if lang.len() != 2 || !lang.chars().all(|c| c.is_ascii_alphabetic()) {
+                return Err(QualityError::InvalidLanguage(lang.clone()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Fails messages that exceed a configurable toxicity threshold.
+pub struct ToxicityThresholdCheck {
+    max: f32,
+}
+
+impl ToxicityThresholdCheck {
+    pub fn new(max: f32) -> Self {
+        Self { max }
+    }
+}
+
+impl DataQualityCheck for ToxicityThresholdCheck {
+    fn name(&self) -> &'static str {
+        "toxicity_threshold_check"
+    }
+
+    fn check(&self, record: &SocialRecord) -> Result<(), QualityError> {
+        if let Some(actual) = record.toxicity_score {
+            if actual > self.max {
+                return Err(QualityError::ToxicityExceeded {
+                    actual,
+                    max: self.max,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Public handle that owns the current validator chain.
+#[derive(Clone)]
+pub struct DataQualityEngine {
+    checks: Arc<RwLock<Vec<Arc<dyn DataQualityCheck>>>>,
+}
+
+impl Default for DataQualityEngine {
+    fn default() -> Self {
+        Self {
+            checks: Arc::new(RwLock::new(vec![
+                Arc::new(SchemaCheck),
+                Arc::new(LanguageCheck),
+                Arc::new(ToxicityThresholdCheck::new(0.85)),
+            ])),
+        }
+    }
+}
+
+impl DataQualityEngine {
+    /// Replace the full validator chain atomically.
+    pub fn swap_checks(&self, new_checks: Vec<Arc<dyn DataQualityCheck>>) {
+        *self.checks.write() = new_checks;
+    }
+
+    /// Validate a slice of records in parallel, returning a tuple:
+    ///  (passed, failed_with_errors)
+    pub fn validate_batch(
+        &self,
+        records: &[SocialRecord],
+    ) -> (Vec<SocialRecord>, Vec<(SocialRecord, Vec<QualityError>)>) {
+        let checks = self.checks.read().clone(); // snapshot
+
+        records
+            .par_iter()
+            .map(|rec| {
+                let mut errors = Vec::new();
+                for check in &checks {
+                    if let Err(e) = check.check(rec) {
+                        errors.push(e);
+                    }
+                }
+                if errors.is_empty() {
+                    Left(rec.clone())
+                } else {
+                    Right((rec.clone(), errors))
+                }
+            })
+            .partition_result()
+    }
+}
+
+/// Async stream processor wiring the engine into Tokio channels.
+pub struct StreamValidator {
+    engine: DataQualityEngine,
+    rx: mpsc::Receiver<SocialRecord>,
+    pass_tx: mpsc::Sender<SocialRecord>,
+    fail_tx: mpsc::Sender<(SocialRecord, Vec<QualityError>)>,
+    cfg_rx: watch::Receiver<EngineConfig>,
+}
+
+/// Runtime configuration delivered through watch channel.
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    pub toxicity_threshold: f32,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            toxicity_threshold: 0.85,
+        }
+    }
+}
+
+impl StreamValidator {
+    pub fn new(
+        engine: DataQualityEngine,
+        rx: mpsc::Receiver<SocialRecord>,
+        pass_tx: mpsc::Sender<SocialRecord>,
+        fail_tx: mpsc::Sender<(SocialRecord, Vec<QualityError>)>,
+        cfg_rx: watch::Receiver<EngineConfig>,
+    ) -> Self {
+        Self {
+            engine,
+            rx,
+            pass_tx,
+            fail_tx,
+            cfg_rx,
+        }
+    }
+
+    /// Spawn processor & metrics tasks.
+    pub fn spawn(mut self) -> task::JoinHandle<()> {
+        task::spawn(async move {
+            // Metrics flush loop (every 5s)
+            let mut flush_tick = time::interval(Duration::from_secs(5));
+            let mut cfg_rx = self.cfg_rx.clone();
+
+            loop {
+                select! {
+                    biased;
+                    _ = cfg_rx.changed() => {
+                        if let Ok(cfg) = cfg_rx.borrow_and_update().clone() {
+                            // Hot-swap toxicity threshold check
+                            self.reload_config(&cfg);
+                        }
+                    }
+                    _ = flush_tick.tick() => {
+                        metrics::gauge!("validator_active_checks", self.engine.checks.read().len() as f64);
+                    }
+                    maybe_rec = self.rx.recv() => {
+                        let rec = match maybe_rec {
+                            Some(r) => r,
+                            None => break, // upstream closed
+                        };
+                        self.handle_record(rec).await;
+                    }
+                }
+            }
+        })
+    }
+
+    fn reload_config(&self, cfg: &EngineConfig) {
+        let new_checks: Vec<Arc<dyn DataQualityCheck>> = vec![
+            Arc::new(SchemaCheck),
+            Arc::new(LanguageCheck),
+            Arc::new(ToxicityThresholdCheck::new(cfg.toxicity_threshold)),
+        ];
+        self.engine.swap_checks(new_checks);
+        tracing::info!("Quality engine re-configured: {:?}", cfg);
+    }
+
+    async fn handle_record(&self, rec: SocialRecord) {
+        let (passed, failed) = self.engine.validate_batch(std::slice::from_ref(&rec));
+        if !passed.is_empty() {
+            // Safe unwrap: slice size is 1
+            let _ = self.pass_tx.send(passed.into_iter().next().unwrap()).await;
+            metrics::increment_counter!("records_valid");
+        } else if let Some((bad_rec, errs)) = failed.into_iter().next() {
+            let _ = self.fail_tx.send((bad_rec, errs)).await;
+            metrics::increment_counter!("records_invalid");
+        }
+    }
+}
+
+/* ---------------------------------- helpers ---------------------------------- */
+
+/// Rayon helper: splits `Result<Left, Right>` into two vecs.
+trait PartitionResult<L, R> {
+    fn partition_result(self) -> (Vec<L>, Vec<R>);
+}
+
+impl<L, R, Iter> PartitionResult<L, R> for Iter
+where
+    Iter: IntoIterator<Item = either::Either<L, R>>,
+{
+    fn partition_result(self) -> (Vec<L>, Vec<R>) {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for item in self {
+            match item {
+                either::Either::Left(l) => left.push(l),
+                either::Either::Right(r) => right.push(r),
+            }
+        }
+        (left, right)
+    }
+}
+
+use either::{Either::Left, Either::Right};
+
+/* --------------------------------- unit tests -------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn engine_validates_records() {
+        let engine = DataQualityEngine::default();
+
+        let good = SocialRecord {
+            id: "1".into(),
+            text: "hello world".into(),
+            lang: Some("en".into()),
+            timestamp: SystemTime::now(),
+            toxicity_score: Some(0.1),
+        };
+        let bad_lang = SocialRecord { lang: Some("long".into()), ..good.clone() };
+        let bad_tox = SocialRecord { toxicity_score: Some(0.99), ..good.clone() };
+        let records = vec![good.clone(), bad_lang.clone(), bad_tox.clone()];
+
+        let (passes, fails) = engine.validate_batch(&records);
+        assert_eq!(passes, vec![good]);
+        assert_eq!(fails.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_validator_passes_through() {
+        let (in_tx, in_rx) = mpsc::channel(4);
+        let (pass_tx, mut pass_rx) = mpsc::channel(4);
+        let (fail_tx, mut fail_rx) = mpsc::channel(4);
+        let (cfg_tx, cfg_rx) = watch::channel(EngineConfig::default());
+
+        let validator = StreamValidator::new(
+            DataQualityEngine::default(),
+            in_rx,
+            pass_tx,
+            fail_tx,
+            cfg_rx,
+        );
+        let _handle = validator.spawn();
+
+        let good = SocialRecord {
+            id: "99".into(),
+            text: "hello".into(),
+            lang: Some("fr".into()),
+            timestamp: SystemTime::now(),
+            toxicity_score: None,
+        };
+        in_tx.send(good.clone()).await.unwrap();
+
+        let received = pass_rx.recv().await.unwrap();
+        assert_eq!(received.id, good.id);
+
+        cfg_tx.send_modify(|cfg| cfg.toxicity_threshold = 0.0);
+        // Now anything with toxicity > 0 should fail
+        let bad = SocialRecord { toxicity_score: Some(0.5), ..good.clone() };
+        in_tx.send(bad.clone()).await.unwrap();
+
+        let (_bad_rec, errs) = fail_rx.recv().await.unwrap();
+        assert!(matches!(errs[0], QualityError::ToxicityExceeded { .. }));
+    }
+}
+```

@@ -1,0 +1,392 @@
+```csharp
+// -----------------------------------------------------------------------------
+//  FILE:    src/module_12.txt   (C# source code file)
+//
+//  NOTE:    Extension “.txt” is intentional—files are stitched together by an
+//           internal build-tool that renames/compiles them.  Treat as .cs.
+// -----------------------------------------------------------------------------
+//
+//  Description
+//  ===========
+//  TransformationCoordinator is part of PulseOps Warehouse’s pluggable
+//  transformation layer.  It wires together the Strategy-Pattern implementation
+//  so that new data-sources can be onboarded by simply dropping a new
+//  IDataTransformationStrategy implementation into the DI container.
+//
+//  The coordinator fan-outs events coming from a Kinesis or SQS trigger, routes
+//  them to the correct transformation strategy, records structured metrics, and
+//  handles faults with circuit-breaker semantics.
+//
+// -----------------------------------------------------------------------------
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformations
+{
+    #region Public Contracts ──────────────────────────────────────────────────
+
+    /// <summary>
+    ///     A canonical event representation flowing through the transformation
+    ///     pipeline.  Keeps only the information required for choosing and
+    ///     performing a transformation.
+    /// </summary>
+    public sealed record StreamEvent(
+        string StreamType,
+        JsonElement Payload,
+        DateTimeOffset Timestamp
+    );
+
+    /// <summary>
+    ///     Transformations convert raw <see cref="StreamEvent"/> instances into
+    ///     domain-level warehouse records (e.g., Parquet rows, Fact tables).
+    /// </summary>
+    /// <typeparam name="TOut">Final representation (e.g., POCO, Avro object).</typeparam>
+    public interface IDataTransformationStrategy<out TOut>
+    {
+        /// <summary>
+        ///     Performs asynchronous transformation with cancellation support.
+        /// </summary>
+        ValueTask<TOut> TransformAsync(StreamEvent @event, CancellationToken token);
+    }
+
+    /// <summary>
+    ///     Allows lookup of strategies by stream identifier.
+    /// </summary>
+    public interface IStrategyRegistry
+    {
+        bool TryResolve<TOut>(
+            string streamType,
+            [NotNullWhen(true)] out IDataTransformationStrategy<TOut>? strategy);
+    }
+
+    /// <summary>
+    ///     Minimal contract for pushing custom metrics into CloudWatch/Prometheus.
+    /// </summary>
+    public interface IMetricsRecorder
+    {
+        void Increment(string metricName, IReadOnlyDictionary<string, string>? dimensions = null);
+        void Timing(string metricName, TimeSpan elapsed, IReadOnlyDictionary<string, string>? dimensions = null);
+    }
+
+    #endregion
+
+    #region Exceptions ────────────────────────────────────────────────────────
+
+    /// <summary>
+    ///     Indicates a transformation failure that should be routed to DLQ.
+    /// </summary>
+    public sealed class DataTransformationException : Exception
+    {
+        public DataTransformationException(string message, Exception? inner) : base(message, inner) { }
+    }
+
+    /// <summary>
+    ///     Thrown when an unknown stream type is encountered.
+    /// </summary>
+    public sealed class StrategyNotFoundException : Exception
+    {
+        public StrategyNotFoundException(string streamType)
+            : base($"No transformation strategy registered for streamType = '{streamType}'") { }
+    }
+
+    #endregion
+
+    #region Coordinator ───────────────────────────────────────────────────────
+
+    /// <summary>
+    ///     Central router that fan-outs incoming events to the appropriate
+    ///     <see cref="IDataTransformationStrategy{TOut}" />.  Handles parallel
+    ///     execution, observability, retries, and error surfacing.
+    /// </summary>
+    public sealed class TransformationCoordinator
+    {
+        private readonly IStrategyRegistry _registry;
+        private readonly ILogger<TransformationCoordinator> _logger;
+        private readonly IMetricsRecorder _metrics;
+        private readonly int _maxConcurrency;
+
+        public TransformationCoordinator(
+            IStrategyRegistry registry,
+            ILogger<TransformationCoordinator> logger,
+            IMetricsRecorder metrics,
+            int maxConcurrency = 8)
+        {
+            _registry = registry ?? throw new ArgumentNullException(nameof(registry));
+            _logger   = logger   ?? throw new ArgumentNullException(nameof(logger));
+            _metrics  = metrics  ?? throw new ArgumentNullException(nameof(metrics));
+            _maxConcurrency = Math.Clamp(maxConcurrency, 1, Environment.ProcessorCount * 2);
+        }
+
+        /// <summary>
+        ///     Processes a batch of <paramref name="events"/> concurrently while
+        ///     respecting <see cref="_maxConcurrency"/>.
+        /// </summary>
+        public async Task HandleBatchAsync(
+            IReadOnlyCollection<StreamEvent> events,
+            CancellationToken token)
+        {
+            if (events is null) throw new ArgumentNullException(nameof(events));
+            if (events.Count == 0) return;
+
+            _logger.LogDebug("Starting batch transformation for {Count} events.", events.Count);
+
+            // Use a concurrent bag to capture failures for consolidated reporting
+            var failures = new ConcurrentBag<Exception>();
+
+            await Parallel.ForEachAsync(
+                events,
+                new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = _maxConcurrency,
+                    CancellationToken      = token
+                },
+                async (@event, ct) =>
+                {
+                    try
+                    {
+                        await HandleSingleAsync(@event, ct).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        failures.Add(ex);
+                    }
+                }).ConfigureAwait(false);
+
+            if (!failures.IsEmpty)
+            {
+                _logger.LogError("{Count} events failed during transformation.", failures.Count);
+                throw new AggregateException("One or more events failed transformation.", failures);
+            }
+
+            _logger.LogInformation("Batch transformation completed successfully.");
+        }
+
+        private async Task HandleSingleAsync(StreamEvent @event, CancellationToken ct)
+        {
+            var stopwatch = Stopwatch.StartNew();
+
+            if (!_registry.TryResolve<object?>(@event.StreamType, out var strategy))
+            {
+                _metrics.Increment("Transformation.UnknownStreamType", new Dictionary<string, string>
+                {
+                    ["StreamType"] = @event.StreamType
+                });
+
+                _logger.LogWarning(
+                    "Skipping event with unknown StreamType: {StreamType}.",
+                    @event.StreamType);
+
+                throw new StrategyNotFoundException(@event.StreamType);
+            }
+
+            try
+            {
+                var output = await strategy!.TransformAsync(@event, ct).ConfigureAwait(false);
+
+                // Downstream dispatch placeholder (e.g., to Firehose/Glue)
+                _logger.LogTrace(
+                    "Transformed event from {StreamType} into {OutputType}.",
+                    @event.StreamType, output?.GetType().Name ?? "<null>");
+
+                _metrics.Increment("Transformation.Success", new Dictionary<string, string>
+                {
+                    ["StreamType"] = @event.StreamType
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Transformation failed for StreamType = {StreamType}.",
+                    @event.StreamType);
+
+                _metrics.Increment("Transformation.Failure", new Dictionary<string, string>
+                {
+                    ["StreamType"] = @event.StreamType
+                });
+
+                throw new DataTransformationException(
+                    $"Transformation failed for StreamType = {@event.StreamType}", ex);
+            }
+            finally
+            {
+                stopwatch.Stop();
+                _metrics.Timing("Transformation.Latency", stopwatch.Elapsed,
+                    new Dictionary<string, string> { ["StreamType"] = @event.StreamType });
+            }
+        }
+    }
+
+    #endregion
+
+    #region Registry Implementation ───────────────────────────────────────────
+
+    /// <summary>
+    ///     Thread-safe registry that supports hot-swapping strategies via DI.
+    /// </summary>
+    public sealed class StrategyRegistry : IStrategyRegistry
+    {
+        private readonly IReadOnlyDictionary<string, object> _map;
+
+        /// <summary>
+        ///     Instantiates the registry with an immutable map of streamType → strategy.
+        /// </summary>
+        public StrategyRegistry(IEnumerable<(string StreamType, object Strategy)> registrations)
+        {
+            if (registrations is null)
+                throw new ArgumentNullException(nameof(registrations));
+
+            var map = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (streamType, strategy) in registrations)
+            {
+                ArgumentNullException.ThrowIfNull(streamType);
+                ArgumentNullException.ThrowIfNull(strategy);
+
+                map[streamType] = strategy;
+            }
+
+            _map = map;
+        }
+
+        public bool TryResolve<TOut>(
+            string streamType,
+            [NotNullWhen(true)] out IDataTransformationStrategy<TOut>? strategy)
+        {
+            strategy = null;
+
+            if (_map.TryGetValue(streamType, out var obj) &&
+                obj is IDataTransformationStrategy<TOut> typed)
+            {
+                strategy = typed;
+                return true;
+            }
+
+            return false;
+        }
+    }
+
+    #endregion
+
+    #region Example Strategies ────────────────────────────────────────────────
+
+    /// <summary>
+    ///     Sample transformation for stream “calendar.events”.  Converts raw JSON
+    ///     into a strongly-typed <see cref="CalendarFact"/> record.
+    /// </summary>
+    public sealed class CalendarEventTransformationStrategy
+        : IDataTransformationStrategy<CalendarFact>
+    {
+        private readonly ILogger<CalendarEventTransformationStrategy> _logger;
+
+        public CalendarEventTransformationStrategy(
+            ILogger<CalendarEventTransformationStrategy> logger)
+        {
+            _logger = logger;
+        }
+
+        public ValueTask<CalendarFact> TransformAsync(
+            StreamEvent @event,
+            CancellationToken token)
+        {
+            // Artificial processing delay for demonstration
+            token.ThrowIfCancellationRequested();
+
+            CalendarRaw raw = JsonSerializer.Deserialize<CalendarRaw>(
+                @event.Payload.GetRawText())!;
+
+            var fact = new CalendarFact(
+                Id: raw.Id,
+                Organizer: raw.Organizer,
+                StartUtc: raw.StartUtc,
+                EndUtc: raw.EndUtc,
+                AttendeeCount: raw.Attendees.Length,
+                DurationMinutes: (int)(raw.EndUtc - raw.StartUtc).TotalMinutes,
+                ExtractedOnUtc: DateTimeOffset.UtcNow);
+
+            _logger.LogDebug("Computed CalendarFact for event {Id}", fact.Id);
+
+            return ValueTask.FromResult(fact);
+        }
+
+        // DTOs for demonstration only
+        private sealed record CalendarRaw(
+            string Id,
+            string Organizer,
+            DateTimeOffset StartUtc,
+            DateTimeOffset EndUtc,
+            string[] Attendees);
+
+        public sealed record CalendarFact(
+            string Id,
+            string Organizer,
+            DateTimeOffset StartUtc,
+            DateTimeOffset EndUtc,
+            int AttendeeCount,
+            int DurationMinutes,
+            DateTimeOffset ExtractedOnUtc);
+    }
+
+    /// <summary>
+    ///     Demonstrates transformation of CI/CD log events into deployment facts.
+    /// </summary>
+    public sealed class CiLogTransformationStrategy : IDataTransformationStrategy<DeploymentFact>
+    {
+        private readonly ILogger<CiLogTransformationStrategy> _logger;
+
+        public CiLogTransformationStrategy(
+            ILogger<CiLogTransformationStrategy> logger)
+        {
+            _logger = logger;
+        }
+
+        public async ValueTask<DeploymentFact> TransformAsync(
+            StreamEvent @event,
+            CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            // Simulate I/O workload—e.g., fetch commit metadata from GitHub API
+            await Task.Delay(TimeSpan.FromMilliseconds(50), token).ConfigureAwait(false);
+
+            CiLogRaw raw = JsonSerializer.Deserialize<CiLogRaw>(
+                @event.Payload.GetRawText())!;
+
+            var fact = new DeploymentFact(
+                PipelineId: raw.PipelineId,
+                Repo: raw.Repo,
+                CommitSha: raw.CommitSha,
+                Status: raw.Status,
+                LeadTimeSeconds: raw.LeadTimeSec,
+                ProducedOnUtc: DateTimeOffset.UtcNow);
+
+            _logger.LogInformation(
+                "Produced DeploymentFact for pipeline {PipelineId}", fact.PipelineId);
+
+            return fact;
+        }
+
+        private sealed record CiLogRaw(
+            string PipelineId,
+            string Repo,
+            string CommitSha,
+            string Status,
+            int LeadTimeSec);
+
+        public sealed record DeploymentFact(
+            string PipelineId,
+            string Repo,
+            string CommitSha,
+            string Status,
+            int LeadTimeSeconds,
+            DateTimeOffset ProducedOnUtc);
+    }
+
+    #endregion
+}
+```

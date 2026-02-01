@@ -1,0 +1,311 @@
+```c
+/******************************************************************************************
+ *  MercuryMonolith Commerce Hub
+ *  Module: Rate Limiter (src/module_20.c)
+ *
+ *  Description:
+ *      Thread-safe token-bucket rate limiter with per-key quotas, automatic window rollover,
+ *      periodic cleanup of idle buckets, and Prometheus-compatible metrics hooks.
+ *
+ *  Notes:
+ *      – Designed for high-QPS internal use (shared in-process across HTTP and GraphQL
+ *        gateways).  
+ *      – Uses uthash (single header BSD-licensed hash-map implementation).
+ *
+ *  Build flags:
+ *      gcc -std=c11 -O2 -Wall -Wextra -pedantic -pthread -c src/module_20.c
+ ******************************************************************************************/
+#define _POSIX_C_SOURCE 200809L
+
+#include <assert.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+/* -------------------------------------------------------------------------- */
+/* uthash (condensed)                                                         */
+/* -------------------------------------------------------------------------- */
+#define uthash_malloc(sz)          malloc(sz)
+#define uthash_free(ptr,sz)        free(ptr)
+#define uthash_noexpand_fyi(tbl)   /* silent */
+#define uthash_expand_fyi(tbl)     /* silent */
+#define HASH_FUNCTION(keyptr, keylen, hashv)                                   \
+    do {                                                                       \
+        const unsigned _hf_keylen = (unsigned)(keylen);                        \
+        const unsigned char *_hf_key = (const unsigned char *)(keyptr);        \
+        unsigned _hf_i, _hf_hash = 5381U;                                      \
+        for (_hf_i = 0; _hf_i < _hf_keylen; _hf_i++)                           \
+            _hf_hash = (_hf_hash * 33U) ^ _hf_key[_hf_i];                      \
+        (hashv) = _hf_hash;                                                    \
+    } while (0)
+
+#include "uthash.h"  /* Expect this header to be on include path */
+/* -------------------------------------------------------------------------- */
+
+/* -------------------------------------------------------------------------- */
+/* Simple structured logging helpers                                          */
+/* -------------------------------------------------------------------------- */
+typedef enum {
+    LOG_TRACE = 0,
+    LOG_DEBUG,
+    LOG_INFO,
+    LOG_WARN,
+    LOG_ERROR,
+    LOG_FATAL
+} log_level_t;
+
+#ifndef MERCURY_LOG_LEVEL
+#define MERCURY_LOG_LEVEL LOG_INFO
+#endif
+
+static const char *LOG_LEVEL_STR[] = {"TRACE", "DEBUG", "INFO",
+                                      "WARN",  "ERROR", "FATAL"};
+
+static inline void mercury_log(log_level_t lvl, const char *fmt, ...)
+{
+    if (lvl < MERCURY_LOG_LEVEL) return;
+
+    char tsbuf[32];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    gmtime_r(&ts.tv_sec, &tm);
+    strftime(tsbuf, sizeof tsbuf, "%Y-%m-%dT%H:%M:%S", &tm);
+
+    fprintf((lvl >= LOG_ERROR) ? stderr : stdout,
+            "{\"ts\":\"%s.%03ldZ\",\"lvl\":\"%s\",\"msg\":\"",
+            tsbuf, ts.tv_nsec / 1000000L, LOG_LEVEL_STR[lvl]);
+
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf((lvl >= LOG_ERROR) ? stderr : stdout, fmt, ap);
+    va_end(ap);
+
+    fputs("\"}\n", (lvl >= LOG_ERROR) ? stderr : stdout);
+    fflush((lvl >= LOG_ERROR) ? stderr : stdout);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Prometheus metric callbacks stubs                                          */
+/* -------------------------------------------------------------------------- */
+typedef void (*metric_inc_fn)(const char *name, const char *key_label);
+typedef void (*metric_gauge_fn)(const char *name, double value);
+
+static void noop_inc(const char *name, const char *key_label)   { (void)name; (void)key_label; }
+static void noop_gauge(const char *name, double value)          { (void)name; (void)value; }
+
+/* -------------------------------------------------------------------------- */
+/* Rate Limiter                                                               */
+/* -------------------------------------------------------------------------- */
+
+typedef struct {
+    uint32_t                capacity;           /* tokens per window            */
+    uint32_t                refill_amount;      /* tokens to add per window     */
+    uint32_t                window_sec;         /* window length (seconds)      */
+    uint32_t                idle_ttl_sec;       /* remove bucket after ttl      */
+    metric_inc_fn           m_inc;              /* increment counter hook       */
+    metric_gauge_fn         m_gauge;            /* gauge hook                   */
+} rl_config_t;
+
+typedef struct rl_bucket_s {
+    char                    key[64];            /* client identifier            */
+    uint32_t                tokens;             /* remaining tokens             */
+    time_t                  window_start_epoch; /* start of current window      */
+    UT_hash_handle          hh;
+} rl_bucket_t;
+
+typedef struct {
+    rl_config_t             cfg;
+    rl_bucket_t            *buckets;
+    pthread_mutex_t         mtx;
+    pthread_t               reaper_thread;
+    atomic_bool             stop_reaper;
+} rate_limiter_t;
+
+/* --------------------------- internal helpers ---------------------------- */
+
+static void rl_bucket_refill(rl_bucket_t *b, time_t now, const rl_config_t *cfg)
+{
+    /* Determine how many whole windows have passed and refill accordingly */
+    uint32_t elapsed_windows = (uint32_t)((now - b->window_start_epoch) / cfg->window_sec);
+    if (elapsed_windows > 0) {
+        uint64_t new_tokens = (uint64_t)b->tokens +
+                              (uint64_t)elapsed_windows * cfg->refill_amount;
+        if (new_tokens > cfg->capacity) new_tokens = cfg->capacity;
+        b->tokens = (uint32_t)new_tokens;
+        b->window_start_epoch += (time_t)elapsed_windows * cfg->window_sec;
+    }
+}
+
+/* -------------------------- public interface ---------------------------- */
+
+static void *rl_reaper_main(void *arg)
+{
+    rate_limiter_t *rl = arg;
+    const uint32_t sleep_sec = rl->cfg.idle_ttl_sec ? rl->cfg.idle_ttl_sec : 30;
+
+    while (!atomic_load(&rl->stop_reaper)) {
+        sleep(sleep_sec);
+
+        time_t now = time(NULL);
+        pthread_mutex_lock(&rl->mtx);
+        rl_bucket_t *b, *tmp;
+        HASH_ITER(hh, rl->buckets, b, tmp)
+        {
+            if ((now - b->window_start_epoch) > rl->cfg.idle_ttl_sec) {
+                HASH_DEL(rl->buckets, b);
+                mercury_log(LOG_DEBUG, "GC bucket key=%s", b->key);
+                rl->cfg.m_gauge("mercury_rl_buckets", (double)HASH_COUNT(rl->buckets));
+                free(b);
+            }
+        }
+        pthread_mutex_unlock(&rl->mtx);
+    }
+    return NULL;
+}
+
+int rl_init(rate_limiter_t *rl, const rl_config_t *cfg)
+{
+    if (!rl || !cfg) return EINVAL;
+
+    *rl = (rate_limiter_t){
+        .cfg       = *cfg,
+        .buckets   = NULL,
+        .mtx       = PTHREAD_MUTEX_INITIALIZER,
+        .stop_reaper = ATOMIC_VAR_INIT(false)
+    };
+    if (!rl->cfg.m_inc)   rl->cfg.m_inc   = noop_inc;
+    if (!rl->cfg.m_gauge) rl->cfg.m_gauge = noop_gauge;
+
+    /* Spawn background reaper */
+    int rc = pthread_create(&rl->reaper_thread, NULL, rl_reaper_main, rl);
+    if (rc != 0) {
+        mercury_log(LOG_ERROR, "Failed to spawn rate-limiter reaper: %s", strerror(rc));
+        return rc;
+    }
+    return 0;
+}
+
+void rl_destroy(rate_limiter_t *rl)
+{
+    if (!rl) return;
+
+    atomic_store(&rl->stop_reaper, true);
+    pthread_join(rl->reaper_thread, NULL);
+
+    pthread_mutex_lock(&rl->mtx);
+    rl_bucket_t *b, *tmp;
+    HASH_ITER(hh, rl->buckets, b, tmp)
+    {
+        HASH_DEL(rl->buckets, b);
+        free(b);
+    }
+    pthread_mutex_unlock(&rl->mtx);
+    pthread_mutex_destroy(&rl->mtx);
+}
+
+bool rl_allow(rate_limiter_t *rl, const char *key)
+{
+    if (!rl || !key) return false;
+
+    time_t now = time(NULL);
+    bool allowed = false;
+
+    pthread_mutex_lock(&rl->mtx);
+
+    rl_bucket_t *bucket;
+    HASH_FIND_STR(rl->buckets, key, bucket);
+
+    if (!bucket) {
+        bucket = calloc(1, sizeof *bucket);
+        if (!bucket) {
+            mercury_log(LOG_ERROR, "rate limiter OOM");
+            goto out;
+        }
+        strncpy(bucket->key, key, sizeof(bucket->key) - 1);
+        bucket->tokens = rl->cfg.capacity;
+        bucket->window_start_epoch = now;
+        HASH_ADD_STR(rl->buckets, key, bucket);
+        rl->cfg.m_gauge("mercury_rl_buckets", (double)HASH_COUNT(rl->buckets));
+    }
+
+    rl_bucket_refill(bucket, now, &rl->cfg);
+
+    if (bucket->tokens > 0) {
+        bucket->tokens--;
+        allowed = true;
+        rl->cfg.m_inc("mercury_rl_allow_total", key);
+    } else {
+        rl->cfg.m_inc("mercury_rl_deny_total", key);
+    }
+
+out:
+    pthread_mutex_unlock(&rl->mtx);
+    return allowed;
+}
+
+uint32_t rl_remaining(rate_limiter_t *rl, const char *key)
+{
+    if (!rl || !key) return 0;
+
+    time_t now = time(NULL);
+    uint32_t remaining = 0;
+
+    pthread_mutex_lock(&rl->mtx);
+    rl_bucket_t *bucket;
+    HASH_FIND_STR(rl->buckets, key, bucket);
+    if (bucket) {
+        rl_bucket_refill(bucket, now, &rl->cfg);
+        remaining = bucket->tokens;
+    }
+    pthread_mutex_unlock(&rl->mtx);
+    return remaining;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Example usage (unit-test style)                                            */
+/* -------------------------------------------------------------------------- */
+
+#ifdef RATE_LIMITER_SELFTEST
+#include <signal.h>
+
+static volatile bool quit = false;
+static void on_sig(int _) { (void)_; quit = true; }
+
+int main(void)
+{
+    signal(SIGINT, on_sig);
+
+    rl_config_t cfg = {
+        .capacity       = 5,
+        .refill_amount  = 5,
+        .window_sec     = 10,
+        .idle_ttl_sec   = 30
+    };
+    rate_limiter_t rl;
+    if (rl_init(&rl, &cfg) != 0) {
+        fputs("Failed to init rate limiter\n", stderr);
+        return EXIT_FAILURE;
+    }
+
+    const char *client = "client-123";
+
+    while (!quit) {
+        bool ok = rl_allow(&rl, client);
+        printf("[%ld] Request %s (remaining=%u)\n",
+               time(NULL), ok ? "ALLOWED" : "DENIED",
+               rl_remaining(&rl, client));
+        sleep(1);
+    }
+
+    rl_destroy(&rl);
+    return EXIT_SUCCESS;
+}
+#endif /* RATE_LIMITER_SELFTEST */
+```

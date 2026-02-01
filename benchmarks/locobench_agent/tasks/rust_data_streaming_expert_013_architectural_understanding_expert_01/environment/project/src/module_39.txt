@@ -1,0 +1,485 @@
+```rust
+//! src/module_39.rs
+//!
+//! Trending-topic detection service with hot-swappable strategies.
+//! This module is part of ChirpPulse’s real-time enrichment tier and
+//! demonstrates how an analysis component can be replaced at runtime
+//! without bringing the pipeline down.
+//!
+//! Key capabilities:
+//!   * Processes the high-volume “enriched_events” Kafka topic.
+//!   * Maintains an in-memory trending calculation (`TrendingStrategy`).
+//!   * Listens to the “analysis_config” topic for live strategy updates.
+//!   * Flushes trending topics every `flush_interval` seconds.
+//!
+//! The default strategy is `RollingCountStrategy`, performing a sliding
+//! hashtag frequency count. New strategies can be introduced by
+//! implementing the `TrendingStrategy` trait and publishing a JSON
+//! config message on the control topic.
+//
+//  ──────────────────────────────────────────────────────────────────────
+//  Example config message published to the `analysis_config` topic:
+//
+//  {
+//      "strategy": "rolling_count",
+//      "window_secs": 300,
+//      "min_count": 25
+//  }
+//
+//  To add a bespoke algorithm, embed the fully qualified Rust type in
+//  the `"strategy"` field and ensure the type is available at runtime
+//  (either statically linked or via a plugin mechanism).
+//  ──────────────────────────────────────────────────────────────────────
+
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
+
+use chrono::{DateTime, Utc};
+use log::{debug, error, info, warn};
+use rdkafka::{
+    config::ClientConfig,
+    consumer::{Consumer, StreamConsumer},
+    message::BorrowedMessage,
+    util::Timeout,
+};
+use serde::Deserialize;
+use tokio::{
+    select,
+    signal::ctrl_c,
+    task,
+    time::{interval_at, Instant as TokioInstant},
+};
+
+/// The Kafka topic from which we ingest enriched social events.
+const TOPIC_EVENTS: &str = "enriched_events";
+
+/// The Kafka topic that carries analysis-level configuration updates.
+const TOPIC_CONFIG: &str = "analysis_config";
+
+/// How often (in seconds) we publish the calculated trending topics.
+const TREND_FLUSH_INTERVAL_SECS: u64 = 15;
+
+// ───────────────────────────────────────────────────────────── Traits ─
+
+/// A unit of data delivered by the upstream enrichment pipeline.
+///
+/// Only the fields relevant for trending detection are kept; the full
+/// upstream struct is much larger.
+#[derive(Debug, Clone, Deserialize)]
+struct EnrichedEvent {
+    id: String,
+    created_at: DateTime<Utc>,
+    hashtags: Vec<String>,
+    /// Language code (ISO-639-1).
+    lang: Option<String>,
+    /// Average sentiment in range [-1.0, 1.0].
+    sentiment: Option<f32>,
+}
+
+/// Represents the result of a trending calculation.
+#[derive(Debug)]
+pub struct Trend {
+    /// Trending tag (without the leading ‘#’).
+    pub tag: String,
+    /// Absolute occurrence count inside the measurement window.
+    pub count: u32,
+}
+
+/// A pluggable algorithm that extracts trending topics from the event
+/// stream. Implementations MUST be thread-safe.
+pub trait TrendingStrategy: Send + Sync + 'static {
+    /// Feed one event into the strategy. Implementations must be
+    /// lightweight because they execute on the hot path.
+    fn update(&mut self, ev: &EnrichedEvent);
+
+    /// Consumes internal buffers and returns the top-N trending tags.
+    /// Implementations are allowed to reset their state.
+    fn flush(&mut self) -> Vec<Trend>;
+
+    /// Human-readable identifier (used for logging/metrics).
+    fn name(&self) -> &str;
+}
+
+// ─────────────────────────────────────────── Default implementation ─
+
+/// How many trending results to return on every `flush`.
+const DEFAULT_TOP_N: usize = 10;
+
+/// RollingCountStrategy parameters derived from a JSON config message.
+#[derive(Debug, Deserialize, Clone)]
+struct RollingCountConfig {
+    /// Sliding window size in seconds.
+    #[serde(default = "RollingCountConfig::default_window")]
+    window_secs: u64,
+    /// Only return tags that have at least `min_count` occurrences.
+    #[serde(default = "RollingCountConfig::default_min_count")]
+    min_count: u32,
+    /// Number of results to produce.
+    #[serde(default = "RollingCountConfig::default_top_n")]
+    top_n: usize,
+}
+
+impl RollingCountConfig {
+    fn default_window() -> u64 {
+        300
+    }
+    fn default_min_count() -> u32 {
+        10
+    }
+    fn default_top_n() -> usize {
+        DEFAULT_TOP_N
+    }
+}
+
+impl Default for RollingCountConfig {
+    fn default() -> Self {
+        Self {
+            window_secs: Self::default_window(),
+            min_count: Self::default_min_count(),
+            top_n: Self::default_top_n(),
+        }
+    }
+}
+
+/// Maintains a sliding window of the last `window_secs` seconds,
+/// counting occurrences of each hashtag. Implementation optimises for
+/// low per-event overhead using a bucketed queue.
+pub struct RollingCountStrategy {
+    cfg: RollingCountConfig,
+    buckets: VecDeque<HashMap<String, u32>>,
+    bucket_span_secs: u64,
+    bucket_start: Instant,
+}
+
+impl RollingCountStrategy {
+    pub fn new(cfg: RollingCountConfig) -> Self {
+        // Divide the window into 1-second sub-buckets for fast evictions.
+        let bucket_span_secs = 1;
+        let bucket_cnt = cfg.window_secs / bucket_span_secs;
+        let mut buckets = VecDeque::with_capacity(bucket_cnt as usize);
+        for _ in 0..bucket_cnt {
+            buckets.push_back(HashMap::new());
+        }
+
+        Self {
+            cfg,
+            buckets,
+            bucket_span_secs,
+            bucket_start: Instant::now(),
+        }
+    }
+
+    /// Advance the sliding window by removing buckets that are outside
+    /// the configured time range.
+    fn rotate_buckets(&mut self) {
+        let elapsed_secs = self.bucket_start.elapsed().as_secs();
+        if elapsed_secs < self.bucket_span_secs {
+            return;
+        }
+
+        let rotations = elapsed_secs / self.bucket_span_secs;
+        for _ in 0..rotations {
+            self.buckets.pop_front();
+            self.buckets.push_back(HashMap::new());
+            self.bucket_start += Duration::from_secs(self.bucket_span_secs);
+        }
+    }
+}
+
+impl TrendingStrategy for RollingCountStrategy {
+    fn update(&mut self, ev: &EnrichedEvent) {
+        self.rotate_buckets();
+
+        // Filter empty hashtags to avoid wasting memory.
+        for raw in &ev.hashtags {
+            // hashtags include the leading '#'; strip it.
+            let tag = raw.trim_start_matches('#').to_ascii_lowercase();
+            if tag.is_empty() {
+                continue;
+            }
+
+            // Insert into the most recent bucket.
+            let current_bucket = self
+                .buckets
+                .back_mut()
+                .expect("buckets must not be empty");
+            *current_bucket.entry(tag).or_insert(0) += 1;
+        }
+    }
+
+    fn flush(&mut self) -> Vec<Trend> {
+        self.rotate_buckets();
+
+        // Merge counts from all buckets.
+        let mut aggregate: HashMap<String, u32> = HashMap::with_capacity(1024);
+        for bucket in &self.buckets {
+            for (tag, cnt) in bucket {
+                *aggregate.entry(tag.clone()).or_insert(0) += cnt;
+            }
+        }
+
+        // Filter by min_count and take top-N.
+        let mut trends: Vec<Trend> = aggregate
+            .into_iter()
+            .filter(|(_, cnt)| *cnt as u32 >= self.cfg.min_count)
+            .map(|(tag, cnt)| Trend { tag, count: cnt })
+            .collect();
+
+        trends.sort_by(|a, b| b.count.cmp(&a.count));
+        trends.truncate(self.cfg.top_n);
+        trends
+    }
+
+    fn name(&self) -> &str {
+        "rolling_count"
+    }
+}
+
+// ─────────────────────────────────────────────────── Strategy manager ─
+
+/// Thread-safe wrapper enabling live strategy replacement.
+#[derive(Clone)]
+pub struct StrategyManager {
+    inner: Arc<RwLock<Box<dyn TrendingStrategy>>>,
+}
+
+impl StrategyManager {
+    pub fn new(default_strategy: Box<dyn TrendingStrategy>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(default_strategy)),
+        }
+    }
+
+    /// Provides mutable access to the current strategy.
+    pub fn with_strategy<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Box<dyn TrendingStrategy>) -> R,
+    {
+        let mut guard = self
+            .inner
+            .write()
+            .expect("Lock poisoned: other thread panicked");
+        f(&mut guard)
+    }
+
+    /// Replace the underlying implementation at runtime.
+    pub fn swap(&self, new_strategy: Box<dyn TrendingStrategy>) {
+        {
+            let mut guard = self
+                .inner
+                .write()
+                .expect("Lock poisoned: other thread panicked");
+            *guard = new_strategy;
+        }
+        info!("Trending strategy swapped successfully");
+    }
+}
+
+// ─────────────────────────────────────────────── Kafka helpers/util ──
+
+/// Deserialize a Kafka message payload as JSON.
+fn deserialize_message<'a, T: Deserialize<'a>>(msg: &'a BorrowedMessage<'a>) -> anyhow::Result<T> {
+    let payload = msg
+        .payload_view::<str>()
+        .ok_or_else(|| anyhow::anyhow!("Empty payload"))?
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    let parsed: T = serde_json::from_str(payload)?;
+    Ok(parsed)
+}
+
+/// Build a configurable Kafka consumer for a given group id.
+fn build_consumer(group_id: &str, brokers: &str) -> anyhow::Result<StreamConsumer> {
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("group.id", group_id)
+        .set("bootstrap.servers", brokers)
+        .set("enable.auto.commit", "false")
+        .set("max.poll.interval.ms", "600000")
+        .set("auto.offset.reset", "earliest")
+        .create()?;
+
+    Ok(consumer)
+}
+
+// ───────────────────────────────────────────── Runner entry point ────
+
+/// Spawn the trending service. This is typically invoked by .
+pub async fn run(brokers: &str) -> anyhow::Result<()> {
+    // 1. Build the strategy manager with defaults.
+    let default_strategy = Box::new(RollingCountStrategy::new(Default::default()));
+    info!(
+        "Starting trending service with default strategy `{}`",
+        default_strategy.name()
+    );
+    let strategy_manager = StrategyManager::new(default_strategy);
+
+    // 2. Build event and config consumers (we use separate group ids).
+    let events_consumer =
+        build_consumer("trending_events_consumer", brokers).expect("Failed to create consumer");
+    events_consumer.subscribe(&[TOPIC_EVENTS])?;
+
+    let cfg_consumer =
+        build_consumer("trending_cfg_consumer", brokers).expect("Failed to create consumer");
+    cfg_consumer.subscribe(&[TOPIC_CONFIG])?;
+
+    // 3. Spawn independent tasks for config updates and event processing.
+    let cfg_task = {
+        let sm = strategy_manager.clone();
+        task::spawn(async move {
+            loop {
+                match cfg_consumer.recv().await {
+                    Err(e) => {
+                        warn!("Config consumer error: {e}");
+                        continue;
+                    }
+                    Ok(msg) => {
+                        if let Err(e) = handle_cfg_message(&sm, &msg) {
+                            error!("Failed to apply config: {e}");
+                        }
+                        // Manual offset commit.
+                        cfg_consumer
+                            .commit_message(&msg, rdkafka::consumer::CommitMode::Async)
+                            .unwrap_or_else(|e| error!("Commit failed: {e}"));
+                    }
+                }
+            }
+        })
+    };
+
+    let events_task = {
+        let sm = strategy_manager.clone();
+        task::spawn(async move {
+            loop {
+                match events_consumer.recv().await {
+                    Err(e) => {
+                        warn!("Event consumer error: {e}");
+                        continue;
+                    }
+                    Ok(msg) => {
+                        if let Err(e) = handle_event_message(&sm, &msg) {
+                            error!("Event processing failed: {e}");
+                        }
+                        // Manual offset commit.
+                        events_consumer
+                            .commit_message(&msg, rdkafka::consumer::CommitMode::Async)
+                            .unwrap_or_else(|e| error!("Commit failed: {e}"));
+                    }
+                }
+            }
+        })
+    };
+
+    // 4. Periodic flush task.
+    let flush_task = {
+        let sm = strategy_manager.clone();
+        task::spawn(async move {
+            let start = TokioInstant::now()
+                + Duration::from_secs(TREND_FLUSH_INTERVAL_SECS);
+            let mut ticker = interval_at(start, Duration::from_secs(TREND_FLUSH_INTERVAL_SECS));
+
+            loop {
+                ticker.tick().await;
+                let trends = sm.with_strategy(|s| s.flush());
+                if trends.is_empty() {
+                    debug!("No trending topics detected in this window");
+                    continue;
+                }
+
+                info!("Top trending topics: {:?}", trends);
+                // TODO: Publish to an output Kafka topic or a metrics system.
+            }
+        })
+    };
+
+    // 5. Wait for ctrl-c signal.
+    select! {
+        _ = ctrl_c() => {
+            info!("Termination signal received. Shutting down trending service.");
+        }
+    }
+
+    // 6. Ensure background tasks stop gracefully.
+    cfg_task.abort();
+    events_task.abort();
+    flush_task.abort();
+
+    Ok(())
+}
+
+/// Handle a normal “enriched event” Kafka message.
+fn handle_event_message(
+    manager: &StrategyManager,
+    msg: &BorrowedMessage<'_>,
+) -> anyhow::Result<()> {
+    let ev: EnrichedEvent = deserialize_message(msg)?;
+    manager.with_strategy(|s| s.update(&ev));
+    Ok(())
+}
+
+/// Handle a configuration update Kafka message.
+fn handle_cfg_message(
+    manager: &StrategyManager,
+    msg: &BorrowedMessage<'_>,
+) -> anyhow::Result<()> {
+    #[derive(Deserialize)]
+    struct CfgEnvelope {
+        strategy: String,
+        #[serde(flatten)]
+        extra: serde_json::Value,
+    }
+
+    let cfg: CfgEnvelope = deserialize_message(msg)?;
+    match cfg.strategy.as_str() {
+        "rolling_count" => {
+            let params: RollingCountConfig = serde_json::from_value(cfg.extra)?;
+            info!("Applying RollingCountStrategy config: {:?}", params);
+            manager.swap(Box::new(RollingCountStrategy::new(params)));
+        }
+        other => {
+            warn!("Unknown strategy `{other}` – ignoring");
+        }
+    }
+    Ok(())
+}
+
+// ──────────────────────────────────────────────── Unit-tests ────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn basic_rolling_count() {
+        let cfg = RollingCountConfig {
+            window_secs: 10,
+            min_count: 1,
+            top_n: 3,
+        };
+        let mut strat = RollingCountStrategy::new(cfg);
+        let now = Utc::now();
+
+        let mut build_ev = |tag: &str| EnrichedEvent {
+            id: "id".into(),
+            created_at: now,
+            hashtags: vec![format!("#{tag}")],
+            lang: None,
+            sentiment: None,
+        };
+
+        for _ in 0..5 {
+            strat.update(&build_ev("rustlang"));
+        }
+
+        for _ in 0..2 {
+            strat.update(&build_ev("opensource"));
+        }
+
+        let trends = strat.flush();
+        assert_eq!(trends[0].tag, "rustlang");
+        assert_eq!(trends[0].count, 5);
+    }
+}
+```

@@ -1,0 +1,371 @@
+```rust
+//! src/module_49.txt
+//! ------------------------------------------------------------
+//! Model-Monitoring & Auto-Retraining sub-system for the
+//! VisuTility Orchestrator (ml_computer_vision)
+//!
+//! This module implements a minimal yet production-oriented slice of the
+//! Observer + Strategy patterns to detect model-drift in real-time KPI
+//! streams and automatically enqueue a retraining job in the background.
+//!
+//! High-level flow
+//! 1. Real-time metrics from Serving-Ops (`fps`, `latency`, `accuracy`, …)
+//!    are converted into `MetricEvent`s and published to an `EventBus`.
+//! 2. Multiple `AsyncObserver`s can subscribe to the bus.  The
+//!    `DriftMonitor` is one such observer that accumulates a rolling window
+//!    of metrics.  If KPI degradation is detected, it builds a
+//!    `RetrainingRequest` and forwards it to a `RetrainingOrchestrator`.
+//! 3. The orchestrator selects an appropriate `RetrainingStrategy` (Grid,
+//!    Bayes, Population-Based, …) via a Factory/Strategy pattern and
+//!    delegates the heavy work to Model-Ops.
+//!
+//! NOTE: The surrounding infrastructure (e.g. actual trainer back-end,
+//! message-queues, persistent storage) is mocked / abstracted by traits.  In
+//! an integration setting these would be provided by sibling crates.
+//!
+//! ------------------------------------------------------------
+
+#![allow(dead_code)]
+#![allow(clippy::missing_errors_doc)]
+
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use rand::{distributions::Uniform, Rng};
+use thiserror::Error;
+use tokio::sync::{broadcast, RwLock};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Unique identifier of a model inside the internal registry.
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub struct ModelId {
+    pub project: String,
+    pub name:    String,
+    pub version: String,
+}
+
+/// Core KPI measurements reported by the Serving-Ops layer.
+///
+/// In a real system this would be far more exhaustive and dependent on the
+/// task type (classification / detection / segmentation / …), but we keep it
+/// concise here for clarity.
+#[derive(Debug, Clone)]
+pub struct PerformanceMetrics {
+    pub accuracy:     f32,
+    pub precision:    f32,
+    pub recall:       f32,
+    pub latency_ms:   f32,
+    pub processed_fps: f32,
+    pub timestamp:    DateTime<Utc>,
+}
+
+/// Event wrapper used by the Observers.
+#[derive(Debug, Clone)]
+pub struct MetricEvent {
+    pub model_id: ModelId,
+    pub metrics:  PerformanceMetrics,
+}
+
+/// Error type shared by all observers.
+#[derive(Debug, Error)]
+pub enum ObserverError {
+    #[error("channel closed")]
+    ChannelClosed,
+    #[error("internal failure: {0}")]
+    Internal(String),
+}
+
+/// Asynchronous Observer trait (publish/subscribe).
+#[async_trait]
+pub trait AsyncObserver<E>: Send + Sync + 'static {
+    async fn on_event(&self, event: &E) -> Result<(), ObserverError>;
+}
+
+/// Simple async publish/subscribe bus with fan-out semantics.
+#[derive(Clone)]
+pub struct EventBus<E> {
+    tx: broadcast::Sender<Arc<E>>,
+}
+
+impl<E: Clone + Send + Sync + 'static> EventBus<E> {
+    pub fn new(buffer: usize) -> Self {
+        let (tx, _rx) = broadcast::channel(buffer);
+        Self { tx }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<E>> {
+        self.tx.subscribe()
+    }
+
+    pub fn publish(&self, event: E) -> Result<(), ObserverError> {
+        self.tx
+            .send(Arc::new(event))
+            .map_err(|_| ObserverError::ChannelClosed)?;
+        Ok(())
+    }
+}
+
+/// Number of past windows that have to fail consecutively before
+/// a drift is declared and retraining kicked-off.
+const CONSECUTIVE_FAILURE_THRESHOLD: u8 = 3;
+
+/// Drift detection monitor.  Subscribes to performance events and
+/// checks rolling averages against configured KPI budgets.
+pub struct DriftMonitor {
+    window_size: usize,
+    accuracy_budget: f32,
+    latency_budget_ms: f32,
+    backoff: Duration,
+    recent_accuracy: RwLock<VecDeque<f32>>,
+    consecutive_failures: RwLock<u8>,
+    last_alert: RwLock<Instant>,
+
+    orchestrator: Arc<dyn RetrainingOrchestrator>,
+}
+
+impl DriftMonitor {
+    pub fn new(
+        window_size: usize,
+        accuracy_budget: f32,
+        latency_budget_ms: f32,
+        backoff: Duration,
+        orchestrator: Arc<dyn RetrainingOrchestrator>,
+    ) -> Self {
+        Self {
+            window_size,
+            accuracy_budget,
+            latency_budget_ms,
+            backoff,
+            recent_accuracy: RwLock::new(VecDeque::with_capacity(window_size)),
+            consecutive_failures: RwLock::new(0),
+            last_alert: RwLock::new(Instant::now() - backoff),
+            orchestrator,
+        }
+    }
+
+    async fn push_metric(&self, acc: f32) {
+        let mut guard = self.recent_accuracy.write().await;
+        if guard.len() == self.window_size {
+            guard.pop_front();
+        }
+        guard.push_back(acc);
+    }
+
+    async fn mean_accuracy(&self) -> Option<f32> {
+        let guard = self.recent_accuracy.read().await;
+        if guard.is_empty() {
+            None
+        } else {
+            Some(guard.iter().sum::<f32>() / guard.len() as f32)
+        }
+    }
+
+    /// Business logic to decide whether we should trigger retraining.
+    #[instrument(skip(self))]
+    async fn evaluate(&self, event: &MetricEvent) -> Result<(), ObserverError> {
+        self.push_metric(event.metrics.accuracy).await;
+        let mean = self.mean_accuracy().await.unwrap_or(event.metrics.accuracy);
+        let drifting =
+            mean < self.accuracy_budget || event.metrics.latency_ms > self.latency_budget_ms;
+
+        if drifting {
+            let mut failures = self.consecutive_failures.write().await;
+            *failures += 1;
+            warn!(
+                model = ?event.model_id,
+                mean_accuracy = mean,
+                latency = event.metrics.latency_ms,
+                "kpi budget violated ({} / {}). failure count={}",
+                self.accuracy_budget,
+                self.latency_budget_ms,
+                *failures
+            );
+
+            if *failures >= CONSECUTIVE_FAILURE_THRESHOLD {
+                let last = *self.last_alert.read().await;
+                if last.elapsed() >= self.backoff {
+                    self.consecutive_failures.write().await.clone_from(&0); // reset
+                    *self.last_alert.write().await = Instant::now();
+                    self.orchestrator
+                        .enqueue_retraining(event)
+                        .await
+                        .map_err(|e| ObserverError::Internal(e.to_string()))?;
+                }
+            }
+        } else {
+            // reset failures if KPI is healthy
+            *self.consecutive_failures.write().await = 0;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AsyncObserver<MetricEvent> for DriftMonitor {
+    async fn on_event(&self, event: &MetricEvent) -> Result<(), ObserverError> {
+        self.evaluate(event).await
+    }
+}
+
+/// High level request object used for retraining.
+#[derive(Debug, Clone)]
+pub struct RetrainingRequest {
+    pub model_id:   ModelId,
+    pub created_at: DateTime<Utc>,
+    pub strategy:   StrategyKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum StrategyKind {
+    GridSearch,
+    Bayesian,
+    Pbt, // population-based training
+}
+
+/// Public API for scheduling retraining work.
+///
+/// Internally this could enqueue a job on a distributed task
+/// runner (Ray, Argo, Nomad, etc).  Here we mock it out.
+#[async_trait]
+pub trait RetrainingOrchestrator: Send + Sync {
+    async fn enqueue_retraining(&self, origin: &MetricEvent) -> anyhow::Result<()>;
+}
+
+/// A toy implementation that decides strategy based on random exploration.
+///
+/// In production one would inspect metadata such as training history,
+/// resource cost, previous attempts, or model type to select the strategy.
+pub struct SimpleRetrainingOrchestrator {
+    queue: RwLock<Vec<RetrainingRequest>>,
+}
+
+impl SimpleRetrainingOrchestrator {
+    pub fn new() -> Self {
+        Self {
+            queue: RwLock::new(Vec::new()),
+        }
+    }
+
+    fn pick_strategy() -> StrategyKind {
+        let dist = Uniform::new(0, 3);
+        match rand::thread_rng().sample(dist) {
+            0 => StrategyKind::GridSearch,
+            1 => StrategyKind::Bayesian,
+            _ => StrategyKind::Pbt,
+        }
+    }
+
+    async fn dispatch_job(&self, req: &RetrainingRequest) {
+        // In real life we would push to a message bus / workflow engine.
+        info!(
+            ?req,
+            "dispatching retraining job (mock impl; replace with actual backend)"
+        );
+        // Simulate delay
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[async_trait]
+impl RetrainingOrchestrator for SimpleRetrainingOrchestrator {
+    #[instrument(skip(self, origin))]
+    async fn enqueue_retraining(&self, origin: &MetricEvent) -> anyhow::Result<()> {
+        let request = RetrainingRequest {
+            model_id: origin.model_id.clone(),
+            created_at: Utc::now(),
+            strategy: Self::pick_strategy(),
+        };
+
+        // Persist–first semantics
+        {
+            let mut guard = self.queue.write().await;
+            guard.push(request.clone());
+        }
+
+        self.dispatch_job(&request).await;
+        Ok(())
+    }
+}
+
+/// ------------------------------
+/// Unit tests
+/// ------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    fn init_tracing() {
+        let _ = fmt()
+            .with_env_filter(EnvFilter::new("debug"))
+            .try_init();
+    }
+
+    fn mock_event(accuracy: f32, latency: f32) -> MetricEvent {
+        MetricEvent {
+            model_id: ModelId {
+                project: "visutility".into(),
+                name:    "object-detector".into(),
+                version: "v1.2.3".into(),
+            },
+            metrics: PerformanceMetrics {
+                accuracy,
+                precision: accuracy * 0.95,
+                recall: accuracy * 0.96,
+                latency_ms: latency,
+                processed_fps: 30.0,
+                timestamp: Utc::now(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drift_monitor_triggers_retraining() {
+        init_tracing();
+
+        let orchestrator = Arc::new(SimpleRetrainingOrchestrator::new());
+        let monitor = Arc::new(DriftMonitor::new(
+            4,
+            0.80,
+            400.0,
+            Duration::from_secs(1),
+            orchestrator.clone(),
+        ));
+
+        // create event bus and subscribe
+        let bus: EventBus<MetricEvent> = EventBus::new(16);
+        let mut rx = bus.subscribe();
+
+        // spawn monitor subscriber
+        let m = monitor.clone();
+        tokio::spawn(async move {
+            while let Ok(evt) = rx.recv().await {
+                if let Err(e) = m.on_event(&evt).await {
+                    error!("observer error: {}", e);
+                }
+            }
+        });
+
+        // Pump failing events
+        for _ in 0..=CONSECUTIVE_FAILURE_THRESHOLD {
+            bus.publish(mock_event(0.50, 800.0)).unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Wait for job to be queued
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let queued = orchestrator.queue.read().await.len();
+        assert!(
+            queued > 0,
+            "drift monitor should have triggered a retraining request"
+        );
+        debug!("queued jobs = {}", queued);
+    }
+}
+```

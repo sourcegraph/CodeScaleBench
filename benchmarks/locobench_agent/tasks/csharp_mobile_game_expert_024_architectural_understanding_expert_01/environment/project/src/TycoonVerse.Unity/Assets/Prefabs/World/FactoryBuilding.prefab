@@ -1,0 +1,454 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+/// <summary>
+///     Behaviour attached to the FactoryBuilding prefab.  
+///     Handles production queues, capacity management, offline catch-up simulation,
+///     and analytics dispatch in a deterministic, test-friendly manner.
+///     
+///     NOTE:  In the hierarchy this component must live on the root of the prefab so that
+///     the GUID persisted in save-files remains stable across Unity reimports.
+/// </summary>
+/// <remarks>
+///     Because a *.prefab file is an asset rather than code, this script is placed in the same
+///     folder as the prefab so Unity automatically links the component when the prefab is
+///     instantiated at runtime.
+/// </remarks>
+namespace TycoonVerse.World.Buildings
+{
+    #region Domain Models
+
+    /// <summary>
+    ///     Lightweight immutable value object representing an item produced by a factory.
+    /// </summary>
+    [Serializable]
+    public sealed class ManufacturedItem
+    {
+        public string ItemId   { get; }
+        public string Name     { get; }
+        public float  UnitCost { get; }
+
+        public ManufacturedItem(string itemId, string name, float unitCost)
+        {
+            if (string.IsNullOrWhiteSpace(itemId)) throw new ArgumentException("Item ID cannot be null", nameof(itemId));
+            if (string.IsNullOrWhiteSpace(name))   throw new ArgumentException("Name cannot be null",   nameof(name));
+            if (unitCost < 0f)                     throw new ArgumentOutOfRangeException(nameof(unitCost));
+
+            ItemId   = itemId;
+            Name     = name;
+            UnitCost = unitCost;
+        }
+    }
+
+    /// <summary>
+    ///     Queue entry representing a work order currently being processed by the factory.
+    /// </summary>
+    [Serializable]
+    internal sealed class WorkOrder
+    {
+        public ManufacturedItem Item          { get; }
+        public int              Quantity      { get; }
+        public DateTimeOffset   EnqueuedUtc   { get; }
+        public DateTimeOffset   CompletionUtc { get; }
+
+        public WorkOrder(ManufacturedItem item, int quantity, DateTimeOffset enqueuedUtc, DateTimeOffset completionUtc)
+        {
+            Item          = item  ?? throw new ArgumentNullException(nameof(item));
+            if (quantity <= 0)    throw new ArgumentOutOfRangeException(nameof(quantity));
+            if (completionUtc <= enqueuedUtc) throw new ArgumentException("Completion time must be in the future.");
+
+            Quantity      = quantity;
+            EnqueuedUtc   = enqueuedUtc;
+            CompletionUtc = completionUtc;
+        }
+    }
+
+    /// <summary>
+    ///     Report generated whenever production completes.
+    /// </summary>
+    public readonly struct ProductionReport
+    {
+        public string           FactoryId     { get; }
+        public ManufacturedItem Item          { get; }
+        public int              Quantity      { get; }
+        public TimeSpan         Duration      { get; }
+        public DateTimeOffset   CompletedUtc  { get; }
+
+        public ProductionReport(string factoryId, ManufacturedItem item, int quantity, TimeSpan duration, DateTimeOffset completedUtc)
+        {
+            FactoryId    = factoryId;
+            Item         = item;
+            Quantity     = quantity;
+            Duration     = duration;
+            CompletedUtc = completedUtc;
+        }
+    }
+
+    #endregion
+
+    #region Persistence Abstractions
+
+    /// <summary>
+    ///     Interface for a lightweight deterministic persistence layer
+    ///     so offline simulation can be reconstructed loss-free on the client.
+    /// </summary>
+    internal interface IFactoryStateRepository
+    {
+        void SaveState(string factoryId, string serialized);
+        bool TryLoadState(string factoryId, out string serialized);
+        void ClearState(string factoryId);
+    }
+
+    /// <summary>
+    ///     Minimal PlayerPrefs-backed repository used on mobile clients.
+    ///     For larger payloads a SQLite adapter is swapped in via DI (see Installer).
+    /// </summary>
+    internal sealed class PlayerPrefsFactoryStateRepository : IFactoryStateRepository
+    {
+        public void SaveState(string factoryId, string serialized)
+        {
+            PlayerPrefs.SetString(factoryId, serialized);
+            PlayerPrefs.Save();
+        }
+
+        public bool TryLoadState(string factoryId, out string serialized)
+        {
+            if (PlayerPrefs.HasKey(factoryId))
+            {
+                serialized = PlayerPrefs.GetString(factoryId);
+                return true;
+            }
+
+            serialized = null;
+            return false;
+        }
+
+        public void ClearState(string factoryId) => PlayerPrefs.DeleteKey(factoryId);
+    }
+
+    #endregion
+
+    /// <summary>
+    ///     Observable factory behaviour implementing the <c>IObservable&lt;ProductionReport&gt;</c> contract
+    ///     so external systems (analytics, UI, achievements) can subscribe without coupling.
+    /// </summary>
+    [DisallowMultipleComponent]
+    public sealed class FactoryBuilding : MonoBehaviour, IObservable<ProductionReport>
+    {
+        // Serialized configuration parameters
+        [Header("Factory Configuration")]
+        [SerializeField] [Tooltip("Unique identifier used for analytics and persistence")]
+        private string factoryId = Guid.NewGuid().ToString("N");
+
+        [SerializeField] [Tooltip("Maximum simultaneous work orders the factory can handle")]
+        private int concurrentCapacity = 3;
+
+        [SerializeField] [Tooltip("Total inventory slots available for completed products")]
+        private int inventoryCapacity = 100;
+
+        [SerializeField] [Tooltip("Base time (in seconds) to produce a single unit at 100% efficiency")]
+        private float baseSecondsPerUnit = 2.5f;
+
+        // Dependencies
+        private readonly List<IObserver<ProductionReport>> observers = new();
+        private IFactoryStateRepository stateRepository;
+        private IAnalyticsService       analyticsService;
+
+        // Runtime state
+        private readonly Queue<WorkOrder>  queue           = new();
+        private readonly List<WorkOrder>   activeOrders    = new();
+        private readonly List<ProductionReport> inventory  = new();
+        private DateTimeOffset             nowUtc          => DateTimeOffset.UtcNow;
+
+        #region Unity Lifecycle
+
+        private void Awake()
+        {
+            Assert.IsTrue(concurrentCapacity  >  0, "Factory must support at least one concurrent work order");
+            Assert.IsTrue(inventoryCapacity   >= 0, "Inventory capacity cannot be negative");
+            Assert.IsTrue(baseSecondsPerUnit  >  0, "Base seconds per unit must be positive");
+
+            // In a production build the repository/service would be injected via Zenject or the project's preferred DI framework
+            stateRepository  = new PlayerPrefsFactoryStateRepository();
+            analyticsService = Analytics.AnalyticsLocator.Resolve();
+
+            RestoreState();               // Attempt to restore persisted queue & inventory
+            SimulateOfflineProgress();    // Advance production for time spent away
+        }
+
+        private void Update()
+        {
+            ProcessActiveOrders(Time.deltaTime);
+            StartQueuedWorkIfPossible();
+        }
+
+        private void OnApplicationPause(bool pauseStatus)
+        {
+            if (pauseStatus)
+            {
+                PersistState();
+            }
+        }
+
+        private void OnDestroy()
+        {
+            PersistState();
+        }
+
+        #endregion
+
+        #region Public API
+
+        /// <summary>
+        ///     Enqueues production of a given item at the requested quantity.
+        ///     Throws if the queue is full or the quantity is invalid.
+        /// </summary>
+        public void EnqueueProduction(ManufacturedItem item, int quantity)
+        {
+            if (item     == null) throw new ArgumentNullException(nameof(item));
+            if (quantity <= 0)    throw new ArgumentOutOfRangeException(nameof(quantity));
+
+            var seconds  = quantity * baseSecondsPerUnit;
+            var order    = new WorkOrder(
+                item,
+                quantity,
+                enqueuedUtc: nowUtc,
+                completionUtc: nowUtc.AddSeconds(seconds)
+            );
+
+            queue.Enqueue(order);
+            StartQueuedWorkIfPossible();
+        }
+
+        /// <summary>
+        ///     Returns an immutable snapshot of currently stored products.
+        /// </summary>
+        public IReadOnlyCollection<ProductionReport> GetInventory() => inventory.AsReadOnly();
+
+        /// <summary>
+        ///     Clears inventory, e.g. when the player sells or transfers goods.
+        /// </summary>
+        public void ClearInventory() => inventory.Clear();
+
+        #endregion
+
+        #region Internal Processing
+
+        private void StartQueuedWorkIfPossible()
+        {
+            while (activeOrders.Count < concurrentCapacity && queue.TryDequeue(out var order))
+            {
+                activeOrders.Add(order);
+            }
+        }
+
+        private void ProcessActiveOrders(float deltaTime)
+        {
+            if (activeOrders.Count == 0) return;
+
+            var completed = new List<WorkOrder>(activeOrders.Count);
+
+            foreach (var order in activeOrders)
+            {
+                // If the order should have finished by now, mark it for completion
+                if (nowUtc >= order.CompletionUtc)
+                    completed.Add(order);
+            }
+
+            foreach (var finished in completed)
+            {
+                activeOrders.Remove(finished);
+                HandleOrderCompletion(finished);
+            }
+        }
+
+        private void HandleOrderCompletion(WorkOrder order)
+        {
+            // Check inventory capacity
+            if (inventory.Count + order.Quantity > inventoryCapacity)
+            {
+                Debug.LogWarning(
+                    $"Factory '{factoryId}' inventory full. Produced items will be discarded. " +
+                    "Consider increasing 'Inventory Capacity' on the prefab.");
+                return;
+            }
+
+            var duration   = order.CompletionUtc - order.EnqueuedUtc;
+            var report     = new ProductionReport(
+                factoryId,
+                order.Item,
+                order.Quantity,
+                duration,
+                order.CompletionUtc
+            );
+
+            inventory.Add(report);
+            NotifyObservers(report);
+            analyticsService.TrackFactoryProduction(report);
+
+            StartQueuedWorkIfPossible();      // In case there is still work left in queue
+        }
+
+        #endregion
+
+        #region Offline Simulation
+
+        /// <summary>
+        ///     Iteratively processes queued orders as though Update() had been running
+        ///     for the entire offline duration. Deterministic and loop-free due to
+        ///     total ordering of work-orders and monotonic timestamps.
+        /// </summary>
+        private void SimulateOfflineProgress()
+        {
+            if (activeOrders.Count == 0 && queue.Count == 0) return;
+
+            var offlineNow = nowUtc;
+
+            // Complete any active orders if their completion time is in the past
+            var completed = activeOrders
+                .Where(a => offlineNow >= a.CompletionUtc)
+                .ToList();
+
+            foreach (var finished in completed)
+            {
+                activeOrders.Remove(finished);
+                HandleOrderCompletion(finished);
+            }
+
+            // Try to spin up more work given capacity
+            StartQueuedWorkIfPossible();
+
+            // Repeat until no order can complete in the past
+            if (activeOrders.Any(a => offlineNow >= a.CompletionUtc))
+                SimulateOfflineProgress(); // Recursion is bounded by total work-orders
+        }
+
+        #endregion
+
+        #region Observer Pattern
+
+        public IDisposable Subscribe(IObserver<ProductionReport> observer)
+        {
+            if (observer == null) throw new ArgumentNullException(nameof(observer));
+
+            if (!observers.Contains(observer))
+                observers.Add(observer);
+
+            return new Unsubscriber(observers, observer);
+        }
+
+        private void NotifyObservers(ProductionReport report)
+        {
+            foreach (var obs in observers.ToArray()) // Snapshot to avoid allocation during enumeration
+            {
+                obs.OnNext(report);
+            }
+        }
+
+        private sealed class Unsubscriber : IDisposable
+        {
+            private readonly IList<IObserver<ProductionReport>> _observers;
+            private readonly IObserver<ProductionReport>        _observer;
+
+            public Unsubscriber(IList<IObserver<ProductionReport>> observers, IObserver<ProductionReport> observer)
+            {
+                _observers = observers;
+                _observer  = observer;
+            }
+
+            public void Dispose()
+            {
+                if (_observer != null && _observers.Contains(_observer))
+                    _observers.Remove(_observer);
+            }
+        }
+
+        #endregion
+
+        #region Persistence
+
+        private const string SerializationKey = "tycoonverse.factory.state";
+
+        private void PersistState()
+        {
+            var dto = new FactoryStateDto
+            {
+                Queue          = queue.ToArray(),
+                ActiveOrders   = activeOrders.ToArray(),
+                Inventory      = inventory.ToArray()
+            };
+
+            var json = JsonUtility.ToJson(dto);
+            stateRepository.SaveState(GetCompositeKey(), json);
+        }
+
+        private void RestoreState()
+        {
+            if (stateRepository.TryLoadState(GetCompositeKey(), out var json))
+            {
+                var dto = JsonUtility.FromJson<FactoryStateDto>(json);
+                if (dto != null)
+                {
+                    queue.Clear();
+                    activeOrders.Clear();
+                    inventory.Clear();
+
+                    foreach (var q in dto.Queue)        queue.Enqueue(q);
+                    foreach (var a in dto.ActiveOrders) activeOrders.Add(a);
+                    inventory.AddRange(dto.Inventory);
+                }
+            }
+        }
+
+        private string GetCompositeKey() => $"{SerializationKey}.{factoryId}";
+
+        [Serializable]
+        private sealed class FactoryStateDto
+        {
+            public WorkOrder[]        Queue;
+            public WorkOrder[]        ActiveOrders;
+            public ProductionReport[] Inventory;
+        }
+
+        #endregion
+    }
+
+    #region Analytics Infrastructure (Locator Pattern)
+
+    /// <summary>
+    ///     Simplified service interface for analytics.  The real implementation sends
+    ///     data to an analytics SDK (Firebase, Amplitude, etc.) but remains behind an
+    ///     adapter so gameplay code never references vendor APIs directly.
+    /// </summary>
+    internal interface IAnalyticsService
+    {
+        void TrackFactoryProduction(ProductionReport report);
+    }
+
+    /// <summary>
+    ///     Lightweight IoC locator to avoid a hard dependency on a DI container inside Unity's
+    ///     low-level asset scripts.  Higher layers will replace the default no-op implementation
+    ///     at boot.
+    /// </summary>
+    internal static class Analytics
+    {
+        internal static class AnalyticsLocator
+        {
+            private static IAnalyticsService _instance;
+
+            public static IAnalyticsService Resolve() => _instance ??= new NullAnalyticsService();
+
+            public static void Register(IAnalyticsService service) => _instance = service;
+        }
+
+        private sealed class NullAnalyticsService : IAnalyticsService
+        {
+            public void TrackFactoryProduction(ProductionReport report) { /* intentionally no-op */ }
+        }
+    }
+
+    #endregion
+}

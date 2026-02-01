@@ -1,0 +1,357 @@
+```csharp
+// -----------------------------------------------------------------------------
+//  File:        src/module_22.txt   (intentionally kept *.txt for build script)
+//  Project:     PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//  Component:   Calendar-centric KPI transformation Lambda (Strategy Pattern)
+// -----------------------------------------------------------------------------
+//  This Lambda listens to a Kinesis stream containing heterogeneous calendar /
+//  meeting telemetry.  Each record has a "metricType" attribute that tells the
+//  engine what KPI should be derived from the raw payload.  A pluggable
+//  strategy registry allows new KPIs to be introduced without redeployment;
+//  they simply get loaded from DI (reflection or external assembly).
+// -----------------------------------------------------------------------------
+
+#pragma warning disable CA2007 // Consider calling ConfigureAwait on the awaited task
+
+using System;
+using System.Buffers.Text;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon;
+using Amazon.Lambda.Core;
+using Amazon.Lambda.KinesisEvents;
+using Amazon.Runtime;
+using Amazon.S3;
+using Amazon.S3.Model;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+
+// Assembly attribute to enable the Lambda function's JSON input to be converted
+// into a .NET class.
+[assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
+
+namespace PulseOps.Warehouse.CalendarMetrics
+{
+    #region Lambda Entrypoint
+
+    public sealed class CalendarMetricLambda
+    {
+        private static readonly Lazy<ServiceProvider> _serviceProvider = new(
+            BuildServiceProvider, LazyThreadSafetyMode.ExecutionAndPublication);
+
+        private static ServiceProvider BuildServiceProvider()
+        {
+            var services = new ServiceCollection();
+
+            // Logging
+            services.AddLogging(cfg => cfg.AddLambdaLogger());
+
+            // AWS clients
+            services.AddDefaultAWSOptions(new Amazon.Extensions.NETCore.Setup.AWSOptions
+            {
+                Region = RegionEndpoint.USEast1
+            });
+            services.AddAWSService<IAmazonS3>();
+
+            // Strategy registry & concrete strategies
+            services.AddSingleton<IMetricStrategyRegistry, MetricStrategyRegistry>();
+
+            // Register built-in strategies
+            services.AddSingleton<IMetricTransformationStrategy, FocusTimeRatioStrategy>();
+            services.AddSingleton<IMetricTransformationStrategy, MeetingCostIndexStrategy>();
+            services.AddSingleton<IMetricTransformationStrategy, DeploymentLeadTimeStrategy>();
+
+            // Metrics publisher
+            services.AddSingleton<IMetricPublisher, S3MetricPublisher>();
+
+            return services.BuildServiceProvider();
+        }
+
+        /// <summary>
+        /// Main Lambda handler.
+        /// </summary>
+        /// <param name="kinesisEvent">Batch of Kinesis records.</param>
+        /// <param name="context">Execution context.</param>
+        public async Task HandlerAsync(KinesisEvent kinesisEvent, ILambdaContext context)
+        {
+            var sp          = _serviceProvider.Value;
+            var logger      = sp.GetRequiredService<ILogger<CalendarMetricLambda>>();
+            var registry    = sp.GetRequiredService<IMetricStrategyRegistry>();
+            var publisher   = sp.GetRequiredService<IMetricPublisher>();
+
+            using var cts = new CancellationTokenSource(context.RemainingTime - TimeSpan.FromSeconds(2));
+
+            var publishTasks = new List<Task>();
+
+            foreach (var record in kinesisEvent.Records)
+            {
+                try
+                {
+                    var envelope = DeserializeEnvelope(record);
+                    var strategy = registry.Resolve(envelope.MetricType);
+
+                    if (strategy is null)
+                    {
+                        logger.LogWarning("No strategy registered for metricType '{MetricType}'.  RecordId={RecordId}", envelope.MetricType, record.EventID);
+                        continue;
+                    }
+
+                    var metric = await strategy.TransformAsync(envelope, cts.Token);
+                    publishTasks.Add(publisher.PublishAsync(metric, cts.Token));
+                }
+                catch (OperationCanceledException) when (cts.IsCancellationRequested)
+                {
+                    logger.LogWarning("Execution cancelled due to nearing timeout.");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Failed to process recordId={RecordId}", record.EventID);
+                    // NOTE: Rethrow to move the batch to DLQ (configured in Lambda event source mapping)
+                    throw;
+                }
+            }
+
+            await Task.WhenAll(publishTasks);
+        }
+
+        private static EventEnvelope DeserializeEnvelope(KinesisEvent.KinesisEventRecord record)
+        {
+            // Kinesis.data is Base64-encoded by contract.
+            var jsonBytes = record.Kinesis.Data.ToArray();
+            return JsonSerializer.Deserialize<EventEnvelope>(jsonBytes) 
+                   ?? throw new InvalidDataException($"Record {record.EventID} produced null deserialization.");
+        }
+    }
+
+    #endregion
+
+    #region Domain Model
+
+    /// <summary>
+    /// The raw, unprocessed envelope coming in from the ingestion pipeline.
+    /// </summary>
+    public sealed record EventEnvelope
+    {
+        [JsonPropertyName("metricType")]  public string MetricType  { get; init; } = default!;
+        [JsonPropertyName("timestamp")]   public DateTime Timestamp { get; init; }
+        [JsonPropertyName("payload")]     public JsonElement Payload { get; init; }
+        [JsonPropertyName("tenantId")]    public string TenantId    { get; init; } = default!;
+        [JsonPropertyName("source")]      public string Source      { get; init; } = default!;
+        [JsonPropertyName("metadata")]    public JsonElement Metadata { get; init; }
+    }
+
+    /// <summary>
+    /// Normalized KPI ready for downstream storage (Parquet, S3, Athena, etc.)
+    /// </summary>
+    public sealed record MetricRecord
+    {
+        public string        MetricType { get; init; } = default!;
+        public string        TenantId   { get; init; } = default!;
+        public DateTime      PeriodEnd  { get; init; }
+        public double        Value      { get; init; }
+        public IReadOnlyDictionary<string, string> Dimensions { get; init; } = default!;
+        public JsonDocument  RawPayload { get; init; } = default!;
+    }
+
+    #endregion
+
+    #region Strategy Infrastructure
+
+    public interface IMetricTransformationStrategy
+    {
+        /// <summary>Unique identifier matching EventEnvelope.metricType.</summary>
+        string MetricType { get; }
+
+        /// <summary>
+        /// Transforms a domain-specific event envelope into a KPI record.
+        /// </summary>
+        Task<MetricRecord> TransformAsync(EventEnvelope envelope, CancellationToken token);
+    }
+
+    public interface IMetricStrategyRegistry
+    {
+        IMetricTransformationStrategy? Resolve(string metricType);
+    }
+
+    public sealed class MetricStrategyRegistry : IMetricStrategyRegistry
+    {
+        private readonly ConcurrentDictionary<string, IMetricTransformationStrategy> _strategies;
+
+        public MetricStrategyRegistry(IEnumerable<IMetricTransformationStrategy> strategies)
+        {
+            _strategies = new ConcurrentDictionary<string, IMetricTransformationStrategy>(StringComparer.OrdinalIgnoreCase);
+            foreach (var s in strategies)
+            {
+                if (!_strategies.TryAdd(s.MetricType, s))
+                {
+                    throw new InvalidOperationException($"Duplicate strategy for metricType '{s.MetricType}'.");
+                }
+            }
+        }
+
+        public IMetricTransformationStrategy? Resolve(string metricType)
+            => _strategies.TryGetValue(metricType, out var strategy) ? strategy : null;
+    }
+
+    #endregion
+
+    #region Concrete Strategies
+
+    internal sealed class FocusTimeRatioStrategy : IMetricTransformationStrategy
+    {
+        public string MetricType => "focus_time_ratio";
+
+        public Task<MetricRecord> TransformAsync(EventEnvelope envelope, CancellationToken token)
+        {
+            // Example logic: count "deep-work" events vs total events in time window.
+            var totalMeetings   = envelope.Payload.GetProperty("totalSlots").GetInt32();
+            var deepWorkSlots   = envelope.Payload.GetProperty("deepWorkSlots").GetInt32();
+            var ratio           = totalMeetings == 0 ? 1 : (double)deepWorkSlots / totalMeetings;
+
+            var record = new MetricRecord
+            {
+                MetricType  = MetricType,
+                TenantId    = envelope.TenantId,
+                PeriodEnd   = envelope.Timestamp,
+                Value       = Math.Round(ratio, 4),
+                Dimensions  = new Dictionary<string, string>
+                {
+                    ["source"] = envelope.Source
+                },
+                RawPayload  = JsonDocument.Parse(envelope.Payload.GetRawText())
+            };
+
+            return Task.FromResult(record);
+        }
+    }
+
+    internal sealed class MeetingCostIndexStrategy : IMetricTransformationStrategy
+    {
+        public string MetricType => "meeting_cost_index";
+
+        public Task<MetricRecord> TransformAsync(EventEnvelope envelope, CancellationToken token)
+        {
+            // Example logic: sum attendee hourly rates × meeting duration.
+            var durationMins = envelope.Payload.GetProperty("durationMinutes").GetDouble();
+            var hourlyRate   = envelope.Payload.GetProperty("avgHourlyRate").GetDouble();
+            var attendeeCnt  = envelope.Payload.GetProperty("attendeeCount").GetInt32();
+
+            var cost = (durationMins / 60.0) * hourlyRate * attendeeCnt;
+
+            var record = new MetricRecord
+            {
+                MetricType = MetricType,
+                TenantId   = envelope.TenantId,
+                PeriodEnd  = envelope.Timestamp,
+                Value      = Math.Round(cost, 2),
+                Dimensions = new Dictionary<string, string>
+                {
+                    ["currency"] = "USD"
+                },
+                RawPayload = JsonDocument.Parse(envelope.Payload.GetRawText())
+            };
+
+            return Task.FromResult(record);
+        }
+    }
+
+    internal sealed class DeploymentLeadTimeStrategy : IMetricTransformationStrategy
+    {
+        public string MetricType => "deployment_lead_time";
+
+        public Task<MetricRecord> TransformAsync(EventEnvelope envelope, CancellationToken token)
+        {
+            var commitTs  = envelope.Payload.GetProperty("commitTimestamp").GetDateTime();
+            var deployTs  = envelope.Payload.GetProperty("deployTimestamp").GetDateTime();
+
+            var leadTimeHrs = (deployTs - commitTs).TotalHours;
+
+            var record = new MetricRecord
+            {
+                MetricType = MetricType,
+                TenantId   = envelope.TenantId,
+                PeriodEnd  = deployTs,
+                Value      = Math.Round(leadTimeHrs, 2),
+                Dimensions = new Dictionary<string, string>
+                {
+                    ["repository"] = envelope.Payload.GetProperty("repository").GetString() ?? "unknown"
+                },
+                RawPayload = JsonDocument.Parse(envelope.Payload.GetRawText())
+            };
+
+            return Task.FromResult(record);
+        }
+    }
+
+    #endregion
+
+    #region Output Channel
+
+    public interface IMetricPublisher
+    {
+        Task PublishAsync(MetricRecord record, CancellationToken token);
+    }
+
+    /// <summary>
+    /// Persists metrics to S3 as newline-delimited JSON, partitioned by tenant & date.
+    /// Glue crawlers project the schema automatically.
+    /// </summary>
+    public sealed class S3MetricPublisher : IMetricPublisher
+    {
+        private const string BucketName = "pulseops-warehouse-metrics";
+        private readonly IAmazonS3 _s3;
+        private readonly ILogger<S3MetricPublisher> _logger;
+
+        public S3MetricPublisher(IAmazonS3 s3, ILogger<S3MetricPublisher> logger)
+        {
+            _s3    = s3;
+            _logger = logger;
+        }
+
+        public async Task PublishAsync(MetricRecord record, CancellationToken token)
+        {
+            var key = BuildObjectKey(record);
+            var body = JsonSerializer.Serialize(record) + "\n"; // NDJSON
+
+            try
+            {
+                var response = await _s3.PutObjectAsync(new PutObjectRequest
+                {
+                    BucketName  = BucketName,
+                    Key         = key,
+                    ContentBody = body,
+                    ContentType = "application/x-ndjson",
+                    ServerSideEncryptionMethod = ServerSideEncryptionMethod.AES256
+                }, token);
+
+                if (response.HttpStatusCode != HttpStatusCode.OK)
+                {
+                    _logger.LogError("Failed to upload metric. S3 returned {StatusCode} for Key={Key}", response.HttpStatusCode, key);
+                    throw new Exception($"S3 upload failed with status {response.HttpStatusCode}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error publishing metric to S3.  Tenant={Tenant} MetricType={MetricType}", record.TenantId, record.MetricType);
+                throw;
+            }
+        }
+
+        private static string BuildObjectKey(MetricRecord record)
+        {
+            var date = record.PeriodEnd;
+            return $"{record.TenantId}/metric_type={record.MetricType}/year={date:yyyy}/month={date:MM}/day={date:dd}/{Guid.NewGuid()}.json";
+        }
+    }
+
+    #endregion
+}
+```

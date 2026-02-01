@@ -1,0 +1,403 @@
+```rust
+//! module_61 – LedgerEntry query service, view models and repository glue
+//!
+//! This module is part of the LedgerLink-Nexus API micro-service.  It
+//! demonstrates the MVVM-inspired layout used across the project where
+//! external HTTP/GraphQL “views” are translated into validated DTOs which
+//! then orchestrate domain models through an abstract repository layer.
+//!
+//! Core concerns addressed here:
+//!   • Pagination helpers that are reusable across endpoints  
+//!   • Response-level caching with automatic invalidation on writes  
+//!   • Tracing/logging + rich error envelopes  
+//!   • Async-friendly service interface suitable for REST *and* GraphQL  
+//!
+//! The code intentionally avoids hard-coding framework specifics (actix,
+//! axum, async-graphql, etc.); instead it focuses on domain logic that can
+//! be wired in from the edge of the application.
+
+#![allow(dead_code)]
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use moka::sync::Cache;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tracing::{debug, error, instrument};
+use uuid::Uuid;
+use validator::{Validate, ValidationErrors};
+
+// -- Constants ----------------------------------------------------------------
+
+/// Amount of time (seconds) that list queries are cached.
+const QUERY_CACHE_TTL_SECONDS: u64 = 30;
+
+// -- Public View / Transport DTO ---------------------------------------------
+
+/// View returned to the client (REST/GraphQL).  
+/// Outgoing payloads are deliberately decoupled from internal domain models.
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerEntryView {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub account_code: String,
+    pub amount: f64,
+    pub currency: String,
+    pub booked_at: DateTime<Utc>,
+}
+
+/// Wrapper that adds pagination meta data.
+#[derive(Debug, Clone, Serialize)]
+pub struct PagedResponse<T> {
+    pub data: Vec<T>,
+    pub total: u64,
+    pub page: u32,
+    pub per_page: u32,
+    pub next_page: Option<u32>,
+    pub prev_page: Option<u32>,
+}
+
+// -- Incoming Filter / View-Model --------------------------------------------
+
+/// Payload accepted in the REST/GraphQL layer before being *validated*
+/// and enriched.  This is the ‘View-Model’ in MVVM parlance.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct LedgerEntryQuery {
+    #[validate(range(min = 1, max = 1000))]
+    pub per_page: Option<u32>,
+
+    #[validate(range(min = 1))]
+    pub page: Option<u32>,
+
+    /// Optional filtering by account code
+    #[validate(length(min = 1, max = 50))]
+    pub account_code: Option<String>,
+}
+
+impl LedgerEntryQuery {
+    /// Convert unsafe incoming query into a safe [Pagination] + [LedgerEntryFilter].
+    pub fn hydrate(
+        mut self,
+        tenant_id: Uuid,
+    ) -> Result<(Pagination, LedgerEntryFilter), ValidationErrors> {
+        // Run structural validations
+        self.validate()?;
+
+        let page = self.page.unwrap_or(1);
+        let per_page = self.per_page.unwrap_or(Pagination::DEFAULT_PER_PAGE);
+
+        let pagination = Pagination::new(page, per_page);
+
+        let filter = LedgerEntryFilter {
+            tenant_id,
+            account_code: self.account_code,
+        };
+
+        Ok((pagination, filter))
+    }
+}
+
+// -- Pagination Helper --------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct Pagination {
+    pub page: u32,
+    pub per_page: u32,
+    pub offset: u32,
+    pub limit: u32,
+}
+
+impl Pagination {
+    pub const DEFAULT_PER_PAGE: u32 = 50;
+    pub const MAX_PER_PAGE: u32 = 500;
+
+    pub fn new(page: u32, per_page: u32) -> Self {
+        let per_page = per_page.min(Self::MAX_PER_PAGE).max(1);
+        let page = page.max(1);
+
+        Self {
+            page,
+            per_page,
+            offset: (page - 1) * per_page,
+            limit: per_page,
+        }
+    }
+}
+
+// -- Domain Filter ------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct LedgerEntryFilter {
+    pub tenant_id: Uuid,
+    pub account_code: Option<String>,
+}
+
+// -- Repository Layer ---------------------------------------------------------
+
+/// Generic repository error type.
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("database error: {0}")]
+    Database(String),
+
+    #[error("invalid tenant context")]
+    InvalidTenant,
+
+    #[error("unknown repository error")]
+    Unknown,
+}
+
+/// Domain model used by downstream layers.
+/// (In real code this would live in its own domain module.)
+#[derive(Debug, Clone)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub account_code: String,
+    pub amount: f64,
+    pub currency: String,
+    pub booked_at: DateTime<Utc>,
+}
+
+impl From<LedgerEntry> for LedgerEntryView {
+    fn from(e: LedgerEntry) -> Self {
+        Self {
+            id: e.id,
+            tenant_id: e.tenant_id,
+            account_code: e.account_code,
+            amount: e.amount,
+            currency: e.currency,
+            booked_at: e.booked_at,
+        }
+    }
+}
+
+/// Read-only repository abstraction for ledger entries.
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync + 'static {
+    async fn list_entries(
+        &self,
+        filter: LedgerEntryFilter,
+        pagination: Pagination,
+    ) -> Result<(Vec<LedgerEntry>, u64 /* total */), RepositoryError>;
+}
+
+// -- Service Error Envelope ---------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation error")]
+    Validation(#[from] ValidationErrors),
+
+    #[error("repository error")]
+    Repository(#[from] RepositoryError),
+
+    #[error("internal server error")]
+    Internal(#[source] anyhow::Error),
+}
+
+// -- Service Implementation ---------------------------------------------------
+
+/// In-memory, size-bound cache shared between all instances of the service.
+/// Keyed by composite filter+paging so competing requests coalesce.
+static QUERY_CACHE: Lazy<Cache<String, PagedResponse<LedgerEntryView>>> =
+    Lazy::new(|| Cache::builder().time_to_live(std::time::Duration::from_secs(QUERY_CACHE_TTL_SECONDS)).max_capacity(10_000).build());
+
+/// Public, async-compatible service façade.
+#[async_trait]
+pub trait LedgerEntryQueryService: Send + Sync + 'static {
+    async fn fetch(
+        &self,
+        tenant_id: Uuid,
+        query: LedgerEntryQuery,
+    ) -> Result<PagedResponse<LedgerEntryView>, ServiceError>;
+}
+
+/// Default production implementation of [LedgerEntryQueryService].
+pub struct DefaultLedgerEntryQueryService<R: LedgerEntryRepository> {
+    repo: R,
+}
+
+impl<R: LedgerEntryRepository> DefaultLedgerEntryQueryService<R> {
+    pub fn new(repo: R) -> Self {
+        Self { repo }
+    }
+}
+
+#[async_trait]
+impl<R> LedgerEntryQueryService for DefaultLedgerEntryQueryService<R>
+where
+    R: LedgerEntryRepository,
+{
+    #[instrument(
+        name = "ledger_entry.query",
+        skip_all,
+        fields(tenant_id=%tenant_id, %query.page, %query.per_page)
+    )]
+    async fn fetch(
+        &self,
+        tenant_id: Uuid,
+        query: LedgerEntryQuery,
+    ) -> Result<PagedResponse<LedgerEntryView>, ServiceError> {
+        // 1. Validate + hydrate
+        let (pagination, filter) = query.hydrate(tenant_id)?;
+
+        // 2. Attempt cache hit
+        let cache_key = cache_key(&filter, &pagination);
+        if let Some(cached) = QUERY_CACHE.get(&cache_key) {
+            debug!("served ledger entry list from cache");
+            return Ok(cached);
+        }
+
+        // 3. Repository fetch
+        let (entries, total) = self.repo.list_entries(filter.clone(), pagination.clone()).await?;
+
+        // 4. Mapping
+        let view_entries: Vec<LedgerEntryView> =
+            entries.into_iter().map(Into::into).collect();
+
+        // 5. Build paged response
+        let response = PagedResponse {
+            total,
+            page: pagination.page,
+            per_page: pagination.per_page,
+            next_page: next_page(pagination.page, pagination.per_page, total),
+            prev_page: prev_page(pagination.page),
+            data: view_entries,
+        };
+
+        // 6. Insert into cache
+        QUERY_CACHE.insert(cache_key, response.clone());
+
+        Ok(response)
+    }
+}
+
+// -- Helper -------------------------------------------------------------------
+
+fn cache_key(filter: &LedgerEntryFilter, pagination: &Pagination) -> String {
+    format!(
+        "{}|{:?}|{}|{}",
+        filter.tenant_id, filter.account_code, pagination.page, pagination.per_page
+    )
+}
+
+fn next_page(page: u32, per_page: u32, total: u64) -> Option<u32> {
+    if (page as u64 * per_page as u64) < total {
+        Some(page + 1)
+    } else {
+        None
+    }
+}
+
+fn prev_page(page: u32) -> Option<u32> {
+    if page > 1 {
+        Some(page - 1)
+    } else {
+        None
+    }
+}
+
+// -- MOCK REPOSITORY ----------------------------------------------------------
+//! The following section provides a compile-time demo repository that can be
+//! swapped for a production SQLx/Postgres implementation.  It is intentionally
+//! *not* feature-gated so unit tests can rely on it.
+
+#[derive(Default)]
+pub struct InMemoryLedgerEntryRepo {
+    records: Vec<LedgerEntry>,
+}
+
+impl InMemoryLedgerEntryRepo {
+    pub fn seed(records: Vec<LedgerEntry>) -> Self {
+        Self { records }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for InMemoryLedgerEntryRepo {
+    async fn list_entries(
+        &self,
+        filter: LedgerEntryFilter,
+        pagination: Pagination,
+    ) -> Result<(Vec<LedgerEntry>, u64), RepositoryError> {
+        // Naïve filtering
+        let mut filtered: Vec<_> = self
+            .records
+            .iter()
+            .filter(|e| e.tenant_id == filter.tenant_id)
+            .filter(|e| {
+                filter
+                    .account_code
+                    .as_ref()
+                    .map(|ac| ac == &e.account_code)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+
+        let total = filtered.len() as u64;
+
+        // Order by booked_at desc (simulate typical query)
+        filtered.sort_by(|a, b| b.booked_at.cmp(&a.booked_at));
+
+        // Paginate
+        let start = pagination.offset as usize;
+        let end = (start + pagination.limit as usize).min(filtered.len());
+        let slice = if start < end {
+            filtered[start..end].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        Ok((slice, total))
+    }
+}
+
+// -- Example Unit Test --------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    #[tokio::test]
+    async fn it_paginates_and_caches() {
+        let tenant_id = Uuid::new_v4();
+
+        // seed 120 ledger entries
+        let seed: Vec<_> = (0..120)
+            .map(|i| LedgerEntry {
+                id: Uuid::new_v4(),
+                tenant_id,
+                account_code: if i % 2 == 0 {
+                    "SALES".into()
+                } else {
+                    "AR".into()
+                },
+                amount: 100.0,
+                currency: "USD".into(),
+                booked_at: Utc::now() - Duration::days(i),
+            })
+            .collect();
+
+        let repo = InMemoryLedgerEntryRepo::seed(seed);
+        let service = DefaultLedgerEntryQueryService::new(repo);
+
+        let query = LedgerEntryQuery {
+            page: Some(2),
+            per_page: Some(25),
+            account_code: Some("SALES".into()),
+        };
+
+        let first = service.fetch(tenant_id, query.clone()).await.unwrap();
+        assert_eq!(first.page, 2);
+        assert_eq!(first.per_page, 25);
+
+        // second call should be cached
+        let second = service.fetch(tenant_id, query.clone()).await.unwrap();
+        assert_eq!(second.total, first.total);
+    }
+}
+```

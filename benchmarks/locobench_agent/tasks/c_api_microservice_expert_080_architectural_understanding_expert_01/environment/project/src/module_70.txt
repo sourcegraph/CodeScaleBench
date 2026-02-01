@@ -1,0 +1,257 @@
+```c
+/**
+ * MercuryMonolith Commerce Hub
+ * -------------------------------------
+ * Module 70  : mm_rate_limiter.c
+ * Purpose    : In-memory token-bucket rate-limiter shared by all request handlers.
+ * Description: 
+ *   Provides per-key (API key, IP address, tenant, etc.) throttling with 
+ *   configurable limits. The limiter is entirely in-memory for ultra-fast
+ *   path-latency, yet publishes live statistics to the monitoring subsystem.
+ *
+ *   Thread safety: a read-optimized RW-lock protects the top-level hash-table
+ *   while a fine-grained mutex protects each individual bucket.  
+ *
+ *   Dependencies (local):
+ *      - mm_logger.h    : Structured logging abstraction
+ *      - mm_metrics.h   : Prometheus-compatible metrics sink
+ *      - mm_time.h      : Clock helpers & abstractions
+ *      - mm_memory.h    : xmalloc/xcalloc/xfree wrappers with OOM handling
+ *
+ *   3ʳᵈ-party Dependencies:
+ *      - uthash         : https://troydhanson.github.io/uthash/
+ *
+ * Compile flags:
+ *      -pthread -std=c11
+ */
+
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "mm_logger.h"
+#include "mm_metrics.h"
+#include "mm_time.h"
+#include "mm_memory.h"
+
+/* uthash single-header map */
+#include "uthash.h"
+
+#define MM_RATE_LIMITER_VERSION   "1.0.0"
+#define NANOSECONDS_PER_SEC       1000000000L
+
+/* ---------- Public API ---------------------------------------------------- */
+
+typedef struct {
+    uint32_t max_tokens;     /* Bucket size (maximum burst)          */
+    uint32_t refill_tokens;  /* Number of tokens to add per window   */
+    uint32_t refill_window_ms;
+} mm_rate_limit_cfg_t;
+
+/**
+ * Initialize subsystem with default limits to be applied when a caller
+ * does not provide explicit per-key overrides.
+ */
+bool mm_rate_limiter_init(const mm_rate_limit_cfg_t *defaults);
+void mm_rate_limiter_shutdown(void);
+
+/**
+ * Checks if a request identified by `key` is allowed to proceed.  
+ * Returns true when permitted, false otherwise.
+ *
+ * NOTE: `key` must be a stable, null-terminated string (interned pointer or
+ *       heap/string-literal) that remains valid for the duration of the call.
+ */
+bool mm_rate_limiter_allow(const char *key);
+
+/* ------------------------------------------------------------------------- */
+/* ---------- Implementation ‑---------------------------------------------- */
+
+typedef struct mm_bucket {
+    char           *key;            /* Owner identifier               */
+    uint32_t        tokens;         /* Current token balance          */
+    uint32_t        max_tokens;     /* Capacity                       */
+    uint32_t        refill_tokens;  /* Tokens added every window      */
+    uint32_t        window_ms;      /* Refill period                  */
+    struct timespec last_refill;    /* Nano-precision timestamp       */
+    pthread_mutex_t mtx;            /* Bucket-level lock              */
+    UT_hash_handle  hh;             /* uthash node                    */
+} mm_bucket_t;
+
+/* Global state */
+static struct {
+    mm_bucket_t     *buckets;                    /* uthash map (key → bucket) */
+    pthread_rwlock_t rwlock;                     /* protects buckets map      */
+    mm_rate_limit_cfg_t defaults;                /* fallback config           */
+    atomic_bool      running;
+} g_rl = { .buckets = NULL, .running = ATOMIC_VAR_INIT(false) };
+
+/* Forward decls */
+static mm_bucket_t *_bucket_get_or_create(const char *key);
+static void         _bucket_refill(mm_bucket_t *b, struct timespec now);
+
+/* ----------------------------- API --------------------------------------- */
+
+bool mm_rate_limiter_init(const mm_rate_limit_cfg_t *defaults)
+{
+    if (!defaults || defaults->max_tokens == 0 || defaults->refill_tokens == 0 ||
+        defaults->refill_window_ms == 0) {
+        MM_LOG_ERROR("rate_limiter.init", "Invalid configuration supplied");
+        return false;
+    }
+
+    memset(&g_rl, 0, sizeof(g_rl));
+    g_rl.defaults = *defaults;
+
+    if (pthread_rwlock_init(&g_rl.rwlock, NULL) != 0) {
+        MM_LOG_SYSERR("rate_limiter.init", "pthread_rwlock_init");
+        return false;
+    }
+
+    atomic_store(&g_rl.running, true);
+
+    MM_LOG_INFO("rate_limiter.init",
+                "Rate-Limiter v%s initialized (default=%" PRIu32 "/%" PRIu32 " every %" PRIu32 "ms)",
+                MM_RATE_LIMITER_VERSION,
+                defaults->refill_tokens,
+                defaults->max_tokens,
+                defaults->refill_window_ms);
+
+    mm_metrics_gauge_set("rate_limiter_buckets", 0);
+    return true;
+}
+
+void mm_rate_limiter_shutdown(void)
+{
+    if (!atomic_exchange(&g_rl.running, false)) {
+        return; /* not running */
+    }
+
+    pthread_rwlock_wrlock(&g_rl.rwlock);
+    mm_bucket_t *iter, *tmp;
+    HASH_ITER(hh, g_rl.buckets, iter, tmp) {
+        HASH_DEL(g_rl.buckets, iter);
+        pthread_mutex_destroy(&iter->mtx);
+        free(iter->key);
+        free(iter);
+    }
+    pthread_rwlock_unlock(&g_rl.rwlock);
+    pthread_rwlock_destroy(&g_rl.rwlock);
+
+    MM_LOG_INFO("rate_limiter.shutdown", "Rate-Limiter stopped");
+}
+
+/* Main function: obtains/creates bucket & performs token accounting */
+bool mm_rate_limiter_allow(const char *key)
+{
+    if (!atomic_load(&g_rl.running)) {
+        MM_LOG_WARN("rate_limiter.allow", "Subsystem not initialized");
+        return true; /* fail-open */
+    }
+    if (!key) {
+        MM_LOG_ERROR("rate_limiter.allow", "NULL key provided");
+        return false;
+    }
+
+    /* Obtain bucket (read path) */
+    mm_bucket_t *bucket = NULL;
+    pthread_rwlock_rdlock(&g_rl.rwlock);
+    HASH_FIND_STR(g_rl.buckets, key, bucket);
+    pthread_rwlock_unlock(&g_rl.rwlock);
+
+    if (bucket == NULL) {
+        /* Upgrade to write lock and create */
+        bucket = _bucket_get_or_create(key);
+        if (bucket == NULL) {
+            /* Creation failed – be permissive but log */
+            MM_LOG_ERROR("rate_limiter.allow", "Failed to create bucket for key=%s", key);
+            return true;
+        }
+    }
+
+    /* Refill logic & token consumption */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    bool allowed = false;
+    pthread_mutex_lock(&bucket->mtx);
+    _bucket_refill(bucket, now);
+
+    if (bucket->tokens > 0) {
+        bucket->tokens--;
+        allowed = true;
+    }
+    pthread_mutex_unlock(&bucket->mtx);
+
+    /* Metrics */
+    mm_metrics_counter_inc(allowed ? "rate_limit_allow_total"
+                                   : "rate_limit_deny_total", 1);
+
+    if (!allowed) {
+        MM_LOG_DEBUG("rate_limiter.deny",
+                     "Throttled key=%s (remaining=0, capacity=%u)",
+                     key, bucket->max_tokens);
+    }
+    return allowed;
+}
+
+/* ----------------------------- Internals --------------------------------- */
+
+/* Refill tokens based on elapsed time */
+static void _bucket_refill(mm_bucket_t *b, struct timespec now)
+{
+    /* Time delta in milliseconds */
+    int64_t last_ns = b->last_refill.tv_sec * NANOSECONDS_PER_SEC + b->last_refill.tv_nsec;
+    int64_t now_ns  = now.tv_sec * NANOSECONDS_PER_SEC + now.tv_nsec;
+    int64_t diff_ms = (now_ns - last_ns) / 1000000;
+
+    if (diff_ms >= (int64_t)b->window_ms) {
+        uint32_t periods = diff_ms / b->window_ms;
+        uint64_t add     = (uint64_t)periods * b->refill_tokens;
+
+        if (add > 0) {
+            uint64_t new_tokens = b->tokens + add;
+            b->tokens = (new_tokens > b->max_tokens) ? b->max_tokens : (uint32_t)new_tokens;
+            b->last_refill = now;
+        }
+    }
+}
+
+/* Returns existing bucket or allocates new one under write lock */
+static mm_bucket_t *_bucket_get_or_create(const char *key)
+{
+    mm_bucket_t *bucket = NULL;
+
+    if (pthread_rwlock_wrlock(&g_rl.rwlock) != 0) {
+        MM_LOG_SYSERR("rate_limiter.bucket_lock", "pthread_rwlock_wrlock");
+        return NULL;
+    }
+
+    HASH_FIND_STR(g_rl.buckets, key, bucket);
+    if (bucket == NULL) {
+        bucket = xcalloc(1, sizeof(mm_bucket_t));
+        bucket->key           = strdup(key);
+        bucket->tokens        = g_rl.defaults.max_tokens;
+        bucket->max_tokens    = g_rl.defaults.max_tokens;
+        bucket->refill_tokens = g_rl.defaults.refill_tokens;
+        bucket->window_ms     = g_rl.defaults.refill_window_ms;
+        clock_gettime(CLOCK_MONOTONIC, &bucket->last_refill);
+        pthread_mutex_init(&bucket->mtx, NULL);
+        HASH_ADD_KEYPTR(hh, g_rl.buckets, bucket->key, strlen(bucket->key), bucket);
+
+        mm_metrics_gauge_inc("rate_limiter_buckets", 1);
+        MM_LOG_DEBUG("rate_limiter.bucket_create", "Created new bucket for key=%s", key);
+    }
+
+    pthread_rwlock_unlock(&g_rl.rwlock);
+    return bucket;
+}
+```

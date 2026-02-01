@@ -1,0 +1,354 @@
+```rust
+//! src/module_78.rs
+//!
+//! Centralised event abstractions and an in-memory fallback implementation for
+//! EduPulse Live’s event-driven core.  This module is compiled into every
+//! service crate so that *domain events*, *audit-trail persistence*, and
+//! *inter-service messaging* share a strong, compile-time contract.
+//!
+//! In production deployments we replace the [`InMemoryEventStore`] and
+//! [`InMemoryEventBus`] with infrastructure-backed adapters (Kafka / NATS for
+//! the bus, Postgres / Scylla for the store).  Swapping the implementation is
+//! as easy as enabling the `kafka` or `postgres` cargo features thanks to the
+//! thin, async traits that power the service layer.
+
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    },
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::broadcast;
+use tracing::{debug, error, info, instrument};
+use uuid::Uuid;
+
+/// Identifies a tenant in a multi-tenant deployment.
+/// In the OSS edition this will always be the all-zero UUID.
+pub type TenantId = Uuid;
+
+/// A strongly-typed union of every event the EduPulse domain can emit.
+///
+/// Versioning strategy:
+///  * Never delete a variant.  
+///  * Add *(v2)*, *(v3)* suffixes when breaking the schema.
+///  * Consumers **must** ignore unknown fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum DomainEvent {
+    LessonPublished {
+        lesson_id: Uuid,
+        author_id: Uuid,
+        title: String,
+    },
+    LearningPulseCreated {
+        pulse_id: Uuid,
+        teacher_id: Uuid,
+        prompt: String,
+    },
+    LearningPulseReplied {
+        pulse_id: Uuid,
+        student_id: Uuid,
+        reply_id: Uuid,
+    },
+    BadgeAwarded {
+        badge_id: Uuid,
+        user_id: Uuid,
+        reason: String,
+    },
+    PaymentProcessed {
+        payment_id: Uuid,
+        user_id: Uuid,
+        amount_cents: i64,
+        currency: String,
+    },
+}
+
+/// Metadata attached to every event for observability / auditing purposes.
+pub type EventMetadata = HashMap<String, String>;
+
+/// Thin wrapper that enriches a domain event with context required by
+/// infrastructure components.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    /// Globally unique identifier of the envelope itself (not the domain event
+    /// it wraps).
+    pub id: Uuid,
+    /// Auto-incremented, per-aggregate sequence number.  A value of `-1`
+    /// means *not yet persisted*.
+    pub sequence: i64,
+    /// When the event occurred *from the perspective of the service emitting
+    /// it*.  Immutable.
+    pub occurred_at: DateTime<Utc>,
+    /// Multi-tenant partitioning key.
+    pub tenant_id: TenantId,
+    /// The event payload.
+    pub payload: DomainEvent,
+    /// Arbitrary diagnostic information (IP address, user-agent, request ID…).
+    pub metadata: EventMetadata,
+}
+
+impl EventEnvelope {
+    /// Convenience constructor for freshly created, *non-persisted* events.
+    pub fn new(tenant_id: TenantId, payload: DomainEvent) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            sequence: -1,
+            occurred_at: Utc::now(),
+            tenant_id,
+            payload,
+            metadata: HashMap::new(),
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/*                                   Store                                   */
+/* ------------------------------------------------------------------------- */
+
+/// The write-side of the event store.  Implementations are responsible for
+/// *atomic* insertion of a batch and returning the final, commit-time
+/// sequence numbers.
+#[async_trait]
+pub trait EventStore: Send + Sync {
+    async fn append(&self, events: &mut [EventEnvelope]) -> Result<(), StoreError>;
+}
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("optimistic concurrency violation")]
+    Concurrency,
+    #[error("backend unavailable: {0}")]
+    Backend(String),
+    #[error("serialization error: {0}")]
+    Serialization(String),
+    #[error("unknown store error: {0}")]
+    Other(String),
+}
+
+/// A thread-safe, deterministic, *ephemeral* store for unit / integration
+/// testing. **Not** suitable for production.
+#[derive(Debug, Default)]
+pub struct InMemoryEventStore {
+    inner: RwLock<Vec<EventEnvelope>>,
+    sequence: AtomicI64,
+}
+
+impl InMemoryEventStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[allow(dead_code)]
+    pub fn all_events(&self) -> Vec<EventEnvelope> {
+        self.inner.read().clone()
+    }
+}
+
+#[async_trait]
+impl EventStore for InMemoryEventStore {
+    #[instrument(skip_all, level = "debug")]
+    async fn append(&self, events: &mut [EventEnvelope]) -> Result<(), StoreError> {
+        // In a real store, this is where we would check version / sequence
+        // expectations to enforce optimistic concurrency.  For the in-memory
+        // flavor we simply assign global sequence numbers.
+        for e in events.iter_mut() {
+            let seq = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+            e.sequence = seq;
+        }
+
+        let mut guard = self.inner.write();
+        guard.extend_from_slice(events);
+        Ok(())
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/*                               Event  BUS                                  */
+/* ------------------------------------------------------------------------- */
+
+#[async_trait]
+pub trait EventBus: Send + Sync {
+    async fn publish(&self, events: &[EventEnvelope]) -> Result<(), BusError>;
+}
+
+#[derive(Debug, Error)]
+pub enum BusError {
+    #[error("event bus disconnected")]
+    Disconnected,
+    #[error("payload too large")]
+    PayloadTooLarge,
+    #[error("transport error: {0}")]
+    Transport(String),
+    #[error("unknown bus error: {0}")]
+    Other(String),
+}
+
+/// The simplest possible implementation leveraging [`tokio::sync::broadcast`].
+/// 1. Cheap and cheerful for local development.
+/// 2. Keeps unit tests fast with zero I/O.
+///
+/// Production services swap this out for Kafka / NATS through feature flags.
+#[derive(Debug)]
+pub struct InMemoryEventBus {
+    sender: broadcast::Sender<EventEnvelope>,
+}
+
+impl Default for InMemoryEventBus {
+    fn default() -> Self {
+        // 16k backlog—large enough for dev, small enough to fail fast when a
+        // consumer misbehaves.
+        let (sender, _) = broadcast::channel(16_384);
+        Self { sender }
+    }
+}
+
+impl InMemoryEventBus {
+    pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
+        self.sender.subscribe()
+    }
+}
+
+#[async_trait]
+impl EventBus for InMemoryEventBus {
+    #[instrument(skip_all, level = "debug")]
+    async fn publish(&self, events: &[EventEnvelope]) -> Result<(), BusError> {
+        for ev in events {
+            // Cloning here is cheap thanks to Arc-based internals in UUID /
+            // String.  In prod GUI we avoid cloning by using zero-copy buffers.
+            if self.sender.send(ev.clone()).is_err() {
+                return Err(BusError::Disconnected);
+            }
+            debug!(
+                event_id = %ev.id,
+                sequence = ev.sequence,
+                kind = ?ev.payload,
+                "event published",
+            );
+        }
+        Ok(())
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/*                             SERVICE  FACADE                               */
+/* ------------------------------------------------------------------------- */
+
+/// A façade that bundles [`EventStore`] and [`EventBus`] to guarantee *exactly-once*
+/// publication semantics.  The default implementation follows the
+/// transactional-outbox pattern: a record is inserted into the store first and
+/// later read by a worker that hands it to the bus.  For the in-memory
+/// transport we can cheat and publish immediately after persistence.
+#[derive(Debug)]
+pub struct EventPublisher<S: EventStore, B: EventBus> {
+    store: Arc<S>,
+    bus: Arc<B>,
+}
+
+impl<S, B> EventPublisher<S, B>
+where
+    S: EventStore + 'static,
+    B: EventBus + 'static,
+{
+    pub fn new(store: Arc<S>, bus: Arc<B>) -> Self {
+        Self { store, bus }
+    }
+
+    #[instrument(skip_all, level = "info")]
+    pub async fn persist_and_publish(
+        &self,
+        events: &mut [EventEnvelope],
+    ) -> Result<(), PublisherError> {
+        self.store
+            .append(events)
+            .await
+            .map_err(PublisherError::Store)?;
+
+        if let Err(e) = self.bus.publish(events).await {
+            error!("event bus failed after store commit: {e}");
+            // In production we would enqueue for retry / DLQ here instead of
+            // bubbling the error up.  For simplicity we surface it.
+            return Err(PublisherError::Bus(e));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum PublisherError {
+    #[error("persistence failure: {0}")]
+    Store(#[from] StoreError),
+    #[error("bus failure: {0}")]
+    Bus(#[from] BusError),
+}
+
+/* ------------------------------------------------------------------------- */
+/*                                  Tests                                   */
+/* ------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{sleep, Duration};
+
+    #[tokio::test]
+    async fn persist_and_publish_roundtrip() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let bus = Arc::new(InMemoryEventBus::default());
+
+        let publisher = EventPublisher::new(store.clone(), bus.clone());
+        let mut events = vec![EventEnvelope::new(
+            TenantId::nil(),
+            DomainEvent::LessonPublished {
+                lesson_id: Uuid::new_v4(),
+                author_id: Uuid::new_v4(),
+                title: "Intro to Rust".into(),
+            },
+        )];
+
+        let rx = bus.subscribe();
+        publisher.persist_and_publish(&mut events).await.unwrap();
+
+        // Make sure the in-memory bus delivered exactly what we sent.
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.sequence, 1);
+        assert!(matches!(
+            received.payload,
+            DomainEvent::LessonPublished { .. }
+        ));
+
+        // And also ensure the store has the event.
+        let all = store.all_events();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sequence_increments_across_batches() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let bus = Arc::new(InMemoryEventBus::default());
+        let publisher = EventPublisher::new(store.clone(), bus);
+
+        for _ in 0..5 {
+            let mut ev = vec![EventEnvelope::new(
+                TenantId::nil(),
+                DomainEvent::BadgeAwarded {
+                    badge_id: Uuid::new_v4(),
+                    user_id: Uuid::new_v4(),
+                    reason: "Early-bird".into(),
+                },
+            )];
+            publisher.persist_and_publish(&mut ev).await.unwrap();
+        }
+
+        let seqs: Vec<i64> = store.all_events().into_iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+    }
+}
+```

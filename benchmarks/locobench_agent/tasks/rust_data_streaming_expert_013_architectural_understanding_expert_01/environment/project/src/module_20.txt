@@ -1,0 +1,391 @@
+```rust
+//! src/module_20.rs
+//!
+//! Sentiment strategy subsystem for ChirpPulse.
+//!
+//! The code below demonstrates a plug-and-play “strategy pattern” used by the
+//! real-time enrichment pipeline.  An active `SentimentStrategy` can be swapped
+//! out on the fly without restarting the service, allowing data scientists to
+//! deploy experimental models safely in production.
+//!
+//! Core responsibilities
+//! ---------------------
+//! • Maintain a thread-safe registry of the currently-active strategy  
+//! • Provide a concurrent API for bulk scoring with back-pressure  
+//! • Emit Prometheus metrics for monitoring latency & error rates  
+//! • Periodically reload strategy implementations from disk / network
+//!
+//! Note: For brevity, model inference is mocked; in production this would call
+//! into ONNX, TensorRT, or a remote micro-service.
+
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::Read,
+    path::Path,
+    sync::{Arc, RwLock},
+    time::Instant,
+};
+
+use futures::{stream::FuturesUnordered, StreamExt};
+use log::{error, info, warn};
+use once_cell::sync::Lazy;
+use prometheus::{
+    opts, register_histogram_vec, register_int_counter_vec, Encoder, HistogramVec, IntCounterVec,
+    TextEncoder,
+};
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use thiserror::Error;
+use tokio::{
+    sync::mpsc::{self, Receiver, Sender},
+    task,
+    time::{self, Duration, Interval},
+};
+
+/// Prometheus metrics (global, lazily-initialized).
+static SENTIMENT_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        opts!("sentiment_latency_seconds", "Sentiment scoring latency"),
+        &["strategy"]
+    )
+    .expect("metric can be created")
+});
+
+static SENTIMENT_ERRORS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "sentiment_errors_total",
+        "Number of sentiment evaluation errors",
+        &["strategy", "error_type"]
+    )
+    .expect("metric can be created")
+});
+
+/// Error type for strategy operations.
+#[derive(Error, Debug)]
+pub enum StrategyError {
+    #[error("Model IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Model parsing error: {0}")]
+    Parse(#[from] serde_json::Error),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+}
+
+/// Result alias.
+type Result<T, E = StrategyError> = std::result::Result<T, E>;
+
+/// Sentiment score.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentimentScore {
+    pub polarity: f32,   // -1.0 .. 1.0
+    pub magnitude: f32,  // 0.0  .. +
+}
+
+/// Trait every sentiment strategy must implement.
+pub trait SentimentStrategy: Send + Sync {
+    /// Human-readable name, used for metrics & logging.
+    fn name(&self) -> &'static str;
+
+    /// Evaluate a single text snippet.
+    fn score(&self, text: &str) -> Result<SentimentScore>;
+}
+
+/// Simple rule-based implementation (placeholder).
+#[derive(Default)]
+pub struct RuleBasedStrategy;
+
+impl SentimentStrategy for RuleBasedStrategy {
+    fn name(&self) -> &'static str {
+        "rule_based"
+    }
+
+    fn score(&self, text: &str) -> Result<SentimentScore> {
+        // Naïve heuristic for demo purposes.
+        let polarity = if text.contains("love") {
+            0.75
+        } else if text.contains("hate") {
+            -0.75
+        } else {
+            0.0
+        };
+
+        Ok(SentimentScore {
+            polarity,
+            magnitude: polarity.abs(),
+        })
+    }
+}
+
+/// Dummy ML model strategy that loads weights from JSON.
+pub struct MlModelStrategy {
+    weights: HashMap<String, f32>,
+}
+
+impl MlModelStrategy {
+    /// Load weights from disk.
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let mut buf = String::new();
+        File::open(path.as_ref())?.read_to_string(&mut buf)?;
+        let json: Value = serde_json::from_str(&buf)?;
+        let weights = json
+            .as_object()
+            .ok_or_else(|| StrategyError::InvalidConfig("JSON root must be object".into()))?
+            .iter()
+            .map(|(k, v)| {
+                let w = v
+                    .as_f64()
+                    .ok_or_else(|| StrategyError::InvalidConfig(format!(
+                        "weight for '{}' must be f64",
+                        k
+                    )))? as f32;
+                Ok((k.to_owned(), w))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+
+        Ok(Self { weights })
+    }
+}
+
+impl SentimentStrategy for MlModelStrategy {
+    fn name(&self) -> &'static str {
+        "ml_model"
+    }
+
+    fn score(&self, text: &str) -> Result<SentimentScore> {
+        let mut polarity = 0.0f32;
+        let magnitude = 1.0f32; // constant for demo
+        // Extremely naive bag-of-words dot product.
+        for (token, weight) in &self.weights {
+            if text.contains(token) {
+                polarity += *weight;
+            }
+        }
+        polarity = polarity.clamp(-1.0, 1.0);
+        Ok(SentimentScore {
+            polarity,
+            magnitude,
+        })
+    }
+}
+
+/// Thread-safe wrapper around the active strategy.
+#[derive(Clone)]
+pub struct StrategyManager {
+    inner: Arc<RwLock<Box<dyn SentimentStrategy>>>,
+}
+
+impl StrategyManager {
+    /// Initialize with default rule-based model.
+    pub fn new_default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Box::new(RuleBasedStrategy::default()))),
+        }
+    }
+
+    /// Swap in a new strategy at runtime.
+    pub fn swap<S: SentimentStrategy + 'static>(&self, strategy: S) {
+        let mut guard = self
+            .inner
+            .write()
+            .expect("poisoned lock when swapping strategy");
+        info!(
+            "Swapping strategy: {} -> {}",
+            guard.name(),
+            strategy.name()
+        );
+        *guard = Box::new(strategy);
+    }
+
+    /// Get read-only handle.
+    fn get(&self) -> std::sync::RwLockReadGuard<'_, Box<dyn SentimentStrategy>> {
+        self.inner.read().expect("sentiment lock poisoned")
+    }
+
+    /// Score a batch of texts in parallel.
+    pub fn score_batch(&self, texts: &[String]) -> Vec<Result<SentimentScore>> {
+        let strategy = self.get();
+        let label = strategy.name();
+        let histogram = SENTIMENT_LATENCY.with_label_values(&[label]);
+        let errors = SENTIMENT_ERRORS;
+
+        texts
+            .par_iter()
+            .map(|t| {
+                let timer = histogram.start_timer();
+                let res = strategy.score(t);
+                timer.observe_duration();
+
+                if let Err(ref e) = res {
+                    errors
+                        .with_label_values(&[label, e.to_string().as_str()])
+                        .inc();
+                }
+                res
+            })
+            .collect()
+    }
+}
+
+/// Message consumed from Kafka or other sources.
+#[derive(Debug, Clone)]
+pub struct SocialMessage {
+    pub id: String,
+    pub text: String,
+    pub timestamp_ms: i64,
+}
+
+/// Wrapper for a scored message.
+#[derive(Debug, Clone)]
+pub struct ScoredMessage {
+    pub original: SocialMessage,
+    pub score: Option<SentimentScore>,
+}
+
+/// Spawn a worker pipeline that consumes messages, applies sentiment scoring,
+/// and publishes results into the provided channel with back-pressure.
+pub async fn run_scoring_pipeline(
+    mut rx_in: Receiver<SocialMessage>,
+    tx_out: Sender<ScoredMessage>,
+    manager: StrategyManager,
+) {
+    const BATCH_SIZE: usize = 256;
+    let mut buffer = Vec::with_capacity(BATCH_SIZE);
+
+    while let Some(msg) = rx_in.recv().await {
+        buffer.push(msg);
+
+        if buffer.len() >= BATCH_SIZE {
+            process_chunk(&mut buffer, &manager, &tx_out).await;
+        }
+    }
+
+    // Flush remainder.
+    if !buffer.is_empty() {
+        process_chunk(&mut buffer, &manager, &tx_out).await;
+    }
+
+    info!("Scoring pipeline terminated – input channel closed");
+}
+
+async fn process_chunk(
+    buffer: &mut Vec<SocialMessage>,
+    manager: &StrategyManager,
+    tx_out: &Sender<ScoredMessage>,
+) {
+    let start = Instant::now();
+    let texts: Vec<String> = buffer.iter().map(|m| m.text.clone()).collect();
+    let results = manager.score_batch(&texts);
+
+    // Publish results concurrently while respecting back-pressure.
+    let publish_futures = buffer
+        .drain(..)
+        .zip(results)
+        .map(|(msg, res)| {
+            let mut scored = ScoredMessage {
+                original: msg,
+                score: None,
+            };
+            match res {
+                Ok(s) => scored.score = Some(s),
+                Err(e) => {
+                    error!("Sentiment error on {}: {}", scored.original.id, e);
+                }
+            }
+            let tx_out = tx_out.clone();
+            async move {
+                if tx_out.send(scored).await.is_err() {
+                    warn!("Downstream consumer dropped – terminating publisher");
+                }
+            }
+        })
+        .collect::<FuturesUnordered<_>>();
+
+    publish_futures.collect::<()>().await;
+
+    let elapsed = start.elapsed();
+    info!(
+        "Processed {} messages in {:.2?}",
+        texts.len(),
+        elapsed
+    );
+}
+
+/// Periodic strategy reloader.
+/// Every `interval` the provided loader closure is executed; on success, the
+/// active strategy is swapped in.
+pub fn spawn_hot_reloader<F, Fut>(interval: Duration, manager: StrategyManager, loader: F)
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<Box<dyn SentimentStrategy>>> + Send,
+{
+    let mut ticker: Interval = time::interval(interval);
+
+    task::spawn(async move {
+        loop {
+            ticker.tick().await;
+            match loader().await {
+                Ok(strategy) => manager.swap(strategy),
+                Err(e) => error!("Failed to reload sentiment strategy: {}", e),
+            }
+        }
+    });
+}
+
+/// Export Prometheus metrics in scrape-ready format.
+pub fn gather_metrics() -> String {
+    let metric_families = prometheus::gather();
+    let mut buf = Vec::new();
+    let encoder = TextEncoder::new();
+    encoder.encode(&metric_families, &mut buf).unwrap();
+    String::from_utf8(buf).unwrap()
+}
+
+/*
+   =========================
+   ===  Small integration test
+   =========================
+*/
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_rule_based_scoring() {
+        let mgr = StrategyManager::new_default();
+        let (tx_in, rx_in) = mpsc::channel(10);
+        let (tx_out, mut rx_out) = mpsc::channel(10);
+
+        tokio::spawn(run_scoring_pipeline(rx_in, tx_out, mgr.clone()));
+
+        tx_in.send(SocialMessage {
+            id: "1".into(),
+            text: "I love rust".into(),
+            timestamp_ms: 0,
+        })
+        .await
+        .unwrap();
+
+        drop(tx_in); // close input
+
+        let scored = rx_out.recv().await.unwrap();
+        assert!(scored.score.is_some());
+        assert!(scored.score.unwrap().polarity > 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_strategy_swap() {
+        let mgr = StrategyManager::new_default();
+        assert_eq!(mgr.get().name(), "rule_based");
+
+        let ml = MlModelStrategy {
+            weights: [("rust".to_string(), 1.0)].into(),
+        };
+        mgr.swap(ml);
+        assert_eq!(mgr.get().name(), "ml_model");
+    }
+}
+```

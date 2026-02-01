@@ -1,0 +1,427 @@
+```rust
+//! module_16 – Learning Pulse domain, service layer & event dispatch
+//!
+//! This single module showcases how EduPulse Live persists a domain
+//! entity (“learning pulse”), emits events, and hands them off to an
+//! asynchronous message-broker abstraction.
+//!
+//! The code is deliberately self-contained; wiring to the real runtime
+//! (HTTP controllers, DI container, migration tooling, etc.) is
+//! performed elsewhere in the project.
+
+use std::sync::Arc;
+
+use async_channel::{unbounded, Sender};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgRow, FromRow, PgPool, Row};
+use thiserror::Error;
+use tokio::task::JoinHandle;
+use tracing::{error, info};
+use uuid::Uuid;
+
+/// Domain errors that can occur while dealing with pulses.
+#[derive(Debug, Error)]
+pub enum PulseError {
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+    #[error("channel send error: {0}")]
+    Channel(#[from] async_channel::SendError<PulseEventEnvelope>),
+    #[error("pulse not found: {0}")]
+    NotFound(Uuid),
+    #[error("pulse is closed for further responses")]
+    Closed,
+}
+
+/// Core domain aggregate – a learning pulse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningPulse {
+    pub id: Uuid,
+    pub author_id: Uuid,
+    pub title: String,
+    pub description: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub is_closed: bool,
+}
+
+impl LearningPulse {
+    /// Determines whether the pulse is still open for responses.
+    pub fn is_open(&self) -> bool {
+        !self.is_closed && self.expires_at.map(|e| e > Utc::now()).unwrap_or(true)
+    }
+}
+
+/// DTO representing a reply to a pulse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseReply {
+    pub pulse_id: Uuid,
+    pub responder_id: Uuid,
+    pub payload: ReplyPayload,
+    pub replied_at: DateTime<Utc>,
+}
+
+/// Currently supported reply types (files, snippets etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data")]
+pub enum ReplyPayload {
+    Text(String),
+    File { file_id: Uuid, filename: String },
+    CodeSnippet { language: String, code: String },
+    Recording { url: String, duration_secs: u32 },
+    // add more formats as needed
+}
+
+/// Events emitted by pulse lifecycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum PulseEvent {
+    PulseCreated(LearningPulse),
+    PulseReplied(PulseReply),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseEventEnvelope {
+    pub id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub event: PulseEvent,
+}
+
+/// Contract for publishing domain events (to RabbitMQ, Kafka, NATS…)
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, event: PulseEventEnvelope) -> Result<(), PulseError>;
+}
+
+/// Simple in-process async channel publisher, primarily used in tests
+/// or for local development when no broker is available.
+#[derive(Debug)]
+pub struct ChannelPublisher {
+    tx: Sender<PulseEventEnvelope>,
+}
+
+impl ChannelPublisher {
+    pub fn new(tx: Sender<PulseEventEnvelope>) -> Self {
+        Self { tx }
+    }
+}
+
+#[async_trait]
+impl EventPublisher for ChannelPublisher {
+    async fn publish(&self, event: PulseEventEnvelope) -> Result<(), PulseError> {
+        self.tx.send(event).await?;
+        Ok(())
+    }
+}
+
+/// Repository abstraction. In production we use Postgres (sqlx), but
+/// other backends or mocks may coexist.
+#[async_trait]
+pub trait PulseRepository: Send + Sync {
+    async fn insert(&self, pulse: &LearningPulse) -> Result<(), PulseError>;
+    async fn mark_closed(&self, pulse_id: Uuid) -> Result<(), PulseError>;
+    async fn find(&self, pulse_id: Uuid) -> Result<LearningPulse, PulseError>;
+    async fn add_reply(&self, reply: &PulseReply) -> Result<(), PulseError>;
+}
+
+/// PostgreSQL implementation. Requires the following (simplified) DDL:
+///
+/// ```sql
+/// CREATE TABLE learning_pulses (
+///     id          UUID PRIMARY KEY,
+///     author_id   UUID NOT NULL,
+///     title       TEXT NOT NULL,
+///     description TEXT NOT NULL,
+///     created_at  TIMESTAMPTZ NOT NULL,
+///     expires_at  TIMESTAMPTZ,
+///     is_closed   BOOLEAN NOT NULL
+/// );
+///
+/// CREATE TABLE pulse_replies (
+///     pulse_id     UUID REFERENCES learning_pulses(id),
+///     responder_id UUID NOT NULL,
+///     payload      JSONB NOT NULL,
+///     replied_at   TIMESTAMPTZ NOT NULL
+/// );
+/// ```
+pub struct PostgresPulseRepo {
+    db: PgPool,
+}
+
+impl PostgresPulseRepo {
+    pub fn new(db: PgPool) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl PulseRepository for PostgresPulseRepo {
+    async fn insert(&self, pulse: &LearningPulse) -> Result<(), PulseError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO learning_pulses (id, author_id, title, description,
+                                         created_at, expires_at, is_closed)
+            VALUES ($1,$2,$3,$4,$5,$6,$7)
+            "#,
+            pulse.id,
+            pulse.author_id,
+            pulse.title,
+            pulse.description,
+            pulse.created_at,
+            pulse.expires_at,
+            pulse.is_closed
+        )
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn mark_closed(&self, pulse_id: Uuid) -> Result<(), PulseError> {
+        sqlx::query!(
+            r#"UPDATE learning_pulses SET is_closed = true WHERE id = $1"#,
+            pulse_id
+        )
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn find(&self, pulse_id: Uuid) -> Result<LearningPulse, PulseError> {
+        let row: PgRow = sqlx::query(
+            r#"
+            SELECT id, author_id, title, description,
+                   created_at, expires_at, is_closed
+              FROM learning_pulses WHERE id = $1
+            "#,
+        )
+        .bind(pulse_id)
+        .fetch_one(&self.db)
+        .await?;
+
+        Ok(LearningPulse {
+            id: row.try_get("id")?,
+            author_id: row.try_get("author_id")?,
+            title: row.try_get("title")?,
+            description: row.try_get("description")?,
+            created_at: row.try_get("created_at")?,
+            expires_at: row.try_get("expires_at")?,
+            is_closed: row.try_get("is_closed")?,
+        })
+    }
+
+    async fn add_reply(&self, reply: &PulseReply) -> Result<(), PulseError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO pulse_replies (pulse_id, responder_id, payload, replied_at)
+            VALUES ($1,$2,$3,$4)
+            "#,
+            reply.pulse_id,
+            reply.responder_id,
+            serde_json::to_value(&reply.payload).unwrap(),
+            reply.replied_at
+        )
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+}
+
+/// Service layer with business logic & invariants.
+pub struct PulseService<R: PulseRepository, P: EventPublisher> {
+    repo: Arc<R>,
+    publisher: Arc<P>,
+}
+
+impl<R: PulseRepository, P: EventPublisher> PulseService<R, P> {
+    pub fn new(repo: Arc<R>, publisher: Arc<P>) -> Self {
+        Self { repo, publisher }
+    }
+
+    /// Creates a new learning pulse and publishes `PulseCreated`.
+    pub async fn create_pulse(
+        &self,
+        author_id: Uuid,
+        title: impl Into<String>,
+        description: impl Into<String>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<LearningPulse, PulseError> {
+        let pulse = LearningPulse {
+            id: Uuid::new_v4(),
+            author_id,
+            title: title.into(),
+            description: description.into(),
+            created_at: Utc::now(),
+            expires_at,
+            is_closed: false,
+        };
+
+        self.repo.insert(&pulse).await?;
+
+        let envelope = PulseEventEnvelope {
+            id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            event: PulseEvent::PulseCreated(pulse.clone()),
+        };
+
+        self.publisher.publish(envelope).await?;
+
+        Ok(pulse)
+    }
+
+    /// Adds a reply. Ensures pulse is open and emits `PulseReplied`.
+    pub async fn reply_to_pulse(
+        &self,
+        pulse_id: Uuid,
+        responder_id: Uuid,
+        payload: ReplyPayload,
+    ) -> Result<PulseReply, PulseError> {
+        let pulse = self.repo.find(pulse_id).await?;
+        if !pulse.is_open() {
+            return Err(PulseError::Closed);
+        }
+
+        let reply = PulseReply {
+            pulse_id,
+            responder_id,
+            payload,
+            replied_at: Utc::now(),
+        };
+
+        self.repo.add_reply(&reply).await?;
+
+        let envelope = PulseEventEnvelope {
+            id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            event: PulseEvent::PulseReplied(reply.clone()),
+        };
+        self.publisher.publish(envelope).await?;
+
+        Ok(reply)
+    }
+
+    /// Closes an existing pulse. No event is published here because
+    /// closing could happen through an automated TTL worker.
+    pub async fn close_pulse(&self, pulse_id: Uuid) -> Result<(), PulseError> {
+        self.repo.mark_closed(pulse_id).await
+    }
+}
+
+/// Spins up an asynchronous consumer that simply logs events. In the
+/// real system this might forward events to multiple downstream
+/// services (search-index, scoring pipeline, mailer…).
+pub fn spawn_logging_consumer(
+    rx: async_channel::Receiver<PulseEventEnvelope>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok(env) = rx.recv().await {
+            match &env.event {
+                PulseEvent::PulseCreated(p) => {
+                    info!(pulse_id=%p.id, "new pulse created");
+                }
+                PulseEvent::PulseReplied(r) => {
+                    info!(pulse_id=%r.pulse_id, responder=%r.responder_id, "new reply");
+                }
+            }
+        }
+    })
+}
+
+/// Quick smoke-test (run with `cargo test -- --nocapture`)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::OnceCell;
+
+    static LOGGER: OnceCell<()> = OnceCell::const_new();
+
+    async fn init_logger() {
+        LOGGER
+            .get_or_init(|| async {
+                tracing_subscriber::fmt()
+                    .with_test_writer()
+                    .with_target(false)
+                    .init();
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_create_and_reply_in_memory() {
+        init_logger().await;
+
+        // In-memory channel bus
+        let (tx, rx) = unbounded();
+        let publisher = Arc::new(ChannelPublisher::new(tx));
+
+        // For unit test we’ll use a naive in-memory repo instead of pg.
+        #[derive(Default)]
+        struct MemRepo {
+            pulses: parking_lot::RwLock<Vec<LearningPulse>>,
+            replies: parking_lot::RwLock<Vec<PulseReply>>,
+        }
+
+        #[async_trait]
+        impl PulseRepository for MemRepo {
+            async fn insert(&self, pulse: &LearningPulse) -> Result<(), PulseError> {
+                self.pulses.write().push(pulse.clone());
+                Ok(())
+            }
+            async fn mark_closed(&self, pulse_id: Uuid) -> Result<(), PulseError> {
+                if let Some(p) = self
+                    .pulses
+                    .write()
+                    .iter_mut()
+                    .find(|p| p.id == pulse_id)
+                {
+                    p.is_closed = true;
+                    Ok(())
+                } else {
+                    Err(PulseError::NotFound(pulse_id))
+                }
+            }
+            async fn find(&self, pulse_id: Uuid) -> Result<LearningPulse, PulseError> {
+                self
+                    .pulses
+                    .read()
+                    .iter()
+                    .find(|p| p.id == pulse_id)
+                    .cloned()
+                    .ok_or(PulseError::NotFound(pulse_id))
+            }
+            async fn add_reply(&self, reply: &PulseReply) -> Result<(), PulseError> {
+                self.replies.write().push(reply.clone());
+                Ok(())
+            }
+        }
+
+        let repo = Arc::new(MemRepo::default());
+        let service = PulseService::new(repo, publisher);
+
+        let _join = spawn_logging_consumer(rx);
+
+        let pulse = service
+            .create_pulse(
+                Uuid::new_v4(),
+                "Quantum Entanglement Snapshot",
+                "Share a concise explanation of EPR paradox.",
+                None,
+            )
+            .await
+            .expect("create should succeed");
+
+        assert!(pulse.is_open());
+
+        let reply = service
+            .reply_to_pulse(
+                pulse.id,
+                Uuid::new_v4(),
+                ReplyPayload::Text("Spooky action at a distance".into()),
+            )
+            .await
+            .expect("reply should succeed");
+
+        assert_eq!(reply.pulse_id, pulse.id);
+    }
+}
+```

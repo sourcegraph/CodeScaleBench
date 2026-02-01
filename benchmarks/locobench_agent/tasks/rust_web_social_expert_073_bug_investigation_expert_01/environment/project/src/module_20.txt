@@ -1,0 +1,344 @@
+```rust
+//! src/module_20.rs
+//!
+//! Event-sourcing infrastructure for **EduPulse Live – Event-Driven Social Learning Hub**.
+//!
+//! This module contains everything required to create, persist, and dispatch
+//! immutable domain events in a fully-async, **Tokio** powered context.  The
+//! code is designed to be reusable across bounded contexts and hides the
+//! mechanics of the message broker behind a lightweight `EventBus` façade.
+//!
+//! Production-quality concerns included:
+//!   • Proper error propagation (`thiserror`)  
+//!   • Database integration (`sqlx` w/ compile-time SQL checks)  
+//!   • Structured, versioned events with serialization guards (`serde`)  
+//!   • Broadcast-based in-process fan-out with back-pressure awareness  
+//!   • Cancellation-safe, async/await-friendly API
+//!
+//! NOTE: In production, the `EventBus` would be backed by Kafka/RabbitMQ/Redis.
+//!       For the sake of testability and single-crate compilation the example
+//!       uses `tokio::sync::broadcast`.
+
+#![allow(clippy::module_name_repetitions)]
+
+use std::{
+    fmt,
+    sync::Arc,
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::FutureExt;
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Postgres, QueryBuilder};
+use thiserror::Error;
+use tokio::sync::broadcast;
+use uuid::Uuid;
+
+/// All domain events must be wrapped inside an `EventEnvelope`.  
+/// The envelope guarantees a stable schema for persistence and transport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    /// Unique event id (ULID would also be appropriate).
+    pub id:           Uuid,
+    /// Type discriminator used by consumers / metrics.
+    pub event_type:   String,
+    /// UTC timestamp at event creation (not persistence).
+    pub occurred_at:  DateTime<Utc>,
+    /// Optional correlation id to group together causally related events.
+    pub correlation:  Option<Uuid>,
+    /// Opaque payload containing domain-specific data.
+    pub payload:      serde_json::Value,
+    /// Schema version for data migrations / evolution.
+    pub version:      i32,
+}
+
+impl EventEnvelope {
+    /// Creates an envelope from any `DomainEvent` implementor.
+    pub fn new<E: DomainEvent>(event: &E, correlation: Option<Uuid>) -> Result<Self, EventError> {
+        let payload = serde_json::to_value(event)
+            .map_err(EventError::Serialization)?;
+        Ok(Self {
+            id: Uuid::new_v4(),
+            event_type: event.event_type().to_owned(),
+            occurred_at: Utc::now(),
+            correlation,
+            payload,
+            version: E::SCHEMA_VERSION,
+        })
+    }
+}
+
+/// Marker trait implemented by all strongly-typed, serializable domain events.
+#[async_trait]
+pub trait DomainEvent: Serialize + Send + Sync {
+    /// Consumers rely on this string discriminator.
+    fn event_type(&self) -> &'static str;
+    /// Increment when breaking changes occur.
+    const SCHEMA_VERSION: i32 = 1;
+}
+
+/// ---------------------------------------------------------------------------
+/// Example events occurring inside the EduPulse Live domain
+/// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LessonPublished {
+    pub lesson_id:  Uuid,
+    pub teacher_id: Uuid,
+    pub title:      String,
+}
+
+#[async_trait]
+impl DomainEvent for LessonPublished {
+    fn event_type(&self) -> &'static str { "lesson.published" }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QuizSubmitted {
+    pub quiz_id:   Uuid,
+    pub student_id: Uuid,
+    pub score:      f32,
+}
+
+#[async_trait]
+impl DomainEvent for QuizSubmitted {
+    fn event_type(&self) -> &'static str { "quiz.submitted" }
+}
+
+/// ---------------------------------------------------------------------------
+/// Error handling
+/// ---------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum EventError {
+    #[error("serialization failure: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("broadcast channel error: {0}")]
+    Channel(#[from] broadcast::error::SendError<Arc<EventEnvelope>>),
+
+    #[error("sqlx error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+}
+
+/// Convenience alias used by callers that don't care about the concrete error.
+pub type Result<T, E = EventError> = std::result::Result<T, E>;
+
+/// ---------------------------------------------------------------------------
+/// Event store (PostgreSQL)
+/// ---------------------------------------------------------------------------
+
+/// Persists immutable events in an append-only table.
+///
+/// SQL:
+/// ```sql
+/// CREATE TABLE IF NOT EXISTS event_store (
+///     id            UUID PRIMARY KEY,
+///     event_type    TEXT NOT NULL,
+///     occurred_at   TIMESTAMPTZ NOT NULL,
+///     correlation   UUID NULL,
+///     payload       JSONB NOT NULL,
+///     version       INT  NOT NULL
+/// );
+/// ```
+#[derive(Clone)]
+pub struct PgEventStore {
+    pool: PgPool,
+}
+
+impl PgEventStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Persist a single envelope inside a transactional boundary.
+    pub async fn persist(&self, env: &EventEnvelope) -> Result<()> {
+        QueryBuilder::<Postgres>::new(
+            "INSERT INTO event_store (id, event_type, occurred_at, correlation, payload, version)",
+        )
+        .push_values(
+            std::iter::once(env),
+            |mut b, e| {
+                b.push_bind(e.id)
+                    .push_bind(&e.event_type)
+                    .push_bind(e.occurred_at)
+                    .push_bind(e.correlation)
+                    .push_bind(&e.payload)
+                    .push_bind(e.version);
+            },
+        )
+        .build()
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+}
+
+/// ---------------------------------------------------------------------------
+/// In-process event bus
+/// ---------------------------------------------------------------------------
+
+const BROADCAST_BUFFER: usize = 256;
+
+#[derive(Clone)]
+pub struct EventBus {
+    tx: broadcast::Sender<Arc<EventEnvelope>>,
+}
+
+impl EventBus {
+    /// Creates a new, bounded broadcast bus.
+    pub fn new() -> Self {
+        let (tx, _) = broadcast::channel(BROADCAST_BUFFER);
+        Self { tx }
+    }
+
+    /// Publish an envelope to all subscribers (fire-and-forget).
+    pub fn dispatch(&self, env: Arc<EventEnvelope>) -> Result<()> {
+        self.tx.send(env)?;
+        Ok(())
+    }
+
+    /// Subscribe to all events.  Each subscriber has an independent cursor.
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<EventEnvelope>> {
+        self.tx.subscribe()
+    }
+}
+
+/// ---------------------------------------------------------------------------
+/// High-level façade combining store + bus
+/// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct EventDispatcher {
+    store: PgEventStore,
+    bus:   EventBus,
+}
+
+impl EventDispatcher {
+    pub fn new(store: PgEventStore, bus: EventBus) -> Self {
+        Self { store, bus }
+    }
+
+    /// Atomically persists the event and notifies all listeners.
+    ///
+    /// `correlation` groups logically connected events (e.g. Saga workflows).
+    pub async fn publish<E>(
+        &self,
+        event: E,
+        correlation: Option<Uuid>,
+    ) -> Result<Arc<EventEnvelope>>
+    where
+        E: DomainEvent,
+    {
+        let envelope = Arc::new(EventEnvelope::new(&event, correlation)?);
+
+        // 1. Persist
+        self.store.persist(&envelope).await?;
+
+        // 2. Fan-out
+        self.bus.dispatch(envelope.clone())?;
+
+        Ok(envelope)
+    }
+}
+
+/// ---------------------------------------------------------------------------
+/// Example consumer — Indexing service
+/// ---------------------------------------------------------------------------
+
+/// Builds a Tokio task that listens for `LessonPublished` events and performs
+/// expensive search-index updates without blocking the API threadpool.
+pub fn spawn_search_indexer(bus: EventBus) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut rx = bus.subscribe();
+        while let Ok(env) = rx.recv().await {
+            if env.event_type == LessonPublished::event_type(&LessonPublished {
+                lesson_id: Uuid::nil(),
+                teacher_id: Uuid::nil(),
+                title: String::new(),
+            }) {
+                // Deserialize lazily to avoid unnecessary allocations.
+                match serde_json::from_value::<LessonPublished>(env.payload.clone()) {
+                    Ok(evt) => {
+                        // --- heavy IO / HTTP call to search cluster goes here ---
+                        tracing::info!(
+                            lesson_id = %evt.lesson_id,
+                            "indexed published lesson into search engine"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to deserialize LessonPublished");
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// ---------------------------------------------------------------------------
+/// Integration test (requires `sqlx` offline mode OR live database)
+/// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::{postgres::PgPoolOptions, Executor};
+
+    #[tokio::test]
+    async fn end_to_end_dispatch() -> Result<()> {
+        // Spin up an in-memory Postgres (e.g. `testcontainers`) in real life.
+        let db_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/edupulse_test".into());
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&db_url)
+            .await?;
+
+        // Ensure table present
+        pool.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS event_store (
+                id          UUID PRIMARY KEY,
+                event_type  TEXT NOT NULL,
+                occurred_at TIMESTAMPTZ NOT NULL,
+                correlation UUID NULL,
+                payload     JSONB NOT NULL,
+                version     INT NOT NULL
+            );
+            "#,
+        )
+        .await?;
+
+        let bus        = EventBus::new();
+        let dispatcher = EventDispatcher::new(PgEventStore::new(pool.clone()), bus.clone());
+
+        let handle = spawn_search_indexer(bus.clone());
+
+        // Publish a lesson
+        let evt = LessonPublished {
+            lesson_id:  Uuid::new_v4(),
+            teacher_id: Uuid::new_v4(),
+            title:      "Functional Programming 101".into(),
+        };
+
+        dispatcher.publish(evt, None).await?;
+
+        // Give consumer some breathing room (not ideal ⇒ use Notify/wait group)
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        handle.abort();
+
+        // Assert event persisted
+        let (cnt,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_store")
+            .fetch_one(&pool)
+            .await?;
+
+        assert_eq!(cnt, 1);
+
+        Ok(())
+    }
+}
+```

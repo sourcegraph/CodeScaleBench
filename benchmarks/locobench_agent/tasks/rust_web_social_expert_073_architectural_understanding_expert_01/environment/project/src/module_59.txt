@@ -1,0 +1,321 @@
+```rust
+//! src/module_59.rs
+//! -------------------------------------------------------------
+//! Event-Bus & Audit-Trail component for “EduPulse Live”.
+//!
+//! This module exposes a light-weight, asynchronous event-bus that
+//! serialises every domain event into a JSON envelope and persists it
+//! to Postgres for regulatory audit (GDPR, FERPA, etc.).
+//!
+//! It demonstrates production-grade patterns such as
+//!   * Tokio channels for in-process fan-out
+//!   * async/await with error propagation
+//!   * Repository pattern for database access (sqlx)
+//!   * Structured logging with `tracing`
+//!   * Strong typing & serde for (de)serialisation
+//!   * Versioned event envelopes for forward compatibility.
+//!
+//! Down-stream services (search indexing, e-mail, analytics, …) simply
+//! subscribe to the bus and react to the `EventEnvelope` stream.
+//!
+//! -------------------------------------------------------------
+
+use std::{collections::HashMap, sync::Arc};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    sync::{broadcast, RwLock},
+    task,
+};
+use tracing::{debug, error, info, instrument};
+use uuid::Uuid;
+
+// Re-export so callers do not have to pull the crate again.
+pub use chrono;
+pub use uuid;
+
+/// The latest schema version of [`EventEnvelope`].
+pub const SCHEMA_VERSION: i16 = 1;
+
+/// Domain events must implement marker-trait `DomainEvent`.
+/// Capture the event's unique *logical* name for routing.
+pub trait DomainEvent: Serialize + DeserializeOwned + Send + Sync + 'static {
+    /// Fully-qualified, version-stable event name, e.g. `lesson.published`
+    fn event_name() -> &'static str;
+}
+
+/// ---------------------------
+/// Example domain-events
+/// ---------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LessonPublished {
+    pub lesson_id: Uuid,
+    pub instructor_id: Uuid,
+    pub course_id: Uuid,
+}
+
+impl DomainEvent for LessonPublished {
+    fn event_name() -> &'static str {
+        "lesson.published"
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QuizSubmitted {
+    pub submission_id: Uuid,
+    pub student_id: Uuid,
+    pub quiz_id: Uuid,
+    pub score_raw: f32,
+}
+
+impl DomainEvent for QuizSubmitted {
+    fn event_name() -> &'static str {
+        "quiz.submitted"
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BadgeAwarded {
+    pub badge_id: Uuid,
+    pub awarded_to: Uuid,
+    pub reason: String,
+}
+
+impl DomainEvent for BadgeAwarded {
+    fn event_name() -> &'static str {
+        "badge.awarded"
+    }
+}
+
+/// ---------------------------
+/// Event envelope & helpers
+/// ---------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub id: Uuid,
+    pub aggregate_id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub event_name: String,
+    pub payload: serde_json::Value,
+    pub schema_version: i16,
+}
+
+impl EventEnvelope {
+    /// Wrap a concrete event into an [`EventEnvelope`].
+    #[instrument(level = "debug", skip(event))]
+    pub fn wrap<E: DomainEvent>(
+        aggregate_id: Uuid,
+        event: &E,
+    ) -> Result<Self, serde_json::Error> {
+        let payload = serde_json::to_value(event)?;
+        Ok(Self {
+            id: Uuid::new_v4(),
+            aggregate_id,
+            occurred_at: Utc::now(),
+            event_name: E::event_name().into(),
+            payload,
+            schema_version: SCHEMA_VERSION,
+        })
+    }
+}
+
+/// ---------------------------
+/// Error types
+/// ---------------------------
+
+#[derive(Debug, Error)]
+pub enum EventBusError {
+    #[error("failed to serialise/deserialize event: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("persistence layer error: {0}")]
+    Store(#[from] EventStoreError),
+
+    #[error("channel closed")]
+    ChannelClosed,
+}
+
+#[derive(Debug, Error)]
+pub enum EventStoreError {
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+}
+
+/// ---------------------------
+/// Persistence (Repository pattern)
+/// ---------------------------
+
+#[async_trait]
+pub trait EventStore: Send + Sync {
+    async fn append(&self, env: &EventEnvelope) -> Result<(), EventStoreError>;
+}
+
+/// SQLx-backed Postgres store.
+/// Table schema (simplified):
+///
+/// ```sql
+/// CREATE TABLE event_envelopes (
+///   id              UUID PRIMARY KEY,
+///   aggregate_id    UUID NOT NULL,
+///   occurred_at     TIMESTAMPTZ NOT NULL,
+///   event_name      TEXT NOT NULL,
+///   payload         JSONB NOT NULL,
+///   schema_version  SMALLINT NOT NULL
+/// );
+/// CREATE INDEX idx_event_envelopes_name ON event_envelopes (event_name);
+/// ```
+pub struct PostgresEventStore {
+    pool: sqlx::PgPool,
+}
+
+impl PostgresEventStore {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl EventStore for PostgresEventStore {
+    #[instrument(level = "debug", skip(self))]
+    async fn append(&self, env: &EventEnvelope) -> Result<(), EventStoreError> {
+        sqlx::query!(
+            r#"
+              INSERT INTO event_envelopes (
+                id, aggregate_id, occurred_at,
+                event_name, payload, schema_version
+              ) VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+            env.id,
+            env.aggregate_id,
+            env.occurred_at,
+            env.event_name,
+            env.payload,
+            env.schema_version
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+/// ---------------------------
+/// In-process EventBus
+/// ---------------------------
+
+type BusSender = broadcast::Sender<Arc<EventEnvelope>>;
+type BusReceiver = broadcast::Receiver<Arc<EventEnvelope>>;
+
+pub struct EventBus {
+    sender: BusSender,
+    store: Arc<dyn EventStore>,
+    // Keep a registry for graceful shutdown / debug insight.
+    #[allow(clippy::type_complexity)]
+    subscribers: RwLock<HashMap<String, usize>>,
+}
+
+impl EventBus {
+    /// Build a new [`EventBus`] with the given buffer length.
+    pub fn new<S>(store: S, buffer: usize) -> Self
+    where
+        S: EventStore + 'static,
+    {
+        let (sender, _) = broadcast::channel(buffer);
+        Self {
+            sender,
+            store: Arc::new(store),
+            subscribers: Default::default(),
+        }
+    }
+
+    /// Publish a concrete event. It will be:
+    ///   1. Wrapped into an envelope
+    ///   2. Persisted to the store (Postgres)
+    ///   3. Fanned-out via broadcast channel
+    #[instrument(level = "info", skip(self, event))]
+    pub async fn publish<E>(&self, aggregate_id: Uuid, event: &E) -> Result<(), EventBusError>
+    where
+        E: DomainEvent,
+    {
+        let envelope = EventEnvelope::wrap::<E>(aggregate_id, event)?;
+        self.store.append(&envelope).await?;
+        self.sender
+            .send(Arc::new(envelope))
+            .map_err(|_| EventBusError::ChannelClosed)?;
+        Ok(())
+    }
+
+    /// Subscribe to all events. Caller receives a [`BusReceiver`].
+    /// Each call increases the internal subscriber count.
+    pub async fn subscribe(&self, id: impl Into<String>) -> BusReceiver {
+        let mut sub_guard = self.subscribers.write().await;
+        let key = id.into();
+        let count = sub_guard.entry(key).or_default();
+        *count += 1;
+        drop(sub_guard);
+
+        self.sender.subscribe()
+    }
+
+    /// Return a map of subscriber-ids → active counter (for ops dashboards).
+    pub async fn subscriber_stats(&self) -> HashMap<String, usize> {
+        self.subscribers.read().await.clone()
+    }
+}
+
+/// Example helper to spawn a background task that listens for specific
+/// events and performs side-effects (e.g. notifications).
+pub fn spawn_search_indexer(bus: Arc<EventBus>) {
+    let mut rx = task::block_in_place(|| bus.subscribe("search_indexer"));
+    task::spawn(async move {
+        while let Ok(env) = rx.recv().await {
+            if env.event_name == LessonPublished::event_name() {
+                debug!("search-indexer: scheduling re-index for lesson {}", env.aggregate_id);
+                // → Send to external search service, omitted
+            }
+        }
+    });
+}
+
+/// ---------------------------
+/// Integration test (requires `sqlx_test` feature & test DB)
+/// ---------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::{Executor, PgPool};
+
+    // sqlx database URL is read from env var: `DATABASE_URL`
+    #[tokio::test]
+    async fn event_roundtrip() -> anyhow::Result<()> {
+        // Setup database & migrate schema (skipped in example)
+        let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+        // Clean slate
+        pool.execute("TRUNCATE event_envelopes").await?;
+
+        let store = PostgresEventStore::new(pool.clone());
+        let bus = Arc::new(EventBus::new(store, 16));
+
+        let lesson_id = Uuid::new_v4();
+        let evt = LessonPublished {
+            lesson_id,
+            instructor_id: Uuid::new_v4(),
+            course_id: Uuid::new_v4(),
+        };
+        bus.publish(lesson_id, &evt).await.unwrap();
+
+        // Ensure event hit DB
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM event_envelopes")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(row.0, 1);
+
+        Ok(())
+    }
+}
+```

@@ -1,0 +1,410 @@
+```rust
+//! src/module_48.rs
+//!
+//! Strategy-layer orchestration for real-time analysis algorithms.
+//!
+//! This module provides:
+//! 1. Dynamic registration & hot-swap of `AnalysisStrategy` implementations.
+//! 2. A fault-tolerant executor that streams `EnrichedEvent`s through the
+//!    currently-active strategy.
+//! 3. A lightweight scheduler that runs continuous data-quality checks and
+//!    emits observability metrics.
+//!
+//! Although isolated, the module is ready to be wired into the wider
+//! ChirpPulse pipeline (Kafka consumers, Iceberg writers, dashboards, …).
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
+
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use log::{debug, error, info, warn};
+use metrics::{counter, gauge, histogram};
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+    time::{self, Duration, Instant},
+};
+use uuid::Uuid;
+
+/// Raw message as it arrives from the upstream ingestion layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawEvent {
+    pub id: Uuid,
+    pub payload: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Message after the enrichment pipeline.
+///
+/// The full struct in production contains dozens of additional fields
+/// (language, geolocation, user profile slices, etc.). We only model a subset
+/// that is relevant for this module.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichedEvent {
+    pub raw: RawEvent,
+    /// ISO-639 language tag (e.g. "en", "es").
+    pub language: String,
+    /// Enrichment timestamp.
+    pub enriched_at: DateTime<Utc>,
+}
+
+/// Result returned by any `AnalysisStrategy`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisResult {
+    pub sentiment_score: f32, // -1.0..=1.0
+    pub toxicity_score: f32,  //  0.0..=1.0
+    pub labels: Vec<String>,
+    pub processed_at: DateTime<Utc>,
+}
+
+/// Errors originating from the strategy layer.
+#[derive(thiserror::Error, Debug)]
+pub enum StrategyError {
+    #[error("strategy returned invalid sentiment range: {0}")]
+    InvalidSentiment(f32),
+    #[error("strategy failed: {0}")]
+    Failure(String),
+}
+
+/// Pluggable algorithm interface.
+///
+/// All concrete strategies must be thread-safe as they will be executed on a
+/// multi-core tokio runtime.
+#[async_trait]
+pub trait AnalysisStrategy: Send + Sync + 'static {
+    /// A short, stable identifier used in dashboards and telemetry.
+    fn name(&self) -> &'static str;
+
+    /// Perform the heavy lifting.
+    async fn analyze(&self, event: &EnrichedEvent) -> Result<AnalysisResult, StrategyError>;
+}
+
+/// Simple rule-based sentiment detector.
+///
+/// This is *not* production-grade; it merely serves as a stand-in for a real
+/// NLP model.
+pub struct RuleBasedSentiment;
+
+#[async_trait]
+impl AnalysisStrategy for RuleBasedSentiment {
+    fn name(&self) -> &'static str {
+        "rule_based_v1"
+    }
+
+    async fn analyze(&self, event: &EnrichedEvent) -> Result<AnalysisResult, StrategyError> {
+        // Extremely naive example: random score biased by language.
+        let mut rng = rand::thread_rng();
+        let base: f32 = if event.language == "en" { 0.2 } else { -0.1 };
+        let sentiment = (base + rng.gen_range(-0.3..0.3)).clamp(-1.0, 1.0);
+        let toxicity = rng.gen_range(0.0..0.6);
+
+        Ok(AnalysisResult {
+            sentiment_score: sentiment,
+            toxicity_score: toxicity,
+            labels: vec![],
+            processed_at: Utc::now(),
+        })
+    }
+}
+
+/// Fake ML-backed sentiment classifier that occasionally fails to demonstrate
+/// error propagation.
+///
+/// A real implementation would wrap a TensorFlow / ONNX runtime or call out to
+/// a micro-service.
+pub struct MockMlSentiment;
+
+#[async_trait]
+impl AnalysisStrategy for MockMlSentiment {
+    fn name(&self) -> &'static str {
+        "ml_sentiment_mock"
+    }
+
+    async fn analyze(&self, _event: &EnrichedEvent) -> Result<AnalysisResult, StrategyError> {
+        // Simulate latency & random failures.
+        time::sleep(Duration::from_millis(25)).await;
+
+        let fail: bool = rand::random::<f32>() < 0.02;
+        if fail {
+            return Err(StrategyError::Failure("random model crash".into()));
+        }
+
+        Ok(AnalysisResult {
+            sentiment_score: rand::thread_rng().gen_range(-1.0..=1.0),
+            toxicity_score: rand::thread_rng().gen_range(0.0..=1.0),
+            labels: vec!["ml".into()],
+            processed_at: Utc::now(),
+        })
+    }
+}
+
+/// Live registry & orchestrator for strategies.
+#[derive(Debug)]
+pub struct StrategyRegistry {
+    /// All known strategies keyed by their unique names.
+    strategies: RwLock<HashMap<&'static str, Arc<dyn AnalysisStrategy>>>,
+    /// Watch channel that holds the name of the currently-active strategy.
+    active: watch::Sender<&'static str>,
+}
+
+impl StrategyRegistry {
+    /// Create a new registry and designate `default` as the initial active
+    /// strategy.
+    pub fn new(default: Arc<dyn AnalysisStrategy>) -> Self {
+        let default_name = default.name();
+        let mut map = HashMap::new();
+        map.insert(default_name, default);
+
+        let (tx, _rx) = watch::channel(default_name);
+        Self {
+            strategies: RwLock::new(map),
+            active: tx,
+        }
+    }
+
+    /// Register / replace a strategy implementation.
+    pub fn register(&self, strategy: Arc<dyn AnalysisStrategy>) {
+        let name = strategy.name();
+        {
+            let mut map = self.strategies.write().expect("poisoned rwlock");
+            map.insert(name, strategy);
+        }
+        info!(target: "strategy", "strategy '{name}' registered");
+    }
+
+    /// Promote `name` to be the new active strategy (hot-swap).
+    pub fn set_active(&self, name: &'static str) -> Result<()> {
+        {
+            let map = self.strategies.read().expect("poisoned rwlock");
+            if !map.contains_key(name) {
+                return Err(anyhow!("strategy '{name}' not found"));
+            }
+        }
+        self.active.send(name)?;
+        info!(target: "strategy", "strategy '{name}' activated");
+        Ok(())
+    }
+
+    /// Obtain a shared reference to the currently-active strategy.
+    pub fn current(&self) -> Arc<dyn AnalysisStrategy> {
+        let name = *self.active.borrow();
+        let map = self.strategies.read().expect("poisoned rwlock");
+        map.get(name)
+            .expect("active strategy must exist")
+            .clone()
+    }
+
+    /// Subscribe to strategy change notifications.
+    pub fn subscribe(&self) -> watch::Receiver<&'static str> {
+        self.active.subscribe()
+    }
+}
+
+/// Spawns concurrent workers that pull from `inbox` and push analysis results
+/// into `outbox`.  The pool will automatically switch to the latest strategy
+/// without losing in-flight messages.
+pub struct StrategyExecutor {
+    join_handles: Vec<JoinHandle<()>>,
+}
+
+impl StrategyExecutor {
+    /// Start `concurrency` parallel workers.  Each worker listens to strategy
+    /// changes via a `watch::Receiver`.
+    pub fn spawn(
+        registry: Arc<StrategyRegistry>,
+        mut inbox: mpsc::Receiver<EnrichedEvent>,
+        mut outbox: mpsc::Sender<AnalysisResult>,
+        concurrency: usize,
+    ) -> Self {
+        let mut join_handles = Vec::with_capacity(concurrency);
+
+        for id in 0..concurrency {
+            let registry = Arc::clone(&registry);
+            let mut inbox = inbox.clone();
+            let mut outbox = outbox.clone();
+            let mut rx_strategy = registry.subscribe();
+
+            let handle = tokio::spawn(async move {
+                info!(target: "executor", "worker #{id} online");
+                loop {
+                    tokio::select! {
+                        maybe_event = inbox.recv() => {
+                            match maybe_event {
+                                Some(event) => {
+                                    Self::process_event(&registry, &event, &mut outbox).await;
+                                },
+                                None => {
+                                    info!(target: "executor", "inbox closed; shutting down worker #{id}");
+                                    break;
+                                }
+                            }
+                        }
+                        _ = rx_strategy.changed() => {
+                            let new_strategy = *rx_strategy.borrow();
+                            info!(target: "executor", "worker #{id} switched to strategy '{new_strategy}'");
+                        }
+                    }
+                }
+            });
+            join_handles.push(handle);
+        }
+
+        Self { join_handles }
+    }
+
+    async fn process_event(
+        registry: &StrategyRegistry,
+        event: &EnrichedEvent,
+        outbox: &mut mpsc::Sender<AnalysisResult>,
+    ) {
+        let start = Instant::now();
+        let strategy = registry.current();
+        let name = strategy.name();
+
+        match strategy.analyze(event).await {
+            Ok(result) => {
+                if let Err(e) = outbox.send(result).await {
+                    error!(target: "executor", "failed to forward analysis result: {e}");
+                }
+                counter!("executor_events_ok", 1, "strategy" => name);
+            }
+            Err(err) => {
+                warn!(target: "executor", "strategy '{name}' errored: {err}");
+                counter!("executor_events_err", 1, "strategy" => name);
+            }
+        }
+
+        histogram!("executor_latency_ms", start.elapsed().as_millis() as f64, "strategy" => name);
+    }
+
+    /// Block until all workers have gracefully finished.
+    pub async fn join(self) -> Result<()> {
+        for handle in self.join_handles {
+            handle.await??;
+        }
+        Ok(())
+    }
+}
+
+/// Periodic auditor that runs data-quality checks every `interval` and
+/// publishes real-time metrics.
+///
+/// The auditor is intentionally decoupled from the main executor so that QA
+/// logic can evolve independently.
+pub struct DataQualityMonitor {
+    join_handle: JoinHandle<()>,
+}
+
+impl DataQualityMonitor {
+    pub fn spawn(registry: Arc<StrategyRegistry>, interval: Duration) -> Self {
+        let join_handle = tokio::spawn(async move {
+            let mut ticker = time::interval(interval);
+            loop {
+                ticker.tick().await;
+                Self::run_checks(&registry).await;
+            }
+        });
+
+        Self { join_handle }
+    }
+
+    async fn run_checks(registry: &StrategyRegistry) {
+        let strategy = registry.current();
+        let name = strategy.name();
+
+        // Example check: ensure sentiment scores stay within expected range by
+        // sampling the algorithm with synthetic data.
+        let fake_event = EnrichedEvent {
+            raw: RawEvent {
+                id: Uuid::new_v4(),
+                payload: "Hello World".into(),
+                created_at: Utc::now(),
+            },
+            language: "en".into(),
+            enriched_at: Utc::now(),
+        };
+
+        match strategy.analyze(&fake_event).await {
+            Ok(out) => {
+                let ok = (-1.0..=1.0).contains(&out.sentiment_score);
+                gauge!("dq_sentiment_range_ok", if ok { 1.0 } else { 0.0 }, "strategy" => name);
+                if !ok {
+                    error!(target: "dq", "strategy '{name}' produced invalid sentiment {}", out.sentiment_score);
+                }
+            }
+            Err(err) => {
+                error!(target: "dq", "strategy '{name}' failed self-test: {err}");
+                gauge!("dq_sentiment_range_ok", 0.0, "strategy" => name);
+            }
+        }
+    }
+
+    pub async fn join(self) -> Result<()> {
+        self.join_handle.await??;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mini-demo for manual runs (e.g. `cargo run --example module_48_demo`).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::timeout;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn smoke_test_strategy_hot_swap() -> Result<()> {
+        let default = Arc::new(RuleBasedSentiment);
+        let registry = Arc::new(StrategyRegistry::new(default));
+
+        // Additional strategy.
+        registry.register(Arc::new(MockMlSentiment));
+
+        // Channels.
+        let (tx_in, rx_in) = mpsc::channel(4);
+        let (tx_out, mut rx_out) = mpsc::channel(4);
+
+        let executor = StrategyExecutor::spawn(
+            Arc::clone(&registry),
+            rx_in,
+            tx_out,
+            2, // concurrency
+        );
+
+        // Send an event.
+        let event = EnrichedEvent {
+            raw: RawEvent {
+                id: Uuid::new_v4(),
+                payload: "test".into(),
+                created_at: Utc::now(),
+            },
+            language: "en".into(),
+            enriched_at: Utc::now(),
+        };
+        tx_in.send(event.clone()).await?;
+
+        // Expect a result before swapping.
+        let _first = timeout(Duration::from_secs(2), rx_out.recv()).await??;
+
+        // Activate ML strategy.
+        registry.set_active("ml_sentiment_mock")?;
+
+        // Send another event.
+        tx_in.send(event).await?;
+        let _second = timeout(Duration::from_secs(2), rx_out.recv()).await??;
+
+        drop(tx_in); // close channel
+
+        executor.join().await?;
+        Ok(())
+    }
+}
+```

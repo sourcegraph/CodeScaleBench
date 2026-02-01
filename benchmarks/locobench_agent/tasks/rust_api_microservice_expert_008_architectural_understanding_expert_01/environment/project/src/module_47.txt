@@ -1,0 +1,423 @@
+```rust
+//! src/module_47.rs
+//! -----------------------------------------------------------------------------
+//! Response-caching abstraction for the LedgerLink Nexus query layer.
+//!
+//! The cache sits between the CQ layer (`services::query::*`) and the HTTP/GraphQL
+//! transport.  A successful query result is serialized (CBOR) and persisted in
+//! Redis with a configurable TTL.  Subsequent, identical requests will be served
+//! directly from the cache, dramatically reducing latency and load on the
+//! underlying Postgres replicas.
+//!
+//! Usage excerpt (inside a query handler):
+//!
+//! ```rust,no_run
+//! use crate::cache::{CacheKey, CacheService};
+//!
+//! pub async fn handle_list_entries(
+//!     ctx: RequestContext,
+//!     repo: Arc<dyn LedgerEntryRepository>,
+//!     cache: CacheService,
+//! ) -> anyhow::Result<Vec<LedgerEntryDto>> {
+//!     let key = CacheKey::builder()
+//!         .tenant(ctx.tenant_id)
+//!         .segment("entries")
+//!         .param("page", ctx.page.to_string())
+//!         .param("size", ctx.page_size.to_string())
+//!         .build();
+//!
+//!     cache
+//!         .get_or_set_json(key, || async {
+//!             repo.fetch_entries(ctx.page, ctx.page_size).await
+//!         })
+//!         .await
+//! }
+//! ```
+//!
+//! Layered cache invalidation is triggered by the command layer (see
+//! `event_bus::CacheInvalidated`).  That logic lives elsewhere; this module
+//! focuses solely on *serving* cached responses.
+//! -----------------------------------------------------------------------------
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use deadpool_redis::{redis, Connection, Pool as RedisPool};
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
+use serde::{de::DeserializeOwned, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+use thiserror::Error;
+use tokio::{sync::Mutex, time};
+
+/// Default cache TTL unless callers override.
+pub static DEFAULT_TTL: Lazy<Duration> = Lazy::new(|| Duration::from_secs(30));
+
+/// In-memory map of in-flight requests coalesced to avoid thundering-herd.
+/// Only held for the duration of the async call.
+static INFLIGHT: Lazy<DashMap<u64, Arc<Mutex<()>>>> = Lazy::new(DashMap::new);
+
+type DashMap<K, V> = dashmap::DashMap<K, V>;
+
+/// Errors returned by the caching layer.
+#[derive(Debug, Error)]
+pub enum CacheError {
+    #[error("Redis communication error: {0}")]
+    Redis(#[from] redis::RedisError),
+
+    #[error("Serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("CBOR serialization error: {0}")]
+    Cbor(#[from] serde_cbor::Error),
+
+    #[error("Unexpected UTF-8 data")]
+    Utf8(#[from] std::string::FromUtf8Error),
+}
+
+/// Unified result type.
+pub type CacheResult<T> = Result<T, CacheError>;
+
+/// A pre-hashed 64-bit cache key.
+///
+/// Internally, we SHA-256 the human-readable segments and take the
+/// first eight bytes.  This is small enough to be used as the map key in
+/// `INFLIGHT` and also play nicely with Redis slot hashing.
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+pub struct CacheHash(u64);
+
+impl fmt::Display for CacheHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
+/// Human-readable key builder.
+///
+/// Example:
+///
+/// ```text
+/// tenant:42/segment:entries/page=1&size=20
+/// ```
+#[derive(Default)]
+pub struct CacheKeyBuilder {
+    tenant: Option<String>,
+    segment: Option<String>,
+    params: HashMap<String, String>,
+}
+
+impl CacheKeyBuilder {
+    pub fn tenant(mut self, id: impl ToString) -> Self {
+        self.tenant = Some(id.to_string());
+        self
+    }
+
+    pub fn segment(mut self, s: impl ToString) -> Self {
+        self.segment = Some(s.to_string());
+        self
+    }
+
+    pub fn param(mut self, key: impl ToString, val: impl ToString) -> Self {
+        self.params.insert(key.to_string(), val.to_string());
+        self
+    }
+
+    pub fn build(self) -> CacheKey {
+        let mut key = String::new();
+        if let Some(t) = self.tenant {
+            key.push_str("tenant:");
+            key.push_str(&t);
+            key.push('/');
+        }
+        if let Some(seg) = self.segment {
+            key.push_str("segment:");
+            key.push_str(&seg);
+        }
+        if !self.params.is_empty() {
+            key.push('/');
+            key.push_str(
+                &self
+                    .params
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("&"),
+            );
+        }
+
+        CacheKey(key)
+    }
+}
+
+/// Opaque wrapper over the human-readable component name.
+#[derive(Clone)]
+pub struct CacheKey(String);
+
+impl CacheKey {
+    pub fn builder() -> CacheKeyBuilder {
+        CacheKeyBuilder::default()
+    }
+
+    /// Convert the canonical key to its 64-bit hash for internal usage.
+    fn hash(&self) -> CacheHash {
+        let mut hasher = Sha256::default();
+        hasher.update(self.0.as_bytes());
+        let digest = hasher.finalize();
+        let bytes: [u8; 8] = digest[..8].try_into().expect("slice len");
+        CacheHash(u64::from_be_bytes(bytes))
+    }
+}
+
+impl fmt::Debug for CacheKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CacheKey").field(&self.0).finish()
+    }
+}
+
+/// Trait used by upstream services.  Exists so we can swap the redis
+/// implementation out in tests (e.g. `MemoryCache`).
+#[async_trait]
+pub trait CacheBackend: Send + Sync + 'static {
+    async fn get(&self, key: &CacheKey) -> CacheResult<Option<Bytes>>;
+    async fn set(&self, key: &CacheKey, val: Bytes, ttl: Duration) -> CacheResult<()>;
+}
+
+/// Redis-backed implementation of [`CacheBackend`].
+pub struct RedisBackend {
+    pool: RedisPool,
+}
+
+impl RedisBackend {
+    pub fn new(pool: RedisPool) -> Self {
+        Self { pool }
+    }
+
+    async fn conn(&self) -> CacheResult<Connection> {
+        Ok(self.pool.get().await?)
+    }
+}
+
+#[async_trait]
+impl CacheBackend for RedisBackend {
+    async fn get(&self, key: &CacheKey) -> CacheResult<Option<Bytes>> {
+        let mut conn = self.conn().await?;
+        let bytes: Option<Vec<u8>> = redis::cmd("GET").arg(&key.0).query_async(&mut conn).await?;
+        Ok(bytes.map(Bytes::from))
+    }
+
+    async fn set(&self, key: &CacheKey, val: Bytes, ttl: Duration) -> CacheResult<()> {
+        let mut conn = self.conn().await?;
+        redis::cmd("SETEX")
+            .arg(&key.0)
+            .arg(ttl.as_secs() as usize)
+            .arg(val)
+            .query_async::<_, ()>(&mut conn)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Public façade used by handlers.
+#[derive(Clone)]
+pub struct CacheService {
+    backend: Arc<dyn CacheBackend>,
+}
+
+impl CacheService {
+    pub fn new<B: CacheBackend>(backend: B) -> Self {
+        Self {
+            backend: Arc::new(backend),
+        }
+    }
+
+    /// Fetch JSON-encoded cache entry or compute it using the supplied async
+    /// thunk.  Serialization format is JSON for human debug-ability.
+    ///
+    /// On serialization errors, the computation is still successful but
+    /// the cache write is skipped to avoid polluting the store with
+    /// corrupted blobs.
+    pub async fn get_or_set_json<T, F, Fut>(
+        &self,
+        key: CacheKey,
+        producer: F,
+    ) -> CacheResult<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = anyhow::Result<T>> + Send,
+    {
+        self.get_or_set_impl(key, producer, Serializer::Json).await
+    }
+
+    /// CBOR variant—smaller footprint, preferred for binary payloads.
+    pub async fn get_or_set_cbor<T, F, Fut>(
+        &self,
+        key: CacheKey,
+        producer: F,
+    ) -> CacheResult<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = anyhow::Result<T>> + Send,
+    {
+        self.get_or_set_impl(key, producer, Serializer::Cbor).await
+    }
+
+    async fn get_or_set_impl<T, F, Fut>(
+        &self,
+        key: CacheKey,
+        producer: F,
+        serializer: Serializer,
+    ) -> CacheResult<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = anyhow::Result<T>> + Send,
+    {
+        // Quick path: check cache first.
+        if let Some(bytes) = self.backend.get(&key).await? {
+            if let Ok(val) = serializer.deserialize::<T>(&bytes) {
+                metrics::increment_counter!("cache_hits", &[]);
+                return Ok(val);
+            } else {
+                // If deserialization fails, we treat as miss and recompute.
+                metrics::increment_counter!("cache_corrupt", &[]);
+            }
+        } else {
+            metrics::increment_counter!("cache_misses", &[]);
+        }
+
+        // Coalesce in-flight queries with the same hash to avoid duplicate work.
+        let hash = key.hash();
+        let mutex = INFLIGHT
+            .entry(hash.0)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+
+        let _guard = mutex.lock().await;
+
+        // Double-checked locking after acquiring the inflight guard.
+        if let Some(bytes) = self.backend.get(&key).await? {
+            if let Ok(val) = serializer.deserialize::<T>(&bytes) {
+                metrics::increment_counter!("cache_hits_after_lock", &[]);
+                return Ok(val);
+            }
+        }
+
+        // Produce value.
+        let val = producer().await.map_err(|e| {
+            // Producer failures propagate but are also tracked.
+            metrics::increment_counter!("cache_producer_err", &[]);
+            CacheError::from(serde_json::Error::custom(e.to_string()))
+        })?;
+
+        // Serialize.
+        if let Ok(bytes) = serializer.serialize(&val) {
+            // Fire-and-forget write; errors are logged but not fatal to the call.
+            let backend = self.backend.clone();
+            let key_clone = key.clone();
+            tokio::spawn(async move {
+                if let Err(e) = backend.set(&key_clone, bytes, *DEFAULT_TTL).await {
+                    tracing::warn!(error = %e, "failed to persist cache entry");
+                }
+            });
+        }
+
+        Ok(val)
+    }
+}
+
+/// Supported serialization formats.
+enum Serializer {
+    Json,
+    Cbor,
+}
+
+impl Serializer {
+    fn serialize<T: Serialize>(&self, obj: &T) -> CacheResult<Bytes> {
+        match self {
+            Serializer::Json => {
+                let data = serde_json::to_vec(obj)?;
+                Ok(Bytes::from(data))
+            }
+            Serializer::Cbor => {
+                let data = serde_cbor::to_vec(obj)?;
+                Ok(Bytes::from(data))
+            }
+        }
+    }
+
+    fn deserialize<T: DeserializeOwned>(&self, bytes: &Bytes) -> CacheResult<T> {
+        match self {
+            Serializer::Json => Ok(serde_json::from_slice(bytes)?),
+            Serializer::Cbor => Ok(serde_cbor::from_slice(bytes)?),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct MemoryBackend {
+        store: RwLock<HashMap<String, (Bytes, SystemTime)>>,
+    }
+
+    impl MemoryBackend {
+        fn new() -> Self {
+            Self {
+                store: RwLock::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CacheBackend for MemoryBackend {
+        async fn get(&self, key: &CacheKey) -> CacheResult<Option<Bytes>> {
+            let map = self.store.read();
+            Ok(map.get(&key.0).map(|(b, _)| b.clone()))
+        }
+
+        async fn set(&self, key: &CacheKey, val: Bytes, _ttl: Duration) -> CacheResult<()> {
+            let mut map = self.store.write();
+            map.insert(key.0.clone(), (val, SystemTime::now()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_or_set_json() {
+        let cache = CacheService::new(MemoryBackend::new());
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        let key = CacheKey::builder().tenant("t").segment("foo").build();
+
+        let res1: String = cache
+            .get_or_set_json(key.clone(), || async {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, anyhow::Error>("bar".to_string())
+            })
+            .await
+            .unwrap();
+
+        let res2: String = cache
+            .get_or_set_json(key, || async {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, anyhow::Error>("bar".to_string())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(res1, "bar");
+        assert_eq!(res2, "bar");
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+    }
+}
+```

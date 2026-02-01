@@ -1,0 +1,450 @@
+```rust
+//! module_48.rs
+//! -----------------------------------------------------------------------------
+//! Account Snapshot Query Service
+//! -----------------------------------------------------------------------------
+//! This module hosts the query-side implementation for fetching paginated
+//! account snapshots.  It demonstrates a full vertical slice that includes:
+//!
+//! • DTOs (View-Models) with strong validation
+//! • Service layer with Repository + Cache (Redis)
+//! • Tracing-based structured logging
+//! • Tenant-aware authentication context
+//! • Rich, typed error envelopes
+//!
+//! The code is written to production quality and follows LedgerLink Nexus
+//! conventions (MVVM-inspired layering, CQRS, and repository pattern).
+//!
+//! -----------------------------------------------------------------------------
+//! NOTE: This file is intended to be compiled as part of the `api_microservice`
+//! crate.  Dependencies required (Cargo.toml):
+//!
+//! [dependencies]
+//! async-trait = "0.1"
+//! chrono       = { version = "0.4", features = ["serde"] }
+//! redis        = { version = "0.23", features = ["aio", "tokio-comp"] }
+//! serde        = { version = "1.0", features = ["derive"] }
+//! serde_json   = "1.0"
+//! sqlx         = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid"] }
+//! thiserror    = "1.0"
+//! tokio        = { version = "1", features = ["rt-multi-thread", "macros"] }
+//! tracing      = "0.1"
+//! uuid         = { version = "1", features = ["serde", "v4"] }
+//! validator    = "0.16"
+//!
+//! -----------------------------------------------------------------------------
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use redis::aio::ConnectionLike;
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use std::sync::Arc;
+use thiserror::Error;
+use tracing::{error, info, instrument};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+/// Session data injected by the API-Gateway after authentication.
+/// Provides tenant scoping & user information for command/query handlers.
+#[derive(Debug, Clone)]
+pub struct AuthContext {
+    pub tenant_id: Uuid,
+    pub user_id:   Uuid,
+    /// ISO-3166 alpha-2 country code for localization, analytics, etc.
+    pub locale:    String,
+}
+
+/// Strongly-typed identifier for an `AccountSnapshot`.
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SnapshotId(Uuid);
+
+impl SnapshotId {
+    pub fn new(id: Uuid) -> Self {
+        Self(id)
+    }
+    pub fn into_inner(self) -> Uuid {
+        self.0
+    }
+}
+
+/// View-Model for query parameters (validated).
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct GetSnapshotsRequest {
+    /// Requested page (1-based index).
+    #[validate(range(min = 1, message = "page must be >= 1"))]
+    pub page: u32,
+
+    /// Page size (max 500).
+    #[validate(range(min = 1, max = 500, message = "page_size must be 1..=500"))]
+    pub page_size: u32,
+
+    /// Optional filter for an account identifier (UUID).
+    #[validate(custom = "validate_optional_uuid")]
+    pub account_id: Option<String>,
+}
+
+fn validate_optional_uuid(id: &str) -> Result<(), ValidationError> {
+    Uuid::parse_str(id)
+        .map(|_| ())
+        .map_err(|_| ValidationError::new("invalid_uuid"))
+}
+
+/// View-Model for a single snapshot item.
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotDto {
+    pub id:          Uuid,
+    pub account_id:  Uuid,
+    pub balance:     rust_decimal::Decimal,
+    pub as_of:       DateTime<Utc>,
+    pub captured_at: DateTime<Utc>,
+}
+
+/// Paginated response envelope.
+#[derive(Debug, Clone, Serialize)]
+pub struct PaginatedResponse<T> {
+    pub data:       Vec<T>,
+    pub page:       u32,
+    pub page_size:  u32,
+    pub total:      u64,
+    pub total_pages: u32,
+}
+
+/// Repository interface (Query side) for snapshots.
+#[async_trait]
+pub trait AccountSnapshotRepository: Send + Sync {
+    async fn fetch_page(
+        &self,
+        tenant: Uuid,
+        account_id: Option<Uuid>,
+        page: u32,
+        page_size: u32,
+    ) -> Result<(Vec<SnapshotDto>, u64), SnapshotError>;
+}
+
+/// Postgres implementation of the repository.
+pub struct PostgresAccountSnapshotRepository {
+    pool: PgPool,
+}
+
+impl PostgresAccountSnapshotRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl AccountSnapshotRepository for PostgresAccountSnapshotRepository {
+    #[instrument(skip_all, fields(tenant = %tenant))]
+    async fn fetch_page(
+        &self,
+        tenant: Uuid,
+        account_id: Option<Uuid>,
+        page: u32,
+        page_size: u32,
+    ) -> Result<(Vec<SnapshotDto>, u64), SnapshotError> {
+        let offset = ((page - 1) * page_size) as i64;
+        let limit  = page_size as i64;
+
+        let (rows, total): (Vec<_>, i64) = if let Some(acc_id) = account_id {
+            sqlx::query!(
+                r#"
+                SELECT  s.id,
+                        s.account_id,
+                        s.balance,
+                        s.as_of,
+                        s.captured_at,
+                        COUNT(*) OVER() AS total_count
+                FROM    ledger.account_snapshots s
+                WHERE   s.tenant_id   = $1
+                  AND   s.account_id  = $2
+                ORDER BY s.as_of DESC
+                OFFSET $3
+                LIMIT  $4
+                "#,
+                tenant,
+                acc_id,
+                offset,
+                limit,
+            )
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                (
+                    SnapshotDto {
+                        id:          row.id,
+                        account_id:  row.account_id,
+                        balance:     row.balance,
+                        as_of:       row.as_of,
+                        captured_at: row.captured_at,
+                    },
+                    row.total_count,
+                )
+            })
+            .unzip()
+        } else {
+            sqlx::query!(
+                r#"
+                SELECT  s.id,
+                        s.account_id,
+                        s.balance,
+                        s.as_of,
+                        s.captured_at,
+                        COUNT(*) OVER() AS total_count
+                FROM    ledger.account_snapshots s
+                WHERE   s.tenant_id = $1
+                ORDER BY s.as_of DESC
+                OFFSET $2
+                LIMIT  $3
+                "#,
+                tenant,
+                offset,
+                limit,
+            )
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                (
+                    SnapshotDto {
+                        id:          row.id,
+                        account_id:  row.account_id,
+                        balance:     row.balance,
+                        as_of:       row.as_of,
+                        captured_at: row.captured_at,
+                    },
+                    row.total_count,
+                )
+            })
+            .unzip()
+        };
+
+        let total_count = total.first().copied().unwrap_or(0) as u64;
+        Ok((rows, total_count))
+    }
+}
+
+/// High-level service coordinating repository + cache.
+pub struct AccountSnapshotService<R, C> {
+    repo: Arc<R>,
+    cache: Arc<C>,
+}
+
+impl<R, C> AccountSnapshotService<R, C>
+where
+    R: AccountSnapshotRepository + 'static,
+    C: SnapshotCache + 'static,
+{
+    pub fn new(repo: Arc<R>, cache: Arc<C>) -> Self {
+        Self { repo, cache }
+    }
+
+    /// Public façade to fetch paginated snapshots.  Honors multi-tenancy,
+    /// applies validation, leverages caching and emits structured tracing.
+    #[instrument(skip(self, ctx, req))]
+    pub async fn get_snapshots(
+        &self,
+        ctx: &AuthContext,
+        req: GetSnapshotsRequest,
+    ) -> Result<PaginatedResponse<SnapshotDto>, SnapshotError> {
+        // ------------------------------------------------------------------
+        // Input validation
+        // ------------------------------------------------------------------
+        req.validate()?;
+
+        // ------------------------------------------------------------------
+        // Cache lookup (cache-as-sidecar)
+        // ------------------------------------------------------------------
+        let cache_key = self.cache.make_key(
+            ctx.tenant_id,
+            req.account_id
+                .as_ref()
+                .and_then(|s| Uuid::parse_str(s).ok()),
+            req.page,
+            req.page_size,
+        );
+
+        if let Some(cached) = self.cache.get::<PaginatedResponse<SnapshotDto>>(&cache_key).await? {
+            info!(%cache_key, "cache hit");
+            return Ok(cached);
+        }
+        info!(%cache_key, "cache miss");
+
+        // ------------------------------------------------------------------
+        // Fetch from repository
+        // ------------------------------------------------------------------
+        let (records, total) = self
+            .repo
+            .fetch_page(
+                ctx.tenant_id,
+                req.account_id
+                    .as_ref()
+                    .and_then(|s| Uuid::parse_str(s).ok()),
+                req.page,
+                req.page_size,
+            )
+            .await?;
+
+        // ------------------------------------------------------------------
+        // Build response envelope
+        // ------------------------------------------------------------------
+        let total_pages = ((total as f64) / (req.page_size as f64)).ceil() as u32;
+        let response = PaginatedResponse {
+            data: records,
+            page: req.page,
+            page_size: req.page_size,
+            total,
+            total_pages,
+        };
+
+        // ------------------------------------------------------------------
+        // Persist to cache (fire-and-forget)
+        // ------------------------------------------------------------------
+        self.cache
+            .set(&cache_key, &response, CACHE_TTL_SECONDS)
+            .await?;
+
+        Ok(response)
+    }
+}
+
+/// Redis-backed side-cache interface.
+#[async_trait]
+pub trait SnapshotCache: Send + Sync {
+    async fn get<T>(&self, key: &str) -> Result<Option<T>, SnapshotError>
+    where
+        T: serde::de::DeserializeOwned + Send + Sync;
+
+    async fn set<T>(&self, key: &str, value: &T, ttl_seconds: usize) -> Result<(), SnapshotError>
+    where
+        T: Serialize + Send + Sync;
+
+    fn make_key(
+        &self,
+        tenant: Uuid,
+        account_id: Option<Uuid>,
+        page: u32,
+        page_size: u32,
+    ) -> String;
+}
+
+/// Concrete Redis cache implementation.
+pub struct RedisSnapshotCache {
+    client: redis::Client,
+}
+
+const CACHE_TTL_SECONDS: usize = 30; // Highly volatile ledger data
+
+impl RedisSnapshotCache {
+    pub fn new(client: redis::Client) -> Self {
+        Self { client }
+    }
+
+    async fn get_conn(&self) -> Result<impl ConnectionLike + Send, SnapshotError> {
+        Ok(self.client.get_async_connection().await?)
+    }
+}
+
+#[async_trait]
+impl SnapshotCache for RedisSnapshotCache {
+    #[instrument(skip(self))]
+    async fn get<T>(&self, key: &str) -> Result<Option<T>, SnapshotError>
+    where
+        T: serde::de::DeserializeOwned + Send + Sync,
+    {
+        let mut conn = self.get_conn().await?;
+        let payload: Option<Vec<u8>> = conn.get(key).await?;
+        if let Some(buf) = payload {
+            Ok(Some(serde_json::from_slice(&buf)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[instrument(skip(self, value))]
+    async fn set<T>(&self, key: &str, value: &T, ttl_seconds: usize) -> Result<(), SnapshotError>
+    where
+        T: Serialize + Send + Sync,
+    {
+        let mut conn = self.get_conn().await?;
+        let buf = serde_json::to_vec(value)?;
+        let _: () = redis::pipe()
+            .cmd("SET")
+            .arg(key)
+            .arg(buf)
+            .ignore()
+            .cmd("EXPIRE")
+            .arg(key)
+            .arg(ttl_seconds)
+            .query_async(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    fn make_key(
+        &self,
+        tenant: Uuid,
+        account_id: Option<Uuid>,
+        page: u32,
+        page_size: u32,
+    ) -> String {
+        format!(
+            "snapshots:{tenant}:{account}:{page}:{page_size}",
+            tenant = tenant,
+            account = account_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "all".into()),
+            page = page,
+            page_size = page_size
+        )
+    }
+}
+
+/// Custom error envelope — maps to HTTP 4xx/5xx via `axum` or `actix`.
+#[derive(Error, Debug)]
+pub enum SnapshotError {
+    #[error("input validation failed: {0}")]
+    Validation(#[from] validator::ValidationErrors),
+
+    #[error("database error")]
+    Database(#[from] sqlx::Error),
+
+    #[error("cache I/O error")]
+    Cache(#[from] redis::RedisError),
+
+    #[error("serialization error")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("unexpected: {0}")]
+    Unexpected(String),
+}
+
+impl From<std::io::Error> for SnapshotError {
+    fn from(e: std::io::Error) -> Self {
+        SnapshotError::Unexpected(e.to_string())
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Example wire-up (would live in the service bootstrap, not production code).
+// ----------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dotenvy::dotenv;
+    use std::env;
+
+    #[tokio::test]
+    async fn test_make_cache_key() {
+        dotenv().ok();
+        let cache = RedisSnapshotCache::new(
+            redis::Client::open(env::var("REDIS_URL").unwrap()).unwrap(),
+        );
+        let tenant = Uuid::new_v4();
+        let key = cache.make_key(tenant, None, 1, 50);
+        assert!(key.starts_with("snapshots:"));
+    }
+}
+```

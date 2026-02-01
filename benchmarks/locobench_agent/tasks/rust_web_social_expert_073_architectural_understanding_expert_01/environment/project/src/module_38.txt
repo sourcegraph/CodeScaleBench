@@ -1,0 +1,366 @@
+```rust
+//! src/module_38.rs
+//! -------------------------------------------------------------
+//! EduPulse Live – Learning-Pulse module
+//! -------------------------------------------------------------
+//! This module owns the creation workflow of a “Learning Pulse”, the
+//! micro-activity teachers publish to learners.  A successful creation
+//! persists the pulse in Postgres and emits a `PulseCreated` domain event
+//! that downstream services (plagiarism checks, search indexing, push-
+//! notifications, etc.) subscribe to.
+//!
+//! NOTE: In real deployment the pieces below would likely be split into
+//! multiple crates (domain, infrastructure, api, etc.).  They are collocated
+//! here for brevity and to satisfy the single-file requirement of the prompt.
+//!
+//! Dependencies in `Cargo.toml` (informative):
+//! ```toml
+//! [dependencies]
+//! tokio         = { version = "1", features = ["macros", "rt-multi-thread"] }
+//! async-trait   = "0.1"
+//! serde         = { version = "1", features = ["derive"] }
+//! serde_json    = "1"
+//! chrono        = { version = "0.4", features = ["serde"] }
+//! sqlx          = { version = "0.7", default-features = false, features = ["runtime-tokio-native-tls", "postgres", "macros", "chrono"] }
+//! nats          = "0.24"
+//! thiserror     = "1"
+//! uuid          = { version = "1", features = ["serde", "v4"] }
+//! tracing       = "0.1"
+//! ```
+//! -------------------------------------------------------------
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::task;
+use tracing::{error, info};
+use uuid::Uuid;
+
+// =============================================================
+// Domain
+// =============================================================
+
+/// Strongly-typed identifier for a Pulse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PulseId(Uuid);
+
+impl PulseId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+/// Possible visibility scopes for a Pulse.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "pulse_visibility")]
+pub enum PulseVisibility {
+    Public,
+    CourseOnly,
+    Private, // visible to teacher only
+}
+
+/// Aggregate root representing a Learning Pulse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Pulse {
+    pub id: PulseId,
+    pub teacher_id: Uuid,
+    pub course_id: Uuid,
+    pub title: String,
+    pub instructions: String,
+    pub visibility: PulseVisibility,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Domain event marker trait.
+pub trait DomainEvent: Serialize {
+    fn event_type(&self) -> &'static str;
+}
+
+/// Concrete event fired when a pulse is created.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseCreated {
+    pub pulse_id: PulseId,
+    pub teacher_id: Uuid,
+    pub course_id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+}
+
+impl DomainEvent for PulseCreated {
+    fn event_type(&self) -> &'static str {
+        "edu.pulse.pulse.created"
+    }
+}
+
+// =============================================================
+// Errors
+// =============================================================
+
+#[derive(Debug, Error)]
+pub enum PulseError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("messaging error: {0}")]
+    Messaging(#[from] nats::Error),
+    #[error("validation error: {0}")]
+    Validation(String),
+    #[error("unexpected error: {0}")]
+    Unexpected(String),
+}
+
+// =============================================================
+// Infrastructure – Repository
+// =============================================================
+
+#[async_trait]
+pub trait PulseRepository: Send + Sync {
+    async fn insert(&self, pulse: &Pulse) -> Result<(), PulseError>;
+    async fn find_by_id(&self, id: PulseId) -> Result<Option<Pulse>, PulseError>;
+}
+
+/// Postgres/SqLx-backed repository implementation.
+pub struct SqlxPulseRepository {
+    pool: PgPool,
+}
+
+impl SqlxPulseRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl PulseRepository for SqlxPulseRepository {
+    async fn insert(&self, pulse: &Pulse) -> Result<(), PulseError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO pulses (id, teacher_id, course_id, title, instructions,
+                                visibility, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+            pulse.id.0,
+            pulse.teacher_id,
+            pulse.course_id,
+            pulse.title,
+            pulse.instructions,
+            pulse.visibility as PulseVisibility, // enum will be mapped
+            pulse.created_at,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn find_by_id(&self, id: PulseId) -> Result<Option<Pulse>, PulseError> {
+        let rec = sqlx::query!(
+            r#"
+            SELECT id, teacher_id, course_id, title, instructions,
+                   visibility as "visibility: PulseVisibility", created_at
+            FROM pulses
+            WHERE id = $1
+            "#,
+            id.0
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(rec.map(|r| Pulse {
+            id: PulseId(r.id),
+            teacher_id: r.teacher_id,
+            course_id: r.course_id,
+            title: r.title,
+            instructions: r.instructions,
+            visibility: r.visibility,
+            created_at: r.created_at,
+        }))
+    }
+}
+
+// =============================================================
+// Infrastructure – Event Publisher
+// =============================================================
+
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, event: &impl DomainEvent) -> Result<(), PulseError>;
+}
+
+/// NATS.io-backed event publisher.
+pub struct NatsPublisher {
+    client: nats::asynk::Connection,
+}
+
+impl NatsPublisher {
+    pub async fn connect(url: &str) -> Result<Self, PulseError> {
+        let client = nats::asynk::connect(url).await?;
+        Ok(Self { client })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for NatsPublisher {
+    async fn publish(&self, event: &impl DomainEvent) -> Result<(), PulseError> {
+        // Serialize the event to JSON to keep payload format agnostic.
+        let payload = serde_json::to_vec(event)
+            .map_err(|e| PulseError::Unexpected(e.to_string()))?;
+        self.client
+            .publish(event.event_type(), payload.into())
+            .await?;
+        Ok(())
+    }
+}
+
+// =============================================================
+// Application – Service Layer
+// =============================================================
+
+/// Command DTO used by API layer to create a pulse.
+#[derive(Debug, Clone)]
+pub struct CreatePulseCommand {
+    pub teacher_id: Uuid,
+    pub course_id: Uuid,
+    pub title: String,
+    pub instructions: String,
+    pub visibility: PulseVisibility,
+}
+
+/// Service orchestrating the creation workflow.  All heavy I/O is async.
+pub struct PulseService<R: PulseRepository, P: EventPublisher> {
+    repo: Arc<R>,
+    publisher: Arc<P>,
+}
+
+impl<R: PulseRepository, P: EventPublisher> PulseService<R, P> {
+    pub fn new(repo: Arc<R>, publisher: Arc<P>) -> Self {
+        Self { repo, publisher }
+    }
+
+    /// Main business use-case: create a new pulse.
+    pub async fn create_pulse(&self, cmd: CreatePulseCommand) -> Result<Pulse, PulseError> {
+        // 1) Validate
+        if cmd.title.trim().is_empty() {
+            return Err(PulseError::Validation("title must not be empty".into()));
+        }
+
+        // 2) Build aggregate
+        let pulse = Pulse {
+            id: PulseId::new(),
+            teacher_id: cmd.teacher_id,
+            course_id: cmd.course_id,
+            title: cmd.title,
+            instructions: cmd.instructions,
+            visibility: cmd.visibility,
+            created_at: Utc::now(),
+        };
+
+        // 3) Persist
+        self.repo.insert(&pulse).await?;
+
+        // 4) Emit domain event (fire-and-forget so we don't block API latency)
+        let publisher = Arc::clone(&self.publisher);
+        let event = PulseCreated {
+            pulse_id: pulse.id,
+            teacher_id: pulse.teacher_id,
+            course_id: pulse.course_id,
+            occurred_at: Utc::now(),
+        };
+        task::spawn(async move {
+            if let Err(err) = publisher.publish(&event).await {
+                error!(?err, "failed to publish PulseCreated event");
+            } else {
+                info!("PulseCreated event published");
+            }
+        });
+
+        Ok(pulse)
+    }
+}
+
+// =============================================================
+// Configuration bootstrap helpers
+// =============================================================
+
+/// Bootstrap and return a Postgres connection pool.
+pub async fn init_pg_pool(database_url: &str) -> Result<PgPool, PulseError> {
+    Ok(PgPoolOptions::new()
+        .max_connections(10)
+        .connect(database_url)
+        .await?)
+}
+
+/// Build a fully-wired `PulseService`.
+pub async fn build_pulse_service(
+    pg_url: &str,
+    nats_url: &str,
+) -> Result<
+    PulseService<SqlxPulseRepository, NatsPublisher>,
+    PulseError,
+> {
+    // Database
+    let pool = init_pg_pool(pg_url).await?;
+    let repo = Arc::new(SqlxPulseRepository::new(pool));
+
+    // Event publisher
+    let publisher = Arc::new(NatsPublisher::connect(nats_url).await?);
+
+    Ok(PulseService::new(repo, publisher))
+}
+
+// =============================================================
+// Example of service usage (would live in another file in reality)
+// =============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Executor;
+
+    // Helper to spin up an in-memory Postgres using the `sqlx` test feature
+    // or a docker-based ephemeral instance in real test infra. Here we just
+    // assume DATABASE_URL is a test database.
+    #[tokio::test]
+    async fn create_pulse_happy_path() -> Result<(), Box<dyn std::error::Error>> {
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL env-var must be set for integration tests");
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "demo.nats.io:4222".into());
+
+        // ── Setup database schema (migrations skipped for brevity)
+        let pool = init_pg_pool(&database_url).await?;
+        pool.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS pulses (
+                id            UUID PRIMARY KEY,
+                teacher_id    UUID NOT NULL,
+                course_id     UUID NOT NULL,
+                title         TEXT NOT NULL,
+                instructions  TEXT NOT NULL,
+                visibility    TEXT NOT NULL,
+                created_at    TIMESTAMPTZ NOT NULL
+            )
+            "#,
+        )
+        .await?;
+
+        let service = build_pulse_service(&database_url, &nats_url).await?;
+
+        let cmd = CreatePulseCommand {
+            teacher_id: Uuid::new_v4(),
+            course_id: Uuid::new_v4(),
+            title: "Binary Search Challenge".into(),
+            instructions: "Implement binary search in Rust. Submit code snippet.".into(),
+            visibility: PulseVisibility::CourseOnly,
+        };
+
+        let pulse = service.create_pulse(cmd.clone()).await?;
+
+        assert_eq!(pulse.title, cmd.title);
+        assert_eq!(pulse.instructions, cmd.instructions);
+
+        // Clean-up
+        pool.execute("TRUNCATE TABLE pulses").await?;
+        Ok(())
+    }
+}
+```

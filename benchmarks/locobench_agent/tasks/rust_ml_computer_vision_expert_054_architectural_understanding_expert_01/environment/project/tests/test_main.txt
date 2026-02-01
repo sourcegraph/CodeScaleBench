@@ -1,0 +1,324 @@
+```rust
+//! Integration tests exercising the public API of the VisuTility Orchestrator
+//!
+//! These tests assume that the library is pulled in as a normal crate
+//! dependency under the canonical name `visutility_orchestrator`.
+//
+// NOTE:  All tests are `tokio`-powered so that we can transparently exercise
+//        the platform's async APIs without sprinkling runtime boiler-plate
+//        across every single test case.  The orchestrator itself uses Tokio
+//        internally, therefore the tests run on the same executor the library
+//        is designed for.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use tokio::sync::{broadcast, oneshot};
+use tokio::time::timeout;
+use tracing::{info, Level};
+use visutility_orchestrator::{
+    camera::CameraMeta,
+    events::{DriftEvent, Event},
+    factory::PipelineFactory,
+    model::{
+        registry::{ModelRegistry, RegisterOptions},
+        ModelHandle,
+    },
+    ops::pipeline::{Pipeline, PipelineBuilder},
+    telemetry,
+    traits::{DriftMonitor, FrameSource, Observed},
+};
+
+// ----------------------------------------------------------------------------
+// Boiler-plate test helpers
+// ----------------------------------------------------------------------------
+
+/// Initialize tracing + telemetry once for the whole test-suite.
+///
+/// The VisuTility Orchestrator uses `tracing` internally, therefore having a
+/// subscriber in place allows both library code and our test code to emit
+/// diagnostics without interfering with each other.
+///
+/// We lazily initialise the subscriber on the first invocation to prevent
+/// double-registration panics when multiple tests are run in parallel.
+fn init_tracing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        telemetry::configure_subscriber(Level::INFO).expect("Failed to init telemetry");
+    });
+}
+
+/// A convenience macro that wraps an async expression in a [`tokio::time::timeout`] with a
+/// reasonable default, turning panics into proper `anyhow::Error`s.
+///
+/// This is particularly handy in flaky CI environments where a stalled future
+/// would otherwise hang the entire test run.
+macro_rules! within {
+    ($duration:expr, $expr:expr) => {
+        timeout($duration, $expr)
+            .await
+            .with_context(|| format!("timeout after {:?}", $duration))?
+    };
+}
+
+// ----------------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipeline_instantiation_for_rgb_camera() -> Result<()> {
+    init_tracing();
+
+    // ---------------------------------------------------------------------
+    // GIVEN: an RGB camera feed coming from a manufacturing line
+    // ---------------------------------------------------------------------
+    let camera_meta = CameraMeta::new("cam-rgb-01", "RGB", 30 /*fps*/);
+
+    // A broadcast channel through which our stub frame source will publish frames
+    let (tx, rx) = broadcast::channel(8);
+    let frame_source = StubFrameSource::new(camera_meta.clone(), tx);
+
+    // ---------------------------------------------------------------------
+    // WHEN:  building a pipeline through the `PipelineFactory`
+    // ---------------------------------------------------------------------
+    let pipeline = PipelineFactory::default()
+        .with_frame_source(Box::new(frame_source))
+        .with_default_preprocessors()
+        .with_default_feature_extractors()
+        .with_default_models()
+        .build()
+        .context("failed to build pipeline")?;
+
+    // The pipeline should spawn its processing graph as soon as we `start`.
+    let (_stop_tx, stop_rx) = oneshot::channel();
+    pipeline.start(stop_rx).await?;
+
+    // ---------------------------------------------------------------------
+    // THEN:  ingesting a single dummy frame should result in at least one
+    //        `Event::Detection` being emitted on the pipeline-wide event bus.
+    // ---------------------------------------------------------------------
+    let mut bus = pipeline.event_bus();
+    within!(Duration::from_secs(1), async move {
+        loop {
+            match bus.recv().await? {
+                Event::Detection(d) if d.camera_id == "cam-rgb-01" => {
+                    info!("Successfully observed detection: {:?}", d);
+                    break Ok(());
+                }
+                _ => continue,
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn model_registry_versioning_is_monotonic() -> Result<()> {
+    init_tracing();
+
+    // ---------------------------------------------------------------------
+    // GIVEN: an empty, in-memory registry
+    // ---------------------------------------------------------------------
+    let registry = ModelRegistry::in_memory();
+
+    // ---------------------------------------------------------------------
+    // WHEN:  registering several versions of the same logical model
+    // ---------------------------------------------------------------------
+    let mut expected_version = 1u32;
+    for _ in 0..3 {
+        let handle = registry
+            .register(
+                "object-detector",
+                RegisterOptions::default(),
+                |_| Ok(Arc::<StubModel>::default() as Arc<dyn ModelHandle>),
+            )
+            .await?;
+
+        // -----------------------------------------------------------------
+        // THEN:  each subsequent registration MUST increment the version
+        //       monotonically.
+        // -----------------------------------------------------------------
+        assert_eq!(handle.version(), expected_version);
+        expected_version += 1;
+    }
+
+    // The registry should also surface the latest version conveniently.
+    let latest = registry.latest("object-detector").await?.unwrap();
+    assert_eq!(latest.version(), expected_version - 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn automated_retraining_trigger_on_drift() -> Result<()> {
+    init_tracing();
+
+    // ---------------------------------------------------------------------
+    // GIVEN: a dummy drift monitor subscribed on a synthetic event-stream
+    // ---------------------------------------------------------------------
+    let monitor = StubDriftMonitor::new(/* drift_threshold = */ 0.2);
+    let mut observed = monitor.observe();
+
+    // ---------------------------------------------------------------------
+    // WHEN:  ingesting drift events that cross the threshold
+    // ---------------------------------------------------------------------
+    observed.emit(Event::Drift(DriftEvent {
+        metric: "bbox_iou".into(),
+        magnitude: 0.21,
+    }));
+
+    // ---------------------------------------------------------------------
+    // THEN:  an `Observer` implementation should translate that into a
+    //        retraining trigger.
+    // ---------------------------------------------------------------------
+    within!(Duration::from_millis(200), async move {
+        observed.on_retrain().await?;
+        Ok(())
+    })
+}
+
+// ----------------------------------------------------------------------------
+// Stubs
+// ----------------------------------------------------------------------------
+
+//
+// NOTE:  The following stub implementations are **only** required because the
+//        tests themselves are part of the public repository while the real
+//        orchestrator implementation sits in a private workspace crate that
+//        cannot be published for licensing reasons.  The stubs allow anyone to
+//        run `cargo test` on the open-sourced subset without pulling in the
+//        proprietary codebase.
+//
+//        If you do have the full orchestrator crate on your `$RUST_PATH`, the
+//        conditional compilation flag `proprietary` will skip these stubs and
+//        use the real implementations instead.
+//
+#[cfg(not(feature = "proprietary"))]
+mod stubs {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use tokio::sync::{broadcast, Mutex};
+
+    // --------------------------------------------------
+    // Frame Source Stub
+    // --------------------------------------------------
+    #[derive(Clone)]
+    pub struct StubFrameSource {
+        meta: CameraMeta,
+        tx: broadcast::Sender<Vec<u8>>,
+    }
+
+    impl StubFrameSource {
+        pub fn new(meta: CameraMeta, tx: broadcast::Sender<Vec<u8>>) -> Self {
+            Self { meta, tx }
+        }
+    }
+
+    #[async_trait]
+    impl FrameSource for StubFrameSource {
+        fn metadata(&self) -> &CameraMeta {
+            &self.meta
+        }
+
+        async fn start(&self) -> Result<()> {
+            // Emit a single dummy frame
+            let _ = self.tx.send(vec![0; 42]);
+            Ok(())
+        }
+    }
+
+    // --------------------------------------------------
+    // Model Stub
+    // --------------------------------------------------
+    #[derive(Default)]
+    pub struct StubModel;
+
+    #[async_trait]
+    impl ModelHandle for StubModel {
+        async fn predict(&self, _batch: &[u8]) -> Result<Vec<u8>> {
+            Ok(vec![1, 2, 3])
+        }
+    }
+
+    // --------------------------------------------------
+    // Drift Monitor Stub
+    // --------------------------------------------------
+    pub struct StubDriftMonitor {
+        threshold: f32,
+        retrain_flag: Arc<AtomicBool>,
+        notifier: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    }
+
+    impl StubDriftMonitor {
+        pub fn new(threshold: f32) -> Self {
+            Self {
+                threshold,
+                retrain_flag: Arc::new(AtomicBool::new(false)),
+                notifier: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        pub fn observe(&self) -> ObservedDrift {
+            let (tx, rx) = oneshot::channel();
+            *self.notifier.blocking_lock() = Some(tx);
+            ObservedDrift {
+                threshold: self.threshold,
+                retrain_flag: self.retrain_flag.clone(),
+                notifier: rx,
+            }
+        }
+    }
+
+    pub struct ObservedDrift {
+        threshold: f32,
+        retrain_flag: Arc<AtomicBool>,
+        notifier: oneshot::Receiver<()>,
+    }
+
+    impl ObservedDrift {
+        pub fn emit(&self, evt: Event) {
+            if let Event::Drift(d) = evt {
+                if d.magnitude > self.threshold {
+                    self.retrain_flag.store(true, Ordering::Relaxed);
+                    // Fire the notifier if present
+                    let _ = self.notifier.close();
+                }
+            }
+        }
+
+        pub async fn on_retrain(&mut self) -> Result<()> {
+            self.notifier.await.ok();
+            if self.retrain_flag.load(Ordering::Relaxed) {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("retrain flag was never set"))
+            }
+        }
+    }
+
+    // --------------------------------------------------
+    // Blanket `Observed` impl for `ObservedDrift`
+    // --------------------------------------------------
+    #[async_trait]
+    impl Observed for ObservedDrift {
+        async fn on_event(&mut self, evt: Event) -> Result<()> {
+            self.emit(evt);
+            Ok(())
+        }
+    }
+
+    // Re-export stubs into parent namespace
+    pub(super) use {
+        ObservedDrift as StubObservedDrift, StubDriftMonitor, StubFrameSource, StubModel,
+    };
+}
+
+// Expose the stubs (or the genuine implementations when the `proprietary`
+// feature is enabled) to the parent module scope.
+#[cfg(not(feature = "proprietary"))]
+use stubs::*;
+```

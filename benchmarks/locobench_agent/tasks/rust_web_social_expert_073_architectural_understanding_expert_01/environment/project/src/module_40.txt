@@ -1,0 +1,308 @@
+```rust
+//! src/module_40.rs
+//!
+//! Service-layer abstraction for “Learning Pulse” replies.
+//!
+//! The module demonstrates a typical event-driven workflow used across
+//! the EduPulse Live backend.  A reply is persisted, an event is emitted
+//! to the message broker, and ancillary concerns (search indexing,
+//! analytics, notifications) are handled by downstream consumers.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::task::JoinHandle;
+use tracing::{error, info, instrument};
+use uuid::Uuid;
+
+/// ===========================
+/// Domain Models
+/// ===========================
+
+/// A student’s reply to a learning pulse.
+#[derive(Debug, Clone)]
+pub struct PulseReply {
+    pub id:              Uuid,
+    pub pulse_id:        Uuid,
+    pub author_id:       Uuid,
+    pub body_markdown:   String,
+    pub attachment_url:  Option<String>,
+    pub created_at:      DateTime<Utc>,
+}
+
+/// Domain event emitted when a reply is persisted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum DomainEvent {
+    PulseReplied {
+        reply_id:  Uuid,
+        pulse_id:  Uuid,
+        author_id: Uuid,
+        at:        DateTime<Utc>,
+    },
+}
+
+/// ===========================
+/// Repository Layer
+/// ===========================
+
+/// Abstraction over persistence store.
+///
+/// This allows easy replacement during tests as well as supporting
+/// different storage engines (PostgreSQL, MySQL, SQLite, etc.).
+#[async_trait]
+pub trait PulseRepository: Send + Sync {
+    async fn insert_reply(&self, reply: &PulseReply) -> Result<(), ServiceError>;
+}
+
+/// Concrete SQLx/PostgreSQL repository implementation.
+pub struct SqlxPulseRepository {
+    pool: sqlx::PgPool,
+}
+
+impl SqlxPulseRepository {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl PulseRepository for SqlxPulseRepository {
+    #[instrument(skip_all, err)]
+    async fn insert_reply(&self, reply: &PulseReply) -> Result<(), ServiceError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO pulse_replies
+                (id, pulse_id, author_id, body_markdown, attachment_url, created_at)
+            VALUES
+                ($1, $2, $3, $4, $5, $6)
+            "#,
+            reply.id,
+            reply.pulse_id,
+            reply.author_id,
+            reply.body_markdown,
+            reply.attachment_url,
+            reply.created_at
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ServiceError::Db(e.to_string()))?;
+
+        Ok(())
+    }
+}
+
+/// ===========================
+/// Event Publishing
+/// ===========================
+
+/// Message-broker abstraction; domain services remain broker-agnostic.
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, event: &DomainEvent) -> Result<(), ServiceError>;
+}
+
+/// Example Kafka publisher using rdkafka.
+///
+/// NOTE: In production this would be its own crate; here it’s trimmed down
+///       for brevity.
+pub struct KafkaPublisher {
+    topic:  String,
+    // We hide actual producer inside a Box<dyn ...> to keep compile
+    // dependencies optional for environments without Kafka.
+    producer: Box<dyn KafkaProducer>,
+}
+
+impl KafkaPublisher {
+    pub fn new(topic: impl Into<String>, producer: Box<dyn KafkaProducer>) -> Self {
+        Self {
+            topic: topic.into(),
+            producer,
+        }
+    }
+}
+
+/// Tiny trait to insulate code from concrete Kafka client crate.
+#[async_trait]
+pub trait KafkaProducer: Send + Sync {
+    async fn send(&self, topic: &str, payload: &[u8]) -> Result<(), anyhow::Error>;
+}
+
+#[async_trait]
+impl EventPublisher for KafkaPublisher {
+    #[instrument(skip_all, err)]
+    async fn publish(&self, event: &DomainEvent) -> Result<(), ServiceError> {
+        let payload = serde_json::to_vec(event)
+            .map_err(|e| ServiceError::Serialization(e.to_string()))?;
+        self.producer
+            .send(&self.topic, &payload)
+            .await
+            .map_err(|e| ServiceError::Broker(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/// ===========================
+/// Search Indexing (Async Task)
+/// ===========================
+
+/// Interface for search indexing worker.
+///
+/// Downstream consumers often pick these events from Kafka instead, but
+/// occasionally a synchronous update is required (e.g. ensuring immediate
+/// searchability right after posting during live sessions).
+#[async_trait]
+pub trait SearchIndexer: Send + Sync {
+    async fn index_reply(&self, reply: &PulseReply) -> Result<(), ServiceError>;
+}
+
+/// Dummy implementation used for local development/tests.
+pub struct NoopIndexer;
+
+#[async_trait]
+impl SearchIndexer for NoopIndexer {
+    async fn index_reply(&self, _reply: &PulseReply) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+/// ===========================
+/// Service Layer
+/// ===========================
+
+pub struct PulseService<R, P, S>
+where
+    R: PulseRepository,
+    P: EventPublisher,
+    S: SearchIndexer,
+{
+    repo:     Arc<R>,
+    broker:   Arc<P>,
+    indexer:  Arc<S>,
+}
+
+impl<R, P, S> PulseService<R, P, S>
+where
+    R: PulseRepository,
+    P: EventPublisher,
+    S: SearchIndexer,
+{
+    pub fn new(repo: Arc<R>, broker: Arc<P>, indexer: Arc<S>) -> Self {
+        Self { repo, broker, indexer }
+    }
+
+    /// Persist a new reply, publish an event, and update the search index.
+    #[instrument(skip(self), err)]
+    pub async fn submit_reply(
+        &self,
+        pulse_id: Uuid,
+        author_id: Uuid,
+        body_markdown: String,
+        attachment_url: Option<String>,
+    ) -> Result<PulseReply, ServiceError> {
+        let reply = PulseReply {
+            id: Uuid::new_v4(),
+            pulse_id,
+            author_id,
+            body_markdown,
+            attachment_url,
+            created_at: Utc::now(),
+        };
+
+        // Persist to database
+        self.repo.insert_reply(&reply).await?;
+
+        // Publish domain event
+        let event = DomainEvent::PulseReplied {
+            reply_id: reply.id,
+            pulse_id,
+            author_id,
+            at: reply.created_at,
+        };
+        self.broker.publish(&event).await?;
+
+        // Fire-and-forget search indexing.  We deliberately detach task
+        // so users do not wait for Elasticsearch round-trip.
+        let reply_clone = reply.clone();
+        let indexer = self.indexer.clone();
+        tokio::spawn(async move {
+            if let Err(e) = indexer.index_reply(&reply_clone).await {
+                error!(error = ?e, "failed to index reply");
+            }
+        });
+
+        Ok(reply)
+    }
+}
+
+/// ===========================
+/// Errors
+/// ===========================
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("database error: {0}")]
+    Db(String),
+    #[error("broker error: {0}")]
+    Broker(String),
+    #[error("serialization error: {0}")]
+    Serialization(String),
+    #[error("other: {0}")]
+    Other(String),
+}
+
+/// ===========================
+/// Tests
+/// ===========================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct InMemoryRepo {
+        // keep replies in memory for unit test
+        replies: Mutex<Vec<PulseReply>>,
+    }
+
+    #[async_trait]
+    impl PulseRepository for InMemoryRepo {
+        async fn insert_reply(&self, reply: &PulseReply) -> Result<(), ServiceError> {
+            self.replies.lock().unwrap().push(reply.clone());
+            Ok(())
+        }
+    }
+
+    struct StubPublisher;
+    #[async_trait]
+    impl EventPublisher for StubPublisher {
+        async fn publish(&self, _event: &DomainEvent) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn user_can_submit_pulse_reply() {
+        let repo = Arc::new(InMemoryRepo { replies: Mutex::new(vec![]) });
+        let broker = Arc::new(StubPublisher);
+        let indexer = Arc::new(NoopIndexer);
+
+        let service = PulseService::new(repo.clone(), broker, indexer);
+
+        let pulse_id = Uuid::new_v4();
+        let author_id = Uuid::new_v4();
+
+        let reply = service
+            .submit_reply(pulse_id, author_id, "Hello **EduPulse**!".into(), None)
+            .await
+            .expect("reply should succeed");
+
+        assert_eq!(reply.pulse_id, pulse_id);
+        assert_eq!(reply.author_id, author_id);
+        assert_eq!(repo.replies.lock().unwrap().len(), 1);
+    }
+}
+```

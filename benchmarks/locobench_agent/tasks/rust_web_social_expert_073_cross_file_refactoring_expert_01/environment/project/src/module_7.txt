@@ -1,0 +1,341 @@
+```rust
+//! src/module_7.rs
+//!
+//! Event-bus abstraction used across the EduPulse Live back-end.  All domain
+//! models raise strongly-typed events that are wrapped in an `EventEnvelope`
+//! and forwarded to a message broker (e.g. NATS, Kafka) so that downstream
+//! services can react asynchronously (scoring, analytics, notifications, …).
+//!
+//! Compile-time feature flags
+//! ┌─────────────────────────
+//! │ default      = ["memory"]
+//! │ "nats"       = enable NATS-backed publisher/subscriber
+//! │ "memory"     = enable in-memory publisher/subscriber (tests & dev)
+//! └─────────────────────────
+//! Note: add the corresponding optional dependencies to `Cargo.toml`
+//!
+//!     async-nats = { version = "0.32", optional = true, features = ["tls"] }
+//!     tokio      = { version = "1.36", features = ["full"] }
+//!     serde      = { version = "1.0",  features = ["derive"] }
+//!     async-trait= "0.1"
+//!     uuid       = { version = "1.7",  features = ["serde", "v4"] }
+//!     chrono     = { version = "0.4",  features = ["serde"] }
+//!     tracing    = "0.1"
+//!     thiserror  = "1.0"
+//!
+
+use std::fmt::Debug;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use thiserror::Error;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+/// Common failure modes that can occur when publishing or handling events.
+#[derive(Error, Debug)]
+pub enum EventBusError {
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[cfg(feature = "nats")]
+    #[error("NATS error: {0}")]
+    Nats(#[from] async_nats::Error),
+
+    #[error("channel send error: {0}")]
+    ChannelSend(String),
+
+    #[error("handler error: {0}")]
+    Handler(String),
+}
+
+/// A domain event encapsulates something that occurred within a bounded context.
+///
+/// It must be cheap to copy (hence `Clone`) and serializable (`Serialize`, `DeserializeOwned`).
+pub trait DomainEvent: Debug + Clone + Serialize + DeserializeOwned + Send + Sync + 'static {
+    /// Globally unique event name, e.g. `"LearningPulseCreated"`.
+    fn event_type() -> &'static str;
+}
+
+/// Envelope that adds cross-cutting metadata (id, timestamp) to an event.
+///
+/// This is the actual payload sent across the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope<E: DomainEvent> {
+    pub id:            Uuid,
+    pub occurred_at:   DateTime<Utc>,
+    pub aggregate_id:  Uuid,
+    pub payload:       E,
+}
+
+impl<E: DomainEvent> EventEnvelope<E> {
+    pub fn new(aggregate_id: Uuid, payload: E) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            aggregate_id,
+            payload,
+        }
+    }
+
+    /// Returns the subject / topic name that should be used when publishing the event.
+    pub fn subject(&self) -> String {
+        format!("edu.{}", E::event_type())
+    }
+}
+
+/// Publish-only half of the event bus.
+///
+/// Services emitting events depend only on `EventPublisher`.  They do not care
+/// about how the events are shipped (NATS, Kafka, in-memory).
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish<E: DomainEvent>(&self, envelope: EventEnvelope<E>) -> Result<(), EventBusError>;
+}
+
+/// Subscribe-side abstraction that allows registering strongly-typed handlers.
+///
+/// A handler can be any async function that takes the deserialized envelope.
+#[async_trait]
+pub trait EventSubscriber: Send + Sync {
+    async fn subscribe<E, F>(&self, handler: F) -> Result<(), EventBusError>
+    where
+        E: DomainEvent,
+        F: Fn(EventEnvelope<E>) -> futures::future::BoxFuture<'static, Result<(), EventBusError>>
+            + Send
+            + Sync
+            + 'static;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// In-memory reference implementation (dev / tests)
+////////////////////////////////////////////////////////////////////////////////
+#[cfg(feature = "memory")]
+pub mod memory {
+    use super::*;
+    use futures::{future::BoxFuture, FutureExt};
+    use std::collections::HashMap;
+    use tokio::sync::broadcast;
+
+    type DynSender = broadcast::Sender<Vec<u8>>;
+
+    /// Simple bus built on `tokio::broadcast`. Great for unit tests.
+    #[derive(Clone, Default)]
+    pub struct InMemoryBus {
+        channels: std::sync::Arc<tokio::sync::Mutex<HashMap<&'static str, DynSender>>>,
+    }
+
+    impl InMemoryBus {
+        async fn get_sender(&self, topic: &'static str) -> DynSender {
+            let mut map = self.channels.lock().await;
+            map.entry(topic)
+                .or_insert_with(|| broadcast::channel::<Vec<u8>>(1024).0)
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl EventPublisher for InMemoryBus {
+        async fn publish<E: DomainEvent>(
+            &self,
+            envelope: EventEnvelope<E>,
+        ) -> Result<(), EventBusError> {
+            let bytes = serde_json::to_vec(&envelope)?;
+            let sender = self.get_sender(E::event_type()).await;
+            sender
+                .send(bytes)
+                .map_err(|e| EventBusError::ChannelSend(e.to_string()))?;
+            debug!(
+                "InMemoryBus published event {} ({})",
+                E::event_type(),
+                envelope.id
+            );
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl EventSubscriber for InMemoryBus {
+        async fn subscribe<E, F>(&self, handler: F) -> Result<(), EventBusError>
+        where
+            E: DomainEvent,
+            F: Fn(EventEnvelope<E>) -> BoxFuture<'static, Result<(), EventBusError>>
+                + Send
+                + Sync
+                + 'static,
+        {
+            let receiver = self.get_sender(E::event_type()).await.subscribe();
+
+            tokio::spawn(async move {
+                let mut rx = receiver;
+                while let Ok(bytes) = rx.recv().await {
+                    match serde_json::from_slice::<EventEnvelope<E>>(&bytes) {
+                        Ok(env) => {
+                            if let Err(err) = handler(env).await {
+                                error!("event handler failed: {}", err);
+                            }
+                        }
+                        Err(err) => error!("failed to deserialize event: {}", err),
+                    }
+                }
+            });
+
+            Ok(())
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// NATS implementation (production)
+////////////////////////////////////////////////////////////////////////////////
+#[cfg(feature = "nats")]
+pub mod nats {
+    use super::*;
+    use async_nats::{ConnectOptions, Connection, Subscriber};
+    use futures::{future::BoxFuture, StreamExt};
+    use std::sync::Arc;
+
+    /// NATS-based pub/sub using JSON payloads.
+    #[derive(Clone)]
+    pub struct NatsBus {
+        connection: Arc<Connection>,
+        subject_prefix: String,
+    }
+
+    impl NatsBus {
+        /// Establish a TLS-enabled NATS connection.  Supply a comma-separated list
+        /// of servers (e.g. `"nats://localhost:4222,nats://backup:4222"`).
+        pub async fn new(servers: &str, subject_prefix: impl Into<String>) -> Result<Self, EventBusError> {
+            let conn = ConnectOptions::new()
+                .require_tls(true)
+                .connect(servers)
+                .await?;
+            Ok(Self {
+                connection: Arc::new(conn),
+                subject_prefix: subject_prefix.into(),
+            })
+        }
+
+        fn compose_subject<E: DomainEvent>(&self) -> String {
+            format!("{}.{}", self.subject_prefix, E::event_type())
+        }
+    }
+
+    #[async_trait]
+    impl EventPublisher for NatsBus {
+        async fn publish<E: DomainEvent>(
+            &self,
+            envelope: EventEnvelope<E>,
+        ) -> Result<(), EventBusError> {
+            let subject = self.compose_subject::<E>();
+            let data = serde_json::to_vec(&envelope)?;
+            self.connection.publish(subject.clone(), data.into()).await?;
+            info!(
+                "NatsBus published event {} on '{}'",
+                envelope.id, subject
+            );
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl EventSubscriber for NatsBus {
+        async fn subscribe<E, F>(&self, handler: F) -> Result<(), EventBusError>
+        where
+            E: DomainEvent,
+            F: Fn(EventEnvelope<E>) -> BoxFuture<'static, Result<(), EventBusError>>
+                + Send
+                + Sync
+                + 'static,
+        {
+            let subject = self.compose_subject::<E>();
+            let sub: Subscriber = self.connection.subscribe(subject.clone()).await?;
+            info!("NatsBus subscribed to '{}'", subject);
+
+            tokio::spawn(async move {
+                let mut stream = sub;
+                while let Some(msg) = stream.next().await {
+                    if let Ok(env) = serde_json::from_slice::<EventEnvelope<E>>(&msg.payload) {
+                        if let Err(err) = handler(env).await {
+                            error!("handler error: {}", err);
+                        }
+                    } else {
+                        warn!("discarding invalid event payload on '{}'", subject);
+                    }
+                }
+            });
+
+            Ok(())
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// Example domain events
+////////////////////////////////////////////////////////////////////////////////
+
+/// Emitted when an instructor creates a new learning pulse (short challenge).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningPulseCreated {
+    pub pulse_id:      Uuid,
+    pub instructor_id: Uuid,
+    pub title:         String,
+}
+
+impl DomainEvent for LearningPulseCreated {
+    fn event_type() -> &'static str {
+        "LearningPulseCreated"
+    }
+}
+
+/// Emitted when a student submits a response to a learning pulse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmissionReceived {
+    pub submission_id: Uuid,
+    pub pulse_id:      Uuid,
+    pub student_id:    Uuid,
+    pub attachment_url: Option<String>,
+}
+
+impl DomainEvent for SubmissionReceived {
+    fn event_type() -> &'static str {
+        "SubmissionReceived"
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// Unit tests exercising the in-memory bus
+////////////////////////////////////////////////////////////////////////////////
+#[cfg(all(test, feature = "memory"))]
+mod tests {
+    use super::*;
+    use futures::FutureExt;
+
+    #[tokio::test]
+    async fn in_memory_bus_roundtrip() {
+        let bus = memory::InMemoryBus::default();
+
+        // Subscribe to `LearningPulseCreated`
+        bus.subscribe::<LearningPulseCreated, _>(|env| {
+            async move {
+                assert_eq!(env.payload.title, "Week 3 Quiz");
+                Ok(())
+            }
+            .boxed()
+        })
+        .await
+        .unwrap();
+
+        let payload = LearningPulseCreated {
+            pulse_id:      Uuid::new_v4(),
+            instructor_id: Uuid::new_v4(),
+            title:         "Week 3 Quiz".to_string(),
+        };
+
+        bus.publish(EventEnvelope::new(payload.pulse_id, payload))
+            .await
+            .unwrap();
+    }
+}
+```

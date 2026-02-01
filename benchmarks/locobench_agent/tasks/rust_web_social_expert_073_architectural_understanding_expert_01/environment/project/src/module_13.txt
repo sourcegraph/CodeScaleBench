@@ -1,0 +1,367 @@
+```rust
+//! src/module_13.rs
+//!
+//! Event module for **EduPulse Live – Event-Driven Social Learning Hub**.
+//!
+//! Responsibility
+//! --------------
+//! • Define domain events and their (de)serialization  
+//! • Persist events in Postgres (outbox pattern)  
+//! • Publish events to the NATS message broker (at-least-once)  
+//! • Provide a façade (`EventService`) that application code can depend on.
+//!
+//! The code purposefully avoids project-specific business logic; instead, it
+//! delivers a reusable, production-grade event infrastructure component that
+//! other bounded contexts can plug into via dependency-injection.
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Crate imports (add the following to Cargo.toml)
+//
+// [dependencies]
+// async-nats       = "0.32"
+// async-trait      = "0.1"
+// chrono           = { version = "0.4", features = ["serde"] }
+// serde            = { version = "1", features = ["derive"] }
+// serde_json       = "1"
+// thiserror        = "1"
+// tokio            = { version = "1", features = ["full"] }
+// tracing          = "0.1"
+// uuid             = { version = "1", features = ["v4", "serde"] }
+// sqlx             = { version = "0.7", features = ["postgres", "runtime-tokio-native-tls", "chrono", "uuid"] }
+// ─────────────────────────────────────────────────────────────────────────────
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgQueryResult, PgPool};
+use thiserror::Error;
+use tokio::task;
+use tracing::{error, info};
+use uuid::Uuid;
+
+// ════════════════════════════════════════════════════════════════════════════
+// Domain events
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Every domain event MUST implement this marker trait.
+pub trait DomainEvent: Serialize + Send + Sync {
+    /// Name that uniquely identifies the event type.
+    fn name(&self) -> &'static str;
+}
+
+/// Concrete domain events that EduPulse can emit.
+///
+/// NOTE: Only a subset is represented for brevity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum EduPulseEvent {
+    LessonPublished(LessonPublished),
+    QuizSubmitted(QuizSubmitted),
+}
+
+impl DomainEvent for EduPulseEvent {
+    fn name(&self) -> &'static str {
+        match self {
+            EduPulseEvent::LessonPublished(_) => "lesson.published",
+            EduPulseEvent::QuizSubmitted(_) => "quiz.submitted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LessonPublished {
+    pub lesson_id: Uuid,
+    pub author_id: Uuid,
+    pub title: String,
+    pub published_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuizSubmitted {
+    pub quiz_id: Uuid,
+    pub student_id: Uuid,
+    pub score: f32,
+    pub submitted_at: DateTime<Utc>,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Event envelope + outbox entry
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Metadata that gets prepended to every event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventMeta {
+    /// Surrogate primary key / correlation id.
+    pub id: Uuid,
+    /// ISO-8601 timestamp when the event occurred.
+    pub occurred_at: DateTime<Utc>,
+    /// Service that produced the event (for debugging across micro-services).
+    pub source: String,
+}
+
+impl Default for EventMeta {
+    fn default() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            source: "edu_pulse_live.api".into(),
+        }
+    }
+}
+
+/// What gets persisted into Postgres and published onto NATS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub meta: EventMeta,
+    /// Human-readable discriminant, duplicated from `payload.name()` to make
+    /// querying easier.
+    pub event_type: String,
+    /// The actual application domain payload.
+    pub payload: EduPulseEvent,
+}
+
+impl EventEnvelope {
+    pub fn new(payload: EduPulseEvent) -> Self {
+        Self {
+            meta: EventMeta::default(),
+            event_type: payload.name().into(),
+            payload,
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Errors
+// ════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Error)]
+pub enum EventError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("messaging error: {0}")]
+    Messaging(#[from] async_nats::Error),
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Repository – Postgres async implementation
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Outbox pattern repository – stores an event and later marks it as published.
+#[async_trait]
+pub trait EventRepository: Send + Sync {
+    async fn insert(&self, event: &EventEnvelope) -> Result<PgQueryResult, EventError>;
+    async fn mark_published(&self, event_id: Uuid) -> Result<PgQueryResult, EventError>;
+    async fn fetch_unpublished(&self, limit: i64) -> Result<Vec<EventEnvelope>, EventError>;
+}
+
+/// Actual Postgres implementation, using a single connection pool.
+pub struct PgEventRepository {
+    pool: PgPool,
+}
+
+impl PgEventRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl EventRepository for PgEventRepository {
+    async fn insert(&self, event: &EventEnvelope) -> Result<PgQueryResult, EventError> {
+        // Store the raw JSON as JSONB for efficient querying.
+        sqlx::query!(
+            r#"
+            INSERT INTO domain_events(id, occurred_at, event_type, payload, published)
+            VALUES ($1, $2, $3, $4, false)
+            "#,
+            event.meta.id,
+            event.meta.occurred_at,
+            event.event_type,
+            serde_json::to_value(event)?,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(EventError::Database)
+    }
+
+    async fn mark_published(&self, event_id: Uuid) -> Result<PgQueryResult, EventError> {
+        sqlx::query!(
+            r#"
+            UPDATE domain_events
+            SET published = true
+            WHERE id = $1
+            "#,
+            event_id
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(EventError::Database)
+    }
+
+    async fn fetch_unpublished(&self, limit: i64) -> Result<Vec<EventEnvelope>, EventError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT payload
+            FROM domain_events
+            WHERE published = false
+            ORDER BY occurred_at ASC
+            LIMIT $1
+            "#,
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let value: serde_json::Value = row.payload;
+            events.push(serde_json::from_value::<EventEnvelope>(value)?);
+        }
+        Ok(events)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Publisher – NATS JetStream (async)
+// ════════════════════════════════════════════════════════════════════════════
+
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, event: &EventEnvelope) -> Result<(), EventError>;
+}
+
+/// Simplistic, at-least-once publisher to NATS.
+/// In production, consider JetStream with an explicit acks policy and durable
+/// stream subscriptions.
+pub struct NatsPublisher {
+    client: async_nats::Client,
+    subject_prefix: String,
+}
+
+impl NatsPublisher {
+    pub async fn new(nats_url: &str, subject_prefix: &str) -> Result<Self, EventError> {
+        let client = async_nats::connect(nats_url).await?;
+        Ok(Self {
+            client,
+            subject_prefix: subject_prefix.trim_end_matches('.').to_owned(),
+        })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for NatsPublisher {
+    async fn publish(&self, event: &EventEnvelope) -> Result<(), EventError> {
+        let subject = format!("{}.{}", self.subject_prefix, event.event_type);
+        let bytes = serde_json::to_vec(event)?;
+        self.client.publish(subject, bytes.into()).await?;
+        Ok(())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Service façade (transaction script)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Entry point that aggregates both repository & publisher.
+///
+/// Applies the Outbox pattern:
+/// 1. Persist event in local database transaction.
+/// 2. Spawn background task that tries to deliver event to broker.
+/// 3. Upon success, marks the outbox record as published.
+pub struct EventService<R: EventRepository, P: EventPublisher> {
+    repo: Arc<R>,
+    publisher: Arc<P>,
+}
+
+impl<R, P> EventService<R, P>
+where
+    R: EventRepository + 'static,
+    P: EventPublisher + 'static,
+{
+    pub fn new(repo: Arc<R>, publisher: Arc<P>) -> Self {
+        Self { repo, publisher }
+    }
+
+    /// High-level API called by domain/application layer.
+    pub async fn emit(&self, payload: EduPulseEvent) -> Result<(), EventError> {
+        let envelope = EventEnvelope::new(payload);
+
+        // 1. Store in DB (part of main business transaction).
+        self.repo.insert(&envelope).await?;
+
+        // 2. Fire-and-forget background delivery (decouples HTTP latency).
+        let repo = Arc::clone(&self.repo);
+        let publisher = Arc::clone(&self.publisher);
+        task::spawn(async move {
+            if let Err(e) = publisher.publish(&envelope).await {
+                error!("broker publish failed (will retry later): {e}");
+                return;
+            }
+            // Mark as published; failure just logs (will be retried).
+            if let Err(e) = repo.mark_published(envelope.meta.id).await {
+                error!("unable to mark event as published: {e}");
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Background job to flush unpublished events (run via cron or supervisor).
+    pub async fn flush_outbox(&self, batch_size: i64) -> Result<(), EventError> {
+        let pending = self.repo.fetch_unpublished(batch_size).await?;
+        if pending.is_empty() {
+            info!("no unpublished events in outbox");
+            return Ok(());
+        }
+
+        info!("re-publishing {} pending events", pending.len());
+        for event in pending {
+            match self.publisher.publish(&event).await {
+                Ok(_) => {
+                    self.repo.mark_published(event.meta.id).await?;
+                    info!("delivered event {}", event.meta.id);
+                }
+                Err(err) => {
+                    error!("failed to deliver event {}: {err}", event.meta.id);
+                    // Keep the event for next retry.
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Optional helpers for application bootstrap
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Assemble an `EventService` from environment variables.
+/// Requires:
+///   • DATABASE_URL (postgres)  
+///   • NATS_URL  
+pub async fn configure_from_env() -> Result<
+    EventService<PgEventRepository, NatsPublisher>,
+    EventError,
+> {
+    let database_url =
+        std::env::var("DATABASE_URL").expect("env DATABASE_URL must be set");
+    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+
+    // Pg pool
+    let pool = PgPool::connect(&database_url).await.map_err(EventError::Database)?;
+
+    // NATS publisher
+    let publisher = NatsPublisher::new(&nats_url, "edu.pulse").await?;
+
+    Ok(EventService::new(
+        Arc::new(PgEventRepository::new(pool)),
+        Arc::new(publisher),
+    ))
+}
+```

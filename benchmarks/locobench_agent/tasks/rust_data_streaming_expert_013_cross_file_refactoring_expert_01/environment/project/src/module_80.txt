@@ -1,0 +1,285 @@
+```rust
+//! module_80 – Dynamic analysis-strategy loader & hot-reloader
+//!
+//! This module implements the “strategy” half of the Strategy Pattern that
+//! powers ChirpPulse’s real-time enrichment pipeline.  At runtime we can load
+//! one or more shared libraries that export new sentiment / classification
+//! algorithms without incurring downtime on our Kafka consumers.
+//!
+//! Design goals
+//! ------------
+//! 1.  Zero-copy streaming: Strategies receive an immutable view into the raw
+//!     payload and return an owned JSON document with their findings.
+//! 2.  Hot-swappability:  By watching a directory for filesystem events we can
+//!     add, upgrade, or roll back strategies on the fly.  Version negotiation
+//!     happens in user-space so that the orchestrator can pick the right model.
+//! 3.  Safety first:  `libloading` is wrapped in a thin safety layer and we keep
+//!     the loaded `Library` alive **as long as** the trait object is in use
+//!     (preventing a dangling vtable).
+//!
+//! To compile a compatible plugin, implement the `AnalysisStrategy` trait and
+//! export an extern “C” symbol named `create_strategy`:
+//!
+//! ```rust,ignore
+//! #[no_mangle]
+//! pub extern "C" fn create_strategy() -> *mut dyn AnalysisStrategy {
+//!     Box::into_raw(Box::new(MyCoolAlgo::default()))
+//! }
+//! ```
+//!
+//! See `crates/plugins/examples` for a full template.
+
+use std::{
+    collections::HashMap,
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+use libloading::{Library, Symbol};
+use notify::{event::EventKind, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use parking_lot::RwLock;
+use serde_json::Value;
+use thiserror::Error;
+use tracing::{error, info, instrument, warn};
+
+/// The central trait every dynamically-loaded strategy must implement.
+///
+/// All methods must be thread-safe because the returned `Arc<dyn AnalysisStrategy>`
+/// will be stored in the global [`StrategyRegistry`] and accessed by multiple
+/// green/pinned tasks in Tokio’s runtime.
+pub trait AnalysisStrategy: Send + Sync {
+    /// The human-readable algorithm name (`"bert_sentiment"`)
+    fn name(&self) -> &str;
+
+    /// SemVer or arbitrary string identifying this build (`"1.4.3+gpu"`)
+    fn version(&self) -> &str;
+
+    /// Main entry point. Implementations must be idempotent and must never do
+    /// any blocking disk I/O (use async runtime + channels if needed).
+    ///
+    /// `payload` contains the raw text or pre-processed token stream.
+    fn analyze(&self, payload: &str) -> Result<Value>;
+}
+
+// **********************************************************************
+// *                       Error handling types                         *
+// **********************************************************************
+
+#[derive(Debug, Error)]
+pub enum StrategyError {
+    #[error("Failed to load library: {0}")]
+    Load(#[from] libloading::Error),
+
+    #[error("Dynamic symbol `create_strategy` missing")]
+    MissingSymbol,
+
+    #[error("Analysis failed: {0}")]
+    Execution(#[from] anyhow::Error),
+}
+
+type StrategyResult<T> = std::result::Result<T, StrategyError>;
+
+// **********************************************************************
+// *                  Opaque wrapper around loaded lib                  *
+// **********************************************************************
+
+/// `LoadedStrategy` keeps the underlying [`Library`] alive for the whole
+/// lifetime of the boxed trait object. Otherwise we’d risk a dangling vtable.
+struct LoadedStrategy {
+    _lib: Library,           // must be the first field!
+    inner: Arc<dyn AnalysisStrategy>,
+}
+
+impl LoadedStrategy {
+    /// # Safety
+    ///
+    /// The caller must guarantee that `path` points to a valid `.so`/`.dylib`/`.dll`
+    /// that exports a compatible `create_strategy` symbol.
+    #[instrument(skip(path))]
+    unsafe fn load(path: &Path) -> StrategyResult<Self> {
+        // Use RTLD_NOW to fail fast if dependencies are missing.
+        let lib = Library::new(path).map_err(StrategyError::Load)?;
+
+        // Symbol signature:  extern "C" fn() -> *mut dyn AnalysisStrategy
+        let ctor: Symbol<unsafe extern "C" fn() -> *mut dyn AnalysisStrategy> =
+            lib.get(b"create_strategy\0")
+                .map_err(|_| StrategyError::MissingSymbol)?;
+
+        // Transfer ownership to Box, then Arc-ify it.
+        let boxed = Box::from_raw(ctor());
+        let inner = Arc::from(boxed);
+
+        Ok(Self { _lib: lib, inner })
+    }
+}
+
+// **********************************************************************
+// *                       Public registry API                          *
+// **********************************************************************
+
+#[derive(Default)]
+pub struct StrategyRegistry {
+    // key = name@version
+    store: RwLock<HashMap<String, LoadedStrategy>>,
+}
+
+impl StrategyRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns a read-only view into the chosen strategy.
+    pub fn get(&self, key: &str) -> Option<Arc<dyn AnalysisStrategy>> {
+        self.store
+            .read()
+            .get(key)
+            .map(|slot| Arc::clone(&slot.inner))
+    }
+
+    /// Insert or overwrite a strategy.  The existing library (if any) will be
+    /// dropped, allowing the OS to unload the shared object when all
+    /// outstanding clones are released.
+    pub fn insert(&self, strategy: LoadedStrategy) {
+        let key = format!("{}@{}", strategy.inner.name(), strategy.inner.version());
+
+        info!(%key, "Registering analysis strategy");
+        self.store.write().insert(key, strategy);
+    }
+
+    /// Iterate over stored keys – helpful for debug/metrics.
+    pub fn keys(&self) -> Vec<String> {
+        self.store.read().keys().cloned().collect()
+    }
+}
+
+// **********************************************************************
+// *                      Hot-reload file watcher                       *
+// **********************************************************************
+
+/// Start watching `dir` for changes and automatically (re)load any `.so`
+/// files that appear.  Runs forever on the caller’s async task.
+pub async fn watch_directory(dir: PathBuf, registry: Arc<StrategyRegistry>) -> Result<()> {
+    // Sanity check
+    if !dir.is_dir() {
+        anyhow::bail!("Provided path `{}` is not a directory", dir.display());
+    }
+
+    // Channel used by `notify` to forward events into our async runtime.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
+
+    // We must spawn the blocking `notify` watcher on a separate thread.
+    let mut watcher: RecommendedWatcher = Watcher::new_immediate(move |res| {
+        // This closure executes in the notify thread.
+        match res {
+            Ok(event) => {
+                // best-effort: ignore if receiver closed
+                let _ = tx.blocking_send(event);
+            }
+            Err(e) => {
+                error!("watch error: {e}");
+            }
+        }
+    })?;
+
+    // Kick-off recursive watch.
+    watcher.watch(&dir, RecursiveMode::NonRecursive)?;
+
+    info!("Watching `{}` for strategy libraries", dir.display());
+
+    while let Some(event) = rx.recv().await {
+        // We only react to CloseWrite / Create / Modify – ignore Remove because
+        // the registry keeps the handle alive for active sessions anyway.
+        match event.kind {
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Close(_) => {
+                for path in event.paths {
+                    if is_dynamic_lib(&path) {
+                        match unsafe { LoadedStrategy::load(&path) } {
+                            Ok(loaded) => registry.insert(loaded),
+                            Err(e) => warn!("Failed to load {:?}: {e}", path),
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+// **********************************************************************
+// *                         Helper functions                           *
+// **********************************************************************
+
+#[inline]
+fn is_dynamic_lib(path: &Path) -> bool {
+    matches!(path.extension().and_then(OsStr::to_str), Some("so" | "dylib" | "dll"))
+}
+
+// **********************************************************************
+// *                           Integration test                         *
+// **********************************************************************
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    // Note: we cannot compile a real shared library here, so we focus on the
+    // registry’s bookkeeping logic.
+    #[test]
+    fn registry_insert_and_get() {
+        struct Dummy;
+        impl AnalysisStrategy for Dummy {
+            fn name(&self) -> &str {
+                "dummy"
+            }
+            fn version(&self) -> &str {
+                "0.1.0"
+            }
+            fn analyze(&self, _p: &str) -> Result<Value> {
+                Ok(Value::Null)
+            }
+        }
+
+        // simulate loaded strategy
+        let ls = LoadedStrategy {
+            _lib: unsafe { Library::open_self().unwrap() },
+            inner: Arc::new(Dummy),
+        };
+
+        let reg = StrategyRegistry::new();
+        reg.insert(ls);
+
+        let key = "dummy@0.1.0";
+        assert!(reg.get(key).is_some());
+        assert_eq!(reg.keys(), vec![key]);
+    }
+
+    // Quick smoke test for `is_dynamic_lib`
+    #[test]
+    fn detect_dynlib_extensions() {
+        assert!(is_dynamic_lib(Path::new("libmylib.so")));
+        assert!(is_dynamic_lib(Path::new("something.dylib")));
+        assert!(is_dynamic_lib(Path::new("win.dll")));
+        assert!(!is_dynamic_lib(Path::new("notes.txt")));
+    }
+
+    // Test that the watcher can be created and shut down cleanly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_lifecycle() {
+        let tmp_dir = TempDir::new().unwrap();
+        let registry = Arc::new(StrategyRegistry::new());
+
+        // Spawn watcher, then cancel immediately.
+        let dir_path = tmp_dir.path().to_path_buf();
+        let handle = tokio::spawn(watch_directory(dir_path, registry));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort();
+    }
+}
+```

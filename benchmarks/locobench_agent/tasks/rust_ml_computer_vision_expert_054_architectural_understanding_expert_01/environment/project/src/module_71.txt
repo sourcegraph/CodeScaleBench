@@ -1,0 +1,449 @@
+```rust
+/*!
+Module 71 – Adaptive hyper-parameter tuning & experiment tracking
+
+This module provides a production-grade implementation of:
+
+* Strategy Pattern – multiple `HyperparameterTuner` strategies at runtime
+* Observer Pattern  – `TrainingObserver` that receives callbacks from the
+  model-training engine and feeds metrics back into the tuner
+* Experiment tracking – light-weight SQLite persistence backed by `rusqlite`
+  for auditability
+
+The module is self-contained and does not perform the actual model training.
+Instead, it exposes stable, async-friendly APIs that the higher-level
+`Model Ops` layer can call to obtain hyper-parameters and report training
+results.
+
+The public surface area is intentionally small so that it can be consumed
+from other language bindings (FFI), gRPC layers, or CLI tooling.
+*/
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use log::{debug, error, info, warn};
+use rand::seq::SliceRandom;
+use rand::{thread_rng, Rng};
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+
+/// Common alias for hyper-parameter name/value mapping.
+pub type HyperParams = HashMap<String, f64>;
+
+/// Strategy pattern: A tuner is responsible for suggesting the next set of
+/// hyper-parameters *and* ingesting the resulting score so that it can adapt
+/// its internal search.
+///
+/// Implementors must be `Send + Sync` so that the search can be distributed
+/// across threads or processes.
+///
+/// NOTE: The tuner does *not* execute the training job.  That responsibility
+/// lies with the `Model Ops` layer.  The tuner is also side-effect free––
+/// apart from internal bookkeeping.
+pub trait HyperparameterTuner: Send + Sync {
+    /// Suggest the next configuration to evaluate.
+    fn suggest(&mut self) -> Option<HyperParams>;
+
+    /// Report the evaluation metric (e.g. accuracy, loss) for a previously
+    /// suggested configuration.  Implementations may choose to ignore the
+    /// score when the configuration is unknown.
+    fn report_result(&mut self, params: &HyperParams, metric: f64);
+
+    /// Human-readable name; useful for telemetry & debugging.
+    fn name(&self) -> &'static str;
+}
+
+/// A simple grid-search tuner that exhaustively evaluates the Cartesian
+/// product of discrete candidate values.
+///
+/// Useful for deterministic sweeps when the search space is small.
+pub struct GridSearchTuner {
+    grid: Vec<HyperParams>,
+    cursor: usize,
+}
+
+impl GridSearchTuner {
+    pub fn new(candidates: HashMap<String, Vec<f64>>) -> Self {
+        // Compute Cartesian product
+        let mut grid: Vec<HyperParams> = vec![];
+        Self::cartesian_product(
+            &mut grid,
+            &mut HyperParams::new(),
+            &candidates.into_iter().collect::<Vec<_>>(),
+            0,
+        );
+        info!("GridSearch initialized with {} configurations", grid.len());
+        Self { grid, cursor: 0 }
+    }
+
+    fn cartesian_product(
+        acc: &mut Vec<HyperParams>,
+        current: &mut HyperParams,
+        items: &[(String, Vec<f64>)],
+        idx: usize,
+    ) {
+        if idx == items.len() {
+            acc.push(current.clone());
+            return;
+        }
+
+        let (ref key, ref values) = items[idx];
+        for v in values {
+            current.insert(key.clone(), *v);
+            Self::cartesian_product(acc, current, items, idx + 1);
+        }
+        current.remove(key);
+    }
+}
+
+impl HyperparameterTuner for GridSearchTuner {
+    fn suggest(&mut self) -> Option<HyperParams> {
+        if self.cursor >= self.grid.len() {
+            None
+        } else {
+            let params = self.grid[self.cursor].clone();
+            self.cursor += 1;
+            Some(params)
+        }
+    }
+
+    fn report_result(&mut self, _params: &HyperParams, _metric: f64) {
+        // grid search is stateless; nothing to do.
+    }
+
+    fn name(&self) -> &'static str {
+        "GridSearchTuner"
+    }
+}
+
+/// Random search tuner that samples uniformly from user-supplied ranges.
+/// Each range is inclusive.
+///
+/// NOTE: For continuous variables, the range is treated as continuous;
+/// for discrete variables, the caller can pass equal min==max to achieve
+/// deterministic behavior.
+pub struct RandomSearchTuner {
+    ranges: HashMap<String, (f64, f64)>,
+    max_trials: usize,
+    trials: usize,
+    history: Vec<(HyperParams, f64)>,
+}
+
+impl RandomSearchTuner {
+    pub fn new(ranges: HashMap<String, (f64, f64)>, max_trials: usize) -> Self {
+        Self {
+            ranges,
+            max_trials,
+            trials: 0,
+            history: Vec::new(),
+        }
+    }
+
+    fn random_sample(&self) -> HyperParams {
+        let mut rng = thread_rng();
+        self.ranges
+            .iter()
+            .map(|(k, (min, max))| (k.clone(), rng.gen_range(*min..=*max)))
+            .collect()
+    }
+}
+
+impl HyperparameterTuner for RandomSearchTuner {
+    fn suggest(&mut self) -> Option<HyperParams> {
+        if self.trials >= self.max_trials {
+            None
+        } else {
+            self.trials += 1;
+            Some(self.random_sample())
+        }
+    }
+
+    fn report_result(&mut self, params: &HyperParams, metric: f64) {
+        self.history.push((params.clone(), metric));
+    }
+
+    fn name(&self) -> &'static str {
+        "RandomSearchTuner"
+    }
+}
+
+/// Factory pattern: build tuners dynamically based on a string identifier.
+/// This allows runtime configuration via CLI, YAML, or remote control plane.
+pub enum TunerFactory;
+
+impl TunerFactory {
+    pub fn make_grid_search(candidates: HashMap<String, Vec<f64>>) -> Box<dyn HyperparameterTuner> {
+        Box::new(GridSearchTuner::new(candidates))
+    }
+
+    pub fn make_random_search(
+        ranges: HashMap<String, (f64, f64)>,
+        max_trials: usize,
+    ) -> Box<dyn HyperparameterTuner> {
+        Box::new(RandomSearchTuner::new(ranges, max_trials))
+    }
+}
+
+/// Observer pattern – The model-training engine emits `TrainingEvent`s that
+/// observers can subscribe to.  The tuner implementation itself can be an
+/// observer in order to implement adaptive search algorithms such as Bayesian
+/// optimization, however, we keep them decoupled so that multiple observers
+/// (e.g. loggers, alerting) can co-exist.
+#[derive(Debug, Clone)]
+pub enum TrainingEvent {
+    EpochStart { epoch: u32 },
+    EpochEnd {
+        epoch: u32,
+        metrics: HashMap<String, f64>,
+    },
+    TrainingFinish {
+        best_metric: f64,
+        best_params: HyperParams,
+    },
+}
+
+/// Observer trait.
+pub trait TrainingObserver: Send + Sync {
+    fn on_event(&self, event: &TrainingEvent);
+}
+
+/// Default implementation that feeds back the final metric to the tuner.
+pub struct TunerObserver {
+    tuner: Arc<Mutex<Box<dyn HyperparameterTuner>>>,
+}
+
+impl TunerObserver {
+    pub fn new(tuner: Arc<Mutex<Box<dyn HyperparameterTuner>>>) -> Self {
+        Self { tuner }
+    }
+}
+
+impl TrainingObserver for TunerObserver {
+    fn on_event(&self, event: &TrainingEvent) {
+        if let TrainingEvent::TrainingFinish {
+            best_metric,
+            best_params,
+        } = event
+        {
+            if let Ok(mut tuner) = self.tuner.lock() {
+                tuner.report_result(best_params, *best_metric);
+            } else {
+                error!("Unable to lock tuner mutex in observer");
+            }
+        }
+    }
+}
+
+/// Lightweight experiment tracking backed by SQLite.
+/// Production deployments can replace this with a more
+/// sophisticated store (Postgres, Influx, etc.) via
+/// feature flags without changing the public API.
+#[derive(Debug)]
+pub struct ExperimentTracker {
+    db_path: PathBuf,
+    conn: Connection,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExperimentRecord {
+    pub id: i64,
+    pub timestamp: DateTime<Utc>,
+    pub tuner_name: String,
+    pub params: HyperParams,
+    pub metric: f64,
+}
+
+impl ExperimentTracker {
+    /// Create a new tracker with the given file path.
+    pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
+        let conn = Connection::open(&db_path)
+            .with_context(|| format!("opening experiments db {:?}", db_path.as_ref()))?;
+
+        let tracker = Self {
+            db_path: db_path.as_ref().to_path_buf(),
+            conn,
+        };
+
+        tracker.init_schema()?;
+        Ok(tracker)
+    }
+
+    fn init_schema(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS experiments (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT NOT NULL,
+                tuner_name  TEXT NOT NULL,
+                params      BLOB NOT NULL,
+                metric      REAL NOT NULL
+            );
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// Persist an experiment record.
+    pub fn log_record(&self, tuner_name: &str, params: &HyperParams, metric: f64) -> Result<i64> {
+        let timestamp: DateTime<Utc> = Utc::now();
+        let params_blob = serde_json::to_vec(params).context("serializing hyperparams")?;
+
+        self.conn.execute(
+            "
+            INSERT INTO experiments (timestamp, tuner_name, params, metric)
+            VALUES (?1, ?2, ?3, ?4);
+            ",
+            params![
+                timestamp.to_rfc3339(),
+                tuner_name,
+                params_blob,
+                metric
+            ],
+        )?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Retrieve all experiments for auditing or analytics.
+    pub fn all_records(&self) -> Result<Vec<ExperimentRecord>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, timestamp, tuner_name, params, metric
+            FROM experiments
+            ORDER BY id ASC;
+            ",
+        )?;
+
+        let iter = stmt.query_map([], |row| {
+            let params_blob: Vec<u8> = row.get(3)?;
+            let params: HyperParams = serde_json::from_slice(&params_blob)
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Blob, Box::new(e)))?;
+
+            Ok(ExperimentRecord {
+                id: row.get(0)?,
+                timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(1)?)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e)))?,
+                tuner_name: row.get(2)?,
+                params,
+                metric: row.get(4)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for rec in iter {
+            out.push(rec?);
+        }
+        Ok(out)
+    }
+}
+
+/// Example of orchestrating an end-to-end hyper-parameter tuning session.
+/// The function is *sync* for brevity but can be made async using
+/// `tokio::task::spawn_blocking` or similar.
+///
+/// NOTE: This is *not* executed automatically; it serves as a reference
+/// implementation for higher-level orchestration code.
+pub fn run_hpo_session() -> Result<()> {
+    // ------------------------------------------
+    // Create the tuner (here: grid search)
+    // ------------------------------------------
+    let mut candidates: HashMap<String, Vec<f64>> = HashMap::new();
+    candidates.insert("learning_rate".into(), vec![0.01, 0.001]);
+    candidates.insert("dropout".into(), vec![0.1, 0.2, 0.3]);
+
+    let tuner: Arc<Mutex<Box<dyn HyperparameterTuner>>> =
+        Arc::new(Mutex::new(TunerFactory::make_grid_search(candidates)));
+
+    // ------------------------------------------
+    // Initialize experiment tracker
+    // ------------------------------------------
+    let tracker = ExperimentTracker::new("experiments.db")?;
+
+    // ------------------------------------------
+    // Main loop
+    // ------------------------------------------
+    loop {
+        let next_params = {
+            let mut tuner = tuner.lock().expect("tuner lock poisoned");
+            tuner.suggest()
+        };
+
+        let Some(params) = next_params else {
+            info!("Hyper-parameter search complete.");
+            break;
+        };
+
+        // ------------------------------------------------------------------
+        // >>>>  In the real system, `train_model()` would kick off an *async*
+        // >>>>  training job, possibly on a GPU worker pool and stream back
+        // >>>>  metrics over a channel.  For demonstration, we simulate a
+        // >>>>  random metric here.
+        // ------------------------------------------------------------------
+        let simulated_metric: f64 = thread_rng().gen_range(0.7..0.99);
+
+        // Feed the result back into the tuner *and* log it to the tracker.
+        {
+            let mut tuner_locked = tuner.lock().expect("tuner lock poisoned");
+            tuner_locked.report_result(&params, simulated_metric);
+        }
+
+        tracker
+            .log_record("GridSearchTuner", &params, simulated_metric)
+            .context("logging experiment")?;
+
+        debug!(
+            "Evaluated {:?} -> metric = {:.4}",
+            &params, simulated_metric
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_random_search_suggests_and_reports() {
+        let ranges = HashMap::from([
+            ("lr".to_string(), (0.001, 0.01)),
+            ("batch_size".to_string(), (16.0, 128.0)),
+        ]);
+
+        let mut tuner = RandomSearchTuner::new(ranges, 5);
+        let p1 = tuner.suggest().unwrap();
+        tuner.report_result(&p1, 0.92);
+        assert_eq!(tuner.trials, 1);
+        assert_eq!(tuner.history.len(), 1);
+    }
+
+    #[test]
+    fn test_grid_search_exhaustive() {
+        let mut can = HashMap::new();
+        can.insert("a".into(), vec![1.0, 2.0]);
+        can.insert("b".into(), vec![10.0]);
+
+        let mut tuner = GridSearchTuner::new(can);
+        assert!(tuner.suggest().is_some());
+        assert!(tuner.suggest().is_some());
+        assert!(tuner.suggest().is_none());
+    }
+
+    #[test]
+    fn test_experiment_tracker_persistence() -> Result<()> {
+        let tmp = tempfile::NamedTempFile::new()?;
+        let tracker = ExperimentTracker::new(tmp.path())?;
+        let params = HashMap::from([("x".into(), 42.0)]);
+        tracker.log_record("dummy", &params, 0.5)?;
+        let records = tracker.all_records()?;
+        assert_eq!(records.len(), 1);
+        Ok(())
+    }
+}
+```

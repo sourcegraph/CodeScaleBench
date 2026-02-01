@@ -1,0 +1,280 @@
+```csharp
+// File: src/module_39.txt  (TempoScribe Pro – Hexagonal Productivity Blog Suite)
+// Purpose: Implements the core “Publishing Automation Service” responsible for
+//          scheduled publishing, premium-post payment validation, cache invalidation,
+//          and notification fan-out. Written to the hexagonal “Ports & Adapters” spec.
+
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Polly;
+using Polly.Retry;
+
+namespace TempoScribePro.Blog.Application.Services
+{
+    #region Public Contracts (Ports)
+
+    /// <summary>
+    /// Port for querying and mutating Post aggregates.
+    /// </summary>
+    public interface IPostRepository
+    {
+        Task<Post?> GetAsync(Guid postId, CancellationToken ct);
+        Task UpdateAsync(Post post, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Port for reading monetization rules attached to a post.
+    /// </summary>
+    public interface IMonetizationRuleRepository
+    {
+        Task<MonetizationRule?> GetByPostIdAsync(Guid postId, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Port to external payment processor (e.g., Stripe).
+    /// </summary>
+    public interface IPaymentGateway
+    {
+        Task<bool> IsPaymentSatisfiedAsync(Guid userId, Guid postId, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Simple distributed cache abstraction.
+    /// </summary>
+    public interface ICacheProvider
+    {
+        Task InvalidateAsync(string key, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Port for fan-out notifications (e-mail, in-app, websocket, etc.).
+    /// </summary>
+    public interface INotificationService
+    {
+        Task NotifyAsync(NotificationMessage message, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Outgoing port for analytics pipeline.
+    /// </summary>
+    public interface IEditorialAnalytics
+    {
+        Task TrackPublishAsync(Post post, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Port that hides transactional consistency (Unit-Of-Work).
+    /// </summary>
+    public interface IUnitOfWork
+    {
+        Task CommitAsync(CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Application-level service that can be hosted by background workers or invoked manually.
+    /// </summary>
+    public interface IPublishingAutomationService
+    {
+        Task<PublishResult> TryPublishScheduledAsync(Guid postId, CancellationToken ct = default);
+    }
+
+    #endregion
+
+    #region Domain Primitives (Simplified for illustration)
+
+    public enum PostStatus
+    {
+        Draft     = 0,
+        Scheduled = 1,
+        Published = 2
+    }
+
+    public sealed class Post
+    {
+        public Guid       Id                { get; init; }
+        public Guid       AuthorId          { get; init; }
+        public string     Title             { get; private set; } = string.Empty;
+        public PostStatus Status            { get; private set; } = PostStatus.Draft;
+        public DateTime?  ScheduledUtc      { get; private set; }
+        public DateTime?  PublishedUtc      { get; private set; }
+        public bool       IsPremium         { get; private set; }
+
+        public bool IsReadyToPublish(DateTime utcNow) =>
+            Status == PostStatus.Scheduled
+            && ScheduledUtc.HasValue
+            && ScheduledUtc.Value <= utcNow;
+
+        public void Publish(DateTime utcNow)
+        {
+            Status       = PostStatus.Published;
+            PublishedUtc = utcNow;
+        }
+    }
+
+    public sealed class MonetizationRule
+    {
+        public Guid  PostId       { get; init; }
+        public Money Price        { get; init; } = Money.Free;
+        public bool  IsFree       => Price == Money.Free;
+    }
+
+    public readonly record struct Money(decimal Amount, string Currency)
+    {
+        public static readonly Money Free = new(0m, "USD");
+    }
+
+    public sealed record NotificationMessage(Guid RecipientId, string Subject, string Body);
+
+    public sealed record PublishResult(bool Success, string? FailureReason = null);
+
+    #endregion
+
+    #region Service Implementation
+
+    /// <summary>
+    /// Production-grade implementation of scheduled publishing workflow.
+    /// Handles:
+    ///     * Publish-time validations
+    ///     * Premium payment enforcement
+    ///     * Cache invalidation
+    ///     * Analytics pipeline fan-out
+    ///     * Robust error handling & retry with Polly
+    /// </summary>
+    public sealed class PublishingAutomationService : IPublishingAutomationService
+    {
+        private static readonly string CacheKeyPattern = "post:{0}";
+
+        private readonly IPostRepository              _posts;
+        private readonly IMonetizationRuleRepository  _rules;
+        private readonly IPaymentGateway              _payments;
+        private readonly ICacheProvider               _cache;
+        private readonly INotificationService         _notify;
+        private readonly IEditorialAnalytics          _analytics;
+        private readonly IUnitOfWork                  _uow;
+        private readonly ILogger<PublishingAutomationService> _log;
+        private readonly AsyncRetryPolicy             _retryPolicy;
+
+        public PublishingAutomationService(
+            IPostRepository             posts,
+            IMonetizationRuleRepository rules,
+            IPaymentGateway             payments,
+            ICacheProvider              cache,
+            INotificationService        notify,
+            IEditorialAnalytics         analytics,
+            IUnitOfWork                 uow,
+            ILogger<PublishingAutomationService> log)
+        {
+            _posts     = posts  ?? throw new ArgumentNullException(nameof(posts));
+            _rules     = rules  ?? throw new ArgumentNullException(nameof(rules));
+            _payments  = payments?? throw new ArgumentNullException(nameof(payments));
+            _cache     = cache  ?? throw new ArgumentNullException(nameof(cache));
+            _notify    = notify ?? throw new ArgumentNullException(nameof(notify));
+            _analytics = analytics ?? throw new ArgumentNullException(nameof(analytics));
+            _uow       = uow    ?? throw new ArgumentNullException(nameof(uow));
+            _log       = log    ?? throw new ArgumentNullException(nameof(log));
+
+            // Exponential back-off retry (e.g., for transient SQL/HTTP failures).
+            _retryPolicy = Policy
+                .Handle<Exception>(ex => !(ex is OperationCanceledException))
+                .WaitAndRetryAsync(
+                    retryCount: 3,
+                    sleepDurationProvider: attempt => TimeSpan.FromMilliseconds(100 * Math.Pow(2, attempt)),
+                    onRetry: (ex, ts, attempt, ctx) =>
+                    {
+                        _log.LogWarning(ex,
+                            "Retry {Attempt} triggered in publishing automation. Waiting {Delay} ms.",
+                            attempt,
+                            ts.TotalMilliseconds);
+                    });
+        }
+
+        public async Task<PublishResult> TryPublishScheduledAsync(Guid postId, CancellationToken ct = default)
+        {
+            try
+            {
+                return await _retryPolicy.ExecuteAsync(
+                    async _ => await ExecutePublishAsync(postId, ct),
+                    new Context($"{nameof(TryPublishScheduledAsync)}-{postId}"),
+                    ct);
+            }
+            catch (OperationCanceledException)
+            {
+                _log.LogInformation("Publishing automation canceled for PostId {PostId}", postId);
+                return new PublishResult(false, "Operation canceled");
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Unhandled exception in PublishingAutomationService for PostId {PostId}", postId);
+                return new PublishResult(false, "Unhandled exception");
+            }
+        }
+
+        #endregion
+
+        #region Private Helpers
+
+        private async Task<PublishResult> ExecutePublishAsync(Guid postId, CancellationToken ct)
+        {
+            // 1. Load aggregate
+            var post = await _posts.GetAsync(postId, ct);
+            if (post is null)
+            {
+                _log.LogWarning("Post {PostId} not found during scheduled publish attempt", postId);
+                return new PublishResult(false, "Post not found");
+            }
+
+            // 2. Validate scheduling window
+            if (!post.IsReadyToPublish(DateTime.UtcNow))
+            {
+                _log.LogDebug("Post {PostId} is not ready for publishing. Status={Status}", postId, post.Status);
+                return new PublishResult(false, "Not ready to publish");
+            }
+
+            // 3. Premium rule check
+            if (post.IsPremium)
+            {
+                var rule = await _rules.GetByPostIdAsync(postId, ct)
+                           ?? new MonetizationRule { PostId = postId, Price = Money.Free };
+
+                if (!rule.IsFree)
+                {
+                    var isValid = await _payments.IsPaymentSatisfiedAsync(post.AuthorId, postId, ct);
+                    if (!isValid)
+                    {
+                        _log.LogInformation("Payment validation failed for premium post {PostId}", postId);
+                        return new PublishResult(false, "Payment requirement not satisfied");
+                    }
+                }
+            }
+
+            // 4. Publish
+            post.Publish(DateTime.UtcNow);
+            await _posts.UpdateAsync(post, ct);
+
+            // 5. Commit – ensures all changes within this UoW become atomic.
+            await _uow.CommitAsync(ct);
+
+            // 6. Invalidate cache.
+            await _cache.InvalidateAsync(string.Format(CacheKeyPattern, postId), ct);
+
+            // 7. Notify followers / author.
+            await _notify.NotifyAsync(
+                new NotificationMessage(
+                    post.AuthorId,
+                    $"🎉 Your post '{post.Title}' is now live!",
+                    $"Congrats! Your scheduled post went live at {post.PublishedUtc:O} UTC."),
+                ct);
+
+            // 8. Analytics
+            await _analytics.TrackPublishAsync(post, ct);
+
+            _log.LogInformation("Successfully published post {PostId}", postId);
+            return new PublishResult(true);
+        }
+
+        #endregion
+    }
+}
+```

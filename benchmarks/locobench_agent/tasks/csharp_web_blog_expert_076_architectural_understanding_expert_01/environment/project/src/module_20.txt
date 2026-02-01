@@ -1,0 +1,347 @@
+```csharp
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace TempoScribePro.Application.Scheduling
+{
+    #region Contracts (Ports)
+
+    /// <summary>
+    /// Abstraction over time, so we can stub it in tests.
+    /// </summary>
+    public interface IClock
+    {
+        DateTimeOffset UtcNow { get; }
+    }
+
+    /// <summary>
+    /// Repository that exposes scheduled post queries and persistence.
+    /// </summary>
+    public interface IPostRepository
+    {
+        /// <summary>
+        /// Retrieves all posts that should be published before the supplied timestamp
+        /// and are still marked as <see cref="PostStatus.Scheduled"/>.
+        /// </summary>
+        Task<IReadOnlyList<Post>> GetScheduledPostsAsync(DateTimeOffset publishBefore, CancellationToken ct);
+
+        /// <summary>
+        /// Persists the post. Implementation decides whether this is unit-of-work or immediate commit.
+        /// </summary>
+        Task SaveAsync(Post post, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Generic event bus used by the domain to emit integration events.
+    /// </summary>
+    public interface IEventBus
+    {
+        Task PublishAsync(IDomainEvent @event, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Simple cache wrapper used by the scheduler to avoid hammering the DB.
+    /// </summary>
+    public interface ICacheAdapter
+    {
+        Task<T?> GetAsync<T>(string key, CancellationToken ct);
+        Task SetAsync<T>(string key, T value, TimeSpan ttl, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Payment port, used to place premium content behind a pay wall.
+    /// </summary>
+    public interface IPaymentGateway
+    {
+        Task EnsurePayWallAsync(Post post, CancellationToken ct);
+    }
+
+    #endregion
+
+    #region Domain Model
+
+    /// <summary>
+    /// Strongly-typed post identifier.
+    /// </summary>
+    public readonly record struct PostId(Guid Value)
+    {
+        public override string ToString() => Value.ToString("N");
+        public static PostId New() => new PostId(Guid.NewGuid());
+    }
+
+    public enum PostStatus
+    {
+        Draft       = 0,
+        Scheduled   = 1,
+        Published   = 2,
+        Failed      = 3
+    }
+
+    /// <summary>
+    /// Aggregate root representing a blog post inside the TempoScribe domain.
+    /// </summary>
+    public sealed class Post
+    {
+        public PostId            Id            { get; init; } = PostId.New();
+        public string            Title         { get; private set; } = string.Empty;
+        public string            Content       { get; private set; } = string.Empty;
+        public DateTimeOffset?   ScheduledAt   { get; private set; }
+        public PostStatus        Status        { get; private set; } = PostStatus.Draft;
+        public bool              IsPremium     { get; private set; }
+        public DateTimeOffset?   PublishedAt   { get; private set; }
+        private readonly List<IDomainEvent> _events = new();
+
+        // Domain factory.
+        public static Post Schedule(string title, string content, DateTimeOffset scheduledAtUtc, bool isPremium)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(title);
+            ArgumentException.ThrowIfNullOrWhiteSpace(content);
+
+            return new Post
+            {
+                Title       = title,
+                Content     = content,
+                ScheduledAt = scheduledAtUtc.UtcDateTime,
+                IsPremium   = isPremium,
+                Status      = PostStatus.Scheduled
+            };
+        }
+
+        public void Publish(IClock clock)
+        {
+            if (Status != PostStatus.Scheduled)
+                throw new InvalidOperationException($"Cannot publish post in state {Status}");
+            if (clock.UtcNow < ScheduledAt)
+                throw new InvalidOperationException("Cannot publish before scheduled date.");
+
+            Status      = PostStatus.Published;
+            PublishedAt = clock.UtcNow;
+
+            _events.Add(new PostPublishedEvent(Id));
+        }
+
+        public void MarkFailed(string reason, IClock clock)
+        {
+            Status      = PostStatus.Failed;
+            PublishedAt = clock.UtcNow;
+            _events.Add(new PostPublishFailedEvent(Id, reason));
+        }
+
+        public IReadOnlyCollection<IDomainEvent> DequeueEvents()
+        {
+            var snapshot = _events.ToArray();
+            _events.Clear();
+            return snapshot;
+        }
+    }
+
+    #endregion
+
+    #region Domain Events
+
+    public interface IDomainEvent { }
+
+    public sealed record PostPublishedEvent(PostId PostId)      : IDomainEvent;
+    public sealed record PostPublishFailedEvent(PostId PostId, string Reason) : IDomainEvent;
+
+    #endregion
+
+    #region Application Service
+
+    /// <summary>
+    /// Orchestrates scheduled publishing for posts that are due.
+    /// Intended to be executed by a hosted background worker or a serverless job.
+    /// </summary>
+    public sealed class ScheduledPublishingService
+    {
+        private const string CacheKeyPrefix     = "scheduler:next:";
+        private readonly IPostRepository        _repository;
+        private readonly IPaymentGateway        _paymentGateway;
+        private readonly ICacheAdapter          _cache;
+        private readonly IClock                 _clock;
+        private readonly IEventBus              _eventBus;
+        private readonly ILogger                _logger;
+        private readonly TimeSpan               _lookAhead;
+        private readonly SemaphoreSlim          _mutex            = new(1, 1);
+
+        public ScheduledPublishingService(
+            IPostRepository repository,
+            IPaymentGateway paymentGateway,
+            ICacheAdapter cache,
+            IClock clock,
+            IEventBus eventBus,
+            ILogger<ScheduledPublishingService> logger,
+            TimeSpan? lookAheadWindow = null)
+        {
+            _repository     = repository  ?? throw new ArgumentNullException(nameof(repository));
+            _paymentGateway = paymentGateway ?? throw new ArgumentNullException(nameof(paymentGateway));
+            _cache          = cache       ?? throw new ArgumentNullException(nameof(cache));
+            _clock          = clock       ?? throw new ArgumentNullException(nameof(clock));
+            _eventBus       = eventBus    ?? throw new ArgumentNullException(nameof(eventBus));
+            _logger         = logger      ?? throw new ArgumentNullException(nameof(logger));
+            _lookAhead      = lookAheadWindow ?? TimeSpan.FromMinutes(5);
+        }
+
+        /// <summary>
+        /// Publishes every post that has reached its scheduled time.
+        /// Returns number of posts successfully published.
+        /// </summary>
+        public async Task<int> PublishDuePostsAsync(CancellationToken ct = default)
+        {
+            // Ensures single execution at a time even if the job is triggered in parallel.
+            if (!await _mutex.WaitAsync(TimeSpan.Zero, ct))
+            {
+                _logger.LogDebug("Scheduler is already running – skipping concurrent execution.");
+                return 0;
+            }
+
+            try
+            {
+                var now      = _clock.UtcNow;
+                var cacheKey = CacheKeyPrefix + now.UtcDateTime.ToString("yyyyMMddHHmm");
+
+                // Attempt to pull scheduled posts from the cache first.
+                var duePosts = await _cache.GetAsync<IReadOnlyList<Post>>(cacheKey, ct)
+                               ?? await FetchAndCacheAsync(cacheKey, now, ct);
+
+                if (duePosts.Count == 0)
+                {
+                    _logger.LogTrace("No posts due for publication at {Time}.", now);
+                    return 0;
+                }
+
+                int publishedCount = 0;
+                foreach (var post in duePosts.Where(p => p.Status == PostStatus.Scheduled))
+                {
+                    try
+                    {
+                        ct.ThrowIfCancellationRequested();
+
+                        _logger.LogInformation(
+                            "Publishing post {PostId} (Premium:{IsPremium}).", post.Id, post.IsPremium);
+
+                        // Place premium post behind a pay wall first.
+                        if (post.IsPremium)
+                        {
+                            await _paymentGateway.EnsurePayWallAsync(post, ct);
+                            _logger.LogDebug("Paywall configured for post {PostId}.", post.Id);
+                        }
+
+                        post.Publish(_clock);
+
+                        await _repository.SaveAsync(post, ct);
+                        await EmitEventsAsync(post, ct);
+
+                        publishedCount++;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex,
+                            "Error while publishing post {PostId}. Marking as failed.", post.Id);
+
+                        post.MarkFailed(ex.Message, _clock);
+                        await _repository.SaveAsync(post, ct);
+                        await EmitEventsAsync(post, ct);
+                    }
+                }
+
+                _logger.LogInformation("Scheduler successfully published {Count} posts.", publishedCount);
+                return publishedCount;
+            }
+            finally
+            {
+                _mutex.Release();
+            }
+        }
+
+        private async Task<IReadOnlyList<Post>> FetchAndCacheAsync(
+            string cacheKey,
+            DateTimeOffset now,
+            CancellationToken ct)
+        {
+            // Look ahead to reduce DB hits for near-future runs.
+            var horizon = now + _lookAhead;
+            var posts   = await _repository.GetScheduledPostsAsync(horizon, ct);
+
+            // Cache for 30 seconds to keep things fresh but still reduce load.
+            await _cache.SetAsync(cacheKey, posts, TimeSpan.FromSeconds(30), ct);
+            return posts;
+        }
+
+        private async Task EmitEventsAsync(Post post, CancellationToken ct)
+        {
+            foreach (var domainEvent in post.DequeueEvents())
+            {
+                await _eventBus.PublishAsync(domainEvent, ct);
+            }
+        }
+    }
+
+    #endregion
+
+    #region Simple Adapters (In-Memory)
+
+    /// <summary>
+    /// Thread-safe, in-memory cache implementation suitable for unit tests and local dev.
+    /// Production deployments should replace it with Redis/Memcached adapter.
+    /// </summary>
+    public sealed class InMemoryCacheAdapter : ICacheAdapter
+    {
+        private readonly ConcurrentDictionary<string, CacheEntry> _store = new();
+
+        public Task<T?> GetAsync<T>(string key, CancellationToken ct)
+        {
+            if (_store.TryGetValue(key, out var entry) && !entry.IsExpired)
+                return Task.FromResult((T?)entry.Value);
+
+            _store.TryRemove(key, out _);
+            return Task.FromResult(default(T));
+        }
+
+        public Task SetAsync<T>(string key, T value, TimeSpan ttl, CancellationToken ct)
+        {
+            var expires = DateTimeOffset.UtcNow + ttl;
+            _store[key] = new CacheEntry(value!, expires);
+            return Task.CompletedTask;
+        }
+
+        private sealed class CacheEntry
+        {
+            public object Value { get; }
+            private readonly DateTimeOffset _expiresAt;
+
+            public bool IsExpired => DateTimeOffset.UtcNow >= _expiresAt;
+
+            public CacheEntry(object value, DateTimeOffset expiresAt)
+            {
+                Value       = value;
+                _expiresAt  = expiresAt;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Naïve payment gateway adapter used for local development.
+    /// In production this would integrate with Stripe/PayPal etc.
+    /// </summary>
+    public sealed class MockPaymentGateway : IPaymentGateway
+    {
+        private readonly ILogger _logger;
+
+        public MockPaymentGateway(ILogger<MockPaymentGateway> logger) => _logger = logger;
+
+        public Task EnsurePayWallAsync(Post post, CancellationToken ct)
+        {
+            _logger.LogInformation("Mock paywall applied to post {PostId}.", post.Id);
+            return Task.CompletedTask;
+        }
+    }
+
+    #endregion
+}
+```

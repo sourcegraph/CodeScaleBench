@@ -1,0 +1,260 @@
+```rust
+//! src/module_16.rs
+//! LedgerEntryQueryService – high-throughput, cached, paginated read-side service
+//!
+//! Responsibilities
+//! -----------------
+//! • Authorize caller/tenant
+//! • Validate request (pagination bounds, etc.)
+//! • Fetch from Redis cache when possible
+//! • Fallback to PostgreSQL, then populate cache
+//! • Return DTO‐level page with rich metadata
+//!
+//! This module sits at the “Query” boundary in our CQRS layout and is wired
+//! into the public REST & GraphQL layer by the outer API gateway crate.
+
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+use tracing::{error, info, instrument, warn};
+
+use crate::{
+    auth::AuthContext,
+    cache::CacheProvider,
+    domain::ledger::{LedgerEntry, LedgerEntryId},
+    repository::LedgerEntryRepository,
+};
+
+/// Upper-bound limit for a single page request. Guards against abuse / DoS.
+const MAX_PAGE_SIZE: u32 = 250;
+
+/// How long query results live in cache.
+const CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Canonical pagination request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PageRequest {
+    pub page: u32,
+    pub size: u32,
+}
+
+impl PageRequest {
+    /// Validate bounds; returns error if out of range.
+    pub fn validate(&self) -> Result<()> {
+        if self.page == 0 {
+            return Err(anyhow!("page index must start at 1"));
+        }
+        if self.size == 0 || self.size > MAX_PAGE_SIZE {
+            return Err(anyhow!(
+                "size must be in range 1..={}",
+                MAX_PAGE_SIZE
+            ));
+        }
+        Ok(())
+    }
+
+    /// Convert to SQL-layer offset/limit tuple.
+    pub fn to_offset_limit(&self) -> (u32, u32) {
+        ((self.page - 1) * self.size, self.size)
+    }
+}
+
+/// Generic one-based paginated response DTO.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub page: u32,
+    pub size: u32,
+    pub total: u64,
+    pub has_more: bool,
+}
+
+/// Network-facing DTO for LedgerEntry.
+/// Keeps domain object internal and enforces
+/// backwards compatibility/versioning at boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEntryDto {
+    pub id: LedgerEntryId,
+    pub account_id: String,
+    pub amount: f64,
+    pub currency: String,
+    pub booked_at: DateTime<Utc>,
+}
+
+impl From<LedgerEntry> for LedgerEntryDto {
+    fn from(src: LedgerEntry) -> Self {
+        LedgerEntryDto {
+            id: src.id,
+            account_id: src.account_id,
+            amount: src.amount,
+            currency: src.currency,
+            booked_at: src.booked_at,
+        }
+    }
+}
+
+/// Error envelope specific to this query service.
+#[derive(thiserror::Error, Debug)]
+pub enum QueryError {
+    #[error("auth error: {0}")]
+    Auth(String),
+    #[error("validation error: {0}")]
+    Validation(String),
+    #[error("repository error: {0}")]
+    Repository(#[from] anyhow::Error),
+    #[error("cache error: {0}")]
+    Cache(#[from] redis::RedisError),
+}
+
+impl From<QueryError> for actix_web::Error {
+    fn from(err: QueryError) -> Self {
+        actix_web::error::ErrorInternalServerError(err)
+    }
+}
+
+/// Trait abstraction for LedgerEntry read repository (PostgreSQL).
+#[async_trait]
+pub trait LedgerEntryQueryPort: Send + Sync {
+    async fn page_for_tenant(
+        &self,
+        tenant_id: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<(Vec<LedgerEntry>, u64)>;
+}
+
+/// Allow blanket impl for any LedgerEntryRepository that already provides the fn.
+#[async_trait]
+impl<T> LedgerEntryQueryPort for T
+where
+    T: LedgerEntryRepository + Send + Sync,
+{
+    async fn page_for_tenant(
+        &self,
+        tenant_id: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<(Vec<LedgerEntry>, u64)> {
+        self.page_for_tenant(tenant_id, offset, limit).await
+    }
+}
+
+/// High-level query service with Redis read-through cache.
+pub struct LedgerEntryQueryService<R, C> {
+    repo: R,
+    cache: C,
+}
+
+impl<R, C> LedgerEntryQueryService<R, C>
+where
+    R: LedgerEntryQueryPort,
+    C: CacheProvider,
+{
+    pub fn new(repo: R, cache: C) -> Self {
+        Self { repo, cache }
+    }
+
+    /// Composite cache key.
+    fn cache_key(tenant_id: &str, req: PageRequest) -> String {
+        format!("ledger:entries:{tenant_id}:{page}:{size}", page = req.page, size = req.size)
+    }
+
+    /// Validate, authorize, maybe return from cache, else query DB + prime cache.
+    #[instrument(skip(self, auth_ctx))]
+    pub async fn get_page(
+        &self,
+        auth_ctx: &AuthContext,
+        req: PageRequest,
+    ) -> Result<Page<LedgerEntryDto>, QueryError> {
+        req.validate().map_err(|e| QueryError::Validation(e.to_string()))?;
+
+        // Authorization: check that caller can access given tenant id
+        let tenant_id = auth_ctx.tenant_id();
+        if !auth_ctx.can_access_tenant(tenant_id) {
+            return Err(QueryError::Auth("tenant mismatch".into()));
+        }
+
+        let cache_key = Self::cache_key(tenant_id, req);
+
+        // try cache
+        if let Some(raw) = self
+            .cache
+            .get_json::<Page<LedgerEntryDto>>(&cache_key)
+            .await
+            .context("redis get")?
+        {
+            info!("ledger_page hit cache tenant={tenant_id}");
+            return Ok(raw);
+        }
+
+        // fallback to repository
+        let (offset, limit) = req.to_offset_limit();
+        let (entries, total) = self
+            .repo
+            .page_for_tenant(tenant_id, offset, limit)
+            .await
+            .map_err(QueryError::Repository)?;
+
+        let dtos: Vec<LedgerEntryDto> = entries.into_iter().map(Into::into).collect();
+        let has_more = (offset as u64 + dtos.len() as u64) < total;
+
+        let page = Page {
+            items: dtos,
+            page: req.page,
+            size: req.size,
+            total,
+            has_more,
+        };
+
+        // populate cache (fire-and-forget)
+        if let Err(e) = self
+            .cache
+            .set_json::<Page<LedgerEntryDto>>(&cache_key, &page, CACHE_TTL)
+            .await
+        {
+            warn!(error = %e, "failed to populate redis cache");
+        }
+
+        Ok(page)
+    }
+}
+
+/* ---------- supporting glue code that would live elsewhere ---------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::{MockAuth, MockCache, MockLedgerRepo};
+
+    #[actix_rt::test]
+    async fn test_validation_error() {
+        let svc = LedgerEntryQueryService::new(MockLedgerRepo::default(), MockCache::default());
+        let auth = MockAuth::tenant("acme");
+
+        let req = PageRequest { page: 0, size: 10 };
+        let result = svc.get_page(&auth, req).await;
+        matches!(result.unwrap_err(), QueryError::Validation(_));
+    }
+
+    #[actix_rt::test]
+    async fn test_cache_roundtrip() {
+        let cache = MockCache::default();
+        let repo = MockLedgerRepo::default();
+        let svc = LedgerEntryQueryService::new(repo, cache.clone());
+        let auth = MockAuth::tenant("acme");
+
+        let req = PageRequest { page: 1, size: 1 };
+
+        // First call – hits DB, populates cache
+        let _ = svc.get_page(&auth, req).await.unwrap();
+
+        // Second call – served from cache (repo call counter == 1)
+        let _ = svc.get_page(&auth, req).await.unwrap();
+        assert_eq!(cache.hit_count(), 1);
+    }
+}
+```

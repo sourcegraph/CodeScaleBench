@@ -1,0 +1,315 @@
+```csharp
+// -----------------------------------------------------------------------------
+//  Project : PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//  File    : module_86.cs (generated out of src/module_86.txt specification)
+//  Author  : PulseOps Engineering
+//  Purpose : Infrastructure–agnostic transformation orchestrator that discovers
+//            concrete ITransformationStrategy implementations at runtime and
+//            executes them in parallel over an incoming data-set.  The class is
+//            designed for re-use across stream (Lambda/Kinesis) and batch
+//            (Glue/Step-Functions) workloads.
+// -----------------------------------------------------------------------------
+
+#nullable enable
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.Lambda.Core;
+using Microsoft.Extensions.Logging;
+
+// ReSharper disable MemberCanBePrivate.Global
+// ReSharper disable ClassNeverInstantiated.Global
+
+namespace PulseOps.Warehouse.Core.Transformations
+{
+    /// <summary>
+    /// Signal-bearing wrapper for any incoming raw payload.  The envelope
+    /// standardises metadata required by downstream components while keeping
+    /// the raw JSON representation untouched for schema-on-read scenarios.
+    /// </summary>
+    /// <param name="CorrelationId">Distributed tracing correlation id.</param>
+    /// <param name="SourceSystem">Originating system / product id.</param>
+    /// <param name="Payload">Raw JSON payload.</param>
+    public sealed record DataEnvelope(
+        string CorrelationId,
+        string SourceSystem,
+        JsonElement Payload);
+
+
+    /// <summary>
+    /// All transformation strategies must implement the ITransformationStrategy
+    /// contract.  Implementations <b>must be stateless</b> to guarantee that
+    /// they can be safely reused by the orchestrator across parallel threads.
+    /// </summary>
+    public interface ITransformationStrategy
+    {
+        /// <summary>Unique name that identifies a strategy, e.g. <c>focus-time</c>.</summary>
+        string Name { get; }
+
+        /// <summary>
+        /// Execute transformation against the supplied <see cref="DataEnvelope"/>.
+        /// Implementations should avoid throwing and instead signal domain errors
+        /// via <see cref="TransformationResult"/> payloads to keep the orchestrator
+        /// resilient under failure storms.
+        /// </summary>
+        Task<TransformationResult> TransformAsync(
+            DataEnvelope envelope,
+            CancellationToken cancellationToken);
+    }
+
+
+    /// <summary>
+    /// Represents the outcome of a transformation execution.
+    /// </summary>
+    /// <param name="Success">Whether the transformation succeeded.</param>
+    /// <param name="OutputPayload">Transformed payload (may be null when failed).</param>
+    /// <param name="Error">Optional error details.</param>
+    public sealed record TransformationResult(
+        bool Success,
+        JsonElement? OutputPayload,
+        string? Error);
+
+
+    /// <summary>
+    /// Strategy registry that uses reflection to auto-discover all
+    /// <see cref="ITransformationStrategy"/> implementations and exposes them
+    /// through a keyed dictionary.  A lightweight reload mechanism is provided
+    /// to pick up newly deployed strategies without a full process restart
+    /// (e.g. when running in hot-swap Lambda containers).
+    /// </summary>
+    public sealed class TransformationStrategyRegistry
+    {
+        private readonly ILogger _logger;
+        private readonly ConcurrentDictionary<string, ITransformationStrategy> _strategies = new();
+
+        public TransformationStrategyRegistry(ILogger<TransformationStrategyRegistry> logger)
+        {
+            _logger = logger;
+            Reload();
+        }
+
+        /// <summary>
+        /// Reloads strategy catalogue by scanning all currently loaded assemblies
+        /// for types implementing <see cref="ITransformationStrategy"/>.
+        /// </summary>
+        public void Reload()
+        {
+            _strategies.Clear();
+
+            var strategies = AppDomain.CurrentDomain.GetAssemblies()
+                .SelectMany(a =>
+                {
+                    try { return a.GetTypes(); }
+                    catch (ReflectionTypeLoadException rtl) { return rtl.Types.Where(t => t != null)!; }
+                })
+                .Where(t => !t.IsAbstract && !t.IsInterface && typeof(ITransformationStrategy).IsAssignableFrom(t))
+                .Select(Activator.CreateInstance)
+                .Cast<ITransformationStrategy>();
+
+            foreach (var strategy in strategies)
+            {
+                if (!_strategies.TryAdd(strategy.Name, strategy))
+                {
+                    _logger.LogWarning(
+                        "Duplicate transformation strategy name '{StrategyName}' detected. Skipping extra implementation.",
+                        strategy.Name);
+                }
+            }
+
+            _logger.LogInformation("Transformation strategy registry reloaded. Count={Count}", _strategies.Count);
+        }
+
+        /// <summary>
+        /// Attempt to fetch a strategy by name.
+        /// </summary>
+        public bool TryGet(string name, [NotNullWhen(true)] out ITransformationStrategy? strategy)
+            => _strategies.TryGetValue(name, out strategy);
+
+        /// <summary>Returns snapshot of all registered strategy names.</summary>
+        public IReadOnlyCollection<string> Names => _strategies.Keys.ToArray();
+    }
+
+
+    /// <summary>
+    /// Orchestrates transformation execution across a batch of
+    /// <see cref="DataEnvelope"/> instances by delegating transformation work
+    /// to the appropriate strategy implementation.  The orchestrator is fully
+    /// asynchronous and leverages <see cref="Parallel.ForEachAsync{TSource}"/>
+    /// to maximise throughput on multi-core environments (such as Lambda
+    /// Graviton2/3).
+    /// </summary>
+    public sealed class TransformationOrchestrator
+    {
+        private readonly TransformationStrategyRegistry _registry;
+        private readonly ILogger _logger;
+        private readonly int _maxParallelism;
+
+        public TransformationOrchestrator(
+            TransformationStrategyRegistry registry,
+            ILogger<TransformationOrchestrator> logger,
+            int? maxParallelism = null)
+        {
+            _registry = registry;
+            _logger = logger;
+            _maxParallelism = maxParallelism ?? Environment.ProcessorCount;
+        }
+
+        /// <summary>
+        /// Processes the provided <paramref name="envelopes"/> through the set of
+        /// <paramref name="strategyNames"/> we desire to apply.  Outputs are
+        /// grouped by strategy name for downstream routing (e.g. partitioning
+        /// into separate S3 prefixes or Kinesis shards).
+        /// </summary>
+        public async Task<IDictionary<string, IList<TransformationResult>>> ExecuteAsync(
+            IEnumerable<DataEnvelope> envelopes,
+            IEnumerable<string> strategyNames,
+            CancellationToken cancellationToken = default)
+        {
+            var envelopesList = envelopes as IList<DataEnvelope> ?? envelopes.ToList();
+            var strategyList = strategyNames as IList<string> ?? strategyNames.ToList();
+
+            ValidateInput(envelopesList, strategyList);
+
+            _logger.LogInformation("Starting transformation execution. BatchSize={Batch}, Strategies={Strategies}",
+                envelopesList.Count, string.Join(',', strategyList));
+
+            var output = new ConcurrentDictionary<string, IList<TransformationResult>>(
+                strategyList.ToDictionary(s => s, _ => (IList<TransformationResult>)new List<TransformationResult>()));
+
+            // Kick off transformation tasks
+            await Parallel.ForEachAsync(strategyList, new ParallelOptions
+            {
+                CancellationToken = cancellationToken,
+                MaxDegreeOfParallelism = _maxParallelism
+            }, async (strategyName, token) =>
+            {
+                if (!_registry.TryGet(strategyName, out var strategy))
+                {
+                    _logger.LogError("Requested transformation strategy '{StrategyName}' not found.", strategyName);
+                    return;
+                }
+
+                foreach (var envelope in envelopesList)
+                {
+                    try
+                    {
+                        var result = await strategy.TransformAsync(envelope, token).ConfigureAwait(false);
+                        output[strategyName].Add(result);
+                    }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested)
+                    {
+                        _logger.LogWarning("Transformation execution was cancelled for strategy '{StrategyName}'.",
+                            strategyName);
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex,
+                            "Unhandled exception while executing strategy '{StrategyName}' on CorrelationId={CorrelationId}",
+                            strategyName, envelope.CorrelationId);
+
+                        output[strategyName].Add(new TransformationResult(
+                            Success: false,
+                            OutputPayload: null,
+                            Error: ex.Message));
+                    }
+                }
+            }).ConfigureAwait(false);
+
+            _logger.LogInformation("Transformation execution finished.");
+            return output;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ValidateInput(
+            IList<DataEnvelope> envelopes,
+            IList<string> strategyNames)
+        {
+            if (envelopes.Count == 0)
+                throw new ArgumentException("Envelope batch is empty.", nameof(envelopes));
+
+            if (strategyNames.Count == 0)
+                throw new ArgumentException("No transformation strategies specified.", nameof(strategyNames));
+        }
+    }
+
+
+    // -------------------------------------------------------------------------
+    // Example strategy implementation
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Sample strategy that derives a "focus-time ratio" KPI from a calendar
+    /// event record.  Real-world implementation would rely on domain semantics
+    /// such as user availability, meeting types, etc.  Here we demonstrate
+    /// placeholder business logic and structured error handling.
+    /// </summary>
+    internal sealed class FocusTimeRatioStrategy : ITransformationStrategy
+    {
+        private static readonly JsonSerializerOptions SerializerOptions = new()
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+        };
+
+        public string Name => "focus-time";
+
+        public Task<TransformationResult> TransformAsync(
+            DataEnvelope envelope,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                // Pretend we parse meeting metadata
+                var parsed = JsonSerializer.Deserialize<CalendarEvent>(envelope.Payload, SerializerOptions)
+                             ?? throw new InvalidOperationException("Invalid calendar event schema.");
+
+                // Business logic: compute focus ratio = focusMinutes / totalMinutes
+                var totalMinutes = parsed.TotalMinutes;
+                if (totalMinutes <= 0)
+                    throw new InvalidOperationException("Total minutes must be greater than zero.");
+
+                var focusRatio = parsed.FocusMinutes / (double)totalMinutes;
+
+                var output = new FocusTimeKpi
+                {
+                    EmployeeId = parsed.EmployeeId,
+                    Date = parsed.Date,
+                    FocusRatio = Math.Round(focusRatio, 4)
+                };
+
+                var json = JsonSerializer.SerializeToElement(output, SerializerOptions);
+                return Task.FromResult(new TransformationResult(true, json, null));
+            }
+            catch (Exception ex)
+            {
+                // Bubble up as soft-failure to orchestrator
+                return Task.FromResult(new TransformationResult(false, null, ex.Message));
+            }
+        }
+
+        // DTOs ===================================================================================
+
+        private sealed record CalendarEvent
+        {
+            public string EmployeeId { get; init; } = null!;
+            public DateTime Date { get; init; }
+            public int FocusMinutes { get; init; }
+            public int TotalMinutes { get; init; }
+        }
+
+        private sealed record FocusTimeKpi
+        {
+            public string EmployeeId { get; init; } = null!;
+            public DateTime Date { get; init; }
+            public double FocusRatio { get; init; }
+        }
+    }
+}
+```

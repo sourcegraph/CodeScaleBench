@@ -1,0 +1,418 @@
+```rust
+//! src/utils.txt
+//!
+//! Collection of low-level helper utilities used across the EduPulse Live
+//! backend.  These helpers stay intentionally *domain-agnostic* so that they
+//! can be re-used by service‐layer, repository, or background-worker crates
+//! without incurring cyclic-dependency hell.
+//!
+//! Modules
+//! -------
+//! • `id`          – monotonic, roughly-sortable identifiers (Snowflake-ish)
+//! • `time`        – thin wrappers around `chrono` for consistent timekeeping
+//! • `crypto`      – secure random token generation + constant-time equality
+//! • `retry`       – async, cancel-safe retry / back-off combinator
+//! • `event`       – light-weight domain-event abstraction + envelope
+//! • `serde_ext`   – (de)serialization helpers
+//! • `telemetry`   – opinionated tracing / log initialisation
+//!
+//! All modules are `pub` so that downstream crates can cherry-pick only what
+//! they need without gluing in the entire kitchen-sink.
+//!
+//! The code is `#![forbid(unsafe_code)]` by default when compiled with
+//! `--cfg edu_pulse_deny_unsafe`, giving defence-in-depth for our audit
+//! requirements.
+
+#![cfg_attr(edu_pulse_deny_unsafe, forbid(unsafe_code))]
+
+pub mod id;
+pub mod time;
+pub mod crypto;
+pub mod retry;
+pub mod event;
+pub mod serde_ext;
+pub mod telemetry;
+
+/* ------------------------------------------------------------------------------------------------
+ * Module: id
+ * --------------------------------------------------------------------------------------------- */
+
+pub mod id {
+    //! Monotonically increasing 64-bit identifiers inspired by Twitter’s Snowflake
+    //! algorithm.  IDs are roughly sortable by creation time while remaining unique
+    //! across workers.  
+    //!
+    //! Layout (big-endian):
+    //! ┌────────41b────────┬────10b────┬───12b─┐
+    //! │ milliseconds ts   │ worker_id │ seq  │
+    //! └────────────────────┴───────────┴──────┘
+
+    use parking_lot::Mutex;
+    use std::{sync::Arc, time::SystemTime};
+
+    // Jan 1st 2020 00:00:00.000 UTC (chosen arbitrarily, but in the past)
+    const CUSTOM_EPOCH_MILLIS: u64 = 1_577_836_800_000;
+
+    /// Returned whenever the clock goes *backwards* (NTP sync, leap second,
+    /// manual change, etc.) and we cannot guarantee monotonicity.
+    #[derive(Debug, thiserror::Error)]
+    #[error("system clock drifted backwards")]
+    pub struct ClockDriftError;
+
+    #[derive(Debug, Clone)]
+    pub struct SnowflakeIdGenerator {
+        inner: Arc<Mutex<State>>,
+        worker_id: u16,
+    }
+
+    #[derive(Debug)]
+    struct State {
+        last_ts: u64,
+        sequence: u16,
+    }
+
+    impl SnowflakeIdGenerator {
+        /// Max value that can fit into the *worker* field (10 bits)
+        pub const MAX_WORKER_ID: u16 = (1 << 10) - 1;
+
+        /// Create a new generator for the specified `worker_id`
+        pub fn new(worker_id: u16) -> Self {
+            assert!(
+                worker_id <= Self::MAX_WORKER_ID,
+                "worker_id {} exceeds max {}",
+                worker_id,
+                Self::MAX_WORKER_ID
+            );
+
+            Self {
+                inner: Arc::new(Mutex::new(State {
+                    last_ts: 0,
+                    sequence: 0,
+                })),
+                worker_id,
+            }
+        }
+
+        /// Generate the next 64-bit identifier.
+        ///
+        /// NOTE: This operation grabs a MLS; however contention should be
+        /// minimal because the critical section is extremely small.
+        pub fn next_id(&self) -> Result<u64, ClockDriftError> {
+            const SEQ_MASK: u16 = (1 << 12) - 1; // 12-bit mask
+
+            let mut state = self.inner.lock();
+            let mut ts = current_time_millis();
+
+            if ts < state.last_ts {
+                // Time went backwards
+                return Err(ClockDriftError);
+            }
+
+            if ts == state.last_ts {
+                // Same millisecond ➜ bump sequence
+                state.sequence = (state.sequence + 1) & SEQ_MASK;
+                if state.sequence == 0 {
+                    // Sequence overflow ➜ wait for next millisecond
+                    ts = spin_next_millis(state.last_ts);
+                }
+            } else {
+                state.sequence = 0;
+            }
+
+            state.last_ts = ts;
+
+            let id = ((ts - CUSTOM_EPOCH_MILLIS) << 22)  // 41 bits << (10+12)
+                | ((self.worker_id as u64) << 12)        // 10 bits << 12
+                | (state.sequence as u64);               // 12 bits
+
+            Ok(id)
+        }
+    }
+
+    #[inline(always)]
+    fn current_time_millis() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("time before unix epoch")
+            .as_millis() as u64
+    }
+
+    /// Busy-wait until we reach a new millisecond
+    fn spin_next_millis(last_ts: u64) -> u64 {
+        let mut ts = current_time_millis();
+        while ts <= last_ts {
+            std::hint::spin_loop();
+            ts = current_time_millis();
+        }
+        ts
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Module: time
+ * --------------------------------------------------------------------------------------------- */
+
+pub mod time {
+    //! Consistent time utility wrapper.
+    //! The backend exclusively deals with *UTC* to avoid time-zone hell.
+
+    use chrono::{DateTime, Utc};
+
+    /// Returns the current UTC timestamp (`chrono::DateTime<Utc>`).
+    #[inline(always)]
+    pub fn utc_now() -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    /// Milliseconds since Unix epoch as `i64`.
+    #[inline(always)]
+    pub fn epoch_millis() -> i64 {
+        utc_now().timestamp_millis()
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Module: crypto
+ * --------------------------------------------------------------------------------------------- */
+
+pub mod crypto {
+    //! Cryptography-related helpers (no encryption here, only randomness and
+    //! constant-time comparison).  All randomness is sourced from the OS CSPRNG.
+
+    use rand::{rngs::OsRng, RngCore};
+
+    /// Generate `len` random bytes using the operating system’s CSPRNG.
+    pub fn secure_rand_bytes(len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        OsRng.fill_bytes(&mut buf);
+        buf
+    }
+
+    /// Generate a URL-safe, base64-encoded token of `len` *raw* random bytes.
+    ///
+    /// The resulting string is `4/3 * len` bytes long due to base64 encoding.
+    pub fn secure_token(len: usize) -> String {
+        base64::encode_config(secure_rand_bytes(len), base64::URL_SAFE_NO_PAD)
+    }
+
+    /// Constant-time equality check to prevent timing-side-channels.
+    #[inline(always)]
+    pub fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
+        use subtle::ConstantTimeEq;
+        lhs.ct_eq(rhs).into()
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Module: retry
+ * --------------------------------------------------------------------------------------------- */
+
+pub mod retry {
+    //! Thin async retry combinator with exponential back-off and full-jitter
+    //! (per “Exponential Backoff And Jitter” ‑ AWS Architecture Blog).
+    //!
+    //! Example:
+    //! ```
+    //! use utils::retry::{retry_async, RetryPolicy};
+    //! let policy = RetryPolicy::bounded(5);
+    //! let res: u32 = retry_async(policy, || async { Ok(42u32) }).await?;
+    //! ```
+
+    use rand::Rng;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    #[derive(Debug, Clone)]
+    pub struct RetryPolicy {
+        pub max_retries: usize,
+        pub initial_delay: Duration,
+        pub max_delay: Duration,
+    }
+
+    impl RetryPolicy {
+        pub fn bounded(max_retries: usize) -> Self {
+            Self {
+                max_retries,
+                initial_delay: Duration::from_millis(100),
+                max_delay: Duration::from_secs(5),
+            }
+        }
+    }
+
+    /// Retry the async `operation` according to `policy`.
+    ///
+    /// The `operation` closure is re-invoked if it returns `Err`.
+    pub async fn retry_async<O, Op, E, T>(
+        policy: RetryPolicy,
+        mut operation: O,
+    ) -> Result<T, E>
+    where
+        O: FnMut() -> Op,
+        Op: std::future::Future<Output = Result<T, E>>,
+    {
+        let mut attempt: usize = 0;
+        let mut delay = policy.initial_delay;
+
+        loop {
+            match operation().await {
+                ok @ Ok(_) => return ok,
+                Err(err) if attempt >= policy.max_retries => return Err(err),
+                Err(_) => {
+                    // full-jitter back-off
+                    let sleep_ms = rand::thread_rng().gen_range(0..delay.as_millis() as u64 + 1);
+                    sleep(Duration::from_millis(sleep_ms)).await;
+                    delay = std::cmp::min(delay * 2, policy.max_delay);
+                    attempt += 1;
+                }
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Module: event
+ * --------------------------------------------------------------------------------------------- */
+
+pub mod event {
+    //! Minimalistic domain-event abstraction used by the message-broker layer.
+    //! The envelope is serialisable so that it can be published over NATS/Kafka
+    //! or stored in an event store.
+
+    use crate::id::{self, SnowflakeIdGenerator};
+    use crate::time;
+    use chrono::{DateTime, Utc};
+    use serde::{de::DeserializeOwned, Deserialize, Serialize};
+    use std::sync::OnceLock;
+    use uuid::Uuid;
+
+    /// Marker trait for *payload* types.
+    pub trait DomainEvent:
+        Serialize + DeserializeOwned + Send + Sync + 'static
+    {
+        /// Each event must declare its own *canonical* type string
+        /// (e.g. `"user.password_reset_v1"`) so that consumers can route on it.
+        fn event_type(&self) -> &'static str;
+    }
+
+    /// Envelope wrapping any `DomainEvent` with metadata required for traceability.
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct EventEnvelope<E: DomainEvent> {
+        pub id: u64,
+        pub causation_id: Option<Uuid>,
+        pub correlation_id: Option<Uuid>,
+        pub aggregate_id: Option<Uuid>,
+        pub occurred_at: DateTime<Utc>,
+        pub payload: E,
+    }
+
+    impl<E: DomainEvent> EventEnvelope<E> {
+        /// Wrap `payload` into a fully-initialised envelope.
+        pub fn new(payload: E) -> Self {
+            static ID_GEN: OnceLock<SnowflakeIdGenerator> = OnceLock::new();
+            let gen = ID_GEN.get_or_init(|| SnowflakeIdGenerator::new(1));
+
+            Self {
+                id: gen.next_id().expect("clock drift detected"),
+                causation_id: None,
+                correlation_id: None,
+                aggregate_id: None,
+                occurred_at: time::utc_now(),
+                payload,
+            }
+        }
+
+        /// Set the correlation trail and return self for chaining.
+        pub fn with_correlation(mut self, corr: Uuid, cause: Option<Uuid>) -> Self {
+            self.correlation_id = Some(corr);
+            self.causation_id = cause;
+            self
+        }
+
+        pub fn event_type(&self) -> &'static str {
+            self.payload.event_type()
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Module: serde_ext
+ * --------------------------------------------------------------------------------------------- */
+
+pub mod serde_ext {
+    //! Thin convenience wrappers around `serde_json`.
+    //!
+    //! Using these helpers allows us to switch JSON implementation (e.g. to
+    //! `simd-json`) without sweeping changes in downstream crates.
+
+    use serde::{de::DeserializeOwned, Serialize};
+    use serde_json::{self, Value};
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum SerdeExtError {
+        #[error("serialization failure: {0}")]
+        Serialize(#[from] serde_json::Error),
+    }
+
+    pub fn to_json_value<T: Serialize>(value: &T) -> Result<Value, SerdeExtError> {
+        Ok(serde_json::to_value(value)?)
+    }
+
+    pub fn to_json_string<T: Serialize>(value: &T) -> Result<String, SerdeExtError> {
+        Ok(serde_json::to_string(value)?)
+    }
+
+    pub fn from_json_value<T: DeserializeOwned>(val: Value) -> Result<T, SerdeExtError> {
+        Ok(serde_json::from_value(val)?)
+    }
+
+    pub fn from_json_str<T: DeserializeOwned>(s: &str) -> Result<T, SerdeExtError> {
+        Ok(serde_json::from_str(s)?)
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Module: telemetry
+ * --------------------------------------------------------------------------------------------- */
+
+pub mod telemetry {
+    //! Opinionated `tracing` + `env_logger` initialisation used by every
+    //! executable target in EduPulse Live.  We attach a global subscriber
+    //! exactly once; subsequent calls become no-ops.
+
+    use std::time::Duration;
+    use tracing_subscriber::{
+        filter::LevelFilter,
+        fmt::{format::FmtSpan, time::ChronoLocal},
+        layer::SubscriberExt,
+        util::SubscriberInitExt,
+    };
+
+    static INIT: std::sync::Once = std::sync::Once::new();
+
+    /// Initialise global tracing subscriber (idempotent).
+    ///
+    /// • Log level controlled by `RUST_LOG` (defaults to `info`)
+    /// • Span events emitted at enter/exit for latency measurement
+    pub fn init() {
+        INIT.call_once(|| {
+            let env_filter =
+                std::env::var("RUST_LOG").unwrap_or_else(|_| "info,hyper=warn,tower=warn".into());
+
+            let fmt_layer = tracing_subscriber::fmt::layer()
+                .with_timer(ChronoLocal::with_format("%F %T".into()))
+                .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
+                .with_target(false)
+                .with_level(true)
+                .with_thread_names(true);
+
+            tracing_subscriber::registry()
+                .with(LevelFilter::from_env(&env_filter))
+                .with(fmt_layer)
+                .init();
+
+            // Emit a first line so operators know logging is alive.
+            tracing::info!(uptime = ?Duration::from_secs(0), "Telemetry initialised");
+        });
+    }
+}
+```

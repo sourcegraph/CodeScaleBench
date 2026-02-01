@@ -1,0 +1,330 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * ============================================
+ * Module: Rate Limiter (Token-Bucket implementation)
+ *
+ * This module provides a lightweight, thread-safe rate-limiting
+ * utility intended to be shared by MercuryMonolith’s REST/GraphQL
+ * gateway layer.  It implements a classic token-bucket algorithm
+ * with nanosecond-precision refill logic, Prometheus-compatible
+ * metrics export, and optional structured-logging hooks.
+ *
+ * Compile unit name suggested: src/module_4_rate_limiter.c
+ *
+ * Public API
+ * ----------
+ *  mm_rate_limiter_t* mm_rl_new(const char *name,
+ *                               uint32_t permits_per_sec,
+ *                               uint32_t burst);
+ *
+ *  bool mm_rl_allow(mm_rate_limiter_t *rl, uint32_t cost);
+ *
+ *  void mm_rl_destroy(mm_rate_limiter_t *rl);
+ *
+ *  /* Metrics helpers * /
+ *  size_t mm_rl_metrics_prometheus(char *dst, size_t dst_sz);
+ *
+ * Thread Safety
+ * -------------
+ * Internally uses a POSIX mutex.  fast-path (no refill required)
+ * avoids locking via atomic CAS when possible.
+ *
+ * Dependencies
+ * ------------
+ *   - pthread      (for mutex)
+ *   - stdatomic.h  (for atomic counters, C11)
+ *
+ * Author: mercury@monolith.dev
+ * License: MIT
+ */
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdatomic.h>
+#include <string.h>
+#include <time.h>
+#include <errno.h>
+#include <pthread.h>
+
+/* -------------------------------------------------------------------------
+ * Internal helpers / Fallback stubs for project-wide facilities
+ * ------------------------------------------------------------------------- */
+
+/* Structured-logging facility (weak symbols so that the real logger can
+ * override during link time). */
+__attribute__((weak))
+static void mm_log_warn(const char *fmt, ...)
+{
+    (void)fmt; /* no-op fallback */
+}
+__attribute__((weak))
+static void mm_log_debug(const char *fmt, ...)
+{
+    (void)fmt;
+}
+/* -------------------------------------------------------------------------
+ * Data-types
+ * ------------------------------------------------------------------------- */
+
+/* Nanoseconds from CLOCK_MONOTONIC */
+static inline uint64_t
+mm_clock_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
+/* Token-bucket rate limiter */
+typedef struct mm_rate_limiter_s
+{
+    char                 name[64];
+
+    uint64_t             capacity;       /* Maximum tokens in bucket       */
+    double               refill_tkn_per_ns;
+
+    atomic_double        tokens;         /* C11 _Atomic double             */
+    atomic_uint_fast64_t last_refill_ns; /* Monotonic nanosecond timestamp */
+
+    /* Metrics counters (cumulated) */
+    atomic_uint_fast64_t allowed;
+    atomic_uint_fast64_t denied;
+
+    pthread_mutex_t      mtx;            /* Serialises slow-path refill    */
+
+    struct mm_rate_limiter_s *next;      /* For registry linked-list       */
+} mm_rate_limiter_t;
+
+/* -------------------------------------------------------------------------
+ * Registry (allows metrics scrape across all limiters)
+ * ------------------------------------------------------------------------- */
+
+static pthread_mutex_t          g_registry_mtx = PTHREAD_MUTEX_INITIALIZER;
+static mm_rate_limiter_t       *g_registry_head = NULL;
+
+/* Insert into global registry */
+static void
+mm_rl_registry_add(mm_rate_limiter_t *rl)
+{
+    pthread_mutex_lock(&g_registry_mtx);
+    rl->next        = g_registry_head;
+    g_registry_head = rl;
+    pthread_mutex_unlock(&g_registry_mtx);
+}
+
+/* Remove from registry */
+static void
+mm_rl_registry_remove(mm_rate_limiter_t *rl)
+{
+    pthread_mutex_lock(&g_registry_mtx);
+    mm_rate_limiter_t **it = &g_registry_head;
+    while (*it) {
+        if (*it == rl) {
+            *it = rl->next;
+            break;
+        }
+        it = &(*it)->next;
+    }
+    pthread_mutex_unlock(&g_registry_mtx);
+}
+
+/* -------------------------------------------------------------------------
+ * Rate Limiter Implementation
+ * ------------------------------------------------------------------------- */
+
+/* Allocate and initialise a new rate limiter.
+ *   name             – identifier (copied internally, 63 chars + NUL max)
+ *   permits_per_sec  – steady-state allowed requests/second
+ *   burst            – max burst size (bucket capacity)
+ * Returns NULL on error. */
+mm_rate_limiter_t *
+mm_rl_new(const char *name, uint32_t permits_per_sec, uint32_t burst)
+{
+    if (!name || permits_per_sec == 0 || burst == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    mm_rate_limiter_t *rl = calloc(1, sizeof(*rl));
+    if (!rl) return NULL;
+
+    snprintf(rl->name, sizeof(rl->name), "%s", name);
+    rl->capacity           = burst;
+    rl->refill_tkn_per_ns  = (double)permits_per_sec / 1e9;
+    atomic_init(&rl->tokens, (double)burst);
+    atomic_init(&rl->last_refill_ns, mm_clock_now_ns());
+    atomic_init(&rl->allowed, 0);
+    atomic_init(&rl->denied, 0);
+
+    if (pthread_mutex_init(&rl->mtx, NULL) != 0) {
+        free(rl);
+        return NULL;
+    }
+
+    mm_rl_registry_add(rl);
+    mm_log_debug("[rate-limit] '%s' created: %u rps burst=%u",
+                 rl->name, permits_per_sec, burst);
+    return rl;
+}
+
+/* Destroy rate limiter instance */
+void
+mm_rl_destroy(mm_rate_limiter_t *rl)
+{
+    if (!rl) return;
+
+    mm_rl_registry_remove(rl);
+    pthread_mutex_destroy(&rl->mtx);
+    free(rl);
+}
+
+/* Refill bucket tokens – must be called under rl->mtx */
+static void
+mm_rl_refill_locked(mm_rate_limiter_t *rl, uint64_t now_ns)
+{
+    uint64_t last = atomic_load_explicit(&rl->last_refill_ns,
+                                         memory_order_relaxed);
+    if (now_ns <= last)
+        return;
+
+    uint64_t elapsed_ns = now_ns - last;
+
+    /* Calc tokens to add */
+    double add = elapsed_ns * rl->refill_tkn_per_ns;
+    if (add < 0.000001)  /* negligible */
+        return;
+
+    double cur = atomic_load_explicit(&rl->tokens, memory_order_relaxed);
+    cur += add;
+    if (cur > rl->capacity)
+        cur = (double)rl->capacity;
+
+    atomic_store_explicit(&rl->tokens, cur, memory_order_relaxed);
+    atomic_store_explicit(&rl->last_refill_ns, now_ns,
+                          memory_order_relaxed);
+}
+
+/* Attempt to consume `cost` tokens. Returns true if allowed. */
+bool
+mm_rl_allow(mm_rate_limiter_t *rl, uint32_t cost)
+{
+    if (unlikely(!rl || cost == 0))
+        return false;
+
+    uint64_t now_ns = mm_clock_now_ns();
+
+    /* Fast-path: optimistic read without lock. */
+    double old_tokens = atomic_load_explicit(&rl->tokens, memory_order_relaxed);
+    if (old_tokens >= cost) {
+        /* Try to atomically deduct without lock */
+        double new_tokens = old_tokens - cost;
+        if (atomic_compare_exchange_strong_explicit(
+                &rl->tokens, &old_tokens, new_tokens,
+                memory_order_acq_rel, memory_order_relaxed)) {
+            atomic_fetch_add_explicit(&rl->allowed, 1, memory_order_relaxed);
+            return true;
+        }
+        /* else fallthrough to slow-path */
+    }
+
+    /* Slow-path: take mutex, refill, then retry. */
+    pthread_mutex_lock(&rl->mtx);
+
+    mm_rl_refill_locked(rl, now_ns);
+
+    double tokens = atomic_load_explicit(&rl->tokens, memory_order_relaxed);
+    bool   ok     = false;
+    if (tokens >= cost) {
+        atomic_store_explicit(&rl->tokens, tokens - cost, memory_order_relaxed);
+        ok = true;
+    }
+
+    pthread_mutex_unlock(&rl->mtx);
+
+    if (ok)
+        atomic_fetch_add_explicit(&rl->allowed, 1, memory_order_relaxed);
+    else
+        atomic_fetch_add_explicit(&rl->denied, 1, memory_order_relaxed);
+
+    return ok;
+}
+
+/* -------------------------------------------------------------------------
+ * Metrics
+ * ------------------------------------------------------------------------- */
+
+/* Export Prometheus metrics for all registered limiters.
+ * Example output:
+ *   # HELP mm_rl_allowed_total Total requests allowed by the rate limiter
+ *   # TYPE mm_rl_allowed_total counter
+ *   mm_rl_allowed_total{rl="checkout"} 1234
+ *   ...
+ * Returns bytes written to dst (truncated if dst_sz too small). */
+size_t
+mm_rl_metrics_prometheus(char *dst, size_t dst_sz)
+{
+    static const char header[] =
+        "# HELP mm_rl_allowed_total Total requests allowed by the rate limiter\n"
+        "# TYPE mm_rl_allowed_total counter\n"
+        "# HELP mm_rl_denied_total Total requests denied by the rate limiter\n"
+        "# TYPE mm_rl_denied_total counter\n";
+
+    size_t off = 0;
+    if (dst_sz > 0) {
+        size_t len = snprintf(dst, dst_sz, "%s", header);
+        off = (len >= dst_sz) ? dst_sz : len;
+    }
+
+    pthread_mutex_lock(&g_registry_mtx);
+
+    for (mm_rate_limiter_t *it = g_registry_head; it; it = it->next) {
+        uint64_t allowed = atomic_load_explicit(&it->allowed, memory_order_relaxed);
+        uint64_t denied  = atomic_load_explicit(&it->denied,  memory_order_relaxed);
+
+        int n1 = snprintf(dst + off,
+                          (off < dst_sz) ? dst_sz - off : 0,
+                          "mm_rl_allowed_total{rl=\"%s\"} %" PRIu64 "\n",
+                          it->name, allowed);
+        off += (n1 < 0) ? 0 : (size_t)n1;
+
+        int n2 = snprintf(dst + off,
+                          (off < dst_sz) ? dst_sz - off : 0,
+                          "mm_rl_denied_total{rl=\"%s\"} %" PRIu64 "\n",
+                          it->name, denied);
+        off += (n2 < 0) ? 0 : (size_t)n2;
+    }
+
+    pthread_mutex_unlock(&g_registry_mtx);
+    return off;
+}
+
+/* -------------------------------------------------------------------------
+ * Example usage (can be removed when linking into full codebase)
+ * ------------------------------------------------------------------------- */
+#ifdef MERCURY_RL_MODULE_TEST
+
+#include <unistd.h>
+#include <assert.h>
+
+int main(void)
+{
+    mm_rate_limiter_t *rl = mm_rl_new("demo", 10, 20);
+    assert(rl);
+
+    for (int i = 0; i < 25; ++i) {
+        bool ok = mm_rl_allow(rl, 1);
+        printf("%2d -> %s\n", i + 1, ok ? "ALLOWED" : "DENIED");
+        usleep(50000); /* 50ms */
+    }
+
+    char buf[1024];
+    size_t n = mm_rl_metrics_prometheus(buf, sizeof(buf));
+    fwrite(buf, 1, n, stdout);
+
+    mm_rl_destroy(rl);
+    return 0;
+}
+#endif /* MERCURY_RL_MODULE_TEST */

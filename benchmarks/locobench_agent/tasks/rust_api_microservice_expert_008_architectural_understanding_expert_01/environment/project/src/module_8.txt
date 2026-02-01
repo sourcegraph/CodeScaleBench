@@ -1,0 +1,421 @@
+```rust
+//! src/module_8.rs
+//!
+//! LedgerLink Nexus – Module 8
+//!
+//! This module brings together three horizontal concerns required by
+//! high-volume endpoints such as `GET /v1/ledger-entries`:
+//!     1. Robust, cursor-based pagination helpers
+//!     2. Response-caching via Redis (or an in-memory fallback for tests)
+//!     3. Command/Query service façade that coordinates repository access,
+//!        validation, tracing and cache hydration.
+//!
+//! The implementation is self-contained in a single file for the purpose of
+//! the example, but in the production code-base every sub-module would live
+//! in its own file and be wired together using dependency-injection.
+//!
+//! The public items exposed here are intended to be consumed by the HTTP
+//! or GraphQL layers, hiding all infrastructure details behind clean,
+//! async traits.
+//!
+//! -------------------------------------------------------------------------
+
+#![allow(dead_code)]
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::RwLock;
+use tracing::{debug, instrument, warn};
+use uuid::Uuid;
+
+// Re-export the most useful symbols so consumers can simply
+// `use module_8::{LedgerEntryService, PageParams};`
+pub use pagination::{PageParams, Paged};
+pub use service::LedgerEntryService;
+
+/////////////////////////////////////////////////////////////////////////////
+// 1. DOMAIN + DTOs
+/////////////////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub id:            Uuid,
+    pub tenant_id:     String,
+    pub created_at:    DateTime<Utc>,
+    pub amount_cents:  i64,
+    pub currency:      String,
+    pub description:   String,
+    pub reference_num: String,
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// 2. PAGINATION
+/////////////////////////////////////////////////////////////////////////////
+
+mod pagination {
+    //! Cursor-based pagination utilities.
+    //!
+    //! LedgerLink Nexus supports both page-number & cursor styles, however the
+    //! latter is recommended for high-volume tables because it is stable with
+    //! concurrent inserts.  We expose a minimal but production-ready subset
+    //! here.
+
+    use super::*;
+    use serde::de::Error as DeError;
+    use serde::{Deserializer, Serializer};
+
+    /// Input parameters from the client.  Either `after` or `before` acts as a
+    /// cursor (opaque to the caller), combined with a positive `limit`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct PageParams {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub after: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub before: Option<String>,
+        #[serde(default = "PageParams::default_limit")]
+        pub limit: u32,
+    }
+
+    impl PageParams {
+        const MAX_LIMIT: u32 = 500;
+
+        fn default_limit() -> u32 {
+            100
+        }
+
+        /// Sanity-check – guarantee reasonable values before we hit the DB.
+        pub fn validate(&self) -> Result<(), PageError> {
+            if self.after.is_some() && self.before.is_some() {
+                return Err(PageError::AmbiguousCursors);
+            }
+            if self.limit == 0 || self.limit > Self::MAX_LIMIT {
+                return Err(PageError::InvalidLimit(self.limit));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Error)]
+    pub enum PageError {
+        #[error("both 'after' and 'before' cursors supplied – choose one")]
+        AmbiguousCursors,
+        #[error("limit of {0} outside allowed range")]
+        InvalidLimit(u32),
+    }
+
+    /// Outgoing envelope – contains the requested slice and cursors for the
+    /// caller to request the next/previous page.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Paged<T> {
+        pub data: Vec<T>,
+        #[serde(serialize_with = "serialize_cursor_opt")]
+        #[serde(deserialize_with = "deserialize_cursor_opt")]
+        pub next: Option<String>,
+        #[serde(serialize_with = "serialize_cursor_opt")]
+        #[serde(deserialize_with = "deserialize_cursor_opt")]
+        pub prev: Option<String>,
+    }
+
+    // --- Cursor helpers ---------------------------------------------------
+
+    fn serialize_cursor_opt<S>(value: &Option<Vec<u8>>, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(bytes) => ser.serialize_some(&base64::encode(bytes)),
+            None => ser.serialize_none(),
+        }
+    }
+
+    fn deserialize_cursor_opt<'de, D>(de: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<String> = Option::deserialize(de)?;
+        opt.map(|s| base64::decode(s).map_err(DeError::custom))
+            .transpose()
+    }
+
+    impl<T> Paged<T> {
+        pub fn empty() -> Self {
+            Self {
+                data: Vec::new(),
+                next: None,
+                prev: None,
+            }
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// 3. REPOSITORY LAYER
+/////////////////////////////////////////////////////////////////////////////
+
+/// Abstraction over the persistence mechanism; can be backed by SQLx,
+/// Diesel, etc.  The query is intentionally minimal for clarity.
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    /// Fetch a single page worth of ledger entries for a given tenant,
+    /// using the supplied cursor/limit strategy.
+    async fn fetch_page(
+        &self,
+        tenant_id: &str,
+        params: &PageParams,
+    ) -> Result<Paged<LedgerEntry>, RepositoryError>;
+}
+
+/// Repository error surfaces DB layer failures to upper tiers.
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("database I/O error: {0}")]
+    Db(#[from] anyhow::Error),
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// 4. CACHE LAYER
+/////////////////////////////////////////////////////////////////////////////
+
+/// A very small caching trait; in the real service this would expose more
+/// fine-grained TTL control, eviction metrics, tracing, etc.
+#[async_trait]
+pub trait Cache: Send + Sync {
+    async fn get_bytes(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>>;
+    async fn set_bytes(&self, key: &str, value: &[u8], ttl: Duration) -> anyhow::Result<()>;
+}
+
+/// In-memory stub used in unit/integration tests.
+pub struct MemoryCache {
+    store: RwLock<std::collections::HashMap<String, (Vec<u8>, std::time::Instant)>>,
+}
+
+impl MemoryCache {
+    pub fn new() -> Self {
+        Self {
+            store: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl Cache for MemoryCache {
+    async fn get_bytes(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let map = self.store.read().await;
+        if let Some((bytes, exp)) = map.get(key) {
+            if exp.elapsed() < Duration::from_secs(0) {
+                return Ok(None);
+            }
+            Ok(Some(bytes.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn set_bytes(&self, key: &str, value: &[u8], ttl: Duration) -> anyhow::Result<()> {
+        let mut map = self.store.write().await;
+        map.insert(key.to_string(), (value.to_vec(), std::time::Instant::now() + ttl));
+        Ok(())
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// 5. SERVICE LAYER
+/////////////////////////////////////////////////////////////////////////////
+
+mod service {
+    use super::*;
+    use serde_json::to_vec;
+
+    /// Public facing façade that can be injected into controllers.
+    ///
+    /// Behind the scenes the service will:
+    ///     - Validate the pagination struct
+    ///     - Look for a cached page in Redis
+    ///     - On cache miss, query the repository and hydrate the cache
+    ///     - Emit structured tracing spans
+    pub struct LedgerEntryService<R: LedgerEntryRepository, C: Cache> {
+        repo:  R,
+        cache: C,
+        ttl:   Duration,
+    }
+
+    impl<R: LedgerEntryRepository, C: Cache> LedgerEntryService<R, C> {
+        pub fn new(repo: R, cache: C, ttl: Duration) -> Self {
+            Self { repo, cache, ttl }
+        }
+
+        /// Returns a paginated slice of ledger entries with caching applied.
+        #[instrument(
+            skip_all,
+            fields(
+                tenant = %tenant_id,
+                after = ?params.after,
+                before = ?params.before,
+                limit = params.limit
+            )
+        )]
+        pub async fn list_entries(
+            &self,
+            tenant_id: &str,
+            params: PageParams,
+        ) -> Result<Paged<LedgerEntry>, ServiceError> {
+            params.validate().map_err(ServiceError::Page)?;
+
+            // Compose a stable cache key – versioned for easy invalidation.
+            let cache_key = Self::cache_key(tenant_id, &params);
+
+            if let Some(bytes) = self.cache.get_bytes(&cache_key).await? {
+                debug!("cache hit for key={cache_key}");
+                let page: Paged<LedgerEntry> =
+                    serde_json::from_slice(&bytes).map_err(ServiceError::Internal)?;
+                return Ok(page);
+            }
+
+            debug!("cache miss for key={cache_key}");
+            let page = self.repo.fetch_page(tenant_id, &params).await?;
+            let serialized = to_vec(&page).map_err(ServiceError::Internal)?;
+            self.cache
+                .set_bytes(&cache_key, &serialized, self.ttl)
+                .await?;
+
+            Ok(page)
+        }
+
+        fn cache_key(tenant_id: &str, params: &PageParams) -> String {
+            let mut key = format!(
+                "v1:ledger_entries:{}:lim={}",
+                tenant_id.replace(':', "_"),
+                params.limit
+            );
+            if let Some(a) = &params.after {
+                key.push_str(&format!(":after={}", a));
+            }
+            if let Some(b) = &params.before {
+                key.push_str(&format!(":before={}", b));
+            }
+            key
+        }
+    }
+
+    /// Errors returned by the service façade – coercing lower layers.
+    #[derive(Debug, Error)]
+    pub enum ServiceError {
+        #[error(transparent)]
+        Page(#[from] PageError),
+        #[error(transparent)]
+        Repo(#[from] RepositoryError),
+        #[error(transparent)]
+        Cache(#[from] anyhow::Error),
+        #[error("serialization error: {0}")]
+        Internal(#[from] serde_json::Error),
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// 6. MOCK REPOSITORY IMPLEMENTATION (for illustration / tests)
+/////////////////////////////////////////////////////////////////////////////
+
+/// A deterministic, in-memory repository – **NOT** used in production,
+/// but handy for unit tests and example snippets.
+pub struct MemoryLedgerRepo {
+    records: Vec<LedgerEntry>,
+}
+
+impl MemoryLedgerRepo {
+    pub fn seeded(count: usize, tenant: &str) -> Self {
+        let mut records = Vec::with_capacity(count);
+        for i in 0..count {
+            records.push(LedgerEntry {
+                id:            Uuid::new_v4(),
+                tenant_id:     tenant.to_string(),
+                created_at:    Utc::now() - chrono::Duration::seconds(i as i64),
+                amount_cents:  (i as i64) * 100,
+                currency:      "USD".into(),
+                description:   format!("Txn #{i}"),
+                reference_num: format!("REF{i:04}"),
+            });
+        }
+        Self { records }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for MemoryLedgerRepo {
+    async fn fetch_page(
+        &self,
+        tenant_id: &str,
+        params: &PageParams,
+    ) -> Result<Paged<LedgerEntry>, RepositoryError> {
+        let data: Vec<_> = self
+            .records
+            .iter()
+            .filter(|rec| rec.tenant_id == tenant_id)
+            .take(params.limit as usize)
+            .cloned()
+            .collect();
+
+        let next = data.last().map(|rec| base64::encode(rec.id.as_bytes()));
+        let prev = data.first().map(|rec| base64::encode(rec.id.as_bytes()));
+
+        Ok(Paged { data, next, prev })
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// 7. UNIT TESTS
+/////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::Duration;
+
+    #[tokio::test]
+    async fn cache_is_hit_on_second_request() {
+        tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::DEBUG)
+            .init();
+
+        let repo = MemoryLedgerRepo::seeded(10, "TENANT");
+        let cache = MemoryCache::new();
+        let service = LedgerEntryService::new(repo, cache, Duration::from_secs(60));
+
+        let params = PageParams {
+            after: None,
+            before: None,
+            limit: 5,
+        };
+
+        // First call should populate the cache
+        let page1 = service.list_entries("TENANT", params.clone()).await.unwrap();
+        assert_eq!(page1.data.len(), 5);
+
+        // Second call should be served from cache (observe logs)
+        let page2 = service.list_entries("TENANT", params).await.unwrap();
+        assert_eq!(page2.data.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn invalid_limit_is_rejected() {
+        let repo = MemoryLedgerRepo::seeded(1, "T");
+        let cache = MemoryCache::new();
+        let service = LedgerEntryService::new(repo, cache, Duration::from_secs(60));
+
+        let bad_params = PageParams {
+            after: None,
+            before: None,
+            limit: 0,
+        };
+
+        match service.list_entries("T", bad_params).await {
+            Err(service::ServiceError::Page(_)) => {}
+            other => panic!("expected Page error, got {:?}", other),
+        }
+    }
+}
+```

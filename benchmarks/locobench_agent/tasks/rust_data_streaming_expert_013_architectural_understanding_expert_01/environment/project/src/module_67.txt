@@ -1,0 +1,410 @@
+```rust
+//! src/module_67.rs
+//!
+//! Enrichment micro-service for the ChirpPulse platform.  
+//!
+//! This module implements a pluggable enrichment pipeline that consumes raw
+//! social events from a Kafka topic, applies a configurable *strategy
+//! pipeline*, and republishes enriched events to another topic.  Strategies can
+//! be hot-swapped at runtime without restarting the service.
+//
+//  NOTE: This file is intended to be *representative* production-quality Rust.
+//  Some external crates must be declared in Cargo.toml:
+//
+//  [dependencies]
+//  anyhow            = "1.0"
+//  async-trait       = "0.1"
+//  dashmap           = "5"
+//  futures           = "0.3"
+//  rdkafka           = { version = "0.34", features = ["tokio", "cmake-build"] }
+//  serde             = { version = "1.0", features = ["derive"] }
+//  serde_json        = "1.0"
+//  thiserror         = "1.0"
+//  tokio             = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+//  tracing           = "0.1"
+//  tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+//  whatlang          = "0.15"
+
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use dashmap::DashMap;
+use futures::{StreamExt, TryStreamExt};
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    message::{Headers, OwnedMessage},
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig,
+};
+use serde::{Deserialize, Serialize};
+use tokio::{signal, sync::RwLock, task, time};
+use tracing::{error, info, instrument, warn};
+
+////////////////////////////////////////////////////////////////////////////////
+// Public API                                                                  /
+////////////////////////////////////////////////////////////////////////////////
+
+/// Launch the enrichment service.
+///
+/// This function never returns except on fatal error or SIGINT/SIGTERM.
+pub async fn run_service(kafka_brokers: &str, in_topic: &str, out_topic: &str) -> Result<()> {
+    // ── 1. Boot tracing  ──────────────────────────────────────────────────────
+    init_tracing();
+
+    // ── 2. Build Kafka client(s)  ────────────────────────────────────────────
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("group.id", "chirppulse-enrichment")
+        .set("bootstrap.servers", kafka_brokers)
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()
+        .context("failed to create Kafka consumer")?;
+
+    consumer.subscribe(&[in_topic])?;
+
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", kafka_brokers)
+        .create()
+        .context("failed to create Kafka producer")?;
+
+    // ── 3. Build strategy manager  ───────────────────────────────────────────
+    let strategy_mgr = StrategyManager::default();
+    // Hard-code initial strategies. In real life this could be fetched
+    // from a registry service, database, or WASM module store.
+    strategy_mgr.register(Box::new(SentimentStrategy::default()));
+    strategy_mgr.register(Box::new(LanguageStrategy::default()));
+
+    // Background watcher that (re)loads strategies every N seconds.
+    spawn_strategy_refresh(strategy_mgr.clone());
+
+    // ── 4. Run pipeline  ─────────────────────────────────────────────────────
+    info!("enrichment service started; waiting for messages…");
+
+    tokio::select! {
+        biased;
+
+        _ = shutdown_signal() => {
+            info!("Shutdown signal received.");
+        }
+
+        res = enrichment_loop(consumer, producer, out_topic.to_owned(), strategy_mgr) => {
+            if let Err(e) = res {
+                error!(error = %e, "Enrichment loop terminated with error");
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Domain types                                                                /
+////////////////////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SocialEvent {
+    pub id: String,
+    pub user_id: String,
+    pub timestamp: u64,
+    pub text: String,
+
+    #[serde(default)]
+    pub lang: Option<String>,
+    #[serde(default)]
+    pub sentiment: Option<f32>,
+
+    /// Additional arbitrary key/values produced by enrichers.
+    #[serde(default)]
+    pub meta: serde_json::Map<String, serde_json::Value>,
+}
+
+impl SocialEvent {
+    /// Update or insert an extension key.
+    fn insert_meta<V: Serialize>(&mut self, key: &str, val: V) {
+        if let Ok(v) = serde_json::to_value(val) {
+            self.meta.insert(key.to_owned(), v);
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Enrichment strategy                                                         /
+////////////////////////////////////////////////////////////////////////////////
+
+#[async_trait]
+pub trait EnrichmentStrategy: Send + Sync {
+    /// A unique, stable identifier used when registering/unregistering.
+    fn id(&self) -> &'static str;
+
+    /// Enrich a social event in-place.  
+    /// Returns `Ok(changed)` where `changed` signals whether the event was
+    /// mutated; an implementation may choose to skip enrichment early.
+    async fn enrich(&self, ev: &mut SocialEvent) -> Result<bool>;
+}
+
+/// Thread-safe registry / dispatcher for strategies.
+#[derive(Clone, Default)]
+pub struct StrategyManager {
+    delegates: Arc<RwLock<Vec<Box<dyn EnrichmentStrategy>>>>,
+}
+
+impl StrategyManager {
+    pub async fn enrich_all(&self, ev: &mut SocialEvent) -> Result<()> {
+        let delegates = self.delegates.read().await;
+        for strat in delegates.iter() {
+            // If a single strategy errors, we *warn* but continue the chain.
+            if let Err(e) = strat.enrich(ev).await {
+                warn!(strategy = strat.id(), error = %e, "strategy failed");
+            }
+        }
+        Ok(())
+    }
+
+    /// Register a new strategy instance. If an id collision happens, the
+    /// previous instance is *replaced*.
+    pub fn register(&self, strat: Box<dyn EnrichmentStrategy>) {
+        let id = strat.id();
+        let mut write = futures::executor::block_on(self.delegates.write());
+        match write.iter().position(|s| s.id() == id) {
+            Some(idx) => {
+                write[idx] = strat;
+                info!(%id, "strategy replaced");
+            }
+            None => {
+                write.push(strat);
+                info!(%id, "strategy registered");
+            }
+        }
+    }
+
+    /// List loaded strategy IDs.
+    pub async fn list(&self) -> Vec<&'static str> {
+        self.delegates.read().await.iter().map(|s| s.id()).collect()
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Built-in strategies                                                         /
+////////////////////////////////////////////////////////////////////////////////
+
+/// 1) Naïve sentiment analyser.
+struct SentimentStrategy {
+    positives: HashSet<&'static str>,
+    negatives: HashSet<&'static str>,
+}
+
+impl Default for SentimentStrategy {
+    fn default() -> Self {
+        Self {
+            positives: HashSet::from([
+                "good", "great", "awesome", "fantastic", "love", "like", "excellent", "happy",
+            ]),
+            negatives: HashSet::from([
+                "bad", "terrible", "awful", "hate", "dislike", "sad", "angry", "worst",
+            ]),
+        }
+    }
+}
+
+#[async_trait]
+impl EnrichmentStrategy for SentimentStrategy {
+    fn id(&self) -> &'static str {
+        "sentiment"
+    }
+
+    async fn enrich(&self, ev: &mut SocialEvent) -> Result<bool> {
+        let mut score = 0f32;
+        for token in ev.text.split_whitespace() {
+            let token = token.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+            if self.positives.contains(token.as_str()) {
+                score += 1.0;
+            } else if self.negatives.contains(token.as_str()) {
+                score -= 1.0;
+            }
+        }
+        if score.abs() >= f32::EPSILON {
+            ev.sentiment = Some(score);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// 2) Language detection using `whatlang`.
+struct LanguageStrategy;
+
+impl Default for LanguageStrategy {
+    fn default() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl EnrichmentStrategy for LanguageStrategy {
+    fn id(&self) -> &'static str {
+        "language_detection"
+    }
+
+    async fn enrich(&self, ev: &mut SocialEvent) -> Result<bool> {
+        if ev.lang.is_some() {
+            return Ok(false); // Already detected.
+        }
+        let info = whatlang::detect(&ev.text).ok_or_else(|| anyhow::anyhow!("unable to detect lang"))?;
+        ev.lang = Some(info.lang().code().to_string());
+        Ok(true)
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Service internals                                                          /
+////////////////////////////////////////////////////////////////////////////////
+
+#[instrument(skip(consumer, producer, strategy_mgr))]
+async fn enrichment_loop(
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+    out_topic: String,
+    strategy_mgr: StrategyManager,
+) -> Result<()> {
+    let mut stream = consumer.stream();
+    while let Some(msg) = stream.try_next().await? {
+        let span = tracing::info_span!("process_msg", offset = msg.offset());
+        async {
+            match handle_message(msg, &producer, &out_topic, &strategy_mgr).await {
+                Ok(_) => {}
+                Err(e) => error!(error = %e, "error processing message"),
+            }
+        }
+        .instrument(span)
+        .await;
+    }
+    Ok(())
+}
+
+#[instrument(skip(msg, producer, strategy_mgr))]
+async fn handle_message(
+    msg: OwnedMessage,
+    producer: &FutureProducer,
+    out_topic: &str,
+    strategy_mgr: &StrategyManager,
+) -> Result<()> {
+    // Deserialize
+    let payload = msg
+        .payload_view::<str>()
+        .ok_or_else(|| anyhow::anyhow!("empty payload"))?
+        .context("invalid UTF-8 in payload")?;
+
+    let mut event: SocialEvent = serde_json::from_str(payload).context("failed to parse json")?;
+
+    // Enrich
+    strategy_mgr.enrich_all(&mut event).await?;
+
+    // Serialize
+    let enriched = serde_json::to_vec(&event).context("failed to serialize enriched event")?;
+
+    // Forward to output topic
+    producer
+        .send(
+            FutureRecord::to(out_topic)
+                .payload(&enriched)
+                .key(&event.id)
+                .headers(
+                    Headers::new()
+                        .add("processed_by", "chirppulse_enrichment")
+                        .add("version", env!("CARGO_PKG_VERSION")),
+                ),
+            Duration::from_secs(0),
+        )
+        .await
+        .map_err(|(e, _)| e)
+        .context("failed to write to kafka")?;
+
+    // Commit offset
+    msg.commit(None)?;
+
+    Ok(())
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Auxiliary tasks                                                             /
+////////////////////////////////////////////////////////////////////////////////
+
+/// Periodically reloads strategies (for demo: just logs the current set).
+fn spawn_strategy_refresh(mgr: StrategyManager) {
+    task::spawn(async move {
+        let mut ticker = time::interval(Duration::from_secs(30));
+        loop {
+            ticker.tick().await;
+            match mgr.list().await.as_slice() {
+                ids if ids.is_empty() => warn!("no enrichment strategies loaded"),
+                ids => info!(strategies = ?ids, "active enrichment strategies"),
+            }
+        }
+    });
+}
+
+/// Graceful shutdown on CTRL-C / SIGINT / SIGTERM.
+async fn shutdown_signal() {
+    let _ = signal::ctrl_c().await;
+}
+
+/// Initialize tracing (stdout logger with `RUST_LOG` override support).
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,rdkafka=warn"));
+    fmt().with_env_filter(filter).init();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Unit tests (run with `cargo test -p chirppulse`)                            /
+////////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sentiment_positive() {
+        let mut evt = SocialEvent {
+            id: "1".into(),
+            user_id: "u".into(),
+            timestamp: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            text: "I love Rust, it's awesome!".into(),
+            lang: None,
+            sentiment: None,
+            meta: Default::default(),
+        };
+        let strat = SentimentStrategy::default();
+        strat.enrich(&mut evt).await.unwrap();
+        assert!(evt.sentiment.unwrap() > 0.0);
+    }
+
+    #[tokio::test]
+    async fn language_detection() {
+        let mut evt = SocialEvent {
+            id: "2".into(),
+            user_id: "u".into(),
+            timestamp: 0,
+            text: "Bonjour tout le monde!".into(),
+            lang: None,
+            sentiment: None,
+            meta: Default::default(),
+        };
+        let strat = LanguageStrategy::default();
+        strat.enrich(&mut evt).await.unwrap();
+        assert_eq!(evt.lang.unwrap(), "fr");
+    }
+}
+```

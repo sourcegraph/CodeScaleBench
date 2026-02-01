@@ -1,0 +1,519 @@
+```rust
+//! src/module_16.rs
+//!
+//! This module houses the production-ready implementation of the **Observer-driven
+//! Model-Monitoring & Automated-Retraining subsystem**.
+//!
+//! It demonstrates—at a realistic, non-trivial scale—the patterns and best practices used
+//! in the VisuTility Orchestrator code base.
+//!
+//! Layers touched:
+//!   • Model Ops   ––  Metric aggregation & model versioning  
+//!   • Serving Ops ––  Live-metric tapping from inference endpoints  
+//!   • Utility Ops ––  Observer pattern, error handling, concurrency safety  
+//!
+//! The module purposely avoids concrete tensor operations or inference calls so it can
+//! compile standalone; those hooks are expressed through traits (`MetricSource`,
+//! `TrainableModel`, etc.) that the rest of the project will implement.
+//!
+//! Key capabilities:
+//!   1. Metric ingestion via a *Subject* (`MetricsBus`).
+//!   2. Drift/decay detection handled by *Observers* (`AccuracyDecayDetector`).
+//!   3. Automated retraining orchestration (`RetrainingOrchestrator`).
+//!   4. Hyper-parameter tuning stub (`BayesianTuner`) implementing the Strategy pattern.
+//!   5. Versioned model registry interactions (`ModelRegistryClient`).
+//!
+//! Concurrency strategy:
+//! `MetricsBus` is `Arc<Mutex<_>>` locked only around the observer vector, not the hot
+//! path of metric publication (which relies on `crossbeam_channel`). This keeps contention
+//! low while remaining safe.
+
+#![allow(dead_code)] // Some structs are demonstrative stubs awaiting wider project wiring.
+
+use chrono::{DateTime, Utc};
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use rand::distributions::{Distribution, Uniform};
+use rand::thread_rng;
+use std::collections::VecDeque;
+use std::fmt::Debug;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+use thiserror::Error;
+use uuid::Uuid;
+
+/// Domain-level errors emitted by this module.
+#[derive(Debug, Error)]
+pub enum ModelOpsError {
+    #[error("observer already registered")]
+    DuplicateObserver,
+    #[error("observer not found")]
+    ObserverNotFound,
+    #[error("retraining failed: {0}")]
+    RetrainingFailed(String),
+    #[error("registry error: {0}")]
+    Registry(String),
+}
+
+/// A unique identifier for a model that rises above mere file names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ModelId(Uuid);
+
+impl Default for ModelId {
+    fn default() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+/// Simple immutable version object leveraging semantic versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct ModelVersion {
+    pub major: u16,
+    pub minor: u16,
+    pub patch: u16,
+}
+
+impl ModelVersion {
+    pub const fn new(major: u16, minor: u16, patch: u16) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    pub fn bump_patch(&self) -> Self {
+        Self {
+            major: self.major,
+            minor: self.minor,
+            patch: self.patch + 1,
+        }
+    }
+}
+
+/// ------------------------------------------------------------------------------------------
+/// Subject / Observer abstraction
+/// ------------------------------------------------------------------------------------------
+
+/// Metric event emitted by live-serving endpoints.
+#[derive(Debug, Clone)]
+pub struct MetricEvent {
+    pub model_id: ModelId,
+    pub model_version: ModelVersion,
+    pub timestamp: DateTime<Utc>,
+    pub accuracy: f32,
+    pub latency_ms: u32,
+}
+
+/// A generalized Observer that can react to a `MetricEvent`.
+pub trait MetricsObserver: Send + Sync + 'static {
+    fn on_metric(&self, metric: &MetricEvent) -> Result<(), ModelOpsError>;
+    fn name(&self) -> &'static str;
+}
+
+/// Subject that multiplexes metrics to observers.
+#[derive(Clone)]
+pub struct MetricsBus {
+    sender: Sender<MetricEvent>,
+    observers: Arc<Mutex<Vec<Arc<dyn MetricsObserver>>>>,
+}
+
+impl MetricsBus {
+    /// Create a new bus and background dispatch thread.
+    pub fn new() -> Self {
+        let (tx, rx) = unbounded::<MetricEvent>();
+        let observers = Arc::new(Mutex::new(Vec::new()));
+
+        // Spawn dispatch thread
+        Self::spawn_dispatcher(rx, observers.clone());
+
+        Self {
+            sender: tx,
+            observers,
+        }
+    }
+
+    pub fn register<O: MetricsObserver>(&self, observer: Arc<O>) -> Result<(), ModelOpsError> {
+        let mut obs = self
+            .observers
+            .lock()
+            .expect("observer mutex poisoned");
+
+        if obs.iter().any(|o| o.name() == observer.name()) {
+            return Err(ModelOpsError::DuplicateObserver);
+        }
+        obs.push(observer);
+        Ok(())
+    }
+
+    pub fn unregister_by_name(&self, name: &str) -> Result<(), ModelOpsError> {
+        let mut obs = self
+            .observers
+            .lock()
+            .expect("observer mutex poisoned");
+        let before = obs.len();
+        obs.retain(|o| o.name() != name);
+        if obs.len() == before {
+            Err(ModelOpsError::ObserverNotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Non-blocking publication of metrics.
+    pub fn publish(&self, event: MetricEvent) {
+        // It's acceptable to ignore send errors here because the receiver end
+        // is only disconnected on program shutdown.
+        let _ = self.sender.send(event);
+    }
+
+    fn spawn_dispatcher(rx: Receiver<MetricEvent>, observers: Arc<Mutex<Vec<Arc<dyn MetricsObserver>>>>) {
+        thread::Builder::new()
+            .name("metrics-dispatcher".into())
+            .spawn(move || {
+                for metric in rx {
+                    let snapshot = {
+                        // minimal lock duration — copy the Arc pointers only
+                        observers.lock().expect("observer mutex poisoned").clone()
+                    };
+                    // Dispatch outside lock to avoid observer re-entrancy deadlocks
+                    for obs in snapshot.iter() {
+                        if let Err(e) = obs.on_metric(&metric) {
+                            eprintln!(
+                                "[warn] observer '{}' failed to handle metric: {:?}",
+                                obs.name(),
+                                e
+                            );
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn metrics dispatcher");
+    }
+}
+
+/// ------------------------------------------------------------------------------------------
+/// Drift / decay detector observer
+/// ------------------------------------------------------------------------------------------
+
+/// Configuration values influencing drift detection sensitivity.
+#[derive(Debug, Clone)]
+pub struct DriftConfig {
+    pub sample_window: usize,
+    pub accuracy_threshold: f32,
+}
+
+impl Default for DriftConfig {
+    fn default() -> Self {
+        Self {
+            sample_window: 50,
+            accuracy_threshold: 0.05, // 5% absolute drop
+        }
+    }
+}
+
+/// Internal cache storing recent accuracy measurements.
+struct SlidingWindow {
+    capacity: usize,
+    data: VecDeque<f32>,
+}
+
+impl SlidingWindow {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            data: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, v: f32) {
+        if self.data.len() == self.capacity {
+            self.data.pop_front();
+        }
+        self.data.push_back(v);
+    }
+
+    fn mean(&self) -> Option<f32> {
+        if self.data.is_empty() {
+            None
+        } else {
+            Some(self.data.iter().copied().sum::<f32>() / self.data.len() as f32)
+        }
+    }
+}
+
+/// Observer implementation that raises decay events once detection criteria are met.
+pub struct AccuracyDecayDetector {
+    cfg: DriftConfig,
+    window: Mutex<SlidingWindow>,
+    retrain_tx: Sender<RetrainRequest>,
+}
+
+impl AccuracyDecayDetector {
+    pub fn new(cfg: DriftConfig, retrain_tx: Sender<RetrainRequest>) -> Self {
+        Self {
+            cfg,
+            window: Mutex::new(SlidingWindow::new(cfg.sample_window)),
+            retrain_tx,
+        }
+    }
+}
+
+impl MetricsObserver for AccuracyDecayDetector {
+    fn on_metric(&self, metric: &MetricEvent) -> Result<(), ModelOpsError> {
+        let mut win = self.window.lock().expect("window mutex poisoned");
+        win.push(metric.accuracy);
+
+        if win.data.len() == self.cfg.sample_window {
+            if let Some(mean) = win.mean() {
+                let drop = win
+                    .data
+                    .front()
+                    .map(|first| first - mean)
+                    .unwrap_or_default();
+                if drop >= self.cfg.accuracy_threshold {
+                    let req = RetrainRequest {
+                        model_id: metric.model_id,
+                        current_version: metric.model_version,
+                        reason: format!(
+                            "accuracy decayed by {:.2}% over last {} samples",
+                            drop * 100.0,
+                            self.cfg.sample_window
+                        ),
+                    };
+                    // Fire and forget; orchestration thread will pick this up.
+                    let _ = self.retrain_tx.send(req);
+                    // Clear window to rate-limit retrain events
+                    win.data.clear();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "AccuracyDecayDetector"
+    }
+}
+
+/// ------------------------------------------------------------------------------------------
+/// Retraining orchestration
+/// ------------------------------------------------------------------------------------------
+
+/// Lightweight request describing why a retrain should occur.
+#[derive(Debug, Clone)]
+pub struct RetrainRequest {
+    pub model_id: ModelId,
+    pub current_version: ModelVersion,
+    pub reason: String,
+}
+
+/// Abstract contract for anything that can be trained.
+pub trait TrainableModel: Send + Sync {
+    fn train(&self, params: &HyperParams) -> Result<ModelArtifact, String>;
+}
+
+/// Product of a training job.
+#[derive(Debug)]
+pub struct ModelArtifact {
+    pub model_id: ModelId,
+    pub version: ModelVersion,
+    pub created_at: DateTime<Utc>,
+    pub bytes: Vec<u8>, // Serialized weights; compressed.
+}
+
+/// Hyper-parameters understood by models in the system. Extend as needed.
+#[derive(Debug, Clone)]
+pub struct HyperParams {
+    pub learning_rate: f64,
+    pub batch_size: u32,
+    pub epochs: u32,
+}
+
+/// Strategy pattern: generic tuner interface.
+pub trait HyperParamTuner: Send + Sync {
+    fn propose(&self) -> HyperParams;
+}
+
+/// Basic Bayesian-like tuner stub for demonstration.
+pub struct BayesianTuner;
+
+impl HyperParamTuner for BayesianTuner {
+    fn propose(&self) -> HyperParams {
+        let mut rng = thread_rng();
+        let batch_range = Uniform::from(16..=128);
+        HyperParams {
+            learning_rate: 10f64.powf(Uniform::new(-4.0, -2.0).sample(&mut rng)),
+            batch_size: batch_range.sample(&mut rng) as u32,
+            epochs: 3,
+        }
+    }
+}
+
+/// Client for the model registry. In real life this would hit a datastore.
+pub trait ModelRegistryClient: Send + Sync {
+    fn register(&self, artifact: &ModelArtifact) -> Result<(), ModelOpsError>;
+}
+
+/// Concrete orchestrator
+pub struct RetrainingOrchestrator<R, M> {
+    tuner: Arc<dyn HyperParamTuner>,
+    registry: Arc<R>,
+    model: Arc<M>,
+    rx: Receiver<RetrainRequest>,
+}
+
+impl<R, M> RetrainingOrchestrator<R, M>
+where
+    R: ModelRegistryClient + 'static,
+    M: TrainableModel + 'static,
+{
+    pub fn new(
+        tuner: Arc<dyn HyperParamTuner>,
+        registry: Arc<R>,
+        model: Arc<M>,
+        rx: Receiver<RetrainRequest>,
+    ) -> Self {
+        Self {
+            tuner,
+            registry,
+            model,
+            rx,
+        }
+    }
+
+    /// Blocking loop; should be spawned on its own thread.
+    pub fn run(self) {
+        for req in self.rx {
+            log::info!(
+                "[Retrain] received request: model {:?} (v{:?}) –– {}",
+                req.model_id,
+                req.current_version,
+                req.reason
+            );
+            let params = self.tuner.propose();
+            log::info!("Proposed hyper-parameters: {:?}", params);
+
+            match self.model.train(&params) {
+                Ok(artifact) => {
+                    if let Err(e) = self.registry.register(&artifact) {
+                        log::error!("Failed to register model artifact: {:?}", e);
+                    } else {
+                        log::info!(
+                            "Successfully registered new model version {:?}",
+                            artifact.version
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::error!("Retraining failed: {}", e);
+                }
+            }
+        }
+    }
+}
+
+/// ------------------------------------------------------------------------------------------
+/// Example in-memory stubs for registry & model (for demonstration & unit testing)
+/// ------------------------------------------------------------------------------------------
+
+pub struct InMemoryRegistry {
+    store: Arc<Mutex<Vec<ModelArtifact>>>,
+}
+
+impl Default for InMemoryRegistry {
+    fn default() -> Self {
+        Self {
+            store: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl ModelRegistryClient for InMemoryRegistry {
+    fn register(&self, artifact: &ModelArtifact) -> Result<(), ModelOpsError> {
+        self.store
+            .lock()
+            .expect("registry mutex poisoned")
+            .push(artifact.clone());
+        Ok(())
+    }
+}
+
+pub struct DummyModel;
+
+impl TrainableModel for DummyModel {
+    fn train(&self, params: &HyperParams) -> Result<ModelArtifact, String> {
+        // Pretend training work by sleeping.
+        thread::sleep(Duration::from_millis(500));
+
+        // Randomly fail to showcase error propagation.
+        if rand::random::<f32>() > 0.9 {
+            return Err("synthetic training error".into());
+        }
+
+        Ok(ModelArtifact {
+            model_id: ModelId::default(),
+            version: ModelVersion::new(1, 0, 0).bump_patch(),
+            created_at: Utc::now(),
+            bytes: vec![0u8; 1024], // Placeholder weights
+        })
+    }
+}
+
+/// ------------------------------------------------------------------------------------------
+/// Integration Test (can be `cargo test -- --nocapture` to observe logging)
+/// ------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn end_to_end_retraining_flow() {
+        // Set up bus.
+        let bus = MetricsBus::new();
+
+        // Channel for retrain requests.
+        let (tx, rx) = unbounded();
+
+        // Observer: decay detector
+        let decay_detector = Arc::new(AccuracyDecayDetector::new(DriftConfig::default(), tx));
+        bus.register(decay_detector).unwrap();
+
+        // Retraining orchestrator
+        let tuner = Arc::new(BayesianTuner);
+        let registry = Arc::new(InMemoryRegistry::default());
+        let model = Arc::new(DummyModel);
+
+        // Spawn orchestrator thread
+        let orchestrator = RetrainingOrchestrator::new(tuner, registry.clone(), model, rx);
+        thread::spawn(move || orchestrator.run());
+
+        // Emit synthetic metrics with gradually decaying accuracy
+        let start = Instant::now();
+        let mut acc = 0.95;
+        while start.elapsed() < Duration::from_secs(5) {
+            bus.publish(MetricEvent {
+                model_id: ModelId::default(),
+                model_version: ModelVersion::new(1, 0, 0),
+                timestamp: Utc::now(),
+                accuracy: acc,
+                latency_ms: 30,
+            });
+            acc -= 0.002; // Simulate decay
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // Small grace period for background threads
+        thread::sleep(Duration::from_secs(2));
+
+        // Ensure that at least one model artifact was registered.
+        let store = registry.store.lock().unwrap();
+        assert!(
+            !store.is_empty(),
+            "Expected at least one model artifact to be registered"
+        );
+    }
+}
+```

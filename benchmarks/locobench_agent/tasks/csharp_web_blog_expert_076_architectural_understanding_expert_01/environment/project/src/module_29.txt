@@ -1,0 +1,253 @@
+```csharp
+// File: src/module_29.txt
+// Project: TempoScribe Pro – Hexagonal Productivity Blog Suite (web_blog)
+// Language: C#
+// Description: Application-level service for scheduled publishing automation.
+//              This service lives in the Application layer and orchestrates the
+//              publishing workflow through a set of ports (interfaces) that are
+//              implemented by adapters elsewhere in the solution.
+//
+// NOTE: The namespace follows the convention <Root>.Application.<Feature>
+//
+// -----------------------------------------------------------------------------
+// Copyright © TempoScribe.
+// -----------------------------------------------------------------------------
+
+using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Logging;
+using Polly;
+using Polly.Retry;
+using TempoScribe.Domain.Models;
+using TempoScribe.Domain.Ports;
+using TempoScribe.Domain.ValueObjects;
+
+namespace TempoScribe.Application.Publishing
+{
+    /// <summary>
+    ///     Orchestrates the automatic (timer-based) publication of posts that
+    ///     were previously scheduled by editors.  The service is decoupled
+    ///     from infrastructure concerns through a set of ports so that each
+    ///     dependency can be unit-tested, mocked, or replaced without touching
+    ///     the core logic.
+    /// </summary>
+    public sealed class ScheduledPublishingService : IScheduledPublishingService
+    {
+        private static readonly TimeSpan DistributedLockTtl   = TimeSpan.FromMinutes(4);
+        private static readonly string    DistributedLockKey  = "tempo:publishing:scheduled-lock";
+
+        private readonly IPostRepository            _postRepository;
+        private readonly IClock                     _clock;
+        private readonly IPaymentGatewayPort        _paymentGateway;
+        private readonly INotificationPort          _notificationPort;
+        private readonly ICachePort                 _cache;
+        private readonly ILogger<ScheduledPublishingService> _logger;
+        private readonly IDistributedLockProvider   _lockProvider;
+        private readonly AsyncRetryPolicy           _retryPolicy;
+
+        /// <inheritdoc />
+        public ScheduledPublishingService(
+            IPostRepository postRepository,
+            IClock clock,
+            IPaymentGatewayPort paymentGateway,
+            INotificationPort notificationPort,
+            ICachePort cache,
+            IDistributedLockProvider lockProvider,
+            ILogger<ScheduledPublishingService> logger)
+        {
+            _postRepository   = postRepository  ?? throw new ArgumentNullException(nameof(postRepository));
+            _clock            = clock           ?? throw new ArgumentNullException(nameof(clock));
+            _paymentGateway   = paymentGateway  ?? throw new ArgumentNullException(nameof(paymentGateway));
+            _notificationPort = notificationPort?? throw new ArgumentNullException(nameof(notificationPort));
+            _cache            = cache           ?? throw new ArgumentNullException(nameof(cache));
+            _lockProvider     = lockProvider    ?? throw new ArgumentNullException(nameof(lockProvider));
+            _logger           = logger          ?? throw new ArgumentNullException(nameof(logger));
+
+            _retryPolicy = Policy
+                .Handle<Exception>(ex =>
+                {
+                    _logger.LogWarning(ex, "Transient failure during publishing—will retry.");
+                    return true;
+                })
+                .WaitAndRetryAsync(3, retry => TimeSpan.FromSeconds(Math.Pow(2, retry)));
+        }
+
+        /// <summary>
+        ///     Main entry point that should be triggered by a background worker
+        ///     every minute (or cron expression) to look for posts whose
+        ///     ScheduledPublishAt is <= current time and that are still in a
+        ///     'Scheduled' state.  The actual schedule is configured in the
+        ///     orchestration layer and can be swapped without code changes.
+        /// </summary>
+        /// <param name="cancellationToken">Token to cancel execution.</param>
+        public async Task ProcessDuePostsAsync(CancellationToken cancellationToken = default)
+        {
+            await using var distributedLock = await _lockProvider.TryAcquireAsync(
+                DistributedLockKey,
+                DistributedLockTtl,
+                cancellationToken).ConfigureAwait(false);
+
+            if (!distributedLock.Acquired)
+            {
+                _logger.LogDebug("Another node is already processing scheduled posts.");
+                return;
+            }
+
+            _logger.LogInformation("ScheduledPublishingService: Scan started at {Timestamp}",
+                _clock.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+
+            IReadOnlyList<Post> duePosts;
+
+            try
+            {
+                duePosts = await _postRepository
+                    .FindDueScheduledPostsAsync(_clock.UtcNow, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to retrieve scheduled posts from repository.");
+                return;
+            }
+
+            if (!duePosts.Any())
+            {
+                _logger.LogDebug("No posts ready for publication at this cycle.");
+                return;
+            }
+
+            _logger.LogInformation("Found {Count} posts ready for publishing.", duePosts.Count);
+
+            var publishTasks = duePosts.Select(post =>
+                _retryPolicy.ExecuteAsync(ct => PublishSinglePostAsync(post, ct), cancellationToken));
+
+            await Task.WhenAll(publishTasks).ConfigureAwait(false);
+
+            _logger.LogInformation("ScheduledPublishingService: Scan finished.");
+        }
+
+        #region Internal Helpers
+
+        private async Task PublishSinglePostAsync(Post post, CancellationToken cancellationToken)
+        {
+            _logger.LogDebug("Publishing post {PostId} ({Title})", post.Id, post.Title);
+
+            try
+            {
+                // 1. Monetization Check
+                if (post.IsPremium)
+                {
+                    _logger.LogDebug("Post {PostId} is marked premium. Creating Stripe product/price.", post.Id);
+
+                    var paymentMeta = await _paymentGateway
+                        .CreateOrUpdateProductAsync(post.ToPaymentProductDescriptor(), cancellationToken)
+                        .ConfigureAwait(false);
+
+                    post.ApplyPaymentMetadata(paymentMeta);
+                }
+
+                // 2. Domain-level state change.
+                post.Publish(_clock.UtcNow);
+
+                // 3. Persist.
+                await _postRepository.SaveAsync(post, cancellationToken).ConfigureAwait(false);
+
+                // 4. Cache Invalidation.
+                await _cache.RemoveAsync(CacheKeys.GetPostCacheKey(post.Id), cancellationToken)
+                    .ConfigureAwait(false);
+
+                // 5. Send notifications (email + in-app).
+                await SendNotificationsAsync(post, cancellationToken).ConfigureAwait(false);
+
+                _logger.LogInformation("Post {PostId} published successfully.", post.Id);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to publish post {PostId}.", post.Id);
+                post.MarkAsPublishFailed(ex.Message, _clock.UtcNow);
+                await _postRepository.SaveAsync(post, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        private Task SendNotificationsAsync(Post post, CancellationToken cancellationToken)
+        {
+            // Fire-and-forget pattern is avoided to guarantee delivery and
+            // surface errors to the scheduler for retry.
+            var tasks = new[]
+            {
+                _notificationPort.NotifyFollowersAsync(
+                    new NotificationTemplate(
+                        subject: $"New post by {post.Author.DisplayName}",
+                        body:    $"{post.Title} is now live! Check it out here: {post.PublicUrl}"
+                    ),
+                    post.AuthorId,
+                    cancellationToken),
+
+                _notificationPort.NotifyMentionsAsync(post, cancellationToken)
+            };
+
+            return Task.WhenAll(tasks);
+        }
+
+        #endregion
+    }
+
+    #region Interfaces (Ports)
+
+    /// <summary>
+    ///     Application-layer abstraction so that background workers or API
+    ///     controllers can trigger the scheduled publishing logic without
+    ///     knowledge of implementation details.
+    /// </summary>
+    public interface IScheduledPublishingService
+    {
+        Task ProcessDuePostsAsync(CancellationToken cancellationToken = default);
+    }
+
+    public interface IDistributedLockProvider
+    {
+        /// <summary>
+        ///     Attempts to acquire a distributed lock identified by <paramref name="key"/>.
+        /// </summary>
+        /// <param name="key">Unique lock identifier.</param>
+        /// <param name="ttl">Time-to-live for the lock.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <returns>
+        ///     An <see cref="IDisposable"/> which, when disposed, releases the
+        ///     lock.  The <see cref="IDistributedLockHandle.Acquired"/> flag
+        ///     determines whether the lock was successfully acquired.
+        /// </returns>
+        Task<IDistributedLockHandle> TryAcquireAsync(
+            string key,
+            TimeSpan ttl,
+            CancellationToken cancellationToken = default);
+    }
+
+    public interface IDistributedLockHandle : IAsyncDisposable
+    {
+        bool Acquired { get; }
+    }
+
+    #endregion
+
+    #region Static Cache Keys Helper
+
+    internal static class CacheKeys
+    {
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1822:Mark members as static")]
+        public static string GetPostCacheKey(PostId id)
+            => new StringBuilder("cache:post:")
+                .Append(id.Value.ToString("N", CultureInfo.InvariantCulture))
+                .ToString();
+    }
+
+    #endregion
+}
+```

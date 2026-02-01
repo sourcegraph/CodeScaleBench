@@ -1,0 +1,412 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * ----------------------------------------
+ * File:    src/module_30.txt         (compiled as C source)
+ * Module:  Response Cache Sub-system
+ *
+ * Synopsis
+ * --------
+ * A thread-safe, in-memory LRU response cache with per-entry TTL that can be
+ * enabled by individual HTTP/GraphQL handlers via declarative attributes.  The
+ * implementation is generic and does not depend on the rest of the Mercury
+ * routing stack; integration happens through a small adapter that converts a
+ * `mm_request_t` + `mm_response_t` pair into a canonical cache key/value.
+ *
+ *  - Fully O(1) put/get with hash-map lookup and intrusive doubly linked list
+ *    for eviction ordering (least-recently-used).
+ *  - Fine-grained metrics counters (hits, misses, evictions, insert_errors).
+ *  - Pluggable logger abstraction (see mm_log.h).
+ *  - Hard upper bound on memory usage (`capacity_bytes`) with eviction of the
+ *    oldest entry/entries before overflow.
+ *
+ * External deps:
+ *   * uthash      – https://troydhanson.github.io/uthash
+ *   * pthreads    – POSIX threads
+ *
+ * Build flags (example):
+ *   cc -std=c11 -pthread -Wall -Wextra -O2 -I./deps -c src/module_30.txt -o cache.o
+ *
+ * Copyright © 2023-2024 Mercury
+ */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <assert.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "mm_log.h"     /* Structured logger (info, warn, error)          */
+#include "mm_metrics.h" /* Prometheus-compatible counters/gauges           */
+#include "uthash.h"
+
+/* --------------------------------------------------------------------- */
+/* Configuration knobs                                                   */
+/* --------------------------------------------------------------------- */
+
+/* Default maximum in-memory cache size if not provided at init (16 MiB). */
+#ifndef MM_CACHE_DEFAULT_CAP
+#define MM_CACHE_DEFAULT_CAP (16 * 1024 * 1024UL)
+#endif
+
+/* Maximum key length we are willing to accept (for DoS protection). */
+#ifndef MM_CACHE_MAX_KEY_LEN
+#define MM_CACHE_MAX_KEY_LEN 2048
+#endif
+
+/* --------------------------------------------------------------------- */
+/* Public API                                                            */
+/* --------------------------------------------------------------------- */
+
+typedef struct mm_cache mm_cache_t;
+
+/* Initialize a cache instance. Returns 0 on success or errno-style code. */
+int mm_cache_init(mm_cache_t **out_cache, size_t capacity_bytes);
+
+/* Gracefully release cache resources; afterwards *cache_ptr is set NULL. */
+void mm_cache_destroy(mm_cache_t **cache_ptr);
+
+/*
+ * Attempt to look up an entry.
+ *  - If present & not expired, allocates and returns a copy of the payload
+ *    in *out_buf (caller must free) and writes length to *out_len.
+ *  - Returns 0 on hit, ENOENT if no valid entry exists, or errno on error.
+ */
+int mm_cache_get(mm_cache_t *cache,
+                 const char *key,
+                 uint8_t **out_buf,
+                 size_t *out_len);
+
+/*
+ * Insert value into cache with TTL (sec).  The payload is deep-copied.
+ * Returns 0 on success or errno on failure (e.g., ENOMEM, EINVAL).
+ */
+int mm_cache_put(mm_cache_t *cache,
+                 const char *key,
+                 const uint8_t *payload,
+                 size_t payload_len,
+                 unsigned ttl_sec);
+
+/* Manually purge all entries (used by admin endpoints for cache-clear).  */
+void mm_cache_clear(mm_cache_t *cache);
+
+/* --------------------------------------------------------------------- */
+/* Implementation details                                                */
+/* --------------------------------------------------------------------- */
+
+typedef struct mm_cache_entry {
+    char      *key;           /* NULL-terminated, unique               */
+    uint8_t   *blob;          /* response body                         */
+    size_t     blob_len;      /* bytes                                 */
+    time_t     expire_ts;     /* epoch seconds                         */
+
+    /* LRU list hooks */
+    struct mm_cache_entry *prev;
+    struct mm_cache_entry *next;
+
+    /* uthash handle – key is `key` field                            */
+    UT_hash_handle hh;
+} mm_cache_entry_t;
+
+struct mm_cache {
+    size_t capacity;      /* Hard limit (bytes)                     */
+    size_t size;          /* Current resident size (bytes)          */
+    mm_cache_entry_t *map;/* uthash map                             */
+    mm_cache_entry_t *lru_head;
+    mm_cache_entry_t *lru_tail;
+    pthread_mutex_t  mtx;
+
+    /* Metrics */
+    mm_metric_t *m_hits;
+    mm_metric_t *m_misses;
+    mm_metric_t *m_evictions;
+    mm_metric_t *m_insert_err;
+};
+
+/* ------------- Helpers ------------------------------------------------ */
+
+/* Move node to front of LRU list (most-recent). */
+static inline void lru_move_front(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    if (c->lru_head == e) return;
+
+    /* Detach */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    /* Re-insert at head */
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+/* Insert new node at LRU front. */
+static inline void lru_insert_front(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+/* Remove node completely from list & hash. */
+static void evict_entry(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    HASH_DEL(c->map, e);
+
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_head == e) c->lru_head = e->next;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    c->size -= e->blob_len;
+    c->size -= strlen(e->key) + 1;
+
+    free(e->blob);
+    free(e->key);
+    free(e);
+
+    mm_metric_inc(c->m_evictions, 1);
+}
+
+/* Purge expired entries starting from the tail to keep traversal bounded. */
+static void lru_purge_expired(mm_cache_t *c)
+{
+    time_t now = time(NULL);
+    mm_cache_entry_t *e = c->lru_tail;
+
+    while (e) {
+        mm_cache_entry_t *prev = e->prev;
+        if (e->expire_ts > now) break; /* Entries before this are newer */
+
+        evict_entry(c, e);
+        e = prev;
+    }
+}
+
+/* Evict until capacity is below limit. */
+static void lru_evict_overflow(mm_cache_t *c)
+{
+    while (c->size > c->capacity && c->lru_tail) {
+        evict_entry(c, c->lru_tail);
+    }
+}
+
+/* --------------------------------------------------------------------- */
+/* Public interface implementations                                      */
+/* --------------------------------------------------------------------- */
+
+int mm_cache_init(mm_cache_t **out_cache, size_t capacity_bytes)
+{
+    if (!out_cache) return EINVAL;
+
+    mm_cache_t *c = calloc(1, sizeof(*c));
+    if (!c) return ENOMEM;
+
+    c->capacity = capacity_bytes ? capacity_bytes : MM_CACHE_DEFAULT_CAP;
+
+    if (pthread_mutex_init(&c->mtx, NULL) != 0) {
+        free(c);
+        return errno;
+    }
+
+    /* Register metrics */
+    c->m_hits       = mm_metric_counter_create("cache_hits", "Response cache hit count");
+    c->m_misses     = mm_metric_counter_create("cache_misses", "Response cache miss count");
+    c->m_evictions  = mm_metric_counter_create("cache_evictions", "Entries evicted from cache");
+    c->m_insert_err = mm_metric_counter_create("cache_insert_errors", "Failed cache insertions");
+
+    *out_cache = c;
+    MM_LOG_INFO("Cache initialised (capacity=%zu bytes)", c->capacity);
+    return 0;
+}
+
+void mm_cache_destroy(mm_cache_t **cache_ptr)
+{
+    if (!cache_ptr || !*cache_ptr) return;
+
+    mm_cache_t *c = *cache_ptr;
+
+    pthread_mutex_lock(&c->mtx);
+
+    mm_cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, c->map, cur, tmp) { evict_entry(c, cur); }
+
+    pthread_mutex_unlock(&c->mtx);
+    pthread_mutex_destroy(&c->mtx);
+
+    mm_metric_free(c->m_hits);
+    mm_metric_free(c->m_misses);
+    mm_metric_free(c->m_evictions);
+    mm_metric_free(c->m_insert_err);
+
+    free(c);
+
+    *cache_ptr = NULL;
+    MM_LOG_INFO("Cache destroyed");
+}
+
+int mm_cache_get(mm_cache_t *cache,
+                 const char *key,
+                 uint8_t **out_buf,
+                 size_t *out_len)
+{
+    if (!cache || !key || !out_buf || !out_len) return EINVAL;
+
+    int rc = 0;
+
+    pthread_mutex_lock(&cache->mtx);
+
+    lru_purge_expired(cache);
+
+    mm_cache_entry_t *e = NULL;
+    HASH_FIND_STR(cache->map, key, e);
+    if (!e) {
+        mm_metric_inc(cache->m_misses, 1);
+        rc = ENOENT;
+        goto done;
+    }
+
+    if (e->expire_ts <= time(NULL)) {
+        /* Stale entry */
+        evict_entry(cache, e);
+        mm_metric_inc(cache->m_misses, 1);
+        rc = ENOENT;
+        goto done;
+    }
+
+    /* Hit */
+    *out_len = e->blob_len;
+    *out_buf = malloc(e->blob_len);
+    if (!*out_buf) {
+        rc = ENOMEM;
+        goto done;
+    }
+    memcpy(*out_buf, e->blob, e->blob_len);
+
+    lru_move_front(cache, e);
+    mm_metric_inc(cache->m_hits, 1);
+
+done:
+    pthread_mutex_unlock(&cache->mtx);
+    return rc;
+}
+
+int mm_cache_put(mm_cache_t *cache,
+                 const char *key,
+                 const uint8_t *payload,
+                 size_t payload_len,
+                 unsigned ttl_sec)
+{
+    if (!cache || !key || !payload || payload_len == 0) return EINVAL;
+    if (strlen(key) > MM_CACHE_MAX_KEY_LEN) return EMSGSIZE;
+
+    int rc = 0;
+    time_t now = time(NULL);
+
+    mm_cache_entry_t *existing = NULL;
+
+    pthread_mutex_lock(&cache->mtx);
+
+    lru_purge_expired(cache);
+
+    HASH_FIND_STR(cache->map, key, existing);
+    if (existing) {
+        /* Override in place */
+        cache->size -= existing->blob_len;
+        uint8_t *dup = realloc(existing->blob, payload_len);
+        if (!dup) {
+            rc = ENOMEM;
+            goto fail;
+        }
+        memcpy(dup, payload, payload_len);
+        existing->blob = dup;
+        existing->blob_len = payload_len;
+        existing->expire_ts = now + ttl_sec;
+        cache->size += payload_len;
+
+        lru_move_front(cache, existing);
+        goto success;
+    }
+
+    /* Fresh insert */
+    mm_cache_entry_t *e = calloc(1, sizeof(*e));
+    if (!e) { rc = ENOMEM; goto fail; }
+
+    e->key = strdup(key);
+    if (!e->key) { free(e); rc = ENOMEM; goto fail; }
+
+    e->blob = malloc(payload_len);
+    if (!e->blob) { free(e->key); free(e); rc = ENOMEM; goto fail; }
+    memcpy(e->blob, payload, payload_len);
+    e->blob_len = payload_len;
+    e->expire_ts = now + ttl_sec;
+
+    HASH_ADD_KEYPTR(hh, cache->map, e->key, strlen(e->key), e);
+    lru_insert_front(cache, e);
+
+    cache->size += payload_len;
+    cache->size += strlen(e->key) + 1;
+
+success:
+    lru_evict_overflow(cache);
+    pthread_mutex_unlock(&cache->mtx);
+    return 0;
+
+fail:
+    mm_metric_inc(cache->m_insert_err, 1);
+    pthread_mutex_unlock(&cache->mtx);
+    return rc;
+}
+
+void mm_cache_clear(mm_cache_t *cache)
+{
+    if (!cache) return;
+
+    pthread_mutex_lock(&cache->mtx);
+    mm_cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, cache->map, cur, tmp) { evict_entry(cache, cur); }
+    pthread_mutex_unlock(&cache->mtx);
+
+    MM_LOG_INFO("Cache cleared via admin command");
+}
+
+/* --------------------------------------------------------------------- */
+/* Demo stub (only compiled in unit test builds)                         */
+/* --------------------------------------------------------------------- */
+#ifdef MM_CACHE_STANDALONE_TEST
+int main(void)
+{
+    mm_cache_t *cache;
+    if (mm_cache_init(&cache, 1024 * 1024) != 0) {
+        fprintf(stderr, "Cache init failed\n");
+        return 1;
+    }
+
+    const char key[] = "GET:/api/v1/ping";
+    const uint8_t payload[] = "pong";
+
+    mm_cache_put(cache, key, payload, sizeof(payload), 2);
+
+    uint8_t *out;
+    size_t   len;
+    if (mm_cache_get(cache, key, &out, &len) == 0) {
+        printf("Hit: %.*s\n", (int)len, out);
+        free(out);
+    } else {
+        puts("Miss (?)");
+    }
+
+    mm_cache_destroy(&cache);
+    return 0;
+}
+#endif

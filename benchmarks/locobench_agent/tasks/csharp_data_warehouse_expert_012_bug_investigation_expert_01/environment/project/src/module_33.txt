@@ -1,0 +1,366 @@
+```csharp
+// -------------------------------------------------------------------------------------------------
+//  File:        module_33.txt   (kept extension for historical reasons, compiled as C# source)
+//  Project:     PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//  Description: Generic, strategy-driven data-quality validator that is reused by multiple
+//               ingestion/transformation Lambdas. The validator relies on the Strategy Pattern to
+//               load the proper IValidationStrategy implementation at runtime and the Observer
+//               Pattern to notify interested parties of validation outcomes (e.g., DLQ fan-out,
+//               metrics, PagerDuty alerts).
+// -------------------------------------------------------------------------------------------------
+
+#nullable enable
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+
+using Amazon.SimpleNotificationService;
+using Amazon.SimpleNotificationService.Model;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
+// ReSharper disable MemberCanBePrivate.Global
+
+namespace PulseOps.Warehouse.Quality;
+
+/// <summary>
+/// Provides a single-responsibility façade for validating incoming data envelopes, routing invalid
+/// payloads to a dead-letter topic, and notifying observers about quality incidents.
+/// </summary>
+public sealed class DataQualityValidator : IObservable<ValidationResult>, IDisposable
+{
+    private readonly IValidationStrategyFactory _strategyFactory;
+    private readonly IAmazonSimpleNotificationService _snsClient;
+    private readonly string _deadLetterTopicArn;
+    private readonly ILogger<DataQualityValidator> _logger;
+    private readonly ConcurrentDictionary<IObserver<ValidationResult>, byte> _observers = new();
+
+    public DataQualityValidator(
+        IValidationStrategyFactory strategyFactory,
+        IAmazonSimpleNotificationService snsClient,
+        string deadLetterTopicArn,
+        ILogger<DataQualityValidator>? logger = null)
+    {
+        _strategyFactory = strategyFactory ?? throw new ArgumentNullException(nameof(strategyFactory));
+        _snsClient = snsClient ?? throw new ArgumentNullException(nameof(snsClient));
+        _deadLetterTopicArn = !string.IsNullOrWhiteSpace(deadLetterTopicArn)
+            ? deadLetterTopicArn
+            : throw new ArgumentException("DLQ topic ARN must be provided.", nameof(deadLetterTopicArn));
+
+        _logger = logger ?? NullLogger<DataQualityValidator>.Instance;
+    }
+
+    /// <summary>
+    /// Validates the provided <see cref="DataEnvelope"/> by delegating to the appropriate
+    /// <see cref="IValidationStrategy"/>. Errors are published to a DLQ topic on failure.
+    /// </summary>
+    /// <exception cref="UnknownSourceException">
+    /// Thrown when no validation strategy exists for the envelope's Source.
+    /// </exception>
+    public async Task<ValidationResult> ValidateAsync(
+        DataEnvelope envelope,
+        CancellationToken cancellationToken = default)
+    {
+        if (envelope is null) throw new ArgumentNullException(nameof(envelope));
+
+        _logger.LogDebug("Validating envelope with CorrelationId={CorrelationId}", envelope.CorrelationId);
+
+        if (!_strategyFactory.TryCreate(envelope.Source, out var strategy))
+        {
+            _logger.LogError("Unknown source '{Source}'. Unable to find validation strategy.", envelope.Source);
+            throw new UnknownSourceException(envelope.Source);
+        }
+
+        var isValid = strategy.Validate(envelope.Payload, out var errors);
+        var result = new ValidationResult(envelope, isValid, errors);
+
+        if (!isValid)
+        {
+            await PublishToDlqAsync(result, cancellationToken).ConfigureAwait(false);
+        }
+
+        NotifyObservers(result);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public IDisposable Subscribe(IObserver<ValidationResult> observer)
+    {
+        _observers.TryAdd(observer, 0);
+        return new Unsubscriber(_observers, observer);
+    }
+
+    private void NotifyObservers(ValidationResult result)
+    {
+        foreach (var observer in _observers.Keys)
+        {
+            try
+            {
+                observer.OnNext(result);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Observer {Observer} threw while handling validation result.", observer);
+            }
+        }
+    }
+
+    private async Task PublishToDlqAsync(ValidationResult result, CancellationToken cancellationToken)
+    {
+        var message = new PublishRequest
+        {
+            TopicArn = _deadLetterTopicArn,
+            Subject = "PulseOps Data Validation Failure",
+            Message = JsonSerializer.Serialize(result, Serializer.Options)
+        };
+
+        try
+        {
+            await _snsClient.PublishAsync(message, cancellationToken).ConfigureAwait(false);
+            _logger.LogWarning("Invalid envelope dispatched to DLQ (CorrelationId={CorrelationId})",
+                result.Envelope.CorrelationId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "Failed to publish invalid envelope CorrelationId={CorrelationId} to DLQ.",
+                result.Envelope.CorrelationId);
+            // In production we might reroute to backup storage or raise a PagerDuty alert.
+        }
+    }
+
+    public void Dispose()
+    {
+        _snsClient?.Dispose();
+        _logger.LogDebug("Disposed {Instance}", nameof(DataQualityValidator));
+    }
+
+    // -- Nested helper types ---------------------------------------------------------------------
+
+    private sealed class Unsubscriber : IDisposable
+    {
+        private readonly ConcurrentDictionary<IObserver<ValidationResult>, byte> _dict;
+        private readonly IObserver<ValidationResult> _observer;
+
+        public Unsubscriber(
+            ConcurrentDictionary<IObserver<ValidationResult>, byte> dict,
+            IObserver<ValidationResult> observer)
+        {
+            _dict = dict;
+            _observer = observer;
+        }
+
+        public void Dispose() => _dict.TryRemove(_observer, out _);
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+//  Strategy Pattern plumbing
+// -------------------------------------------------------------------------------------------------
+
+/// <summary>
+/// Abstraction for source-specific validation strategies.
+/// </summary>
+public interface IValidationStrategy
+{
+    bool Validate(JsonElement payload, out IReadOnlyList<string>? errors);
+}
+
+/// <summary>
+/// Factory for resolving a strategy matching the envelope's Source.
+/// </summary>
+public interface IValidationStrategyFactory
+{
+    bool TryCreate(string source, [NotNullWhen(true)] out IValidationStrategy? strategy);
+}
+
+/// <summary>
+/// Default implementation that scans the current assembly (or DI container) for strategy types.
+/// New validation logic can be deployed as separate DLLs and loaded via reflection without
+/// touching this factory.
+/// </summary>
+public sealed class ReflectionValidationStrategyFactory : IValidationStrategyFactory
+{
+    private readonly IReadOnlyDictionary<string, Type> _types;
+    private readonly ILogger<ReflectionValidationStrategyFactory> _logger;
+
+    public ReflectionValidationStrategyFactory(
+        ILogger<ReflectionValidationStrategyFactory>? logger = null)
+    {
+        _logger = logger ?? NullLogger<ReflectionValidationStrategyFactory>.Instance;
+        _types = LoadStrategyTypes();
+    }
+
+    public bool TryCreate(string source, [NotNullWhen(true)] out IValidationStrategy? strategy)
+    {
+        if (_types.TryGetValue(source, out var type))
+        {
+            strategy = (IValidationStrategy)Activator.CreateInstance(type)!;
+            return true;
+        }
+
+        strategy = null;
+        return false;
+    }
+
+    private static IReadOnlyDictionary<string, Type> LoadStrategyTypes()
+    {
+        var dict = new Dictionary<string, Type>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var type in typeof(ReflectionValidationStrategyFactory).Assembly.GetTypes())
+        {
+            if (type.IsAbstract || !typeof(IValidationStrategy).IsAssignableFrom(type)) continue;
+
+            var attr = type.GetCustomAttributes(typeof(SourceAttribute), inherit: false);
+            if (attr.Length == 0) continue;
+
+            var sourceName = ((SourceAttribute)attr[0]).Source;
+            dict[sourceName] = type;
+        }
+
+        return dict;
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+//  Example concrete validation strategies
+// -------------------------------------------------------------------------------------------------
+
+/// <summary>
+/// Validates calendar event metadata originating from Google Workspace.
+/// </summary>
+[Source("calendar.google")]
+public sealed class GoogleCalendarValidationStrategy : IValidationStrategy
+{
+    private static readonly Regex EmailRegex =
+        new(@"^[^\s@]+@[^\s@]+\.[^\s@]+$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    public bool Validate(JsonElement payload, out IReadOnlyList<string>? errors)
+    {
+        var errorList = new List<string>();
+
+        if (!payload.TryGetProperty("organizerEmail", out var organizerEmail) ||
+            organizerEmail.ValueKind != JsonValueKind.String ||
+            !EmailRegex.IsMatch(organizerEmail.GetString()!))
+        {
+            errorList.Add("Invalid or missing organizerEmail");
+        }
+
+        if (!payload.TryGetProperty("startTimeUtc", out var startTime) ||
+            !payload.TryGetProperty("endTimeUtc", out var endTime) ||
+            startTime.ValueKind != JsonValueKind.String ||
+            endTime.ValueKind != JsonValueKind.String)
+        {
+            errorList.Add("Invalid or missing startTimeUtc/endTimeUtc");
+        }
+        else
+        {
+            if (!DateTime.TryParse(startTime.GetString(), out var start))
+                errorList.Add("startTimeUtc cannot be parsed as DateTime");
+
+            if (!DateTime.TryParse(endTime.GetString(), out var end))
+                errorList.Add("endTimeUtc cannot be parsed as DateTime");
+            else if (end <= start)
+                errorList.Add("endTimeUtc must be greater than startTimeUtc");
+        }
+
+        errors = errorList;
+        return errors.Count == 0;
+    }
+}
+
+/// <summary>
+/// Validates GitHub Actions workflow run events.
+/// </summary>
+[Source("github.cicd")]
+public sealed class GitHubCiCdValidationStrategy : IValidationStrategy
+{
+    public bool Validate(JsonElement payload, out IReadOnlyList<string>? errors)
+    {
+        var errorList = new List<string>();
+
+        if (!payload.TryGetProperty("repository", out var repoProp) ||
+            repoProp.ValueKind != JsonValueKind.String ||
+            string.IsNullOrWhiteSpace(repoProp.GetString()))
+        {
+            errorList.Add("repository must be a non-empty string");
+        }
+
+        if (!payload.TryGetProperty("workflowId", out var workflowIdProp) ||
+            workflowIdProp.ValueKind != JsonValueKind.Number ||
+            !workflowIdProp.TryGetInt32(out var workflowId) ||
+            workflowId <= 0)
+        {
+            errorList.Add("workflowId must be a positive integer");
+        }
+
+        errors = errorList;
+        return errors.Count == 0;
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+//  Domain models & supporting infrastructure
+// -------------------------------------------------------------------------------------------------
+
+/// <summary>
+/// Serializable wrapper used by various Lambdas to standardize incoming data.
+/// </summary>
+/// <param name="Source">Source system identifier (e.g., "calendar.google").</param>
+/// <param name="Payload">Raw JSON payload emitted by the source system.</param>
+/// <param name="IngestedAt">UTC timestamp when the event was ingested.</param>
+/// <param name="CorrelationId">Distributed trace identifier (propagated from API GW/Kinesis).</param>
+public sealed record DataEnvelope(
+    string Source,
+    JsonElement Payload,
+    DateTimeOffset IngestedAt,
+    string CorrelationId);
+
+/// <summary>
+/// Outcome of a <see cref="DataQualityValidator.ValidateAsync"/> operation.
+/// </summary>
+public sealed record ValidationResult(
+    DataEnvelope Envelope,
+    bool IsValid,
+    IReadOnlyList<string>? Errors);
+
+/// <summary>
+/// Thrown when no <see cref="IValidationStrategy"/> can be resolved for a data source.
+/// </summary>
+public sealed class UnknownSourceException : Exception
+{
+    public UnknownSourceException(string source)
+        : base($"Unknown data source '{source}'. No validation strategy registered.")
+    {
+    }
+}
+
+/// <summary>
+/// Decorates a <see cref="IValidationStrategy"/> implementation with its data-source identifier.
+/// </summary>
+[AttributeUsage(AttributeTargets.Class, AllowMultiple = false)]
+public sealed class SourceAttribute : Attribute
+{
+    public string Source { get; }
+
+    public SourceAttribute(string source) => Source = source;
+}
+
+/// <summary>
+/// Shared JSON serializer options (camel-case, ignore null, etc.).
+/// </summary>
+internal static class Serializer
+{
+    public static readonly JsonSerializerOptions Options = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = false,
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+    };
+}
+```

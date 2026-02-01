@@ -1,0 +1,442 @@
+```rust
+//! src/module_17.rs
+//!
+//! Reactive service that consumes `LearningPulseReplyEvent`s from the
+//! message broker, performs plagiarism screening, and updates the
+//! submission record in Postgres.  A simplified in-memory fallback
+//! broker is provided for unit & integration testing.
+//!
+//! This module demonstrates idiomatic Rust in a production setting,
+//! highlighting async processing, repository pattern, rich error
+//! handling, and structured logging.
+
+use std::{
+    pin::Pin,
+    sync::Arc,
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::{Stream, StreamExt};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::broadcast::{self, Receiver},
+    task::JoinHandle,
+};
+use tracing::{debug, error, info, instrument};
+
+/// Maximum allowed similarity percentage before a submission is
+/// considered plagiarised.
+///
+/// In a real system this could be feature-flagged or stored in a config
+/// service such as Consul / Vault.
+const MAX_ALLOWED_SIMILARITY: f32 = 0.35;
+
+/// Domain event emitted by the API boundary when a learner replies to a
+/// `LearningPulse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningPulseReplyEvent {
+    pub submission_id: uuid::Uuid,
+    pub author_id: uuid::Uuid,
+    pub pulse_id: uuid::Uuid,
+    pub submitted_at: DateTime<Utc>,
+    /// Raw content for the reply (code snippet, essay, etc.).  Large
+    /// payloads are normally stored in object storage – trimmed here
+    /// for brevity.
+    pub body: String,
+}
+
+/// Generalised domain event wrapper allowing us to multiplex streams
+/// without losing type-safe payloads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", content = "payload")]
+pub enum DomainEvent {
+    LearningPulseReply(LearningPulseReplyEvent),
+    // ..other events (quiz, badge-awarded, etc.)
+}
+
+/// Failure type for this module – keeps external API surface small
+/// while still conveying root causes.
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("broker error: {0}")]
+    Broker(String),
+
+    #[error("plagiarism service error: {0}")]
+    PlagiarismService(String),
+
+    #[error("shutdown signal received")]
+    Shutdown,
+}
+
+/// Abstract message-broker interface so we can plug in NATS, Kafka,
+/// RabbitMQ, or an in-memory channel for tests.
+#[async_trait]
+pub trait MessageBroker {
+    type EventStream: Stream<Item = Result<DomainEvent, ServiceError>> + Send + Unpin + 'static;
+
+    /// Subscribe to domain events.  The stream MUST be fused – if the
+    /// underlying broker connection drops it should yield an error
+    /// instead of endlessly blocking.
+    async fn subscribe(&self) -> Result<Self::EventStream, ServiceError>;
+}
+
+/// --------------------------------------------------------------------
+/// In-memory broadcast broker implementation (testing & dev only)
+/// --------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct InMemoryBroker {
+    tx: broadcast::Sender<DomainEvent>,
+}
+
+impl Default for InMemoryBroker {
+    fn default() -> Self {
+        let (tx, _rx) = broadcast::channel(256);
+        Self { tx }
+    }
+}
+
+impl InMemoryBroker {
+    /// Publish an event for local testing purposes.
+    pub async fn publish(&self, evt: DomainEvent) -> Result<(), ServiceError> {
+        self.tx
+            .send(evt)
+            .map_err(|e| ServiceError::Broker(format!("broadcast error: {e}")))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl MessageBroker for InMemoryBroker {
+    type EventStream = Pin<Box<dyn Stream<Item = Result<DomainEvent, ServiceError>> + Send>>;
+
+    async fn subscribe(&self) -> Result<Self::EventStream, ServiceError> {
+        let mut rx: Receiver<DomainEvent> = self.tx.subscribe();
+
+        let stream = async_stream::stream! {
+            loop {
+                match rx.recv().await {
+                    Ok(evt) => yield Ok(evt),
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        yield Err(ServiceError::Broker(format!("lagged by {skipped} messages")));
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        };
+
+        Ok(Box::pin(stream))
+    }
+}
+
+/// --------------------------------------------------------------------
+/// Repository Layer
+/// --------------------------------------------------------------------
+
+#[async_trait]
+pub trait SubmissionRepository: Send + Sync {
+    async fn mark_plagiarised(
+        &self,
+        submission_id: uuid::Uuid,
+        similarity: f32,
+    ) -> Result<(), ServiceError>;
+
+    async fn mark_clean(&self, submission_id: uuid::Uuid) -> Result<(), ServiceError>;
+}
+
+pub struct PgSubmissionRepository {
+    pool: PgPool,
+}
+
+impl PgSubmissionRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl SubmissionRepository for PgSubmissionRepository {
+    #[instrument(skip(self))]
+    async fn mark_plagiarised(
+        &self,
+        submission_id: uuid::Uuid,
+        similarity: f32,
+    ) -> Result<(), ServiceError> {
+        sqlx::query!(
+            r#"
+            UPDATE learning_pulse_submissions
+            SET is_plagiarised = TRUE,
+                similarity_score = $1,
+                checked_at = NOW()
+            WHERE id = $2
+            "#,
+            similarity,
+            submission_id
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn mark_clean(&self, submission_id: uuid::Uuid) -> Result<(), ServiceError> {
+        sqlx::query!(
+            r#"
+            UPDATE learning_pulse_submissions
+            SET is_plagiarised = FALSE,
+                similarity_score = 0,
+                checked_at = NOW()
+            WHERE id = $1
+            "#,
+            submission_id
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+}
+
+/// --------------------------------------------------------------------
+/// External plagiarism scanning service (simplified stub)
+/// --------------------------------------------------------------------
+#[async_trait]
+pub trait PlagiarismScanner: Send + Sync {
+    /// Returns similarity measure between 0.0..=1.0
+    async fn similarity(&self, body: &str) -> Result<f32, ServiceError>;
+}
+
+/// Naïve trigram Jaccard similarity as a local stub.
+pub struct NaivePlagiarismScanner;
+
+#[async_trait]
+impl PlagiarismScanner for NaivePlagiarismScanner {
+    #[instrument(skip(self, body))]
+    async fn similarity(&self, body: &str) -> Result<f32, ServiceError> {
+        fn trigrams(text: &str) -> Vec<String> {
+            let chars: Vec<_> = text.chars().collect();
+            chars
+                .windows(3)
+                .map(|w| w.iter().collect::<String>().to_lowercase())
+                .collect()
+        }
+
+        let sample_corpus = "previous submissions and public internet snippets";
+        let a = trigrams(body);
+        let b = trigrams(sample_corpus);
+
+        let union: std::collections::HashSet<_> = a.iter().chain(&b).collect();
+        let inter: std::collections::HashSet<_> = a.iter().filter(|x| b.contains(x)).collect();
+
+        Ok(inter.len() as f32 / union.len() as f32)
+    }
+}
+
+/// --------------------------------------------------------------------
+/// Service Layer
+/// --------------------------------------------------------------------
+
+pub struct PlagiarismCheckService<B: MessageBroker + ?Sized> {
+    broker: Arc<B>,
+    repo: Arc<dyn SubmissionRepository>,
+    scanner: Arc<dyn PlagiarismScanner>,
+}
+
+impl<B: MessageBroker + ?Sized> PlagiarismCheckService<B> {
+    pub fn new(
+        broker: Arc<B>,
+        repo: Arc<dyn SubmissionRepository>,
+        scanner: Arc<dyn PlagiarismScanner>,
+    ) -> Self {
+        Self {
+            broker,
+            repo,
+            scanner,
+        }
+    }
+
+    /// Spawns a background task that listens to events until the
+    /// supplied `shutdown` channel is triggered.
+    pub async fn run(
+        self: Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<()>,
+    ) -> Result<JoinHandle<()>, ServiceError> {
+        let mut stream = self.broker.subscribe().await?;
+
+        let svc = self.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                select! {
+                    _ = shutdown.changed() => {
+                        info!("shutdown signal received by plagiarism service");
+                        break;
+                    }
+                    maybe_evt = stream.next() => match maybe_evt {
+                        None => {
+                            error!("broker stream closed unexpectedly");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            error!(?e, "error while reading from broker");
+                        }
+                        Some(Ok(evt)) => {
+                            if let Err(e) = svc.handle_event(evt).await {
+                                error!(?e, "error while handling event");
+                            }
+                        }
+                    }
+                }
+            }
+            info!("plagiarism service terminated");
+        });
+
+        Ok(handle)
+    }
+
+    #[instrument(skip(self, evt))]
+    async fn handle_event(&self, evt: DomainEvent) -> Result<(), ServiceError> {
+        match evt {
+            DomainEvent::LearningPulseReply(inner) => {
+                self.process_learning_pulse_reply(inner).await?;
+            }
+            _ => {
+                debug!("ignored event: {:?}", evt);
+            }
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self, event))]
+    async fn process_learning_pulse_reply(
+        &self,
+        event: LearningPulseReplyEvent,
+    ) -> Result<(), ServiceError> {
+        let score = self.scanner.similarity(&event.body).await?;
+        info!(
+            submission_id = %event.submission_id,
+            similarity = %score,
+            "plagiarism similarity calculated"
+        );
+
+        if score > MAX_ALLOWED_SIMILARITY {
+            self.repo
+                .mark_plagiarised(event.submission_id, score)
+                .await?;
+            info!(
+                submission_id = %event.submission_id,
+                "submission flagged as plagiarised"
+            );
+        } else {
+            self.repo.mark_clean(event.submission_id).await?;
+            debug!(
+                submission_id = %event.submission_id,
+                "submission cleared of plagiarism"
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// --------------------------------------------------------------------
+/// Manual demonstration entry-point (would live in bin/ or tests/)
+/// --------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{sleep, Duration};
+
+    #[tokio::test]
+    async fn it_flags_plagiarised_submissions() -> Result<(), Box<dyn std::error::Error>> {
+        // 📦 0. Arrange
+        tracing_subscriber::fmt::try_init().ok();
+
+        let broker = Arc::new(InMemoryBroker::default());
+
+        // Create a disposable in-memory Postgres instance (or use
+        // test-containers).  For brevity we create a static one.
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect("postgres://edupulse:edupulse@localhost/edupulse_test")
+            .await?;
+
+        // Ensure table exists (simplified)
+        sqlx::query!(
+            r#"
+            CREATE TABLE IF NOT EXISTS learning_pulse_submissions(
+                id UUID PRIMARY KEY,
+                is_plagiarised BOOLEAN DEFAULT FALSE,
+                similarity_score REAL DEFAULT 0,
+                checked_at TIMESTAMPTZ
+            );
+            "#
+        )
+        .execute(&pool)
+        .await?;
+
+        let repo = Arc::new(PgSubmissionRepository::new(pool));
+        let scanner = Arc::new(NaivePlagiarismScanner);
+
+        let service = Arc::new(PlagiarismCheckService::new(
+            broker.clone(),
+            repo.clone(),
+            scanner,
+        ));
+
+        // Shutdown channel
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+
+        // 🎬 1. Act – start the worker
+        let _handle = service.run(shutdown_rx).await?;
+
+        // Insert a fake submission
+        let submission_id = uuid::Uuid::new_v4();
+        sqlx::query!(
+            r#"
+            INSERT INTO learning_pulse_submissions(id)
+            VALUES ($1)
+            "#,
+            submission_id
+        )
+        .execute(&repo.pool)
+        .await?;
+
+        // Publish an event that is highly plagiarised
+        let evt = DomainEvent::LearningPulseReply(LearningPulseReplyEvent {
+            submission_id,
+            author_id: uuid::Uuid::new_v4(),
+            pulse_id: uuid::Uuid::new_v4(),
+            submitted_at: Utc::now(),
+            body: "internet snippets snippets snippets".into(),
+        });
+        broker.publish(evt).await.unwrap();
+
+        // Give the async worker some breathing room.
+        sleep(Duration::from_millis(500)).await;
+
+        // 🔎 2. Assert
+        let rec = sqlx::query!(
+            r#"SELECT is_plagiarised, similarity_score FROM learning_pulse_submissions WHERE id = $1"#,
+            submission_id
+        )
+        .fetch_one(&repo.pool)
+        .await?;
+
+        assert!(rec.is_plagiarised, "submission should be flagged");
+        assert!(rec.similarity_score > MAX_ALLOWED_SIMILARITY);
+
+        // Clean-up
+        shutdown_tx.send(()).ok();
+
+        Ok(())
+    }
+}
+```

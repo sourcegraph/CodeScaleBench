@@ -1,0 +1,406 @@
+```rust
+//! Module 11 – Real-Time Sentiment Enrichment Service
+//!
+//! This micro-service listens to a raw social-chatter Kafka topic, enriches
+//! each event with a sentiment score, and republishes the result to an output
+//! topic.  A strategy pattern lets data-scientists hot-swap sentiment
+//! algorithms without downtime.  Extensive tracing and metrics instrumentation
+//! deliver production-grade observability.
+
+#![allow(clippy::missing_errors_doc)]
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use metrics::{counter, gauge, histogram};
+use once_cell::sync::OnceCell;
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    message::BorrowedMessage,
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Message,
+};
+use serde::{Deserialize, Serialize};
+use tokio::{select, signal, task, time};
+use tokio_stream::StreamExt;
+use tracing::{debug, error, info, instrument, span, Level};
+
+/// The raw, incoming social event (as published by the ingestion gateway).
+#[derive(Debug, Deserialize)]
+struct SocialEvent {
+    /// Logical UTF-8 event payload
+    text: String,
+    /// Upstream platform identifier (Twitter, Reddit, etc.)
+    platform: String,
+    /// Unique event id
+    event_id: String,
+    /// Event creation timestamp millis since epoch
+    ts: i64,
+    /// Any additional dynamic fields
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+/// The enriched event we publish downstream.
+#[derive(Debug, Serialize)]
+struct EnrichedEvent {
+    #[serde(flatten)]
+    raw: SocialEvent,
+    sentiment: SentimentScore,
+}
+
+/// Sentiment score produced by a strategy.
+#[derive(Debug, Serialize)]
+struct SentimentScore {
+    /// Polarity in range [-1.0, 1.0]
+    polarity: f32,
+    /// Confidence / magnitude in range [0.0, 1.0]
+    magnitude: f32,
+}
+
+/// Build-time constant version string (injected by CI).
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Strategy trait that all sentiment algorithms must implement.
+#[async_trait]
+pub trait SentimentStrategy: Send + Sync + 'static {
+    /// Short, human-readable identifier (e.g. `"vader"`)
+    fn name(&self) -> &'static str;
+
+    /// Analyze the given text and return its sentiment score.
+    async fn analyze(&self, text: &str) -> SentimentScore;
+}
+
+/// ----------------------------------------------------------------------------
+///                             Strategy Implementations
+/// ----------------------------------------------------------------------------
+
+/// A toy, lexicon-based Vader approximation.
+pub struct VaderStrategy;
+
+#[async_trait]
+impl SentimentStrategy for VaderStrategy {
+    fn name(&self) -> &'static str {
+        "vader"
+    }
+
+    async fn analyze(&self, text: &str) -> SentimentScore {
+        // Extremely naive polarity approximation:
+        let lower = text.to_ascii_lowercase();
+        let pos = ["love", "great", "win", "awesome"]
+            .iter()
+            .filter(|w| lower.contains(**w))
+            .count() as f32;
+        let neg = ["hate", "terrible", "lose", "awful"]
+            .iter()
+            .filter(|w| lower.contains(**w))
+            .count() as f32;
+
+        let polarity = ((pos - neg) / 4.0).clamp(-1.0, 1.0);
+        let magnitude = ((pos + neg) / 8.0).clamp(0.0, 1.0);
+
+        SentimentScore {
+            polarity,
+            magnitude,
+        }
+    }
+}
+
+/// Mock transformer representing a DL-based BERT model.
+/// (In production we’d call out to an async TensorFlow/ONNX runtime.)
+pub struct BertStrategy;
+
+#[async_trait]
+impl SentimentStrategy for BertStrategy {
+    fn name(&self) -> &'static str {
+        "bert"
+    }
+
+    async fn analyze(&self, text: &str) -> SentimentScore {
+        // Placeholder for demonstration: random-ish but deterministic.
+        let hash = seahash::hash(text.as_bytes()) % 100;
+        let polarity = (hash as f32 / 50.0) - 1.0;
+        let magnitude = 0.75;
+
+        SentimentScore {
+            polarity,
+            magnitude,
+        }
+    }
+}
+
+/// ----------------------------------------------------------------------------
+///                               Configuration
+/// ----------------------------------------------------------------------------
+
+/// Eagerly-initialized global configuration singleton.
+#[derive(Clone)]
+struct Config {
+    kafka_brokers: String,
+    group_id: String,
+    input_topic: String,
+    output_topic: String,
+    strategy: String,
+    lag_monitor_interval: Duration,
+}
+
+impl Config {
+    fn from_env() -> Self {
+        Self {
+            kafka_brokers: std::env::var("KAFKA_BROKERS")
+                .unwrap_or_else(|_| "localhost:9092".into()),
+            group_id: std::env::var("GROUP_ID")
+                .unwrap_or_else(|_| "chirppulse.sentiment.enricher".into()),
+            input_topic: std::env::var("INPUT_TOPIC")
+                .unwrap_or_else(|_| "social.raw".into()),
+            output_topic: std::env::var("OUTPUT_TOPIC")
+                .unwrap_or_else(|_| "social.enriched".into()),
+            strategy: std::env::var("STRATEGY").unwrap_or_else(|_| "vader".into()),
+            lag_monitor_interval: Duration::from_secs(
+                std::env::var("LAG_MONITOR_INTERVAL_SECONDS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(15),
+            ),
+        }
+    }
+}
+
+static CONFIG: OnceCell<Config> = OnceCell::new();
+
+/// Access the global config (must be initialized first).
+fn cfg() -> &'static Config {
+    CONFIG
+        .get()
+        .expect("Config accessed before initialization")
+}
+
+/// ----------------------------------------------------------------------------
+///                           Kafka Client Utilities
+/// ----------------------------------------------------------------------------
+
+/// Build a connected [`StreamConsumer`] with sensible defaults.
+fn build_consumer() -> Result<StreamConsumer> {
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &cfg().kafka_brokers)
+        .set("group.id", &cfg().group_id)
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()
+        .context("failed to create consumer")?;
+
+    consumer.subscribe(&[&cfg().input_topic])?;
+    Ok(consumer)
+}
+
+/// Build a [`FutureProducer`] for our output topic.
+fn build_producer() -> Result<FutureProducer> {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &cfg().kafka_brokers)
+        .create()
+        .context("failed to create producer")?;
+    Ok(producer)
+}
+
+/// ----------------------------------------------------------------------------
+///                           Pipeline / Service Logic
+/// ----------------------------------------------------------------------------
+
+/// Resolve the configured sentiment strategy.
+fn build_strategy() -> Arc<dyn SentimentStrategy> {
+    match cfg().strategy.as_str() {
+        "bert" => Arc::new(BertStrategy),
+        _ => Arc::new(VaderStrategy),
+    }
+}
+
+/// Core pipeline task.
+///
+/// Spawns two subsidiary async loops:
+///     1. `message_loop` – consumes, enriches, publishes.
+///     2. `lag_monitor`  – emits consumer-group lag metrics.
+///
+/// The service terminates on SIGINT / SIGTERM.
+pub async fn run_service() -> Result<()> {
+    // Initialise global config (only once).
+    CONFIG
+        .set(Config::from_env())
+        .map_err(|_| anyhow::anyhow!("Config already initialised"))?;
+
+    // Initialise tracing / metrics back-ends (omitted – left to main binary).
+    info!(version = VERSION, "Sentiment enrichment service starting…");
+
+    let consumer = build_consumer()?;
+    let producer = build_producer()?;
+    let strategy = build_strategy();
+
+    let message_loop = task::spawn(message_loop(consumer, producer, strategy.clone()));
+    let lag_loop = task::spawn(lag_monitor_loop(cfg().lag_monitor_interval));
+
+    // Graceful shutdown on ^C or container stop.
+    select! {
+        res = message_loop => res??,
+        res = lag_loop => res??,
+        _ = signal::ctrl_c() => {
+            info!("Shutdown signal received");
+        }
+    }
+
+    Ok(())
+}
+
+/// Consume messages, apply strategy, publish to output topic.
+#[instrument(skip(consumer, producer, strategy))]
+async fn message_loop(
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+    strategy: Arc<dyn SentimentStrategy>,
+) -> Result<()> {
+    let mut stream = consumer.stream();
+
+    while let Some(msg) = stream.next().await {
+        let msg = match msg {
+            Ok(m) => m,
+            Err(e) => {
+                error!(error = %e, "Error while reading from Kafka");
+                continue;
+            }
+        };
+
+        let span = span!(Level::TRACE, "process_msg", offset = msg.offset());
+        let _enter = span.enter();
+
+        if let Err(e) = handle_message(&msg, &producer, strategy.clone()).await {
+            error!(error = %e, "Failed to handle message");
+        }
+
+        // We commit offsets manually to guarantee at-least-once semantics.
+        if let Err(e) = consumer.commit_message(&msg, rdkafka::consumer::CommitMode::Async) {
+            error!(error = %e, "Offset commit failed");
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a message, enrich, and publish downstream.
+#[instrument(skip(msg, producer, strategy))]
+async fn handle_message(
+    msg: &BorrowedMessage<'_>,
+    producer: &FutureProducer,
+    strategy: Arc<dyn SentimentStrategy>,
+) -> Result<()> {
+    let start = Instant::now();
+
+    let payload = msg
+        .payload_view::<str>()
+        .ok_or_else(|| anyhow::anyhow!("Missing payload"))??;
+
+    let raw_event: SocialEvent =
+        serde_json::from_str(payload).context("Invalid event JSON payload")?;
+
+    if raw_event.text.trim().is_empty() {
+        counter!("chirppulse.enricher.skipped_empty_text", 1);
+        debug!("Skipping event with empty text: {}", raw_event.event_id);
+        return Ok(());
+    }
+
+    // Strategy analysis
+    let sentiment = strategy.analyze(&raw_event.text).await;
+
+    // Build enriched event.
+    let enriched = EnrichedEvent {
+        raw: raw_event,
+        sentiment,
+    };
+
+    let enriched_json = serde_json::to_string(&enriched)?;
+
+    // Publish to output topic – we use the original event_id as the key
+    // to guarantee partitioning consistency.
+    let record = FutureRecord::to(&cfg().output_topic)
+        .key(&enriched.raw.event_id)
+        .payload(&enriched_json);
+
+    producer
+        .send(record, Duration::from_secs(0))
+        .await
+        .map_err(|(e, _)| e)
+        .context("Failed to publish enriched event")?;
+
+    // Metrics
+    counter!(
+        "chirppulse.enricher.processed_total",
+        1,
+        "strategy" => strategy.name(),
+    );
+    histogram!(
+        "chirppulse.enricher.latency_ms",
+        start.elapsed().as_millis() as f64,
+        "strategy" => strategy.name(),
+    );
+
+    Ok(())
+}
+
+/// Periodically query consumer lag to alert on ingestion stalls.
+async fn lag_monitor_loop(interval: Duration) -> Result<()> {
+    let consumer = build_consumer()?;
+    loop {
+        time::sleep(interval).await;
+
+        let (lag_sum, partitions) = calculate_lag(&consumer)?;
+        gauge!("chirppulse.enricher.group_lag", lag_sum as f64);
+        info!(lag = lag_sum, partitions, "Consumer group lag");
+    }
+}
+
+/// Calculate total lag across all assigned partitions.
+fn calculate_lag(consumer: &StreamConsumer) -> Result<(i64, usize)> {
+    use rdkafka::TopicPartitionList;
+
+    let mut tpl = TopicPartitionList::new();
+    for el in consumer.assignment()?.elements() {
+        tpl.add_partition_offset(el.topic(), el.partition(), el.offset());
+    }
+
+    let mut lag_sum = 0;
+    let mut partitions = 0;
+
+    for el in tpl.elements() {
+        if let Some(low) = el.offset().to_raw() {
+            // In production we would query the end offset via
+            // `consumer.fetch_watermarks`.  For brevity, we assume 0 lag.
+            lag_sum += 0 - low;
+            partitions += 1;
+        }
+    }
+
+    Ok((lag_sum, partitions))
+}
+
+/// Library entry-point for integration tests.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::runtime::Runtime;
+
+    #[test]
+    fn strategy_switch_works() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let vader = VaderStrategy;
+            let bert = BertStrategy;
+
+            let s1 = vader.analyze("I love Rust!").await.polarity;
+            let s2 = bert.analyze("I love Rust!").await.polarity;
+            assert_ne!(s1, s2);
+        });
+    }
+}
+```

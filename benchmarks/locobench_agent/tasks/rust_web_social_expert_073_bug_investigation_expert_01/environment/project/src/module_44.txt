@@ -1,0 +1,429 @@
+```rust
+//! src/module_44.rs
+//!
+//! Learning Pulse domain logic: persistence, caching, and event emission.
+//!
+//! This module owns the “learning pulse response” workflow.
+//! When a student submits an artefact to a pulse, we
+//!  1. Persist the submission in Postgres (via `sqlx`).
+//!  2. Cache metadata in Redis for quick feed rendering.
+//!  3. Publish a `DomainEvent::PulseResponded` through NATS so
+//!     downstream workers (plagiarism check, rubric scoring, notifications…)
+//!     can react asynchronously.
+//!
+//! The code illustrates EduPulse Live’s hexagonal/service-layer design.
+//!
+//! Dependencies (add to Cargo.toml):
+//! tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+//! sqlx  = { version = "0.7", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+//! redis = { version = "0.24", features = ["aio", "tokio-comp"] }
+//! nats  = "0.25"
+//! uuid  = { version = "1", features = ["v4"] }
+//! serde = { version = "1", features = ["derive"] }
+//! serde_json = "1"
+//! tracing = "0.1"
+
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
+use thiserror::Error;
+use tokio::time::{timeout, Duration};
+use tracing::{error, info, instrument};
+use uuid::Uuid;
+
+// ----- Domain ----------------------------------------------------------------
+
+/// Represents a student file/code/video reply to a Learning Pulse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseResponse {
+    pub id: Uuid,
+    pub pulse_id: Uuid,
+    pub student_id: Uuid,
+    pub artifact_url: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Domain events produced by the core service layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum DomainEvent {
+    PulseResponded {
+        response_id: Uuid,
+        pulse_id: Uuid,
+        student_id: Uuid,
+        at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+// ----- Error -----------------------------------------------------------------
+
+#[derive(Error, Debug)]
+pub enum PulseError {
+    #[error("database error")]
+    Database(#[from] sqlx::Error),
+
+    #[error("redis error")]
+    Redis(#[from] redis::RedisError),
+
+    #[error("nats error")]
+    Nats(#[from] nats::Error),
+
+    #[error("timeout")]
+    Timeout,
+}
+
+// ----- Repository ------------------------------------------------------------
+
+#[async_trait::async_trait]
+pub trait PulseRepository: Send + Sync {
+    async fn insert(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        response: &PulseResponse,
+    ) -> Result<(), PulseError>;
+}
+
+/// Sqlx implementation of `PulseRepository`.
+pub struct SqlxPulseRepository {
+    pool: PgPool,
+}
+
+impl SqlxPulseRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl PulseRepository for SqlxPulseRepository {
+    #[instrument(skip(self, tx))]
+    async fn insert(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        response: &PulseResponse,
+    ) -> Result<(), PulseError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO pulse_responses (id, pulse_id, student_id, artifact_url, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            response.id,
+            response.pulse_id,
+            response.student_id,
+            response.artifact_url,
+            response.created_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        Ok(())
+    }
+}
+
+// ----- Cache Layer (Redis) ---------------------------------------------------
+
+#[async_trait::async_trait]
+pub trait Cache: Send + Sync {
+    async fn cache_response(&self, response: &PulseResponse) -> Result<(), PulseError>;
+}
+
+pub struct RedisCache {
+    client: redis::Client,
+}
+
+impl RedisCache {
+    pub fn new(client: redis::Client) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait::async_trait]
+impl Cache for RedisCache {
+    #[instrument(skip(self, response))]
+    async fn cache_response(&self, response: &PulseResponse) -> Result<(), PulseError> {
+        let mut conn = self.client.get_multiplexed_tokio_connection().await?;
+        let key = format!("pulse:{}:latest_responses", response.pulse_id);
+        let payload = serde_json::to_string(response).expect("PulseResponse is serializable");
+        // Push to the front of a list; trim to last 20 entries.
+        redis::pipe()
+            .cmd("LPUSH")
+            .arg(&key)
+            .arg(&payload)
+            .cmd("LTRIM")
+            .arg(&key)
+            .arg(0)
+            .arg(19)
+            .ignore()
+            .query_async(&mut conn)
+            .await?;
+        Ok(())
+    }
+}
+
+// ----- Event Publishing ------------------------------------------------------
+
+#[async_trait::async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, evt: &DomainEvent) -> Result<(), PulseError>;
+}
+
+pub struct NatsPublisher {
+    conn: nats::asynk::Connection,
+    subject: String,
+}
+
+impl NatsPublisher {
+    pub fn new(conn: nats::asynk::Connection, subject: impl Into<String>) -> Self {
+        Self {
+            conn,
+            subject: subject.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl EventPublisher for NatsPublisher {
+    #[instrument(skip(self, evt))]
+    async fn publish(&self, evt: &DomainEvent) -> Result<(), PulseError> {
+        let bytes = serde_json::to_vec(evt).expect("DomainEvent is serializable");
+        self.conn.publish(&self.subject, bytes).await?;
+        Ok(())
+    }
+}
+
+// ----- Service Layer ---------------------------------------------------------
+
+pub struct PulseService<R, C, P>
+where
+    R: PulseRepository,
+    C: Cache,
+    P: EventPublisher,
+{
+    repo: Arc<R>,
+    cache: Arc<C>,
+    publisher: Arc<P>,
+    pool: PgPool,
+}
+
+impl<R, C, P> PulseService<R, C, P>
+where
+    R: PulseRepository + 'static,
+    C: Cache + 'static,
+    P: EventPublisher + 'static,
+{
+    pub fn new(repo: Arc<R>, cache: Arc<C>, publisher: Arc<P>, pool: PgPool) -> Self {
+        Self {
+            repo,
+            cache,
+            publisher,
+            pool,
+        }
+    }
+
+    /// Handles student submission end-to-end.
+    /// On success, returns the persisted [`PulseResponse`].
+    #[instrument(skip_all, err)]
+    pub async fn submit_response(
+        &self,
+        pulse_id: Uuid,
+        student_id: Uuid,
+        artifact_url: String,
+    ) -> Result<PulseResponse, PulseError> {
+        let mut tx = self.pool.begin().await?;
+
+        let response = PulseResponse {
+            id: Uuid::new_v4(),
+            pulse_id,
+            student_id,
+            artifact_url,
+            created_at: chrono::Utc::now(),
+        };
+
+        self.repo.insert(&mut tx, &response).await?;
+        tx.commit().await?;
+
+        // Fire-and-forget caching (we still propagate error to caller).
+        self.cache.cache_response(&response).await?;
+
+        // Build event and publish. Use small timeout so service won’t hang.
+        let evt = DomainEvent::PulseResponded {
+            response_id: response.id,
+            pulse_id: response.pulse_id,
+            student_id: response.student_id,
+            at: response.created_at,
+        };
+        timeout(Duration::from_secs(2), self.publisher.publish(&evt))
+            .await
+            .map_err(|_| PulseError::Timeout)??;
+
+        Ok(response)
+    }
+}
+
+// ----- Runtime Wiring --------------------------------------------------------
+
+/// Build PgPool, Redis, NATS and spawn a fully-wired `PulseService`.
+pub async fn bootstrap_pulse_service() -> Result<
+    impl PulseServiceHandle,
+    PulseError,
+> {
+    // Reading env vars is a fallible operation in real code; kept simple here.
+    let pg_dsn = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set (e.g. postgres://user:pass@host/db)");
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".into());
+    let nats_url =
+        std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+
+    // Database connection pool.
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&pg_dsn)
+        .await?;
+
+    // Redis client.
+    let redis_client = redis::Client::open(redis_url)?;
+    // NATS async connection.
+    let nats_conn = nats::asynk::connect(nats_url).await?;
+
+    // Construct layer components.
+    let repo = Arc::new(SqlxPulseRepository::new(pool.clone()));
+    let cache = Arc::new(RedisCache::new(redis_client));
+    let publisher = Arc::new(NatsPublisher::new(nats_conn, "domain.pulses"));
+
+    Ok(PulseService::new(repo, cache, publisher, pool))
+}
+
+/// Trait alias for object-safe handle exposed by `bootstrap_pulse_service`.
+pub trait PulseServiceHandle: Send + Sync {
+    fn clone_handle(&self) -> Box<dyn PulseServiceHandle>;
+    fn into_arc(self: Box<Self>) -> Arc<dyn PulseServiceHandle>;
+    fn downcast_arc(self: Arc<Self>) -> Arc<Self>;
+}
+
+impl<R, C, P> PulseServiceHandle for PulseService<R, C, P>
+where
+    R: PulseRepository + 'static,
+    C: Cache + 'static,
+    P: EventPublisher + 'static,
+{
+    fn clone_handle(&self) -> Box<dyn PulseServiceHandle> {
+        Box::new(Self {
+            repo: self.repo.clone(),
+            cache: self.cache.clone(),
+            publisher: self.publisher.clone(),
+            pool: self.pool.clone(),
+        })
+    }
+
+    fn into_arc(self: Box<Self>) -> Arc<dyn PulseServiceHandle> {
+        self
+    }
+
+    fn downcast_arc(self: Arc<Self>) -> Arc<Self> {
+        self
+    }
+}
+
+// ----- Tests -----------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    struct MockRepo;
+    struct MockCache;
+    struct MockPublisher;
+
+    #[async_trait::async_trait]
+    impl PulseRepository for MockRepo {
+        async fn insert(
+            &self,
+            _tx: &mut Transaction<'_, Postgres>,
+            _response: &PulseResponse,
+        ) -> Result<(), PulseError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Cache for MockCache {
+        async fn cache_response(&self, _response: &PulseResponse) -> Result<(), PulseError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventPublisher for MockPublisher {
+        async fn publish(&self, _evt: &DomainEvent) -> Result<(), PulseError> {
+            Ok(())
+        }
+    }
+
+    // Tests don’t require real Postgres; use sqlx::Any + in-memory sqlite for demo.
+    async fn test_pool() -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(1)
+            .connect("postgres://postgres@localhost/test")
+            .await
+            .unwrap_or_else(|_| panic!("Local Postgres required for tests"))
+    }
+
+    #[tokio::test]
+    async fn happy_path_submits_response() {
+        let pool = test_pool().await;
+
+        let service = PulseService::new(
+            Arc::new(MockRepo),
+            Arc::new(MockCache),
+            Arc::new(MockPublisher),
+            pool,
+        );
+
+        let resp = service
+            .submit_response(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "https://cdn.edu/artifact.png".into(),
+            )
+            .await
+            .expect("happy path");
+
+        assert!(resp.created_at.timestamp() <= chrono::Utc::now().timestamp());
+        assert_eq!(resp.artifact_url, "https://cdn.edu/artifact.png");
+    }
+
+    #[tokio::test]
+    async fn timeout_is_propagated() {
+        struct SlowPublisher;
+        #[async_trait::async_trait]
+        impl EventPublisher for SlowPublisher {
+            async fn publish(&self, _evt: &DomainEvent) -> Result<(), PulseError> {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Ok(())
+            }
+        }
+
+        let pool = test_pool().await;
+        let service = PulseService::new(
+            Arc::new(MockRepo),
+            Arc::new(MockCache),
+            Arc::new(SlowPublisher),
+            pool,
+        );
+
+        let err = service
+            .submit_response(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "https://cdn.edu/slow.png".into(),
+            )
+            .await
+            .unwrap_err();
+
+        matches!(err, PulseError::Timeout);
+    }
+}
+```

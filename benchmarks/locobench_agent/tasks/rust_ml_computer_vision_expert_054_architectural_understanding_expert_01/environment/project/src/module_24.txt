@@ -1,0 +1,367 @@
+```rust
+//! module_24.rs
+//!
+//! This module implements an event–based model-monitoring subsystem that can be
+//! embedded anywhere inside VisuTility Orchestrator pipelines.  It demonstrates
+//! an Observer pattern where metric producers (publishers) broadcast events to
+//! registered observers.  Observers may trigger automated activities—such as
+//! model retraining—when specific conditions are met.
+//!
+//! The code is **self-contained** and can compile standalone.  In the real
+//! project it would be imported by other crates via `mod` or a separate crate
+//! dependency.
+
+use std::{
+    collections::VecDeque,
+    fmt::{self, Display},
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime},
+};
+
+use chrono::{DateTime, Utc};
+use log::{error, info, warn};
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    sync::broadcast::{self, Receiver, Sender},
+    task,
+    time,
+};
+
+/// Define the type of metrics that flow through the monitoring channel.
+///
+/// In a production environment this would likely be far more exhaustive
+/// (precision/recall, confusion matrix slices, custom business KPIs, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MetricKind {
+    InferenceLatencyMs,
+    AccuracyPct,
+    DataDriftScore,
+}
+
+/// Lightweight, serializable event wrapper for metrics that will be sent across
+/// threads/tasks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricEvent {
+    pub kind: MetricKind,
+    pub value: f64,
+    pub ts: DateTime<Utc>,
+}
+
+impl MetricEvent {
+    pub fn new(kind: MetricKind, value: f64) -> Self {
+        Self {
+            kind,
+            value,
+            ts: Utc::now(),
+        }
+    }
+}
+
+/// A generic Observer that can consume [`MetricEvent`]s.
+pub trait MetricObserver: Send + Sync + 'static {
+    fn on_event(&self, event: MetricEvent);
+    fn name(&self) -> &'static str;
+}
+
+/// Thread-safe registry that fans-out events to all registered [`MetricObserver`]s.
+///
+/// Internally uses a `broadcast` channel so observers never block the publishers.
+/// Each observer listens on its own `Receiver`.
+pub struct MetricPublisher {
+    tx: Sender<MetricEvent>,
+    // Keep handles so that receivers stay alive while the publisher is alive.
+    _observer_tasks: Arc<Mutex<Vec<task::JoinHandle<()>>>>,
+}
+
+impl MetricPublisher {
+    /// Capacity here defines the size of the broadcast channel buffer.
+    pub fn new(capacity: usize) -> Self {
+        let (tx, _rx) = broadcast::channel(capacity);
+        Self {
+            tx,
+            _observer_tasks: Arc::new(Mutex::new(vec![])),
+        }
+    }
+
+    /// Send an event asynchronously; failures occur only if there are no
+    /// receivers listening.  Caller decides whether that is exceptional.
+    pub fn publish(&self, event: MetricEvent) -> Result<(), PublishError> {
+        self.tx
+            .send(event)
+            .map_err(|e| PublishError::NoObservers(e.0))
+    }
+
+    /// Attach an observer and spawn an async task that consumes the broadcast
+    /// stream.
+    pub fn attach_observer<O: MetricObserver>(&self, observer: O) {
+        let name = observer.name();
+        let mut rx: Receiver<MetricEvent> = self.tx.subscribe();
+        let handle = task::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => observer.on_event(event),
+                    // Lagged—messages were dropped.  Log & try to continue.
+                    Err(broadcast::error::RecvError::Lagged(count)) => {
+                        warn!(
+                            "[observer={}]: Lagged by {} messages. Consider increasing channel size.",
+                            name, count
+                        );
+                    }
+                    // Closed—publisher dropped; exit the loop gracefully.
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!("[observer={}]: channel closed, terminating task.", name);
+                        break;
+                    }
+                }
+            }
+        });
+        self._observer_tasks.lock().unwrap().push(handle);
+    }
+}
+
+/// Error when publishing a metric event.
+#[derive(Debug, Error)]
+pub enum PublishError {
+    #[error("no observers are attached; event lost: {0:?}")]
+    NoObservers(MetricEvent),
+}
+
+/// Sliding-window aggregator for metric events.
+///
+/// For simplicity, we store *all* events in window; real impl might use
+/// reservoir sampling or streaming stats to cap memory usage.
+#[derive(Debug)]
+pub struct SlidingWindow {
+    window: VecDeque<(SystemTime, f64)>,
+    duration: Duration,
+}
+
+impl SlidingWindow {
+    pub fn new(duration: Duration) -> Self {
+        Self {
+            window: VecDeque::new(),
+            duration,
+        }
+    }
+
+    /// Push a value with current timestamp and evict old entries.
+    pub fn push(&mut self, value: f64) {
+        let now = SystemTime::now();
+        self.window.push_back((now, value));
+        self.evict(now);
+    }
+
+    /// Compute the average of current items.
+    pub fn mean(&self) -> Option<f64> {
+        if self.window.is_empty() {
+            return None;
+        }
+        Some(
+            self.window
+                .iter()
+                .map(|(_, v)| v)
+                .sum::<f64>()
+                / self.window.len() as f64,
+        )
+    }
+
+    fn evict(&mut self, now: SystemTime) {
+        while let Some((ts, _)) = self.window.front() {
+            if now.duration_since(*ts).unwrap_or_default() > self.duration {
+                self.window.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// An observer that watches accuracy and data-drift metrics to decide whether a
+/// model should be retrained.
+pub struct RetrainObserver {
+    accuracy_window: Mutex<SlidingWindow>,
+    drift_window: Mutex<SlidingWindow>,
+    cfg: RetrainConfig,
+    retrain_tx: tokio::sync::mpsc::Sender<RetrainSignal>,
+}
+
+impl RetrainObserver {
+    pub fn new(cfg: RetrainConfig, retrain_tx: tokio::sync::mpsc::Sender<RetrainSignal>) -> Self {
+        Self {
+            accuracy_window: Mutex::new(SlidingWindow::new(cfg.window)),
+            drift_window: Mutex::new(SlidingWindow::new(cfg.window)),
+            cfg,
+            retrain_tx,
+        }
+    }
+
+    fn check_and_signal(&self) {
+        let acc_mean = self.accuracy_window.lock().unwrap().mean();
+        let drift_mean = self.drift_window.lock().unwrap().mean();
+
+        // Simple thresholding logic; can be swapped with sophisticated stats.
+        if let (Some(acc), Some(drift)) = (acc_mean, drift_mean) {
+            if acc < self.cfg.min_accuracy || drift > self.cfg.max_drift {
+                warn!(
+                    "[RetrainObserver]: Conditions met (acc={:.2}, drift={:.2}); triggering retrain.",
+                    acc, drift
+                );
+                let _ = self.retrain_tx.try_send(RetrainSignal::Triggered); // Best-effort.
+            }
+        }
+    }
+}
+
+impl MetricObserver for RetrainObserver {
+    fn on_event(&self, event: MetricEvent) {
+        match event.kind {
+            MetricKind::AccuracyPct => self
+                .accuracy_window
+                .lock()
+                .unwrap()
+                .push(event.value), // Push & maybe evict.
+            MetricKind::DataDriftScore => self.drift_window.lock().unwrap().push(event.value),
+            _ => {}
+        }
+        self.check_and_signal();
+    }
+
+    fn name(&self) -> &'static str {
+        "RetrainObserver"
+    }
+}
+
+/// Configuration for retraining triggers.
+#[derive(Debug, Clone)]
+pub struct RetrainConfig {
+    pub min_accuracy: f64, // % accuracy threshold to trigger retrain.
+    pub max_drift: f64,    // Drift score threshold.
+    pub window: Duration,  // Sliding window duration to compute means.
+}
+
+impl Default for RetrainConfig {
+    fn default() -> Self {
+        Self {
+            min_accuracy: 92.0,
+            max_drift: 0.15,
+            window: Duration::from_secs(300),
+        }
+    }
+}
+
+/// Signal enum between observers and retraining orchestrator.
+#[derive(Debug)]
+pub enum RetrainSignal {
+    Triggered,
+    Completed,
+}
+
+/// A mock retraining orchestrator that listens for retraining signals and
+/// performs long-running (simulated) tasks.
+pub struct RetrainOrchestrator {
+    rx: tokio::sync::mpsc::Receiver<RetrainSignal>,
+}
+
+impl RetrainOrchestrator {
+    pub fn new(rx: tokio::sync::mpsc::Receiver<RetrainSignal>) -> Self {
+        Self { rx }
+    }
+
+    pub async fn run(mut self) {
+        while let Some(sig) = self.rx.recv().await {
+            match sig {
+                RetrainSignal::Triggered => {
+                    info!("[RetrainOrchestrator]: Retraining started.");
+                    // Simulate heavy computation.
+                    time::sleep(Duration::from_secs(5)).await;
+                    info!("[RetrainOrchestrator]: Retraining finished.");
+                }
+                RetrainSignal::Completed => {
+                    info!("[RetrainOrchestrator]: Completed signal received.");
+                }
+            }
+        }
+        info!("[RetrainOrchestrator]: Channel closed, exiting.");
+    }
+}
+
+/// `MetricGenerator` simulates an upstream component that periodically publishes
+/// random metric values.  In production this would be replaced by the actual
+/// inference service or monitoring agent.
+pub struct MetricGenerator {
+    publisher: MetricPublisher,
+    interval: Duration,
+}
+
+impl MetricGenerator {
+    pub fn new(publisher: MetricPublisher, interval: Duration) -> Self {
+        Self { publisher, interval }
+    }
+
+    pub async fn run(self) {
+        let mut rng = rand::thread_rng();
+        let kinds = [
+            MetricKind::AccuracyPct,
+            MetricKind::InferenceLatencyMs,
+            MetricKind::DataDriftScore,
+        ];
+
+        loop {
+            // Produce a random event per loop for demonstration.
+            let kind = kinds[rng.gen_range(0..kinds.len())].clone();
+            let value = match kind {
+                MetricKind::AccuracyPct => rng.gen_range(80.0..99.9),
+                MetricKind::InferenceLatencyMs => rng.gen_range(3.0..100.0),
+                MetricKind::DataDriftScore => rng.gen_range(0.0..0.3),
+            };
+
+            let event = MetricEvent::new(kind, value);
+            if let Err(e) = self.publisher.publish(event) {
+                error!("Failed to publish metric: {}", e);
+            }
+
+            time::sleep(self.interval).await;
+        }
+    }
+}
+
+/// Demo entrypoint.  This would normally belong in `main.rs` of an executable
+/// crate, but is included here for completeness.
+///
+/// To run:
+/// ```no_run
+/// RUST_LOG=info cargo run --bin module_24
+/// ```
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
+    // Initialize env_logger if available; ignore error if already set.
+    let _ = env_logger::try_init();
+
+    let publisher = MetricPublisher::new(1_024);
+
+    // Retrain path wiring.
+    let (tx, rx) = tokio::sync::mpsc::channel::<RetrainSignal>(32);
+    let retrain_observer = RetrainObserver::new(RetrainConfig::default(), tx);
+    publisher.attach_observer(retrain_observer);
+
+    let retrain_orch = RetrainOrchestrator::new(rx);
+    tokio::spawn(retrain_orch.run());
+
+    // Metric generator.
+    let generator = MetricGenerator::new(publisher, Duration::from_millis(800));
+    generator.run().await;
+}
+
+// Implement Display for better log formatting.
+impl Display for MetricKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MetricKind::InferenceLatencyMs => write!(f, "latency_ms"),
+            MetricKind::AccuracyPct => write!(f, "accuracy_pct"),
+            MetricKind::DataDriftScore => write!(f, "drift_score"),
+        }
+    }
+}
+```

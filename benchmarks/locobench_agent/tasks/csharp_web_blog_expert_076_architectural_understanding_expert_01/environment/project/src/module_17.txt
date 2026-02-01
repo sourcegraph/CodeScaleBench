@@ -1,0 +1,208 @@
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace TempoScribePro.PublishingAutomation
+{
+    /// <summary>
+    /// Port – abstraction of the post repository used by the publishing scheduler.
+    /// Implementation lives in an infrastructure adapter (SQL, NoSQL, etc.).
+    /// </summary>
+    public interface IPostRepository
+    {
+        /// <summary>
+        /// Returns all posts that are scheduled to be published at or before <paramref name="now"/>
+        /// and that have not yet been published.
+        /// </summary>
+        Task<IReadOnlyCollection<Post>> GetPostsScheduledForPublishingAsync(
+            DateTimeOffset now,
+            CancellationToken cancellationToken);
+
+        /// <summary>
+        /// Persists changes made to a post (state mutation, metadata updates, etc.).
+        /// </summary>
+        Task UpdateAsync(Post post, CancellationToken cancellationToken);
+    }
+
+    /// <summary>
+    /// Port – abstraction of a distributed lock that ensures only one instance of the scheduler
+    /// runs critical sections at a time (e.g., Azure Blob Lease, PostgreSQL advisory lock, Redis lock).
+    /// </summary>
+    public interface IDistributedLock : IAsyncDisposable
+    {
+        Task<bool> AcquireAsync(string resource, TimeSpan ttl, CancellationToken cancellationToken);
+        Task ReleaseAsync(string resource, CancellationToken cancellationToken);
+    }
+
+    /// <summary>
+    /// Port – abstraction of a clock so we can deterministically test time-sensitive code.
+    /// </summary>
+    public interface IClock
+    {
+        DateTimeOffset UtcNow { get; }
+    }
+
+    /// <summary>
+    /// Port – abstraction of a domain event publisher to decouple core logic from transport (e.g., RabbitMQ, 
+    /// Azure Service Bus, in-process mediator, etc.).
+    /// </summary>
+    public interface IEventBus
+    {
+        ValueTask PublishAsync<TEvent>(TEvent @event, CancellationToken cancellationToken);
+    }
+
+    /// <summary>
+    /// Domain model (simplified). Real implementation resides in TempoScribePro.Domain.
+    /// Only the members required by this module are re-declared here.
+    /// </summary>
+    public sealed class Post
+    {
+        public Guid Id { get; private init; }
+        public string Slug { get; private set; } = default!;
+        public PostStatus Status { get; private set; }
+        public DateTimeOffset? ScheduledPublishAt { get; private set; }
+        public DateTimeOffset? PublishedAt { get; private set; }
+
+        /* Other rich domain props & methods are omitted for brevity. */
+
+        public bool IsDueToPublish(IClock clock) =>
+            Status == PostStatus.Scheduled &&
+            ScheduledPublishAt.HasValue &&
+            ScheduledPublishAt.Value <= clock.UtcNow;
+
+        public void Publish(IClock clock)
+        {
+            if (!IsDueToPublish(clock))
+                throw new InvalidOperationException(
+                    $"Post {Id} cannot be published. Status = {Status}, ScheduledPublishAt = {ScheduledPublishAt:u}, Now = {clock.UtcNow:u}");
+
+            Status      = PostStatus.Published;
+            PublishedAt = clock.UtcNow;
+            ScheduledPublishAt = null;
+        }
+    }
+
+    public enum PostStatus
+    {
+        Draft      = 0,
+        Scheduled  = 1,
+        Published  = 2,
+        Archived   = 3,
+        Deleted    = 4
+    }
+
+    public record PostPublishedEvent(Guid PostId, string Slug, DateTimeOffset PublishedAtUtc);
+
+    /// <summary>
+    /// Application Service responsible for scanning, publishing, and raising events for all posts whose
+    /// scheduled datetime has elapsed. This is orchestrated via a cron job or message-based trigger and
+    /// runs behind a distributed lock to guarantee idempotency across a multi-node cluster.
+    /// </summary>
+    public sealed class ScheduledPublishingService
+    {
+        private const string LockName = "scheduled-publishing-service";
+        private static readonly TimeSpan LockTtl = TimeSpan.FromMinutes(2);
+
+        private readonly IPostRepository   _repository;
+        private readonly IClock            _clock;
+        private readonly IEventBus         _events;
+        private readonly IDistributedLock? _distributedLock;
+        private readonly ILogger<ScheduledPublishingService> _logger;
+
+        public ScheduledPublishingService(
+            IPostRepository repository,
+            IClock clock,
+            IEventBus events,
+            ILogger<ScheduledPublishingService> logger,
+            IDistributedLock? distributedLock = null /* Null-object if lock not configured */)
+        {
+            _repository      = repository  ?? throw new ArgumentNullException(nameof(repository));
+            _clock           = clock       ?? throw new ArgumentNullException(nameof(clock));
+            _events          = events      ?? throw new ArgumentNullException(nameof(events));
+            _logger          = logger      ?? throw new ArgumentNullException(nameof(logger));
+            _distributedLock = distributedLock;
+        }
+
+        /// <summary>
+        /// Publishes all posts that are due. Returns the number of posts successfully published.
+        /// </summary>
+        public async Task<int> PublishDuePostsAsync(CancellationToken cancellationToken = default)
+        {
+            // Acquire distributed lock if configured; otherwise continue optimistically.
+            var lockAcquired = _distributedLock is null ||
+                               await _distributedLock.AcquireAsync(LockName, LockTtl, cancellationToken);
+
+            if (!lockAcquired)
+            {
+                _logger.LogInformation("Another instance holds the '{LockName}' lock. Skipping execution.", LockName);
+                return 0;
+            }
+
+            try
+            {
+                // Query repository for due posts.
+                var duePosts = await _repository.GetPostsScheduledForPublishingAsync(
+                    _clock.UtcNow,
+                    cancellationToken);
+
+                if (duePosts.Count == 0)
+                {
+                    _logger.LogDebug("No due posts found for publishing at {Now:u}.", _clock.UtcNow);
+                    return 0;
+                }
+
+                var publishedCount = 0;
+
+                foreach (var post in duePosts)
+                {
+                    try
+                    {
+                        // Execute domain behavior.
+                        post.Publish(_clock);
+
+                        // Persist changes.
+                        await _repository.UpdateAsync(post, cancellationToken);
+
+                        // Raise integration event.
+                        await _events.PublishAsync(
+                            new PostPublishedEvent(post.Id, post.Slug, post.PublishedAt!.Value),
+                            cancellationToken);
+
+                        publishedCount++;
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log, but continue publishing other posts.
+                        _logger.LogError(
+                            ex,
+                            "Error publishing post {PostId}. It will be retried on next run.",
+                            post.Id);
+                    }
+                }
+
+                _logger.LogInformation("Published {Count} posts on {Now:u}.", publishedCount, _clock.UtcNow);
+                return publishedCount;
+            }
+            finally
+            {
+                if (_distributedLock is not null)
+                {
+                    try
+                    {
+                        await _distributedLock.ReleaseAsync(LockName, cancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to release distributed lock '{LockName}'.", LockName);
+                    }
+
+                    await _distributedLock.DisposeAsync();
+                }
+            }
+        }
+    }
+}
+```

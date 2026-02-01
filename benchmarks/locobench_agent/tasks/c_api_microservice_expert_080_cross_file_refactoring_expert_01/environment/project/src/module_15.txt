@@ -1,0 +1,592 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * -----------------------------------------
+ * Module 15: In-Memory Event Bus
+ *
+ * This file provides a thread-safe, low-latency publish/subscribe message bus
+ * that allows the various “pseudo-microservices” inside the monolith to
+ * exchange domain events without leaving the process.
+ *
+ * Design goals:
+ *   • lock contention kept to a minimum (per-subscription queues)
+ *   • back-pressure handled via lossy overwrite or blocking wait (configurable)
+ *   • observability hooks for Prometheus metrics
+ *   • graceful shutdown & resource cleanup
+ *
+ * Authors:   MercuryMonolith Core Team
+ * License:   Apache-2.0
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+#include <errno.h>
+#include <stdatomic.h>
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/* Forward declarations for the monitoring layer. These are implemented in
+ * the project-wide “monitoring/metrics.c”, but we only need the prototypes
+ * here to keep this module self-contained.
+ */
+void mm_metrics_counter_inc(const char *name, uint64_t value);
+void mm_metrics_gauge_set(const char *name, double value);
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/* Utility macros                                                              */
+#define MM_UNUSED(x)   ((void)(x))
+#define MM_ARRAY_GROW_CAP(cap)  ((cap) == 0 ? 4 : (cap) * 2)
+
+/* Log helpers (redirected to the unified structured logging subsystem). */
+static inline void mm_log_error(const char *msg)
+{
+    fprintf(stderr, "[event_bus][error] %s\n", msg);
+}
+
+static inline void mm_log_warn(const char *msg)
+{
+    fprintf(stderr, "[event_bus][warn] %s\n", msg);
+}
+
+static inline void mm_log_debug(const char *msg)
+{
+#ifdef MERCURY_DEBUG
+    fprintf(stdout, "[event_bus][debug] %s\n", msg);
+#else
+    MM_UNUSED(msg);
+#endif
+}
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/* Event definition                                                            */
+
+/* A single event message. Payload is an opaque blob owned by the bus. */
+typedef struct mm_event {
+    char    *type;          /* Event type string / topic name.               */
+    void    *payload;       /* Opaque payload data.                           */
+    size_t   payload_size;  /* Bytes in payload.                              */
+    uint64_t timestamp_ns;  /* Monotonic clock time when event was published. */
+} mm_event_t;
+
+/* Construct a deep copy of an event so that each subscriber owns its memory. */
+static mm_event_t *mm_event_clone(const char *type,
+                                  const void *payload,
+                                  size_t payload_size)
+{
+    mm_event_t *ev = calloc(1, sizeof(mm_event_t));
+    if (!ev) {
+        mm_log_error("Out of memory cloning event header");
+        return NULL;
+    }
+
+    ev->type = strdup(type);
+    if (!ev->type) {
+        free(ev);
+        mm_log_error("Out of memory cloning event type");
+        return NULL;
+    }
+
+    ev->payload = malloc(payload_size);
+    if (payload_size && !ev->payload) {
+        free(ev->type);
+        free(ev);
+        mm_log_error("Out of memory cloning event payload");
+        return NULL;
+    }
+
+    if (payload_size) {
+        memcpy(ev->payload, payload, payload_size);
+    }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ev->timestamp_ns = ((uint64_t) ts.tv_sec * 1000000000ull) + ts.tv_nsec;
+    ev->payload_size = payload_size;
+
+    return ev;
+}
+
+static void mm_event_free(mm_event_t *ev)
+{
+    if (!ev) return;
+    free(ev->type);
+    free(ev->payload);
+    free(ev);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/* Subscription queue (single-producer, single-consumer ring buffer)           */
+
+typedef enum {
+    MM_SUB_POLICY_BLOCK,     /* Wait until space is available (publisher)     */
+    MM_SUB_POLICY_OVERWRITE  /* Drop oldest message if queue is full          */
+} mm_sub_overflow_policy_t;
+
+typedef struct mm_sub_queue {
+    mm_event_t               **buf;      /* Ring buffer array                 */
+    size_t                     cap;      /* Capacity (# of pointers)          */
+    size_t                     head;     /* Next position to read             */
+    size_t                     tail;     /* Next position to write            */
+    pthread_mutex_t            mtx;      /* Protects head/tail & buf          */
+    pthread_cond_t             cv;       /* Signaled when new data arrives    */
+    bool                       closed;   /* Set by unsubscribe / shutdown     */
+    mm_sub_overflow_policy_t   policy;   /* Overflow behaviour                */
+} mm_sub_queue_t;
+
+/* Forward to avoid circular reference */
+struct mm_subscription;
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/* Topic index: each topic owns a list of subscriptions                        */
+
+typedef struct mm_topic {
+    char                   *name;
+    struct mm_subscription *subs;      /* Linked list head */
+    struct mm_topic        *next;      /* Next topic */
+} mm_topic_t;
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/* Subscription metadata                                                       */
+
+typedef struct mm_subscription {
+    uint64_t            id;        /* Unique handle returned to caller */
+    mm_sub_queue_t      queue;     /* Per-subscriber ring buffer       */
+    struct mm_topic    *topic;     /* Back-pointer                     */
+    struct mm_subscription *next;  /* Next subscription in topic list  */
+} mm_subscription_t;
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/* Event bus                                                                   */
+
+typedef struct mm_event_bus {
+    mm_topic_t           *topics;          /* Linked list of topics   */
+    pthread_mutex_t       mtx;             /* Protects topic index    */
+    atomic_uint_fast64_t  next_sub_id;     /* Monotonically increasing */
+    bool                  shutting_down;   /* Reject new work         */
+} mm_event_bus_t;
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/* Helper: allocate & initialise queue                                         */
+static int mm_queue_init(mm_sub_queue_t *q,
+                         size_t capacity,
+                         mm_sub_overflow_policy_t policy)
+{
+    memset(q, 0, sizeof(*q));
+    q->cap = capacity ? capacity : 1024;
+    q->policy = policy;
+    q->buf = calloc(q->cap, sizeof(mm_event_t *));
+    if (!q->buf) {
+        return ENOMEM;
+    }
+    pthread_mutex_init(&q->mtx, NULL);
+    pthread_cond_init(&q->cv, NULL);
+    return 0;
+}
+
+static void mm_queue_free(mm_sub_queue_t *q)
+{
+    if (!q) return;
+    for (size_t i = 0; i < q->cap; ++i) {
+        mm_event_free(q->buf[i]);
+    }
+    free(q->buf);
+    pthread_mutex_destroy(&q->mtx);
+    pthread_cond_destroy(&q->cv);
+}
+
+/* Push an event into queue. Caller holds queue->mtx. */
+static int mm_queue_push_locked(mm_sub_queue_t *q, mm_event_t *ev)
+{
+    size_t next_tail = (q->tail + 1) % q->cap;
+    bool full = (next_tail == q->head);
+
+    if (full) {
+        if (q->policy == MM_SUB_POLICY_BLOCK) {
+            /* Wait until consumer reads at least one event */
+            do {
+                pthread_cond_wait(&q->cv, &q->mtx);
+                next_tail = (q->tail + 1) % q->cap;
+                full = (next_tail == q->head);
+            } while (full && !q->closed);
+            if (q->closed) return ECANCELED;
+        } else if (q->policy == MM_SUB_POLICY_OVERWRITE) {
+            /* Drop the oldest event */
+            mm_event_free(q->buf[q->head]);
+            q->head = (q->head + 1) % q->cap;
+        }
+    }
+
+    q->buf[q->tail] = ev;
+    q->tail = next_tail;
+    pthread_cond_signal(&q->cv);
+    return 0;
+}
+
+/* Pop an event with optional timeout (ms). Returns NULL on timeout/closed.    */
+static mm_event_t *mm_queue_pop(mm_sub_queue_t *q, int timeout_ms)
+{
+    struct timespec ts_deadline;
+    bool use_timeout = timeout_ms >= 0;
+    if (use_timeout) {
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        ts_deadline.tv_sec  = now.tv_sec + timeout_ms / 1000;
+        ts_deadline.tv_nsec = now.tv_nsec + (timeout_ms % 1000) * 1000000;
+        if (ts_deadline.tv_nsec >= 1000000000) {
+            ts_deadline.tv_sec++;
+            ts_deadline.tv_nsec -= 1000000000;
+        }
+    }
+
+    pthread_mutex_lock(&q->mtx);
+    while (q->head == q->tail && !q->closed) {
+        int rc;
+        if (use_timeout) {
+            rc = pthread_cond_timedwait(&q->cv, &q->mtx, &ts_deadline);
+            if (rc == ETIMEDOUT) {
+                pthread_mutex_unlock(&q->mtx);
+                return NULL;
+            }
+        } else {
+            pthread_cond_wait(&q->cv, &q->mtx);
+        }
+    }
+
+    if (q->closed) {
+        pthread_mutex_unlock(&q->mtx);
+        return NULL;
+    }
+
+    mm_event_t *ev = q->buf[q->head];
+    q->buf[q->head] = NULL; /* Prevent double free on shutdown. */
+    q->head = (q->head + 1) % q->cap;
+    pthread_cond_signal(&q->cv); /* Wake publisher if blocked. */
+    pthread_mutex_unlock(&q->mtx);
+    return ev;
+}
+
+/* Close queue and wake up any blocked readers/writers. */
+static void mm_queue_close(mm_sub_queue_t *q)
+{
+    pthread_mutex_lock(&q->mtx);
+    q->closed = true;
+    pthread_cond_broadcast(&q->cv);
+    pthread_mutex_unlock(&q->mtx);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/* Internal helpers for topic management                                       */
+
+/* Search or create topic. Caller must hold bus->mtx. */
+static mm_topic_t *mm_topic_get_or_create(mm_event_bus_t *bus,
+                                          const char *name,
+                                          bool create_if_missing)
+{
+    mm_topic_t *t = bus->topics;
+    while (t) {
+        if (strcmp(t->name, name) == 0) {
+            return t;
+        }
+        t = t->next;
+    }
+    if (!create_if_missing) return NULL;
+
+    /* Create new topic */
+    t = calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    t->name = strdup(name);
+    if (!t->name) {
+        free(t);
+        return NULL;
+    }
+    t->next = bus->topics;
+    bus->topics = t;
+    return t;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/* Public API                                                                  */
+
+mm_event_bus_t *mm_event_bus_create(void)
+{
+    mm_event_bus_t *bus = calloc(1, sizeof(mm_event_bus_t));
+    if (!bus) return NULL;
+    pthread_mutex_init(&bus->mtx, NULL);
+    atomic_init(&bus->next_sub_id, 1);
+    bus->shutting_down = false;
+    mm_metrics_gauge_set("mm_event_bus_topics", 0.0);
+    mm_metrics_gauge_set("mm_event_bus_subscriptions", 0.0);
+    return bus;
+}
+
+void mm_event_bus_destroy(mm_event_bus_t *bus)
+{
+    if (!bus) return;
+    pthread_mutex_lock(&bus->mtx);
+    bus->shutting_down = true;
+
+    mm_topic_t *topic = bus->topics;
+    while (topic) {
+        mm_subscription_t *sub = topic->subs;
+        while (sub) {
+            mm_queue_close(&sub->queue);
+            sub = sub->next;
+        }
+        topic = topic->next;
+    }
+    pthread_mutex_unlock(&bus->mtx);
+
+    /* Give consumers time to drain and exit (optional). */
+    /* In production we would join known consumer threads; out of scope here. */
+
+    pthread_mutex_lock(&bus->mtx);
+    topic = bus->topics;
+    while (topic) {
+        mm_subscription_t *sub = topic->subs;
+        while (sub) {
+            mm_subscription_t *next_sub = sub->next;
+            mm_queue_free(&sub->queue);
+            free(sub);
+            sub = next_sub;
+        }
+        mm_topic_t *next_topic = topic->next;
+        free(topic->name);
+        free(topic);
+        topic = next_topic;
+    }
+    pthread_mutex_unlock(&bus->mtx);
+
+    pthread_mutex_destroy(&bus->mtx);
+    free(bus);
+    mm_metrics_gauge_set("mm_event_bus_topics", 0.0);
+    mm_metrics_gauge_set("mm_event_bus_subscriptions", 0.0);
+}
+
+uint64_t mm_event_bus_subscribe(mm_event_bus_t *bus,
+                                const char *topic_name,
+                                size_t queue_capacity,
+                                mm_sub_overflow_policy_t policy)
+{
+    if (!bus || !topic_name) return 0;
+
+    pthread_mutex_lock(&bus->mtx);
+    if (bus->shutting_down) {
+        pthread_mutex_unlock(&bus->mtx);
+        return 0;
+    }
+
+    mm_topic_t *topic = mm_topic_get_or_create(bus, topic_name, true);
+    if (!topic) {
+        pthread_mutex_unlock(&bus->mtx);
+        return 0;
+    }
+
+    mm_subscription_t *sub = calloc(1, sizeof(*sub));
+    if (!sub) {
+        pthread_mutex_unlock(&bus->mtx);
+        return 0;
+    }
+    sub->id = atomic_fetch_add(&bus->next_sub_id, 1);
+    sub->topic = topic;
+    int rc = mm_queue_init(&sub->queue, queue_capacity, policy);
+    if (rc != 0) {
+        pthread_mutex_unlock(&bus->mtx);
+        free(sub);
+        return 0;
+    }
+
+    /* Insert at list head */
+    sub->next = topic->subs;
+    topic->subs = sub;
+
+    mm_metrics_counter_inc("mm_event_bus_subscribe_total", 1);
+    double current = (double) atomic_load(&bus->next_sub_id) - 1;
+    mm_metrics_gauge_set("mm_event_bus_subscriptions", current);
+
+    pthread_mutex_unlock(&bus->mtx);
+    mm_log_debug("new subscription registered");
+    return sub->id;
+}
+
+int mm_event_bus_unsubscribe(mm_event_bus_t *bus, uint64_t sub_id)
+{
+    if (!bus || sub_id == 0) return EINVAL;
+
+    pthread_mutex_lock(&bus->mtx);
+
+    mm_topic_t *topic = bus->topics;
+    while (topic) {
+        mm_subscription_t **prev = &topic->subs;
+        mm_subscription_t *sub = topic->subs;
+        while (sub) {
+            if (sub->id == sub_id) {
+                /* Remove from list */
+                *prev = sub->next;
+                mm_queue_close(&sub->queue);
+                pthread_mutex_unlock(&bus->mtx);
+
+                mm_queue_free(&sub->queue);
+                free(sub);
+
+                mm_metrics_counter_inc("mm_event_bus_unsubscribe_total", 1);
+                /* We don’t know exact count without scanning, but keep rough metric. */
+                return 0;
+            }
+            prev = &sub->next;
+            sub = sub->next;
+        }
+        topic = topic->next;
+    }
+    pthread_mutex_unlock(&bus->mtx);
+    return ENOENT;
+}
+
+int mm_event_bus_publish(mm_event_bus_t *bus,
+                         const char *topic_name,
+                         const void *payload,
+                         size_t payload_size)
+{
+    if (!bus || !topic_name) return EINVAL;
+    pthread_mutex_lock(&bus->mtx);
+    if (bus->shutting_down) {
+        pthread_mutex_unlock(&bus->mtx);
+        return ECANCELED;
+    }
+
+    mm_topic_t *topic = mm_topic_get_or_create(bus, topic_name, false);
+    if (!topic || !topic->subs) {
+        /* No subscribers – early exit. */
+        pthread_mutex_unlock(&bus->mtx);
+        return 0;
+    }
+
+    /* Clone event once per subscriber to avoid contention. */
+    mm_subscription_t *sub = topic->subs;
+    int result = 0;
+    while (sub) {
+        mm_event_t *ev = mm_event_clone(topic_name, payload, payload_size);
+        if (!ev) {
+            result = ENOMEM;
+            break;
+        }
+
+        pthread_mutex_lock(&sub->queue.mtx);
+        int rc = mm_queue_push_locked(&sub->queue, ev);
+        pthread_mutex_unlock(&sub->queue.mtx);
+        if (rc != 0) {
+            mm_event_free(ev);
+            result = rc; /* Continue to push others, but remember first error */
+        }
+        sub = sub->next;
+    }
+
+    pthread_mutex_unlock(&bus->mtx);
+    mm_metrics_counter_inc("mm_event_bus_publish_total", 1);
+    return result;
+}
+
+int mm_event_bus_receive(mm_event_bus_t *bus,
+                         uint64_t sub_id,
+                         mm_event_t **out_event,
+                         int timeout_ms)
+{
+    if (!bus || !out_event) return EINVAL;
+    *out_event = NULL;
+
+    pthread_mutex_lock(&bus->mtx);
+    mm_topic_t *topic = bus->topics;
+    mm_subscription_t *target = NULL;
+    while (topic && !target) {
+        mm_subscription_t *sub = topic->subs;
+        while (sub) {
+            if (sub->id == sub_id) {
+                target = sub;
+                break;
+            }
+            sub = sub->next;
+        }
+        topic = topic->next;
+    }
+    if (!target) {
+        pthread_mutex_unlock(&bus->mtx);
+        return ENOENT;
+    }
+
+    /* Increase ref count of queue by taking pointer; safe after unlock. */
+    mm_sub_queue_t *queue = &target->queue;
+    pthread_mutex_unlock(&bus->mtx);
+
+    mm_event_t *ev = mm_queue_pop(queue, timeout_ms);
+    if (!ev) {
+        return ETIMEDOUT;
+    }
+    *out_event = ev;
+    return 0;
+}
+
+/* Convenience wrapper */
+void mm_event_free_message(mm_event_t *ev)
+{
+    mm_event_free(ev);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/* Example usage (unit test skeleton)                                          */
+#ifdef MERCURY_EVENT_BUS_SELFTEST
+#include <assert.h>
+
+static void *producer_thread(void *arg)
+{
+    mm_event_bus_t *bus = arg;
+    for (int i = 0; i < 1000; ++i) {
+        char buf[32];
+        snprintf(buf, sizeof buf, "hello-%d", i);
+        mm_event_bus_publish(bus, "demo.topic", buf, strlen(buf) + 1);
+    }
+    return NULL;
+}
+
+static void *consumer_thread(void *arg)
+{
+    uint64_t sub_id = *(uint64_t *) arg;
+    extern mm_event_bus_t *g_bus;
+
+    mm_event_t *ev;
+    int rc;
+    size_t cnt = 0;
+    while ((rc = mm_event_bus_receive(g_bus, sub_id, &ev, 100)) == 0) {
+        cnt++;
+        printf("recv: %s\n", (char *) ev->payload);
+        mm_event_free_message(ev);
+        if (cnt == 1000) break;
+    }
+    return NULL;
+}
+
+mm_event_bus_t *g_bus;
+
+int main(void)
+{
+    g_bus = mm_event_bus_create();
+    uint64_t sub_id = mm_event_bus_subscribe(g_bus,
+                                             "demo.topic",
+                                             256,
+                                             MM_SUB_POLICY_BLOCK);
+
+    pthread_t prod, cons;
+    pthread_create(&prod, NULL, producer_thread, g_bus);
+    pthread_create(&cons, NULL, consumer_thread, &sub_id);
+
+    pthread_join(prod, NULL);
+    pthread_join(cons, NULL);
+
+    mm_event_bus_unsubscribe(g_bus, sub_id);
+    mm_event_bus_destroy(g_bus);
+    return 0;
+}
+#endif
+
+/* ──────────────────────────────────────────────────────────────────────────── */

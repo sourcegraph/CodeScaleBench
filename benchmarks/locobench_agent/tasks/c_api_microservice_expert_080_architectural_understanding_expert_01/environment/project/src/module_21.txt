@@ -1,0 +1,477 @@
+```c
+/***********************************************************************
+ *  MercuryMonolith Commerce Hub – Response Cache Module
+ *
+ *  File:    src/module_21.c
+ *  Project: api_microservice
+ *
+ *  Description:
+ *      Generic, in-memory, thread-safe response cache that supports
+ *      per-entry TTL, size-bounded eviction, LRU replacement policy,
+ *      structured logging, and Prometheus-compatible metrics export.
+ *
+ *  This module is *only* responsible for the storage mechanics. It is
+ *  intentionally agnostic of HTTP specifics so it can be reused by the
+ *  GraphQL gateway, repository layer, or any other sub-system that
+ *  benefits from short-lived, best-effort caching.
+ *
+ *  Author:  MercuryMonolith Core Team
+ *  License: MIT
+ ***********************************************************************/
+
+#include <assert.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* ------------------------------------------------------------------ */
+/*  Project-wide interfaces                                            */
+/* ------------------------------------------------------------------ */
+
+#include "mm_log.h"       /* Structured, severity-aware logging      */
+#include "mm_metrics.h"   /* Prometheus counter / gauge helpers       */
+#include "mm_memory.h"    /* Secure / leak-tracked malloc wrappers    */
+
+#ifndef MM_CACHE_LOG_DOMAIN
+#   define MM_CACHE_LOG_DOMAIN "response_cache"
+#endif
+
+/* ------------------------------------------------------------------ */
+/*  Tunables & Constants                                               */
+/* ------------------------------------------------------------------ */
+
+#define MM_CACHE_DEFAULT_CAP_ITEMS   10'000
+#define MM_CACHE_DEFAULT_CAP_BYTES   (64ull * 1024 * 1024)  /* 64 MiB  */
+#define MM_CACHE_HASHTABLE_FACTOR    1.3                    /* load factor */
+
+/* ------------------------------------------------------------------ */
+/*  Type Declarations                                                  */
+/* ------------------------------------------------------------------ */
+
+typedef struct mm_cache_entry {
+    char                     *key;        /* UTF-8, NULL terminated             */
+    void                     *blob;       /* Opaque payload                     */
+    size_t                    blob_sz;    /* Payload size in bytes              */
+    time_t                    expires_at; /* Epoch seconds, 0 = no expiry       */
+
+    /* Intrusive LRU doubly-linked list */
+    struct mm_cache_entry    *lru_prev;
+    struct mm_cache_entry    *lru_next;
+
+    /* Separate chaining for hash table bucket */
+    struct mm_cache_entry    *hash_next;
+} mm_cache_entry_t;
+
+typedef struct mm_cache {
+    /* Capacity constraints */
+    uint64_t      cap_items;      /* Max count of items allowed            */
+    uint64_t      cap_bytes;      /* Max sum(payload) across all entries   */
+
+    /* Accounting */
+    uint64_t      cur_items;
+    uint64_t      cur_bytes;
+
+    /* Hash table for O(1) lookups, sized to nearest prime > cap_items*factor */
+    size_t                ht_size;
+    mm_cache_entry_t    **ht_buckets;
+
+    /* LRU list head/tail */
+    mm_cache_entry_t     *lru_head;
+    mm_cache_entry_t     *lru_tail;
+
+    /* Concurrency control */
+    pthread_rwlock_t      rwlock;
+
+    /* Metrics handles (registered at init) */
+    mm_metric_counter_t  *m_hits;
+    mm_metric_counter_t  *m_misses;
+    mm_metric_counter_t  *m_evictions;
+} mm_cache_t;
+
+/* ------------------------------------------------------------------ */
+/*  Forward Declarations                                               */
+/* ------------------------------------------------------------------ */
+
+static size_t          mm_cache__next_prime(size_t n);
+static uint32_t        mm_cache__hash(const char *str);
+static void            mm_cache__unlink_lru(mm_cache_t *c, mm_cache_entry_t *e);
+static void            mm_cache__link_lru_front(mm_cache_t *c, mm_cache_entry_t *e);
+static void            mm_cache__evict_if_needed(mm_cache_t *c, uint64_t needed_bytes);
+
+/* ------------------------------------------------------------------ */
+/*  Public API                                                         */
+/* ------------------------------------------------------------------ */
+
+mm_cache_t *
+mm_cache_create(uint64_t cap_items,
+                uint64_t cap_bytes)
+{
+    if (cap_items == 0)  cap_items = MM_CACHE_DEFAULT_CAP_ITEMS;
+    if (cap_bytes == 0)  cap_bytes = MM_CACHE_DEFAULT_CAP_BYTES;
+
+    mm_cache_t *c = mm_calloc(1, sizeof(*c));
+    if (!c) return NULL;
+
+    c->cap_items = cap_items;
+    c->cap_bytes = cap_bytes;
+
+    c->ht_size    = mm_cache__next_prime((size_t)(cap_items * MM_CACHE_HASHTABLE_FACTOR));
+    c->ht_buckets = mm_calloc(c->ht_size, sizeof(*c->ht_buckets));
+    if (!c->ht_buckets) {
+        mm_free(c);
+        return NULL;
+    }
+
+    pthread_rwlock_init(&c->rwlock, NULL);
+
+    /* Register Prometheus metrics */
+    c->m_hits      = mm_metrics_counter_create("cache_hits_total",
+                                               "Counter of cache hits",
+                                               MM_CACHE_LOG_DOMAIN);
+    c->m_misses    = mm_metrics_counter_create("cache_misses_total",
+                                               "Counter of cache misses",
+                                               MM_CACHE_LOG_DOMAIN);
+    c->m_evictions = mm_metrics_counter_create("cache_evictions_total",
+                                               "Counter of cache evictions",
+                                               MM_CACHE_LOG_DOMAIN);
+
+    MM_LOG_INFO("response cache created: max_items=%"PRIu64", max_bytes=%"PRIu64,
+                c->cap_items, c->cap_bytes);
+    return c;
+}
+
+void
+mm_cache_destroy(mm_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    /* Free all entries */
+    for (size_t i = 0; i < c->ht_size; ++i) {
+        mm_cache_entry_t *e = c->ht_buckets[i];
+        while (e) {
+            mm_cache_entry_t *next = e->hash_next;
+            mm_free(e->key);
+            mm_free(e->blob);
+            mm_free(e);
+            e = next;
+        }
+    }
+    mm_free(c->ht_buckets);
+    pthread_rwlock_unlock(&c->rwlock);
+
+    pthread_rwlock_destroy(&c->rwlock);
+    mm_free(c);
+
+    MM_LOG_INFO("response cache destroyed");
+}
+
+/* Retrieve payload copy. Caller must free() out_blob when done. */
+bool
+mm_cache_get(mm_cache_t  *c,
+             const char  *key,
+             void       **out_blob,
+             size_t      *out_blob_sz)
+{
+    if (!c || !key) return false;
+
+    pthread_rwlock_rdlock(&c->rwlock);
+
+    size_t bucket = mm_cache__hash(key) % c->ht_size;
+    mm_cache_entry_t *e = c->ht_buckets[bucket];
+
+    while (e && strcmp(e->key, key) != 0)
+        e = e->hash_next;
+
+    bool hit = false;
+
+    if (e) {
+        /* Expired? */
+        time_t now = time(NULL);
+        if (e->expires_at && e->expires_at < now) {
+            pthread_rwlock_unlock(&c->rwlock);
+            /* Re-enter with write lock to delete expired entry */
+            pthread_rwlock_wrlock(&c->rwlock);
+            mm_cache__unlink_lru(c, e);
+
+            /* Remove from hash table */
+            mm_cache_entry_t **p = &c->ht_buckets[bucket];
+            while (*p && *p != e)
+                p = &(*p)->hash_next;
+            if (*p) *p = e->hash_next;
+
+            c->cur_items--;
+            c->cur_bytes -= e->blob_sz;
+
+            mm_free(e->key);
+            mm_free(e->blob);
+            mm_free(e);
+            pthread_rwlock_unlock(&c->rwlock);
+
+            mm_metrics_counter_inc(c->m_misses);
+            MM_LOG_DEBUG("cache expired miss: key=%s", key);
+            return false;
+        }
+
+        /* Hit: duplicate blob for caller */
+        void *dup = mm_malloc(e->blob_sz);
+        if (!dup) {
+            pthread_rwlock_unlock(&c->rwlock);
+            return false;
+        }
+
+        memcpy(dup, e->blob, e->blob_sz);
+        *out_blob    = dup;
+        *out_blob_sz = e->blob_sz;
+        hit = true;
+
+        /* Promote to front of LRU */
+        mm_cache__unlink_lru(c, e);
+        mm_cache__link_lru_front(c, e);
+    }
+
+    pthread_rwlock_unlock(&c->rwlock);
+
+    if (hit) {
+        mm_metrics_counter_inc(c->m_hits);
+        MM_LOG_DEBUG("cache hit: key=%s", key);
+    } else {
+        mm_metrics_counter_inc(c->m_misses);
+        MM_LOG_DEBUG("cache miss: key=%s", key);
+    }
+    return hit;
+}
+
+/* Insert or replace entry. blob is copied into cache. */
+bool
+mm_cache_put(mm_cache_t *c,
+             const char *key,
+             const void *blob,
+             size_t      blob_sz,
+             uint32_t    ttl_seconds)
+{
+    if (!c || !key || !blob || blob_sz == 0) return false;
+
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    /* Check if key already exists -> replace */
+    size_t bucket = mm_cache__hash(key) % c->ht_size;
+    mm_cache_entry_t *e = c->ht_buckets[bucket];
+    mm_cache_entry_t *prev = NULL;
+    while (e && strcmp(e->key, key) != 0) {
+        prev = e;
+        e = e->hash_next;
+    }
+
+    /* Pre-allocate before mutating state */
+    char *dup_key  = mm_strdup(key);
+    void *dup_blob = mm_malloc(blob_sz);
+
+    if (!dup_key || !dup_blob) {
+        mm_free(dup_key);
+        mm_free(dup_blob);
+        pthread_rwlock_unlock(&c->rwlock);
+        return false;
+    }
+    memcpy(dup_blob, blob, blob_sz);
+
+    /* If exists: adjust accounting & detach from structures */
+    if (e) {
+        mm_cache__unlink_lru(c, e);
+        if (prev)
+            prev->hash_next = e->hash_next;
+        else
+            c->ht_buckets[bucket] = e->hash_next;
+
+        c->cur_items--;
+        c->cur_bytes -= e->blob_sz;
+
+        mm_free(e->key);
+        mm_free(e->blob);
+        mm_free(e);
+    }
+
+    /* Evict until we fit */
+    mm_cache__evict_if_needed(c, blob_sz);
+
+    /* Allocate new entry */
+    mm_cache_entry_t *ne = mm_calloc(1, sizeof(*ne));
+    ne->key        = dup_key;
+    ne->blob       = dup_blob;
+    ne->blob_sz    = blob_sz;
+    ne->expires_at = ttl_seconds ? (time(NULL) + ttl_seconds) : 0;
+
+    /* Insert into hash table front */
+    ne->hash_next             = c->ht_buckets[bucket];
+    c->ht_buckets[bucket]     = ne;
+
+    /* Add to LRU */
+    mm_cache__link_lru_front(c, ne);
+
+    c->cur_items++;
+    c->cur_bytes += blob_sz;
+
+    pthread_rwlock_unlock(&c->rwlock);
+
+    MM_LOG_DEBUG("cache put: key=%s, ttl=%us", key, ttl_seconds);
+    return true;
+}
+
+void
+mm_cache_clear(mm_cache_t *c)
+{
+    if (!c) return;
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    /* Free all buckets */
+    for (size_t i = 0; i < c->ht_size; ++i) {
+        mm_cache_entry_t *e = c->ht_buckets[i];
+        while (e) {
+            mm_cache_entry_t *next = e->hash_next;
+            mm_free(e->key);
+            mm_free(e->blob);
+            mm_free(e);
+            e = next;
+        }
+        c->ht_buckets[i] = NULL;
+    }
+
+    c->cur_items = 0;
+    c->cur_bytes = 0;
+    c->lru_head  = c->lru_tail = NULL;
+
+    pthread_rwlock_unlock(&c->rwlock);
+    MM_LOG_INFO("cache cleared");
+}
+
+/* ------------------------------------------------------------------ */
+/*  Internal Helpers                                                   */
+/* ------------------------------------------------------------------ */
+
+static size_t
+mm_cache__next_prime(size_t n)
+{
+    /* Very small list of primes sufficient for default capacities */
+    static const size_t primes[] = {
+        53,   97,   193,   389,   769,  1543,  3079,  6151,
+        12289, 24593, 49157, 98317, 196613, 393241,
+        786433, 1572869, 3145739, 6291469, 12582917,
+        25165843, 50331653, 100663319, 201326611,
+        402653189, 805306457, 1610612741
+    };
+    for (size_t i = 0; i < sizeof(primes)/sizeof(primes[0]); ++i)
+        if (primes[i] >= n) return primes[i];
+    return primes[sizeof(primes)/sizeof(primes[0]) - 1];
+}
+
+static uint32_t
+mm_cache__hash(const char *str)
+{
+    /* Fowler–Noll–Vo hash variant */
+    uint32_t hash = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)str; *p; ++p) {
+        hash ^= *p;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static void
+mm_cache__unlink_lru(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    if (e->lru_prev)
+        e->lru_prev->lru_next = e->lru_next;
+    else
+        c->lru_head = e->lru_next;
+
+    if (e->lru_next)
+        e->lru_next->lru_prev = e->lru_prev;
+    else
+        c->lru_tail = e->lru_prev;
+
+    e->lru_prev = e->lru_next = NULL;
+}
+
+static void
+mm_cache__link_lru_front(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    e->lru_next = c->lru_head;
+    e->lru_prev = NULL;
+
+    if (c->lru_head)
+        c->lru_head->lru_prev = e;
+    c->lru_head = e;
+
+    if (!c->lru_tail)
+        c->lru_tail = e;
+}
+
+/* Evict in LRU order until enough room for new_bytes */
+static void
+mm_cache__evict_if_needed(mm_cache_t *c, uint64_t new_bytes)
+{
+    while ((c->cur_items >= c->cap_items) ||
+           (c->cur_bytes + new_bytes > c->cap_bytes))
+    {
+        mm_cache_entry_t *victim = c->lru_tail;
+        if (!victim) break; /* Should not happen */
+
+        mm_cache__unlink_lru(c, victim);
+
+        size_t bucket = mm_cache__hash(victim->key) % c->ht_size;
+        mm_cache_entry_t **p = &c->ht_buckets[bucket];
+        while (*p && *p != victim)
+            p = &(*p)->hash_next;
+        if (*p) *p = victim->hash_next;
+
+        c->cur_items--;
+        c->cur_bytes -= victim->blob_sz;
+
+        mm_free(victim->key);
+        mm_free(victim->blob);
+        mm_free(victim);
+
+        mm_metrics_counter_inc(c->m_evictions);
+        MM_LOG_DEBUG("cache evict: freed one entry (items=%"PRIu64", bytes=%"PRIu64")",
+                     c->cur_items, c->cur_bytes);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Optional – JSON admin snapshot                                     */
+/* ------------------------------------------------------------------ */
+#ifdef MM_CACHE_JSON_DIAGNOSTICS
+#include "cJSON.h"
+
+char *
+mm_cache_snapshot_json(mm_cache_t *c)
+{
+    if (!c) return NULL;
+    pthread_rwlock_rdlock(&c->rwlock);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "cap_items", (double)c->cap_items);
+    cJSON_AddNumberToObject(root, "cap_bytes", (double)c->cap_bytes);
+    cJSON_AddNumberToObject(root, "cur_items", (double)c->cur_items);
+    cJSON_AddNumberToObject(root, "cur_bytes", (double)c->cur_bytes);
+
+    /* Top-N (<=20) hottest keys */
+    cJSON *hot = cJSON_AddArrayToObject(root, "lru_head");
+    mm_cache_entry_t *e = c->lru_head;
+    for (int i = 0; e && i < 20; ++i, e = e->lru_next)
+        cJSON_AddItemToArray(hot, cJSON_CreateString(e->key));
+
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    pthread_rwlock_unlock(&c->rwlock);
+    return json_str; /* Caller free */
+}
+#endif /* MM_CACHE_JSON_DIAGNOSTICS */
+```

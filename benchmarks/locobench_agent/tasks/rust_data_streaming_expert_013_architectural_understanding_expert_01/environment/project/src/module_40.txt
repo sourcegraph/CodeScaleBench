@@ -1,0 +1,321 @@
+```rust
+// src/module_40.rs
+//
+// ChirpPulse: Real-Time Social Sentiment Lake
+// ------------------------------------------
+// Module 40 – Quality-Control Validator Service
+//
+// This micro-service consumes raw social-chatter events from Kafka,
+// applies configurable data-quality rules, and republishes the good
+// records to a clean topic while shunting bad ones to a DLQ.
+//
+// Build-time dependencies (add to Cargo.toml):
+// --------------------------------------------
+// tokio          = { version = "1", features = ["macros", "rt-multi-thread"] }
+// rdkafka        = { version = "0.36", features = ["tokio"] }
+// serde          = { version = "1", features = ["derive"] }
+// serde_json     = "1"
+// dotenvy        = "0.15"
+// futures        = "0.3"
+// log            = "0.4"
+// env_logger     = "0.10"
+//
+// ---------------------------------------------------------------
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::StreamExt;
+use log::{error, info, warn};
+use rdkafka::config::ClientConfig;
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::message::{BorrowedMessage, Message};
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use serde::Deserialize;
+use serde_json::Value;
+use tokio::sync::RwLock;
+use tokio::time::timeout;
+
+/// Convenience alias for dynamic error results.
+type DynResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+// ────────────────────────────────────────────────────────────────
+//  Data-quality rule infrastructure
+// ────────────────────────────────────────────────────────────────
+
+/// Trait implemented by every data-quality rule.
+///
+/// A rule is a cheap, stateless predicate that
+/// inspects an incoming JSON record.
+pub trait DataQualityRule: Send + Sync {
+    /// Return `true` if the record passes the rule.
+    fn validate(&self, record: &Value) -> bool;
+
+    /// Human-readable identifier for metrics/logs.
+    fn name(&self) -> &'static str;
+}
+
+/// Rule that ensures a field exists and is not null.
+pub struct RequiredFieldRule {
+    field: String,
+}
+
+impl RequiredFieldRule {
+    pub fn new(field: impl Into<String>) -> Self {
+        Self { field: field.into() }
+    }
+}
+
+impl DataQualityRule for RequiredFieldRule {
+    fn validate(&self, record: &Value) -> bool {
+        record.get(&self.field).map_or(false, |v| !v.is_null())
+    }
+
+    fn name(&self) -> &'static str {
+        "required_field"
+    }
+}
+
+/// Rule that enforces a numeric field is within a range.
+///
+/// Useful for scores (sentiment, toxicity, etc.).
+pub struct RangeRule {
+    field: String,
+    min: f64,
+    max: f64,
+}
+
+impl RangeRule {
+    pub fn new(field: impl Into<String>, min: f64, max: f64) -> Self {
+        Self {
+            field: field.into(),
+            min,
+            max,
+        }
+    }
+}
+
+impl DataQualityRule for RangeRule {
+    fn validate(&self, record: &Value) -> bool {
+        match record.get(&self.field).and_then(Value::as_f64) {
+            Some(v) => v >= self.min && v <= self.max,
+            None => false,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "range_rule"
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+//  Service configuration (serde-deserialisable)
+// ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ServiceConfig {
+    pub kafka_brokers: String,
+    pub input_topic: String,
+    pub output_topic: String,
+    pub dlq_topic: String,
+
+    #[serde(default = "default_consumer_group")]
+    pub consumer_group: String,
+
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+
+    #[serde(default = "default_commit_interval_ms")]
+    pub commit_interval_ms: u64,
+}
+
+fn default_consumer_group() -> String {
+    "chirp_pulse_quality_control".into()
+}
+fn default_batch_size() -> usize {
+    500
+}
+fn default_commit_interval_ms() -> u64 {
+    5_000
+}
+
+// ────────────────────────────────────────────────────────────────
+//  Worker implementation
+// ────────────────────────────────────────────────────────────────
+
+/// Core worker that owns the Kafka consumer / producer and rule set.
+pub struct QualityControlWorker {
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+    rules: Arc<Vec<Box<dyn DataQualityRule>>>,
+    cfg: ServiceConfig,
+}
+
+impl QualityControlWorker {
+    /// Construct a new worker and connect to Kafka.
+    pub async fn new(cfg: ServiceConfig) -> DynResult<Self> {
+        // ----- Consumer -----------------------------------------------------
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.kafka_brokers)
+            .set("group.id", &cfg.consumer_group)
+            .set("enable.partition.eof", "false")
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "latest")
+            .create()?;
+
+        consumer.subscribe(&[&cfg.input_topic])?;
+
+        // ----- Producer -----------------------------------------------------
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.kafka_brokers)
+            .create()?;
+
+        // ----- Default rules (can be hot-reloaded at runtime in future) -----
+        let rules: Vec<Box<dyn DataQualityRule>> = vec![
+            Box::new(RequiredFieldRule::new("id")),
+            Box::new(RequiredFieldRule::new("timestamp")),
+            Box::new(RangeRule::new("sentiment_score", -1.0, 1.0)),
+        ];
+
+        Ok(Self {
+            consumer,
+            producer,
+            rules: Arc::new(rules),
+            cfg,
+        })
+    }
+
+    /// Run the worker forever; automatically reconnects on fatal errors.
+    pub async fn run(&self) -> DynResult<()> {
+        let commit_interval = Duration::from_millis(self.cfg.commit_interval_ms);
+        let pending_offset = Arc::new(RwLock::new(None));
+
+        loop {
+            let mut stream = self.consumer.stream();
+
+            while let Some(result) = stream.next().await {
+                match result {
+                    Err(e) => {
+                        error!("Kafka error: {}", e);
+                        continue;
+                    }
+                    Ok(msg) => {
+                        // Validate + route message
+                        if let Err(e) = self.process_message(&msg).await {
+                            error!("Failed to process message: {}", e);
+                            self.forward_to_dlq(&msg).await?;
+                        }
+
+                        // Track latest offset
+                        {
+                            let mut guard = pending_offset.write().await;
+                            *guard = Some(msg.offset());
+                        }
+
+                        // Periodic async commit
+                        if let Ok(Some(offset)) =
+                            timeout(commit_interval, pending_offset.read()).await
+                        {
+                            self.consumer.commit_message(&msg, CommitMode::Async)?;
+                            info!("Committed offset: {}", offset);
+                        }
+                    }
+                }
+            }
+
+            // If stream closed, attempt recovery
+            warn!("Kafka stream ended. Re-subscribing after 2 s …");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            self.consumer.subscribe(&[&self.cfg.input_topic])?;
+        }
+    }
+
+    /// Apply rules and forward to appropriate topic.
+    async fn process_message(&self, msg: &BorrowedMessage<'_>) -> DynResult<()> {
+        let payload = msg.payload().ok_or("empty payload")?;
+        let json: Value = serde_json::from_slice(payload)?;
+
+        // Evaluate all rules
+        for rule in self.rules.iter() {
+            if !rule.validate(&json) {
+                warn!(
+                    "Record failed rule {} (key = {:?})",
+                    rule.name(),
+                    msg.key().map(String::from_utf8_lossy)
+                );
+                return self.forward_to_dlq(msg).await;
+            }
+        }
+
+        // All good → publish to clean topic
+        self.forward_to_output(&json, msg.key()).await
+    }
+
+    async fn forward_to_output(&self, json: &Value, key: Option<&[u8]>) -> DynResult<()> {
+        let record = FutureRecord::to(&self.cfg.output_topic)
+            .key_bytes(key.unwrap_or_default())
+            .payload(&serde_json::to_vec(json)?);
+
+        self.producer
+            .send(record, Duration::from_secs(0))
+            .await
+            .map_err(|(e, _)| e)?;
+
+        Ok(())
+    }
+
+    async fn forward_to_dlq(&self, msg: &BorrowedMessage<'_>) -> DynResult<()> {
+        let record = FutureRecord::to(&self.cfg.dlq_topic)
+            .key_bytes(msg.key().unwrap_or_default())
+            .payload(msg.payload().unwrap_or_default());
+
+        self.producer
+            .send(record, Duration::from_secs(0))
+            .await
+            .map_err(|(e, _)| e)?;
+
+        Ok(())
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+//  Binary entry-point
+// ────────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() -> DynResult<()> {
+    // Load .env (optional)
+    dotenvy::dotenv().ok();
+    env_logger::init();
+
+    // Compose configuration from env vars with sane defaults
+    let cfg = ServiceConfig {
+        kafka_brokers: std::env::var("KAFKA_BROKERS")
+            .unwrap_or_else(|_| "127.0.0.1:9092".into()),
+        input_topic: std::env::var("INPUT_TOPIC").unwrap_or_else(|_| "social_raw".into()),
+        output_topic: std::env::var("OUTPUT_TOPIC").unwrap_or_else(|_| "social_clean".into()),
+        dlq_topic: std::env::var("DLQ_TOPIC").unwrap_or_else(|_| "social_dlq".into()),
+        consumer_group: std::env::var("CONSUMER_GROUP")
+            .unwrap_or_else(|_| default_consumer_group()),
+        batch_size: std::env::var("BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_batch_size),
+        commit_interval_ms: std::env::var("COMMIT_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_commit_interval_ms),
+    };
+
+    info!("Launching quality-control worker with config: {:?}", cfg);
+    let worker = QualityControlWorker::new(cfg).await?;
+
+    // If the worker crashes we exit; Kubernetes (or systemd) should restart it.
+    if let Err(e) = worker.run().await {
+        error!("Worker terminated with error: {:?}", e);
+    }
+
+    Ok(())
+}
+```

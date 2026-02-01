@@ -1,0 +1,453 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * --------------------------------------
+ * Module 52  : response_cache
+ * File       : src/module_52.txt   (compiled as C source)
+ *
+ * High-performance in-memory HTTP response cache with LRU eviction, TTL support,
+ * structured logging, and Prometheus-compatible metrics export.
+ *
+ * The cache is designed to be shared across REST / GraphQL endpoints inside the
+ * monolith and is 100 % thread-safe (single global mutex for simplicity; can be
+ * replaced with sharding or read-write locks if contention becomes measurable).
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+#define _GNU_SOURCE  /* clock_gettime, asprintf */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <errno.h>
+
+#include "uthash.h"        /* Single-header hash map: https://troydhanson.github.io/uthash/ */
+
+/* ------------------------------------------------------------
+ * Compatibility shim for logging; falls back to stderr if the
+ * project-wide logger header is not available at build time.
+ * ------------------------------------------------------------ */
+#ifdef HAVE_MM_LOGGER
+#   include "mm_logger.h"
+#else
+#   define MM_LOG_LEVEL_INFO  "INFO"
+#   define MM_LOG_LEVEL_WARN  "WARN"
+#   define MM_LOG_LEVEL_ERR   "ERROR"
+#   define MM_LOG(_lvl_, _fmt_, ...) \
+        fprintf(stderr,"[%s] %s:%d: " _fmt_ "\n",_lvl_,__FILE__,__LINE__,##__VA_ARGS__)
+#   define mm_log_info(...)   MM_LOG(MM_LOG_LEVEL_INFO, __VA_ARGS__)
+#   define mm_log_warn(...)   MM_LOG(MM_LOG_LEVEL_WARN, __VA_ARGS__)
+#   define mm_log_error(...)  MM_LOG(MM_LOG_LEVEL_ERR, __VA_ARGS__)
+#endif /* HAVE_MM_LOGGER */
+
+/* ------------------------------------------------------------
+ * Public API
+ * ------------------------------------------------------------ */
+#ifndef RESPONSE_CACHE_H
+#define RESPONSE_CACHE_H
+
+typedef struct response_cache response_cache_t;
+
+/* Create cache with a maximum number of live entries and a default TTL (sec). */
+response_cache_t *rcache_create(size_t max_entries, uint32_t default_ttl_sec);
+
+/* Destroy cache and release all resources. */
+void rcache_destroy(response_cache_t *cache);
+
+/* Insert or replace a cached object.
+ * ttl_sec == 0  → use cache default.
+ * Returns 0 on success, -errno on failure.
+ */
+int  rcache_put(response_cache_t *cache,
+                const char       *key,
+                const void       *payload,
+                size_t            payload_size,
+                uint32_t          ttl_sec);
+
+/* Retrieve a cached object. Caller owns returned buffer (malloc'ed). 
+ * NULL on miss or expired entry. */
+void *rcache_get(response_cache_t *cache,
+                 const char       *key,
+                 size_t           *out_size);
+
+/* Remove entry if present. Returns 1 if removed, 0 if not found. */
+int  rcache_invalidate(response_cache_t *cache, const char *key);
+
+/* Export Prometheus-formatted metrics to open FILE*. */
+void rcache_export_metrics(response_cache_t *cache, FILE *out);
+
+#endif /* RESPONSE_CACHE_H */
+
+/* ------------------------------------------------------------
+ * Implementation
+ * ------------------------------------------------------------ */
+
+struct cache_entry {
+    char               *key;        /* hashed key (heap)           */
+    uint8_t            *data;       /* response payload (heap)     */
+    size_t              size;       /* payload size                */
+    struct timespec     expires_at; /* absolute expiry time        */
+
+    struct cache_entry *prev;       /* LRU double-linked list      */
+    struct cache_entry *next;
+
+    UT_hash_handle      hh;         /* uthash handle               */
+};
+
+struct response_cache {
+    struct cache_entry *table;      /* uthash hash table           */
+    struct cache_entry *lru_head;   /* most recent                 */
+    struct cache_entry *lru_tail;   /* least recent                */
+    size_t              max_entries;
+    size_t              cur_entries;
+    uint32_t            default_ttl;
+
+    pthread_mutex_t     mtx;        /* single cache lock           */
+
+    /* Prometheus metrics (atomic for lock-free reads) */
+    atomic_uint_fast64_t metric_hits;
+    atomic_uint_fast64_t metric_misses;
+    atomic_uint_fast64_t metric_evictions;
+};
+
+/* --------------------------------------
+ * Time helpers
+ * -------------------------------------- */
+static inline struct timespec
+ts_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ts;
+}
+
+static inline struct timespec
+ts_add_sec(struct timespec ts, uint32_t sec)
+{
+    ts.tv_sec += sec;
+    return ts;
+}
+
+static inline int
+ts_is_expired(struct timespec now, struct timespec expires_at)
+{
+    return (now.tv_sec >  expires_at.tv_sec) ||
+           (now.tv_sec == expires_at.tv_sec &&
+            now.tv_nsec >= expires_at.tv_nsec);
+}
+
+/* --------------------------------------
+ * LRU helpers
+ * -------------------------------------- */
+static inline void
+lru_move_to_front(response_cache_t *c, struct cache_entry *e)
+{
+    if (c->lru_head == e) return;            /* Already in front */
+
+    /* Detach */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    /* Insert front */
+    e->prev       = NULL;
+    e->next       = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head   = e;
+    if (!c->lru_tail) c->lru_tail = e;       /* First entry */
+}
+
+static void
+lru_evict_tail(response_cache_t *c)
+{
+    struct cache_entry *victim = c->lru_tail;
+    if (!victim) return;
+
+    /* Detach from list */
+    if (victim->prev) victim->prev->next = NULL;
+    c->lru_tail = victim->prev;
+    if (c->lru_head == victim) c->lru_head = NULL;
+
+    /* Remove from hash */
+    HASH_DEL(c->table, victim);
+
+    /* Metrics */
+    atomic_fetch_add_explicit(&c->metric_evictions, 1, memory_order_relaxed);
+
+    /* Free memory */
+    free(victim->key);
+    free(victim->data);
+    free(victim);
+    --c->cur_entries;
+}
+
+/* --------------------------------------
+ * Cache core
+ * -------------------------------------- */
+response_cache_t *
+rcache_create(size_t max_entries, uint32_t default_ttl_sec)
+{
+    if (max_entries == 0)     { errno = EINVAL; return NULL; }
+
+    response_cache_t *c = calloc(1, sizeof(*c));
+    if (!c) return NULL;
+
+    c->max_entries  = max_entries;
+    c->default_ttl  = default_ttl_sec ? default_ttl_sec : 60; /* fallback */
+    pthread_mutex_init(&c->mtx, NULL);
+    return c;
+}
+
+/* -- internal helper ------------------------------------------------------- */
+static int
+internal_put_locked(response_cache_t *c,
+                    const char       *key,
+                    const void       *payload,
+                    size_t            payload_size,
+                    uint32_t          ttl_sec)
+{
+    struct cache_entry *e = NULL;
+    HASH_FIND_STR(c->table, key, e);
+
+    if (e) {
+        /* Replace existing entry */
+        free(e->data);
+
+        e->data   = malloc(payload_size);
+        if (!e->data) return -ENOMEM;
+        memcpy(e->data, payload, payload_size);
+        e->size   = payload_size;
+        e->expires_at = ts_add_sec(ts_now(), ttl_sec ? ttl_sec : c->default_ttl);
+
+        lru_move_to_front(c, e);
+        return 0;
+    }
+
+    /* Insert new */
+    if (c->cur_entries >= c->max_entries) {
+        lru_evict_tail(c);
+    }
+
+    e = calloc(1, sizeof(*e));
+    if (!e) return -ENOMEM;
+
+    e->key  = strdup(key);
+    if (!e->key) { free(e); return -ENOMEM; }
+
+    e->data = malloc(payload_size);
+    if (!e->data) { free(e->key); free(e); return -ENOMEM; }
+    memcpy(e->data, payload, payload_size);
+    e->size = payload_size;
+    e->expires_at = ts_add_sec(ts_now(), ttl_sec ? ttl_sec : c->default_ttl);
+
+    /* Add to hash & LRU */
+    HASH_ADD_KEYPTR(hh, c->table, e->key, strlen(e->key), e);
+    lru_move_to_front(c, e);
+
+    ++c->cur_entries;
+    return 0;
+}
+
+int
+rcache_put(response_cache_t *cache,
+           const char       *key,
+           const void       *payload,
+           size_t            payload_size,
+           uint32_t          ttl_sec)
+{
+    if (!cache || !key || !payload || payload_size == 0) {
+        return -EINVAL;
+    }
+
+    int rc;
+    pthread_mutex_lock(&cache->mtx);
+    rc = internal_put_locked(cache, key, payload, payload_size, ttl_sec);
+    pthread_mutex_unlock(&cache->mtx);
+
+    if (rc == 0) {
+        mm_log_info("RCACHE PUT key=%s size=%zu ttl=%u", key, payload_size,
+                    ttl_sec ? ttl_sec : cache->default_ttl);
+    } else {
+        mm_log_error("RCACHE PUT failed key=%s err=%d", key, rc);
+    }
+    return rc;
+}
+
+void *
+rcache_get(response_cache_t *cache,
+           const char       *key,
+           size_t           *out_size)
+{
+    if (!cache || !key) return NULL;
+
+    void *ret_data = NULL;
+    size_t ret_size = 0;
+    struct cache_entry *e = NULL;
+
+    pthread_mutex_lock(&cache->mtx);
+    HASH_FIND_STR(cache->table, key, e);
+    if (!e) {
+        pthread_mutex_unlock(&cache->mtx);
+        atomic_fetch_add_explicit(&cache->metric_misses, 1, memory_order_relaxed);
+        return NULL; /* MISS */
+    }
+
+    struct timespec now = ts_now();
+    if (ts_is_expired(now, e->expires_at)) {
+        /* Remove expired entry */
+        mm_log_info("RCACHE EXPIRED key=%s", key);
+        HASH_DEL(cache->table, e);
+        /* unlink from LRU */
+        if (e->prev) e->prev->next = e->next;
+        if (e->next) e->next->prev = e->prev;
+        if (cache->lru_head == e) cache->lru_head = e->next;
+        if (cache->lru_tail == e) cache->lru_tail = e->prev;
+        --cache->cur_entries;
+
+        free(e->key);
+        free(e->data);
+        free(e);
+
+        pthread_mutex_unlock(&cache->mtx);
+        atomic_fetch_add_explicit(&cache->metric_misses, 1, memory_order_relaxed);
+        return NULL;
+    }
+
+    /* HIT: copy payload so we can release lock */
+    ret_data = malloc(e->size);
+    if (ret_data) {
+        memcpy(ret_data, e->data, e->size);
+        ret_size = e->size;
+    }
+
+    lru_move_to_front(cache, e);
+    pthread_mutex_unlock(&cache->mtx);
+
+    if (ret_data) {
+        atomic_fetch_add_explicit(&cache->metric_hits, 1, memory_order_relaxed);
+    } else {
+        atomic_fetch_add_explicit(&cache->metric_misses, 1, memory_order_relaxed);
+    }
+
+    if (out_size) *out_size = ret_size;
+    return ret_data;
+}
+
+int
+rcache_invalidate(response_cache_t *cache, const char *key)
+{
+    if (!cache || !key) return 0;
+
+    int removed = 0;
+    pthread_mutex_lock(&cache->mtx);
+    struct cache_entry *e = NULL;
+    HASH_FIND_STR(cache->table, key, e);
+    if (e) {
+        HASH_DEL(cache->table, e);
+        if (e->prev) e->prev->next = e->next;
+        if (e->next) e->next->prev = e->prev;
+        if (cache->lru_head == e) cache->lru_head = e->next;
+        if (cache->lru_tail == e) cache->lru_tail = e->prev;
+        --cache->cur_entries;
+
+        free(e->key);
+        free(e->data);
+        free(e);
+        removed = 1;
+    }
+    pthread_mutex_unlock(&cache->mtx);
+
+    if (removed) mm_log_info("RCACHE INVALIDATED key=%s", key);
+    return removed;
+}
+
+void
+rcache_destroy(response_cache_t *cache)
+{
+    if (!cache) return;
+    pthread_mutex_lock(&cache->mtx);
+    struct cache_entry *e, *tmp;
+    HASH_ITER(hh, cache->table, e, tmp) {
+        HASH_DEL(cache->table, e);
+        free(e->key);
+        free(e->data);
+        free(e);
+    }
+    pthread_mutex_unlock(&cache->mtx);
+    pthread_mutex_destroy(&cache->mtx);
+    free(cache);
+}
+
+/* --------------------------------------
+ * Prometheus metrics export
+ * -------------------------------------- */
+void
+rcache_export_metrics(response_cache_t *cache, FILE *out)
+{
+    if (!cache || !out) return;
+
+    uint64_t hits      = atomic_load_explicit(&cache->metric_hits, memory_order_relaxed);
+    uint64_t misses    = atomic_load_explicit(&cache->metric_misses, memory_order_relaxed);
+    uint64_t evictions = atomic_load_explicit(&cache->metric_evictions, memory_order_relaxed);
+
+    fprintf(out, "# HELP rcache_hits_total Total number of cache hits\n");
+    fprintf(out, "# TYPE rcache_hits_total counter\n");
+    fprintf(out, "rcache_hits_total %" PRIu64 "\n", hits);
+
+    fprintf(out, "# HELP rcache_misses_total Total number of cache misses\n");
+    fprintf(out, "# TYPE rcache_misses_total counter\n");
+    fprintf(out, "rcache_misses_total %" PRIu64 "\n", misses);
+
+    fprintf(out, "# HELP rcache_evictions_total Total number of evictions\n");
+    fprintf(out, "# TYPE rcache_evictions_total counter\n");
+    fprintf(out, "rcache_evictions_total %" PRIu64 "\n", evictions);
+
+    fprintf(out, "# HELP rcache_entries Current number of cached objects\n");
+    fprintf(out, "# TYPE rcache_entries gauge\n");
+
+    pthread_mutex_lock(&cache->mtx);
+    fprintf(out, "rcache_entries %zu\n", cache->cur_entries);
+    pthread_mutex_unlock(&cache->mtx);
+}
+
+/* ------------------------------------------------------------
+ * Unit test (can be disabled by defining NDEBUG or building
+ * without -DUNIT_TEST).
+ * ------------------------------------------------------------ */
+#ifdef UNIT_TEST
+#include <assert.h>
+
+static void
+basic_test(void)
+{
+    response_cache_t *c = rcache_create(2, 1); /* TTL 1 second */
+    assert(c);
+
+    const char *key1 = "GET:/hello";
+    const char *val1 = "world";
+
+    assert(rcache_put(c, key1, val1, strlen(val1)+1, 0) == 0);
+
+    size_t sz;
+    char *got = rcache_get(c, key1, &sz);
+    assert(got && strcmp(got, val1) == 0);
+    free(got);
+
+    /* Wait for expiry */
+    sleep(2);
+    got = rcache_get(c, key1, &sz);
+    assert(got == NULL);
+
+    rcache_destroy(c);
+    puts("rcache basic_test passed.");
+}
+
+int main(void)
+{
+    basic_test();
+    return 0;
+}
+#endif /* UNIT_TEST */

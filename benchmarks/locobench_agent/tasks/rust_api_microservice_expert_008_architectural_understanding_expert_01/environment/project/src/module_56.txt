@@ -1,0 +1,359 @@
+```rust
+//! src/module_56.rs
+//! --------------------------------------------------------------
+//! LedgerLink Nexus – Ledger Entry Query Pipeline
+//!
+//! This module wires together request validation, pagination,
+//! repository‐backed querying and a Redis read-through cache for the
+//! “/v1/ledger/entries” endpoint family.
+//!
+//! Production-grade concerns addressed in this file
+//!   - Input validation (validator)
+//!   - Transparent, versioned cache envelopes (Redis, SHA-256 keys)
+//!   - Repository pattern abstraction (async, sqlx compatible)
+//!   - Structured logging / tracing spans
+//!   - Robust error envelopes convertible to Actix‐Web responses
+//!
+//! --------------------------------------------------------------
+
+#![allow(clippy::module_name_repetitions)]
+
+use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, Utc};
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{collections::HashMap, sync::Arc};
+use thiserror::Error;
+use tracing::{debug, instrument, warn};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+// ================ Domain Model ===============================================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub account_id: Uuid,
+    pub booked_date: NaiveDate,
+    pub amount_cents: i64,
+    pub currency: String,
+}
+
+// ================ Input DTO (View-Model) =====================================
+
+/// Incoming query params for GET /v1/ledger/entries
+#[derive(Debug, Deserialize, Validate)]
+pub struct LedgerEntriesQueryDTO {
+    #[validate(range(min = 1, max = 500))]
+    pub page_size: Option<u32>,
+
+    /// Opaque pagination cursor
+    pub page_token: Option<String>,
+
+    /// RFC 3339 datetimes; both must be provided together or omitted.
+    #[validate(custom = "validate_date_range")]
+    pub date_from: Option<DateTime<Utc>>,
+    pub date_to: Option<DateTime<Utc>>,
+}
+
+fn validate_date_range(dto: &Option<DateTime<Utc>>) -> Result<(), ValidationError> {
+    // The validator crate only lets us validate a single field at a time,
+    // hence we return Ok(()) and cross-field validation is done in `validate`.
+    let _ = dto;
+    Ok(())
+}
+
+impl Validate for LedgerEntriesQueryDTO {
+    fn validate(&self) -> Result<(), validator::ValidationErrors> {
+        let mut errors = validator::ValidationErrors::new();
+
+        // leverage derive-generated validations first
+        if let Err(e) = <Self as Validate>::validate_derive(self) {
+            errors = e;
+        }
+
+        match (&self.date_from, &self.date_to) {
+            (Some(from), Some(to)) if from > to => {
+                let mut err = ValidationError::new("date_from_must_precede_date_to");
+                err.add_param("date_from".into(), &from.to_string());
+                err.add_param("date_to".into(), &to.to_string());
+                errors.add("date_from", err);
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                let err = ValidationError::new("date_range_incomplete");
+                errors.add("date_from", err.clone());
+                errors.add("date_to", err);
+            }
+            _ => {}
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+// ================ Pagination Envelope ========================================
+
+#[derive(Debug, Serialize)]
+pub struct Paginated<T> {
+    pub items: Vec<T>,
+    pub next_page_token: Option<String>,
+}
+
+// ================ Errors =====================================================
+
+#[derive(Debug, Error)]
+pub enum QueryError {
+    #[error("Validation failed: {0}")]
+    Validation(#[from] validator::ValidationErrors),
+
+    #[error("Persistence error: {0}")]
+    Repository(#[from] RepositoryError),
+
+    #[error("Cache error: {0}")]
+    Cache(#[from] redis::RedisError),
+}
+
+impl actix_web::ResponseError for QueryError {
+    fn error_response(&self) -> actix_web::HttpResponse {
+        use actix_web::{http::StatusCode, HttpResponse};
+        match self {
+            QueryError::Validation(e) => HttpResponse::build(StatusCode::BAD_REQUEST)
+                .json(&serde_json::json!({ "error": e.to_string() })),
+            QueryError::Repository(_) | QueryError::Cache(_) => {
+                HttpResponse::InternalServerError().finish()
+            }
+        }
+    }
+}
+
+// ================ Repository Abstraction =====================================
+
+#[derive(Debug, Error)]
+#[error("Repository failure: {0}")]
+pub struct RepositoryError(pub String);
+
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    async fn fetch_entries(
+        &self,
+        tenant_id: Uuid,
+        filters: LedgerEntriesQueryFilters,
+    ) -> Result<(Vec<LedgerEntry>, Option<String>), RepositoryError>;
+}
+
+/// Extracted filter struct to decouple repo from DTO
+#[derive(Debug, Clone)]
+pub struct LedgerEntriesQueryFilters {
+    pub page_size: u32,
+    pub page_token: Option<String>,
+    pub date_from: Option<DateTime<Utc>>,
+    pub date_to: Option<DateTime<Utc>>,
+}
+
+// ================ Query Service with Cache ===================================
+
+pub struct LedgerEntryQueryService<R> {
+    repository: Arc<R>,
+    redis: redis::Client,
+    cache_ttl_secs: usize,
+}
+
+impl<R> LedgerEntryQueryService<R>
+where
+    R: LedgerEntryRepository + 'static,
+{
+    pub fn new(repository: Arc<R>, redis: redis::Client, cache_ttl_secs: usize) -> Self {
+        Self {
+            repository,
+            redis,
+            cache_ttl_secs,
+        }
+    }
+
+    /// High-level entry point called by Actix handlers
+    #[instrument(skip(self, tenant_id, query_dto))]
+    pub async fn get_entries(
+        &self,
+        tenant_id: Uuid,
+        query_dto: LedgerEntriesQueryDTO,
+    ) -> Result<Paginated<LedgerEntry>, QueryError> {
+        query_dto.validate()?; // step 1 ‑ validation
+
+        let filters = LedgerEntriesQueryFilters {
+            page_size: query_dto.page_size.unwrap_or(100),
+            page_token: query_dto.page_token.clone(),
+            date_from: query_dto.date_from,
+            date_to: query_dto.date_to,
+        };
+
+        let cache_key = Self::derive_cache_key(tenant_id, &filters);
+
+        // step 2 ‑ attempt read-through cache
+        if let Ok(Some(cached)) = self.fetch_from_cache::<Paginated<LedgerEntry>>(&cache_key).await
+        {
+            debug!(%tenant_id, "hit ledger_entry cache");
+            return Ok(cached);
+        }
+
+        // step 3 ‑ fallthrough to repository
+        let (items, next_token) = self.repository.fetch_entries(tenant_id, filters.clone()).await?;
+        let envelope = Paginated {
+            items: items.clone(),
+            next_page_token: next_token,
+        };
+
+        // step 4 ‑ store in cache (fire and forget)
+        let redis_clone = self.redis.clone();
+        let envelope_clone = envelope.clone();
+        let ttl = self.cache_ttl_secs;
+        tokio::spawn(async move {
+            if let Err(e) = store_in_cache(redis_clone, cache_key, &envelope_clone, ttl).await {
+                warn!("redis store_in_cache failed: {:?}", e);
+            }
+        });
+
+        Ok(envelope)
+    }
+
+    // -------------------- Helpers ------------------------------------------
+
+    fn derive_cache_key(tenant_id: Uuid, filters: &LedgerEntriesQueryFilters) -> String {
+        // Stable key based on SHA‐256 of serialized filters
+        let mut hasher = Sha256::new();
+        hasher.update(tenant_id.as_bytes());
+
+        let mut map = HashMap::new();
+        map.insert("page_size", filters.page_size.to_string());
+        if let Some(token) = &filters.page_token {
+            map.insert("page_token", token.clone());
+        }
+        if let Some(from) = filters.date_from {
+            map.insert("date_from", from.to_rfc3339());
+        }
+        if let Some(to) = filters.date_to {
+            map.insert("date_to", to.to_rfc3339());
+        }
+        hasher.update(serde_json::to_vec(&map).expect("map serialize"));
+
+        format!("ledger_entry:{}:{}", tenant_id, hex::encode(hasher.finalize()))
+    }
+
+    async fn fetch_from_cache<T>(&self, key: &str) -> redis::RedisResult<Option<T>>
+    where
+        for<'de> T: Deserialize<'de>,
+    {
+        let mut conn = self.redis.get_async_connection().await?;
+        let value: Option<Vec<u8>> = conn.get(key).await?;
+        match value {
+            Some(buf) => Ok(Some(bincode::deserialize(&buf).map_err(|e| {
+                redis::RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "deser",
+                    format!("{e:?}"),
+                ))
+            })?)),
+            None => Ok(None),
+        }
+    }
+}
+
+// Fire-and-forget helper stored in its own task
+#[instrument(skip(client, payload))]
+async fn store_in_cache<T>(
+    client: redis::Client,
+    key: String,
+    payload: &T,
+    ttl_secs: usize,
+) -> redis::RedisResult<()>
+where
+    T: Serialize,
+{
+    let mut conn = client.get_async_connection().await?;
+    let buf = bincode::serialize(payload).map_err(|e| {
+        redis::RedisError::from((
+            redis::ErrorKind::TypeError,
+            "ser",
+            format!("{e:?}"),
+        ))
+    })?;
+    conn.set_ex(key, buf, ttl_secs).await?;
+    Ok(())
+}
+
+// ================ Placeholder Repository Implementation ======================
+//! NOTE: In production this would live in another crate (e.g. nexus_persistence)
+
+pub struct PostgresLedgerEntryRepository {
+    pool: sqlx::PgPool,
+}
+
+impl PostgresLedgerEntryRepository {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for PostgresLedgerEntryRepository {
+    #[instrument(skip(self, tenant_id, filters))]
+    async fn fetch_entries(
+        &self,
+        tenant_id: Uuid,
+        filters: LedgerEntriesQueryFilters,
+    ) -> Result<(Vec<LedgerEntry>, Option<String>), RepositoryError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| RepositoryError(e.to_string()))?;
+
+        // Simplified example ‑ production code would handle page_token as cursor
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, tenant_id, account_id, booked_date, amount_cents, currency
+            FROM ledger_entries
+            WHERE tenant_id = $1
+              AND ($2::timestamptz IS NULL OR booked_date >= $2)
+              AND ($3::timestamptz IS NULL OR booked_date <= $3)
+            ORDER BY booked_date DESC, id
+            LIMIT $4
+            "#,
+            tenant_id,
+            filters.date_from,
+            filters.date_to,
+            filters.page_size as i64,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| RepositoryError(e.to_string()))?;
+
+        let items: Vec<LedgerEntry> = rows
+            .into_iter()
+            .map(|r| LedgerEntry {
+                id: r.id,
+                tenant_id: r.tenant_id,
+                account_id: r.account_id,
+                booked_date: r.booked_date.date_naive(),
+                amount_cents: r.amount_cents,
+                currency: r.currency,
+            })
+            .collect();
+
+        // For simplicity we compute next_page_token as last id; real code would
+        // use stable cursors.
+        let next_token = items.last().map(|e| e.id.to_string());
+
+        Ok((items, next_token))
+    }
+}
+```

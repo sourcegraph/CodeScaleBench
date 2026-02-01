@@ -1,0 +1,338 @@
+```rust
+//! Integration tests for utility components that power ChirpPulse’s
+//! streaming/analytics internals.  Although these helpers live in
+//! `chirp_pulse::utils`, re-implementations are provided here so the
+//! tests are completely self-contained and compile in isolation.  In the
+//! real project you would `use chirp_pulse::utils::*` instead.
+//!
+//! The utilities covered:
+//! 1. WeightedMovingAverage – constant-time sliding window average
+//! 2. RateLimitedExecutor     – client-side rate-limiter for burst control
+//! 3. retry_async             – exponential back-off with jitter
+//!
+//! The tests exercise determinism, concurrency safety, and boundary
+//! conditions (overflow, zero-division, etc.).
+
+use anyhow::{anyhow, bail, Result};
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use tokio::{
+    sync::Semaphore,
+    task::JoinHandle,
+    time::{sleep, timeout},
+};
+
+/// ------------------------------------------------------------------------------------------------
+/// WeightedMovingAverage
+/// ------------------------------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct WeightedMovingAverage {
+    /// Maximum number of samples to include in the window
+    window: usize,
+    /// (value, weight) pairs in order of insertion
+    values: VecDeque<(f64, f64)>,
+    /// Cached sum(value * weight) for O(1) updates
+    sum_weighted: f64,
+    /// Cached sum(weight) for O(1) updates
+    sum_weights: f64,
+}
+
+impl WeightedMovingAverage {
+    fn new(window: usize) -> Self {
+        assert!(window > 0, "window must be greater than zero");
+        Self {
+            window,
+            values: VecDeque::with_capacity(window),
+            sum_weighted: 0.0,
+            sum_weights: 0.0,
+        }
+    }
+
+    /// Inserts a (value, weight) pair into the window.  If the window is
+    /// full, the oldest entry is evicted.
+    fn insert(&mut self, value: f64, weight: f64) {
+        if weight <= 0.0 {
+            // We tolerate zero‐weight samples (ignored) but negative
+            // weights would break the math.
+            panic!("weight must be positive");
+        }
+
+        // Push new sample
+        self.values.push_back((value, weight));
+        self.sum_weighted += value * weight;
+        self.sum_weights += weight;
+
+        // Evict if over capacity
+        if self.values.len() > self.window {
+            if let Some((old_val, old_w)) = self.values.pop_front() {
+                self.sum_weighted -= old_val * old_w;
+                self.sum_weights -= old_w;
+            }
+        }
+    }
+
+    fn average(&self) -> Option<f64> {
+        if self.sum_weights == 0.0 {
+            None
+        } else {
+            Some(self.sum_weighted / self.sum_weights)
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// RateLimitedExecutor
+/// ------------------------------------------------------------------------------------------------
+
+/// A simple, thread-safe token bucket that allows `capacity` “permits”
+/// every `interval`.  Tasks acquire a permit before running; if none are
+/// available they wait until the next refill.
+#[derive(Debug)]
+struct RateLimitedExecutor {
+    capacity: usize,
+    interval: Duration,
+    /// Timestamps of used permits; size <= capacity
+    permits: Mutex<VecDeque<Instant>>,
+}
+
+impl RateLimitedExecutor {
+    fn new(capacity: usize, interval: Duration) -> Self {
+        assert!(capacity > 0, "capacity must be > 0");
+        Self {
+            capacity,
+            interval,
+            permits: Mutex::new(VecDeque::with_capacity(capacity)),
+        }
+    }
+
+    /// Runs the future once a permit is available.  The executor itself
+    /// does not spawn; callers may `tokio::spawn` if needed.
+    async fn execute<F, T>(&self, fut: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        loop {
+            let mut guard = self.permits.lock().unwrap();
+
+            // Remove expired permits
+            let now = Instant::now();
+            while let Some(&front) = guard.front() {
+                if now.duration_since(front) >= self.interval {
+                    guard.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            if guard.len() < self.capacity {
+                // Acquire token
+                guard.push_back(now);
+                drop(guard);
+                break fut.await;
+            }
+
+            // No permits.  Figure out when the next one expires.
+            let wait_for = self
+                .interval
+                .checked_sub(now.duration_since(*guard.front().unwrap()))
+                .unwrap_or(Duration::from_millis(1));
+
+            drop(guard); // Release lock before sleeping
+            sleep(wait_for).await;
+        }
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// retry_async – exponential back-off with jitter
+/// ------------------------------------------------------------------------------------------------
+
+/// Configuration options for `retry_async`.
+#[derive(Clone, Copy, Debug)]
+struct RetryConfig {
+    max_retries: usize,
+    base_delay: Duration,
+    max_delay: Duration,
+}
+
+/// Retries an async operation until it succeeds (Ok) or the max retry
+/// count is reached.  Uses decorrelated jitter to avoid thundering herd.
+async fn retry_async<F, Fut, T>(cfg: RetryConfig, mut factory: F) -> Result<T>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 0;
+    let rng_seed = 0xDEADBEEF; // deterministic for tests
+    let mut rng = StdRng::seed_from_u64(rng_seed);
+
+    loop {
+        match factory(attempt).await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < cfg.max_retries => {
+                attempt += 1;
+
+                // decorrelated jitter algorithm
+                let exp_delay = cfg.base_delay * (1u32 << attempt as u32);
+                let upper = std::cmp::min(exp_delay, cfg.max_delay);
+                let sleep_for = Duration::from_millis(rng.gen_range(
+                    cfg.base_delay.as_millis() as u64,
+                    upper.as_millis() as u64 + 1,
+                ));
+                sleep(sleep_for).await;
+
+                // Continue retrying
+                tracing::warn!(
+                    attempt,
+                    "retrying after error: {e:?}, sleeping for {:?}",
+                    sleep_for
+                );
+            }
+            Err(e) => {
+                bail!("retry_async: exhausted all attempts: {e}");
+            }
+        }
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Tests
+/// ------------------------------------------------------------------------------------------------
+
+#[test]
+fn weighted_moving_average_basic_math() {
+    let mut wma = WeightedMovingAverage::new(3);
+
+    assert!(wma.average().is_none());
+    wma.insert(10.0, 1.0); // average = 10
+    assert_eq!(wma.average().unwrap(), 10.0);
+
+    wma.insert(20.0, 1.0); // average = 15
+    assert_eq!(wma.average().unwrap(), 15.0);
+
+    wma.insert(30.0, 2.0); // weighted (10*1 + 20*1 + 30*2) / 4 = 22.5
+    assert_eq!(wma.average().unwrap(), 22.5);
+
+    // This insertion evicts the first sample (window = 3)
+    wma.insert(0.0, 1.0); // (20*1 + 30*2 + 0*1) / 4 = 20
+    assert_eq!(wma.average().unwrap(), 20.0);
+    assert_eq!(wma.len(), 3);
+}
+
+#[test]
+fn weighted_moving_average_zero_weight_ignored() {
+    let mut wma = WeightedMovingAverage::new(4);
+
+    wma.insert(100.0, 0.0); // should panic? we chose to allow zero -> ignored
+    assert!(wma.average().is_none());
+
+    wma.insert(50.0, 5.0);
+    assert_eq!(wma.average(), Some(50.0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rate_limiter_blocks_until_permit_available() {
+    let rl = Arc::new(RateLimitedExecutor::new(2, Duration::from_millis(100)));
+
+    let started = Instant::now();
+    let mut handles: Vec<JoinHandle<Instant>> = vec![];
+
+    for _ in 0..4 {
+        let cloned = rl.clone();
+        handles.push(tokio::spawn(async move {
+            cloned
+                .execute(async {
+                    // trivial work
+                    Instant::now()
+                })
+                .await
+        }));
+    }
+
+    let results = futures::future::join_all(handles).await;
+    let mut timestamps: Vec<_> = results.into_iter().map(Result::unwrap).collect();
+    timestamps.sort();
+
+    // First two should execute immediately (< 20 ms)
+    assert!(timestamps[1].duration_since(started) < Duration::from_millis(20));
+
+    // Next two should be >= 100 ms after start (due to rate limit)
+    for ts in &timestamps[2..] {
+        assert!(ts.duration_since(started) >= Duration::from_millis(100));
+    }
+}
+
+#[tokio::test]
+async fn retry_async_eventually_succeeds() -> Result<()> {
+    let cfg = RetryConfig {
+        max_retries: 5,
+        base_delay: Duration::from_millis(10),
+        max_delay: Duration::from_millis(100),
+    };
+
+    // Simulate a flaky function that fails 3 times then returns "OK"
+    let failures_before_success = Arc::new(Semaphore::new(3));
+
+    let result: String = retry_async(cfg, |attempt| {
+        let failures = failures_before_success.clone();
+        async move {
+            if failures.try_acquire().is_ok() {
+                Err(anyhow!("transient error on attempt {attempt}"))
+            } else {
+                Ok("OK".to_string())
+            }
+        }
+    })
+    .await?;
+
+    assert_eq!(&result, "OK");
+    Ok(())
+}
+
+#[tokio::test]
+async fn retry_async_gives_up_after_max() {
+    let cfg = RetryConfig {
+        max_retries: 2,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+    };
+
+    let res = retry_async(cfg, |_| async { Err::<(), _>(anyhow!("always fails")) }).await;
+
+    assert!(res.is_err(), "should fail after exceeding max_retries");
+}
+
+/// Make sure retry_async doesn't hang indefinitely when the wrapped
+/// future is cancellation-safe but never completes.  We protect against
+/// this with a global timeout.
+#[tokio::test]
+async fn retry_async_respects_global_timeout() {
+    let cfg = RetryConfig {
+        max_retries: 3,
+        base_delay: Duration::from_millis(5),
+        max_delay: Duration::from_millis(15),
+    };
+
+    let hanging_future = || async {
+        // never returns
+        futures::future::pending::<Result<()>>().await
+    };
+
+    // If timeout triggers, the test passes
+    let timed = timeout(Duration::from_millis(100), retry_async(cfg, |_| hanging_future()));
+    assert!(timed.await.is_err(), "global timeout should elapse");
+}
+```

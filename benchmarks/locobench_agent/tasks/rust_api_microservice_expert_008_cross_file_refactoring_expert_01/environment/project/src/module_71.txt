@@ -1,0 +1,543 @@
+```rust
+//! src/module_71.rs
+//!
+//! Cash-Flow Forecast query service with optional Redis-backed response
+//! caching, pagination helpers and domain-driven abstractions.
+//!
+//! This module is completely self-contained yet showcases the LedgerLink
+//! Nexus architecture principles:
+//!   • Clean separation between View (DTO)  ➜  View-Model (validated
+//!     transport structs)  ➜  Domain Models / Repository  ➜  Service.
+//!   • Transparent response-caching with Redis using a typed cache key.
+//!   • Structured error handling with `thiserror` and `tracing`.
+//!   • Feature-gated compile options (`response_caching`) for optional
+//!     dependencies, keeping binary size and attack-surface minimal.
+//!
+//! Down-stream HTTP/GraphQL handlers can simply call
+//! `CashFlowForecastService::get_forecast(..)` and receive a fully
+//! validated, paginated & (optionally) cached payload ready to be
+//! serialized by the transport layer.
+
+#![allow(clippy::async_yields_async)] // False-positive for async_trait
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
+
+use async_trait::async_trait;
+use chrono::{NaiveDate, Utc};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::time::Instant;
+use tracing::{debug, error, instrument, warn};
+use uuid::Uuid;
+#[cfg(feature = "response_caching")]
+use {
+    redis::{aio::ConnectionLike, AsyncCommands},
+    serde_json::json,
+};
+
+/// Inclusive date range used when querying forecasts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DateRange {
+    pub from: NaiveDate,
+    pub to: NaiveDate,
+}
+
+impl DateRange {
+    pub fn validate(self) -> Result<Self, ValidationError> {
+        if self.from > self.to {
+            Err(ValidationError::InvalidDateRange)
+        } else {
+            Ok(self)
+        }
+    }
+}
+
+/// Simple pagination descriptor (page & per_page are both 1-based).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pagination {
+    page: NonZeroU32,
+    per_page: NonZeroU32,
+}
+
+impl Pagination {
+    pub fn new(page: u32, per_page: u32) -> Result<Self, ValidationError> {
+        let page = NonZeroU32::new(page).ok_or(ValidationError::InvalidPage)?;
+        let per_page =
+            NonZeroU32::new(per_page).ok_or(ValidationError::InvalidPageSize)?;
+        Ok(Self { page, per_page })
+    }
+
+    #[inline]
+    pub fn offset(&self) -> u32 {
+        (self.page.get() - 1) * self.per_page.get()
+    }
+
+    #[inline]
+    pub fn limit(&self) -> u32 {
+        self.per_page.get()
+    }
+}
+
+/// Domain aggregate representing a single cash-flow forecast entry.
+#[derive(Debug, Clone)]
+pub struct CashFlowForecast {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub date: NaiveDate,
+    pub expected_inflow: Decimal,
+    pub expected_outflow: Decimal,
+    pub currency: String,
+}
+
+/// Data Transfer Object returned to the outside world (View-Model).
+#[derive(Debug, Clone, Serialize)]
+pub struct CashFlowForecastDto {
+    pub id: Uuid,
+    pub date: NaiveDate,
+    pub expected_inflow: Decimal,
+    pub expected_outflow: Decimal,
+    pub currency: String,
+}
+
+impl From<CashFlowForecast> for CashFlowForecastDto {
+    fn from(f: CashFlowForecast) -> Self {
+        Self {
+            id: f.id,
+            date: f.date,
+            expected_inflow: f.expected_inflow,
+            expected_outflow: f.expected_outflow,
+            currency: f.currency,
+        }
+    }
+}
+
+/// Output envelope with pagination metadata.
+#[derive(Debug, Clone, Serialize)]
+pub struct CashFlowForecastPage {
+    pub items: Vec<CashFlowForecastDto>,
+    pub total_items: u64,
+    pub page: u32,
+    pub per_page: u32,
+}
+
+/// Domain-driven repository abstraction.
+///
+/// Implementations live in separate crates (e.g. `ledgerlink_pg`) and can
+/// be swapped at runtime using dependency-injection.
+#[async_trait]
+pub trait CashFlowForecastRepository: Send + Sync + 'static {
+    async fn list_by_account(
+        &self,
+        account_id: Uuid,
+        range: DateRange,
+        pagination: Pagination,
+    ) -> Result<(Vec<CashFlowForecast>, u64), RepoError>;
+}
+
+/// Service façade orchestrating query workflow.
+pub struct CashFlowForecastService<R, C> {
+    repo: Arc<R>,
+    #[cfg(feature = "response_caching")]
+    cache: Arc<C>,
+    /// TTL for cache entries.
+    #[cfg(feature = "response_caching")]
+    ttl: Duration,
+}
+
+impl<R, C> CashFlowForecastService<R, C>
+where
+    R: CashFlowForecastRepository,
+{
+    pub fn new(repo: Arc<R>) -> Self
+    where
+        C: Default,
+    {
+        Self {
+            repo,
+            #[cfg(feature = "response_caching")]
+            cache: Arc::<C>::default(),
+            #[cfg(feature = "response_caching")]
+            ttl: Duration::from_secs(300),
+        }
+    }
+
+    #[cfg_attr(
+        feature = "response_caching",
+        instrument(
+            name = "CashFlowForecastService::get_forecast",
+            skip(self),
+            fields(account_id = %account_id, page = pagination.page, per_page = pagination.per_page)
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "response_caching"),
+        instrument(
+            name = "CashFlowForecastService::get_forecast",
+            skip(self),
+            fields(account_id = %account_id, page = pagination.page, per_page = pagination.per_page)
+        )
+    )]
+    pub async fn get_forecast(
+        &self,
+        account_id: Uuid,
+        range: DateRange,
+        pagination: Pagination,
+        force_refresh: bool,
+    ) -> Result<CashFlowForecastPage, ServiceError>
+    where
+        C: CacheBackend,
+    {
+        range.validate()?;
+
+        #[cfg(feature = "response_caching")]
+        if !force_refresh {
+            if let Some(cached) = self
+                .cache
+                .get::<CashFlowForecastPage>(&CacheKey::new(
+                    account_id,
+                    range,
+                    pagination,
+                ))
+                .await?
+            {
+                debug!("cache hit for account_id={}", account_id);
+                return Ok(cached);
+            }
+        }
+
+        let span = tracing::info_span!("db_query");
+        let _enter = span.enter();
+        let started_at = Instant::now();
+        let (rows, total) = self
+            .repo
+            .list_by_account(account_id, range, pagination)
+            .await
+            .map_err(ServiceError::Repository)?;
+        debug!("db_query completed in {:?}", started_at.elapsed());
+
+        let page = CashFlowForecastPage {
+            items: rows.into_iter().map(Into::into).collect(),
+            total_items: total,
+            page: pagination.page.get(),
+            per_page: pagination.per_page.get(),
+        };
+
+        #[cfg(feature = "response_caching")]
+        {
+            self.cache
+                .set(
+                    CacheKey::new(account_id, range, pagination),
+                    &page,
+                    self.ttl,
+                )
+                .await?;
+        }
+
+        Ok(page)
+    }
+}
+
+//
+// ----------------------------- Caching ----------------------------------
+//
+#[cfg(feature = "response_caching")]
+#[async_trait]
+pub trait CacheBackend: Send + Sync + 'static {
+    async fn get<T>(&self, key: &CacheKey) -> Result<Option<T>, CacheError>
+    where
+        T: for<'de> Deserialize<'de> + Send;
+    async fn set<T>(
+        &self,
+        key: CacheKey,
+        value: &T,
+        ttl: Duration,
+    ) -> Result<(), CacheError>
+    where
+        T: Serialize + Send + Sync;
+}
+
+/// Typed cache-key guaranteeing stable hash/serialize logic.
+#[cfg(feature = "response_caching")]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize)]
+pub struct CacheKey {
+    account_id: Uuid,
+    from: NaiveDate,
+    to: NaiveDate,
+    page: u32,
+    per_page: u32,
+}
+
+#[cfg(feature = "response_caching")]
+impl CacheKey {
+    pub fn new(
+        account_id: Uuid,
+        range: DateRange,
+        pagination: Pagination,
+    ) -> Self {
+        Self {
+            account_id,
+            from: range.from,
+            to: range.to,
+            page: pagination.page.get(),
+            per_page: pagination.per_page.get(),
+        }
+    }
+
+    fn as_redis_key(&self) -> String {
+        // Example key: cf_forecast:{acct}:{from}:{to}:{p}:{pp}
+        format!(
+            "cf_forecast:{}:{}:{}:{}:{}",
+            self.account_id, self.from, self.to, self.page, self.per_page
+        )
+    }
+}
+
+/// Minimal Redis cache backend implementation.
+#[cfg(all(feature = "response_caching", feature = "redis"))]
+pub struct RedisCache<B: ConnectionLike + Send + Sync + 'static>(pub tokio::sync::Mutex<B>);
+
+#[cfg(all(feature = "response_caching", feature = "redis"))]
+#[async_trait]
+impl<B> CacheBackend for RedisCache<B>
+where
+    B: ConnectionLike + Send + Sync + 'static,
+{
+    async fn get<T>(&self, key: &CacheKey) -> Result<Option<T>, CacheError>
+    where
+        T: for<'de> Deserialize<'de> + Send,
+    {
+        let redis_key = key.as_redis_key();
+        let mut conn = self.0.lock().await;
+        let data: Option<String> = conn.get(&redis_key).await?;
+        Ok(match data {
+            Some(s) => {
+                let parsed = serde_json::from_str::<T>(&s)?;
+                Some(parsed)
+            }
+            None => None,
+        })
+    }
+
+    async fn set<T>(
+        &self,
+        key: CacheKey,
+        value: &T,
+        ttl: Duration,
+    ) -> Result<(), CacheError>
+    where
+        T: Serialize + Send + Sync,
+    {
+        let redis_key = key.as_redis_key();
+        let payload = serde_json::to_string(value)?;
+        let mut conn = self.0.lock().await;
+        let _: () = conn
+            .set_ex::<_, _, ()>(&redis_key, payload, ttl.as_secs() as usize)
+            .await?;
+        Ok(())
+    }
+}
+
+//
+// ----------------------------- Errors -----------------------------------
+//
+
+#[derive(Debug, Error)]
+pub enum ValidationError {
+    #[error("invalid pagination page (must be > 0)")]
+    InvalidPage,
+    #[error("invalid page size (must be > 0)")]
+    InvalidPageSize,
+    #[error("`from` date must be <= `to` date")]
+    InvalidDateRange,
+}
+
+#[derive(Debug, Error)]
+pub enum RepoError {
+    #[error("database error: {0}")]
+    Db(#[from] anyhow::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum CacheError {
+    #[error("redis error: {0}")]
+    Redis(#[from] redis::RedisError),
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation error: {0}")]
+    Validation(#[from] ValidationError),
+    #[error("repository error: {0}")]
+    Repository(#[from] RepoError),
+    #[cfg(feature = "response_caching")]
+    #[error("cache backend error: {0}")]
+    Cache(#[from] CacheError),
+}
+
+//
+// ----------------------------- Tests ------------------------------------
+//
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use once_cell::sync::Lazy;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    // ----------------- In-memory fakes (no external deps) -----------------
+
+    static MOCK_DATA: Lazy<Vec<CashFlowForecast>> = Lazy::new(|| {
+        (0..50)
+            .map(|i| CashFlowForecast {
+                id: Uuid::new_v4(),
+                account_id: Uuid::nil(),
+                date: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()
+                    + chrono::Duration::days(i),
+                expected_inflow: Decimal::new(1000 + i as i64, 2),
+                expected_outflow: Decimal::new(500 + i as i64, 2),
+                currency: "USD".into(),
+            })
+            .collect()
+    });
+
+    struct FakeRepo;
+
+    #[async_trait]
+    impl CashFlowForecastRepository for FakeRepo {
+        async fn list_by_account(
+            &self,
+            _account_id: Uuid,
+            _range: DateRange,
+            pagination: Pagination,
+        ) -> Result<(Vec<CashFlowForecast>, u64), RepoError> {
+            let start = pagination.offset() as usize;
+            let end = (start + pagination.limit() as usize)
+                .min(MOCK_DATA.len());
+            Ok((
+                MOCK_DATA[start..end].to_vec(),
+                MOCK_DATA.len() as u64,
+            ))
+        }
+    }
+
+    // Simple in-mem cache using `HashMap`
+    #[cfg(feature = "response_caching")]
+    struct FakeCache {
+        inner: Mutex<HashMap<String, String>>,
+    }
+
+    #[cfg(feature = "response_caching")]
+    impl Default for FakeCache {
+        fn default() -> Self {
+            Self {
+                inner: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[cfg(feature = "response_caching")]
+    #[async_trait]
+    impl CacheBackend for FakeCache {
+        async fn get<T>(&self, key: &CacheKey) -> Result<Option<T>, CacheError>
+        where
+            T: for<'de> Deserialize<'de> + Send,
+        {
+            let k = key.as_redis_key();
+            let guard = self.inner.lock().await;
+            match guard.get(&k) {
+                Some(v) => Ok(Some(serde_json::from_str(v)?)),
+                None => Ok(None),
+            }
+        }
+
+        async fn set<T>(
+            &self,
+            key: CacheKey,
+            value: &T,
+            _ttl: Duration,
+        ) -> Result<(), CacheError>
+        where
+            T: Serialize + Send + Sync,
+        {
+            let k = key.as_redis_key();
+            let mut guard = self.inner.lock().await;
+            guard.insert(k, serde_json::to_string(value)?);
+            Ok(())
+        }
+    }
+
+    // ------------------------------- Tests -------------------------------
+
+    #[tokio::test]
+    async fn pagination_offset_works() {
+        let p = Pagination::new(2, 10).unwrap();
+        assert_eq!(p.offset(), 10);
+        assert_eq!(p.limit(), 10);
+    }
+
+    #[tokio::test]
+    async fn service_returns_expected_page() {
+        let repo = Arc::new(FakeRepo);
+        let svc: CashFlowForecastService<_, ()> = CashFlowForecastService::new(repo);
+
+        let page = svc
+            .get_forecast(
+                Uuid::nil(),
+                DateRange {
+                    from: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                    to: NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+                },
+                Pagination::new(1, 20).unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page.items.len(), 20);
+        assert_eq!(page.total_items, 50);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "response_caching")]
+    async fn cache_roundtrip() {
+        let repo = Arc::new(FakeRepo);
+        let cache = Arc::new(FakeCache::default());
+        let svc =
+            CashFlowForecastService { repo, cache, ttl: Duration::from_secs(60) };
+
+        // 1st call populates cache
+        let _ = svc
+            .get_forecast(
+                Uuid::nil(),
+                DateRange {
+                    from: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                    to: NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+                },
+                Pagination::new(1, 10).unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Force a cache-hit by deleting repo data
+        let page = svc
+            .get_forecast(
+                Uuid::nil(),
+                DateRange {
+                    from: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                    to: NaiveDate::from_ymd_opt(2024, 3, 1).unwrap(),
+                },
+                Pagination::new(1, 10).unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page.items.len(), 10);
+    }
+}
+```

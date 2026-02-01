@@ -1,0 +1,336 @@
+```rust
+//! VisuTility Orchestrator – Module 10  
+//!
+//! High-level model-monitoring subsystem:  
+//! • Streams real-time model-performance metrics coming from Serving-Ops.  
+//! • Detects concept drift via pluggable `DriftDetector` strategies (Factory Pattern).  
+//! • Notifies downstream components (e.g., automated-retraining pipeline) through an
+//!   Observer channel.  
+//!
+//! This module showcases several patterns referenced in the project description:  
+//! • Factory Pattern  – `DriftDetectorFactory` dynamically instantiates a detector.  
+//! • Strategy Pattern  – `DriftDetector` trait + multiple concrete strategies.  
+//! • Observer Pattern  – Broadcast channel for fan-out event propagation.  
+//! • MLOps Architecture – Tight integration with retraining & registry layers.
+//!
+//! NOTE: External crates required (add to Cargo.toml):
+//! ```toml
+//! async-trait = "0.1"
+//! chrono      = { version = "0.4", features = ["serde"] }
+//! dashmap     = "5"
+//! log         = "0.4"
+//! thiserror   = "1"
+//! tokio       = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+//! ```
+//!
+//! Author: VisuTility Core Team
+
+use async_trait::async_trait;
+use chrono::{DateTime, Duration, Utc};
+use dashmap::DashMap;
+use log::{debug, error, info, warn};
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration as StdDuration, SystemTime},
+};
+use thiserror::Error;
+use tokio::{
+    sync::{
+        broadcast::{self, Receiver, Sender},
+        mpsc,
+    },
+    task,
+    time,
+};
+
+/// ------------------------------------------------------------------------------------------------
+/// Public data-structures
+/// ------------------------------------------------------------------------------------------------
+
+/// Performance metrics produced by the Serving-Ops layer and consumed by this monitor.
+#[derive(Debug, Clone)]
+pub struct ModelMetric {
+    pub model_name:   String,
+    pub model_version: String,
+    pub timestamp:    DateTime<Utc>,
+    pub accuracy:     f32,
+    pub precision:    f32,
+    pub recall:       f32,
+    pub latency_ms:   f32,
+}
+
+/// Event type broadcast to observers.
+/// Additional events can be added without breaking consumers (non-exhaustive).
+#[derive(Debug, Clone)]
+pub enum MonitorEvent {
+    Metric(ModelMetric),
+    DriftAlert(DriftInfo),
+}
+
+/// Detailed information emitted when drift is detected.
+#[derive(Debug, Clone)]
+pub struct DriftInfo {
+    pub model_name:    String,
+    pub model_version: String,
+    pub detected_at:   DateTime<Utc>,
+    pub window_size:   usize,
+    pub mean_accuracy: f32,
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Error handling
+/// ------------------------------------------------------------------------------------------------
+#[derive(Error, Debug)]
+pub enum MonitorError {
+    #[error("broadcast channel error: {0}")]
+    Channel(#[from] broadcast::error::SendError<MonitorEvent>),
+
+    #[error("drift-detector error: {0}")]
+    DriftDetector(String),
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Drift-detector Strategy trait & implementations
+/// ------------------------------------------------------------------------------------------------
+
+/// Trait implemented by any concept-drift detection algorithm.
+#[async_trait]
+pub trait DriftDetector: Send + Sync {
+    /// Checks whether the supplied metric window indicates drift.
+    async fn detect(
+        &self,
+        window: &[ModelMetric],
+    ) -> Result<Option<DriftInfo>, MonitorError>;
+}
+
+/// Simple, interpretable drift detector comparing mean accuracy against a static threshold.
+#[derive(Debug)]
+pub struct ThresholdDriftDetector {
+    min_samples:     usize,
+    accuracy_floor:  f32,
+}
+
+impl ThresholdDriftDetector {
+    pub fn new(min_samples: usize, accuracy_floor: f32) -> Self {
+        Self { min_samples, accuracy_floor }
+    }
+}
+
+#[async_trait]
+impl DriftDetector for ThresholdDriftDetector {
+    async fn detect(
+        &self,
+        window: &[ModelMetric],
+    ) -> Result<Option<DriftInfo>, MonitorError> {
+        if window.len() < self.min_samples {
+            return Ok(None);
+        }
+        let mean_acc =
+            window.iter().map(|m| m.accuracy as f64).sum::<f64>() / window.len() as f64;
+
+        if (mean_acc as f32) < self.accuracy_floor {
+            let last = window.last().expect("window non-empty");
+            Ok(Some(DriftInfo {
+                model_name:    last.model_name.clone(),
+                model_version: last.model_version.clone(),
+                detected_at:   Utc::now(),
+                window_size:   window.len(),
+                mean_accuracy: mean_acc as f32,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Future implementations (Page-Hinkley, ADWIN, etc.) can be plugged in here.
+#[derive(Debug, Clone, Copy)]
+pub enum DriftDetectorKind {
+    Threshold,
+    // PageHinkley,
+    // Adwin,
+}
+
+/// Factory Pattern – creates a detector based on configuration.
+pub struct DriftDetectorFactory;
+
+impl DriftDetectorFactory {
+    pub fn build(kind: DriftDetectorKind) -> Arc<dyn DriftDetector> {
+        match kind {
+            DriftDetectorKind::Threshold => {
+                Arc::new(ThresholdDriftDetector::new(100, 0.90))
+            }
+        }
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Performance Monitor (Observer publisher)
+/// ------------------------------------------------------------------------------------------------
+
+/// Sliding-window cache of recent metrics per model version.
+type Window = VecDeque<ModelMetric>;
+
+/// Central monitoring component; can be cloned cheaply (internally Arc’ed).
+#[derive(Clone)]
+pub struct PerformanceMonitor {
+    windows:       Arc<DashMap<String, Window>>,
+    drift_detector: Arc<dyn DriftDetector>,
+    event_tx:      Sender<MonitorEvent>,
+    window_capacity: usize,
+}
+
+impl PerformanceMonitor {
+    pub fn new(drift_detector: Arc<dyn DriftDetector>) -> Self {
+        // Broadcast channel with large enough buffer for typical QPS in industry settings.
+        let (event_tx, _) = broadcast::channel(1_024);
+        Self {
+            windows: Arc::new(DashMap::new()),
+            drift_detector,
+            event_tx,
+            window_capacity: 1_000,
+        }
+    }
+
+    /// Subscribe to monitor events (Observer pattern).
+    pub fn subscribe(&self) -> Receiver<MonitorEvent> {
+        self.event_tx.subscribe()
+    }
+
+    /// Ingest a single performance metric (sync) – called from Serving-Ops.
+    pub fn ingest_metric(&self, metric: ModelMetric) -> Result<(), MonitorError> {
+        // Publish the raw metric to observers.
+        self.event_tx.send(MonitorEvent::Metric(metric.clone()))?;
+
+        // Update sliding window.
+        let key = format!("{}::{}", metric.model_name, metric.model_version);
+        let mut entry = self.windows.entry(key).or_insert_with(VecDeque::new);
+        entry.push_back(metric);
+        if entry.len() > self.window_capacity {
+            entry.pop_front();
+        }
+
+        Ok(())
+    }
+
+    /// Spawn an async task that periodically runs drift detection on each window.
+    pub fn start_drift_task(&self) {
+        let this = self.clone();
+        task::spawn(async move {
+            let mut interval = time::interval(StdDuration::from_secs(30));
+            loop {
+                interval.tick().await;
+                for mut window_ref in this.windows.iter_mut() {
+                    let window: &mut Window = window_ref.value_mut();
+                    if window.is_empty() {
+                        continue;
+                    }
+                    match this.drift_detector.detect(window).await {
+                        Ok(Some(info)) => {
+                            warn!("Drift detected: {:?}", info);
+                            if let Err(e) =
+                                this.event_tx.send(MonitorEvent::DriftAlert(info.clone()))
+                            {
+                                error!("unable to broadcast drift alert: {e:?}");
+                            }
+                            // Optional: purge window after drift to avoid repeated alerts
+                            window.clear();
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            error!("drift detection error: {err}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Automated-retraining consumer (brief example)
+/// ------------------------------------------------------------------------------------------------
+
+/// Simple retraining job payload sent to Model-Ops layer.
+#[derive(Debug)]
+pub struct RetrainJob {
+    pub model_name:    String,
+    pub model_version: String,
+    pub triggered_at:  DateTime<Utc>,
+}
+
+/// Listens for drift alerts and schedules retraining via a bounded channel.
+pub async fn start_retraining_listener(
+    mut event_rx: Receiver<MonitorEvent>,
+    retrain_tx: mpsc::Sender<RetrainJob>,
+) {
+    loop {
+        match event_rx.recv().await {
+            Ok(MonitorEvent::DriftAlert(info)) => {
+                info!(
+                    "Scheduling retraining for {} v{} (mean_acc={:.3})",
+                    info.model_name, info.model_version, info.mean_accuracy
+                );
+                let job = RetrainJob {
+                    model_name:    info.model_name,
+                    model_version: info.model_version,
+                    triggered_at:  Utc::now(),
+                };
+                if let Err(e) = retrain_tx.send(job).await {
+                    error!("unable to enqueue retraining job: {e}");
+                }
+            }
+            Ok(_) => {} // ignore other events
+            Err(e) => {
+                error!("monitor channel closed: {e}");
+                break;
+            }
+        }
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Example wiring (would live in main.rs in a real binary target)
+/// ------------------------------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{distributions::Uniform, Rng};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn integration_smoke_test() {
+        let detector = DriftDetectorFactory::build(DriftDetectorKind::Threshold);
+        let monitor  = PerformanceMonitor::new(detector);
+        monitor.start_drift_task();
+
+        // Retrain channel (bounded to avoid back-pressure explosion).
+        let (retrain_tx, mut retrain_rx) = mpsc::channel::<RetrainJob>(16);
+        // Listener task
+        tokio::spawn(start_retraining_listener(monitor.subscribe(), retrain_tx));
+
+        // Simulate metric stream with gradually degrading accuracy.
+        let mut rng = rand::thread_rng();
+        let dist  = Uniform::new(0.0_f32, 0.10);
+
+        for i in 0..300 {
+            let acc = 0.95 - (i as f32) * rng.sample(dist) * 0.001;
+            let metric = ModelMetric {
+                model_name:    "quality_inspector".into(),
+                model_version: "v1.2.3".into(),
+                timestamp:     Utc::now(),
+                accuracy:      acc,
+                precision:     acc - 0.02,
+                recall:        acc - 0.03,
+                latency_ms:    12f32,
+            };
+            monitor.ingest_metric(metric).unwrap();
+            time::sleep(StdDuration::from_millis(10)).await;
+        }
+
+        // Ensure a retrain job was queued.
+        let job = retrain_rx.recv().await.expect("expected retraining job");
+        assert_eq!(job.model_name, "quality_inspector");
+    }
+}
+```

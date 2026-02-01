@@ -1,0 +1,308 @@
+```rust
+//! module_72 – Runtime-hot-swappable sentiment analysis strategy layer
+//!
+//! This module owns the “strategy” part of the strategy-pattern that lets
+//! ChirpPulse swap out sentiment-analysis algorithms without stopping the
+//! data-stream.  It exposes a thread-safe handle (`AnalyzerHub`) that other
+//! services can use to classify social events.  New algorithms can be shipped
+//! in the background and atomically promoted to production once they have
+//! warmed up.
+
+use std::{
+    fmt,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use tokio::{
+    select,
+    sync::mpsc,
+    task::JoinHandle,
+    time::{interval, Interval},
+};
+use tracing::{debug, error, info, instrument};
+
+/// Lightweight domain object representing a chunk of user-generated text that
+/// has to be classified.
+///
+/// NOTE: The full ChirpPulse event carries much more context (language hints,
+/// source network, actor id…).  We only keep the essentials here, because the
+/// analyst trait should remain opinion-free.
+#[derive(Debug, Clone)]
+pub struct SocialText {
+    pub id:        String,
+    pub body:      String,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Enum-style sentiment.  More fine-grained scores are wrapped by
+/// [`SentimentScore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sentiment {
+    Positive,
+    Neutral,
+    Negative,
+}
+
+/// Continuous sentiment score accompanied by a categorical label.
+#[derive(Debug, Clone)]
+pub struct SentimentScore {
+    pub label: Sentiment,
+    /// Normalised score in [-1.0, 1.0] (-1 == most negative).
+    pub magnitude: f32,
+}
+
+impl fmt::Display for SentimentScore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({:?}, {:.2})", self.label, self.magnitude)
+    }
+}
+
+/// Error wrapper returned by analyzers.  Kept opaque on purpose; real
+/// implementations can attach model metadata, feature flags, etc.
+#[derive(Debug, thiserror::Error)]
+#[error("analyzer error: {msg}")]
+pub struct AnalyzerError {
+    msg: String,
+}
+
+impl AnalyzerError {
+    fn new<T: Into<String>>(msg: T) -> Self {
+        Self { msg: msg.into() }
+    }
+}
+
+/// Pluggable sentiment-analysis algorithm.
+///
+/// A blanket `Send + Sync` bound allows us to store trait objects inside
+/// `Arc`s.  The API is intentionally minimal: stateless synchronous inference
+/// fits 99 % of our use-cases and plays nicely with rayon batching.  If you
+/// need GPU acceleration or async I/O, wrap that behind channels on the
+/// call-site.
+#[async_trait]
+pub trait SentimentAnalyzer: Send + Sync + fmt::Debug {
+    /// Runs inference over a single text fragment.
+    fn analyze(&self, text: &SocialText) -> Result<SentimentScore, AnalyzerError>;
+
+    /// Optional warm-up hook.  Called once right after the analyzer becomes the
+    /// active strategy.  Implementors can spin up heavy resources here.
+    async fn warm_up(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Human-readable name used during log rotations and metrics.
+    fn name(&self) -> &str;
+}
+
+/// A naîve Bag-Of-Words demo model.  *Do not use in production*.
+#[derive(Debug, Default)]
+pub struct NaiveLexiconAnalyzer;
+
+/// Example keyword list.
+const POSITIVE_WORDS: &[&str] = &["good", "great", "love", "awesome", "💖"];
+const NEGATIVE_WORDS: &[&str] = &["bad", "terrible", "hate", "awful", "💔"];
+
+#[async_trait]
+impl SentimentAnalyzer for NaiveLexiconAnalyzer {
+    fn analyze(&self, text: &SocialText) -> Result<SentimentScore, AnalyzerError> {
+        let lower = text.body.to_ascii_lowercase();
+        let score = POSITIVE_WORDS
+            .iter()
+            .filter(|w| lower.contains(**w))
+            .count() as f32
+            - NEGATIVE_WORDS
+                .iter()
+                .filter(|w| lower.contains(**w))
+                .count() as f32;
+
+        let label = match score {
+            s if s > 0.0 => Sentiment::Positive,
+            s if s < 0.0 => Sentiment::Negative,
+            _ => Sentiment::Neutral,
+        };
+
+        Ok(SentimentScore {
+            label,
+            magnitude: (score / 10.0).clamp(-1.0, 1.0),
+        })
+    }
+
+    async fn warm_up(&self) -> Result<()> {
+        // Nothing to do, but real models could load embeddings here.
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "naive_lexicon"
+    }
+}
+
+/// The heart of the strategy-pattern implementation.  It keeps an [`Arc`] to
+/// the current analyzer behind an [`RwLock`] so readers don’t block each other.
+/// Writers are rare (only during hot-swaps) and therefore pay the exclusive
+/// lock price.
+///
+/// Swaps are performed atomically: either the new model is live for all
+/// requests, or none.  No request can be executed on a half-initialised model.
+#[derive(Debug, Clone)]
+pub struct AnalyzerHub {
+    inner: Arc<RwLock<Arc<dyn SentimentAnalyzer>>>,
+}
+
+impl AnalyzerHub {
+    /// Instantiates the hub with a default strategy.
+    pub fn new<A>(default: A) -> Self
+    where
+        A: SentimentAnalyzer + 'static,
+    {
+        Self {
+            inner: Arc::new(RwLock::new(Arc::new(default))),
+        }
+    }
+
+    /// Returns the human-readable name of the active strategy.
+    pub fn current_name(&self) -> String {
+        self.inner.read().unwrap().name().to_owned()
+    }
+
+    /// Analyse text with the active strategy.
+    pub fn classify(&self, text: &SocialText) -> Result<SentimentScore, AnalyzerError> {
+        self.inner.read().unwrap().analyze(text)
+    }
+
+    /// Atomically replaces the active strategy after first running its warm-up
+    /// hook.  If warm-up fails, the old model stays untouched.
+    #[instrument(skip(self, next))]
+    pub async fn swap<A>(&self, next: A) -> Result<()>
+    where
+        A: SentimentAnalyzer + 'static,
+    {
+        info!(old = %self.current_name(), new = next.name(), "initiating analyzer swap");
+
+        // Run warm-up without touching the live handle.
+        next.warm_up()
+            .await
+            .with_context(|| format!("warm-up failed for {}", next.name()))?;
+
+        let mut lock = self.inner.write().unwrap();
+        *lock = Arc::new(next);
+
+        info!(active = %self.current_name(), "analyzer swap completed");
+        Ok(())
+    }
+}
+
+/// A watchdog that watches for configuration change events (e.g. on a Kafka
+/// topic or a config store) and hot-swaps the analyzer accordingly.
+///
+/// To keep the example self-contained, we use a Tokio `mpsc` channel instead of
+/// real infrastructure.  Each message contains a boxed analyzer that becomes
+/// immediately live once received.
+pub struct AnalyzerWatchdog {
+    hub:      AnalyzerHub,
+    rx:       mpsc::Receiver<Box<dyn SentimentAnalyzer>>,
+    ticker:   Interval,
+    handle:   Option<JoinHandle<()>>,
+}
+
+impl AnalyzerWatchdog {
+    pub fn new(
+        hub: AnalyzerHub,
+        rx: mpsc::Receiver<Box<dyn SentimentAnalyzer>>,
+        refresh_interval: Duration,
+    ) -> Self {
+        Self {
+            hub,
+            rx,
+            ticker: interval(refresh_interval),
+            handle: None,
+        }
+    }
+
+    /// Starts the watchdog loop on a separate Tokio task.
+    pub fn start(mut self) -> Self {
+        let task = tokio::spawn(async move {
+            loop {
+                select! {
+                    maybe_new = self.rx.recv() => {
+                        match maybe_new {
+                            Some(analyzer) => {
+                                if let Err(err) = self.hub.swap(analyzer).await {
+                                    error!(%err, "failed to hot-swap analyzer");
+                                }
+                            },
+                            // All senders dropped – watchdog can shut down.
+                            None => {
+                                info!("analyzer configuration channel closed; exiting watchdog");
+                                break;
+                            }
+                        }
+                    }
+                    _ = self.ticker.tick() => {
+                        debug!(current = %self.hub.current_name(), "periodic analyzer heartbeat");
+                    }
+                }
+            }
+        });
+        self.handle = Some(task);
+        self
+    }
+
+    /// Blocks until the watchdog task finishes.  Usually called during
+    /// graceful shutdown.
+    pub async fn join(self) -> Result<()> {
+        if let Some(handle) = self.handle {
+            handle
+                .await
+                .map_err(|err| anyhow!("watchdog join error: {err}"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn swap_works() {
+        let hub = AnalyzerHub::new(NaiveLexiconAnalyzer::default());
+        assert_eq!(hub.current_name(), "naive_lexicon");
+
+        // Prepare a dummy alternative analyzer.
+        #[derive(Debug)]
+        struct AlwaysPositive;
+        #[async_trait]
+        impl SentimentAnalyzer for AlwaysPositive {
+            fn analyze(
+                &self,
+                _text: &SocialText,
+            ) -> Result<SentimentScore, AnalyzerError> {
+                Ok(SentimentScore {
+                    label: Sentiment::Positive,
+                    magnitude: 1.0,
+                })
+            }
+
+            fn name(&self) -> &str {
+                "always_positive"
+            }
+        }
+
+        hub.swap(AlwaysPositive).await.unwrap();
+        assert_eq!(hub.current_name(), "always_positive");
+
+        let sample = SocialText {
+            id: "1".into(),
+            body: "whatever".into(),
+            timestamp: Utc::now(),
+        };
+        let res = hub.classify(&sample).unwrap();
+        assert_eq!(res.label, Sentiment::Positive);
+    }
+}
+```

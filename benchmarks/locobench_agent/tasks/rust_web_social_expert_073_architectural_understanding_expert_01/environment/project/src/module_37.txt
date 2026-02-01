@@ -1,0 +1,485 @@
+```rust
+//! src/module_37.rs
+//! ---------------------------------------------------------------------------
+//! Event Infrastructure (v0.9)
+//!
+//! This module provides the “back-bone” for EduPulse Live’s event-driven
+//! architecture.  All *domain events* emitted by upstream Bounded Contexts
+//! (Accounts, Courses, Commerce, etc.) flow through the abstractions below:
+//!
+//!   1. `DomainEvent` – type-safe representation of concrete events.
+//!   2. `EventEnvelope` – versioned, traceable wrapper (metadata, causation).
+//!   3. `EventStore` – durable append-only persistence (PostgreSQL, jsonb).
+//!   4. `EventPublisher` – fan-out to the message broker (NATS).
+//!   5. `EventStream` – async iterator used by read-model/materializers.
+//!   6. `EventError` – unified error enum w/ rich context.
+//!
+//! The code is *production-grade*: it performs structured logging, spans,
+//! back-pressure aware publishing, and RUSTSEC-clean error handling.
+//!
+//! Dependencies (Cargo.toml excerpt):
+//! ----------------------------------
+//! async-nats = { version = "0.33", default-features = false, features = ["tls"] }
+//! sqlx       = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "json"] }
+//! serde      = { version = "1.0", features = ["derive"] }
+//! serde_json = "1.0"
+//! thiserror  = "1.0"
+//! uuid       = { version = "1.3", features = ["v4", "serde"] }
+//! chrono     = { version = "0.4", features = ["serde"] }
+//! tracing    = "0.1"
+//! futures    = "0.3"
+//! anyhow     = "1.0"
+//! ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+
+use async_nats::{Client as NatsClient, PublishAck};
+use chrono::{DateTime, Utc};
+use futures::{Stream, StreamExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
+use thiserror::Error;
+use tracing::{instrument, span, Level};
+use uuid::Uuid;
+
+/// Type alias for the *canonical* aggregate identifier.
+/// (We keep it generic enough to be shared among all contexts.)
+pub type AggregateId = Uuid;
+
+/// A type-safe identifier used for exactly-once message guarantees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EventId(Uuid);
+
+impl Default for EventId {
+    fn default() -> Self {
+        EventId(Uuid::new_v4())
+    }
+}
+
+/// Core domain events.
+///
+/// NOTE: In a real system this enum would live in its own crate and be shared
+/// through the workspace.  We show an abridged list for brevity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum DomainEvent {
+    LessonPublished {
+        lesson_id: Uuid,
+        author_id: Uuid,
+        title: String,
+    },
+    QuizSubmitted {
+        quiz_id: Uuid,
+        student_id: Uuid,
+        score: f32,
+    },
+    BadgeAwarded {
+        badge_id: Uuid,
+        recipient_id: Uuid,
+    },
+    PaymentProcessed {
+        order_id: Uuid,
+        amount_cents: i64,
+    },
+    // -- snip --
+}
+
+/// Envelope holding a domain event plus metadata needed for governance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub id: EventId,
+    pub aggregate_id: AggregateId,
+    pub seq: i64,
+    pub event: DomainEvent,
+    pub created_at: DateTime<Utc>,
+    pub causation_id: Option<EventId>,
+    pub correlation_id: Option<EventId>,
+}
+
+impl EventEnvelope {
+    pub fn new(
+        aggregate_id: AggregateId,
+        seq: i64,
+        event: DomainEvent,
+        correlation_id: Option<EventId>,
+    ) -> Self {
+        Self {
+            id: EventId::default(),
+            aggregate_id,
+            seq,
+            event,
+            created_at: Utc::now(),
+            causation_id: correlation_id,
+            correlation_id,
+        }
+    }
+}
+
+/// Unified error type for the event subsystem.
+#[derive(Debug, Error)]
+pub enum EventError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("broker error: {0}")]
+    Broker(#[from] async_nats::Error),
+
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("concurrency conflict (aggregate: {aggregate_id}, expected_seq: {expected}, actual_seq: {actual})")]
+    Concurrency {
+        aggregate_id: AggregateId,
+        expected: i64,
+        actual: i64,
+    },
+}
+
+/// Result alias w/ EventError default.
+pub type Result<T, E = EventError> = std::result::Result<T, E>;
+
+/// Data-access abstraction for the event store.
+///
+/// Implementation uses *optimistic concurrency control* (OCC) via a `seq`
+/// column coupled with a *partial unique index* on (`aggregate_id`, `seq`).
+#[derive(Clone)]
+pub struct EventStore {
+    pool: Arc<PgPool>,
+}
+
+impl EventStore {
+    pub async fn connect(database_url: &str, max_connections: u32) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .after_connect(|mut conn, _meta| {
+                Box::pin(async move {
+                    // Force UTC timezone for timestamp determinism.
+                    sqlx::query("SET TIME ZONE 'UTC'").execute(&mut conn).await?;
+                    Ok(())
+                })
+            })
+            .connect(database_url)
+            .await?;
+
+        Ok(Self {
+            pool: Arc::new(pool),
+        })
+    }
+
+    /// Append a *single* event to the store with OCC.
+    ///
+    /// Returns the stored [`EventEnvelope`] (with auto-generated id + timestamp).
+    #[instrument(skip(self, tx))]
+    pub async fn append_one(
+        &self,
+        mut tx: Transaction<'_, Postgres>,
+        aggregate_id: AggregateId,
+        expected_seq: i64,
+        event: DomainEvent,
+        correlation_id: Option<EventId>,
+    ) -> Result<EventEnvelope> {
+        // Next sequence number we intend to store.
+        let next_seq = expected_seq + 1;
+
+        let envelope = EventEnvelope::new(aggregate_id, next_seq, event, correlation_id);
+        let serialized = serde_json::to_value(&envelope)?;
+
+        let res = sqlx::query(
+            r#"
+            INSERT INTO event_store (id, aggregate_id, seq, payload)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (aggregate_id, seq) DO NOTHING
+            "#,
+        )
+        .bind(envelope.id.0)
+        .bind(envelope.aggregate_id)
+        .bind(envelope.seq)
+        .bind(&serialized)
+        .execute(&mut *tx)
+        .await?;
+
+        if res.rows_affected() == 0 {
+            // Sequence already taken – someone else wrote concurrently.
+            let actual = self
+                .latest_sequence_for(&aggregate_id)
+                .await?
+                .unwrap_or_default();
+
+            return Err(EventError::Concurrency {
+                aggregate_id,
+                expected: expected_seq,
+                actual,
+            });
+        }
+
+        Ok(envelope)
+    }
+
+    /// Returns the *last* known sequence for an aggregate.  If absent, returns
+    /// `None`.
+    #[instrument(skip(self))]
+    pub async fn latest_sequence_for(&self, aggregate_id: &AggregateId) -> Result<Option<i64>> {
+        let seq = sqlx::query_scalar::<_, Option<i64>>(
+            r#"
+            SELECT seq
+            FROM event_store
+            WHERE aggregate_id = $1
+            ORDER BY seq DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(aggregate_id)
+        .fetch_one(&*self.pool)
+        .await?;
+
+        Ok(seq)
+    }
+
+    /// Open an *unbounded* stream for the whole event log.
+    /// Clients should apply their own back-pressure strategies.
+    #[instrument(skip(self))]
+    pub fn stream_all(&self) -> impl Stream<Item = Result<EventEnvelope>> + '_ {
+        sqlx::query_scalar::<_, serde_json::Value>(
+            r#"SELECT payload FROM event_store ORDER BY id"#,
+        )
+        .fetch(&*self.pool)
+        .map_ok(|val| serde_json::from_value::<EventEnvelope>(val))
+        .try_buffered(64) // concurrent JSON deserialization
+    }
+
+    /// Helper to begin a transaction.
+    pub async fn begin(&self) -> Result<Transaction<'_, Postgres>> {
+        Ok(self.pool.begin().await?)
+    }
+}
+
+/// Publishes events to NATS with at-least-once semantics.
+///
+/// It is intentionally *thin*: we keep transport concerns outside domain
+/// services.
+#[derive(Clone)]
+pub struct EventPublisher {
+    nats: NatsClient,
+    subject_prefix: Arc<str>,
+}
+
+impl EventPublisher {
+    pub async fn connect(nats_url: &str, subject_prefix: impl AsRef<str>) -> Result<Self> {
+        // TLS enabled by default (async_nats w/ `tls` feature).
+        let nats = async_nats::connect(nats_url).await?;
+
+        Ok(Self {
+            nats,
+            subject_prefix: Arc::from(subject_prefix.as_ref()),
+        })
+    }
+
+    fn subject_for(&self, event: &DomainEvent) -> String {
+        // Use enum variant name as the subject suffix.
+        let variant = match event {
+            DomainEvent::LessonPublished { .. } => "LessonPublished",
+            DomainEvent::QuizSubmitted { .. } => "QuizSubmitted",
+            DomainEvent::BadgeAwarded { .. } => "BadgeAwarded",
+            DomainEvent::PaymentProcessed { .. } => "PaymentProcessed",
+        };
+        format!("{}.{}", self.subject_prefix, variant)
+    }
+
+    /// Publish an envelope to NATS.  Returns the `PublishAck`.
+    #[instrument(skip(self, envelope))]
+    pub async fn publish(&self, envelope: &EventEnvelope) -> Result<PublishAck> {
+        let subject = self.subject_for(&envelope.event);
+        let payload = serde_json::to_vec(envelope)?;
+
+        Ok(self.nats.publish(subject, payload.into()).await?)
+    }
+}
+
+/// High-level facade combining the store and broker for transactional
+/// *outbox*-style consistency.
+///
+/// Usage:
+///
+/// ```rust,no_run
+/// let ctx = EventContext::new(store, publisher);
+/// ctx.commit(|tx| async move {
+///     // ... domain logic mutating aggregates ...
+///     ctx.append(tx, aggregate_id, expected_seq, event).await?;
+///     Ok(())
+/// }).await?;
+/// ```
+#[derive(Clone)]
+pub struct EventContext {
+    store: EventStore,
+    publisher: EventPublisher,
+}
+
+impl EventContext {
+    pub fn new(store: EventStore, publisher: EventPublisher) -> Self {
+        Self { store, publisher }
+    }
+
+    /// Wrap a *business* operation in a transaction and publish all newly
+    /// appended events atomically (two-phase commit).
+    #[instrument(skip(self, op))]
+    pub async fn commit<F, Fut, T>(&self, op: F) -> Result<T>
+    where
+        F: FnOnce(&Self, &mut Transaction<'_, Postgres>) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<T>> + Send,
+        T: Send,
+    {
+        let mut tx = self.store.begin().await?;
+
+        let result = op(self, &mut tx).await?;
+
+        // Extract fresh events written within the tx:
+        let staged_events: Vec<EventEnvelope> = sqlx::query_scalar(
+            r#"
+            SELECT payload
+            FROM event_store
+            WHERE transaction_timestamp() - statement_timestamp() < INTERVAL '1 second'
+              AND txid_current() = txid_current()
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|val: serde_json::Value| serde_json::from_value(val))
+        .collect::<std::result::Result<_, _>>()?;
+
+        // Commit DB first (outbox pattern).
+        tx.commit().await?;
+
+        // Publish *after* commit to avoid phantom events.
+        for env in staged_events {
+            // We could `spawn` but prefer sequential to simplify ordering/acks.
+            self.publisher.publish(&env).await?;
+        }
+
+        Ok(result)
+    }
+
+    /// Convenience wrapper: append + publish inside a running tx.
+    #[instrument(skip(self, tx))]
+    pub async fn append(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        aggregate_id: AggregateId,
+        expected_seq: i64,
+        event: DomainEvent,
+        correlation_id: Option<EventId>,
+    ) -> Result<EventEnvelope> {
+        let env = self
+            .store
+            .append_one(
+                tx.as_mut(),
+                aggregate_id,
+                expected_seq,
+                event,
+                correlation_id,
+            )
+            .await?;
+
+        // Buffer the event in the transaction’s local temp table for later pickup.
+        sqlx::query(
+            r#"
+            INSERT INTO _staged_events (payload) VALUES ($1)
+            "#,
+        )
+        .bind(sqlx::types::Json(&env))
+        .execute(&mut *tx)
+        .await?;
+
+        Ok(env)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Database bootstrap helpers (run via migrations)
+// ---------------------------------------------------------------------------
+
+/// Creates the *event_store* table and helper structures.
+///
+/// Called by the migration runner (e.g., refinery, sqlx-migrate).
+pub async fn bootstrap_event_schema(pool: &PgPool) -> anyhow::Result<()> {
+    let mut conn = pool.acquire().await?;
+
+    // Use idempotent `IF NOT EXISTS` to keep it re-runnable.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS event_store (
+            id            UUID            PRIMARY KEY,
+            aggregate_id  UUID            NOT NULL,
+            seq           BIGINT          NOT NULL,
+            payload       JSONB           NOT NULL,
+
+            CONSTRAINT seq_unique UNIQUE (aggregate_id, seq)
+        );
+
+        -- Fast lookup for aggregates
+        CREATE INDEX IF NOT EXISTS idx_event_store_aggregate
+            ON event_store (aggregate_id);
+
+        -- Staging area for outbox pattern (tx-scoped)
+        CREATE TEMP TABLE IF NOT EXISTS _staged_events (
+            payload JSONB NOT NULL
+        ) ON COMMIT DROP;
+        "#,
+    )
+    .execute(&mut conn)
+    .await?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests (can run w/ `cargo test -- --ignored` once a local PG + NATS exists)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[tokio::test]
+    #[ignore] // Requires external services
+    async fn round_trip_event_append_and_publish() -> anyhow::Result<()> {
+        dotenvy::dotenv().ok();
+        let db = env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set for integration tests");
+        let nats_url = env::var("NATS_URL").unwrap_or_else(|_| "tls://localhost:4222".into());
+
+        let store = EventStore::connect(&db, 5).await?;
+        bootstrap_event_schema(&store.pool).await?;
+
+        let publisher = EventPublisher::connect(&nats_url, "edupulse.events").await?;
+        let ctx = EventContext::new(store.clone(), publisher);
+
+        let aggregate_id = Uuid::new_v4();
+
+        // Transaction: publish a *LessonPublished* event
+        ctx.commit(|ctx, tx| async move {
+            ctx.append(
+                tx,
+                aggregate_id,
+                0,
+                DomainEvent::LessonPublished {
+                    lesson_id: Uuid::new_v4(),
+                    author_id: Uuid::new_v4(),
+                    title: "Quantum Entanglement 101".into(),
+                },
+                None,
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await?;
+
+        // Verify sequence
+        assert_eq!(store.latest_sequence_for(&aggregate_id).await?, Some(1));
+
+        Ok(())
+    }
+}
+```

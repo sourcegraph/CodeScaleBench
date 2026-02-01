@@ -1,0 +1,331 @@
+```rust
+//! src/module_46.rs
+//!
+//! Real-time sentiment aggregation micro–service.
+//!
+//! This component listens to the `sentiment.enriched` Kafka topic that is
+//! produced by the enrichment pipeline.  It applies a pluggable windowing
+//! aggregation strategy (Strategy Pattern) and publishes the consolidated
+//! metrics to `sentiment.aggregated`.  The design purposefully hides the
+//! streaming details behind a small façade (`SentimentAggregator`) so that
+//! data-scientists can hot-swap aggregation algorithms at run-time without
+//! touching any Kafka plumbing.
+//!
+//! Compile-time feature flags
+//! --------------------------
+//! `metrics` – export Prometheus counters / histograms using the `metrics`
+//!             crate.  
+//! `otel`    – enable OpenTelemetry tracing.
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use rdkafka::{
+    config::ClientConfig,
+    consumer::{Consumer, StreamConsumer},
+    message::{BorrowedMessage, Headers},
+    producer::{FutureProducer, FutureRecord},
+    util::Timeout,
+};
+use serde::{Deserialize, Serialize};
+use tokio::{select, task, time};
+use tokio_stream::StreamExt;
+use tracing::{debug, error, info, instrument};
+
+/// Input message schema coming from the enrichment pipeline.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SentimentRecord {
+    pub message_id: String,
+    pub topic: String,
+    pub language: String,
+    pub sentiment_score: f32,
+    /// Unix timestamp in milliseconds.
+    pub timestamp_ms: i64,
+}
+
+/// Aggregated representation emitted to downstream consumers.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AggregatedSentiment {
+    pub topic: String,
+    /// ISO-8601 window start.
+    pub window_start: DateTime<Utc>,
+    /// ISO-8601 window end.
+    pub window_end: DateTime<Utc>,
+    pub average_sentiment: f32,
+    pub samples: u64,
+}
+
+/// Strategy Pattern: pluggable aggregation algorithms.
+pub trait AggregationStrategy: Send + Sync + 'static {
+    /// Consume a `SentimentRecord` and, if the inner window closes, return
+    /// zero or more aggregated results ready for publishing.
+    fn aggregate(&mut self, record: &SentimentRecord) -> Vec<AggregatedSentiment>;
+}
+
+/// Sliding one-minute average per topic.
+pub struct OneMinuteAvgStrategy {
+    window_size: Duration,
+    /// topic -> active window bucket.
+    buckets: HashMap<String, Window>,
+}
+
+impl Default for OneMinuteAvgStrategy {
+    fn default() -> Self {
+        Self {
+            window_size: Duration::from_secs(60),
+            buckets: HashMap::new(),
+        }
+    }
+}
+
+impl AggregationStrategy for OneMinuteAvgStrategy {
+    fn aggregate(&mut self, record: &SentimentRecord) -> Vec<AggregatedSentiment> {
+        let mut output = Vec::new();
+        let bucket = self
+            .buckets
+            .entry(record.topic.clone())
+            .or_insert_with(|| Window::new(record.timestamp_ms, self.window_size));
+
+        // If the record falls outside the current bucket, flush & rotate.
+        if bucket.exceeds(record.timestamp_ms) {
+            output.push(bucket.close());
+            *bucket = Window::new(record.timestamp_ms, self.window_size);
+        }
+
+        bucket.add(record.sentiment_score);
+
+        output
+    }
+}
+
+/// Internal state holder for an active window.
+#[derive(Debug)]
+struct Window {
+    start_ms: i64,
+    end_ms: i64,
+    sum: f64,
+    count: u64,
+}
+
+impl Window {
+    fn new(start_ms: i64, size: Duration) -> Self {
+        let end_ms = start_ms + (size.as_millis() as i64);
+        Self {
+            start_ms,
+            end_ms,
+            sum: 0.0,
+            count: 0,
+        }
+    }
+
+    fn add(&mut self, score: f32) {
+        self.sum += score as f64;
+        self.count += 1;
+    }
+
+    fn exceeds(&self, ts_ms: i64) -> bool {
+        ts_ms >= self.end_ms
+    }
+
+    fn close(&self) -> AggregatedSentiment {
+        let avg = if self.count == 0 {
+            0.0
+        } else {
+            (self.sum / self.count as f64) as f32
+        };
+
+        AggregatedSentiment {
+            topic: String::from(""), // to be filled by caller.
+            window_start: unix_ms_to_datetime(self.start_ms),
+            window_end: unix_ms_to_datetime(self.end_ms),
+            average_sentiment: avg,
+            samples: self.count,
+        }
+    }
+}
+
+/// Converts Unix milliseconds to `DateTime<Utc>`.
+fn unix_ms_to_datetime(ms: i64) -> DateTime<Utc> {
+    let d = UNIX_EPOCH + Duration::from_millis(ms as u64);
+    DateTime::<Utc>::from(d)
+}
+
+/// Kafka settings required by this micro-service.
+#[derive(Clone, Debug)]
+pub struct KafkaConfig {
+    pub brokers: String,
+    pub group_id: String,
+    pub consume_topic: String,
+    pub produce_topic: String,
+}
+
+impl KafkaConfig {
+    fn build_consumer(&self) -> Result<StreamConsumer> {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &self.brokers)
+            .set("group.id", &self.group_id)
+            .set("auto.offset.reset", "latest")
+            .create()
+            .context("Failed to create Kafka consumer")?;
+
+        consumer
+            .subscribe(&[&self.consume_topic])
+            .context("Failed to subscribe to topic")?;
+
+        Ok(consumer)
+    }
+
+    fn build_producer(&self) -> Result<FutureProducer> {
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &self.brokers)
+            .set("message.timeout.ms", "5000")
+            .create()
+            .context("Failed to create Kafka producer")?;
+
+        Ok(producer)
+    }
+}
+
+/// Top-level façade hiding Kafka details from data scientists.
+pub struct SentimentAggregator {
+    cfg: KafkaConfig,
+    strategy: Box<dyn AggregationStrategy>,
+}
+
+impl SentimentAggregator {
+    pub fn new(cfg: KafkaConfig, strategy: Box<dyn AggregationStrategy>) -> Self {
+        Self { cfg, strategy }
+    }
+
+    #[instrument(skip(self))]
+    pub async fn run(self) -> Result<()> {
+        let consumer = self.cfg.build_consumer()?;
+        let producer = self.cfg.build_producer()?;
+
+        // Wrap the strategy in a Mutex so we can move it into the async stream.
+        let strategy = Arc::new(Mutex::new(self.strategy));
+
+        info!("SentimentAggregator online; waiting for events …");
+
+        let mut message_stream = consumer.stream();
+
+        loop {
+            select! {
+                maybe_msg = message_stream.next() => {
+                    match maybe_msg {
+                        Some(Ok(msg)) => {
+                            if let Err(e) = process_message(&msg, &producer, &self.cfg, Arc::clone(&strategy)).await {
+                                error!(error=%e, "Failed to process message");
+                            }
+                        }
+                        Some(Err(e)) => {
+                            error!(error=%e, "Kafka error");
+                            time::sleep(Duration::from_secs(1)).await;
+                        }
+                        None => {
+                            debug!("Kafka stream ended");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[instrument(level = "debug", skip_all)]
+async fn process_message(
+    msg: &BorrowedMessage<'_>,
+    producer: &FutureProducer,
+    cfg: &KafkaConfig,
+    strategy: Arc<Mutex<Box<dyn AggregationStrategy>>>,
+) -> Result<()> {
+    let record: SentimentRecord = serde_json::from_slice(msg.payload().context("empty payload")?)
+        .context("Deserialization failure")?;
+
+    // Apply strategy.
+    let results = {
+        let mut strat = strategy.lock().unwrap();
+        strat.aggregate(&record)
+    };
+
+    for mut agg in results {
+        // The `topic` field was left blank during Window::close.
+        agg.topic = record.topic.clone();
+
+        let payload = serde_json::to_vec(&agg)?;
+        let key = agg.topic.clone();
+
+        // Fire-and-forget up to 5 s.
+        producer
+            .send(
+                FutureRecord::to(&cfg.produce_topic)
+                    .key(&key)
+                    .payload(&payload)
+                    .headers(Headers::new().add("content-type", "application/json")),
+                Timeout::After(Duration::from_secs(5)),
+            )
+            .await
+            .map_err(|(e, _)| e)
+            .context("Failed to publish aggregated record")?;
+
+        debug!(topic = %agg.topic, start = %agg.window_start, count=%agg.samples,
+               "Published aggregated sentiment");
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Binary entry point (optional)
+//
+// This file doubles as both a library and a thin binary so that `cargo run -p
+// sentiment_aggregator` just works in local development.
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "integration"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_closes_correctly() {
+        let size = Duration::from_secs(60);
+        let mut w = Window::new(0, size);
+
+        for _ in 0..10 {
+            w.add(1.0);
+        }
+
+        assert!(!w.exceeds(59_999));
+        assert!(w.exceeds(60_000));
+
+        let agg = w.close();
+        assert_eq!(agg.samples, 10);
+        assert_eq!(agg.average_sentiment, 1.0);
+    }
+}
+
+#[cfg(feature = "bin")]
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
+    let cfg = KafkaConfig {
+        brokers: std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".into()),
+        group_id: std::env::var("KAFKA_GROUP").unwrap_or_else(|_| "sentiment-aggregator".into()),
+        consume_topic: std::env::var("INPUT_TOPIC").unwrap_or_else(|_| "sentiment.enriched".into()),
+        produce_topic: std::env::var("OUTPUT_TOPIC").unwrap_or_else(|_| "sentiment.aggregated".into()),
+    };
+
+    let strategy = Box::<OneMinuteAvgStrategy>::default();
+
+    SentimentAggregator::new(cfg, strategy).run().await
+}
+```

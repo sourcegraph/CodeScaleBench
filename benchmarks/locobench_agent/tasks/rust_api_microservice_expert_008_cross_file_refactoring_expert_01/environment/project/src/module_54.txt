@@ -1,0 +1,325 @@
+```rust
+//! LedgerLink Nexus – Ledger Entry Query/Micro-Caching Module
+//!
+//! This module provides the core building-blocks required to
+//! query and paginate Ledger Entries **efficiently** while
+//! keeping the surrounding infrastructure (database, cache,
+//! tracing, validation, …) completely decoupled from the
+//! application’s domain logic.
+//!
+//! File: `src/module_54.rs`
+//! Part of: LedgerLink Nexus (api_microservice)
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use deadpool_redis::{redis::AsyncCommands, Connection as RedisConn, Pool as RedisPool};
+use derive_more::{Display, From};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgRow, PgPool, Row};
+use thiserror::Error;
+use tracing::{debug, instrument};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+/// Maximum page size allowed by the API (prevents DoS from absurdly large pages).
+pub const MAX_PAGE_SIZE: u32 = 500;
+
+/// TTL for ledger-entry JSON blobs cached in Redis.
+pub const CACHE_TTL: Duration = Duration::from_secs(90);
+
+/// Result alias used throughout this module.
+pub type Result<T, E = LedgerEntryError> = std::result::Result<T, E>;
+
+/// Domain-level error enumeration for ledger entry flow.
+#[derive(Debug, Display, Error, From)]
+pub enum LedgerEntryError {
+    #[display(fmt = "validation failure: {}", _0)]
+    Validation(validator::ValidationErrors),
+
+    #[display(fmt = "repository error: {}", _0)]
+    Repository(sqlx::Error),
+
+    #[display(fmt = "cache error: {}", _0)]
+    Cache(deadpool_redis::PoolError),
+
+    #[display(fmt = "redis command error: {}", _0)]
+    RedisCmd(deadpool_redis::redis::RedisError),
+
+    #[display(fmt = "internal server error")]
+    Internal,
+}
+
+/// Public query DTO (View) representing the client’s request parameters.
+///
+/// Validation is automatically triggered by `validate()` calls.
+#[derive(Debug, Deserialize, Validate)]
+pub struct LedgerEntryQuery {
+    #[validate(range(min = 1, max = "MAX_PAGE_SIZE"))]
+    pub page_size: u32,
+
+    #[validate(range(min = 0))]
+    pub page: u32,
+
+    /// Optional cursor for stateless paging.
+    pub cursor: Option<Uuid>,
+
+    /// Filter by tenant in our multi-tenant system.
+    #[validate(length(min = 1))]
+    pub tenant_id: String,
+
+    /// Optional ISO-8601 date constraint (inclusive lower bound)
+    #[validate(custom = "validate_chrono_date")]
+    pub since: Option<DateTime<Utc>>,
+}
+
+/// Custom validator helper for chrono DateTime fields.
+fn validate_chrono_date(dt: &DateTime<Utc>) -> std::result::Result<(), ValidationError> {
+    let year = dt.year();
+    // Simple sanity check (Nexus was founded in 2010; reject anything before):
+    if year < 2010 {
+        return Err(ValidationError::new("date_range"));
+    }
+    Ok(())
+}
+
+/// View-Model returned to API clients.
+/// (Flattened & serialized independently from DB schema.)
+#[derive(Debug, Serialize)]
+pub struct LedgerEntryViewModel {
+    pub id: Uuid,
+    pub tenant_id: String,
+    pub booking_date: DateTime<Utc>,
+    pub amount_minor_units: i64,
+    pub currency: String,
+    pub counterpart: String,
+    pub narrative: Option<String>,
+}
+
+/// Pagination wrapper that is inlined in the HTTP/GraphQL response
+/// to make the client’s integration simpler.
+#[derive(Debug, Serialize)]
+pub struct Paginated<T> {
+    pub data: Vec<T>,
+    pub page: u32,
+    pub page_size: u32,
+    pub has_next: bool,
+    pub next_cursor: Option<Uuid>,
+}
+
+/// Internal representation of a row in the `ledger_entries` table.
+#[derive(Debug)]
+struct LedgerEntryRow {
+    id: Uuid,
+    tenant_id: String,
+    booking_date: DateTime<Utc>,
+    amount_minor_units: i64,
+    currency: String,
+    counterpart: String,
+    narrative: Option<String>,
+}
+
+impl From<LedgerEntryRow> for LedgerEntryViewModel {
+    fn from(row: LedgerEntryRow) -> Self {
+        Self {
+            id: row.id,
+            tenant_id: row.tenant_id,
+            booking_date: row.booking_date,
+            amount_minor_units: row.amount_minor_units,
+            currency: row.currency,
+            counterpart: row.counterpart,
+            narrative: row.narrative,
+        }
+    }
+}
+
+/// Repository abstraction – hides the persistence layer.
+///
+/// This follows the Repository Pattern so the Service Layer does not depend
+/// on (nor is polluted by) SQL/ORM specifics.
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    async fn fetch_page(
+        &self,
+        query: &LedgerEntryQuery,
+    ) -> Result<(Vec<LedgerEntryRow>, bool /* has_next */)>;
+}
+
+/// PostgreSQL O/R-mapper-free implementation leveraging `sqlx`.
+pub struct PgLedgerEntryRepository {
+    pool: PgPool,
+}
+
+impl PgLedgerEntryRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for PgLedgerEntryRepository {
+    #[instrument(skip_all, fields(tenant = %query.tenant_id))]
+    async fn fetch_page(
+        &self,
+        query: &LedgerEntryQuery,
+    ) -> Result<(Vec<LedgerEntryRow>, bool)> {
+        let limit = query.page_size as i64 + 1; // request one extra row to detect `has_next`
+        let offset = (query.page * query.page_size) as i64;
+
+        let rows: Vec<PgRow> = sqlx::query(
+            r#"
+            SELECT id,
+                   tenant_id,
+                   booking_date,
+                   amount_minor_units,
+                   currency,
+                   counterpart,
+                   narrative
+            FROM   ledger_entries
+            WHERE  tenant_id = $1
+              AND  ($2::timestamptz IS NULL OR booking_date >= $2)
+            ORDER  BY booking_date DESC, id DESC
+            LIMIT  $3
+            OFFSET $4
+            "#,
+        )
+        .bind(&query.tenant_id)
+        .bind(query.since)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let has_next = rows.len() as u32 > query.page_size;
+        let rows = rows
+            .into_iter()
+            .take(query.page_size as usize)
+            .map(|r| LedgerEntryRow {
+                id: r.get("id"),
+                tenant_id: r.get("tenant_id"),
+                booking_date: r.get("booking_date"),
+                amount_minor_units: r.get("amount_minor_units"),
+                currency: r.get("currency"),
+                counterpart: r.get("counterpart"),
+                narrative: r.get("narrative"),
+            })
+            .collect();
+
+        Ok((rows, has_next))
+    }
+}
+
+/// Service Layer that orchestrates Repository + Caching,
+/// ensures DTO validation and emits tracing spans.
+#[derive(Clone)]
+pub struct LedgerEntryService<R: LedgerEntryRepository> {
+    repo: Arc<R>,
+    cache: RedisPool,
+}
+
+impl<R: LedgerEntryRepository> LedgerEntryService<R> {
+    pub fn new(repo: R, cache: RedisPool) -> Self {
+        Self {
+            repo: Arc::new(repo),
+            cache,
+        }
+    }
+
+    /// High-level async query API used by REST/GraphQL handlers.
+    #[instrument(skip_all, fields(tenant=%query.tenant_id, page=query.page, page_size=query.page_size))]
+    pub async fn query_ledger_entries(
+        &self,
+        mut query: LedgerEntryQuery,
+    ) -> Result<Paginated<LedgerEntryViewModel>> {
+        // 1) Validate request upfront.
+        query
+            .validate()
+            .map_err(LedgerEntryError::Validation)?;
+
+        // 2) Check mini-cache.
+        let cache_key = Self::compute_cache_key(&query);
+
+        if let Some(cached) = self.get_cached_page(&cache_key).await? {
+            debug!("cache hit");
+            return Ok(cached);
+        }
+
+        // 3) Cache missed: fetch from repository.
+        let (rows, has_next) = self.repo.fetch_page(&query).await?;
+
+        let data: Vec<LedgerEntryViewModel> =
+            rows.into_iter().map(Into::into).collect();
+
+        let next_cursor = data.last().map(|vm| vm.id);
+
+        let resp = Paginated {
+            data,
+            page: query.page,
+            page_size: query.page_size,
+            has_next,
+            next_cursor,
+        };
+
+        // 4) Write to cache in the background (best effort).
+        self.put_cache_page(cache_key, &resp).await?;
+
+        Ok(resp)
+    }
+
+    /// Creates a stable cache key from query parameters.
+    fn compute_cache_key(query: &LedgerEntryQuery) -> String {
+        let since = query
+            .since
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| "null".into());
+
+        format!(
+            "ledger_page:v1:{}:{}:{}:{}:{}",
+            query.tenant_id, query.page, query.page_size, query.cursor.unwrap_or_default(), since
+        )
+    }
+
+    /// Attempt to fetch and deserialize a previously serialized response.
+    async fn get_cached_page(
+        &self,
+        key: &str,
+    ) -> Result<Option<Paginated<LedgerEntryViewModel>>> {
+        let mut conn = self.get_redis_conn().await?;
+        let payload: Option<Vec<u8>> = conn.get(key).await?;
+        if let Some(bytes) = payload {
+            let model: Paginated<LedgerEntryViewModel> =
+                match serde_json::from_slice(&bytes) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        // Corrupted JSON cached – delete key to be safe.
+                        let _: () = conn.del(key).await.unwrap_or_default();
+                        return Ok(None);
+                    }
+                };
+            Ok(Some(model))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Serializes response and stores it in Redis with an expiration.
+    async fn put_cache_page(
+        &self,
+        key: String,
+        payload: &Paginated<LedgerEntryViewModel>,
+    ) -> Result<()> {
+        let mut conn = self.get_redis_conn().await?;
+        let buf = serde_json::to_vec(payload).map_err(|_| LedgerEntryError::Internal)?;
+        let (): () = conn
+            .set_ex::<_, _, ()>(key, buf, CACHE_TTL.as_secs() as usize)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_redis_conn(&self) -> Result<RedisConn> {
+        self.cache.get().await.map_err(LedgerEntryError::Cache)
+    }
+}
+```

@@ -1,0 +1,516 @@
+```rust
+//! ChirpPulse – Quality‐Control Pipeline
+//! =====================================
+//!
+//! This module implements the Quality-Control (QC) stage that sits early in the
+//! ingestion pipeline.  Every incoming `SocialRecord` is validated against a
+//! configurable set of `QualityRule`s.  Records that pass are forwarded to the
+//! *validated* Kafka topic, while rejected records are written to a quarantine
+//! topic alongside a detailed `QualityReport` for later inspection.
+//!
+//! Highlights
+//! ----------
+//! • Strategy pattern for hot-swappable rules                   </br>
+//! • Builder pattern for ergonomic, type-safe configuration     </br>
+//! • Tokio-based async runtime with graceful shutdown           </br>
+//! • Comprehensive tracing, metrics, and error handling
+//!
+//! The code is intended to be production-ready and showcases idiomatic Rust
+//! practices used at scale in data-streaming systems.
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::Duration,
+};
+
+use chrono::{DateTime, Utc};
+use futures::{future::try_join_all, StreamExt};
+use rdkafka::{
+    consumer::{stream_consumer::StreamConsumer, Consumer},
+    error::KafkaError,
+    message::{BorrowedMessage, OwnedHeaders},
+    producer::{FutureProducer, FutureRecord},
+    util::Timeout,
+    ClientConfig,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{select, signal, task::JoinHandle};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Name of the header that stores QC failure reason when publishing to quarantine.
+const QC_FAILURE_REASON_HDR: &str = "qc.failure.reason";
+
+/// A single (already partially enriched) social record.
+///
+/// Records enter the QC stage right after the canonicalization step and before
+/// enrichment. Only light validation and metadata lookups are performed here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialRecord {
+    pub id: String,
+    pub text: String,
+    pub lang: Option<String>,
+    pub spam_score: Option<f32>,
+    pub timestamp: DateTime<Utc>,
+    /// Arbitrary metadata such as sentiment, country, engagement, etc.
+    #[serde(default)]
+    pub metadata: HashMap<String, serde_json::Value>,
+}
+
+/// Failure severity used by [`RuleOutcome`].
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum Severity {
+    Warn,
+    Error,
+}
+
+/// Outcome of a single quality rule evaluation.
+#[derive(Debug)]
+pub enum RuleOutcome {
+    Passed,
+    Failed {
+        severity: Severity,
+        reason:   &'static str,
+    },
+}
+
+/// Common interface for every QC rule.
+pub trait QualityRule: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn check(&self, record: &SocialRecord) -> RuleOutcome;
+}
+
+/// A rule that verifies language detection exists and is within an allowed set.
+pub struct LanguageRule {
+    allowed: Arc<Vec<String>>,
+}
+
+impl LanguageRule {
+    pub fn new(allowed: Vec<String>) -> Self {
+        Self {
+            allowed: Arc::new(allowed),
+        }
+    }
+}
+
+impl QualityRule for LanguageRule {
+    fn name(&self) -> &'static str {
+        "language"
+    }
+
+    fn check(&self, record: &SocialRecord) -> RuleOutcome {
+        match &record.lang {
+            None => RuleOutcome::Failed {
+                severity: Severity::Error,
+                reason:   "missing_language",
+            },
+            Some(lang) if !self.allowed.contains(lang) => RuleOutcome::Failed {
+                severity: Severity::Error,
+                reason:   "unsupported_language",
+            },
+            _ => RuleOutcome::Passed,
+        }
+    }
+}
+
+/// A rule that checks whether a spam score crosses a configured threshold.
+pub struct SpamScoreRule {
+    threshold: f32,
+}
+
+impl SpamScoreRule {
+    pub fn new(threshold: f32) -> Self {
+        Self { threshold }
+    }
+}
+
+impl QualityRule for SpamScoreRule {
+    fn name(&self) -> &'static str {
+        "spam_score"
+    }
+
+    fn check(&self, record: &SocialRecord) -> RuleOutcome {
+        match record.spam_score {
+            Some(score) if score > self.threshold => RuleOutcome::Failed {
+                severity: Severity::Warn,
+                reason:   "spam_score_above_threshold",
+            },
+            _ => RuleOutcome::Passed,
+        }
+    }
+}
+
+/// Aggregated QC report for a record.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QualityReport {
+    pub record_id: String,
+    pub failed_rules: Vec<&'static str>,
+    pub reasons: Vec<&'static str>,
+}
+
+/// QC‐related errors raised by this module.
+#[derive(Error, Debug)]
+pub enum QualityError {
+    #[error("kafka error: {0}")]
+    Kafka(#[from] KafkaError),
+
+    #[error("tokio task join error: {0}")]
+    Join(#[from] tokio::task::JoinError),
+
+    #[error("task cancelled during graceful shutdown")]
+    Cancelled,
+
+    #[error("serialization failure: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+/// Orchestrates evaluation of all configured quality rules.
+#[derive(Clone)]
+pub struct QualityGate {
+    rules: Arc<Vec<Arc<dyn QualityRule>>>,
+}
+
+impl QualityGate {
+    /// Build a new gate from the supplied rule set.
+    pub fn new<R>(rules: R) -> Self
+    where
+        R: IntoIterator<Item = Arc<dyn QualityRule>>,
+    {
+        Self {
+            rules: Arc::new(rules.into_iter().collect()),
+        }
+    }
+
+    /// Evaluate a record and optionally return a QC report containing every
+    /// failing rule. `None` is returned when the record passes all rules.
+    pub fn validate(&self, record: &SocialRecord) -> Option<QualityReport> {
+        let mut failed_rules = Vec::<&'static str>::new();
+        let mut reasons      = Vec::<&'static str>::new();
+
+        for rule in self.rules.iter() {
+            match rule.check(record) {
+                RuleOutcome::Passed => continue,
+                RuleOutcome::Failed { reason, .. } => {
+                    failed_rules.push(rule.name());
+                    reasons.push(reason);
+                }
+            }
+        }
+
+        if failed_rules.is_empty() {
+            None
+        } else {
+            Some(QualityReport {
+                record_id:    record.id.clone(),
+                failed_rules,
+                reasons,
+            })
+        }
+    }
+}
+
+/// Runtime configuration for the QC microservice.
+///
+/// This struct is populated via `serde` from `TOML`, `JSON`, or environment
+/// variables (e.g., using `config` crate outside of this module).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServiceConfig {
+    /* Kafka */
+    pub brokers:            String,
+    pub group_id:           String,
+    pub input_topic:        String,
+    pub validated_topic:    String,
+    pub quarantine_topic:   String,
+
+    /* QC parameters */
+    #[serde(default)]
+    pub allowed_languages:  Vec<String>,
+    #[serde(default = "default_spam_threshold")]
+    pub spam_threshold:     f32,
+
+    /* Runtime */
+    #[serde(default = "default_shutdown_grace")]
+    pub shutdown_grace_sec: u64,
+}
+
+fn default_spam_threshold() -> f32 {
+    0.75
+}
+
+fn default_shutdown_grace() -> u64 {
+    10
+}
+
+/// End-to-end QC service façade.
+///
+/// This object takes over Kafka connectivity, spawns worker tasks, and exposes
+/// a single `run()` function that blocks until a termination signal arrives.
+pub struct QualityControlService {
+    gate:     QualityGate,
+    cfg:      ServiceConfig,
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+}
+
+impl QualityControlService {
+    /// Instantiate the service from config.
+    pub fn try_from_cfg(cfg: ServiceConfig) -> Result<Self, QualityError> {
+        /* --- Build Gate --------------------------------------------------- */
+        let gate = QualityGate::new(vec![
+            Arc::new(LanguageRule::new(cfg.allowed_languages.clone())),
+            Arc::new(SpamScoreRule::new(cfg.spam_threshold)),
+        ]);
+
+        /* --- Kafka Consumer ---------------------------------------------- */
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.brokers)
+            .set("group.id", &cfg.group_id)
+            .set("enable.partition.eof", "false")
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .create()?;
+
+        consumer.subscribe(&[&cfg.input_topic])?;
+
+        /* --- Kafka Producer ---------------------------------------------- */
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.brokers)
+            .set("message.timeout.ms", "5000")
+            .create()?;
+
+        Ok(Self {
+            gate,
+            cfg,
+            consumer,
+            producer,
+        })
+    }
+
+    /// Starts the QC service and blocks until a SIGINT/SIGTERM is received
+    /// or a fatal error occurs.
+    #[instrument(skip_all, name = "quality_control_service.run")]
+    pub async fn run(self) -> Result<(), QualityError> {
+        info!("QC microservice booting …");
+        let mut tasks = Vec::<JoinHandle<Result<(), QualityError>>>::new();
+
+        // Spawn the main processing loop.
+        let processing_handle = tokio::spawn(self.clone().processing_loop());
+        tasks.push(processing_handle);
+
+        // Wait for termination signal.
+        select! {
+            _ = signal::ctrl_c() => {
+                info!("Shutdown signal received");
+            }
+        }
+
+        // Give tasks some time to finish gracefully.
+        let grace = Duration::from_secs(self.cfg.shutdown_grace_sec);
+        let timeout = tokio::time::sleep(grace);
+        tokio::pin!(timeout);
+
+        // Abort tasks if they don't finish in time.
+        loop {
+            select! {
+                biased;
+                _ = &mut timeout => {
+                    warn!("Grace period exceeded, aborting tasks");
+                    for t in &tasks {
+                        t.abort();
+                    }
+                    break;
+                }
+                Some(res) = tasks.pop() => match res {
+                    Ok(inner) => inner?, // bubble up first error
+                    Err(err)  => return Err(QualityError::from(err)),
+                },
+                else => break,
+            }
+        }
+
+        info!("QC microservice stopped");
+        Ok(())
+    }
+
+    /// Main processing loop – consumes, validates, and publishes records in a
+    /// back-pressure-aware manner.
+    async fn processing_loop(self) -> Result<(), QualityError> {
+        let mut stream = self.consumer.stream();
+
+        loop {
+            let msg = match stream.next().await {
+                Some(Ok(msg)) => msg,
+                Some(Err(err)) => {
+                    error!(error = ?err, "Kafka error while reading");
+                    continue;
+                }
+                None => {
+                    warn!("Kafka stream exhausted");
+                    break;
+                }
+            };
+
+            match self.handle_message(&msg).await {
+                Ok(_) => self.consumer.commit_message(&msg, rdkafka::consumer::CommitMode::Async)?,
+                Err(err) => error!(error = ?err, "Failed to handle message"),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle a single Kafka message: deserialize, run QC, and publish.
+    #[instrument(skip_all, fields(offset = %msg.offset(), partition = %msg.partition()))]
+    async fn handle_message(&self, msg: &BorrowedMessage<'_>) -> Result<(), QualityError> {
+        let payload = match msg.payload_view::<str>() {
+            Some(Ok(json)) => json,
+            Some(Err(_)) | None => {
+                warn!("Received message with invalid UTF-8 payload, discarding");
+                return Ok(());
+            }
+        };
+
+        let record: SocialRecord = serde_json::from_str(payload)?;
+        match self.gate.validate(&record) {
+            None => self.publish_validated(&record).await,
+            Some(report) => self.publish_to_quarantine(&record, &report).await,
+        }
+    }
+
+    /// Publish a passing record to the *validated* topic.
+    async fn publish_validated(&self, record: &SocialRecord) -> Result<(), QualityError> {
+        let json = serde_json::to_vec(record)?;
+        let fut = self
+            .producer
+            .send(
+                FutureRecord::to(&self.cfg.validated_topic)
+                    .key(&record.id)
+                    .payload(&json),
+                Timeout::Never,
+            )
+            .await;
+
+        match fut {
+            Ok(_) => {
+                debug!(id = %record.id, "published to validated topic");
+                Ok(())
+            }
+            Err((err, _)) => Err(QualityError::Kafka(err)),
+        }
+    }
+
+    /// Publish a failing record together with QC metadata to the quarantine topic.
+    async fn publish_to_quarantine(
+        &self,
+        record: &SocialRecord,
+        report: &QualityReport,
+    ) -> Result<(), QualityError> {
+        let json_record   = serde_json::to_vec(record)?;
+        let json_report   = serde_json::to_vec(report)?;
+        let reason_string = report.reasons.join(",");
+
+        let fut = self
+            .producer
+            .send(
+                FutureRecord::to(&self.cfg.quarantine_topic)
+                    .key(&record.id)
+                    .payload(&json_record)
+                    .headers(
+                        OwnedHeaders::new()
+                            .add(QC_FAILURE_REASON_HDR, &reason_string)
+                            .add("qc.report", &json_report),
+                    ),
+                Timeout::Never,
+            )
+            .await;
+
+        match fut {
+            Ok(_) => {
+                debug!(id = %record.id, "published to quarantine");
+                Ok(())
+            }
+            Err((err, _)) => Err(QualityError::Kafka(err)),
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              Service Entrypoint                            */
+/* -------------------------------------------------------------------------- */
+
+/// Convenience wrapper used by `main.rs`.  Panics are limited to configuration
+/// failures; runtime errors are logged and cause a non-zero exit code.
+pub async fn run_quality_control_service(cfg: ServiceConfig) {
+    if let Err(err) = QualityControlService::try_from_cfg(cfg.clone())
+        .and_then(|svc| tokio::runtime::Handle::current().block_on(svc.run()))
+    {
+        error!(error = ?err, "QC service terminated with error");
+        std::process::exit(1);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                  Unit Tests                                */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_gate() -> QualityGate {
+        QualityGate::new(vec![
+            Arc::new(LanguageRule::new(vec!["en".into()])),
+            Arc::new(SpamScoreRule::new(0.8)),
+        ])
+    }
+
+    #[test]
+    fn test_gate_pass() {
+        let gate = build_gate();
+        let rec = SocialRecord {
+            id: "42".into(),
+            text: "hello".into(),
+            lang: Some("en".into()),
+            spam_score: Some(0.1),
+            timestamp: Utc::now(),
+            metadata: Default::default(),
+        };
+
+        assert!(gate.validate(&rec).is_none());
+    }
+
+    #[test]
+    fn test_gate_fail_language() {
+        let gate = build_gate();
+        let rec = SocialRecord {
+            id: "43".into(),
+            text: "hola".into(),
+            lang: Some("es".into()),
+            spam_score: Some(0.1),
+            timestamp: Utc::now(),
+            metadata: Default::default(),
+        };
+
+        let report = gate.validate(&rec).expect("expected QC failure");
+        assert_eq!(report.failed_rules, vec!["language"]);
+        assert_eq!(report.reasons, vec!["unsupported_language"]);
+    }
+
+    #[test]
+    fn test_gate_warn_spam() {
+        let gate = build_gate();
+        let rec = SocialRecord {
+            id: "44".into(),
+            text: "buy now".into(),
+            lang: Some("en".into()),
+            spam_score: Some(0.9),
+            timestamp: Utc::now(),
+            metadata: Default::default(),
+        };
+
+        let report = gate.validate(&rec).expect("expected QC failure");
+        assert_eq!(report.failed_rules, vec!["spam_score"]);
+    }
+}
+```

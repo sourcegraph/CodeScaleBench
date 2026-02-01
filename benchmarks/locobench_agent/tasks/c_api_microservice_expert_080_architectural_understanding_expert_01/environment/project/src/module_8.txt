@@ -1,0 +1,438 @@
+```c
+/*
+ * MercuryMonolith Commerce Hub
+ * ----------------------------------------
+ * Module: Response Cache
+ *
+ * File Path: src/module_8.txt
+ * Language : C99
+ *
+ * Description:
+ *   Thread–safe, in-memory LRU cache for HTTP/GraphQL responses with TTL
+ *   expiration, Prometheus-compatible metrics, and structured logging.
+ *
+ *   The cache is transparent to service modules and plugs into the shared
+ *   event bus so that any mutation event (e.g., order placed, catalog item
+ *   updated) can broadcast invalidation messages.
+ *
+ *   This implementation deliberately depends only on ubiquitous libraries
+ *   (pthread, time, stdlib) and two internal headers—`logger.h` for
+ *   structured logging and `metrics.h` for runtime instrumentation—so it can
+ *   be reused by other subsystems (rate limiting, session storage, etc.).
+ *
+ * Build:
+ *   gcc -std=c99 -Wall -Wextra -pthread -c src/module_8.txt -o response_cache.o
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <time.h>
+#include <string.h>
+#include <pthread.h>
+#include <errno.h>
+
+/* Third-party single-header hash table (BSD license)                  */
+#include "uthash.h"
+
+/* Project internal headers                                            */
+#include "logger.h"   /* logger_info(), logger_warn(), logger_error()   */
+#include "metrics.h"  /* metrics_counter_inc(), metrics_gauge_set()    */
+
+/* -------------------------------------------------------------------------- */
+/*                              Utility Helpers                               */
+/* -------------------------------------------------------------------------- */
+
+#define NS_PER_MS   1000000ULL
+#define MS_PER_SEC  1000ULL
+
+/* Return the current epoch time in milliseconds.                            */
+static inline uint64_t
+epoch_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * MS_PER_SEC + ts.tv_nsec / NS_PER_MS;
+}
+
+/* Safely allocate memory or abort the program if OOM.                       */
+static inline void *
+xmalloc(size_t sz)
+{
+    void *ptr = malloc(sz);
+    if (!ptr) {
+        logger_fatal("response-cache", "Out of memory while allocating %zu bytes", sz);
+        abort();
+    }
+    return ptr;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              Data Structures                               */
+/* -------------------------------------------------------------------------- */
+
+typedef struct CacheEntry {
+    char               *key;           /* UTF-8 resource identifier (URI + Vary set).         */
+    void               *blob;          /* Opaque payload ‑ owned by cache.                    */
+    size_t              blob_size;     /* Payload length in bytes.                            */
+    uint64_t            expiry_ms;     /* Expiration timestamp in epoch-ms.                   */
+    struct CacheEntry  *prev, *next;   /* Intrusive double-linked list for LRU ordering.      */
+    UT_hash_handle      hh;            /* Hash handle (keyed by `key`).                       */
+} CacheEntry;
+
+/* ResponseCache is intentionally opaque to callers.                         */
+typedef struct ResponseCache {
+    size_t              max_bytes;     /* Soft capacity limit.                                */
+    size_t              used_bytes;    /* Current consumption.                                */
+    uint32_t            gc_interval;   /* Background GC interval in milliseconds.             */
+    CacheEntry         *lru_head;      /* Most-recently-used entry (front of list).           */
+    CacheEntry         *lru_tail;      /* Least-recently-used entry (back of list).           */
+    CacheEntry         *hash;          /* uthash root pointer.                                */
+    pthread_mutex_t     mtx;           /* Global lock (simple coarse-grained).                */
+    pthread_t           gc_thread;     /* Background sweeper.                                 */
+    bool                shutdown;      /* Async termination flag.                             */
+} ResponseCache;
+
+/* -------------------------------------------------------------------------- */
+/*                             Forward Declarations                           */
+/* -------------------------------------------------------------------------- */
+
+static void   *gc_worker(void *opaque);
+static void    prune_lru(ResponseCache *c, size_t bytes_needed);
+static void    unlink_entry(ResponseCache *c, CacheEntry *e);
+static void    link_mru(ResponseCache *c, CacheEntry *e);
+static void    evict_entry(ResponseCache *c, CacheEntry *e);
+
+/* -------------------------------------------------------------------------- */
+/*                        Public API (header-like section)                    */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * response_cache_create
+ * ---------------------
+ * Allocate and initialize a new cache instance.
+ *
+ * Parameters
+ *   capacity_bytes  Maximum combined payload size before eviction commences.
+ *   gc_interval_ms  Background sweeper interval (0 disables GC thread).
+ *
+ * Returns
+ *   Pointer to newly allocated cache or NULL on failure.
+ */
+ResponseCache *
+response_cache_create(size_t capacity_bytes, uint32_t gc_interval_ms);
+
+/*
+ * response_cache_destroy
+ * ----------------------
+ * Flush all resources and terminate GC thread.
+ */
+void
+response_cache_destroy(ResponseCache *c);
+
+/*
+ * response_cache_put
+ * ------------------
+ * Insert (or replace) a payload into the cache. If the payload size exceeds
+ * the cache capacity, the function returns false and the data is *not*
+ * cached. Otherwise, the LRU is pruned until enough space is available.
+ *
+ * ttl_ms = 0 means "store forever" (caller is responsible for explicit
+ * invalidation on data mutation events).
+ */
+bool
+response_cache_put(ResponseCache *c, const char *key,
+                   const void *payload, size_t payload_sz, uint32_t ttl_ms);
+
+/*
+ * response_cache_get
+ * ------------------
+ * Attempt to retrieve a cached payload. The function allocates a new
+ * memory region owned by the caller (deep copy) to avoid locking callers
+ * into cache lifetime semantics.
+ *
+ * Returns true on HIT, false on MISS or if entry expired.
+ */
+bool
+response_cache_get(ResponseCache *c, const char *key,
+                   void **out_payload, size_t *out_size);
+
+/*
+ * response_cache_invalidate
+ * -------------------------
+ * Remove a single entry from the cache if present.
+ */
+void
+response_cache_invalidate(ResponseCache *c, const char *key);
+
+/*
+ * response_cache_clear
+ * --------------------
+ * Drop *all* entries immediately.
+ */
+void
+response_cache_clear(ResponseCache *c);
+
+
+/* -------------------------------------------------------------------------- */
+/*                              Implementation                                */
+/* -------------------------------------------------------------------------- */
+
+ResponseCache *
+response_cache_create(size_t capacity_bytes, uint32_t gc_interval_ms)
+{
+    ResponseCache *c = xmalloc(sizeof(*c));
+    memset(c, 0, sizeof(*c));
+    c->max_bytes   = capacity_bytes;
+    c->gc_interval = gc_interval_ms ? gc_interval_ms : 0;
+    pthread_mutex_init(&c->mtx, NULL);
+
+    logger_info("response-cache", "Initialized (capacity=%zu bytes, gc=%u ms)",
+                c->max_bytes, c->gc_interval);
+
+    if (c->gc_interval > 0) {
+        if (pthread_create(&c->gc_thread, NULL, gc_worker, c) != 0) {
+            logger_error("response-cache",
+                         "Failed to spawn GC thread: %s", strerror(errno));
+            free(c);
+            return NULL;
+        }
+    }
+
+    metrics_gauge_set("response_cache_bytes", 0);
+    return c;
+}
+
+void
+response_cache_destroy(ResponseCache *c)
+{
+    if (!c) return;
+
+    /* Signal thread & join. */
+    pthread_mutex_lock(&c->mtx);
+    c->shutdown = true;
+    pthread_mutex_unlock(&c->mtx);
+
+    if (c->gc_interval > 0) {
+        pthread_join(c->gc_thread, NULL);
+    }
+
+    response_cache_clear(c);
+    pthread_mutex_destroy(&c->mtx);
+    free(c);
+
+    logger_info("response-cache", "Destroyed");
+}
+
+/* Internal: Unlink node from current position in LRU list.                  */
+static void
+unlink_entry(ResponseCache *c, CacheEntry *e)
+{
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_head == e) c->lru_head = e->next;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+    e->prev = e->next = NULL;
+}
+
+/* Internal: Push node to front of LRU list (most-recently-used).            */
+static void
+link_mru(ResponseCache *c, CacheEntry *e)
+{
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+/* Internal: Remove entry from hash & list and free its memory.              */
+static void
+evict_entry(ResponseCache *c, CacheEntry *e)
+{
+    unlink_entry(c, e);
+    HASH_DEL(c->hash, e);
+    c->used_bytes -= e->blob_size;
+    metrics_gauge_set("response_cache_bytes", (double)c->used_bytes);
+
+    free(e->key);
+    free(e->blob);
+    free(e);
+}
+
+/* Internal: Evict LRU items until at least `bytes_needed` are free.         */
+static void
+prune_lru(ResponseCache *c, size_t bytes_needed)
+{
+    while (c->used_bytes + bytes_needed > c->max_bytes && c->lru_tail) {
+        logger_debug("response-cache", "Evicting LRU entry to free space");
+        evict_entry(c, c->lru_tail);
+        metrics_counter_inc("response_cache_evictions");
+    }
+}
+
+bool
+response_cache_put(ResponseCache *c, const char *key,
+                   const void *payload, size_t payload_sz, uint32_t ttl_ms)
+{
+    if (!c || !key || !payload || payload_sz == 0) return false;
+    if (payload_sz > c->max_bytes) {
+        logger_warn("response-cache", "Payload size %zu exceeds cache capacity %zu",
+                    payload_sz, c->max_bytes);
+        return false;
+    }
+
+    pthread_mutex_lock(&c->mtx);
+
+    CacheEntry *e = NULL;
+    HASH_FIND_STR(c->hash, key, e);
+    if (e) {
+        /* Replace existing entry. */
+        unlink_entry(c, e);
+        c->used_bytes -= e->blob_size;
+
+        free(e->blob);
+        e->blob = xmalloc(payload_sz);
+        memcpy(e->blob, payload, payload_sz);
+        e->blob_size = payload_sz;
+        e->expiry_ms = ttl_ms ? epoch_ms() + ttl_ms : 0;
+    } else {
+        prune_lru(c, payload_sz);
+
+        e = xmalloc(sizeof(*e));
+        memset(e, 0, sizeof(*e));
+        e->key       = strdup(key);
+        e->blob      = xmalloc(payload_sz);
+        e->blob_size = payload_sz;
+        memcpy(e->blob, payload, payload_sz);
+        e->expiry_ms = ttl_ms ? epoch_ms() + ttl_ms : 0;
+
+        HASH_ADD_KEYPTR(hh, c->hash, e->key, strlen(e->key), e);
+    }
+
+    /* Commit memory usage & LRU position. */
+    c->used_bytes += e->blob_size;
+    link_mru(c, e);
+    metrics_gauge_set("response_cache_bytes", (double)c->used_bytes);
+
+    pthread_mutex_unlock(&c->mtx);
+    metrics_counter_inc("response_cache_puts");
+
+    return true;
+}
+
+bool
+response_cache_get(ResponseCache *c, const char *key,
+                   void **out_payload, size_t *out_size)
+{
+    if (!c || !key || !out_payload || !out_size) return false;
+
+    pthread_mutex_lock(&c->mtx);
+
+    CacheEntry *e = NULL;
+    HASH_FIND_STR(c->hash, key, e);
+
+    if (!e) {
+        pthread_mutex_unlock(&c->mtx);
+        metrics_counter_inc("response_cache_miss");
+        return false; /* MISS */
+    }
+
+    /* Check TTL. */
+    if (e->expiry_ms && e->expiry_ms < epoch_ms()) {
+        logger_debug("response-cache", "Entry expired (key=%s)", key);
+        evict_entry(c, e);
+        pthread_mutex_unlock(&c->mtx);
+        metrics_counter_inc("response_cache_miss");
+        return false;
+    }
+
+    /* Hit: move to front of LRU and copy data. */
+    unlink_entry(c, e);
+    link_mru(c, e);
+
+    void *copy = xmalloc(e->blob_size);
+    memcpy(copy, e->blob, e->blob_size);
+    *out_payload = copy;
+    *out_size    = e->blob_size;
+
+    pthread_mutex_unlock(&c->mtx);
+    metrics_counter_inc("response_cache_hit");
+    return true;
+}
+
+void
+response_cache_invalidate(ResponseCache *c, const char *key)
+{
+    if (!c || !key) return;
+
+    pthread_mutex_lock(&c->mtx);
+    CacheEntry *e = NULL;
+    HASH_FIND_STR(c->hash, key, e);
+    if (e) {
+        evict_entry(c, e);
+        logger_debug("response-cache", "Invalidated entry: %s", key);
+    }
+    pthread_mutex_unlock(&c->mtx);
+}
+
+void
+response_cache_clear(ResponseCache *c)
+{
+    if (!c) return;
+
+    pthread_mutex_lock(&c->mtx);
+    CacheEntry *e, *tmp;
+    HASH_ITER(hh, c->hash, e, tmp) {
+        evict_entry(c, e);
+    }
+    c->lru_head = c->lru_tail = NULL;
+    pthread_mutex_unlock(&c->mtx);
+
+    logger_info("response-cache", "Cleared all entries");
+}
+
+/* -------------------------------------------------------------------------- */
+/*                         Background GC / Sweeper Thread                     */
+/* -------------------------------------------------------------------------- */
+
+static void *
+gc_worker(void *opaque)
+{
+    ResponseCache *c = (ResponseCache *)opaque;
+    const uint32_t sleep_ms = c->gc_interval;
+
+    while (true) {
+        struct timespec ts = {
+            .tv_sec  = sleep_ms / MS_PER_SEC,
+            .tv_nsec = (sleep_ms % MS_PER_SEC) * NS_PER_MS
+        };
+        nanosleep(&ts, NULL);
+
+        pthread_mutex_lock(&c->mtx);
+        if (c->shutdown) {
+            pthread_mutex_unlock(&c->mtx);
+            break;
+        }
+
+        uint64_t now = epoch_ms();
+        CacheEntry *e, *tmp;
+        HASH_ITER(hh, c->hash, e, tmp) {
+            if (e->expiry_ms && e->expiry_ms < now) {
+                logger_debug("response-cache", "GC: evict expired key=%s", e->key);
+                evict_entry(c, e);
+                metrics_counter_inc("response_cache_expired");
+            }
+        }
+
+        pthread_mutex_unlock(&c->mtx);
+    }
+
+    return NULL;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              End of Module                                 */
+/* -------------------------------------------------------------------------- */
+```

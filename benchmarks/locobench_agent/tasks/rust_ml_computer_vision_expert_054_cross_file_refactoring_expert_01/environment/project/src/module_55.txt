@@ -1,0 +1,402 @@
+```rust
+//! Module 55 ­— Hyper-parameter Tuning & Experiment Tracking
+//! ---------------------------------------------------------
+//! This module contains the implementation of the Strategy‐based hyper-parameter
+//! tuner as well as a lightweight Observer for experiment tracking.  Although
+//! the production project offers many more knobs, this file provides a realistic
+//! slice that can be embedded directly into the VisuTility Orchestrator.
+//!
+//! Architectural Patterns Demonstrated
+//! * Strategy Pattern    – `TunerStrategy` trait + concrete tuners
+//! * Factory  Pattern    – `TunerFactory` for late-bound instantiation
+//! * Observer Pattern    – `ExperimentEvent`  + `ExperimentObserver`
+//! * Pipeline  Pattern    – `run_hyperparameter_tuning` async pipeline
+//!
+//! External Crates
+//! * `rand`              – random search strategy
+//! * `tokio`             – async execution
+//! * `serde`, `serde_json` – (De)serialising trial metadata
+//! * `thiserror`         – ergonomic error definitions
+
+// --------------------------- Dependency Imports ------------------------------
+use rand::{rngs::StdRng, seq::IteratorRandom, Rng, SeedableRng};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+use thiserror::Error;
+use tokio::task;
+
+// ---------------------------- Error Definition -------------------------------
+#[derive(Debug, Error)]
+pub enum TuningError {
+    #[error("model training failed: {0}")]
+    TrainFailure(String),
+    #[error("invalid hyper-parameter space: {0}")]
+    InvalidSpace(String),
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+// ------------------------- Trainable Model Abstraction -----------------------
+/// A minimal contract that every model inside VisuTility needs to implement
+/// in order to participate in automated tuning.
+pub trait Trainable: Send + Sync + Debug + 'static {
+    /// User-level hyper-parameter type.
+    type HyperParams: Serialize + for<'de> Deserialize<'de> + Send + Sync + Clone + Debug;
+    /// Metric returned by evaluation.
+    type Metric: PartialOrd + Copy + Debug;
+
+    /// Create a new model instance with the supplied hyper-parameters.
+    fn new(params: &Self::HyperParams) -> Result<Self, TuningError>
+    where
+        Self: Sized;
+
+    /// Train the model on given data split.
+    fn train(&mut self, dataset: DatasetView) -> Result<(), TuningError>;
+
+    /// Validate the model and return a metric (higher is better).
+    fn validate(&self, dataset: DatasetView) -> Result<Self::Metric, TuningError>;
+}
+
+// ----------------------------- Data Contracts --------------------------------
+/// A lightweight view over a data split.
+///
+/// NOTE: In the real platform this is a zero-copy view into an Arrow Flight
+/// stream.  For brevity, we merely keep a string ID here.
+#[derive(Clone, Debug)]
+pub struct DatasetView {
+    pub id: String,
+}
+
+// ------------------------------ Experiment I/O -------------------------------
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrialRecord<M: Trainable> {
+    pub params: M::HyperParams,
+    pub metric: M::Metric,
+    pub duration_ms: u128,
+}
+
+/// Event emitted by the tuning engine.
+#[derive(Debug, Clone)]
+pub enum ExperimentEvent<M: Trainable> {
+    TrialStarted(M::HyperParams),
+    TrialCompleted(TrialRecord<M>),
+    TuningFinished(Option<TrialRecord<M>>),
+}
+
+/// Observer interface (pull-based is also supported in other modules).
+pub trait ExperimentObserver<M: Trainable>: Send + Sync {
+    fn on_event(&self, event: ExperimentEvent<M>);
+}
+
+/// Thread-safe, in-memory observer used in tests and local runs.
+#[derive(Default)]
+pub struct InMemoryObserver<M: Trainable> {
+    events: Arc<Mutex<Vec<ExperimentEvent<M>>>>,
+}
+impl<M: Trainable> InMemoryObserver<M> {
+    pub fn events(&self) -> Vec<ExperimentEvent<M>> {
+        self.events.lock().unwrap().clone()
+    }
+}
+impl<M: Trainable> ExperimentObserver<M> for InMemoryObserver<M> {
+    fn on_event(&self, event: ExperimentEvent<M>) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+// ----------------------------- Tuner Strategy --------------------------------
+pub trait TunerStrategy<M: Trainable>: Send + Sync {
+    /// Run the tuning loop and return the best trial record (if any).
+    fn tune(
+        &self,
+        space: HyperParamSpace<M>,
+        dataset: DatasetView,
+        observers: &[Arc<dyn ExperimentObserver<M>>],
+    ) -> Result<Option<TrialRecord<M>>, TuningError>;
+}
+
+/// Hyper-parameter search space.
+///
+/// In the real system this would allow conditional spaces, distributions,
+/// nested structures, etc.  Here we simply map parameter names to candidate
+/// categorical values.
+#[derive(Clone)]
+pub struct HyperParamSpace<M: Trainable> {
+    choices: HashMap<String, Vec<serde_json::Value>>,
+    _phantom: std::marker::PhantomData<M>,
+}
+impl<M: Trainable> HyperParamSpace<M> {
+    pub fn new() -> Self {
+        Self {
+            choices: HashMap::new(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    pub fn add_choice<T: Serialize>(&mut self, name: &str, values: Vec<T>) {
+        self.choices.insert(
+            name.to_owned(),
+            values
+                .into_iter()
+                .map(|v| serde_json::to_value(v).expect("serialise hyper-param"))
+                .collect(),
+        );
+    }
+
+    fn enumerate_grid(&self) -> Vec<M::HyperParams> {
+        // A naïve Cartesian product enumerator. Usually replaced by an iterator
+        // that yields lazily to avoid combinatorial explosion.
+        let mut param_maps: Vec<HashMap<String, serde_json::Value>> = vec![HashMap::new()];
+
+        for (key, choices) in &self.choices {
+            let mut next_maps = Vec::new();
+            for choice in choices {
+                for base in &param_maps {
+                    let mut map = base.clone();
+                    map.insert(key.clone(), choice.clone());
+                    next_maps.push(map);
+                }
+            }
+            param_maps = next_maps;
+        }
+
+        param_maps
+            .into_iter()
+            .map(|map| serde_json::from_value::<M::HyperParams>(serde_json::Value::Object(
+                map.into_iter().collect(),
+            ))
+            .expect("convert to HyperParams"))
+            .collect()
+    }
+
+    fn pick_random(&self, rng: &mut StdRng) -> Option<M::HyperParams> {
+        let mut map = HashMap::<String, serde_json::Value>::new();
+        for (k, choices) in &self.choices {
+            let choice = choices.iter().choose(rng)?;
+            map.insert(k.clone(), choice.clone());
+        }
+        serde_json::from_value(serde_json::Value::Object(map.into_iter().collect())).ok()
+    }
+}
+
+// --------------------- Concrete Strategies ----------------------------------
+pub struct GridSearchTuner;
+impl<M: Trainable> TunerStrategy<M> for GridSearchTuner {
+    fn tune(
+        &self,
+        space: HyperParamSpace<M>,
+        dataset: DatasetView,
+        observers: &[Arc<dyn ExperimentObserver<M>>],
+    ) -> Result<Option<TrialRecord<M>>, TuningError> {
+        let mut best: Option<TrialRecord<M>> = None;
+
+        for params in space.enumerate_grid() {
+            notify(observers, ExperimentEvent::TrialStarted(params.clone()));
+            let start = Instant::now();
+
+            let mut model = M::new(&params)?;
+            model.train(dataset.clone())?;
+            let metric = model.validate(dataset.clone())?;
+
+            let record = TrialRecord {
+                params: params.clone(),
+                metric,
+                duration_ms: start.elapsed().as_millis(),
+            };
+            notify(observers, ExperimentEvent::TrialCompleted(record.clone()));
+
+            if best.as_ref().map(|b| metric > b.metric).unwrap_or(true) {
+                best = Some(record);
+            }
+        }
+
+        notify(observers, ExperimentEvent::TuningFinished(best.clone()));
+        Ok(best)
+    }
+}
+
+pub struct RandomSearchTuner {
+    trials: usize,
+    seed: u64,
+}
+impl RandomSearchTuner {
+    pub fn new(trials: usize, seed: u64) -> Self {
+        Self { trials, seed }
+    }
+}
+impl<M: Trainable> TunerStrategy<M> for RandomSearchTuner {
+    fn tune(
+        &self,
+        space: HyperParamSpace<M>,
+        dataset: DatasetView,
+        observers: &[Arc<dyn ExperimentObserver<M>>],
+    ) -> Result<Option<TrialRecord<M>>, TuningError> {
+        let mut best: Option<TrialRecord<M>> = None;
+        let mut rng = StdRng::seed_from_u64(self.seed);
+
+        for _ in 0..self.trials {
+            let params = match space.pick_random(&mut rng) {
+                Some(p) => p,
+                None => return Err(TuningError::InvalidSpace("space is empty".into())),
+            };
+
+            notify(observers, ExperimentEvent::TrialStarted(params.clone()));
+            let start = Instant::now();
+
+            let mut model = M::new(&params)?;
+            model.train(dataset.clone())?;
+            let metric = model.validate(dataset.clone())?;
+
+            let record = TrialRecord {
+                params: params.clone(),
+                metric,
+                duration_ms: start.elapsed().as_millis(),
+            };
+            notify(observers, ExperimentEvent::TrialCompleted(record.clone()));
+
+            if best.as_ref().map(|b| metric > b.metric).unwrap_or(true) {
+                best = Some(record);
+            }
+        }
+
+        notify(observers, ExperimentEvent::TuningFinished(best.clone()));
+        Ok(best)
+    }
+}
+
+// ------------------------------ Factory --------------------------------------
+#[derive(Clone, Copy)]
+pub enum TunerKind {
+    Grid,
+    Random { trials: usize, seed: u64 },
+}
+
+pub struct TunerFactory;
+impl TunerFactory {
+    pub fn create<M: Trainable>(kind: TunerKind) -> Box<dyn TunerStrategy<M>> {
+        match kind {
+            TunerKind::Grid => Box::new(GridSearchTuner),
+            TunerKind::Random { trials, seed } => Box::new(RandomSearchTuner::new(trials, seed)),
+        }
+    }
+}
+
+// ------------------------- Pipeline Orchestrator -----------------------------
+pub async fn run_hyperparameter_tuning<M>(
+    kind: TunerKind,
+    space: HyperParamSpace<M>,
+    dataset: DatasetView,
+    observers: Vec<Arc<dyn ExperimentObserver<M>>>,
+) -> Result<Option<TrialRecord<M>>, TuningError>
+where
+    M: Trainable,
+{
+    let tuner = TunerFactory::create(kind);
+
+    // Offload to a blocking thread pool to avoid holding up async reactors.
+    let result = task::spawn_blocking(move || tuner.tune(space, dataset, &observers)).await?;
+
+    result
+}
+
+// ----------------------------- Helper Functions ------------------------------
+fn notify<M: Trainable>(observers: &[Arc<dyn ExperimentObserver<M>>], event: ExperimentEvent<M>) {
+    for obs in observers {
+        obs.on_event(event.clone());
+    }
+}
+
+// ------------------------ Mock Implementation (tests) -----------------------
+//! In real life, each domain model implements `Trainable` in its own crate.
+//! Below is a synthetic model so `cargo test` compiles without extra deps.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    // Dummy model that tries to maximise x ‑ y.
+    #[derive(Debug)]
+    struct DummyModel {
+        x: i32,
+        y: i32,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct DummyParams {
+        x: i32,
+        y: i32,
+    }
+
+    impl Trainable for DummyModel {
+        type HyperParams = DummyParams;
+        type Metric = i32;
+
+        fn new(params: &Self::HyperParams) -> Result<Self, TuningError> {
+            Ok(Self {
+                x: params.x,
+                y: params.y,
+            })
+        }
+
+        fn train(&mut self, _dataset: DatasetView) -> Result<(), TuningError> {
+            Ok(())
+        }
+
+        fn validate(&self, _dataset: DatasetView) -> Result<Self::Metric, TuningError> {
+            Ok(self.x - self.y)
+        }
+    }
+
+    fn sample_space() -> HyperParamSpace<DummyModel> {
+        let mut space = HyperParamSpace::<DummyModel>::new();
+        space.add_choice("x", vec![1, 2, 3]);
+        space.add_choice("y", vec![0, 1, 2]);
+        space
+    }
+
+    #[tokio::test]
+    async fn test_grid_search_finds_best() {
+        let dataset = DatasetView { id: "dummy".into() };
+        let obs = Arc::new(InMemoryObserver::<DummyModel>::default());
+
+        let best = run_hyperparameter_tuning(
+            TunerKind::Grid,
+            sample_space(),
+            dataset,
+            vec![obs.clone()],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(best.metric, 3); // (x=3, y=0) => 3
+        assert!(!obs.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_random_search_executes() {
+        let dataset = DatasetView { id: "dummy".into() };
+        let obs = Arc::new(InMemoryObserver::<DummyModel>::default());
+
+        let _ = run_hyperparameter_tuning(
+            TunerKind::Random {
+                trials: 5,
+                seed: 42,
+            },
+            sample_space(),
+            dataset,
+            vec![obs.clone()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(obs.events().len(), 5 * 2 + 1); // start + complete per trial + finished
+    }
+}
+```

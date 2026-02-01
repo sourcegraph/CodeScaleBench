@@ -1,0 +1,564 @@
+```rust
+//! module_34 – Hyper-parameter Tuning sub-system
+//! --------------------------------------------
+//! This module implements the Strategy + Observer patterns for
+//! hyper-parameter tuning.  Tuning strategies (`GridSearchTuner`,
+//! `RandomSearchTuner`, …) implement the [`HyperParamTuner`] trait,
+//! while interested parties subscribe to an async broadcast bus to
+//! receive fine-grained tuning events in real time.
+//!
+//! The code is self-contained and can be compiled independently, yet
+//! integrates cleanly into the VisuTility Orchestrator ecosystem:
+//!   • Uses `async_trait` for async polymorphism
+//!   • Emits structured logs via `tracing`
+//!   • Relies on `serde_json::Value` for schema-less parameter configs
+//!   • Provides unit tests powered by `tokio` runtime
+//!
+//! External crates required (add to Cargo.toml):
+//! ```toml
+//! async-trait   = "0.1"
+//! futures       = "0.3"
+//! maplit        = "1.0"
+//! rand          = "0.8"
+//! serde         = { version = "1", features = ["derive"] }
+//! serde_json    = "1"
+//! thiserror     = "1"
+//! tokio         = { version = "1", features = ["full"] }
+//! tracing       = "0.1"
+//! tracing-test  = "0.2"
+//! ```
+//! ------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::fmt::{self, Display};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use futures::{stream, StreamExt};
+use maplit::hashmap;
+use rand::{seq::SliceRandom, Rng};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use thiserror::Error;
+use tokio::sync::broadcast;
+use tokio::time::{timeout, Duration};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Generic, schema-less hyper-parameter map.
+///
+/// NOTE: In highly regulated environments you may want a stricter,
+/// schema-validated representation.
+pub type HyperParams = HashMap<String, Value>;
+
+/// A single evaluation metric produced by a model run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Metric {
+    pub name: String,
+    pub value: f64,
+    pub direction: MetricDirection,
+}
+
+impl Metric {
+    /// Returns `true` if `self` is better than `other` w.r.t. the
+    /// optimization direction.
+    pub fn is_better_than(&self, other: &Self) -> bool {
+        match self.direction {
+            MetricDirection::Maximize => self.value > other.value,
+            MetricDirection::Minimize => self.value < other.value,
+        }
+    }
+}
+
+/// Optimization direction for a metric.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum MetricDirection {
+    Maximize,
+    Minimize,
+}
+
+impl Display for MetricDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MetricDirection::Maximize => write!(f, "maximize"),
+            MetricDirection::Minimize => write!(f, "minimize"),
+        }
+    }
+}
+
+/// Result returned by any tuner.
+#[derive(Debug, Clone)]
+pub struct TuningResult {
+    pub best_params: HyperParams,
+    pub best_metric: Metric,
+}
+
+/// Domain-specific errors during tuning.
+#[derive(Error, Debug)]
+pub enum TuningError {
+    #[error("model training failed: {0}")]
+    TrainingFailure(String),
+
+    #[error("evaluation timed out")]
+    EvalTimeout,
+
+    #[error("search space exhausted without receiving any metric")]
+    EmptySearchSpace,
+
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+impl TuningError {
+    pub fn internal<E: std::error::Error>(err: E) -> Self {
+        Self::Internal(err.to_string())
+    }
+}
+
+/// Minimal interface for something able to train + evaluate a model.
+#[async_trait]
+pub trait ModelTrainer: Send + Sync {
+    async fn train_and_eval(&self, params: &HyperParams) -> Result<Metric, TuningError>;
+}
+
+/// Observer interface (Observer pattern).
+#[async_trait]
+pub trait TuningEventObserver: Send + Sync {
+    async fn on_trial_start(&self, trial_id: usize, params: &HyperParams);
+    async fn on_trial_complete(
+        &self,
+        trial_id: usize,
+        params: &HyperParams,
+        metric: &Result<Metric, TuningError>,
+    );
+    async fn on_tuning_complete(&self, result: &Result<TuningResult, TuningError>);
+}
+
+/// Internal enumeration of broadcast events.
+#[derive(Debug, Clone)]
+pub enum TuningEvent {
+    TrialStart {
+        trial_id: usize,
+        params: HyperParams,
+    },
+    TrialComplete {
+        trial_id: usize,
+        params: HyperParams,
+        metric: Result<Metric, TuningError>,
+    },
+    TuningComplete {
+        result: Result<TuningResult, TuningError>,
+    },
+}
+
+/// Broadcast bus wrapping `tokio::sync::broadcast`.
+#[derive(Clone)]
+pub struct TuningEventBus {
+    tx: broadcast::Sender<TuningEvent>,
+}
+
+impl TuningEventBus {
+    pub fn new(buffer: usize) -> Self {
+        let (tx, _) = broadcast::channel(buffer);
+        Self { tx }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<TuningEvent> {
+        self.tx.subscribe()
+    }
+
+    pub fn emit(&self, e: TuningEvent) {
+        // Ignoring send errors (occurs if no receiver is listening).
+        let _ = self.tx.send(e);
+    }
+}
+
+/// Trait that every tuning strategy must implement.
+#[async_trait]
+pub trait HyperParamTuner: Send + Sync {
+    async fn tune(&self) -> Result<TuningResult, TuningError>;
+}
+
+/// Shared context passed to tuners.
+pub struct TunerContext<T: ModelTrainer> {
+    pub trainer: Arc<T>,
+    pub event_bus: TuningEventBus,
+    pub max_duration: Option<Duration>,
+}
+
+//
+// ────────────────────────────────
+//   _____ _     _     _
+/// |  ___(_)___| |__ | |_
+// | |_  | / __| '_ \| __|
+// |  _| | \__ \ | | | |_
+// |_|   |_|___/_| |_|\__|
+// ────────────────────────────────
+//
+
+/// Exhaustive grid-search implementation.
+pub struct GridSearchTuner<T: ModelTrainer> {
+    context: TunerContext<T>,
+    search_space: Vec<HyperParams>,
+}
+
+impl<T: ModelTrainer> GridSearchTuner<T> {
+    pub fn new(
+        trainer: Arc<T>,
+        search_space: Vec<HyperParams>,
+        event_buffer: usize,
+        max_duration: Option<Duration>,
+    ) -> Self {
+        Self {
+            context: TunerContext {
+                trainer,
+                event_bus: TuningEventBus::new(event_buffer),
+                max_duration,
+            },
+            search_space,
+        }
+    }
+
+    pub fn event_bus(&self) -> TuningEventBus {
+        self.context.event_bus.clone()
+    }
+}
+
+#[async_trait]
+impl<T> HyperParamTuner for GridSearchTuner<T>
+where
+    T: ModelTrainer + 'static,
+{
+    #[instrument(skip_all, name = "grid_search_tune")]
+    async fn tune(&self) -> Result<TuningResult, TuningError> {
+        let ctx = &self.context;
+
+        if self.search_space.is_empty() {
+            return Err(TuningError::EmptySearchSpace);
+        }
+
+        let mut best_metric: Option<Metric> = None;
+        let mut best_params: Option<HyperParams> = None;
+
+        let mut trials = stream::iter(self.search_space.clone().into_iter().enumerate());
+
+        while let Some((trial_id, params)) = trials.next().await {
+            ctx.event_bus.emit(TuningEvent::TrialStart {
+                trial_id,
+                params: params.clone(),
+            });
+
+            let metric_res = match ctx.max_duration {
+                Some(dur) => match timeout(dur, ctx.trainer.train_and_eval(&params)).await {
+                    Ok(res) => res,
+                    Err(_) => Err(TuningError::EvalTimeout),
+                },
+                None => ctx.trainer.train_and_eval(&params).await,
+            };
+
+            ctx.event_bus.emit(TuningEvent::TrialComplete {
+                trial_id,
+                params: params.clone(),
+                metric: metric_res.clone(),
+            });
+
+            match &metric_res {
+                Ok(metric) => {
+                    let better = best_metric
+                        .as_ref()
+                        .map(|m| metric.is_better_than(m))
+                        .unwrap_or(true);
+                    if better {
+                        best_metric = Some(metric.clone());
+                        best_params = Some(params);
+                    }
+                }
+                Err(e) => warn!(trial_id, error = %e, "grid-search trial failed"),
+            }
+        }
+
+        let result = match (best_params, best_metric) {
+            (Some(p), Some(m)) => Ok(TuningResult {
+                best_params: p,
+                best_metric: m,
+            }),
+            _ => Err(TuningError::TrainingFailure(
+                "all grid-search trials failed".into(),
+            )),
+        };
+
+        ctx.event_bus
+            .emit(TuningEvent::TuningComplete { result: result.clone() });
+
+        result
+    }
+}
+
+//
+// ────────────────────────────────
+//  _____                 _
+/// |  __ \               | |
+// | |__) |___  __ _  ___ | |_
+// |  _  // _ \/ _` |/ _ \| __|
+// | | \ \  __/ (_| | (_) | |_
+// |_|  \_\___|\__, |\___/ \__|
+//              __/ |
+//             |___/
+// ────────────────────────────────
+//
+
+/// Random-search implementation.
+pub struct RandomSearchTuner<T: ModelTrainer> {
+    context: TunerContext<T>,
+    candidate_params: Vec<HyperParams>,
+    max_trials: usize,
+}
+
+impl<T: ModelTrainer> RandomSearchTuner<T> {
+    pub fn new(
+        trainer: Arc<T>,
+        candidate_params: Vec<HyperParams>,
+        max_trials: usize,
+        event_buffer: usize,
+        max_duration: Option<Duration>,
+    ) -> Self {
+        Self {
+            context: TunerContext {
+                trainer,
+                event_bus: TuningEventBus::new(event_buffer),
+                max_duration,
+            },
+            candidate_params,
+            max_trials,
+        }
+    }
+
+    pub fn event_bus(&self) -> TuningEventBus {
+        self.context.event_bus.clone()
+    }
+}
+
+#[async_trait]
+impl<T> HyperParamTuner for RandomSearchTuner<T>
+where
+    T: ModelTrainer + 'static,
+{
+    #[instrument(skip_all, name = "random_search_tune")]
+    async fn tune(&self) -> Result<TuningResult, TuningError> {
+        let ctx = &self.context;
+
+        if self.candidate_params.is_empty() {
+            return Err(TuningError::EmptySearchSpace);
+        }
+
+        // Shuffle + truncate candidate list for randomness
+        let mut rng = rand::thread_rng();
+        let mut params_pool = self.candidate_params.clone();
+        params_pool.shuffle(&mut rng);
+        params_pool.truncate(self.max_trials);
+
+        let mut best_metric: Option<Metric> = None;
+        let mut best_params: Option<HyperParams> = None;
+
+        for (trial_id, params) in params_pool.into_iter().enumerate() {
+            ctx.event_bus.emit(TuningEvent::TrialStart {
+                trial_id,
+                params: params.clone(),
+            });
+
+            let metric_res = match ctx.max_duration {
+                Some(dur) => match timeout(dur, ctx.trainer.train_and_eval(&params)).await {
+                    Ok(res) => res,
+                    Err(_) => Err(TuningError::EvalTimeout),
+                },
+                None => ctx.trainer.train_and_eval(&params).await,
+            };
+
+            ctx.event_bus.emit(TuningEvent::TrialComplete {
+                trial_id,
+                params: params.clone(),
+                metric: metric_res.clone(),
+            });
+
+            match &metric_res {
+                Ok(metric) => {
+                    let better = best_metric
+                        .as_ref()
+                        .map(|m| metric.is_better_than(m))
+                        .unwrap_or(true);
+                    if better {
+                        best_metric = Some(metric.clone());
+                        best_params = Some(params);
+                    }
+                }
+                Err(e) => error!(trial_id, error = %e, "random-search trial failed"),
+            }
+        }
+
+        let result = match (best_params, best_metric) {
+            (Some(p), Some(m)) => Ok(TuningResult {
+                best_params: p,
+                best_metric: m,
+            }),
+            _ => Err(TuningError::TrainingFailure(
+                "all random-search trials failed".into(),
+            )),
+        };
+
+        ctx.event_bus
+            .emit(TuningEvent::TuningComplete { result: result.clone() });
+
+        result
+    }
+}
+
+//
+// ───────────────────────────────
+//  _                 _
+/// | | ___   __ _  __| |
+// | |/ _ \ / _` |/ _` |
+// | | (_) | (_| | (_| |
+// |_|\___/ \__,_|\__,_|
+// ───────────────────────────────
+//
+
+/// Simple observer that logs events via `tracing`.
+pub struct LoggingObserver;
+
+#[async_trait]
+impl TuningEventObserver for LoggingObserver {
+    #[instrument(skip_all)]
+    async fn on_trial_start(&self, trial_id: usize, params: &HyperParams) {
+        debug!(trial_id, params = %serde_json::to_string(params).unwrap_or_default(), "trial started");
+    }
+
+    #[instrument(skip_all)]
+    async fn on_trial_complete(
+        &self,
+        trial_id: usize,
+        params: &HyperParams,
+        metric: &Result<Metric, TuningError>,
+    ) {
+        match metric {
+            Ok(m) => info!(trial_id, metric_value = m.value, "trial completed"),
+            Err(e) => warn!(trial_id, error = %e, "trial failed"),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn on_tuning_complete(&self, result: &Result<TuningResult, TuningError>) {
+        match result {
+            Ok(res) => info!(
+                best_value = res.best_metric.value,
+                best_params = %serde_json::to_string(&res.best_params).unwrap_or_default(),
+                "tuning finished"
+            ),
+            Err(e) => error!(error = %e, "tuning failed"),
+        }
+    }
+}
+
+/// Attach an observer to the bus; returns a detach-able async task.
+pub fn attach_observer<O: TuningEventObserver + 'static>(
+    bus: &TuningEventBus,
+    observer: Arc<O>,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = bus.subscribe();
+    tokio::spawn(async move {
+        while let Ok(event) = rx.recv().await {
+            match event {
+                TuningEvent::TrialStart { trial_id, params } => {
+                    observer.on_trial_start(trial_id, &params).await;
+                }
+                TuningEvent::TrialComplete {
+                    trial_id,
+                    params,
+                    metric,
+                } => {
+                    observer
+                        .on_trial_complete(trial_id, &params, &metric)
+                        .await;
+                }
+                TuningEvent::TuningComplete { result } => {
+                    observer.on_tuning_complete(&result).await;
+                }
+            }
+        }
+    })
+}
+
+//
+// ───────────────────────────
+//  __  __              _
+/// |  \/  | ___  _ __  | |_
+// | |\/| |/ _ \| '_ \ | __|
+// | |  | | (_) | | | || |_
+// |_|  |_|\___/|_| |_| \__|
+// ───────────────────────────
+//
+
+/// Mock trainer for documentation & tests.
+pub struct MockTrainer;
+
+#[async_trait]
+impl ModelTrainer for MockTrainer {
+    async fn train_and_eval(&self, params: &HyperParams) -> Result<Metric, TuningError> {
+        // Simulate latency
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Compute deterministic mock score
+        let mut hash = 0u64;
+        for (k, v) in params {
+            hash ^= fxhash::hash32(&format!("{k}{v}").as_bytes()) as u64;
+        }
+        let value = (hash as f64 % 10_000f64) / 10_000f64; // [0,1)
+
+        Ok(Metric {
+            name: "mock_accuracy".into(),
+            value,
+            direction: MetricDirection::Maximize,
+        })
+    }
+}
+
+//
+// ─────────────────────────
+//           _
+///  ___ ___| |_ _   _ _ __
+// / __/ __| __| | | | '__|
+// \__ \__ \ |_| |_| | |
+// |___/___/\__|\__,_|_|
+// ─────────────────────────
+//
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_test::traced_test;
+
+    fn search_space() -> Vec<HyperParams> {
+        vec![
+            hashmap! { "lr".into() => json!(0.1),   "batch".into() => json!(16) },
+            hashmap! { "lr".into() => json!(0.01),  "batch".into() => json!(32) },
+            hashmap! { "lr".into() => json!(0.001), "batch".into() => json!(64) },
+        ]
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn grid_search_works() {
+        let trainer = Arc::new(MockTrainer);
+        let tuner = GridSearchTuner::new(trainer, search_space(), 8, None);
+        let _logger = attach_observer(&tuner.event_bus(), Arc::new(LoggingObserver));
+        assert!(tuner.tune().await.is_ok());
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn random_search_works() {
+        let trainer = Arc::new(MockTrainer);
+        let tuner = RandomSearchTuner::new(trainer, search_space(), 2, 8, None);
+        let _logger = attach_observer(&tuner.event_bus(), Arc::new(LoggingObserver));
+        assert!(tuner.tune().await.is_ok());
+    }
+}
+```

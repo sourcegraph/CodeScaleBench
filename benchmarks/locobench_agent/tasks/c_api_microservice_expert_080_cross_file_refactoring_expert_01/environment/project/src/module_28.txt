@@ -1,0 +1,548 @@
+```c
+/*
+ * MercuryMonolith Commerce Hub – Response Cache (module_28)
+ *
+ * This module implements an in-memory, thread-safe, TTL-aware response cache
+ * with an LRU eviction strategy.  It is used by the HTTP/GraphQL gateway layer
+ * to accelerate hot read-only endpoints such as catalog search, price lookups,
+ * and public product pages.
+ *
+ *  ‑ Hit / miss metrics are exported to the global Prometheus registry
+ *  ‑ Expired entries are lazily swept in O(1) on access and opportunistically
+ *    in the background by a lightweight maintenance thread.
+ *  ‑ All public functions are safe for concurrent use.
+ *
+ *  Author: Core Platform Team
+ *  SPDX-License-Identifier: MIT
+ */
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <errno.h>
+#include <pthread.h>
+
+#include "logging/logger.h"          /* project-wide structured logger */
+#include "metrics/metrics.h"          /* Prometheus counters / gauges   */
+#include "util/hash.h"                /* XXH3/CityHash wrappers         */
+#include "util/safe_alloc.h"          /* checked malloc helpers         */
+#include "util/str.h"                 /* string helpers                 */
+#include "http/http_status.h"         /* http_status_t enum             */
+#include "config/runtime_config.h"    /* live config overrides          */
+
+#define MODULE_NAME    "response_cache"
+#define CACHE_NS       "mercury_response_cache"
+
+/*-------------------------------------------------------------------------*
+ *                        Forward Declarations                             *
+ *-------------------------------------------------------------------------*/
+typedef struct cache_entry_s cache_entry_t;
+typedef struct cache_bucket_s cache_bucket_t;
+
+static void *maintenance_loop(void *arg);
+
+/*-------------------------------------------------------------------------*
+ *                              Metrics                                    *
+ *-------------------------------------------------------------------------*/
+static mercury_metric_counter_t *g_cache_hit_ctr  = NULL;
+static mercury_metric_counter_t *g_cache_miss_ctr = NULL;
+static mercury_metric_gauge_t   *g_cache_size_gauge = NULL;
+
+/*-------------------------------------------------------------------------*
+ *                         Cache Structures                                *
+ *-------------------------------------------------------------------------*/
+
+struct cache_entry_s
+{
+    uint64_t            key_hash;
+    void               *value;              /* opaque payload (heap owned) */
+    size_t              value_len;
+    http_status_t       http_status;        /* HTTP status of response     */
+    time_t              expiry_epoch;       /* absolute TTL epoch          */
+
+    /* Intrusive LRU doubly-linked list */
+    cache_entry_t      *prev;
+    cache_entry_t      *next;
+
+    /* Separate collision chain inside bucket (chaining hash) */
+    cache_entry_t      *hnext;
+};
+
+struct cache_bucket_s
+{
+    pthread_mutex_t    lock;      /* protects bucket list & lru nodes */
+    cache_entry_t     *head;      /* hash collision chain head        */
+};
+
+/*-------------------------------------------------------------------------*
+ *                         Global Cache State                              *
+ *-------------------------------------------------------------------------*/
+
+typedef struct
+{
+    cache_bucket_t    *buckets;
+    size_t             bucket_count;        /* power of 2                 */
+
+    /* LRU list head/tail – separate from hash buckets for O(1) eviction */
+    cache_entry_t     *lru_head;
+    cache_entry_t     *lru_tail;
+    pthread_mutex_t    lru_lock;
+
+    size_t             max_entries;
+    atomic_size_t      curr_entries;
+
+    atomic_bool        running;
+    pthread_t          maintenance_tid;
+} response_cache_t;
+
+static response_cache_t g_cache;
+
+/*-------------------------------------------------------------------------*
+ *                         Helper Macros                                   *
+ *-------------------------------------------------------------------------*/
+#define HASH_TO_BUCKET(h, mask)  ((h) & (mask))
+
+/*-------------------------------------------------------------------------*
+ *                         Initialization / Shutdown                       *
+ *-------------------------------------------------------------------------*/
+
+/* Initialize metrics gauges / counters – idempotent */
+static void
+init_metrics(void)
+{
+    if (g_cache_hit_ctr == NULL)
+    {
+        g_cache_hit_ctr  = mercury_counter_create(CACHE_NS, "hits_total",
+                                                  "Number of cache hits");
+        g_cache_miss_ctr = mercury_counter_create(CACHE_NS, "misses_total",
+                                                  "Number of cache misses");
+        g_cache_size_gauge = mercury_gauge_create(CACHE_NS, "entries",
+                                                  "Current number of entries in cache");
+    }
+}
+
+/*
+ * Public: response_cache_init
+ *
+ * size_hint     – approximate maximum number of entries
+ * maintenance_period_sec – background sweep / stats interval
+ */
+bool
+response_cache_init(size_t size_hint, unsigned maintenance_period_sec)
+{
+    memset(&g_cache, 0, sizeof(g_cache));
+
+    init_metrics();
+
+    /* Round bucket count to next power of 2 */
+    size_t buckets = 1;
+    while (buckets < (size_hint / 4))
+        buckets <<= 1;
+    if (buckets < 16) buckets = 16;
+
+    g_cache.buckets       = xcalloc(buckets, sizeof(cache_bucket_t));
+    g_cache.bucket_count  = buckets;
+    g_cache.max_entries   = size_hint;
+
+    for (size_t i = 0; i < buckets; ++i)
+        pthread_mutex_init(&g_cache.buckets[i].lock, NULL);
+
+    pthread_mutex_init(&g_cache.lru_lock, NULL);
+
+    atomic_store(&g_cache.curr_entries, 0);
+    atomic_store(&g_cache.running, true);
+
+    /* start maintenance thread */
+    int rc = pthread_create(&g_cache.maintenance_tid, NULL,
+                            maintenance_loop,
+                            (void *)(uintptr_t)maintenance_period_sec);
+    if (rc != 0)
+    {
+        mercury_log_error(MODULE_NAME,
+                          "failed to spawn maintenance thread: %s",
+                          strerror(rc));
+        return false;
+    }
+
+    mercury_log_info(MODULE_NAME,
+                     "response cache initialized with %zu buckets, max %zu entries",
+                     buckets, size_hint);
+    return true;
+}
+
+/* Graceful shutdown */
+void
+response_cache_shutdown(void)
+{
+    atomic_store(&g_cache.running, false);
+    if (g_cache.maintenance_tid)
+        pthread_join(g_cache.maintenance_tid, NULL);
+
+    /* Free all entries */
+    pthread_mutex_lock(&g_cache.lru_lock);
+    cache_entry_t *cur = g_cache.lru_head;
+    while (cur)
+    {
+        cache_entry_t *next = cur->next;
+        free(cur->value);
+        free(cur);
+        cur = next;
+    }
+    g_cache.lru_head = g_cache.lru_tail = NULL;
+    pthread_mutex_unlock(&g_cache.lru_lock);
+
+    /* Buckets locks destruction */
+    for (size_t i = 0; i < g_cache.bucket_count; ++i)
+        pthread_mutex_destroy(&g_cache.buckets[i].lock);
+
+    pthread_mutex_destroy(&g_cache.lru_lock);
+    free(g_cache.buckets);
+
+    mercury_log_info(MODULE_NAME, "response cache shutdown complete");
+}
+
+/*-------------------------------------------------------------------------*
+ *                         Internal Utilities                              *
+ *-------------------------------------------------------------------------*/
+
+/* Move node to head of LRU list (most recently used) – caller must hold lru_lock */
+static inline void
+lru_promote_locked(cache_entry_t *node)
+{
+    if (node == g_cache.lru_head) return;
+
+    /* detach */
+    if (node->prev) node->prev->next = node->next;
+    if (node->next) node->next->prev = node->prev;
+    if (node == g_cache.lru_tail) g_cache.lru_tail = node->prev;
+
+    /* insert at head */
+    node->prev = NULL;
+    node->next = g_cache.lru_head;
+    if (g_cache.lru_head) g_cache.lru_head->prev = node;
+    g_cache.lru_head = node;
+    if (g_cache.lru_tail == NULL) g_cache.lru_tail = node;
+}
+
+/* Insert node at head of LRU – caller must hold lru_lock */
+static inline void
+lru_insert_locked(cache_entry_t *node)
+{
+    node->prev = NULL;
+    node->next = g_cache.lru_head;
+    if (g_cache.lru_head) g_cache.lru_head->prev = node;
+    g_cache.lru_head = node;
+    if (g_cache.lru_tail == NULL)
+        g_cache.lru_tail = node;
+}
+
+/* Pop the oldest (tail) entry – caller must hold lru_lock */
+static inline cache_entry_t *
+lru_pop_tail_locked(void)
+{
+    cache_entry_t *old = g_cache.lru_tail;
+    if (old == NULL) return NULL;
+
+    if (old->prev)
+        old->prev->next = NULL;
+    g_cache.lru_tail = old->prev;
+    if (g_cache.lru_tail == NULL)
+        g_cache.lru_head = NULL; /* list empty */
+
+    old->prev = old->next = NULL;
+    return old;
+}
+
+/*-------------------------------------------------------------------------*
+ *                         Public API                                      *
+ *-------------------------------------------------------------------------*/
+
+/*
+ * response_cache_get
+ *
+ * Attempt to fetch cached payload for the specified key.
+ *
+ * key        – canonical URI + query string
+ * out_status – HTTP status stored alongside payload
+ * out_len    – payload length
+ * returns pointer to malloc()'d buffer containing payload, or NULL if miss.
+ */
+void *
+response_cache_get(const char *key,
+                   http_status_t *out_status,
+                   size_t *out_len)
+{
+    uint64_t hash = xxh3_64(key, strlen(key));
+    size_t idx = HASH_TO_BUCKET(hash, g_cache.bucket_count - 1);
+    cache_bucket_t *bucket = &g_cache.buckets[idx];
+
+    pthread_mutex_lock(&bucket->lock);
+
+    cache_entry_t *e = bucket->head;
+    while (e && e->key_hash != hash) e = e->hnext;
+
+    if (!e)
+    {
+        pthread_mutex_unlock(&bucket->lock);
+        mercury_counter_inc(g_cache_miss_ctr);
+        return NULL;
+    }
+
+    time_t now = time(NULL);
+    if (e->expiry_epoch < now)
+    {
+        /* expired – treat as miss and evict lazily */
+        pthread_mutex_unlock(&bucket->lock);
+        mercury_counter_inc(g_cache_miss_ctr);
+
+        /* eviction done outside bucket lock to minimize contention */
+        response_cache_remove(key);
+        return NULL;
+    }
+
+    /* Clone payload for caller */
+    void *copy = xmalloc(e->value_len);
+    memcpy(copy, e->value, e->value_len);
+
+    *out_status = e->http_status;
+    *out_len    = e->value_len;
+
+    /* Update LRU */
+    pthread_mutex_lock(&g_cache.lru_lock);
+    lru_promote_locked(e);
+    pthread_mutex_unlock(&g_cache.lru_lock);
+
+    pthread_mutex_unlock(&bucket->lock);
+
+    mercury_counter_inc(g_cache_hit_ctr);
+    return copy;
+}
+
+/*
+ * response_cache_put
+ *
+ * Store a payload in cache with given TTL.
+ */
+bool
+response_cache_put(const char *key,
+                   const void *payload,
+                   size_t payload_len,
+                   http_status_t http_status,
+                   unsigned ttl_sec)
+{
+    if (ttl_sec == 0 || payload_len == 0)
+        return false; /* never cache empty/ttl=0 */
+
+    uint64_t hash = xxh3_64(key, strlen(key));
+    size_t idx = HASH_TO_BUCKET(hash, g_cache.bucket_count - 1);
+    cache_bucket_t *bucket = &g_cache.buckets[idx];
+
+    /* Allocate entry outside locks to avoid blocking for long */
+    cache_entry_t *new_entry = xmalloc(sizeof(*new_entry));
+    memset(new_entry, 0, sizeof(*new_entry));
+    new_entry->key_hash = hash;
+    new_entry->value = xmalloc(payload_len);
+    memcpy(new_entry->value, payload, payload_len);
+    new_entry->value_len = payload_len;
+    new_entry->http_status = http_status;
+    new_entry->expiry_epoch = time(NULL) + ttl_sec;
+
+    pthread_mutex_lock(&bucket->lock);
+
+    /* Check if already exists – replace */
+    cache_entry_t **headp = &bucket->head;
+    cache_entry_t *e = *headp;
+    while (e && e->key_hash != hash) e = e->hnext;
+
+    if (e)
+    {
+        /* replace existing */
+        /* first detach from LRU */
+        pthread_mutex_lock(&g_cache.lru_lock);
+        if (e->prev) e->prev->next = e->next;
+        if (e->next) e->next->prev = e->prev;
+        if (e == g_cache.lru_head) g_cache.lru_head = e->next;
+        if (e == g_cache.lru_tail) g_cache.lru_tail = e->prev;
+        pthread_mutex_unlock(&g_cache.lru_lock);
+
+        /* detach from bucket chain */
+        cache_entry_t **link = headp;
+        while (*link && *link != e) link = &(*link)->hnext;
+        if (*link == e) *link = e->hnext;
+
+        free(e->value);
+        free(e);
+        atomic_fetch_sub(&g_cache.curr_entries, 1);
+    }
+
+    /* insert at head of bucket chain */
+    new_entry->hnext = bucket->head;
+    bucket->head = new_entry;
+    pthread_mutex_unlock(&bucket->lock);
+
+    /* insert into LRU list */
+    pthread_mutex_lock(&g_cache.lru_lock);
+    lru_insert_locked(new_entry);
+
+    /* Check eviction */
+    size_t cur_sz = atomic_fetch_add(&g_cache.curr_entries, 1) + 1;
+    mercury_gauge_set(g_cache_size_gauge, (double)cur_sz);
+
+    if (cur_sz > g_cache.max_entries)
+    {
+        cache_entry_t *victim = lru_pop_tail_locked();
+        pthread_mutex_unlock(&g_cache.lru_lock);
+        if (victim)
+        {
+            /* remove from bucket */
+            size_t vidx = HASH_TO_BUCKET(victim->key_hash,
+                                         g_cache.bucket_count - 1);
+            cache_bucket_t *vbucket = &g_cache.buckets[vidx];
+
+            pthread_mutex_lock(&vbucket->lock);
+            cache_entry_t **link = &vbucket->head;
+            while (*link && *link != victim) link = &(*link)->hnext;
+            if (*link == victim)
+                *link = victim->hnext;
+            pthread_mutex_unlock(&vbucket->lock);
+
+            free(victim->value);
+            free(victim);
+            atomic_fetch_sub(&g_cache.curr_entries, 1);
+            mercury_gauge_dec(g_cache_size_gauge);
+        }
+    }
+    else
+    {
+        pthread_mutex_unlock(&g_cache.lru_lock);
+    }
+
+    return true;
+}
+
+/*
+ * response_cache_remove
+ *
+ * Remove key from cache if present.
+ */
+bool
+response_cache_remove(const char *key)
+{
+    uint64_t hash = xxh3_64(key, strlen(key));
+    size_t idx = HASH_TO_BUCKET(hash, g_cache.bucket_count - 1);
+    cache_bucket_t *bucket = &g_cache.buckets[idx];
+
+    pthread_mutex_lock(&bucket->lock);
+
+    cache_entry_t **link = &bucket->head;
+    cache_entry_t *e = *link;
+    while (e && e->key_hash != hash)
+    {
+        link = &e->hnext;
+        e = e->hnext;
+    }
+
+    if (!e)
+    {
+        pthread_mutex_unlock(&bucket->lock);
+        return false;
+    }
+
+    *link = e->hnext;
+    pthread_mutex_unlock(&bucket->lock);
+
+    /* detach from LRU */
+    pthread_mutex_lock(&g_cache.lru_lock);
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (e == g_cache.lru_head) g_cache.lru_head = e->next;
+    if (e == g_cache.lru_tail) g_cache.lru_tail = e->prev;
+    pthread_mutex_unlock(&g_cache.lru_lock);
+
+    free(e->value);
+    free(e);
+    atomic_fetch_sub(&g_cache.curr_entries, 1);
+    mercury_gauge_dec(g_cache_size_gauge);
+    return true;
+}
+
+/*-------------------------------------------------------------------------*
+ *                         Maintenance Thread                              *
+ *-------------------------------------------------------------------------*/
+
+/* Sweeps expired entries and logs stats periodically */
+static void *
+maintenance_loop(void *arg)
+{
+    const unsigned period_sec = (unsigned)(uintptr_t)arg;
+    mercury_log_info(MODULE_NAME, "maintenance thread started (period=%us)",
+                     period_sec);
+
+    while (atomic_load(&g_cache.running))
+    {
+        time_t now = time(NULL);
+
+        /* Rough sweep across all buckets */
+        for (size_t i = 0; i < g_cache.bucket_count; ++i)
+        {
+            cache_bucket_t *bucket = &g_cache.buckets[i];
+            pthread_mutex_lock(&bucket->lock);
+
+            cache_entry_t **link = &bucket->head;
+            cache_entry_t *e = *link;
+            while (e)
+            {
+                if (e->expiry_epoch >= now)
+                {
+                    link = &e->hnext;
+                    e = e->hnext;
+                    continue;
+                }
+
+                /* expired */
+                *link = e->hnext;
+                pthread_mutex_unlock(&bucket->lock); /* release while we hold lru */
+                pthread_mutex_lock(&g_cache.lru_lock);
+
+                if (e->prev) e->prev->next = e->next;
+                if (e->next) e->next->prev = e->prev;
+                if (e == g_cache.lru_head) g_cache.lru_head = e->next;
+                if (e == g_cache.lru_tail) g_cache.lru_tail = e->prev;
+
+                pthread_mutex_unlock(&g_cache.lru_lock);
+                pthread_mutex_lock(&bucket->lock); /* re-acquire */
+
+                free(e->value);
+                cache_entry_t *tmp = e;
+                e = *link; /* continue iteration */
+                free(tmp);
+
+                atomic_fetch_sub(&g_cache.curr_entries, 1);
+                mercury_gauge_dec(g_cache_size_gauge);
+            }
+
+            pthread_mutex_unlock(&bucket->lock);
+        }
+
+        /* Emit periodic stats */
+        mercury_log_debug(MODULE_NAME,
+                          "cache stats – entries=%zu hits=%" PRIu64 " misses=%" PRIu64,
+                          atomic_load(&g_cache.curr_entries),
+                          mercury_counter_get(g_cache_hit_ctr),
+                          mercury_counter_get(g_cache_miss_ctr));
+
+        for (unsigned slept = 0; slept < period_sec &&
+                                   atomic_load(&g_cache.running); ++slept)
+        {
+            sleep(1);
+        }
+    }
+
+    mercury_log_info(MODULE_NAME, "maintenance thread terminating");
+    return NULL;
+}
+```

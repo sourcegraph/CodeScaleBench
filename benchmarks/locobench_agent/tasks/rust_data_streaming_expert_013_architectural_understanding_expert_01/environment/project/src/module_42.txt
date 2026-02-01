@@ -1,0 +1,301 @@
+```rust
+//! src/module_42.rs
+//!
+//! ChirpPulse – Module 42: Real-Time Sentiment Enrichment Pipeline
+//! -------------------------------------------------------------
+//! An asynchronous Kafka consumer that performs data-quality checks,
+//! enriches social events with sentiment scores, and republishes the
+//! transformed events.  A Strategy pattern enables hot-swappable
+//! sentiment algorithms without downtime.
+
+use std::{
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use futures_util::StreamExt;
+use once_cell::sync::Lazy;
+use rdkafka::{
+    consumer::{CommitMode, Consumer, StreamConsumer},
+    message::{BorrowedMessage, OwnedHeaders},
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use thiserror::Error;
+use tokio::{select, signal, time};
+use tracing::{debug, error, info, instrument, warn};
+
+////////////////////////////////////////////////////////////////
+// Configuration ///////////////////////////////////////////////
+////////////////////////////////////////////////////////////////
+
+const DEFAULT_MAX_PAYLOAD_BYTES: usize = 128 * 1024; // 128 KiB
+
+#[derive(Debug, Deserialize)]
+struct PipelineConfig {
+    // Kafka
+    kafka_brokers: String,
+    raw_topic: String,
+    enriched_topic: String,
+    consumer_group: String,
+
+    // Strategy
+    #[serde(default = "default_strategy_name")]
+    strategy: String,
+
+    // Data quality
+    #[serde(default = "default_max_payload")]
+    max_payload_bytes: usize,
+}
+
+fn default_strategy_name() -> String {
+    "naive".to_string()
+}
+fn default_max_payload() -> usize {
+    DEFAULT_MAX_PAYLOAD_BYTES
+}
+
+impl PipelineConfig {
+    /// Load configuration from the `CHIRPPULSE_` environment prefix.
+    fn from_env() -> Result<Self> {
+        let mut settings = config::Config::builder()
+            .add_source(config::Environment::with_prefix("CHIRPPULSE"))
+            .build()?;
+        settings.set_default("max_payload_bytes", DEFAULT_MAX_PAYLOAD_BYTES)?;
+        Ok(settings.try_deserialize()?)
+    }
+}
+
+////////////////////////////////////////////////////////////////
+// Error Definitions ///////////////////////////////////////////
+////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Error)]
+enum ProcessingError {
+    #[error("payload size {0} B exceeds configured limit")]
+    PayloadTooLarge(usize),
+    #[error("payload is not valid JSON")]
+    InvalidJson(#[from] serde_json::Error),
+}
+
+////////////////////////////////////////////////////////////////
+// Analysis Strategy ///////////////////////////////////////////
+////////////////////////////////////////////////////////////////
+
+#[async_trait]
+pub trait SentimentStrategy: Send + Sync + 'static {
+    /// Scores text in the range [-1.0, 1.0].
+    async fn analyze(&self, text: &str) -> Result<f32>;
+}
+
+/// Naive word-count–based sentiment.
+struct NaiveSentiment;
+#[async_trait]
+impl SentimentStrategy for NaiveSentiment {
+    async fn analyze(&self, text: &str) -> Result<f32> {
+        let score = text.matches("good").count() as f32 - text.matches("bad").count() as f32;
+        Ok(score.clamp(-1.0, 1.0))
+    }
+}
+
+/// Placeholder for an ML-backed sentiment model.
+struct FancySentiment;
+#[async_trait]
+impl SentimentStrategy for FancySentiment {
+    async fn analyze(&self, _text: &str) -> Result<f32> {
+        // Pretend to call a TensorFlow / ONNX model here.
+        Ok(0.0)
+    }
+}
+
+////////////////////////////////////////////////////////////////
+// Strategy Registry (hot-swappable) ////////////////////////////
+////////////////////////////////////////////////////////////////
+
+type DynStrategy = Arc<dyn SentimentStrategy>;
+
+static STRATEGY_REGISTRY: Lazy<RwLock<DynStrategy>> =
+    Lazy::new(|| RwLock::new(Arc::new(NaiveSentiment) as DynStrategy));
+
+/// Replace the active strategy at runtime.
+pub fn swap_strategy(new_strategy: DynStrategy) {
+    let mut guard = STRATEGY_REGISTRY.write().expect("strategy lock poisoned");
+    *guard = new_strategy;
+}
+
+/// Load the current strategy.
+fn current_strategy() -> DynStrategy {
+    STRATEGY_REGISTRY
+        .read()
+        .expect("strategy lock poisoned")
+        .clone()
+}
+
+////////////////////////////////////////////////////////////////
+// Data Model //////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Deserialize)]
+struct RawEvent {
+    id: String,
+    text: String,
+    user_id: String,
+    #[serde(flatten)]
+    extra: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct EnrichedEvent {
+    #[serde(flatten)]
+    raw: RawEvent,
+    sentiment_score: f32,
+    processed_at_epoch_ms: u64,
+}
+
+////////////////////////////////////////////////////////////////
+// Enrichment Pipeline /////////////////////////////////////////
+////////////////////////////////////////////////////////////////
+
+pub struct EnrichmentPipeline {
+    cfg: Arc<PipelineConfig>,
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+}
+
+impl EnrichmentPipeline {
+    pub fn new(cfg: PipelineConfig) -> Result<Self> {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.kafka_brokers)
+            .set("group.id", &cfg.consumer_group)
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()
+            .context("create consumer")?;
+
+        consumer
+            .subscribe(&[&cfg.raw_topic])
+            .context("subscribe")?;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.kafka_brokers)
+            .set("message.timeout.ms", "5000")
+            .create()
+            .context("create producer")?;
+
+        Ok(Self {
+            cfg: Arc::new(cfg),
+            consumer,
+            producer,
+        })
+    }
+
+    #[instrument(skip(self))]
+    pub async fn run(self) -> Result<()> {
+        let mut shutdown = signal::ctrl_c();
+        let mut stream = self.consumer.stream();
+
+        info!("sentiment pipeline started");
+        loop {
+            select! {
+                _ = &mut shutdown => {
+                    info!("ctrl-c received – shutting down");
+                    break;
+                }
+                maybe_msg = stream.next() => {
+                    match maybe_msg {
+                        Some(Ok(msg)) => {
+                            if let Err(err) = self.process(msg).await {
+                                error!("processing error: {err:#}");
+                            }
+                        }
+                        Some(Err(err)) => error!("Kafka error: {err}"),
+                        None => {
+                            warn!("Kafka stream returned None – pausing");
+                            time::sleep(Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self, msg))]
+    async fn process(&self, msg: BorrowedMessage<'_>) -> Result<()> {
+        let payload = msg
+            .payload()
+            .context("received empty payload")?;
+
+        // Data-quality check: size
+        if payload.len() > self.cfg.max_payload_bytes {
+            self.consumer.commit_message(&msg, CommitMode::Async)?;
+            return Err(ProcessingError::PayloadTooLarge(payload.len()).into());
+        }
+
+        // Parse JSON
+        let raw: RawEvent = serde_json::from_slice(payload)?;
+
+        // Enrich
+        let sentiment = current_strategy().analyze(&raw.text).await?;
+
+        let enriched = EnrichedEvent {
+            raw,
+            sentiment_score: sentiment,
+            processed_at_epoch_ms: chrono::Utc::now().timestamp_millis() as u64,
+        };
+
+        // Serialize & publish
+        let bytes = serde_json::to_vec(&enriched)?;
+        let record = FutureRecord::to(&self.cfg.enriched_topic)
+            .key(&enriched.raw.id)
+            .payload(&bytes)
+            .headers(OwnedHeaders::new().add("x-schema-version", "1"));
+
+        self.producer
+            .send(record, Duration::from_secs(0))
+            .await
+            .map_err(|(e, _)| e)?;
+
+        self.consumer.commit_message(&msg, CommitMode::Async)?;
+
+        debug!("processed event {}", enriched.raw.id);
+        Ok(())
+    }
+}
+
+////////////////////////////////////////////////////////////////
+// Main ////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt::init();
+
+    let cfg = match PipelineConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            error!("config error: {e:#}");
+            std::process::exit(1);
+        }
+    };
+
+    // Swap in requested strategy
+    match cfg.strategy.as_str() {
+        "naive" => swap_strategy(Arc::new(NaiveSentiment)),
+        "fancy" => swap_strategy(Arc::new(FancySentiment)),
+        other => warn!("unknown strategy '{other}' – defaulting to naive"),
+    }
+
+    if let Err(e) = EnrichmentPipeline::new(cfg)
+        .and_then(|p| p.run())
+        .await
+    {
+        error!("pipeline terminated with error: {e:#}");
+        std::process::exit(1);
+    }
+}
+```

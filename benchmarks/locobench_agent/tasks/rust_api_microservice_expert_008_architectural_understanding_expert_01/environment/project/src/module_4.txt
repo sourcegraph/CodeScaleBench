@@ -1,0 +1,367 @@
+```rust
+//! src/module_4.rs
+//!
+//! Account-snapshot “Query” service (read-model) for LedgerLink Nexus.
+//!
+//! • Fetches paginated snapshots from the repository (PostgreSQL / read-replica)
+//! • Optionally caches the hydrated DTO list in Redis for `CACHE_TTL_SECS`
+//! • Performs lightweight request-side validation & structured error handling
+//! • Uses `tracing` for span-based request logging
+//!
+//! This file purposefully lives in its own module so it can be imported by
+//! `graphql::resolvers` and `rest::handlers` without causing circular deps.
+
+use std::{sync::Arc, time::Duration};
+
+use chrono::{DateTime, Utc};
+use futures::TryStreamExt;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tracing::{instrument, Span};
+use uuid::Uuid;
+use validator::Validate;
+
+/// ------------------------------------------------------------------------------------------------
+/// Domain model (read-side)
+/// ------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct AccountSnapshot {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub balance: rust_decimal::Decimal,
+    pub currency: String,
+    pub as_of: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// DTO (View-Model)
+/// ------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct AccountSnapshotDto {
+    #[validate(length(min = 3, max = 3))]
+    pub currency: String,
+    pub balance: rust_decimal::Decimal,
+    pub as_of: DateTime<Utc>,
+}
+
+impl From<AccountSnapshot> for AccountSnapshotDto {
+    fn from(s: AccountSnapshot) -> Self {
+        Self {
+            currency: s.currency,
+            balance: s.balance,
+            as_of: s.as_of,
+        }
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Pagination helpers
+/// ------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Validate)]
+pub struct Pagination {
+    #[validate(range(min = 1, max = 500))]
+    pub per_page: u32,
+    #[validate(range(min = 1))]
+    pub page: u32,
+}
+
+impl Pagination {
+    pub fn offset(self) -> u64 {
+        (self.page.saturating_sub(1) * self.per_page) as u64
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Paged<T> {
+    pub data: Vec<T>,
+    pub page: u32,
+    pub per_page: u32,
+    pub total: u64,
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Query envelope
+/// ------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Validate)]
+pub struct GetAccountSnapshotsQuery {
+    #[validate(length(equal = 36))]
+    pub account_id: String,
+    #[validate]
+    pub pagination: Pagination,
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Repository abstraction & concrete implementation
+/// ------------------------------------------------------------------------------------------------
+
+#[async_trait::async_trait]
+pub trait AccountSnapshotRepository: Send + Sync {
+    /// Returns `(total_count, stream)` where stream yields individual snapshots in chronological
+    /// order (newer first).
+    async fn list_paginated(
+        &self,
+        account_id: Uuid,
+        pagination: Pagination,
+    ) -> Result<(u64, Vec<AccountSnapshot>), RepositoryError>;
+}
+
+/// SQLx-backed implementation.
+/// Note: The actual SQL schema is **not** defined here to keep the example concise.
+pub struct PgAccountSnapshotRepository {
+    pool: sqlx::PgPool,
+}
+
+impl PgAccountSnapshotRepository {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+}
+
+#[async_trait::async_trait]
+impl AccountSnapshotRepository for PgAccountSnapshotRepository {
+    #[instrument(skip(self))]
+    async fn list_paginated(
+        &self,
+        account_id: Uuid,
+        pagination: Pagination,
+    ) -> Result<(u64, Vec<AccountSnapshot>), RepositoryError> {
+        let total: (i64,) = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM account_snapshots WHERE account_id = $1",
+        )
+        .bind(account_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        // Stream is nicer for large results but we hydrate into Vec here for simplicity
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, account_id, balance, currency, as_of, created_at
+            FROM account_snapshots
+            WHERE account_id = $1
+            ORDER BY as_of DESC
+            LIMIT $2 OFFSET $3
+            "#,
+            account_id,
+            pagination.per_page as i64,
+            pagination.offset() as i64,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let snapshots = rows
+            .into_iter()
+            .map(|r| AccountSnapshot {
+                id: r.id,
+                account_id: r.account_id,
+                balance: r.balance,
+                currency: r.currency,
+                as_of: r.as_of,
+                created_at: r.created_at,
+            })
+            .collect();
+
+        Ok((total.0 as u64, snapshots))
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Redis-backed response cache
+/// ------------------------------------------------------------------------------------------------
+
+const CACHE_TTL_SECS: u64 = 30; // Short-lived cache – ensure reconciliation freshness
+
+pub struct RedisCache {
+    client: deadpool_redis::Pool,
+}
+
+impl RedisCache {
+    pub fn new(client: deadpool_redis::Pool) -> Self {
+        Self { client }
+    }
+
+    async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError> {
+        let mut conn = self.client.get().await?;
+        let bytes: Option<Vec<u8>> = redis::cmd("GET").arg(key).query_async(&mut conn).await?;
+        Ok(bytes)
+    }
+
+    async fn set_bytes(&self, key: &str, bytes: &[u8]) -> Result<(), CacheError> {
+        let mut conn = self.client.get().await?;
+        redis::pipe()
+            .cmd("SET")
+            .arg(key)
+            .arg(bytes)
+            .ignore()
+            .cmd("EXPIRE")
+            .arg(key)
+            .arg(CACHE_TTL_SECS as usize)
+            .query_async(&mut conn)
+            .await?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum CacheError {
+    #[error("redis error: {0}")]
+    Redis(#[from] redis::RedisError),
+    #[error("pool error: {0}")]
+    Pool(#[from] deadpool_redis::PoolError),
+    #[error("serialization error: {0}")]
+    Bincode(#[from] bincode::Error),
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Service layer
+/// ------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation error: {0}")]
+    Validation(validator::ValidationErrors),
+    #[error("repository: {0}")]
+    Repository(#[from] RepositoryError),
+    #[error("cache: {0}")]
+    Cache(#[from] CacheError),
+    #[error("internal error: {0}")]
+    Internal(#[from] anyhow::Error),
+}
+
+pub struct AccountSnapshotService<R> {
+    repo: Arc<R>,
+    cache: Option<Arc<RedisCache>>,
+}
+
+impl<R> AccountSnapshotService<R>
+where
+    R: AccountSnapshotRepository + 'static,
+{
+    pub fn new(repo: Arc<R>, cache: Option<Arc<RedisCache>>) -> Self {
+        Self { repo, cache }
+    }
+
+    /// Handles `GetAccountSnapshotsQuery` and returns paginated DTOs.
+    #[instrument(skip(self, query))]
+    pub async fn handle(
+        &self,
+        query: GetAccountSnapshotsQuery,
+    ) -> Result<Paged<AccountSnapshotDto>, ServiceError> {
+        query.validate().map_err(ServiceError::Validation)?;
+
+        let account_id = Uuid::parse_str(&query.account_id)
+            .map_err(|e| ServiceError::Internal(e.into()))?;
+
+        let cache_key = format!(
+            "acct_snapshots:{}:{}:{}",
+            account_id, query.pagination.page, query.pagination.per_page
+        );
+
+        // Attempt cache hit
+        if let Some(cache) = &self.cache {
+            if let Some(bytes) = cache.get_bytes(&cache_key).await? {
+                let dto: Paged<AccountSnapshotDto> = bincode::deserialize(&bytes)?;
+                tracing::debug!("cache hit for {}", &cache_key);
+                return Ok(dto);
+            }
+        }
+
+        // Repo fallback
+        Span::current().record("cache.miss", &true);
+        let (total, snapshots) = self
+            .repo
+            .list_paginated(account_id, query.pagination)
+            .await?;
+
+        let dto = Paged {
+            data: snapshots
+                .into_iter()
+                .map(AccountSnapshotDto::from)
+                .collect::<Vec<_>>(),
+            page: query.pagination.page,
+            per_page: query.pagination.per_page,
+            total,
+        };
+
+        // Async cache populate (fire-and-forget)
+        if let Some(cache) = &self.cache {
+            let cache = Arc::clone(cache);
+            let key = cache_key.clone();
+            let dto_clone = dto.clone();
+            tokio::spawn(async move {
+                if let Ok(bytes) = bincode::serialize(&dto_clone) {
+                    let _ = cache.set_bytes(&key, &bytes).await;
+                }
+            });
+        }
+
+        Ok(dto)
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Unit tests (cargo test -p ledgerlink_nexus --lib module_4)
+/// ------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    struct DummyRepo {
+        snapshots: Vec<AccountSnapshot>,
+    }
+
+    #[async_trait::async_trait]
+    impl AccountSnapshotRepository for DummyRepo {
+        async fn list_paginated(
+            &self,
+            _account_id: Uuid,
+            pagination: Pagination,
+        ) -> Result<(u64, Vec<AccountSnapshot>), RepositoryError> {
+            let start = pagination.offset() as usize;
+            let end = start + pagination.per_page as usize;
+            let slice = self.snapshots[start..end.min(self.snapshots.len())].to_vec();
+            Ok((self.snapshots.len() as u64, slice))
+        }
+    }
+
+    #[tokio::test]
+    async fn service_returns_paginated_response() {
+        let account_id = Uuid::new_v4();
+        let snapshots = (0..30)
+            .map(|i| AccountSnapshot {
+                id: Uuid::new_v4(),
+                account_id,
+                balance: rust_decimal::Decimal::new(i, 2),
+                currency: "USD".to_string(),
+                as_of: Utc::now(),
+                created_at: Utc::now(),
+            })
+            .collect::<Vec<_>>();
+
+        let repo = Arc::new(DummyRepo { snapshots });
+        let service: AccountSnapshotService<_> = AccountSnapshotService::new(repo, None);
+
+        let query = GetAccountSnapshotsQuery {
+            account_id: account_id.to_string(),
+            pagination: Pagination { per_page: 10, page: 2 },
+        };
+
+        let res = service.handle(query).await.unwrap();
+        assert_eq!(res.data.len(), 10);
+        assert_eq!(res.total, 30);
+        assert_eq!(res.page, 2);
+    }
+}
+```

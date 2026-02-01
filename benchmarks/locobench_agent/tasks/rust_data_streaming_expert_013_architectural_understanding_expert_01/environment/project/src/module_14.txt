@@ -1,0 +1,358 @@
+```rust
+//! src/module_14.rs  
+//!
+//! Sentiment‐analysis microservice used by ChirpPulse’s real-time ingestion
+//! pipeline.  The module demonstrates a strategy pattern that allows data
+//! scientists to hot-swap sentiment algorithms at runtime without restarting
+//! the service.  It also showcases robust Kafka stream-processing with proper
+//! observability and error handling.
+//!
+//! Compile with:
+//! ```bash
+//! cargo build --features "vader"
+//! ```
+//! The optional `vader` feature enables a slightly more sophisticated scoring
+//! algorithm.  In production this feature could be compiled into a separate
+//! container image and rolled out on demand.
+
+use std::{
+    collections::HashSet,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+
+use anyhow::{anyhow, Context, Result};
+use rdkafka::{
+    config::ClientConfig,
+    consumer::{CommitMode, Consumer, StreamConsumer},
+    error::KafkaError,
+    message::BorrowedMessage,
+    producer::{FutureProducer, FutureRecord},
+    Message,
+};
+use serde::{Deserialize, Serialize};
+use tokio::{select, signal, sync::watch, time};
+use tracing::{error, info, instrument};
+
+/// ------------- Public API ---------------------------------------------------------------------
+
+/// Starts the sentiment streaming job.
+///
+/// * `bootstrap_servers` – comma-separated Kafka brokers (e.g. `"kafka:9092"`).
+/// * `in_topic` – topic containing the raw social events.
+/// * `out_topic` – topic receiving enriched events.
+/// * `ctrl_rx` – broadcast channel used to hot-swap algorithms (payload is the
+///               *name* of the algorithm, e.g. `"simple"` or `"vader"`).
+pub async fn serve(
+    bootstrap_servers: &str,
+    in_topic: &str,
+    out_topic: &str,
+    ctrl_rx: watch::Receiver<String>,
+) -> Result<()> {
+    // Initialise observability early.
+    tracing_subscriber::fmt::init();
+
+    let consumer = build_consumer(bootstrap_servers, &format!("sentiment-{}", in_topic))?;
+    consumer
+        .subscribe(&[in_topic])
+        .context("failed to subscribe to input topic")?;
+
+    let producer = build_producer(bootstrap_servers)?;
+
+    // Use `RwLock` to allow many concurrent reads (stream processing) while
+    // allowing a *single* writer (algorithm switch).
+    let algo: Arc<RwLock<Box<dyn SentimentAnalyzer + Send + Sync>>> =
+        Arc::new(RwLock::new(select_algorithm("simple")?));
+
+    // Spawn a task that listens on the control channel and swaps the algorithm.
+    tokio::spawn(algo_hotswapper(Arc::clone(&algo), ctrl_rx));
+
+    info!("sentiment engine booted; consuming from {in_topic}, publishing to {out_topic}");
+
+    // Main processing loop.
+    loop {
+        select! {
+            biased;
+
+            // Graceful shutdown.
+            _ = signal::ctrl_c() => {
+                info!("shutdown signal received – flushing and terminating");
+                break;
+            }
+
+            // Poll Kafka (with timeout to keep cancellation responsive).
+            msg = consumer.recv() => match msg {
+                Err(KafkaError::PartitionEOF(_)) => continue, // not an error – reached end of partition
+                Err(e) => error!(error = %e, "Kafka error"),
+                Ok(m)  => {
+                    if let Err(e) = process_message(&algo, &producer, out_topic, m).await {
+                        error!(error = %e, "failed to process message");
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Convenience wrapper that sends a single hot-swap request.
+///
+/// In production this could be exposed via HTTP or an RPC façade.
+pub fn request_hotswap(ctrl_tx: &watch::Sender<String>, algorithm: &str) -> Result<()> {
+    validate_algorithm(algorithm)?;
+    ctrl_tx.send(algorithm.to_owned())?;
+    Ok(())
+}
+
+/// Returns the set of supported algorithms at this compile-time configuration.
+pub fn supported_algorithms() -> HashSet<&'static str> {
+    let mut set = HashSet::new();
+    set.insert("simple");
+    #[cfg(feature = "vader")]
+    set.insert("vader");
+    set
+}
+
+/// ------------- Internal (private) API ----------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct RawEvent {
+    text: String,
+    lang: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct EnrichedEvent {
+    text: String,
+    lang: Option<String>,
+    sentiment_score: f32,
+    algorithm: String,
+    ts_ms: i64,
+}
+
+/// Sentiment strategy interface.
+trait SentimentAnalyzer {
+    /// Algorithm’s human-readable identifier.
+    fn name(&self) -> &'static str;
+    /// Returns a sentiment score in the range [-1.0, +1.0].
+    fn score(&self, text: &str) -> f32;
+}
+
+/// A *very* naive sentiment algorithm based on word counts.
+///
+/// Negative and positive dictionaries should be replaced with a real model.
+struct SimpleAnalyzer {
+    neg: HashSet<&'static str>,
+    pos: HashSet<&'static str>,
+}
+
+impl Default for SimpleAnalyzer {
+    fn default() -> Self {
+        let neg = HashSet::from([
+            "bad", "hate", "terrible", "worst", "angry", "sad", "upset", "panic",
+        ]);
+        let pos =
+            HashSet::from(["good", "love", "great", "best", "happy", "joy", "fun", "excited"]);
+
+        Self { neg, pos }
+    }
+}
+
+impl SentimentAnalyzer for SimpleAnalyzer {
+    fn name(&self) -> &'static str {
+        "simple"
+    }
+
+    fn score(&self, text: &str) -> f32 {
+        let mut score = 0i32;
+        let mut count = 0i32;
+        for token in text.split_whitespace() {
+            let normalised = token.to_ascii_lowercase();
+            if self.neg.contains(normalised.as_str()) {
+                score -= 1;
+                count += 1;
+            } else if self.pos.contains(normalised.as_str()) {
+                score += 1;
+                count += 1;
+            }
+        }
+
+        if count == 0 {
+            0.0
+        } else {
+            score as f32 / count as f32
+        }
+    }
+}
+
+/// Optional VADER-like algorithm (placeholder).
+#[cfg(feature = "vader")]
+struct VaderAnalyzer;
+
+#[cfg(feature = "vader")]
+impl SentimentAnalyzer for VaderAnalyzer {
+    fn name(&self) -> &'static str {
+        "vader"
+    }
+
+    fn score(&self, text: &str) -> f32 {
+        // This is only a stub.  Hook a real VADER implementation here.
+        // For demonstrative purposes we just return a fake sinusoid.
+        let x = text.len() as f32;
+        (x.sin() * 0.5).clamp(-1.0, 1.0)
+    }
+}
+
+/// Convenience helper that validates supported algorithms.
+fn validate_algorithm(name: &str) -> Result<()> {
+    if supported_algorithms().contains(name) {
+        Ok(())
+    } else {
+        Err(anyhow!("unsupported algorithm: {name}"))
+    }
+}
+
+/// Factory that builds the desired algorithm implementation.
+fn select_algorithm(name: &str) -> Result<Box<dyn SentimentAnalyzer + Send + Sync>> {
+    match name {
+        "simple" => Ok(Box::new(SimpleAnalyzer::default())),
+        #[cfg(feature = "vader")]
+        "vader" => Ok(Box::new(VaderAnalyzer)),
+        _ => Err(anyhow!("algorithm not compiled in: {name}")),
+    }
+}
+
+/// Background task that listens on a watch channel and swaps the strategy.
+async fn algo_hotswapper(
+    algo: Arc<RwLock<Box<dyn SentimentAnalyzer + Send + Sync>>>,
+    mut rx: watch::Receiver<String>,
+) {
+    loop {
+        // Wait for a new value or end of stream.
+        if rx.changed().await.is_err() {
+            break;
+        }
+        let requested = rx.borrow().clone();
+
+        match select_algorithm(&requested) {
+            Ok(new_algo) => {
+                let mut write = algo.write().expect("lock poisoned");
+                *write = new_algo;
+                info!("switched sentiment algorithm to {requested}");
+            }
+            Err(e) => error!(error = %e, "failed to switch algorithm"),
+        }
+    }
+}
+
+/// Consumes one Kafka message and produces an enriched one.
+#[instrument(skip_all, err)]
+async fn process_message(
+    algo: &Arc<RwLock<Box<dyn SentimentAnalyzer + Send + Sync>>>,
+    producer: &FutureProducer,
+    out_topic: &str,
+    msg: BorrowedMessage<'_>,
+) -> Result<()> {
+    let payload = msg
+        .payload()
+        .context("message payload was empty")?;
+
+    let evt: RawEvent = serde_json::from_slice(payload)
+        .context("failed to deserialize raw event")?;
+
+    // Clone to avoid holding the lock across await point.
+    let (algorithm, score) = {
+        let read = algo.read().expect("lock poisoned");
+        (read.name().to_owned(), read.score(&evt.text))
+    };
+
+    let enriched = EnrichedEvent {
+        text: evt.text,
+        lang: evt.lang,
+        sentiment_score: score,
+        algorithm,
+        ts_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    let json = serde_json::to_vec(&enriched)
+        .context("failed to serialize enriched event")?;
+
+    // Send asynchronously; we ignore the returned delivery status but you could
+    // await it if stronger guarantees are needed.
+    producer.send(
+        FutureRecord::to(out_topic)
+            .payload(&json)
+            .key(msg.key().unwrap_or_default()),
+        Duration::from_secs(0),
+    ).await
+        .map_err(|(e, _)| anyhow!(e))
+        .context("failed to produce enriched event")?;
+
+    Ok(())
+}
+
+/// Build a configured Kafka consumer.
+fn build_consumer(bootstrap: &str, group_id: &str) -> Result<StreamConsumer> {
+    let c: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("group.id", group_id)
+        .set("enable.partition.eof", "true")
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()
+        .context("failed to create Kafka consumer")?;
+
+    // Periodic auto-commit to keep offsets up to date.
+    tokio::spawn(auto_commit(c.clone()));
+
+    Ok(c)
+}
+
+/// Build a configured Kafka producer.
+fn build_producer(bootstrap: &str) -> Result<FutureProducer> {
+    ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("message.timeout.ms", "5000")
+        .create()
+        .context("failed to create Kafka producer")
+}
+
+/// Periodically commit consumer offsets.
+async fn auto_commit(consumer: StreamConsumer) {
+    let mut interval = time::interval(Duration::from_secs(5));
+    loop {
+        interval.tick().await;
+        if let Err(e) = consumer.commit_consumer_state(CommitMode::Async) {
+            error!(error = %e, "auto-commit failed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simple_analyzer_scores_correctly() {
+        let algo = SimpleAnalyzer::default();
+        assert!(algo.score("I love this, best thing ever!") > 0.5);
+        assert!(algo.score("Worst. Terrible. I hate it") < -0.5);
+        assert_eq!(algo.score("Neutral statement with unknown words"), 0.0);
+    }
+
+    #[test]
+    #[cfg(feature = "vader")]
+    fn vader_compiles() {
+        let algo = VaderAnalyzer;
+        // We can at least call the method.
+        let _ = algo.score("hello");
+    }
+
+    #[test]
+    fn hotswap_validation() {
+        assert!(validate_algorithm("simple").is_ok());
+        assert!(validate_algorithm("unknown").is_err());
+    }
+}
+```

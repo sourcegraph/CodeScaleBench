@@ -1,0 +1,410 @@
+```rust
+//! src/module_68.rs
+//!
+//! Strategy-pattern implementation that allows **ChirpPulse** to hot-swap
+//! real-time sentiment–analysis algorithms without downtime.  A central
+//! `StrategyRegistry` holds multiple `AnalysisStrategy` implementations that
+//! may be switched on the fly via an async control channel or a persisted
+//! configuration update.  This module purposefully encapsulates the
+//! algorithm-loading logic away from the surrounding ingestion/ETL services so
+//! that data-scientists can ship new models independently of the core
+//! streaming runtime.
+//!
+//! Key Features
+//! ------------
+//! * Trait–object–based plugin registry with dynamic dispatch
+//! * Thread-safe, non-blocking reads using `Arc<RwLock<…>>`
+//! * Async processing pipeline compatible with Tokio & rdkafka streams
+//! * Example strategies: `NaiveBayesStrategy` & `TransformerStrategy`
+//! * Graceful runtime strategy switching and observability hooks
+//!
+//! NOTE:  This file purposefully avoids any project-specific glue code
+//!        (metrics, persistent storage, etc.) to stay self-contained.  Hook
+//!        it into the larger application by wiring the public `run` function
+//!        from your service entrypoint.
+
+#![allow(clippy::arc_with_non_send_sync)] // dyn AnalysisStrategy is Send+Sync
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
+use thiserror::Error;
+use tokio::{
+    select,
+    signal,
+    sync::{broadcast, mpsc},
+    task,
+};
+use tracing::{error, info, warn};
+
+/// Convenience result alias used across the module.
+type Result<T> = std::result::Result<T, StrategyError>;
+
+/// Domain object representing an enriched social‐media message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichedMessage {
+    pub id: String,
+    pub timestamp: DateTime<Utc>,
+    pub user_handle: String,
+    pub language: String,
+    pub text: String,
+}
+
+/// Output of a sentiment analysis run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentimentScore {
+    /// Polarity in range `[-1.0, 1.0]`; negative == pessimistic.
+    pub polarity: f32,
+    /// Model-reported confidence `[0.0, 1.0]`.
+    pub confidence: f32,
+}
+
+/// Public error type surfaced by the strategy layer.
+#[derive(Debug, Error)]
+pub enum StrategyError {
+    #[error("strategy `{0}` not found")]
+    UnknownStrategy(String),
+    #[error("analysis failed: {0}")]
+    Analysis(String),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// Trait describing a pluggable analysis strategy.
+///
+/// Implementations must be `Send + Sync` because they will be shared across
+/// multiple async worker tasks.
+#[async_trait]
+pub trait AnalysisStrategy: Send + Sync {
+    /// Descriptive, unique identifier.
+    fn name(&self) -> &str;
+
+    /// Human-readable version string for diagnostics.
+    fn version(&self) -> &str;
+
+    /// Invoked for each message coming from upstream ingestion.
+    async fn analyze(&self, msg: &EnrichedMessage) -> Result<SentimentScore>;
+}
+
+/// Thread-safe strategy registry.
+///
+/// The registry owns the actual strategy instances; cloning the registry will
+/// only clone the `Arc` wrapper so it’s cheap to pass around.
+#[derive(Clone, Default)]
+pub struct StrategyRegistry {
+    inner: Arc<RwLock<InnerRegistry>>,
+}
+
+#[derive(Default)]
+struct InnerRegistry {
+    strategies: HashMap<String, Arc<dyn AnalysisStrategy>>,
+    current: Option<String>,
+}
+
+impl StrategyRegistry {
+    /// Register a strategy.  Overwrites any existing entry with the same name.
+    pub fn register(&self, strategy: Arc<dyn AnalysisStrategy>) {
+        let mut inner = self
+            .inner
+            .write()
+            .expect("poisoned StrategyRegistry write lock");
+        let name = strategy.name().to_owned();
+        inner.strategies.insert(name.clone(), strategy);
+        // First strategy wins as the default unless one was already chosen.
+        inner.current.get_or_insert(name);
+    }
+
+    /// Switch the *current* strategy to `name`.
+    pub fn switch(&self, name: &str) -> Result<()> {
+        let mut inner = self
+            .inner
+            .write()
+            .expect("poisoned StrategyRegistry write lock");
+        if inner.strategies.contains_key(name) {
+            inner.current = Some(name.to_string());
+            Ok(())
+        } else {
+            Err(StrategyError::UnknownStrategy(name.into()))
+        }
+    }
+
+    /// Retrieve the active strategy for read-only usage.
+    fn active(&self) -> Result<Arc<dyn AnalysisStrategy>> {
+        let inner = self
+            .inner
+            .read()
+            .expect("poisoned StrategyRegistry read lock");
+        match inner
+            .current
+            .as_ref()
+            .and_then(|n| inner.strategies.get(n))
+            .cloned()
+        {
+            Some(s) => Ok(s),
+            None => Err(StrategyError::UnknownStrategy(
+                inner.current.clone().unwrap_or_default(),
+            )),
+        }
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Example Strategy #1 — Naive Bayes
+ * ----------------------------------------------------------------------- */
+
+/// Very lightweight heuristic classifier used for smoke-tests & fallback.
+pub struct NaiveBayesStrategy;
+
+impl NaiveBayesStrategy {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl AnalysisStrategy for NaiveBayesStrategy {
+    fn name(&self) -> &str {
+        "naive_bayes"
+    }
+
+    fn version(&self) -> &str {
+        "1.0.0"
+    }
+
+    async fn analyze(&self, msg: &EnrichedMessage) -> Result<SentimentScore> {
+        // NOTE:  This is intentionally trivial; real impl would use a proper
+        //        multivariate Bernoulli/Bayes classifier.
+        let polarity = if msg.text.contains(':') { 0.4 } else { -0.3 };
+        Ok(SentimentScore {
+            polarity,
+            confidence: 0.55,
+        })
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Example Strategy #2 — Transformer
+ * ----------------------------------------------------------------------- */
+
+/// Stub wrapper simulating a heavy neural NLP model.
+///
+/// A real implementation would hold a compiled `tch::CModule` or call out to
+/// an online inference endpoint.  Here we fake execution latency and return
+/// pseudo-random results so benchmarks remain deterministic.
+pub struct TransformerStrategy {
+    rng: RwLock<rand::rngs::ThreadRng>,
+}
+
+impl TransformerStrategy {
+    pub fn new() -> Self {
+        Self {
+            rng: RwLock::new(rand::thread_rng()),
+        }
+    }
+}
+
+#[async_trait]
+impl AnalysisStrategy for TransformerStrategy {
+    fn name(&self) -> &str {
+        "transformer_v2"
+    }
+
+    fn version(&self) -> &str {
+        "2.1.3"
+    }
+
+    async fn analyze(&self, _msg: &EnrichedMessage) -> Result<SentimentScore> {
+        // Simulate async / I/O delay incurred by GPU inference.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let mut rng = self.rng.write().expect("poisoned rng lock");
+        let polarity = rng.gen_range(-1.0..=1.0);
+        let confidence = rng.gen_range(0.65..=0.99);
+
+        Ok(SentimentScore {
+            polarity,
+            confidence,
+        })
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Runtime Worker
+ * ----------------------------------------------------------------------- */
+
+/// Enum controlling live updates of the strategy service.
+#[derive(Debug)]
+pub enum ControlMessage {
+    SwitchStrategy(String),
+}
+
+/// Launch the asynchronous sentiment processing loop.
+///
+/// Parameters
+/// ----------
+/// `input_rx`
+///     Stream of `EnrichedMessage` values coming from upstream ingestion
+///     (Kafka consumer, HTTP source, etc.).
+///
+/// `control_rx`
+///     Broadcast channel that allows runtime commands such as strategy
+///     switching.
+///
+/// Returns
+/// -------
+/// Never returns unless signalled via CTRL-C or all producers have closed.
+pub async fn run(
+    mut input_rx: mpsc::Receiver<EnrichedMessage>,
+    mut control_rx: broadcast::Receiver<ControlMessage>,
+) -> Result<()> {
+    // -------------------------------------------------------------------------------------------
+    // Strategy setup — this is where new models would get registered.
+    // -------------------------------------------------------------------------------------------
+    let registry = StrategyRegistry::default();
+    registry.register(Arc::new(NaiveBayesStrategy::new()));
+    registry.register(Arc::new(TransformerStrategy::new()));
+
+    info!(
+        "Strategy runtime initialised — default strategy: {}",
+        registry.active()?.name()
+    );
+
+    // ===========================================================================================
+    // Concurrent event-loop: consume input & control channels + Ctrl-C.
+    // ===========================================================================================
+    loop {
+        select! {
+            biased;
+
+            // Allow ^C to abort all tasks gracefully.
+            _ = signal::ctrl_c() => {
+                warn!("CTRL-C received — shutting down sentiment engine");
+                break;
+            }
+
+            // Control plane commands (broadcast channel).
+            cmd = control_rx.recv() => {
+                match cmd {
+                    Ok(ControlMessage::SwitchStrategy(name)) => match registry.switch(&name) {
+                        Ok(()) => info!("Switched active strategy to `{name}`"),
+                        Err(e) => warn!("Strategy switch failed: {e}"),
+                    },
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("Control channel lagged by {n} messages");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        warn!("Control channel closed; continuing without dynamic updates");
+                    }
+                }
+            }
+
+            // Main data pipeline.
+            maybe_msg = input_rx.recv() => {
+                match maybe_msg {
+                    Some(msg) => {
+                        // Clone registry Arc cheaply — analysing does not block the loop.
+                        let strategy = match registry.active() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                error!("No active strategy! {e}");
+                                continue;
+                            }
+                        };
+
+                        // Offload heavy analysis onto a separate tokio task
+                        // so we never block the select! loop.
+                        let _ = task::spawn(async move {
+                            match strategy.analyze(&msg).await {
+                                Ok(score) => {
+                                    info!(
+                                        message_id = %msg.id,
+                                        strategy = strategy.name(),
+                                        polarity = %score.polarity,
+                                        confidence = %score.confidence,
+                                        "processed message",
+                                    );
+                                    // TODO:  Publish score downstream (Kafka, gRPC, etc.)
+                                }
+                                Err(e) => error!(error = %e, "sentiment analysis failed"),
+                            }
+                        });
+                    }
+                    None => {
+                        info!("Input stream closed; draining tasks before shutdown");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/* --------------------------------------------------------------------------
+ * Test Scaffolding
+ * ----------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn strategy_switching_works() -> Result<()> {
+        let registry = StrategyRegistry::default();
+        registry.register(Arc::new(NaiveBayesStrategy::new()));
+        registry.register(Arc::new(TransformerStrategy::new()));
+
+        assert_eq!(registry.active()?.name(), "naive_bayes");
+
+        registry.switch("transformer_v2")?;
+        assert_eq!(registry.active()?.name(), "transformer_v2");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn end_to_end_pipeline_runs() -> Result<()> {
+        let (msg_tx, msg_rx) = mpsc::channel(8);
+        let (ctrl_tx, ctrl_rx) = broadcast::channel(4);
+
+        // Spawn runtime
+        let runtime_handle = tokio::spawn(async move {
+            run(msg_rx, ctrl_rx).await
+        });
+
+        // Fire test message.
+        msg_tx
+            .send(EnrichedMessage {
+                id: "42".into(),
+                timestamp: Utc::now(),
+                user_handle: "tester".into(),
+                language: "en".into(),
+                text: "hello world :)".into(),
+            })
+            .await
+            .unwrap();
+
+        // Switch strategy mid-flight.
+        ctrl_tx
+            .send(ControlMessage::SwitchStrategy("transformer_v2".into()))
+            .unwrap();
+
+        // Close producer to force shutdown.
+        drop(msg_tx);
+
+        // Time-box test to avoid hanging indefinitely.
+        timeout(std::time::Duration::from_secs(2), runtime_handle)
+            .await
+            .expect("runtime never finished")??;
+
+        Ok(())
+    }
+}
+```

@@ -1,0 +1,360 @@
+```rust
+//! src/module_16.rs
+//!
+//! Hot-swappable sentiment-analysis stage for the ChirpPulse pipeline.
+//!
+//! The code below demonstrates how the platform can swap sentiment algorithms
+//! at runtime without restarting the service.  It uses an in-memory
+//! `ConfigSource` so it can compile everywhere, but a production build would
+//! back the same trait with Kafka, ZooKeeper, etcd, or any other dynamic
+//! configuration channel.
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
+
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use tokio::{
+    sync::watch,
+    task::JoinHandle,
+};
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+
+/// A single social-network event that flows through the pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialMessage {
+    pub id: u64,
+    pub author: String,
+    pub text: String,
+    pub timestamp_ms: i64,
+}
+
+/// Enriched message carrying an additional sentiment `Score`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichedMessage {
+    pub original: SocialMessage,
+    pub score: Score,
+}
+
+/// Output structure for the sentiment analyzers.
+///
+/// All values are normalized to the range `0.0‒1.0` except `compound`, which
+/// lies in `−1.0‒1.0`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Score {
+    pub positivity: f32,
+    pub negativity: f32,
+    pub neutrality: f32,
+    pub compound: f32,
+}
+
+impl Score {
+    pub fn new(positivity: f32, negativity: f32, neutrality: f32) -> Self {
+        let compound = positivity - negativity;
+        Self {
+            positivity,
+            negativity,
+            neutrality,
+            compound,
+        }
+    }
+}
+
+/// Strategy trait representing a pluggable sentiment algorithm.
+#[async_trait]
+pub trait SentimentAnalyzer: Send + Sync + 'static {
+    /// Human-readable identifier; must be unique per implementation.
+    fn name(&self) -> &'static str;
+
+    /// Calculates the [`Score`] for a piece of user-generated text.
+    async fn analyze(&self, text: &str) -> Score;
+}
+
+pub type AnalyzerHandle = Arc<dyn SentimentAnalyzer>;
+
+/// A minimal bag-of-words analyzer.  Fast but naïve.
+pub struct BagOfWordsAnalyzer {
+    pos_words: Vec<&'static str>,
+    neg_words: Vec<&'static str>,
+}
+
+impl Default for BagOfWordsAnalyzer {
+    fn default() -> Self {
+        Self {
+            pos_words: vec!["good", "great", "love", "awesome", "happy"],
+            neg_words: vec!["bad", "terrible", "hate", "horrible", "sad"],
+        }
+    }
+}
+
+#[async_trait]
+impl SentimentAnalyzer for BagOfWordsAnalyzer {
+    fn name(&self) -> &'static str {
+        "bag_of_words"
+    }
+
+    async fn analyze(&self, text: &str) -> Score {
+        let mut pos = 0usize;
+        let mut neg = 0usize;
+
+        for token in text.split(|c: char| !c.is_alphabetic()) {
+            if token.is_empty() {
+                continue;
+            }
+            let token_lower = token.to_ascii_lowercase();
+            if self.pos_words.contains(&token_lower.as_str()) {
+                pos += 1;
+            } else if self.neg_words.contains(&token_lower.as_str()) {
+                neg += 1;
+            }
+        }
+
+        let total = (pos + neg).max(1) as f32;
+        Score::new(pos as f32 / total, neg as f32 / total, 0.0)
+    }
+}
+
+/// A placeholder for a heavy ML-based analyzer (e.g., BERT).
+///
+/// In a real build this would call into an ONNX runtime or Python FFI.
+pub struct MlBertAnalyzer;
+
+#[async_trait]
+impl SentimentAnalyzer for MlBertAnalyzer {
+    fn name(&self) -> &'static str {
+        "bert"
+    }
+
+    async fn analyze(&self, text: &str) -> Score {
+        // Dummy, deterministic hash-based score so the tests can assert.
+        let h = seahash::hash(text.as_bytes());
+        let positivity = (h & 0xFF) as f32 / 255.0;
+        let negativity = ((h >> 8) & 0xFF) as f32 / 255.0;
+        let neutrality = 1.0 - ((positivity + negativity) / 2.0).min(1.0);
+        Score::new(positivity, negativity, neutrality)
+    }
+}
+
+/// Global registry that stores all compiled-in analyzers.
+///
+/// New strategies can be registered at runtime as dynamic libraries or via
+/// a build-time feature flag.  For simplicity we only handle static ones here.
+#[derive(Default)]
+pub struct AnalyzerRegistry {
+    inner: RwLock<HashMap<&'static str, AnalyzerHandle>>,
+}
+
+impl AnalyzerRegistry {
+    pub fn with_defaults() -> Self {
+        let registry = Self::default();
+        registry.register(Arc::new(BagOfWordsAnalyzer::default()));
+        registry.register(Arc::new(MlBertAnalyzer));
+        registry
+    }
+
+    pub fn register(&self, analyzer: AnalyzerHandle) {
+        self.inner
+            .write()
+            .expect("registry lock poisoned")
+            .insert(analyzer.name(), analyzer);
+    }
+
+    /// Retrieve an analyzer by its canonical name.
+    pub fn get(&self, name: &str) -> Option<AnalyzerHandle> {
+        self.inner
+            .read()
+            .expect("registry lock poisoned")
+            .get(name)
+            .cloned()
+    }
+}
+
+/// Dynamic configuration channel.
+///
+/// Production implementations could be backed by Kafka compact topics, etcd
+/// watch APIs, Consul, Redis streams, or any other system that can emit
+/// "current analyzer = <name>" events.
+#[async_trait]
+pub trait ConfigSource: Send + Sync {
+    /// Returns a [`watch::Receiver`] that is updated every time the analyzer
+    /// should be swapped.  The receiver contains the *name* of the desired
+    /// analyzer (as registered in [`AnalyzerRegistry`]).
+    async fn listen(&self) -> Result<watch::Receiver<String>>;
+}
+
+/// An in-memory reconfigurable source (injectable in unit tests).
+#[derive(Debug)]
+pub struct InMemoryConfigSource {
+    sender: watch::Sender<String>,
+}
+
+impl InMemoryConfigSource {
+    pub fn new(initial: impl Into<String>) -> Self {
+        let (tx, _rx) = watch::channel(initial.into());
+        Self { sender: tx }
+    }
+
+    /// Push a new analyzer name to all listeners.
+    pub fn update(&self, new_analyzer: impl Into<String>) {
+        let _ = self.sender.send(new_analyzer.into());
+    }
+}
+
+#[async_trait]
+impl ConfigSource for InMemoryConfigSource {
+    async fn listen(&self) -> Result<watch::Receiver<String>> {
+        Ok(self.sender.subscribe())
+    }
+}
+
+/// Central processing unit that transforms a [`Stream`] of [`SocialMessage`]
+/// into a stream of [`EnrichedMessage`].  It internally listens to dynamic
+/// configuration updates and swaps analyzers on the fly without dropping
+/// incoming messages.
+pub struct SentimentProcessor<C: ConfigSource> {
+    registry: Arc<AnalyzerRegistry>,
+    cfg_source: Arc<C>,
+    /// The currently active analyzer.  Updated by a background task.
+    current: Arc<RwLock<AnalyzerHandle>>,
+}
+
+impl<C: ConfigSource> SentimentProcessor<C> {
+    pub async fn new(registry: Arc<AnalyzerRegistry>, cfg_source: Arc<C>) -> Result<Self> {
+        // Obtain first preferred analyzer from config, or fall back.
+        let cfg_rx = cfg_source
+            .listen()
+            .await
+            .map_err(|e| anyhow!("config channel failed: {e}"))?;
+
+        let initial_name = (*cfg_rx.borrow()).clone();
+        let analyzer = registry
+            .get(&initial_name)
+            .ok_or_else(|| anyhow!("unknown analyzer '{initial_name}'"))?;
+
+        Ok(Self {
+            registry,
+            cfg_source,
+            current: Arc::new(RwLock::new(analyzer)),
+        })
+    }
+
+    /// Runs a background listener that hot-swaps the analyzer every time the
+    /// configuration changes.
+    pub async fn start_config_listener(self: &Arc<Self>) -> Result<JoinHandle<()>> {
+        let mut cfg_rx = self.cfg_source.listen().await?;
+        let registry = Arc::clone(&self.registry);
+        let current = Arc::clone(&self.current);
+
+        Ok(tokio::spawn(async move {
+            loop {
+                cfg_rx.changed().await.expect("config channel closed");
+                let desired = cfg_rx.borrow().clone();
+                if let Some(new_analyzer) = registry.get(&desired) {
+                    let mut guard = current.write().expect("lock poisoned");
+                    *guard = new_analyzer;
+                    tracing::info!(%desired, "Switched active sentiment analyzer");
+                } else {
+                    tracing::warn!(%desired, "Requested analyzer not found; ignoring");
+                }
+            }
+        }))
+    }
+
+    /// Consumes the provided `input` stream, enriches each message, and returns
+    /// a *new* stream that yields [`EnrichedMessage`] values.
+    ///
+    /// The returned stream ends when the input stream ends.
+    pub fn enrich_stream<S>(&self, input: S) -> impl Stream<Item = EnrichedMessage>
+    where
+        S: Stream<Item = SocialMessage> + Send + Unpin + 'static,
+    {
+        let current = Arc::clone(&self.current);
+        input.then(move |msg| {
+            let current_clone = Arc::clone(&current);
+            async move {
+                let analyzer = {
+                    // Clone the handle so we can drop lock ASAP.
+                    current_clone
+                        .read()
+                        .expect("lock poisoned")
+                        .clone()
+                };
+                let score = analyzer.analyze(&msg.text).await;
+                EnrichedMessage { original: msg, score }
+            }
+        })
+    }
+}
+
+// --------------------------------------------------------------------------------------------
+//                                           Tests
+// --------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::{sync::mpsc, time::timeout};
+
+    #[tokio::test]
+    async fn hot_swap_works() -> Result<()> {
+        let registry = Arc::new(AnalyzerRegistry::with_defaults());
+        let cfg_src = Arc::new(InMemoryConfigSource::new("bag_of_words"));
+
+        let processor = Arc::new(SentimentProcessor::new(registry, cfg_src.clone()).await?);
+        let _listener = processor.start_config_listener().await?;
+
+        // Producer side.
+        let (tx, rx) = mpsc::channel::<SocialMessage>(8);
+        tokio::spawn(async move {
+            tx.send(SocialMessage {
+                id: 1,
+                author: "alice".into(),
+                text: "I love rust!".into(),
+                timestamp_ms: 0,
+            })
+            .await
+            .unwrap();
+
+            // Switch algorithm mid-flight.
+            cfg_src.update("bert");
+
+            tx.send(SocialMessage {
+                id: 2,
+                author: "bob".into(),
+                text: "terrible experience :(".into(),
+                timestamp_ms: 1,
+            })
+            .await
+            .unwrap();
+        });
+
+        let mut out_stream = processor.enrich_stream(ReceiverStream::new(rx));
+
+        // First message should be scored by BagOfWordsAnalyzer.
+        let first = timeout(Duration::from_secs(1), out_stream.next())
+            .await?
+            .expect("stream ended");
+        assert!(
+            first.score.positivity > first.score.negativity,
+            "Bag-of-words expected positive sentiment"
+        );
+
+        // Second message should be handled by the BERT placeholder.
+        let second = timeout(Duration::from_secs(1), out_stream.next())
+            .await?
+            .expect("stream ended");
+        // There is no deterministic positivity/negativity ratio, but we *can*
+        // assert that the placeholder has a non-zero neutrality component.
+        assert!(
+            (second.score.neutrality - 0.0).abs() > f32::EPSILON,
+            "BERT placeholder returns mixed sentiment"
+        );
+
+        Ok(())
+    }
+}
+```

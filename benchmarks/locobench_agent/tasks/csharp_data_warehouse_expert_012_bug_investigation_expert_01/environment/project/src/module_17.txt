@@ -1,0 +1,276 @@
+```csharp
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Linq;
+using System.Reflection;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformations
+{
+    #region Domain Models
+
+    /// <summary>
+    /// Standard envelope that wraps every ingested raw-event prior to transformation.
+    /// </summary>
+    public sealed record StreamEnvelope(
+        Guid Id,
+        string EventType,
+        DateTimeOffset IngestedAt,
+        JsonElement Payload);
+
+    /// <summary>
+    /// Represents the outcome of executing an <see cref="ITransformationStrategy"/>.
+    /// </summary>
+    public sealed record TransformationResult(
+        Guid SourceEventId,
+        DateTimeOffset ProcessedAt,
+        string MetricName,
+        JsonElement MetricPayload);
+
+    #endregion
+
+    #region Strategy Infrastructure
+
+    /// <summary>
+    /// Attribute used to tag a concrete <see cref="ITransformationStrategy"/> with a friendly alias.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Class)]
+    public sealed class TransformationAttribute : Attribute
+    {
+        public TransformationAttribute(string alias) => Alias = alias ?? throw new ArgumentNullException(nameof(alias));
+        public string Alias { get; }
+    }
+
+    /// <summary>
+    /// Contract for a transformation strategy that converts an incoming <see cref="StreamEnvelope"/> 
+    /// into a domain-level <see cref="TransformationResult"/>.
+    /// </summary>
+    public interface ITransformationStrategy
+    {
+        string Alias { get; }
+
+        /// <summary>
+        /// Indicates whether the strategy can process the provided event without throwing.
+        /// Lightweight declaration that avoids heavy IO or CPU work.
+        /// </summary>
+        bool CanHandle(StreamEnvelope envelope);
+
+        /// <summary>
+        /// Executes the transformation asynchronously.
+        /// </summary>
+        Task<TransformationResult> TransformAsync(StreamEnvelope envelope, CancellationToken token);
+    }
+
+    /// <summary>
+    /// Thread-safe registry that discovers and caches all <see cref="ITransformationStrategy"/> 
+    /// implementations across loaded assemblies.
+    /// </summary>
+    public sealed class TransformationStrategyRegistry
+    {
+        private readonly ILogger<TransformationStrategyRegistry> _logger;
+        private readonly IMemoryCache _cache;
+        private readonly IServiceProvider _serviceProvider;
+
+        private const string CacheKey = "PulseOps.Warehouse.Transformations.Registry";
+
+        public TransformationStrategyRegistry(
+            IServiceProvider serviceProvider,
+            ILogger<TransformationStrategyRegistry> logger,
+            IMemoryCache cache)
+        {
+            _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
+            _logger           = logger           ?? throw new ArgumentNullException(nameof(logger));
+            _cache            = cache            ?? throw new ArgumentNullException(nameof(cache));
+        }
+
+        /// <summary>
+        /// Retrieves all registered strategies, scanning assemblies only on first invocation.
+        /// </summary>
+        public ImmutableArray<ITransformationStrategy> GetAllStrategies()
+        {
+            return _cache.GetOrCreate(CacheKey, entry =>
+            {
+                entry.SetPriority(CacheItemPriority.NeverRemove);
+                var strategies = DiscoverStrategies().ToImmutableArray();
+                _logger.LogInformation("Discovered {Count} transformation strategies.", strategies.Length);
+                return strategies;
+            });
+        }
+
+        /// <summary>
+        /// Executes the first strategy that <see cref="ITransformationStrategy.CanHandle"/> the envelope.
+        /// Throws <see cref="InvalidOperationException"/> when no handler is found.
+        /// </summary>
+        public async Task<TransformationResult> ExecuteAsync(
+            StreamEnvelope envelope,
+            CancellationToken token = default)
+        {
+            var strategy = GetAllStrategies()
+                .FirstOrDefault(s => s.CanHandle(envelope));
+
+            if (strategy is null)
+            {
+                _logger.LogWarning(
+                    "No transformation strategy found for event {EventId} of type {EventType}.", 
+                    envelope.Id, envelope.EventType);
+
+                throw new InvalidOperationException(
+                    $"No transformation strategy could handle event type '{envelope.EventType}'.");
+            }
+
+            _logger.LogDebug(
+                "Executing strategy {Alias} for event {EventId}.", 
+                strategy.Alias, envelope.Id);
+
+            try
+            {
+                return await strategy.TransformAsync(envelope, token)
+                                      .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Transformation failed for event {EventId} using strategy {Alias}.",
+                    envelope.Id, strategy.Alias);
+
+                throw; // Let upstream handlers decide what to do (DLQ, retry, etc.)
+            }
+        }
+
+        #region Private Helpers
+
+        private IEnumerable<ITransformationStrategy> DiscoverStrategies()
+        {
+            // Search all currently loaded assemblies. In a Lambda environment, this is small.
+            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+
+            foreach (var assembly in assemblies)
+            {
+                IEnumerable<Type>? candidates = null;
+
+                try
+                {
+                    candidates = assembly
+                        .GetTypes()
+                        .Where(t => !t.IsAbstract &&
+                                    typeof(ITransformationStrategy).IsAssignableFrom(t));
+                }
+                catch (ReflectionTypeLoadException ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Partial failure loading types from assembly {Assembly}. Skipping problematic types.",
+                        assembly.FullName);
+
+                    candidates = ex.Types.Where(t => t is not null &&
+                                                     !t.IsAbstract &&
+                                                     typeof(ITransformationStrategy).IsAssignableFrom(t!));
+                }
+
+                foreach (var candidate in candidates)
+                {
+                    // Obtain attribute alias or fallback to class full name
+                    var alias = candidate.GetCustomAttribute<TransformationAttribute>()?.Alias 
+                                ?? candidate.FullName!;
+
+                    // Resolve instance via DI if possible; otherwise try parameterless ctor
+                    if (_serviceProvider.GetService(candidate) is ITransformationStrategy fromDi)
+                    {
+                        yield return fromDi;
+                    }
+                    else if (Activator.CreateInstance(candidate) is ITransformationStrategy instance)
+                    {
+                        yield return instance;
+                    }
+                    else
+                    {
+                        _logger.LogError(
+                            "Unable to instantiate strategy {StrategyType}. Skipping.",
+                            candidate.FullName);
+                    }
+                }
+            }
+        }
+
+        #endregion
+    }
+
+    #endregion
+
+    #region Concrete Strategies
+
+    /// <summary>
+    /// Calculates the ratio of 'focus-time' to total working hours using calendar events.
+    /// </summary>
+    [Transformation("focus-time-ratio")]
+    public sealed class FocusTimeRatioStrategy : ITransformationStrategy
+    {
+        public string Alias => "focus-time-ratio";
+
+        private const string EventTypeHandled = "calendar-event";
+
+        public bool CanHandle(StreamEnvelope envelope)
+            => string.Equals(envelope.EventType, EventTypeHandled, StringComparison.OrdinalIgnoreCase);
+
+        public Task<TransformationResult> TransformAsync(StreamEnvelope envelope, CancellationToken token)
+        {
+            // Parse calendar events from raw JSON payload
+            var rawEvents = JsonSerializer.Deserialize<IEnumerable<CalendarEvent>>(envelope.Payload.GetRawText()) 
+                            ?? Enumerable.Empty<CalendarEvent>();
+
+            var workHours = rawEvents
+                .Where(e => e.IsWorkingHours)
+                .Sum(e => (e.End - e.Start).TotalMinutes);
+
+            var focusMinutes = rawEvents
+                .Where(e => e.IsWorkingHours && e.Tags.Contains("FOCUS", StringComparer.OrdinalIgnoreCase))
+                .Sum(e => (e.End - e.Start).TotalMinutes);
+
+            double ratio = workHours > 0 ? focusMinutes / workHours : 0;
+
+            var metric = new FocusTimeRatio
+            {
+                FocusMinutes = focusMinutes,
+                TotalWorkMinutes = workHours,
+                Ratio = ratio
+            };
+
+            var metricJson = JsonSerializer.SerializeToElement(metric);
+
+            var result = new TransformationResult(
+                SourceEventId: envelope.Id,
+                ProcessedAt: DateTimeOffset.UtcNow,
+                MetricName: "focus-time-ratio",
+                MetricPayload: metricJson);
+
+            return Task.FromResult(result);
+        }
+
+        #region Nested DTOs
+
+        private sealed record CalendarEvent(
+            DateTimeOffset Start,
+            DateTimeOffset End,
+            bool IsWorkingHours,
+            IReadOnlyList<string> Tags);
+
+        private sealed record FocusTimeRatio
+        {
+            public double FocusMinutes { get; init; }
+            public double TotalWorkMinutes { get; init; }
+            public double Ratio { get; init; }
+        }
+
+        #endregion
+    }
+
+    #endregion
+}
+```

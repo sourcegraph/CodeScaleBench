@@ -1,0 +1,536 @@
+```c
+/**
+ * src/cache/response_cache.c
+ *
+ * MercuryMonolith Commerce Hub – Response Cache
+ *
+ * A high-performance, thread-safe, in-memory LRU cache for serialized HTTP /
+ * GraphQL responses.  The cache supports TTL-based eviction, Prometheus-style
+ * metrics, structured logging, and graceful shutdown.  This component is
+ * designed to be embedded in a single-process “micro-service” monolith and
+ * therefore avoids global symbols other than the public API declared in
+ * response_cache.h.
+ *
+ * Build flags:
+ *   -std=c11 -pthread -DMERCURY_DEBUG
+ *
+ * Author:    MercuryMonolith Core Team
+ * Copyright: (c) 2024 Pioneer Retail Systems
+ */
+
+#include "response_cache.h"
+
+#include <errno.h>
+#include <inttypes.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifdef MERCURY_DEBUG
+#    define DEBUG_LOG(fmt, ...)                                                  \
+        do {                                                                     \
+            fprintf(stderr, "[RCACHE][DEBUG] " fmt "\n", ##__VA_ARGS__);         \
+        } while (0)
+#else
+#    define DEBUG_LOG(...) /* no-op */
+#endif
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/*                              Internal structs                               */
+/* ──────────────────────────────────────────────────────────────────────────── */
+
+typedef struct cache_entry_t {
+    char                     *key;       /* Heap-allocated, null-terminated.     */
+    uint8_t                  *payload;   /* Serialized response buffer.          */
+    size_t                    payload_sz;
+    uint64_t                  expires_at;/* Epoch millis.                        */
+    struct cache_entry_t     *prev;      /* LRU doubly-linked list.              */
+    struct cache_entry_t     *next;
+    struct cache_entry_t     *hnext;     /* Hash chain link.                     */
+} cache_entry_t;
+
+typedef struct {
+    /* Configuration */
+    size_t          capacity;      /* Max # entries                             */
+    uint64_t        default_ttl;   /* Milliseconds                              */
+    /* State */
+    size_t          table_size;    /* Hash table buckets                        */
+    cache_entry_t **table;         /* Hash table                                */
+    cache_entry_t  *lru_head;      /* Most recently used                        */
+    cache_entry_t  *lru_tail;      /* Least recently used                       */
+    size_t          size;          /* Current # entries                         */
+    /* Concurrency */
+    pthread_rwlock_t rwlock;       /* Global RW lock                            */
+    /* Metrics */
+    atomic_uint_fast64_t hits;
+    atomic_uint_fast64_t misses;
+    atomic_uint_fast64_t evictions;
+} cache_ctx_t;
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/*                           Static-scope declarations                         */
+/* ──────────────────────────────────────────────────────────────────────────── */
+
+static uint64_t _now_millis(void);
+static uint64_t _hash(const char *s);
+static void     _promote(cache_ctx_t *ctx, cache_entry_t *e);
+static void     _evict_tail(cache_ctx_t *ctx);
+static void     _remove_entry(cache_ctx_t *ctx, cache_entry_t *e);
+static void     _free_entry(cache_entry_t *e);
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/*                             Public API impl                                 */
+/* ──────────────────────────────────────────────────────────────────────────── */
+
+cache_handle_t cache_create(size_t capacity, uint64_t default_ttl_ms)
+{
+    if (capacity == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    cache_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) return NULL;
+
+    ctx->capacity     = capacity;
+    ctx->default_ttl  = default_ttl_ms ? default_ttl_ms : 30000; /* 30s default */
+    ctx->table_size   = 1;
+    while (ctx->table_size < capacity * 2) ctx->table_size <<= 1;
+
+    ctx->table = calloc(ctx->table_size, sizeof(cache_entry_t *));
+    if (!ctx->table) {
+        free(ctx);
+        return NULL;
+    }
+
+    pthread_rwlock_init(&ctx->rwlock, NULL);
+
+    DEBUG_LOG("Cache created (capacity=%zu, ttl=%" PRIu64 "ms, buckets=%zu)",
+              capacity, ctx->default_ttl, ctx->table_size);
+
+    return (cache_handle_t)ctx;
+}
+
+void cache_destroy(cache_handle_t handle)
+{
+    if (!handle) return;
+    cache_ctx_t *ctx = (cache_ctx_t *)handle;
+
+    pthread_rwlock_wrlock(&ctx->rwlock);
+    for (size_t i = 0; i < ctx->table_size; ++i) {
+        cache_entry_t *e = ctx->table[i];
+        while (e) {
+            cache_entry_t *next = e->hnext;
+            _free_entry(e);
+            e = next;
+        }
+    }
+    pthread_rwlock_unlock(&ctx->rwlock);
+
+    pthread_rwlock_destroy(&ctx->rwlock);
+    free(ctx->table);
+    free(ctx);
+}
+
+bool cache_get(cache_handle_t handle,
+               const char   *key,
+               uint8_t     **out_payload,
+               size_t       *out_sz,
+               uint64_t     *out_ttl_ms_remaining)
+{
+    if (!handle || !key || !out_payload || !out_sz) {
+        errno = EINVAL;
+        return false;
+    }
+
+    cache_ctx_t *ctx = (cache_ctx_t *)handle;
+    bool          hit  = false;
+
+    pthread_rwlock_rdlock(&ctx->rwlock);
+
+    uint64_t       h     = _hash(key) & (ctx->table_size - 1);
+    cache_entry_t *entry = ctx->table[h];
+
+    while (entry && strcmp(entry->key, key) != 0)
+        entry = entry->hnext;
+
+    if (entry) {
+        uint64_t now = _now_millis();
+        if (entry->expires_at > now) {
+            /* Cache hit */
+            hit = true;
+            *out_sz      = entry->payload_sz;
+            *out_payload = malloc(entry->payload_sz);
+            if (*out_payload == NULL) {
+                pthread_rwlock_unlock(&ctx->rwlock);
+                errno = ENOMEM;
+                return false;
+            }
+            memcpy(*out_payload, entry->payload, entry->payload_sz);
+
+            if (out_ttl_ms_remaining)
+                *out_ttl_ms_remaining = entry->expires_at - now;
+        }
+    }
+
+    pthread_rwlock_unlock(&ctx->rwlock);
+
+    if (hit) {
+        atomic_fetch_add_explicit(&ctx->hits, 1, memory_order_relaxed);
+        /* Promotion done outside read lock to minimize contention */
+        pthread_rwlock_wrlock(&ctx->rwlock);
+        _promote(ctx, entry);
+        pthread_rwlock_unlock(&ctx->rwlock);
+    } else {
+        atomic_fetch_add_explicit(&ctx->misses, 1, memory_order_relaxed);
+    }
+
+    return hit;
+}
+
+bool cache_put(cache_handle_t   handle,
+               const char      *key,
+               const uint8_t   *payload,
+               size_t           payload_sz,
+               uint64_t         ttl_ms /* 0 = use default */)
+{
+    if (!handle || !key || !payload || payload_sz == 0) {
+        errno = EINVAL;
+        return false;
+    }
+
+    cache_ctx_t *ctx = (cache_ctx_t *)handle;
+    uint64_t     now = _now_millis();
+
+    /* Allocate a copy before taking locks to shorten critical section */
+    cache_entry_t *new_entry = calloc(1, sizeof(*new_entry));
+    if (!new_entry) {
+        errno = ENOMEM;
+        return false;
+    }
+
+    new_entry->key        = strdup(key);
+    new_entry->payload    = malloc(payload_sz);
+    if (!new_entry->key || !new_entry->payload) {
+        _free_entry(new_entry);
+        errno = ENOMEM;
+        return false;
+    }
+    memcpy(new_entry->payload, payload, payload_sz);
+    new_entry->payload_sz = payload_sz;
+    new_entry->expires_at = now + (ttl_ms ? ttl_ms : ctx->default_ttl);
+
+    pthread_rwlock_wrlock(&ctx->rwlock);
+
+    /* Remove existing entry if present */
+    uint64_t       h     = _hash(key) & (ctx->table_size - 1);
+    cache_entry_t *e     = ctx->table[h];
+    cache_entry_t *prevh = NULL;
+    while (e && strcmp(e->key, key) != 0) {
+        prevh = e;
+        e     = e->hnext;
+    }
+    if (e) {
+        _remove_entry(ctx, e);
+        if (prevh)
+            prevh->hnext = e->hnext;
+        else
+            ctx->table[h] = e->hnext;
+        _free_entry(e);
+    }
+
+    /* Insert new entry at head of hash chain */
+    new_entry->hnext  = ctx->table[h];
+    ctx->table[h]     = new_entry;
+
+    /* Insert into LRU front */
+    new_entry->prev = NULL;
+    new_entry->next = ctx->lru_head;
+    if (ctx->lru_head)
+        ctx->lru_head->prev = new_entry;
+    ctx->lru_head = new_entry;
+    if (!ctx->lru_tail)
+        ctx->lru_tail = new_entry;
+
+    if (ctx->size < ctx->capacity)
+        ++ctx->size;
+    else
+        _evict_tail(ctx);
+
+    pthread_rwlock_unlock(&ctx->rwlock);
+
+    return true;
+}
+
+bool cache_invalidate(cache_handle_t handle, const char *key)
+{
+    if (!handle || !key) {
+        errno = EINVAL;
+        return false;
+    }
+
+    cache_ctx_t *ctx = (cache_ctx_t *)handle;
+    pthread_rwlock_wrlock(&ctx->rwlock);
+
+    uint64_t       h     = _hash(key) & (ctx->table_size - 1);
+    cache_entry_t *e     = ctx->table[h];
+    cache_entry_t *prevh = NULL;
+    while (e && strcmp(e->key, key) != 0) {
+        prevh = e;
+        e     = e->hnext;
+    }
+    if (!e) {
+        pthread_rwlock_unlock(&ctx->rwlock);
+        errno = ENOENT;
+        return false;
+    }
+
+    _remove_entry(ctx, e);
+    if (prevh)
+        prevh->hnext = e->hnext;
+    else
+        ctx->table[h] = e->hnext;
+
+    _free_entry(e);
+    ctx->size--;
+
+    pthread_rwlock_unlock(&ctx->rwlock);
+    return true;
+}
+
+void cache_clear(cache_handle_t handle)
+{
+    if (!handle) return;
+    cache_ctx_t *ctx = (cache_ctx_t *)handle;
+
+    pthread_rwlock_wrlock(&ctx->rwlock);
+
+    for (size_t i = 0; i < ctx->table_size; ++i) {
+        cache_entry_t *e = ctx->table[i];
+        while (e) {
+            cache_entry_t *next = e->hnext;
+            _free_entry(e);
+            e = next;
+        }
+        ctx->table[i] = NULL;
+    }
+    ctx->lru_head = ctx->lru_tail = NULL;
+    ctx->size     = 0;
+
+    pthread_rwlock_unlock(&ctx->rwlock);
+}
+
+void cache_stats(cache_handle_t     handle,
+                 cache_stats_t     *out_stats)
+{
+    if (!handle || !out_stats) return;
+    cache_ctx_t *ctx = (cache_ctx_t *)handle;
+
+    out_stats->capacity   = ctx->capacity;
+    out_stats->size       = ctx->size;
+    out_stats->hits       = atomic_load(&ctx->hits);
+    out_stats->misses     = atomic_load(&ctx->misses);
+    out_stats->evictions  = atomic_load(&ctx->evictions);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/*                         Internal helper implementations                     */
+/* ──────────────────────────────────────────────────────────────────────────── */
+
+static uint64_t _now_millis(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
+
+static uint64_t _hash(const char *s)
+{
+    /* FNV-1a 64-bit */
+    uint64_t hash = 14695981039346656037ULL;
+    for (; *s; ++s) {
+        hash ^= (unsigned char)*s;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static void _promote(cache_ctx_t *ctx, cache_entry_t *e)
+{
+    if (!e || ctx->lru_head == e) return;
+
+    /* Detach from current position */
+    if (e->prev)
+        e->prev->next = e->next;
+    if (e->next)
+        e->next->prev = e->prev;
+    if (ctx->lru_tail == e)
+        ctx->lru_tail = e->prev;
+
+    /* Move to front */
+    e->prev = NULL;
+    e->next = ctx->lru_head;
+    if (ctx->lru_head)
+        ctx->lru_head->prev = e;
+    ctx->lru_head = e;
+    if (!ctx->lru_tail)
+        ctx->lru_tail = e;
+}
+
+static void _evict_tail(cache_ctx_t *ctx)
+{
+    if (!ctx->lru_tail) return;
+
+    cache_entry_t *victim = ctx->lru_tail;
+
+    /* Remove from hash table */
+    uint64_t       h     = _hash(victim->key) & (ctx->table_size - 1);
+    cache_entry_t *e     = ctx->table[h];
+    cache_entry_t *prevh = NULL;
+    while (e && e != victim) {
+        prevh = e;
+        e     = e->hnext;
+    }
+    if (e) {
+        if (prevh)
+            prevh->hnext = e->hnext;
+        else
+            ctx->table[h] = e->hnext;
+    }
+
+    _remove_entry(ctx, victim);
+    _free_entry(victim);
+    atomic_fetch_add_explicit(&ctx->evictions, 1, memory_order_relaxed);
+}
+
+static void _remove_entry(cache_ctx_t *ctx, cache_entry_t *e)
+{
+    if (e->prev)
+        e->prev->next = e->next;
+    if (e->next)
+        e->next->prev = e->prev;
+    if (ctx->lru_head == e)
+        ctx->lru_head = e->next;
+    if (ctx->lru_tail == e)
+        ctx->lru_tail = e->prev;
+}
+
+static void _free_entry(cache_entry_t *e)
+{
+    if (!e) return;
+    free(e->key);
+    free(e->payload);
+    free(e);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/*                               Unit-test stub                                */
+/* ──────────────────────────────────────────────────────────────────────────── */
+#ifdef MERCURY_CACHE_TEST
+
+#include <assert.h>
+
+static void test_basic(void)
+{
+    cache_handle_t c = cache_create(2, 1000);
+    assert(c);
+
+    const char *k1 = "foo";
+    const char *v1 = "bar";
+
+    assert(cache_put(c, k1, (const uint8_t *)v1, strlen(v1) + 1, 0));
+
+    uint8_t *out;
+    size_t   sz;
+    assert(cache_get(c, k1, &out, &sz, NULL));
+    assert(sz == strlen(v1) + 1 && strcmp((char *)out, v1) == 0);
+    free(out);
+
+    cache_destroy(c);
+}
+
+int main(void)
+{
+    test_basic();
+    puts("Response cache unit tests passed.");
+    return 0;
+}
+
+#endif /* MERCURY_CACHE_TEST */
+```
+
+```c
+/**
+ * src/cache/response_cache.h
+ *
+ * Public API for the in-memory response cache used by the MercuryMonolith
+ * “micro-service” monolith.  This header is consumed by the API gateway and
+ * by individual service handlers to accelerate frequently requested resources.
+ */
+
+#pragma once
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Opaque pointer to internal cache context */
+typedef void *cache_handle_t;
+
+/* Statistics structure for Prometheus export */
+typedef struct {
+    size_t   capacity;   /* Configured capacity (items)            */
+    size_t   size;       /* Current items in cache                 */
+    uint64_t hits;       /* Cumulative cache hits                  */
+    uint64_t misses;     /* Cumulative cache misses                */
+    uint64_t evictions;  /* Cumulative evicted entries             */
+} cache_stats_t;
+
+/* Create a cache instance
+ * capacity            – maximum number of entries
+ * default_ttl_ms      – default time-to-live in milliseconds (0 => 30s)
+ * returns opaque handle or NULL on error (check errno)
+ */
+cache_handle_t cache_create(size_t capacity, uint64_t default_ttl_ms);
+
+/* Destroy a cache instance and free all resources */
+void cache_destroy(cache_handle_t handle);
+
+/* Retrieve an entry by key.  Returns true on hit, false on miss.
+ * The payload is heap-allocated and must be free()-d by caller.
+ * out_ttl_ms_remaining is optional (may be NULL).
+ */
+bool cache_get(cache_handle_t handle,
+               const char   *key,
+               uint8_t     **out_payload,
+               size_t       *out_sz,
+               uint64_t     *out_ttl_ms_remaining);
+
+/* Insert or replace a cache entry */
+bool cache_put(cache_handle_t   handle,
+               const char      *key,
+               const uint8_t   *payload,
+               size_t           payload_sz,
+               uint64_t         ttl_ms);
+
+/* Explicitly invalidate an entry */
+bool cache_invalidate(cache_handle_t handle, const char *key);
+
+/* Remove all entries */
+void cache_clear(cache_handle_t handle);
+
+/* Retrieve statistics */
+void cache_stats(cache_handle_t handle, cache_stats_t *out_stats);
+
+#ifdef __cplusplus
+}
+#endif
+```

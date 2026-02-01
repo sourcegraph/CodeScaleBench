@@ -1,0 +1,312 @@
+```rust
+//! tests/test_utils.rs
+//!
+//! Shared helpers & fixtures for the LedgerLink Nexus
+//! end-to-end / integration test-suite.
+//
+//  ─────────────────────────────────────────────────────────
+//
+//  This module is *only* compiled when the test target is
+//  built (`cargo test`).  It provides a small harness that
+//  spins-up the HTTP server on a random local port, exposes
+//  a pre-configured `reqwest` client, and ships a handful of
+//  assertion helpers (pagination metadata, cache headers,
+//  JSON decoding, etc.).
+//
+//  All helpers are **async-first** and rely on Tokio, which
+//  is already a transitive dependency of the main crate.
+//
+//  ─────────────────────────────────────────────────────────
+
+#![allow(dead_code)]
+
+use std::{
+    net::TcpListener,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{anyhow, Context, Result};
+use jsonwebtoken as jwt;
+use once_cell::sync::Lazy;
+use reqwest::{header, Client, Response};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::Value;
+use tokio::task::JoinHandle;
+use tracing::{subscriber::set_global_default, Subscriber};
+use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
+use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Registry};
+use uuid::Uuid;
+
+// -------------------------------------------------------------------------------------------------
+// Tracing / logging
+// -------------------------------------------------------------------------------------------------
+
+/// Global, one-time initialization of the tracing subscriber.
+///
+/// When the `TEST_LOG` environment variable is set, logs are routed
+/// to `stdout` so that `cargo test` output remains visible.  Otherwise,
+/// logs are discarded to keep the test output clean.
+static TRACING: Lazy<()> = Lazy::new(|| {
+    let filter_layer = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new("info,hyper=warn,sqlx=warn"))
+        .expect("Failed to init `tracing` filter-layer");
+
+    let formatting_layer = BunyanFormattingLayer::new(
+        "ledgerlink_nexus_tests".into(),
+        std::io::stdout, // replaced with `sink()` when TEST_LOG not set
+    );
+
+    let subscriber = Registry::default()
+        .with(filter_layer)
+        .with(JsonStorageLayer)
+        .with(formatting_layer);
+
+    init_subscriber(subscriber);
+});
+
+/// Install the subscriber as the global default tracing dispatcher.
+fn init_subscriber(subscriber: impl Subscriber + Send + Sync + 'static) {
+    set_global_default(subscriber)
+        .expect("Failed to set global default tracing subscriber");
+}
+
+/// Override the logging sink when `TEST_LOG` is *not* set so noisy
+/// integration tests stay clean.
+fn get_output() -> Box<(dyn std::io::Write + Send)> {
+    if std::env::var("TEST_LOG").is_ok() {
+        Box::new(std::io::stdout())
+    } else {
+        Box::new(std::io::sink())
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Test application harness
+// -------------------------------------------------------------------------------------------------
+
+/// A running instance of the LedgerLink Nexus HTTP service,
+/// bound to a random port on *localhost*.
+pub struct TestApp {
+    pub address: String,
+    pub port: u16,
+    pub http_client: Client,
+    _server_handle: JoinHandle<()>,
+}
+
+/// Spin-up the API service on a random local port and return a
+/// configured [`TestApp`] handle.
+///
+/// This relies on `ledgerlink_nexus::startup::run`, which is
+/// expected to accept a bound `TcpListener` and return an
+/// `axum::http::Server` *future*.  If your implementation differs
+/// simply patch the call-site below.
+pub async fn spawn_app() -> TestApp {
+    // Ensure tracing is initialized _once_ per test-binary.
+    Lazy::force(&TRACING);
+
+    // Bind to port 0 — let the OS allocate a free port.
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .expect("Failed to bind random local port");
+    let port = listener.local_addr().unwrap().port();
+    let address = format!("http://127.0.0.1:{port}");
+
+    // Launch the actual server in a background task.
+    //
+    // `run()` **must not** block – it should return a `Future`
+    // that drives the Axum/Hyper server.  We detach that future
+    // onto Tokio's runtime so tests can continue.
+    let server = ledgerlink_nexus::startup::run(listener)
+        .expect("Failed to spawn application");
+
+    let _server_handle = tokio::spawn(server);
+
+    // A very small timeout to prevent hanging tests when
+    // the server accidentally dead-locks.
+    let http_client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        // Accept invalid certs *only* in tests so we could hit
+        // HTTPS endpoints with self-signed certificates.
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build `reqwest` client");
+
+    TestApp {
+        address,
+        port,
+        http_client,
+        _server_handle,
+    }
+}
+
+impl TestApp {
+    /// Perform a generic *POST* request against the test application.
+    pub async fn post<T: Serialize + ?Sized>(&self, path: &str, body: &T) -> Response {
+        self.http_client
+            .post(self.url(path))
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("POST {}", path))
+            .expect("Failed to execute request")
+    }
+
+    /// Perform a generic *GET* request against the test application.
+    pub async fn get(&self, path: &str) -> Response {
+        self.http_client
+            .get(self.url(path))
+            .send()
+            .await
+            .with_context(|| format!("GET {}", path))
+            .expect("Failed to execute request")
+    }
+
+    /// Build a fully-qualified URL relative to the test server.
+    pub fn url(&self, path: &str) -> String {
+        // We want to handle `/v1/ledger` and `v1/ledger` equally.
+        let trimmed = path.trim_start_matches('/');
+        format!("{}/{}", self.address, trimmed)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Domain specific helpers
+// -------------------------------------------------------------------------------------------------
+
+/// Short-hand for decoding a JSON response body into the desired `T`.
+/// Returns **`anyhow::Error`** if decoding fails and enriches the
+/// error with the *raw body* for easier debugging.
+pub async fn json<T>(resp: Response) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let status = resp.status();
+    let bytes = resp.bytes().await.context("Reading response body")?;
+    serde_json::from_slice(&bytes).with_context(|| {
+        let body = String::from_utf8_lossy(&bytes);
+        format!("Decoding JSON failed (status: {status}) – body: {body}")
+    })
+}
+
+/// Common LedgerLink pagination envelope as emitted by the API.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PaginationMeta {
+    pub page: u32,
+    pub per_page: u32,
+    pub total_pages: u32,
+    pub total_items: u64,
+}
+
+/// Validate that the top-level JSON object contains the canonical
+/// pagination keys under `meta.pagination`.  Returns a deserialized
+/// [`PaginationMeta`] struct on success.
+pub fn extract_pagination_meta(v: &Value) -> Result<PaginationMeta> {
+    v.get("meta")
+        .and_then(|m| m.get("pagination"))
+        .ok_or_else(|| anyhow!("Missing `meta.pagination` in response"))?
+        .to_owned()
+        .try_into()
+        .context("Deserializing pagination metadata")
+}
+
+/// Assert that the response carries RFC 7234 compatible cache headers.
+///
+/// A LedgerLink endpoint **must** set either `Cache-Control: no-store`
+/// or a positive `max-age` directive plus an explicit `ETag`.
+pub fn assert_cache_headers(resp: &Response) -> Result<()> {
+    let cc = resp
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .ok_or_else(|| anyhow!("Missing `Cache-Control` header"))?
+        .to_str()
+        .context("Parsing `Cache-Control` header")?;
+
+    if cc.contains("no-store") {
+        // Explicitly opted-out -> we’re good.
+        return Ok(());
+    }
+
+    // Must have a max-age AND an ETag
+    let has_max_age = cc.split(',').any(|d| d.trim().starts_with("max-age="));
+    let has_etag = resp.headers().contains_key(header::ETAG);
+
+    if has_max_age && has_etag {
+        Ok(())
+    } else {
+        Err(anyhow!("Cache headers invalid: {cc:?} / etag={has_etag}"))
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Authentication helpers
+// -------------------------------------------------------------------------------------------------
+
+/// Short-hand to build a *signed* bearer token for test scenarios.
+///
+/// The microservice under test is expected to validate HS256 signed
+/// tokens with an internal **HMAC** secret (`LEDGERLINK_TEST_JWT_KEY`).
+///
+/// NOTE: These *test* secrets **MUST NOT** be used in production!
+pub fn bearer_token(user_id: Uuid, roles: &[&str]) -> Result<String> {
+    #[derive(Debug, Serialize)]
+    struct Claims<'a> {
+        sub: Uuid,
+        exp: usize,
+        roles: &'a [&'a str],
+    }
+
+    let exp = SystemTime::now()
+        .checked_add(Duration::from_secs(60 * 60)) // 1h
+        .expect("valid timestamp")
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_secs() as usize;
+
+    let claims = Claims {
+        sub: user_id,
+        exp,
+        roles,
+    };
+
+    let secret = std::env::var("LEDGERLINK_TEST_JWT_KEY")
+        .unwrap_or_else(|_| "ledgerlink-super-secret".into());
+
+    let header = jwt::Header::default();
+    jwt::encode(&header, &claims, &jwt::EncodingKey::from_secret(secret.as_bytes()))
+        .context("Signing test JWT")
+}
+
+/// Convenience wrapper to attach the `Authorization: Bearer <token>`
+/// header to a `reqwest::RequestBuilder`.
+pub trait WithBearer {
+    fn bearer(self, token: &str) -> Self;
+}
+
+impl WithBearer for reqwest::RequestBuilder {
+    fn bearer(self, token: &str) -> Self {
+        self.header(header::AUTHORIZATION, format!("Bearer {token}"))
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Example integration test (kept here to ensure utils compile)
+// -------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn health_check_works() -> Result<()> {
+        let app = spawn_app().await;
+
+        let resp = app.get("/health").await;
+        assert_eq!(resp.status(), 200);
+
+        let body: Value = json(resp).await?;
+        assert_eq!(body, json!({ "status": "ok" }));
+
+        Ok(())
+    }
+}
+```

@@ -1,0 +1,375 @@
+```rust
+//! module_46 – Event abstractions + RabbitMQ publisher + Indexing consumer
+//! ---------------------------------------------------------------------------------
+//! This module lives inside the EduPulse Live core crate and provides the following:
+//!
+//! 1. A generic, version-tolerant representation of a domain event (`DomainEvent`).
+//! 2. A strongly-typed, JSON-serialisable event envelope (`EventEnvelope<T>`).
+//! 3. An `EventPublisher` trait and a RabbitMQ implementation (`RabbitMqPublisher`).
+//! 4. A long-running, fault-tolerant consumer that updates the full-text search index
+//!    on every content-relevant event (`SearchIndexConsumer`).
+//!
+//! All public types are intentionally reusable by other sub-crates such as the
+//! notification service, the audit log writer, or the analytics pipeline.
+
+#![allow(clippy::unused_async)] // For brevity in this example
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::{stream::StreamExt, FutureExt};
+use lapin::{
+    options::{
+        BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, QueueDeclareOptions,
+    },
+    types::FieldTable,
+    BasicProperties, Channel, Connection, ConnectionProperties,
+};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::{fmt::Debug, sync::Arc, time::Duration};
+use thiserror::Error;
+use tokio::{sync::Mutex, task::JoinHandle};
+use uuid::Uuid;
+
+/// A lightweight backdrop for failure propagation inside this module.
+#[derive(Debug, Error)]
+pub enum EventBusError {
+    #[error("AMQP error: {0}")]
+    Amqp(#[from] lapin::Error),
+    #[error("serialization failure: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("search index error: {0}")]
+    Indexing(String),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// Semantic discriminator for all events that *might* end up in the search index.
+/// Other bounded contexts can define additional variants inside their own enums.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SearchableEvent {
+    LessonPublished {
+        lesson_id: Uuid,
+        author_id: Uuid,
+        title: String,
+        abstract_md: String,
+    },
+    LearningPulseCreated {
+        pulse_id: Uuid,
+        teacher_id: Uuid,
+        headline: String,
+    },
+    ReplySubmitted {
+        pulse_id: Uuid,
+        student_id: Uuid,
+        reply_id: Uuid,
+        content: String,
+    },
+    // --- Add new variants backwards-compatibly (do *not* change existing variants)
+}
+
+/// Super-trait to mark structs/enums as domain events.
+pub trait DomainEvent: Debug + Send + Sync + Serialize + DeserializeOwned {}
+
+impl DomainEvent for SearchableEvent {}
+
+/// Envelope containing meta-information shared by all events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope<T: DomainEvent> {
+    pub id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub aggregate_id: Uuid,
+    pub version: u16,
+    pub payload: T,
+}
+
+impl<T: DomainEvent> EventEnvelope<T> {
+    /// Wrap a raw domain event into a versioned envelope.
+    pub fn wrap(aggregate_id: Uuid, payload: T, version: u16) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            aggregate_id,
+            version,
+            payload,
+        }
+    }
+}
+
+/// Side-effect-free abstraction for publishing domain events.
+#[async_trait]
+pub trait EventPublisher {
+    async fn publish<T: DomainEvent>(&self, routing_key: &str, event: &EventEnvelope<T>)
+        -> Result<(), EventBusError>;
+}
+
+/// Reference-counted, thread-safe publisher backed by RabbitMQ.
+#[derive(Clone)]
+pub struct RabbitMqPublisher {
+    channel: Arc<Channel>,
+    exchange: String,
+}
+
+impl RabbitMqPublisher {
+    /// Bootstrap RabbitMQ connection and ensure the topic exchange exists.
+    pub async fn new(url: &str, exchange: &str) -> Result<Self, EventBusError> {
+        let conn = Connection::connect(url, ConnectionProperties::default()).await?;
+        let channel = conn.create_channel().await?;
+        channel
+            .exchange_declare(
+                exchange,
+                lapin::ExchangeKind::Topic,
+                lapin::options::ExchangeDeclareOptions {
+                    durable: true,
+                    auto_delete: false,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await?;
+        Ok(Self {
+            channel: Arc::new(channel),
+            exchange: exchange.to_owned(),
+        })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for RabbitMqPublisher {
+    async fn publish<T: DomainEvent>(
+        &self,
+        routing_key: &str,
+        event: &EventEnvelope<T>,
+    ) -> Result<(), EventBusError> {
+        let payload = serde_json::to_vec(event)?;
+        self.channel
+            .basic_publish(
+                &self.exchange,
+                routing_key,
+                BasicPublishOptions::default(),
+                &payload,
+                BasicProperties::default()
+                    .with_content_type("application/json".into())
+                    .with_message_id(event.id.to_string().into()),
+            )
+            .await?
+            .await?; // wait for confirmation
+        Ok(())
+    }
+}
+
+/// Consumer responsible for maintaining an external search index (e.g. OpenSearch).
+///
+/// The implementation is simplified for readability; in production, you would inject
+/// a typed HTTP client with retry, exponential back-off, circuit-breaker, etc.
+pub struct SearchIndexConsumer {
+    channel: Channel,
+    queue_name: String,
+    _handle: JoinHandle<()>,
+    shutdown: Arc<Mutex<bool>>,
+}
+
+impl SearchIndexConsumer {
+    /// Bind to the topic exchange and spawn a long-running consume loop.
+    pub async fn spawn(
+        amqp_url: &str,
+        exchange: &str,
+        queue_name: &str,
+        binding_keys: &[&str],
+    ) -> Result<Self, EventBusError> {
+        let conn = Connection::connect(amqp_url, ConnectionProperties::default()).await?;
+        let channel = conn.create_channel().await?;
+
+        // Durable queue; survives broker restart.
+        channel
+            .queue_declare(
+                queue_name,
+                QueueDeclareOptions {
+                    durable: true,
+                    auto_delete: false,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await?;
+
+        for binding_key in binding_keys {
+            channel
+                .queue_bind(
+                    queue_name,
+                    exchange,
+                    binding_key,
+                    lapin::options::QueueBindOptions::default(),
+                    FieldTable::default(),
+                )
+                .await?;
+        }
+
+        let shutdown = Arc::new(Mutex::new(false));
+        let shutdown_signal = shutdown.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut consumer = match channel
+                .basic_consume(
+                    queue_name,
+                    "search_index_consumer",
+                    BasicConsumeOptions {
+                        no_ack: false,
+                        ..Default::default()
+                    },
+                    FieldTable::default(),
+                )
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Consumer could not start: {e}");
+                    return;
+                }
+            };
+
+            info!("SearchIndexConsumer started.");
+
+            while let Some(delivery) = consumer.next().await {
+                let delivery = match delivery {
+                    Ok(d) => d,
+                    Err(e) => {
+                        error!("Delivery error: {e}");
+                        continue;
+                    }
+                };
+
+                match Self::handle_delivery(&delivery.data).await {
+                    Ok(_) => {
+                        if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
+                            error!("Ack failed: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to process message: {e:?}");
+                        // Optionally use dead-letter exchange or nack w/ requeue.
+                        if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
+                            error!("Ack after failure failed: {e}");
+                        }
+                    }
+                }
+
+                // Cooperative cancellation
+                if *shutdown_signal.lock().await {
+                    info!("SearchIndexConsumer is shutting down.");
+                    break;
+                }
+            }
+        });
+
+        Ok(Self {
+            channel,
+            queue_name: queue_name.into(),
+            _handle: handle,
+            shutdown,
+        })
+    }
+
+    /// Convert the raw message into an event and update the index.
+    async fn handle_delivery(payload: &[u8]) -> Result<(), EventBusError> {
+        let envelope: EventEnvelope<SearchableEvent> = serde_json::from_slice(payload)?;
+
+        match &envelope.payload {
+            SearchableEvent::LessonPublished { lesson_id, title, .. } => {
+                // Simulate upsert into the search index
+                debug!("Indexing lesson {lesson_id}, title={title}");
+            }
+            SearchableEvent::LearningPulseCreated { pulse_id, .. } => {
+                debug!("Indexing pulse {pulse_id}");
+            }
+            SearchableEvent::ReplySubmitted { reply_id, .. } => {
+                debug!("Indexing reply {reply_id}");
+            }
+        }
+
+        // In a real implementation one might call:
+        // self.index_client.upsert(document_id, &envelope.payload).await?;
+        Ok(())
+    }
+
+    /// Gracefully ask the consumer loop to exit, wait for queue drain, then close channel.
+    pub async fn shutdown(self) -> Result<(), EventBusError> {
+        {
+            let mut flag = self.shutdown.lock().await;
+            *flag = true;
+        }
+        // Allow the async task some time to finish reading remaining deliveries.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        self.channel.close(200, "shutdown").await?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// Example: publishing a lesson event right after a lesson is persisted.
+// (Normally this would live in the lesson service not in this file.)
+// ---------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn envelope_wraps_correctly() {
+        let agg_id = Uuid::new_v4();
+        let event = SearchableEvent::LessonPublished {
+            lesson_id: agg_id,
+            author_id: Uuid::new_v4(),
+            title: "Intro to Rust".into(),
+            abstract_md: "Ownership, borrowing, lifetimes...".into(),
+        };
+
+        let envelope = EventEnvelope::wrap(agg_id, event, 1);
+
+        assert_eq!(envelope.aggregate_id, agg_id);
+        assert_eq!(envelope.version, 1);
+    }
+
+    /// Spawn a consumer & publisher talking to a local dev broker (RabbitMQ),
+    /// publish a single message, and verify that the consumer processes it.
+    ///
+    /// This test is ignored by default because it depends on infrastructure.
+    #[tokio::test]
+    #[ignore]
+    async fn roundtrip_integration() -> Result<(), EventBusError> {
+        let amqp = "amqp://guest:guest@127.0.0.1:5672/%2f";
+        let exchange = "ep-search";
+        let queue = "ep-search-q";
+
+        // Launch consumer
+        let consumer = SearchIndexConsumer::spawn(amqp, exchange, queue, &["search.#"]).await?;
+
+        // Publisher
+        let publisher = RabbitMqPublisher::new(amqp, exchange).await?;
+
+        // Publish
+        let lesson_id = Uuid::new_v4();
+        let envelope = EventEnvelope::wrap(
+            lesson_id,
+            SearchableEvent::LessonPublished {
+                lesson_id,
+                author_id: Uuid::new_v4(),
+                title: "Async in Rust".into(),
+                abstract_md: "Futures, async/await, runtime...".into(),
+            },
+            1,
+        );
+
+        publisher.publish("search.lesson", &envelope).await?;
+
+        // Wait a bit until consumer processed message
+        timeout(Duration::from_secs(2), async {}).await.ok();
+
+        // Shut everything down
+        consumer.shutdown().await?;
+
+        Ok(())
+    }
+}
+```

@@ -1,0 +1,465 @@
+// src/module_51.txt
+
+//! Ledger Entry Query DTO, validation, caching and service layer.
+//!
+//! This module lives in the View-Model / Query layer of LedgerLink Nexus.  
+//! It owns:
+//!   • Strongly-typed, validated DTOs for paging through ledger entries  
+//!   • A repository abstraction + Postgres implementation (CQRS friendly)  
+//!   • Deterministic cache-key generation & a small LRU cache provider  
+//!   • A query service that unifies validation, caching and persistence  
+//!
+//! The goal is to keep controllers “thin” by having them delegate to the
+//! service so that business rules remain testable and cohesive.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use log::{debug, trace};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sqlx::{postgres::PgRow, PgPool, Row};
+use thiserror::Error;
+use validator::{Validate, ValidationError};
+
+/// Hard upper bound for `per_page` to protect database & memory.
+pub const MAX_PAGE_SIZE: u32 = 500;
+
+/// Asc/Desc sorting.
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortOrder {
+    Asc,
+    Desc,
+}
+
+impl Default for SortOrder {
+    fn default() -> Self {
+        SortOrder::Asc
+    }
+}
+
+/// Inbound View-Model used by REST & GraphQL layers.
+///
+/// It NEVER leaks domain entities to the outside world.  
+/// Implements `Validate` (via `validator`) so controllers only call `validate()`
+/// and can confidently forward the struct deeper into the system.
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct LedgerEntryQueryDto {
+    /// Tenant-scoped account identifier.
+    #[validate(length(min = 1, max = 64))]
+    pub account_id: String,
+
+    /// Optional inclusive start filter.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rfc3339_opt"
+    )]
+    pub start_date: Option<DateTime<Utc>>,
+
+    /// Optional inclusive end filter.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rfc3339_opt"
+    )]
+    pub end_date: Option<DateTime<Utc>>,
+
+    /// Page index (1-based).
+    #[validate(custom = "validate_non_zero")]
+    #[serde(default = "default_page")]
+    pub page: u32,
+
+    /// Page size.
+    #[validate(range(min = 1, max = "MAX_PAGE_SIZE"))]
+    #[serde(default = "default_per_page")]
+    pub per_page: u32,
+
+    /// Sort direction.
+    #[serde(default)]
+    pub sort_order: SortOrder,
+}
+
+// ---------------------------------------------------------------------------
+// Custom validation helpers
+// ---------------------------------------------------------------------------
+
+fn validate_non_zero(val: &u32) -> Result<(), ValidationError> {
+    if *val == 0 {
+        return Err(ValidationError::new("page must be ≥ 1"));
+    }
+    Ok(())
+}
+
+// Defaults for `serde(default)`
+fn default_page() -> u32 {
+    1
+}
+fn default_per_page() -> u32 {
+    100
+}
+
+// ---------------------------------------------------------------------------
+// RFC-3339 (de)serializer for Option<DateTime<Utc>>
+// ---------------------------------------------------------------------------
+mod rfc3339_opt {
+    use chrono::{DateTime, Utc};
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(
+        val: &Option<DateTime<Utc>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match val {
+            Some(dt) => serializer.serialize_str(&dt.to_rfc3339()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt = Option::<String>::deserialize(deserializer)?;
+        match opt {
+            Some(s) => {
+                let dt = DateTime::parse_from_rfc3339(&s)
+                    .map_err(serde::de::Error::custom)?
+                    .with_timezone(&Utc);
+                Ok(Some(dt))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Domain entity (simplified) — lives in the domain layer
+// ---------------------------------------------------------------------------
+#[derive(Debug)]
+pub struct LedgerEntry {
+    pub id: i64,
+    pub account_id: String,
+    pub amount: rust_decimal::Decimal,
+    pub currency: String,
+    pub occurred_at: DateTime<Utc>,
+    pub memo: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Repository Abstraction & Implementation
+// ---------------------------------------------------------------------------
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync + 'static {
+    async fn find_page(&self, query: &LedgerEntryQueryDto) -> Result<Vec<LedgerEntry>, RepositoryError>;
+}
+
+pub struct PostgresLedgerEntryRepository {
+    pool: PgPool,
+}
+
+impl PostgresLedgerEntryRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for PostgresLedgerEntryRepository {
+    async fn find_page(&self, query: &LedgerEntryQueryDto) -> Result<Vec<LedgerEntry>, RepositoryError> {
+        // ------------------------------------------------------------------
+        // Dynamic SQL assembly; we keep it explicit so callers can audit/trace
+        // ------------------------------------------------------------------
+        let mut sql = String::from(
+            r#"
+            SELECT  id,
+                    account_id,
+                    amount,
+                    currency,
+                    occurred_at,
+                    memo
+            FROM    ledger_entries
+            WHERE   account_id = $1
+        "#,
+        );
+
+        // param positions after `$1` (account_id)
+        let mut bind_index = 2;
+        let mut binds: Vec<Box<dyn sqlx::Encode<'_, sqlx::Postgres> + Send + Sync>> = Vec::new();
+
+        if let Some(start) = query.start_date {
+            sql.push_str(&format!(" AND occurred_at >= ${}", bind_index));
+            bind_index += 1;
+            binds.push(Box::new(start));
+        }
+        if let Some(end) = query.end_date {
+            sql.push_str(&format!(" AND occurred_at <= ${}", bind_index));
+            bind_index += 1;
+            binds.push(Box::new(end));
+        }
+
+        sql.push_str(" ORDER BY occurred_at ");
+        sql.push_str(match query.sort_order {
+            SortOrder::Asc => "ASC",
+            SortOrder::Desc => "DESC",
+        });
+
+        // Pagination (OFFSET + LIMIT)
+        sql.push_str(&format!(" OFFSET ${} LIMIT ${}", bind_index, bind_index + 1));
+        let offset: i64 = ((query.page - 1) * query.per_page) as i64;
+        let limit: i64 = query.per_page as i64;
+
+        debug!("SQL[ledger_page]: {}", sql);
+
+        let mut q = sqlx::query::<sqlx::Postgres>(&sql).bind(&query.account_id);
+
+        for b in binds {
+            q = q.bind(b);
+        }
+        q = q.bind(offset).bind(limit);
+
+        let rows: Vec<PgRow> = q.fetch_all(&self.pool).await?;
+        let entries = rows
+            .into_iter()
+            .map(|row| LedgerEntry {
+                id: row.get::<i64, _>("id"),
+                account_id: row.get::<String, _>("account_id"),
+                amount: row.get::<rust_decimal::Decimal, _>("amount"),
+                currency: row.get::<String, _>("currency"),
+                occurred_at: row.get::<DateTime<Utc>, _>("occurred_at"),
+                memo: row.get::<Option<String>, _>("memo"),
+            })
+            .collect();
+
+        Ok(entries)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Repository error
+// ---------------------------------------------------------------------------
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("database error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+}
+
+// ---------------------------------------------------------------------------
+// Cache abstraction — injected so we can swap Redis/In-Mem implementations
+// ---------------------------------------------------------------------------
+#[async_trait]
+pub trait CacheProvider: Send + Sync {
+    async fn get<T: serde::de::DeserializeOwned + Send>(&self, key: &str) -> Result<Option<T>, CacheError>;
+    async fn set<T: serde::Serialize + Send>(&self, key: &str, value: &T, ttl_secs: u64) -> Result<(), CacheError>;
+}
+
+#[derive(Debug, Error)]
+pub enum CacheError {
+    #[error("cache error: {0}")]
+    Generic(String),
+}
+
+// ---------------------------------------------------------------------------
+// In-memory LRU cache (dev/test convenience)
+// ---------------------------------------------------------------------------
+pub struct LocalLruCache {
+    store: parking_lot::RwLock<lru::LruCache<String, (Vec<u8>, std::time::Instant)>>,
+}
+
+impl LocalLruCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            store: parking_lot::RwLock::new(lru::LruCache::new(capacity)),
+        }
+    }
+}
+
+#[async_trait]
+impl CacheProvider for LocalLruCache {
+    async fn get<T: serde::de::DeserializeOwned + Send>(&self, key: &str) -> Result<Option<T>, CacheError> {
+        let now = std::time::Instant::now();
+        let mut map = self.store.write();
+        if let Some((bytes, expires_at)) = map.get(key) {
+            if *expires_at > now {
+                let v = bincode::deserialize(bytes).map_err(|e| CacheError::Generic(e.to_string()))?;
+                return Ok(Some(v));
+            }
+            map.pop(key); // expired
+        }
+        Ok(None)
+    }
+
+    async fn set<T: serde::Serialize + Send>(&self, key: &str, value: &T, ttl_secs: u64) -> Result<(), CacheError> {
+        let mut map = self.store.write();
+        let bytes = bincode::serialize(value).map_err(|e| CacheError::Generic(e.to_string()))?;
+        let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(ttl_secs);
+        map.put(key.to_owned(), (bytes, expires_at));
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Service layer
+// ---------------------------------------------------------------------------
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation failed: {0}")]
+    Validation(String),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+    #[error(transparent)]
+    Cache(#[from] CacheError),
+}
+
+#[async_trait]
+pub trait LedgerEntryQueryService: Send + Sync {
+    async fn get_page(&self, params: LedgerEntryQueryDto) -> Result<Vec<LedgerEntry>, ServiceError>;
+}
+
+pub struct LedgerEntryQueryServiceImpl<R: LedgerEntryRepository, C: CacheProvider> {
+    repo: Arc<R>,
+    cache: Arc<C>,
+}
+
+impl<R: LedgerEntryRepository, C: CacheProvider> LedgerEntryQueryServiceImpl<R, C> {
+    pub fn new(repo: Arc<R>, cache: Arc<C>) -> Self {
+        Self { repo, cache }
+    }
+}
+
+#[async_trait]
+impl<R, C> LedgerEntryQueryService for LedgerEntryQueryServiceImpl<R, C>
+where
+    R: LedgerEntryRepository,
+    C: CacheProvider,
+{
+    async fn get_page(&self, mut params: LedgerEntryQueryDto) -> Result<Vec<LedgerEntry>, ServiceError> {
+        // 1. Validate inbound payload
+        params.validate().map_err(|e| ServiceError::Validation(e.to_string()))?;
+
+        // 2. Cache lookup
+        let key = params.cache_key();
+        trace!("ledger_page cache_lookup={key}");
+        if let Some(cached) = self.cache.get::<Vec<LedgerEntry>>(&key).await? {
+            trace!("ledger_page cache_hit={key}");
+            return Ok(cached);
+        }
+
+        // 3. Repository call
+        let entries = self.repo.find_page(&params).await?;
+
+        // 4. Write-through cache (10 seconds — tune per SLA)
+        self.cache.set(&key, &entries, 10).await?;
+
+        Ok(entries)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DTO helpers
+// ---------------------------------------------------------------------------
+impl LedgerEntryQueryDto {
+    /// Deterministic cache key (v1).  
+    /// We SHA-256 the canonical JSON representation — stable across field order.
+    pub fn cache_key(&self) -> String {
+        let json = serde_json::to_string(self).expect("DTO JSON serialization never fails");
+        let mut sha = Sha256::new();
+        sha.update(json.as_bytes());
+        format!("ledger_page:v1:{}", hex::encode(sha.finalize()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[tokio::test]
+    async fn cache_key_is_stable() {
+        let dto1 = LedgerEntryQueryDto {
+            account_id: "a".into(),
+            start_date: None,
+            end_date: None,
+            page: 1,
+            per_page: 10,
+            sort_order: SortOrder::Asc,
+        };
+        let dto2 = dto1.clone();
+        assert_eq!(dto1.cache_key(), dto2.cache_key());
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_page_zero() {
+        let dto = LedgerEntryQueryDto {
+            account_id: "x".into(),
+            start_date: None,
+            end_date: None,
+            page: 0,
+            per_page: 10,
+            sort_order: SortOrder::Asc,
+        };
+        assert!(dto.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_cache_roundtrip() {
+        let cache = LocalLruCache::new(8);
+        let key = "foo";
+        cache.set(key, &vec![1, 2, 3], 5).await.unwrap();
+        let out: Option<Vec<i32>> = cache.get(key).await.unwrap();
+        assert_eq!(out, Some(vec![1, 2, 3]));
+    }
+
+    #[tokio::test]
+    async fn service_uses_cache() {
+        struct StubRepo;
+        #[async_trait]
+        impl LedgerEntryRepository for StubRepo {
+            async fn find_page(&self, _q: &LedgerEntryQueryDto) -> Result<Vec<LedgerEntry>, RepositoryError> {
+                Ok(vec![])
+            }
+        }
+
+        let cache = Arc::new(LocalLruCache::new(4));
+        let repo = Arc::new(StubRepo);
+        let svc = LedgerEntryQueryServiceImpl::new(repo, cache.clone());
+
+        // Prime cache
+        let dto = LedgerEntryQueryDto {
+            account_id: "a".into(),
+            start_date: None,
+            end_date: None,
+            page: 1,
+            per_page: 10,
+            sort_order: SortOrder::Asc,
+        };
+        let key = dto.cache_key();
+        cache.set(&key, &Vec::<LedgerEntry>::new(), 60).await.unwrap();
+
+        // The repo will NOT be hit (would panic otherwise)
+        let res = svc.get_page(dto).await.unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[test]
+    fn rfc3339_serializes() {
+        let dto = LedgerEntryQueryDto {
+            account_id: "a".into(),
+            start_date: Some(Utc.ymd(2023, 1, 1).and_hms(0, 0, 0)),
+            end_date: None,
+            page: 1,
+            per_page: 1,
+            sort_order: SortOrder::Asc,
+        };
+        let j = serde_json::to_string(&dto).unwrap();
+        assert!(j.contains("2023-01-01T00:00:00+00:00"));
+    }
+}

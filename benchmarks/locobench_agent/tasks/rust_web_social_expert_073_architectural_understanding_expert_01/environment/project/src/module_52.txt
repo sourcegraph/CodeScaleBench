@@ -1,0 +1,342 @@
+```rust
+//! src/module_52.rs
+//!
+//! Event-bus abstraction and RabbitMQ publisher for the EduPulse Live
+//! platform.  All domain services depend on this module to asynchronously
+//! propagate events such as `LearningPulseSubmitted`, `QuizGraded`, or
+//! `BadgeAwarded` to downstream consumers (search indexing, notifications,
+//! analytics, …).  The implementation adheres to the Repository pattern and
+//! hides the AMQP details behind a clean service interface.
+//!
+//! # Highlights
+//! • Async/await end-to-end (Tokio runtime).  
+//! • Connection pooling and automatic reconnection.  
+//! • Structured logging with `tracing`.  
+//! • Comprehensive error handling with `anyhow`.  
+//! • Zero-copy JSON serialization via `serde`.  
+//! • Feature-gated so the core API stays lightweight if the message bus is
+//!   disabled (`cargo build --no-default-features`).
+
+#![forbid(unsafe_code)]
+#![warn(
+    clippy::all,
+    clippy::pedantic,
+    clippy::cargo,
+    missing_docs,
+    rust_2018_idioms
+)]
+
+use std::{env, time::Duration};
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use lapin::{
+    options::{BasicPublishOptions, ExchangeDeclareOptions},
+    publisher_confirm::Confirmation,
+    Connection, ConnectionProperties, ExchangeKind,
+};
+use once_cell::sync::OnceCell;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::Value;
+use tokio::{
+    select,
+    sync::{mpsc, Mutex},
+    task::JoinHandle,
+};
+use tracing::{debug, error, info, instrument};
+use uuid::Uuid;
+
+/// Maximum number of events that can queue up before back-pressure is applied.
+const CHANNEL_BUFFER_SIZE: usize = 10_000;
+/// Re-connection back-off in case of an AMQP outage.
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(3);
+
+/// Describes every event emitted inside the bounded context.
+///
+/// Implementors must be serialisable to JSON so they can be transmitted over
+/// the wire.
+#[async_trait]
+pub trait DomainEvent: Send + Sync + Serialize + DeserializeOwned + 'static {
+    /// Logical name of the event (e.g. `"LearningPulseSubmitted"`).
+    fn event_type(&self) -> &'static str;
+
+    /// Convert a concrete event into an envelope ready for transport.
+    fn into_envelope(self) -> Envelope
+    where
+        Self: Sized,
+    {
+        Envelope::from_event(self)
+    }
+}
+
+/// Standard metadata wrapper for domain events.
+///
+/// The wrapper ensures every message is self-contained, traceable, and can be
+/// routed by any consumer regardless of the concrete payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Envelope {
+    /// UUIDv4 – event identifier.
+    pub id: Uuid,
+    /// ISO-8601 UTC time stamp.
+    pub occurred_at: DateTime<Utc>,
+    /// Event _kind_ (routing key), e.g. `"LearningPulseSubmitted"`.
+    pub event_type: String,
+    /// Opaque JSON payload.
+    pub data: Value,
+}
+
+impl Envelope {
+    /// Create an envelope from a strongly-typed event.
+    pub fn from_event<E>(event: E) -> Self
+    where
+        E: DomainEvent,
+    {
+        let data = serde_json::to_value(&event).expect("DomainEvent must be serializable");
+        Self {
+            id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            event_type: event.event_type().to_string(),
+            data,
+        }
+    }
+}
+
+/// Abstract publisher for domain events.
+#[async_trait]
+pub trait EventBus: Send + Sync {
+    /// Publish a single [`Envelope`].
+    async fn publish(&self, envelope: Envelope) -> Result<()>;
+
+    /// Convenience helper for publishing a concrete domain event.
+    async fn publish_event<E>(&self, event: E) -> Result<()>
+    where
+        E: DomainEvent,
+    {
+        self.publish(event.into_envelope()).await
+    }
+}
+
+/// AMQP configuration loaded from environment variables.
+///
+/// All fields are optional so sensible defaults kick in automatically in
+/// development environments.
+#[derive(Debug, Deserialize)]
+pub struct AmqpConfig {
+    /// AMQP connection URI (e.g. `amqp://guest:guest@localhost:5672/%2f`).
+    pub uri: Option<String>,
+    /// Exchange name to publish events to.
+    pub exchange: Option<String>,
+    /// Timeout for individual publish operations.
+    #[serde(default = "AmqpConfig::default_publish_timeout_secs")]
+    pub publish_timeout_secs: u64,
+}
+
+impl AmqpConfig {
+    fn default_publish_timeout_secs() -> u64 {
+        5
+    }
+
+    /// Load configuration from the process environment (fails fast in CI).
+    pub fn from_env() -> Result<Self> {
+        let cfg = envy::prefixed("EDUPULSE_AMQP_").from_env::<AmqpConfig>()?;
+        Ok(cfg)
+    }
+
+    /// Provide nice fallbacks.
+    fn uri(&self) -> &str {
+        self.uri
+            .as_deref()
+            .unwrap_or("amqp://guest:guest@127.0.0.1:5672/%2f")
+    }
+
+    fn exchange(&self) -> &str {
+        self.exchange.as_deref().unwrap_or("edupulse.events")
+    }
+}
+
+/// Concrete EventBus implementation based on RabbitMQ / AMQP 0-9-1.
+///
+/// The bus owns a worker thread that consumes events from an mpsc channel and
+/// handles the (re-)connection logic transparently.
+pub struct RabbitMqBus {
+    /// Sender side of the channel; cloned for each producer.
+    tx: mpsc::Sender<Envelope>,
+    /// JoinHandle for the background task (so we can await graceful shutdown).
+    _bg_handle: JoinHandle<()>,
+}
+
+impl RabbitMqBus {
+    /// Lazily initialised, globally shared instance.
+    pub fn global() -> Result<Arc<Self>> {
+        static INSTANCE: OnceCell<Arc<RabbitMqBus>> = OnceCell::new();
+        INSTANCE
+            .get_or_try_init(|| {
+                let cfg = AmqpConfig::from_env()
+                    .context("Failed to read EDUPULSE_AMQP_* environment variables")?;
+                Self::new(cfg)
+            })
+            .cloned()
+    }
+
+    /// Create a new connection pool and spawn the background dispatcher loop.
+    pub fn new(cfg: AmqpConfig) -> Result<Arc<Self>> {
+        let (tx, rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
+        let cfg_clone = cfg.clone();
+
+        let bg_handle = tokio::spawn(async move {
+            if let Err(e) = Self::dispatcher_loop(cfg_clone, rx).await {
+                error!("RabbitMqBus shut down unexpectedly: {e:#}");
+            }
+        });
+
+        Ok(Arc::new(Self { tx, _bg_handle: bg_handle }))
+    }
+
+    /// Main worker loop: connect / reconnect, drain the buffer, publish events.
+    async fn dispatcher_loop(cfg: AmqpConfig, mut rx: mpsc::Receiver<Envelope>) -> Result<()> {
+        loop {
+            match Self::connect(&cfg).await {
+                Ok((conn, channel)) => {
+                    info!("RabbitMQ connected ({}).", cfg.uri());
+
+                    // Drain queue until connection drops or channel is closed.
+                    while let Some(envelope) = rx.recv().await {
+                        // Serialize once per message.
+                        let payload = serde_json::to_vec(&envelope)?;
+                        let confirm = channel
+                            .basic_publish(
+                                cfg.exchange(),
+                                &envelope.event_type,
+                                BasicPublishOptions::default(),
+                                payload,
+                                lapin::BasicProperties::default(),
+                            )
+                            .await?
+                            .await; // Await publish confirmation.
+
+                        match confirm {
+                            Ok(Confirmation::NotRequested) | Ok(Confirmation::Ack(_)) => {
+                                debug!("Event published: {}", envelope.id);
+                            }
+                            Ok(Confirmation::Nack(_)) | Err(_) => {
+                                error!("Message nack'd by broker, requeueing...");
+                                // Push back into channel for retry.
+                                rx.send(envelope).await.ok();
+                                break; // Break to reconnect.
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    error!("RabbitMQ connection error: {err:?}");
+                }
+            }
+
+            info!(
+                "RabbitMQ retrying in {}s …",
+                RECONNECT_BACKOFF.as_secs()
+            );
+            tokio::time::sleep(RECONNECT_BACKOFF).await;
+        }
+    }
+
+    /// Establish a fresh AMQP connection and declare the required exchange.
+    async fn connect(
+        cfg: &AmqpConfig,
+    ) -> Result<(Connection, lapin::Channel)> {
+        let conn = Connection::connect(cfg.uri(), ConnectionProperties::default()).await?;
+        let channel = conn.create_channel().await?;
+
+        channel
+            .exchange_declare(
+                cfg.exchange(),
+                ExchangeKind::Topic,
+                ExchangeDeclareOptions {
+                    durable: true,
+                    auto_delete: false,
+                    ..ExchangeDeclareOptions::default()
+                },
+                Default::default(),
+            )
+            .await?;
+
+        Ok((conn, channel))
+    }
+}
+
+#[async_trait]
+impl EventBus for RabbitMqBus {
+    #[instrument(skip_all, err)]
+    async fn publish(&self, envelope: Envelope) -> Result<()> {
+        self.tx
+            .send(envelope)
+            .await
+            .map_err(|e| anyhow!("EventBus channel closed: {e}"))
+    }
+}
+
+/// Example domain event for demonstration purposes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningPulseSubmitted {
+    /// Unique identifier of the pulse.
+    pub pulse_id: Uuid,
+    /// Authoring student.
+    pub author_id: Uuid,
+    /// Course context for routing.
+    pub course_id: Uuid,
+}
+
+#[async_trait]
+impl DomainEvent for LearningPulseSubmitted {
+    fn event_type(&self) -> &'static str {
+        "LearningPulseSubmitted"
+    }
+}
+
+/// Convenience function used by controller / service layers.
+///
+/// Publishes an event via the global event bus.  
+/// The indirection avoids tight coupling between application code and the
+/// specific message broker.
+#[instrument(level = "info", skip(event))]
+pub async fn emit<E>(event: E) -> Result<()>
+where
+    E: DomainEvent,
+{
+    RabbitMqBus::global()?
+        .publish_event(event)
+        .await
+}
+
+/// Local test that spins up an in-memory broker (assumes `docker compose up`).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Integration test – should succeed if a RabbitMQ instance is reachable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn smoke_publish_event() -> Result<()> {
+        // Skip on CI if no broker is available.
+        if env::var("CI").is_ok() {
+            eprintln!("Skipping RabbitMQ test on CI");
+            return Ok(());
+        }
+
+        tracing_subscriber::fmt::try_init().ok();
+
+        let event = LearningPulseSubmitted {
+            pulse_id: Uuid::new_v4(),
+            author_id: Uuid::new_v4(),
+            course_id: Uuid::new_v4(),
+        };
+
+        emit(event).await?;
+
+        // Allow the background task to flush.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        Ok(())
+    }
+}
+```

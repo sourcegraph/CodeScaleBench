@@ -1,0 +1,434 @@
+```rust
+//! src/module_58.rs
+//! -------------------------------------------------------------
+//! LedgerLink Nexus – LedgerEntry querying & caching module.
+//!
+//! This source file implements the production-ready query service
+//! that powers the `/v1/ledger_entries` REST + GraphQL endpoints.
+//! It demonstrates end-to-end flow:
+//!     1. Typed, validated query parameters (View-Model)
+//!     2. Repository / data-access using SQLx (PostgreSQL)
+//!     3. Multi-tenant cache backed by Redis with configurable TTL
+//!     4. Paginated, cursor-based response envelope
+//!     5. Structured logging + error propagation via anyhow
+//!
+//! NOTE:   The file is self-contained, import-able as a library
+//!         module. External dependencies must be added to
+//!         `Cargo.toml` (see inline comment near the bottom).
+//!
+//! -------------------------------------------------------------
+
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::missing_errors_doc)]
+
+use std::{fmt::Display, time::Duration};
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, NaiveDateTime, Utc};
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sqlx::{postgres::PgRow, PgPool, Row};
+use tracing::{debug, instrument};
+use uuid::Uuid;
+use validator::Validate;
+
+// -----------------------------------------------------------------------------
+// Domain-level helpers
+// -----------------------------------------------------------------------------
+
+/// Identifies the current tenant obtained from the auth layer / gateway.
+///
+/// Every query is scoped to a tenant to guarantee hard multi-tenancy.
+#[derive(Debug, Clone)]
+pub struct TenantCtx {
+    pub tenant_id: Uuid,
+    /// Optional correlation id for structured logging.
+    pub trace_id: Option<Uuid>,
+}
+
+// -----------------------------------------------------------------------------
+// Cursor-based pagination
+// -----------------------------------------------------------------------------
+
+/// Cursor direction
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+impl Default for SortDir {
+    fn default() -> Self {
+        Self::Desc
+    }
+}
+
+/// A generic, cursor-based page containing records and navigation cursors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Page<T> {
+    pub data: Vec<T>,
+    pub next_cursor: Option<DateTime<Utc>>,
+    pub prev_cursor: Option<DateTime<Utc>>,
+}
+
+// -----------------------------------------------------------------------------
+// View-Model (DTO) for an individual ledger entry
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEntryView {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub amount: rust_decimal::Decimal,
+    pub currency: String,
+    pub entry_ts: DateTime<Utc>,
+    pub narrative: String,
+}
+
+// -----------------------------------------------------------------------------
+// Query parameters (+ validation)
+// -----------------------------------------------------------------------------
+
+/// Input parameters accepted by the endpoint.
+/// NOTE: the struct doubles as GraphQL input object via `async-graphql`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct LedgerEntryQuery {
+    /// Target account id
+    pub account_id: Uuid,
+
+    /// Result page size (1-250)
+    #[validate(range(min = 1, max = 250))]
+    #[serde(default = "default_per_page")]
+    pub per_page: u16,
+
+    /// Optional cursor representing `entry_ts` boundary.
+    ///
+    /// If provided with `direction=desc` (default) we fetch rows *before* the
+    /// timestamp, resulting in backwards chronological pagination.
+    ///
+    /// If provided with `direction=asc`, we fetch rows *after* the timestamp.
+    pub cursor: Option<DateTime<Utc>>,
+
+    /// Ascending / descending direction. Defaults to `desc` (newest first).
+    #[serde(default)]
+    pub direction: SortDir,
+}
+
+const fn default_per_page() -> u16 {
+    100
+}
+
+// -----------------------------------------------------------------------------
+// Repository trait (decouples DB technology from service)
+// -----------------------------------------------------------------------------
+
+/// Domain-driven repository contract.
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    async fn fetch_page(
+        &self,
+        tenant: &TenantCtx,
+        query: &LedgerEntryQuery,
+    ) -> Result<Page<LedgerEntryView>>;
+}
+
+// -----------------------------------------------------------------------------
+// SQLx-powered repository implementation
+// -----------------------------------------------------------------------------
+
+pub struct PgLedgerEntryRepo {
+    pool: PgPool,
+}
+
+impl PgLedgerEntryRepo {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for PgLedgerEntryRepo {
+    #[instrument(skip_all, fields(tenant = %tenant.tenant_id))]
+    async fn fetch_page(
+        &self,
+        tenant: &TenantCtx,
+        query: &LedgerEntryQuery,
+    ) -> Result<Page<LedgerEntryView>> {
+        // Build dynamic SQL statement
+        let mut sql = String::from(
+            r#"
+            SELECT id,
+                   account_id,
+                   amount,
+                   currency,
+                   entry_ts,
+                   narrative
+            FROM ledger_entries
+            WHERE tenant_id = $1
+              AND account_id = $2
+            "#,
+        );
+
+        // Add cursor filter
+        if let Some(cursor_ts) = query.cursor {
+            match query.direction {
+                SortDir::Asc => sql.push_str(" AND entry_ts > $3 "),
+                SortDir::Desc => sql.push_str(" AND entry_ts < $3 "),
+            }
+        }
+
+        // Ordering + limit
+        sql.push_str(" ORDER BY entry_ts ");
+        sql.push_str(match query.direction {
+            SortDir::Asc => "ASC ",
+            SortDir::Desc => "DESC ",
+        });
+        sql.push_str("LIMIT $4 ");
+
+        let mut q = sqlx::query(&sql)
+            .bind(tenant.tenant_id)
+            .bind(query.account_id);
+
+        // Bind cursor if present
+        if let Some(cursor_ts) = query.cursor {
+            q = q.bind(cursor_ts);
+        } else {
+            // placeholder param to satisfy positional index for $3
+            // WILL NOT be used by Postgres when cursor is absent
+            q = q.bind(chrono::MAX_DATETIME.with_timezone(&Utc));
+        }
+
+        q = q.bind(query.per_page as i64);
+
+        debug!(sql = %sql, "Executing paginated ledger entry query");
+
+        let rows: Vec<PgRow> = q
+            .fetch_all(&self.pool)
+            .await
+            .context("database query failed")?;
+
+        let mut data: Vec<LedgerEntryView> = rows
+            .into_iter()
+            .map(|row| LedgerEntryView {
+                id: row.get("id"),
+                account_id: row.get("account_id"),
+                amount: row.get("amount"),
+                currency: row.get("currency"),
+                entry_ts: DateTime::<Utc>::from_utc(
+                    row.get::<NaiveDateTime, _>("entry_ts"),
+                    Utc,
+                ),
+                narrative: row.get("narrative"),
+            })
+            .collect();
+
+        // Compute cursors (front & back of the vector)
+        let (next_cursor, prev_cursor) = if data.is_empty() {
+            (None, None)
+        } else {
+            let first = data.first().unwrap().entry_ts;
+            let last = data.last().unwrap().entry_ts;
+
+            match query.direction {
+                SortDir::Asc => (Some(last), Some(first)),
+                SortDir::Desc => (Some(last), Some(first)),
+            }
+        };
+
+        // For DESC fetch we currently have newest->oldest, keep as-is.
+        // For ASC fetch we also keep oldest->newest because we sorted ASC.
+
+        Ok(Page {
+            data,
+            next_cursor,
+            prev_cursor,
+        })
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Caching wrapper around repository
+// -----------------------------------------------------------------------------
+
+/// Ledger entry query cache (Redis JSON serialization).
+///
+/// Delegates to an inner repository on cache miss.
+pub struct CachingLedgerEntryRepo<R: LedgerEntryRepository> {
+    inner: R,
+    redis: redis::Client,
+    ttl: Duration,
+}
+
+impl<R: LedgerEntryRepository> CachingLedgerEntryRepo<R> {
+    pub fn new(inner: R, redis: redis::Client, ttl: Duration) -> Self {
+        Self { inner, redis, ttl }
+    }
+
+    /// Stable SHA-256 key from tenant + query.
+    fn build_cache_key(tenant: &TenantCtx, query: &LedgerEntryQuery) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(tenant.tenant_id.as_bytes());
+        hasher.update(query.account_id.as_bytes());
+        hasher.update(&query.per_page.to_be_bytes());
+        hasher.update(&[query.direction as u8]);
+
+        if let Some(cursor) = query.cursor {
+            hasher.update(cursor.timestamp().to_be_bytes());
+        }
+
+        let digest = hasher.finalize();
+        format!("ledger_page:{:x}", digest)
+    }
+}
+
+#[async_trait]
+impl<R: LedgerEntryRepository> LedgerEntryRepository for CachingLedgerEntryRepo<R> {
+    #[instrument(skip_all, fields(tenant = %tenant.tenant_id))]
+    async fn fetch_page(
+        &self,
+        tenant: &TenantCtx,
+        query: &LedgerEntryQuery,
+    ) -> Result<Page<LedgerEntryView>> {
+        query.validate()?;
+
+        let cache_key = Self::build_cache_key(tenant, query);
+        let mut redis_conn = self
+            .redis
+            .get_async_connection()
+            .await
+            .context("failed to acquire redis connection")?;
+
+        // --------------- Attempt cache hit -----------------
+        if let Ok(Some(cached_bytes)) = redis_conn.get::<_, Vec<u8>>(&cache_key).await {
+            debug!(%cache_key, "cache hit");
+            let page: Page<LedgerEntryView> =
+                rmp_serde::from_slice(&cached_bytes).context("decode cached page")?;
+            return Ok(page);
+        }
+        debug!(%cache_key, "cache miss");
+
+        // --------------- Fetch from DB ---------------------
+        let page = self
+            .inner
+            .fetch_page(tenant, query)
+            .await
+            .context("inner repository failed")?;
+
+        // --------------- Write-through cache ---------------
+        let encoded =
+            rmp_serde::to_vec_named(&page).context("msgpack encode failed for Page")?;
+
+        // Ignore cache errors – not fatal for the request
+        let _: Result<(), _> = redis_conn
+            .set_ex(&cache_key, encoded, self.ttl.as_secs() as usize)
+            .await;
+
+        Ok(page)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Public service façade
+// -----------------------------------------------------------------------------
+
+/// Orchestrates repository, provides a stable interface to command/query layer.
+pub struct LedgerEntryService {
+    repo: Box<dyn LedgerEntryRepository>,
+}
+
+impl LedgerEntryService {
+    pub fn new(repo: Box<dyn LedgerEntryRepository>) -> Self {
+        Self { repo }
+    }
+
+    /// High-level list method exposed to controllers & GraphQL resolvers.
+    #[instrument(skip(self))]
+    pub async fn list_entries(
+        &self,
+        tenant: &TenantCtx,
+        query: &LedgerEntryQuery,
+    ) -> Result<Page<LedgerEntryView>> {
+        self.repo
+            .fetch_page(tenant, query)
+            .await
+            .map_err(|e| anyhow!("LedgerEntryService.list_entries failed: {e}"))
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Example wiring (would live in `main.rs` or dependency injection container)
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dotenvy::dotenv;
+    use std::env;
+
+    /// Integration-like test (requires Postgres + Redis running).
+    ///
+    /// Run with:
+    ///     DATABASE_URL=postgres://... \
+    ///     REDIS_URL=redis://...        \
+    ///     cargo test -p api_microservice module_58 -- --nocapture
+    #[tokio::test]
+    async fn smoke_test_repo() -> Result<()> {
+        dotenv().ok();
+        let db_pool = PgPool::connect(&env::var("DATABASE_URL")?).await?;
+        let redis_client = redis::Client::open(env::var("REDIS_URL")?)?;
+
+        let pg_repo = PgLedgerEntryRepo::new(db_pool);
+        let cached_repo =
+            CachingLedgerEntryRepo::new(pg_repo, redis_client, Duration::from_secs(30));
+
+        let service = LedgerEntryService::new(Box::new(cached_repo));
+
+        let tenant = TenantCtx {
+            tenant_id: Uuid::new_v4(), // test isolation
+            trace_id: None,
+        };
+
+        let query = LedgerEntryQuery {
+            account_id: Uuid::new_v4(),
+            per_page: 50,
+            cursor: None,
+            direction: SortDir::Desc,
+        };
+
+        let res = service.list_entries(&tenant, &query).await?;
+        println!("Fetched {} entries", res.data.len());
+
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Cargo.toml additions (for reference):
+//
+// [dependencies]
+// anyhow          = "1.0"
+// async-trait     = "0.1"
+// chrono          = { version = "0.4", features = ["serde"] }
+// rust_decimal    = { version = "1", features = ["serde"] }
+// serde           = { version = "1", features = ["derive"] }
+// sha2            = "0.10"
+// sqlx            = { version = "0.7", features = [
+//     "runtime-tokio-native-tls",
+//     "postgres",
+//     "uuid",
+//     "chrono",
+//     "rust_decimal",
+//     "macros"
+// ] }
+// uuid            = { version = "1", features = ["serde", "v4"] }
+// redis           = { version = "0.24", features = ["aio", "tokio-comp"] }
+// rmp-serde       = "1.1"
+// validator       = { version = "0.16", features = ["derive"] }
+// tracing         = "0.1"
+// dotenvy         = "0.15"         # for tests
+// tokio           = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+// -----------------------------------------------------------------------------
+```

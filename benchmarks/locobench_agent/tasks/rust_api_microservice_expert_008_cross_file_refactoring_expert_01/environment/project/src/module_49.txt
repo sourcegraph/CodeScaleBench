@@ -1,0 +1,391 @@
+```rust
+//! src/module_49.rs
+//!
+//! Response-caching infrastructure for LedgerLink Nexus.
+//!
+//! This module is **framework-agnostic**—it can be wired into Axum, Actix or any
+//! other Tokio-based web framework.  We rely on `deadpool-redis` for connection
+//! pooling and expose a `ResponseCache` service that transparently
+//! serialises/deserialises arbitrary payloads implementing `serde::{Serialize,
+//! Deserialize}`.  Cache keys are derived from a request’s identity (tenant,
+//! path, query-string, headers, etc.) via the [`CacheKey`] trait.
+//!
+//! Typical usage in a handler:
+//!
+//! ```ignore
+//! async fn get_snapshot(
+//!     State(cache): State<ResponseCache>,
+//!     State(repo):  State<Arc<AccountSnapshotRepo>>,  // domain repository
+//!     auth:         AuthContext,                      // extracted by middleware
+//!     Query(p):     Query<SnapshotParams>,
+//! ) -> ApiResult<Json<SnapshotVm>> {
+//!     // Build a key that’s unique per tenant + request parameters.
+//!     let key = SnapshotParamsKey::new(&auth, &p);
+//!
+//!     // Ask cache to resolve or run closure.
+//!     let snapshot = cache
+//!         .get_or_set_json(&key, CacheTTL::Minutes(5), || async {
+//!             repo.fetch_snapshot(&auth.tenant_id, p).await
+//!         })
+//!         .await?;
+//!
+//!     Ok(Json(snapshot))
+//! }
+//! ```
+
+use std::{borrow::Cow, fmt, sync::Arc, time::Duration};
+
+use async_trait::async_trait;
+use deadpool_redis::{redis::AsyncCommands, Pool, Runtime};
+use derive_more::{Display, From};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tokio::time::sleep;
+use tracing::{debug, error, instrument};
+
+/// Defines how long a cached entry should live.
+///
+/// Can be converted into a concrete `Duration`.
+#[derive(Debug, Clone, Copy)]
+pub enum CacheTTL {
+    Seconds(u64),
+    Minutes(u64),
+    Hours(u64),
+    // Domain-specific helpers
+    ShortHotPath, // 15 s
+    Default,      // 300 s
+    Long,         // 2 h
+}
+
+impl From<CacheTTL> for Duration {
+    fn from(value: CacheTTL) -> Self {
+        match value {
+            CacheTTL::Seconds(s) => Duration::from_secs(s),
+            CacheTTL::Minutes(m) => Duration::from_secs(m * 60),
+            CacheTTL::Hours(h) => Duration::from_secs(h * 60 * 60),
+            CacheTTL::ShortHotPath => Duration::from_secs(15),
+            CacheTTL::Default => Duration::from_secs(300),
+            CacheTTL::Long => Duration::from_secs(60 * 60 * 2),
+        }
+    }
+}
+
+/// Errors produced by the caching system.
+#[derive(Debug, Display, From)]
+pub enum CacheError {
+    #[display(fmt = "Redis error: {}", _0)]
+    Redis(deadpool_redis::redis::RedisError),
+
+    #[display(fmt = "Serialization error: {}", _0)]
+    SerdeJson(serde_json::Error),
+
+    #[display(fmt = "Domain error: {}", _0)]
+    Domain(anyhow::Error),
+}
+
+impl std::error::Error for CacheError {}
+
+/// Anything that can be used as a cache key for a response.
+///
+/// Implementations should guarantee *uniqueness* wrt the response they map to
+/// (e.g. include tenant-id, locale, pagination parameters, etc.).
+#[async_trait]
+pub trait CacheKey: Send + Sync + 'static {
+    /// Return a stable, namespaced key.
+    fn as_key(&self) -> Cow<'_, str>;
+
+    /// Optional invalidation hook automatically triggered *after* a set
+    /// operation.  Useful for cascading purges (e.g. wildcard del).
+    async fn on_set(&self, _redis: &mut deadpool_redis::redis::aio::Connection) -> Result<(), CacheError> {
+        Ok(())
+    }
+}
+
+/// Blanket impl for strings—useful for quick & dirty keys in tests.
+#[async_trait]
+impl CacheKey for String {
+    fn as_key(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self)
+    }
+}
+
+/// Lightweight wrapper around `deadpool_redis::Pool`.
+///
+/// It intentionally exposes a minimal surface area—high-level helpers are
+/// implemented on this struct to prevent leaking Redis commands all over the
+/// codebase.
+#[derive(Clone)]
+pub struct ResponseCache {
+    pool: Arc<Pool>,
+    prefix: String,
+}
+
+impl ResponseCache {
+    /// Build a new cache service.
+    ///
+    /// `prefix` should be stable for the lifetime of the binary—typically the
+    /// service name (e.g. `ll-nexus-api`) and environment identifier
+    /// (`prod`, `dev`, etc.) so different deployments never clash.
+    pub fn new(pool: Pool, prefix: impl Into<String>) -> Self {
+        Self {
+            pool: Arc::new(pool),
+            prefix: prefix.into(),
+        }
+    }
+
+    fn scoped_key(&self, key: &impl CacheKey) -> String {
+        // Prefix with global namespace to avoid accidental collisions.
+        format!("{}:{}", self.prefix, key.as_key())
+    }
+
+    /// Core helper: try hitting cache, otherwise call supplied async function.
+    ///
+    /// Parameterised over JSON serialisable payloads.
+    #[instrument(skip(self, key, ttl, compute), fields(cache.key = %key.as_key()))]
+    pub async fn get_or_set_json<T, K, F, Fut>(
+        &self,
+        key: &K,
+        ttl: CacheTTL,
+        compute: F,
+    ) -> Result<T, CacheError>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        K: CacheKey,
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<T, anyhow::Error>> + Send,
+    {
+        let cache_key = self.scoped_key(key);
+
+        // 1) Fast path: attempt redis GET.
+        if let Ok(Some(blob)) = self
+            .with_redis(|mut conn| async move { conn.get::<_, Vec<u8>>(cache_key.clone()).await })
+            .await
+        {
+            match serde_json::from_slice::<T>(&blob) {
+                Ok(val) => {
+                    debug!("cache hit");
+                    return Ok(val);
+                }
+                Err(e) => {
+                    error!(error = %e, "Corrupted cache entry, purging");
+                    // Delete corrupted entry and fall through to recompute path.
+                    let _ = self
+                        .with_redis(|mut conn| async move { conn.del::<_, ()>(cache_key.clone()).await })
+                        .await;
+                }
+            }
+        }
+
+        debug!("cache miss, computing…");
+        // 2) Miss: compute the payload.
+        let value = compute().await.map_err(CacheError::Domain)?;
+
+        // 3) Serialize & save.
+        let blob = serde_json::to_vec(&value)?;
+        let expire_seconds: usize = CacheTTL::from(ttl).as_secs() as usize;
+        let key_ref = cache_key.clone();
+
+        self.with_redis(move |mut conn| async move {
+            conn.set_ex::<_, _, ()>(key_ref, blob, expire_seconds).await?;
+            Ok(())
+        })
+        .await?;
+
+        // Invalidate related keys if requested.
+        self.with_redis(|mut conn| key.on_set(&mut conn)).await?;
+
+        Ok(value)
+    }
+
+    /// Explicitly purge a key (or pattern using Redis glob-style wildcards).
+    ///
+    /// If `pattern` contains wildcards, *all* matching keys in the current
+    /// database are removed (uses `scan` → `del` pipeline; O(N)).  Intended for
+    /// low-frequency invalidation hooks (post-commit, nightly jobs, etc.).
+    #[instrument(skip(self))]
+    pub async fn purge(&self, pattern: &str) -> Result<u64, CacheError> {
+        let full = format!("{}:{}", self.prefix, pattern);
+        self.with_redis(|mut conn| async move {
+            // SAFETY: we trust callers to not pass unbounded patterns in hot
+            // paths.  No protection against DoS within this helper.
+            let mut cursor: u64 = 0;
+            let mut total_deleted = 0u64;
+            loop {
+                let (next, keys): (u64, Vec<String>) = conn.scan_match::<_, Vec<String>>(&full, cursor).await?;
+                if !keys.is_empty() {
+                    total_deleted += conn.del::<_, u64>(keys).await?;
+                }
+                if next == 0 {
+                    break;
+                }
+                cursor = next;
+                // Yield a bit to Redis under heavy load.
+                sleep(Duration::from_millis(8)).await;
+            }
+            Ok(total_deleted)
+        })
+        .await
+    }
+
+    /// Low-level helper to borrow a connection from the pool and run async
+    /// closure.
+    async fn with_redis<R, F, Fut>(&self, op: F) -> Result<R, CacheError>
+    where
+        F: FnOnce(deadpool_redis::redis::aio::Connection) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<R, CacheError>> + Send,
+    {
+        // NB: we don’t instrument here to avoid noise—callers can.
+        let mut conn = self.pool.get().await?;
+        op(conn).await
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            Utility: Example Keys                           */
+/* -------------------------------------------------------------------------- */
+
+/// Tenant-aware cache key for GET /cashflows/forecast?period=…
+#[derive(Debug)]
+pub struct CashflowForecastKey {
+    tenant_id: String,
+    period: String,
+}
+
+impl CashflowForecastKey {
+    pub fn new(tenant_id: impl Into<String>, period: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            period: period.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl CacheKey for CashflowForecastKey {
+    fn as_key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("tenant:{}:cashflow:{}", self.tenant_id, self.period))
+    }
+}
+
+/// Snapshot params for pagination / sorting, hashed into a shorter key.
+///
+/// We use a SHA256 digest to keep keys small even for verbose queries.
+#[derive(Serialize, Deserialize)]
+pub struct SnapshotParams {
+    pub page: u32,
+    pub page_size: u32,
+    pub sort: String,
+}
+
+pub struct SnapshotParamsKey {
+    digest: String,
+}
+
+impl SnapshotParamsKey {
+    pub fn new(auth: &AuthContext, params: &SnapshotParams) -> Self {
+        let payload = serde_json::to_string(params).expect("serializable");
+        let raw = format!("{}:{}", auth.tenant_id, payload);
+        let digest = format!("{:x}", sha2::Sha256::digest(raw.as_bytes()));
+        Self { digest }
+    }
+}
+
+#[async_trait]
+impl CacheKey for SnapshotParamsKey {
+    fn as_key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("snapshot:{}", self.digest))
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            Mocked Auxiliary Types                          */
+/* -------------------------------------------------------------------------- */
+
+/// Minimal representation of authentication context.
+///
+/// In reality this is extracted by middleware that authenticates JWTs or API
+/// keys and attaches claim data to the request extensions.
+#[derive(Debug)]
+pub struct AuthContext {
+    pub tenant_id: String,
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                    Tests                                   */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deadpool_redis::{Config as RedisCfg, Runtime as RedisRt};
+    use tokio::sync::OnceCell;
+
+    async fn test_cache() -> ResponseCache {
+        static POOL: OnceCell<Pool> = OnceCell::const_new();
+        let pool = POOL
+            .get_or_init(|| async {
+                let cfg = RedisCfg {
+                    url: Some("redis://127.0.0.1/14".into()), // CI/test db
+                    ..Default::default()
+                };
+                cfg.create_pool(Some(RedisRt::Tokio1)).unwrap()
+            })
+            .await
+            .clone();
+
+        // Ensure clean DB
+        let mut conn = pool.get().await.unwrap();
+        let _: () = conn.flushdb().await.unwrap();
+
+        ResponseCache::new(pool, "ll-test")
+    }
+
+    #[tokio::test]
+    async fn it_roundtrips_struct() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Foo {
+            a: i32,
+            b: String,
+        }
+
+        let cache = test_cache().await;
+        let key = String::from("foo:bar");
+
+        // First call should compute.
+        let first = cache
+            .get_or_set_json(&key, CacheTTL::Seconds(30), || async {
+                Ok::<_, anyhow::Error>(Foo {
+                    a: 42,
+                    b: "biz".into(),
+                })
+            })
+            .await
+            .unwrap();
+
+        // Second call should hit cache.
+        let second: Foo = cache
+            .get_or_set_json(&key, CacheTTL::Seconds(30), || async {
+                panic!("should not be called")
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn purge_works() {
+        let cache = test_cache().await;
+        let key = String::from("tmp:123");
+
+        cache
+            .get_or_set_json(&key, CacheTTL::Seconds(30), || async {
+                Ok::<_, anyhow::Error>("hello")
+            })
+            .await
+            .unwrap();
+
+        let deleted = cache.purge("tmp:*").await.unwrap();
+        assert_eq!(deleted, 1);
+    }
+}
+```

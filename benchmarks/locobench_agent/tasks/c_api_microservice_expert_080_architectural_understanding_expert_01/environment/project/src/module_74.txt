@@ -1,0 +1,370 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * ------------------------------------
+ * Module: src/module_74.c   (Rate-Limiting Engine)
+ *
+ * Provides an in-process, thread-safe, token-bucket rate limiter that can be
+ * used by any layer (HTTP, GraphQL, gRPC, internal event bus, …) to protect
+ * endpoints against abusive traffic while guaranteeing deterministic latency.
+ *
+ *   ‑ Per-key (API-Key, JWT subject, IP, Route) token buckets
+ *   ‑ Optional per-route overrides
+ *   ‑ Lock-free hot-path (single CAS) for maximum performance
+ *   ‑ Background janitor to purge idle buckets
+ *   ‑ Prometheus-compatible metric exposition
+ *
+ * Build:
+ *   cc -std=c11 -O2 -pthread -Wall -Wextra -c src/module_74.c
+ *
+ * License: Apache-2.0
+ */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <pthread.h>
+#include <time.h>
+#include <errno.h>
+#include <inttypes.h>
+
+/* -------------------------------------------------------------------------
+ * uthash – single-file open-source hash-map (https://troydhanson.github.io/uthash/)
+ * A cut-down copy is embedded here to avoid extra build deps.
+ * ------------------------------------------------------------------------- */
+#ifndef UTHASH_H
+#define UTHASH_H
+/* Only what we need: HASH_ADD_KEYPTR, HASH_FIND, HASH_DEL */
+#define uthash_malloc(sz) malloc(sz)
+#define uthash_free(ptr,sz) free(ptr)
+#define uthash_noexpand_fyi(tbl)
+#define uthash_expand_fyi(tbl)
+#define HASH_FIND(hh,head,keyptr,keylen,out)                                          \
+    do {                                                                             \
+        out = NULL;                                                                  \
+        if (head) {                                                                  \
+            unsigned _hf_bkt = ((const unsigned char*)keyptr)[0] & (head)->hh.tbl->num_buckets-1; \
+            struct UT_hash_handle *_hf_hh = (head)->hh.tbl->buckets[_hf_bkt].hh_head; \
+            while (_hf_hh) {                                                         \
+                if ((_hf_hh->keylen == (unsigned)(keylen)) &&                        \
+                    (memcmp(_hf_hh->key, keyptr, keylen) == 0)) {                    \
+                    out = _hf_hh->prev; /* prev pointer is container */              \
+                    break;                                                           \
+                }                                                                    \
+                _hf_hh = _hf_hh->hh_next;                                            \
+            }                                                                        \
+        }                                                                            \
+    } while(0)
+
+#define HASH_ADD_KEYPTR(hh,head,keyptr,keylen_in,add)                                \
+    do {                                                                             \
+        unsigned _ha_bkt;                                                            \
+        if (!(head)) {                                                               \
+            (head)=add;                                                              \
+            (head)->hh.tbl = (UT_hash_table*)uthash_malloc(sizeof(UT_hash_table));   \
+            memset((head)->hh.tbl,0,sizeof(UT_hash_table));                          \
+            (head)->hh.tbl->num_buckets = 512;                                       \
+            (head)->hh.tbl->buckets =                                                \
+              (UT_hash_bucket*)uthash_malloc(512*sizeof(struct UT_hash_bucket));     \
+            memset((head)->hh.tbl->buckets,0,512*sizeof(struct UT_hash_bucket));     \
+        }                                                                            \
+        (add)->hh.key = (const void*)(keyptr);                                       \
+        (add)->hh.keylen = (unsigned)(keylen_in);                                    \
+        _ha_bkt = ((const unsigned char*)keyptr)[0] & ((head)->hh.tbl->num_buckets-1);\
+        (add)->hh.hh_next = (head)->hh.tbl->buckets[_ha_bkt].hh_head;                \
+        (head)->hh.tbl->buckets[_ha_bkt].hh_head = &((add)->hh);                     \
+        (add)->hh.prev = (add); /* back-pointer to struct (simplification) */        \
+    } while(0)
+
+#define HASH_DEL(hh,head,delptr)                                                     \
+    do {                                                                             \
+        unsigned _hd_bkt = ((const unsigned char*)(delptr)->hh.key)[0] &             \
+                           ((head)->hh.tbl->num_buckets-1);                          \
+        struct UT_hash_handle *_hd_hh = (head)->hh.tbl->buckets[_hd_bkt].hh_head;    \
+        struct UT_hash_handle *_hd_prev = NULL;                                      \
+        while (_hd_hh) {                                                             \
+            if (_hd_hh == &((delptr)->hh)) {                                         \
+                if (_hd_prev) _hd_prev->hh_next = _hd_hh->hh_next;                   \
+                else head->hh.tbl->buckets[_hd_bkt].hh_head = _hd_hh->hh_next;       \
+                uthash_free(delptr, sizeof(*(delptr)));                              \
+                break;                                                               \
+            }                                                                        \
+            _hd_prev = _hd_hh;                                                       \
+            _hd_hh = _hd_hh->hh_next;                                                \
+        }                                                                            \
+    } while(0)
+
+typedef struct UT_hash_bucket {
+    struct UT_hash_handle *hh_head;
+} UT_hash_bucket;
+
+typedef struct UT_hash_table {
+    UT_hash_bucket *buckets;
+    unsigned num_buckets;
+} UT_hash_table;
+
+typedef struct UT_hash_handle {
+    const void *key;
+    unsigned keylen;
+    struct UT_hash_handle *hh_next;
+    struct UT_hash_table *tbl;
+    /* custom stuff */
+    void *prev;          /* back-pointer to container struct (simplification) */
+} UT_hash_handle;
+#endif /* UTHASH_H */
+/* ------------------------------------------------------------------------- */
+
+#define RL_MAX_KEY      96u
+#define RL_DEFAULT_RPS  50u
+#define RL_DEFAULT_BURST (RL_DEFAULT_RPS * 2u)
+#define RL_IDLE_TTL_SEC  180u          /* remove buckets idle for >3min         */
+#define RL_JANITOR_INTERVAL_SEC 30u
+
+typedef struct rl_bucket {
+    char               key[RL_MAX_KEY];
+    uint32_t           rps;           /* tokens added per second    */
+    uint32_t           burst;         /* bucket capacity            */
+    _Atomic uint32_t   tokens;        /* current tokens (<=burst)   */
+    _Atomic uint64_t   last_ns;       /* last refill timestamp      */
+    _Atomic uint64_t   last_touch_ns; /* last time key was used     */
+    UT_hash_handle     hh;            /* uthash linkage             */
+} rl_bucket_t;
+
+/* Global state ----------------------------------------------------------------*/
+static rl_bucket_t *g_table = NULL;
+static pthread_mutex_t g_table_mtx = PTHREAD_MUTEX_INITIALIZER;
+static atomic_bool g_rl_initialized = false;
+static uint32_t g_default_rps   = RL_DEFAULT_RPS;
+static uint32_t g_default_burst = RL_DEFAULT_BURST;
+static atomic_bool g_stop_janitor = false;
+static pthread_t janitor_tid;
+
+/* Utility ---------------------------------------------------------------------*/
+static inline uint64_t nsec_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* Refill algorithm: lock-free, CAS on tokens & last_ns                        */
+static inline void bucket_refill(rl_bucket_t *b, uint64_t now_ns)
+{
+    uint64_t last_ns = atomic_load_explicit(&b->last_ns, memory_order_relaxed);
+
+    /* If another thread updated more recently, nothing to do.                 */
+    if (now_ns <= last_ns) return;
+
+    uint64_t elapsed_ns = now_ns - last_ns;
+    uint32_t add_tokens = (uint32_t)((elapsed_ns * b->rps) / 1000000000ull);
+    if (add_tokens == 0) return;
+
+    /* Attempt to advance last_ns – if fails, another thread updated.          */
+    if (!atomic_compare_exchange_strong(&b->last_ns, &last_ns, now_ns))
+        return;
+
+    uint32_t cur = atomic_load_explicit(&b->tokens, memory_order_relaxed);
+    uint32_t new_val = cur + add_tokens;
+    if (new_val > b->burst) new_val = b->burst;
+    atomic_store_explicit(&b->tokens, new_val, memory_order_relaxed);
+}
+
+/* Find or create bucket – must hold g_table_mtx                               */
+static rl_bucket_t *bucket_get_locked(const char *key, size_t keylen)
+{
+    rl_bucket_t *b = NULL;
+    HASH_FIND(hh, g_table, key, (unsigned)keylen, b);
+    if (!b) {
+        b = calloc(1, sizeof(*b));
+        strncpy(b->key, key, RL_MAX_KEY - 1);
+        b->rps          = g_default_rps;
+        b->burst        = g_default_burst;
+        atomic_store(&b->tokens, b->burst);
+        uint64_t now = nsec_now();
+        atomic_store(&b->last_ns, now);
+        atomic_store(&b->last_touch_ns, now);
+        HASH_ADD_KEYPTR(hh, g_table, b->key, (unsigned)strlen(b->key), b);
+    }
+    return b;
+}
+
+static int rl_allocate_janitor(void);
+
+/* API ------------------------------------------------------------------------*/
+/*
+ * rl_init()
+ *  Initialize subsystem. Safe to call multiple times;
+ *  subsequent calls are no-ops and return 0.
+ */
+int rl_init(uint32_t default_rps, uint32_t default_burst)
+{
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&g_rl_initialized, &expected, true))
+        return 0; /* already initialized */
+
+    if (default_rps > 0)   g_default_rps   = default_rps;
+    if (default_burst > 0) g_default_burst = default_burst;
+
+    if (pthread_mutex_init(&g_table_mtx, NULL) != 0)
+        return -1;
+
+    if (rl_allocate_janitor() != 0)
+        return -1;
+
+    return 0;
+}
+
+/*
+ * rl_set_override()
+ *  Override RPS/Burst for a specific key (or route).
+ */
+int rl_set_override(const char *key, uint32_t rps, uint32_t burst)
+{
+    if (!key) return -EINVAL;
+    size_t len = strnlen(key, RL_MAX_KEY);
+    if (len == 0 || len >= RL_MAX_KEY) return -EINVAL;
+
+    pthread_mutex_lock(&g_table_mtx);
+    rl_bucket_t *b = bucket_get_locked(key, len);
+    if (rps   > 0) b->rps   = rps;
+    if (burst > 0) b->burst = burst;
+    if (atomic_load(&b->tokens) > b->burst)
+        atomic_store(&b->tokens, b->burst);
+    pthread_mutex_unlock(&g_table_mtx);
+    return 0;
+}
+
+/*
+ * rl_allow()
+ *  Fast-path check – may be called on every request.
+ *  Returns true if request should be allowed, false otherwise.
+ */
+bool rl_allow(const char *key)
+{
+    if (!key) return true; /* no key => unlimited */
+
+    size_t len = strnlen(key, RL_MAX_KEY);
+    if (len == 0) return true;
+
+    rl_bucket_t *b;
+    /* First try read-only lookup. We accept small risk of race creating twice. */
+    HASH_FIND(hh, g_table, key, (unsigned)len, b);
+    if (!b) {
+        pthread_mutex_lock(&g_table_mtx);
+        b = bucket_get_locked(key, len);
+        pthread_mutex_unlock(&g_table_mtx);
+    }
+
+    uint64_t now = nsec_now();
+    bucket_refill(b, now);
+    atomic_store_explicit(&b->last_touch_ns, now, memory_order_relaxed);
+
+    uint32_t cur = atomic_load_explicit(&b->tokens, memory_order_relaxed);
+    if (cur == 0) return false;
+
+    /* Attempt to consume one token. */
+    while (cur > 0) {
+        if (atomic_compare_exchange_weak(&b->tokens, &cur, cur - 1))
+            return true;
+    }
+    return false; /* contention lost, bucket exhausted */
+}
+
+/*
+ * rl_metrics_prometheus()
+ *  Emit text format metrics into supplied FILE* (already opened).
+ */
+void rl_metrics_prometheus(FILE *out)
+{
+    fprintf(out,
+        "# HELP mm_rate_limiter_tokens_available Current tokens per key\n"
+        "# TYPE mm_rate_limiter_tokens_available gauge\n");
+
+    rl_bucket_t *b, *tmp;
+    pthread_mutex_lock(&g_table_mtx);
+    HASH_FIND(hh, g_table, "", 0, b); /* noop to silence macro warning */
+    HASH_ITER(hh, g_table, b, tmp) {
+        uint32_t tok = atomic_load(&b->tokens);
+        fprintf(out,
+            "mm_rate_limiter_tokens_available{key=\"%s\"} %" PRIu32 "\n",
+            b->key, tok);
+    }
+    pthread_mutex_unlock(&g_table_mtx);
+
+    fprintf(out,
+        "# HELP mm_rate_limiter_config Configured RPS and Burst\n"
+        "# TYPE mm_rate_limiter_config gauge\n");
+    pthread_mutex_lock(&g_table_mtx);
+    HASH_ITER(hh, g_table, b, tmp) {
+        fprintf(out,
+            "mm_rate_limiter_config{key=\"%s\",type=\"rps\"} %" PRIu32 "\n"
+            "mm_rate_limiter_config{key=\"%s\",type=\"burst\"} %" PRIu32 "\n",
+            b->key, b->rps, b->key, b->burst);
+    }
+    pthread_mutex_unlock(&g_table_mtx);
+}
+
+/* Background janitor ---------------------------------------------------------*/
+static void *janitor_thread(void *arg)
+{
+    (void)arg;
+    while (!atomic_load(&g_stop_janitor)) {
+        sleep(RL_JANITOR_INTERVAL_SEC);
+        uint64_t now = nsec_now();
+        rl_bucket_t *b, *tmp;
+
+        pthread_mutex_lock(&g_table_mtx);
+        HASH_ITER(hh, g_table, b, tmp) {
+            uint64_t last_touch = atomic_load(&b->last_touch_ns);
+            if ((now - last_touch) > (uint64_t)RL_IDLE_TTL_SEC * 1000000000ull) {
+                HASH_DEL(hh, g_table, b);
+            }
+        }
+        pthread_mutex_unlock(&g_table_mtx);
+    }
+    return NULL;
+}
+
+static int rl_allocate_janitor(void)
+{
+    if (pthread_create(&janitor_tid, NULL, janitor_thread, NULL) != 0)
+        return -1;
+    pthread_detach(janitor_tid);
+    return 0;
+}
+
+/*
+ * rl_shutdown()
+ *  Optional graceful shutdown (main process exit will reclaim memory anyway).
+ */
+void rl_shutdown(void)
+{
+    atomic_store(&g_stop_janitor, true);
+}
+
+/* Self-test (debug builds) ---------------------------------------------------*/
+#ifdef RL_SELFTEST
+#include <assert.h>
+static void busy_loop(const char *key, int n)
+{
+    for (int i = 0; i < n; ++i) {
+        bool ok = rl_allow(key);
+        if (!ok) {
+            fprintf(stderr, "Rate limit hit @%d\n", i);
+            nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 10000000}, NULL);
+        }
+    }
+}
+int main(void)
+{
+    rl_init(10, 10); /* 10 req/sec, burst 10 */
+    busy_loop("clientA", 25);
+    FILE *f = fopen("/tmp/metrics.txt", "w");
+    rl_metrics_prometheus(f);
+    fclose(f);
+    rl_shutdown();
+    return 0;
+}
+#endif /* RL_SELFTEST */

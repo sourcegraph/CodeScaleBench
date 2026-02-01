@@ -1,0 +1,392 @@
+```rust
+//! src/module_28.rs
+//!
+//! Sentiment engine – runtime-hot-swappable sentiment–scoring strategy.
+//!
+//! This module demonstrates how ChirpPulse allows data–scientists to switch
+//! sentiment–analysis algorithms without forcing a full deployment.  An
+//! asynchronous background task listens for configuration changes (published
+//! for instance via etcd or a dedicated config-topic) and atomically replaces
+//! the active strategy.  The public API stays stable while callers benefit
+//! from new models in real time.
+
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
+use rdkafka::{
+    producer::{FutureProducer, FutureRecord},
+    util::Timeout,
+    ClientConfig,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{select, sync::watch, task, time};
+use tracing::{debug, error, info, warn};
+
+////////////////////////////////////////////////////////////////////////////////
+// Public data types
+////////////////////////////////////////////////////////////////////////////////
+
+/// A raw post coming from the ingestion layer (already parsed, but not enriched
+/// with sentiment).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SocialPost {
+    pub id: String,
+    pub text: String,
+    pub lang: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Enriched post after sentiment analysis.
+#[derive(Clone, Serialize)]
+pub struct SentimentPost {
+    pub id: String,
+    pub sentiment: SentimentScore,
+    pub confidence: f32,
+    pub processed_at: DateTime<Utc>,
+    // …other enrichment fields (toxicity, intents, etc.) could live here.
+}
+
+/// Binned sentiment score.  Values and ranges follow widely used conventions.
+#[derive(Clone, Debug, Serialize)]
+pub enum SentimentScore {
+    VeryNegative,
+    Negative,
+    Neutral,
+    Positive,
+    VeryPositive,
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Strategy pattern – trait and implementations
+////////////////////////////////////////////////////////////////////////////////
+
+/// Errors that can occur during sentiment analysis.
+#[derive(Debug, Error)]
+pub enum SentimentError {
+    #[error("Language {0} not supported by active strategy")]
+    UnsupportedLanguage(String),
+
+    #[error("Strategy internal error: {0}")]
+    Internal(String),
+}
+
+/// Trait that every algorithm must implement.
+#[async_trait]
+pub trait SentimentAlgorithm: Send + Sync + fmt::Debug {
+    /// Produce a [`SentimentScore`] and confidence ∊ [0, 1].
+    async fn analyze(&self, post: &SocialPost) -> Result<(SentimentScore, f32), SentimentError>;
+
+    /// Return a stable identifier – useful for tracing/logging.
+    fn name(&self) -> &'static str;
+}
+
+/// Very naïve lexicon-based sentiment: counts positive/negative tokens.
+#[derive(Debug, Default)]
+pub struct LexiconV1 {
+    lexicon: HashMap<&'static str, i8>,
+}
+
+impl LexiconV1 {
+    fn new() -> Self {
+        // Static list for demo; in real world would be loaded from a dictionary
+        // service or a language model.
+        let mut lexicon = HashMap::new();
+        lexicon.insert("good", 1);
+        lexicon.insert("great", 2);
+        lexicon.insert("awesome", 3);
+        lexicon.insert("bad", -1);
+        lexicon.insert("terrible", -3);
+        Self { lexicon }
+    }
+}
+
+#[async_trait]
+impl SentimentAlgorithm for LexiconV1 {
+    async fn analyze(&self, post: &SocialPost) -> Result<(SentimentScore, f32), SentimentError> {
+        if post.lang != "en" {
+            return Err(SentimentError::UnsupportedLanguage(post.lang.clone()));
+        }
+
+        let mut score: i32 = 0;
+        for token in post.text.split_whitespace() {
+            score += self.lexicon.get(token.to_lowercase().as_str()).unwrap_or(&0u8) as i32;
+        }
+
+        let (sentiment, confidence) = if score > 3 {
+            (SentimentScore::VeryPositive, 0.6)
+        } else if score > 0 {
+            (SentimentScore::Positive, 0.55)
+        } else if score == 0 {
+            (SentimentScore::Neutral, 0.5)
+        } else if score < -3 {
+            (SentimentScore::VeryNegative, 0.6)
+        } else {
+            (SentimentScore::Negative, 0.55)
+        };
+
+        Ok((sentiment, confidence))
+    }
+
+    fn name(&self) -> &'static str {
+        "lexicon_v1"
+    }
+}
+
+/// Placeholder for a hypothetical transformer/BERT-based model.
+#[derive(Debug)]
+pub struct BertV2;
+
+#[async_trait]
+impl SentimentAlgorithm for BertV2 {
+    async fn analyze(&self, post: &SocialPost) -> Result<(SentimentScore, f32), SentimentError> {
+        // Pretend we're sending the text to an inference microservice.
+        // The body is mocked to keep the example self-contained.
+        let hash = fxhash::hash32(post.text.as_bytes());
+        let bucket = hash % 5;
+
+        let sentiment = match bucket {
+            0 => SentimentScore::VeryNegative,
+            1 => SentimentScore::Negative,
+            2 => SentimentScore::Neutral,
+            3 => SentimentScore::Positive,
+            _ => SentimentScore::VeryPositive,
+        };
+
+        // Confidence is synthetic.
+        let confidence = 0.75;
+        Ok((sentiment, confidence))
+    }
+
+    fn name(&self) -> &'static str {
+        "bert_v2"
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Engine
+////////////////////////////////////////////////////////////////////////////////
+
+/// Engine configuration hot-reloaded from watch channel.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EngineConfig {
+    /// Which algorithm to use for new posts.
+    pub active_algorithm: String,
+    /// Kafka bootstrap servers.
+    pub kafka_brokers: String,
+    /// Kafka topic that will receive enriched posts.
+    pub output_topic: String,
+}
+
+/// Public façade.  The object is cloneable and internally reference-counted,
+/// therefore cheap to share across tasks.
+#[derive(Clone)]
+pub struct SentimentEngine {
+    inner: Arc<EngineInner>,
+}
+
+// Internal structure – not exported.
+struct EngineInner {
+    algo: RwLock<Box<dyn SentimentAlgorithm>>,
+    producer: FutureProducer,
+}
+
+// Global constant – the default algorithm when the engine starts.
+static DEFAULT_ALGO: Lazy<Box<dyn SentimentAlgorithm + Send + Sync>> =
+    Lazy::new(|| Box::new(LexiconV1::new()));
+
+impl SentimentEngine {
+    /// Create a new engine, spawn the config-watcher task, and return a handle.
+    ///
+    /// * `config_rx` – a Watch channel delivering [`EngineConfig`]
+    pub async fn bootstrap(mut config_rx: watch::Receiver<EngineConfig>) -> Result<Self> {
+        let initial_cfg = (*config_rx.borrow()).clone();
+        let producer = Self::build_producer(&initial_cfg)?;
+        let inner = Arc::new(EngineInner {
+            algo: RwLock::new(Self::algo_from_name(&initial_cfg.active_algorithm)),
+            producer,
+        });
+
+        let engine = Self {
+            inner: inner.clone(),
+        };
+
+        // Spawn a background task that watches for config changes.
+        task::spawn(Self::config_watcher(inner, producer.clone(), config_rx));
+
+        Ok(engine)
+    }
+
+    /// Process a single post: run sentiment analysis and publish to Kafka.
+    ///
+    /// Errors are logged but not bubbled up so that upstream components are not
+    /// back-pressured by failures in the enrichment pipeline.
+    pub async fn process(&self, post: SocialPost) {
+        let algo = { self.inner.algo.read().unwrap().clone() }; // clone Arc ptr
+        let algo_name = algo.name();
+
+        match algo.analyze(&post).await {
+            Ok((score, confidence)) => {
+                debug!(
+                    "Post {} ‑ sentiment {:?} ({:.2}) via {}",
+                    post.id, score, confidence, algo_name
+                );
+
+                let enriched = SentimentPost {
+                    id: post.id,
+                    sentiment: score,
+                    confidence,
+                    processed_at: Utc::now(),
+                };
+
+                if let Err(e) = self.publish(enriched).await {
+                    error!("Kafka publish error: {e:?}");
+                }
+            }
+            Err(e) => {
+                warn!("sentiment failure for post {}: {e}", post.id);
+            }
+        }
+    }
+
+    /// Build a `FutureProducer` for Kafka.
+    fn build_producer(conf: &EngineConfig) -> Result<FutureProducer> {
+        ClientConfig::new()
+            .set("bootstrap.servers", &conf.kafka_brokers)
+            .set("message.timeout.ms", "3000")
+            .create()
+            .context("unable to create kafka producer")
+    }
+
+    /// Send result to Kafka, with JSON serialization.
+    async fn publish(&self, enriched: SentimentPost) -> Result<()> {
+        let topic = "chirp_pulse.sentiment";
+        let payload = serde_json::to_vec(&enriched).context("serialize enriched post")?;
+        // Partition key: keep ordering per original post id.
+        let key = &enriched.id;
+        self.inner
+            .producer
+            .send(
+                FutureRecord::to(topic).key(key).payload(&payload),
+                Timeout::After(Duration::from_secs(1)),
+            )
+            .await
+            .map_err(|(e, _)| anyhow::anyhow!(e))
+            .context("kafka send")?;
+        Ok(())
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    // Internal helpers
+    ////////////////////////////////////////////////////////////////////////////
+
+    /// Map config syntax to algorithm instance.
+    fn algo_from_name(name: &str) -> Box<dyn SentimentAlgorithm> {
+        match name {
+            "bert_v2" => Box::new(BertV2),
+            "lexicon_v1" | _ => Box::new(LexiconV1::new()),
+        }
+    }
+
+    /// Background task: reacts to config changes and replaces the algorithm or
+    /// producer when necessary.
+    async fn config_watcher(
+        inner: Arc<EngineInner>,
+        mut producer: FutureProducer,
+        mut cfg_rx: watch::Receiver<EngineConfig>,
+    ) {
+        let mut current_algo = {
+            let algo = inner.algo.read().unwrap();
+            algo.name()
+        }
+        .to_string();
+        let mut current_brokers = String::new();
+
+        loop {
+            select! {
+                // Wait for config changes with a timeout so we can do periodic checks if needed.
+                changed = cfg_rx.changed() => {
+                    if changed.is_err() {
+                        warn!("Config watcher channel closed; terminating task.");
+                        return;
+                    }
+                    let new_cfg = (*cfg_rx.borrow()).clone();
+
+                    // Algorithm change?
+                    if new_cfg.active_algorithm != current_algo {
+                        let mut guard = inner.algo.write().unwrap();
+                        *guard = Self::algo_from_name(&new_cfg.active_algorithm);
+                        current_algo = new_cfg.active_algorithm.clone();
+                        info!("Switched sentiment algorithm -> {}", current_algo);
+                    }
+
+                    // Kafka broker change?
+                    if new_cfg.kafka_brokers != current_brokers {
+                        match Self::build_producer(&new_cfg) {
+                            Ok(new_prod) => {
+                                producer = new_prod;
+                                inner.producer = producer.clone();
+                                current_brokers = new_cfg.kafka_brokers.clone();
+                                info!("Updated Kafka producer. brokers={}", current_brokers);
+                            }
+                            Err(e) => {
+                                error!("Failed to rebuild Kafka producer: {e:?}");
+                            }
+                        }
+                    }
+                }
+
+                // Idle tick – can emit metrics, healthchecks, etc.
+                _ = time::sleep(Duration::from_secs(30)) => {
+                    debug!(engine_algo = %current_algo, "Sentiment engine heartbeat");
+                }
+            }
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Tests – `cargo test -p chirp_pulse`
+////////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lexicon_basic() {
+        let algo = LexiconV1::new();
+        let post = SocialPost {
+            id: "42".into(),
+            text: "awesome awesome bad".into(),
+            lang: "en".into(),
+            created_at: Utc::now(),
+        };
+
+        let (score, _conf) = algo.analyze(&post).await.unwrap();
+        assert!(matches!(score, SentimentScore::Positive));
+    }
+
+    #[tokio::test]
+    async fn unsupported_lang() {
+        let algo = LexiconV1::new();
+        let post = SocialPost {
+            id: "1".into(),
+            text: "bon".into(),
+            lang: "fr".into(),
+            created_at: Utc::now(),
+        };
+
+        let err = algo.analyze(&post).await.unwrap_err();
+        assert!(matches!(err, SentimentError::UnsupportedLanguage(_)));
+    }
+}
+```

@@ -1,0 +1,347 @@
+```rust
+//! src/module_86.rs
+//!
+//! Event ingestion + audit–trail writer for **EduPulse Live**.
+//!
+//! This module exposes a small yet production-ready building block that
+//! 1. Deserialises raw JSON coming from the message broker,
+//! 2. Validates and enriches it with metadata,
+//! 3. Persists the event in an auditable, append-only PostgreSQL table, and
+//! 4. Re-publishes the validated envelope on an internal broadcast channel
+//!    so other in-process components (e.g. notification fan-out) can react
+//!    without needing to hit the broker again.
+//!
+//! # Crate Features
+//! This module is behind the `event_ingest` crate feature to allow
+//! integration-tests to spin up a lighter compile without DB code.
+//!
+//! # Diagram
+//! broker (NATS/Redpanda) ─▶ Ingestor ─▶ `audit.events` (pg) ─▶ broadcast
+//!                                                  │
+//!                                                  └─▶ downstream rust tasks
+//!
+//! The design purposefully follows **single-writer** semantics to make sure
+//! ordering stays intact for a given aggregate_id.
+//
+//  *Copyright (c) EduPulse Live*
+//
+//! ```sql
+//! CREATE TABLE IF NOT EXISTS audit.events (
+//!     id              UUID        PRIMARY KEY,
+//!     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+//!     aggregate_id    UUID        NOT NULL,
+//!     aggregate_type  TEXT        NOT NULL,
+//!     event_type      TEXT        NOT NULL,
+//!     payload         JSONB       NOT NULL
+//! );
+//! ```
+//!
+//! Compile: `cargo build --features event_ingest`
+
+#![allow(clippy::missing_errors_doc)]
+
+use std::{convert::TryFrom, sync::Arc};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, oneshot},
+};
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
+
+#[cfg(feature = "event_ingest")]
+use sqlx::{postgres::PgPoolOptions, PgPool};
+
+/// Maximum capacity for the in-process broadcast channel.
+///
+/// Using `broadcast` guarantees that every listener gets each message
+/// once (provided its buffer isn't overflowed).
+const BROADCAST_CAPACITY: usize = 16_384;
+
+/// Envelope wrapping a validated domain event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub id: Uuid,
+    pub aggregate_id: Uuid,
+    pub aggregate_type: &'static str,
+    pub event_type: &'static str,
+    pub payload: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A raw event as received from the broker.
+///
+/// NOTE: the intermediary representation uses `String` for event names to
+/// allow loose coupling between services written in different languages.
+#[derive(Debug, Deserialize)]
+pub struct RawBrokerEvent {
+    pub aggregate_id: Uuid,
+    pub aggregate_type: String,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+}
+
+/// Trait used to transform command-side strongly-typed structs
+/// into the generic envelope needed for auditing.
+pub trait IntoEventEnvelope {
+    /// The string name of the event. E.g. `"LessonPublished"`.
+    const EVENT_TYPE: &'static str;
+    /// Logical aggregate type — e.g. `"Lesson"`.
+    const AGGREGATE_TYPE: &'static str;
+
+    fn aggregate_id(&self) -> Uuid;
+    fn into_json(self) -> serde_json::Value
+    where
+        Self: Serialize,
+    {
+        serde_json::to_value(self).expect("serialising own type never fails")
+    }
+
+    fn into_envelope(self) -> EventEnvelope
+    where
+        Self: Serialize,
+    {
+        EventEnvelope {
+            id: Uuid::new_v4(),
+            aggregate_id: self.aggregate_id(),
+            aggregate_type: Self::AGGREGATE_TYPE,
+            event_type: Self::EVENT_TYPE,
+            payload: self.into_json(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+/// Errors produced by the ingestion service.
+#[derive(Debug, Error)]
+pub enum IngestError {
+    #[error("channel closed")]
+    ChannelClosed,
+    #[error("payload rejected: {0}")]
+    Validation(String),
+    #[error("database error: {0}")]
+    #[cfg(feature = "event_ingest")]
+    Db(#[from] sqlx::Error),
+}
+
+/// Main actor handling ingestion.
+///
+/// Implements cooperative cancellation via a one-shot shutdown channel.
+pub struct EventIngestor {
+    shutdown_rx: oneshot::Receiver<()>,
+    broker_rx: BrokerSubscription,
+    broadcaster: broadcast::Sender<EventEnvelope>,
+    #[cfg(feature = "event_ingest")]
+    pool: PgPool,
+}
+
+impl EventIngestor {
+    /// Factory: connect to PostgreSQL & initialise the broadcast channel.
+    #[cfg(feature = "event_ingest")]
+    pub async fn new(
+        dsn: &str,
+        broker_rx: BrokerSubscription,
+        shutdown_rx: oneshot::Receiver<()>,
+    ) -> Result<Self, sqlx::Error> {
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(dsn)
+            .await?;
+
+        Ok(Self {
+            shutdown_rx,
+            broker_rx,
+            broadcaster: broadcast::channel(BROADCAST_CAPACITY).0,
+            pool,
+        })
+    }
+
+    /// Factory without DB (unit-tests).
+    #[cfg(not(feature = "event_ingest"))]
+    pub fn new_mock(
+        broker_rx: BrokerSubscription,
+        shutdown_rx: oneshot::Receiver<()>,
+    ) -> Self {
+        Self {
+            shutdown_rx,
+            broker_rx,
+            broadcaster: broadcast::channel(BROADCAST_CAPACITY).0,
+        }
+    }
+
+    /// Allow other tasks to subscribe to in-memory envelopes.
+    pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
+        self.broadcaster.subscribe()
+    }
+
+    /// Blocking loop until shutdown requested.
+    #[instrument(skip(self), name = "ingestor_run")]
+    pub async fn run(mut self) -> Result<(), IngestError> {
+        loop {
+            select! {
+                _ = &mut self.shutdown_rx => {
+                    info!("ingestor received shutdown signal");
+                    break;
+                }
+                maybe_msg = self.broker_rx.recv() => {
+                    let raw = match maybe_msg {
+                        Some(v) => v,
+                        None => {
+                            warn!("broker channel closed, terminating");
+                            break;
+                        }
+                    };
+
+                    match EventEnvelope::try_from(raw) {
+                        Ok(envelope) => {
+                            #[cfg(feature = "event_ingest")]
+                            self.persist(&envelope).await?;
+
+                            // Non-blocking send to broadcast subscribers.
+                            let _ = self.broadcaster.send(envelope);
+                        }
+                        Err(e) => {
+                            error!("event rejected: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Persist the envelope atomically.
+    #[cfg(feature = "event_ingest")]
+    #[instrument(skip_all, fields(event_id = %envelope.id))]
+    async fn persist(&self, envelope: &EventEnvelope) -> Result<(), IngestError> {
+        let query = r#"
+            INSERT INTO audit.events
+                (id, aggregate_id, aggregate_type, event_type, payload, created_at)
+            VALUES
+                ($1, $2, $3, $4, $5, $6)
+        "#;
+
+        sqlx::query(query)
+            .bind(envelope.id)
+            .bind(envelope.aggregate_id)
+            .bind(envelope.aggregate_type)
+            .bind(envelope.event_type)
+            .bind(&envelope.payload)
+            .bind(envelope.created_at)
+            .execute(&self.pool)
+            .await?;
+
+        debug!("event persisted to audit.events");
+        Ok(())
+    }
+}
+
+impl TryFrom<RawBrokerEvent> for EventEnvelope {
+    type Error = IngestError;
+
+    fn try_from(raw: RawBrokerEvent) -> Result<Self, Self::Error> {
+        // Example validation: aggregate_type must equal event_type prefix.
+        if !raw.event_type.starts_with(&raw.aggregate_type) {
+            return Err(IngestError::Validation(format!(
+                "aggregate_type `{}` not matching event_type `{}`",
+                raw.aggregate_type, raw.event_type
+            )));
+        }
+
+        Ok(EventEnvelope {
+            id: Uuid::new_v4(),
+            aggregate_id: raw.aggregate_id,
+            aggregate_type: Box::leak(raw.aggregate_type.into_boxed_str()),
+            event_type: Box::leak(raw.event_type.into_boxed_str()),
+            payload: raw.payload,
+            created_at: Utc::now(),
+        })
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * ↓↓↓ Mock broker adapter (for demonstration / integration tests only) ↓↓↓
+ * ---------------------------------------------------------------------- */
+
+/// Alias so business logic does not depend on the concrete channel type.
+pub type BrokerSubscription = tokio::sync::mpsc::UnboundedReceiver<RawBrokerEvent>;
+
+/// Utility to create a mock broker publisher for local tests.
+///
+/// Example:
+/// ```rust,no_run
+/// let (tx, rx) = module_86::broker_channel();
+/// tx.send(raw_event)?;
+/// ```
+pub fn broker_channel(
+) -> (
+    tokio::sync::mpsc::UnboundedSender<RawBrokerEvent>,
+    BrokerSubscription,
+) {
+    tokio::sync::mpsc::unbounded_channel()
+}
+
+/* --------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{sleep, Duration};
+
+    #[tokio::test]
+    async fn event_ingestor_runs_and_broadcasts() {
+        let (broker_tx, broker_rx) = broker_channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let ingestor = EventIngestor::new_mock(broker_rx, shutdown_rx);
+        let mut sub = ingestor.subscribe();
+
+        // Spawn ingestor loop
+        let handle = tokio::spawn(async move { ingestor.run().await });
+
+        // Send mocked event
+        broker_tx
+            .send(RawBrokerEvent {
+                aggregate_id: Uuid::new_v4(),
+                aggregate_type: "Lesson".into(),
+                event_type: "LessonPublished".into(),
+                payload: serde_json::json!({"title": "Rust 101"}),
+            })
+            .unwrap();
+
+        let envelope = sub.recv().await.unwrap();
+        assert_eq!(envelope.event_type, "LessonPublished");
+
+        // Shutdown
+        shutdown_tx.send(()).ok();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_events_are_rejected() {
+        let (broker_tx, broker_rx) = broker_channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let ingestor = EventIngestor::new_mock(broker_rx, shutdown_rx);
+
+        let join = tokio::spawn(async move { ingestor.run().await });
+
+        broker_tx
+            .send(RawBrokerEvent {
+                aggregate_id: Uuid::new_v4(),
+                aggregate_type: "User".into(),
+                event_type: "LessonPublished".into(), // mismatch
+                payload: serde_json::json!({}),
+            })
+            .unwrap();
+
+        // Allow some time for processing then shut down.
+        sleep(Duration::from_millis(100)).await;
+        shutdown_tx.send(()).ok();
+        join.await.unwrap().unwrap();
+    }
+}
+```

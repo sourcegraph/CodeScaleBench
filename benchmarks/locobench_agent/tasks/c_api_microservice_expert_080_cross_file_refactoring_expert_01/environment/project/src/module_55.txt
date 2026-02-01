@@ -1,0 +1,467 @@
+```c
+/*
+ * MercuryMonolith Commerce Hub
+ * ---------------------------------------
+ * In-memory Response Cache (LRU + TTL)
+ *
+ * This module provides a thread-safe, process-local cache that can be
+ * leveraged by the API gateway layer to short-circuit expensive repository
+ * calls when identical requests are repeated within a small time-window.
+ *
+ * The implementation combines a hash-map (key ➜ entry*) for O(1) lookup
+ * and a doubly-linked list to maintain a Least-Recently-Used eviction
+ * policy.  Each entry carries an absolute expiry timestamp (TTL).
+ *
+ *   ‑ Metrics:   Exposes counters & gauges to the global metrics registry
+ *   ‑ Logging:   Emits structured log lines on insert, hit, miss & evict
+ *   ‑ Concurrency: Read-optimized using a pthread read/write lock
+ *
+ * Build-only Dependencies:
+ *   • uthash.h  – MIT-licensed single-header hash-map
+ *
+ * Project Dependencies (provided elsewhere in repo):
+ *   • mm_log.h      – logging helpers (mm_log_info, mm_log_debug, etc.)
+ *   • mm_metrics.h  – metrics helpers (mm_metrics_inc_counter, etc.)
+ */
+
+#include <errno.h>
+#include <pthread.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "uthash.h"      /* External single-header hash map */
+#include "mm_log.h"      /* Project logging facade */
+#include "mm_metrics.h"  /* Project metrics facade */
+
+/* ------------------------------------------------------------------ */
+/* Public Types                                                       */
+/* ------------------------------------------------------------------ */
+
+/* Simple heap-allocated buffer helper used widely in the codebase */
+typedef struct {
+    void  *ptr;
+    size_t len;
+} mm_buffer_t;
+
+/* Cache statistics, returned to callers who care about internals */
+typedef struct {
+    size_t max_entries;
+    size_t current_entries;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+} mm_cache_stats_t;
+
+/* ------------------------------------------------------------------ */
+/* Module-private structures                                          */
+/* ------------------------------------------------------------------ */
+
+typedef struct cache_entry_s {
+    char               *key;     /* Hash key (heap owned)            */
+    mm_buffer_t         blob;    /* Cached payload (heap owned)       */
+    time_t              expiry;  /* Absolute epoch seconds           */
+    struct cache_entry_s *prev;  /* LRU doubly-linked list           */
+    struct cache_entry_s *next;
+    UT_hash_handle       hh;     /* uthash linker member             */
+} cache_entry_t;
+
+typedef struct {
+    cache_entry_t  *table;          /* uthash root                    */
+    cache_entry_t  *lru_head;       /* MRU side                       */
+    cache_entry_t  *lru_tail;       /* LRU side                       */
+    size_t          max_entries;    /* Hard cap                       */
+    size_t          current_entries;
+    time_t          default_ttl;    /* Fallback TTL                   */
+    uint64_t        hits;
+    uint64_t        misses;
+    uint64_t        evictions;
+    pthread_rwlock_t rwlock;        /* Readers ⇢ shared, Writers ⇢ exclusive */
+    int             initialized;
+} cache_state_t;
+
+/* ------------------------------------------------------------------ */
+/* Globals                                                            */
+/* ------------------------------------------------------------------ */
+
+static cache_state_t g_cache = {
+    .table            = NULL,
+    .lru_head         = NULL,
+    .lru_tail         = NULL,
+    .max_entries      = 0,
+    .current_entries  = 0,
+    .default_ttl      = 0,
+    .hits             = 0,
+    .misses           = 0,
+    .evictions        = 0,
+    .initialized      = 0
+};
+
+/* ------------------------------------------------------------------ */
+/* Internal Helpers                                                   */
+/* ------------------------------------------------------------------ */
+
+/* Move an existing entry to the head of the LRU list (most recently used) */
+static inline void
+move_to_head(cache_entry_t *e)
+{
+    if (g_cache.lru_head == e) {
+        return; /* already head */
+    }
+
+    /* Detach */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (g_cache.lru_tail == e) g_cache.lru_tail = e->prev;
+
+    /* Insert at head */
+    e->prev = NULL;
+    e->next = g_cache.lru_head;
+    if (g_cache.lru_head) g_cache.lru_head->prev = e;
+    g_cache.lru_head = e;
+    if (g_cache.lru_tail == NULL) g_cache.lru_tail = e;
+}
+
+/* Remove the LRU (tail) element from both hash-map and linked list */
+static void
+evict_tail(void)
+{
+    if (!g_cache.lru_tail) return;
+
+    cache_entry_t *victim = g_cache.lru_tail;
+
+    /* Log prior to destruction */
+    mm_log_debug("cache", "evicting key='%s' (expires=%ld)", victim->key,
+                 (long)victim->expiry);
+
+    /* Remove from linked list */
+    if (victim->prev) victim->prev->next = NULL;
+    g_cache.lru_tail = victim->prev;
+    if (g_cache.lru_head == victim) g_cache.lru_head = NULL;
+
+    /* Remove from hash table */
+    HASH_DEL(g_cache.table, victim);
+
+    /* Stats */
+    g_cache.current_entries--;
+    g_cache.evictions++;
+    mm_metrics_inc_counter("cache_evictions_total", 1);
+
+    /* Free resources */
+    free(victim->key);
+    free(victim->blob.ptr);
+    free(victim);
+}
+
+/* Free a single entry object (does NOT unlink) */
+static inline void
+free_entry(cache_entry_t *e)
+{
+    free(e->key);
+    free(e->blob.ptr);
+    free(e);
+}
+
+/* ------------------------------------------------------------------ */
+/* Public API                                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Initialize the in-memory cache.
+ *
+ * Arguments:
+ *   max_entries  – hard cardinality limit (must be >0)
+ *   default_ttl  – fallback TTL in seconds (0 = no automatic expiry)
+ *
+ * Returns 0 on success, errno on failure.
+ */
+int
+mm_cache_init(size_t max_entries, time_t default_ttl)
+{
+    if (g_cache.initialized) {
+        return 0; /* idempotent */
+    }
+    if (max_entries == 0) {
+        return EINVAL;
+    }
+
+    memset(&g_cache, 0, sizeof(g_cache));
+    g_cache.max_entries = max_entries;
+    g_cache.default_ttl = default_ttl;
+
+    if (pthread_rwlock_init(&g_cache.rwlock, NULL) != 0) {
+        return errno;
+    }
+    g_cache.initialized = 1;
+
+    mm_log_info("cache", "initialized (max_entries=%zu default_ttl=%lds)",
+                max_entries, (long)default_ttl);
+    return 0;
+}
+
+/*
+ * Gracefully dismantle cache, freeing all resources.
+ */
+void
+mm_cache_shutdown(void)
+{
+    if (!g_cache.initialized) return;
+
+    pthread_rwlock_wrlock(&g_cache.rwlock);
+
+    cache_entry_t *e, *tmp;
+    HASH_ITER(hh, g_cache.table, e, tmp)
+    {
+        HASH_DEL(g_cache.table, e);
+        free_entry(e);
+    }
+
+    g_cache.table = NULL;
+    g_cache.lru_head = g_cache.lru_tail = NULL;
+    g_cache.current_entries = 0;
+
+    pthread_rwlock_unlock(&g_cache.rwlock);
+    pthread_rwlock_destroy(&g_cache.rwlock);
+
+    g_cache.initialized = 0;
+    mm_log_info("cache", "shutdown complete");
+}
+
+/*
+ * Retrieve a cached object by key.
+ *
+ * Returns:
+ *   0            – hit (copy placed in `out`, caller MUST free out->ptr)
+ *   ENOENT       – miss
+ *   EAGAIN       – hit but expired (treated as miss, entry removed)
+ *   EINVAL/E2BIG – parameter issues
+ */
+int
+mm_cache_get(const char *key, mm_buffer_t *out)
+{
+    if (!g_cache.initialized || !key || !out) return EINVAL;
+
+    pthread_rwlock_rdlock(&g_cache.rwlock);
+
+    cache_entry_t *e;
+    HASH_FIND_STR(g_cache.table, key, e);
+
+    if (!e) {
+        /* Miss */
+        g_cache.misses++;
+        mm_metrics_inc_counter("cache_misses_total", 1);
+        pthread_rwlock_unlock(&g_cache.rwlock);
+        return ENOENT;
+    }
+
+    /* Check expiry */
+    time_t now = time(NULL);
+    if (e->expiry && e->expiry < now) {
+        /* Stale */
+        pthread_rwlock_unlock(&g_cache.rwlock);
+
+        /* Acquire write lock to delete */
+        pthread_rwlock_wrlock(&g_cache.rwlock);
+        /* Ensure not deleted by other thread */
+        HASH_FIND_STR(g_cache.table, key, e);
+        if (e) {
+            /* Unlink from LRU list */
+            if (e->prev) e->prev->next = e->next;
+            if (e->next) e->next->prev = e->prev;
+            if (g_cache.lru_head == e) g_cache.lru_head = e->next;
+            if (g_cache.lru_tail == e) g_cache.lru_tail = e->prev;
+
+            HASH_DEL(g_cache.table, e);
+            g_cache.current_entries--;
+            free_entry(e);
+        }
+        g_cache.misses++;
+        mm_metrics_inc_counter("cache_misses_total", 1);
+
+        pthread_rwlock_unlock(&g_cache.rwlock);
+        return EAGAIN;
+    }
+
+    /* Copy blob */
+    out->ptr = malloc(e->blob.len);
+    if (!out->ptr) {
+        pthread_rwlock_unlock(&g_cache.rwlock);
+        return ENOMEM;
+    }
+    memcpy(out->ptr, e->blob.ptr, e->blob.len);
+    out->len = e->blob.len;
+
+    /* Update LRU ordering */
+    /* We must hold write lock to mutate list; upgrade cautiously */
+    pthread_rwlock_unlock(&g_cache.rwlock);
+    pthread_rwlock_wrlock(&g_cache.rwlock);
+    move_to_head(e);
+    pthread_rwlock_unlock(&g_cache.rwlock);
+
+    /* Metrics */
+    g_cache.hits++;
+    mm_metrics_inc_counter("cache_hits_total", 1);
+
+    return 0;
+}
+
+/*
+ * Insert/Replace a cached object.
+ *
+ * ttl_sec = 0  ➜ use default_ttl
+ * ttl_sec < 0  ➜ no expiry
+ */
+int
+mm_cache_put(const char *key, const void *data, size_t len, time_t ttl_sec)
+{
+    if (!g_cache.initialized || !key || !data || len == 0) return EINVAL;
+    if (strlen(key) > 4096) return E2BIG; /* sanity */
+
+    pthread_rwlock_wrlock(&g_cache.rwlock);
+
+    cache_entry_t *e;
+    HASH_FIND_STR(g_cache.table, key, e);
+
+    time_t now = time(NULL);
+    time_t expiry = 0;
+
+    if (ttl_sec == 0)
+        ttl_sec = g_cache.default_ttl;
+    if (ttl_sec > 0)
+        expiry = now + ttl_sec;
+
+    if (e) {
+        /* Replace existing */
+        free(e->blob.ptr);
+    } else {
+        /* New entry */
+        e = calloc(1, sizeof(cache_entry_t));
+        if (!e) {
+            pthread_rwlock_unlock(&g_cache.rwlock);
+            return ENOMEM;
+        }
+        e->key = strdup(key);
+        if (!e->key) {
+            free(e);
+            pthread_rwlock_unlock(&g_cache.rwlock);
+            return ENOMEM;
+        }
+        HASH_ADD_KEYPTR(hh, g_cache.table, e->key, strlen(e->key), e);
+        g_cache.current_entries++;
+    }
+
+    /* Deep copy payload */
+    e->blob.ptr = malloc(len);
+    if (!e->blob.ptr) {
+        pthread_rwlock_unlock(&g_cache.rwlock);
+        return ENOMEM;
+    }
+    memcpy(e->blob.ptr, data, len);
+    e->blob.len = len;
+    e->expiry   = expiry;
+
+    /* Move to MRU position */
+    move_to_head(e);
+
+    mm_metrics_inc_counter("cache_put_total", 1);
+
+    /* Evict if over capacity */
+    while (g_cache.current_entries > g_cache.max_entries) {
+        evict_tail();
+    }
+
+    pthread_rwlock_unlock(&g_cache.rwlock);
+
+    mm_log_debug("cache", "stored key='%s' (bytes=%zu, ttl=%lds)", key, len,
+                 (long)ttl_sec);
+    return 0;
+}
+
+/*
+ * Explicitly purge an entry by key.  Safe to call on non-existent keys.
+ */
+void
+mm_cache_invalidate(const char *key)
+{
+    if (!g_cache.initialized || !key) return;
+
+    pthread_rwlock_wrlock(&g_cache.rwlock);
+
+    cache_entry_t *e;
+    HASH_FIND_STR(g_cache.table, key, e);
+    if (e) {
+        /* Unlink LRU */
+        if (e->prev) e->prev->next = e->next;
+        if (e->next) e->next->prev = e->prev;
+        if (g_cache.lru_head == e) g_cache.lru_head = e->next;
+        if (g_cache.lru_tail == e) g_cache.lru_tail = e->prev;
+
+        HASH_DEL(g_cache.table, e);
+        g_cache.current_entries--;
+        free_entry(e);
+
+        mm_metrics_inc_counter("cache_invalidations_total", 1);
+        mm_log_debug("cache", "invalidated key='%s'", key);
+    }
+
+    pthread_rwlock_unlock(&g_cache.rwlock);
+}
+
+/*
+ * Snapshot statistics (consistent values).
+ */
+void
+mm_cache_stats(mm_cache_stats_t *out)
+{
+    if (!out || !g_cache.initialized) return;
+
+    pthread_rwlock_rdlock(&g_cache.rwlock);
+    out->max_entries      = g_cache.max_entries;
+    out->current_entries  = g_cache.current_entries;
+    out->hits             = g_cache.hits;
+    out->misses           = g_cache.misses;
+    out->evictions        = g_cache.evictions;
+    pthread_rwlock_unlock(&g_cache.rwlock);
+}
+
+/* ------------------------------------------------------------------ */
+/* Unit-style self-test, compiled only in DEBUG builds                */
+/* ------------------------------------------------------------------ */
+#ifdef MM_CACHE_SELFTEST
+
+#include <assert.h>
+
+static void
+selftest_basic_flow(void)
+{
+    const char *k = "hello";
+    const char *v = "world";
+
+    assert(mm_cache_init(8, 5) == 0);
+    assert(mm_cache_put(k, v, strlen(v) + 1, 2) == 0);
+
+    mm_buffer_t out = {0};
+    assert(mm_cache_get(k, &out) == 0);
+    assert(strcmp(out.ptr, v) == 0);
+    free(out.ptr);
+
+    /* Wait for expiry */
+    sleep(3);
+    assert(mm_cache_get(k, &out) == EAGAIN);
+
+    mm_cache_shutdown();
+    puts("mm_cache selftest_basic_flow OK");
+}
+
+int main(void)
+{
+    selftest_basic_flow();
+    return 0;
+}
+
+#endif /* MM_CACHE_SELFTEST */
+
+```

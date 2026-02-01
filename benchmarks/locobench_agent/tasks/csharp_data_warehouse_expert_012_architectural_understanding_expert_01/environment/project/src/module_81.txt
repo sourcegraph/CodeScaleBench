@@ -1,0 +1,366 @@
+```csharp
+// -----------------------------------------------------------------------------
+//  Project : PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//  File    : src/module_81.txt   (compiled as Module81.DynamicTransformation.cs)
+//  Language: C# 10 / .NET 6
+//
+//  Description:
+//      Dynamic transformation engine that wires together Strategy + Observer
+//      patterns for stream-time manipulation of EventEnvelope objects.  The
+//      component supports plug-and-play business-logic via reflection-based
+//      discovery of ITransformationStrategy implementations, runtime hot-swap,
+//      CloudWatch metrics, and structured logging.
+//
+//  ─────────────────────────────────────────────────────────────────────────────
+//  Copyright © 2023-2024 PulseOps.
+//  Licensed under the Apache License, Version 2.0.
+// -----------------------------------------------------------------------------
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Diagnostics;
+using System.Linq;
+using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.CloudWatch;
+using Amazon.CloudWatch.Model;
+using Microsoft.Extensions.Logging;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+
+namespace PulseOps.Warehouse.Transformations
+{
+    #region Models
+
+    /// <summary>
+    /// Canonical wrapper for any inbound / outbound event within the warehouse.
+    /// </summary>
+    public sealed record EventEnvelope
+    {
+        public required string Id { get; init; }
+        public required string Source { get; init; }
+        public required DateTimeOffset Timestamp { get; init; }
+        public required JObject Payload { get; init; }
+        public ImmutableDictionary<string, string> Metadata { get; init; } =
+            ImmutableDictionary<string, string>.Empty;
+
+        public EventEnvelope WithPayload(JObject newPayload) =>
+            this with { Payload = newPayload };
+    }
+
+    #endregion
+
+    #region Strategy Interfaces
+
+    /// <summary>
+    /// Marker interface for transformation strategies.
+    /// </summary>
+    public interface ITransformationStrategy
+    {
+        /// <summary>Human-readable name for the strategy.</summary>
+        string Name { get; }
+
+        /// <summary>
+        /// Whether the strategy is able to handle a specific <see cref="EventEnvelope"/>.
+        /// </summary>
+        bool CanHandle(EventEnvelope envelope);
+
+        /// <summary>
+        /// Applies the transformation.  The returned envelope may be the original
+        /// instance (immutable) or a mutated copy.
+        /// </summary>
+        Task<EventEnvelope> TransformAsync(
+            EventEnvelope envelope,
+            CancellationToken cancellationToken = default);
+    }
+
+    #endregion
+
+    #region Registry
+
+    /// <summary>
+    /// Thread-safe registry that discovers, registers and provides
+    /// <see cref="ITransformationStrategy"/> instances.
+    /// </summary>
+    public sealed class TransformationRegistry
+    {
+        private readonly ILogger<TransformationRegistry> _logger;
+        private readonly ConcurrentDictionary<string, ITransformationStrategy> _byName = new();
+
+        public TransformationRegistry(ILogger<TransformationRegistry> logger)
+        {
+            _logger = logger;
+            DiscoverStrategies(AppDomain.CurrentDomain.GetAssemblies());
+        }
+
+        /// <summary>
+        /// Discovers all strategies located in provided assemblies.
+        /// </summary>
+        public void DiscoverStrategies(IEnumerable<Assembly> assemblies)
+        {
+            foreach (var assembly in assemblies)
+            {
+                IEnumerable<Type> types;
+
+                try
+                {
+                    types = assembly
+                        .GetTypes()
+                        .Where(t => !t.IsAbstract && !t.IsInterface &&
+                                    typeof(ITransformationStrategy).IsAssignableFrom(t));
+                }
+                catch (ReflectionTypeLoadException ex)
+                {
+                    types = ex.Types.Where(t => t is not null)!;
+                    foreach (var loaderEx in ex.LoaderExceptions)
+                    {
+                        _logger.LogWarning(loaderEx, "Loader exception while scanning {Assembly}", assembly.FullName);
+                    }
+                }
+
+                foreach (var type in types)
+                {
+                    try
+                    {
+                        if (Activator.CreateInstance(type) is ITransformationStrategy instance)
+                        {
+                            Register(instance);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex,
+                            "Unable to instantiate strategy {StrategyType}", type.FullName);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Registers a strategy.  Duplicate names are rejected.
+        /// </summary>
+        public void Register(ITransformationStrategy strategy)
+        {
+            if (!_byName.TryAdd(strategy.Name, strategy))
+            {
+                _logger.LogWarning(
+                    "Duplicate strategy ignored (Name: {Name}, Type: {Type})",
+                    strategy.Name, strategy.GetType().FullName);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Registered transformation strategy {Name} ({Type})",
+                    strategy.Name, strategy.GetType().FullName);
+            }
+        }
+
+        public IReadOnlyCollection<ITransformationStrategy> All =>
+            _byName.Values.ToImmutableArray();
+
+        public bool TryGet(string name, out ITransformationStrategy? strategy) =>
+            _byName.TryGetValue(name, out strategy);
+    }
+
+    #endregion
+
+    #region Engine
+
+    /// <summary>
+    /// Orchestrates dynamic selection + execution of transformation strategies.
+    /// Implements <see cref="IObserver{T}"/> so that it can be plugged into
+    /// reactive pipelines (e.g. Kinesis fan-out via Rx.NET).
+    /// </summary>
+    public sealed class TransformationEngine : IObserver<EventEnvelope>, IDisposable
+    {
+        private const string MetricNamespace = "PulseOps/Warehouse/Transformations";
+        private readonly ILogger<TransformationEngine> _logger;
+        private readonly IAmazonCloudWatch _cloudWatch;
+        private readonly TransformationRegistry _registry;
+        private readonly IObserver<EventEnvelope> _downstream;
+        private readonly CancellationTokenSource _cts = new();
+
+        public TransformationEngine(
+            ILogger<TransformationEngine> logger,
+            IAmazonCloudWatch cloudWatch,
+            TransformationRegistry registry,
+            IObserver<EventEnvelope> downstream)
+        {
+            _logger = logger;
+            _cloudWatch = cloudWatch;
+            _registry = registry;
+            _downstream = downstream;
+        }
+
+        #region IObserver<EventEnvelope>
+
+        public void OnNext(EventEnvelope value)
+        {
+            _ = ProcessAsync(value, _cts.Token);
+        }
+
+        public void OnError(Exception error)
+        {
+            _logger.LogError(error, "Upstream error propagated to TransformationEngine");
+            _downstream.OnError(error);
+        }
+
+        public void OnCompleted()
+        {
+            _logger.LogInformation("Upstream completed");
+            _downstream.OnCompleted();
+        }
+
+        #endregion
+
+        public async Task ProcessAsync(EventEnvelope envelope, CancellationToken ct = default)
+        {
+            var timer = Stopwatch.StartNew();
+            try
+            {
+                var strategy = ResolveStrategy(envelope);
+
+                if (strategy is null)
+                {
+                    _logger.LogWarning(
+                        "No transformation strategy found for {Source} (EventId={Id})",
+                        envelope.Source, envelope.Id);
+                    PublishMetric("UnresolvedStrategy", 1);
+                    _downstream.OnNext(envelope);
+                    return;
+                }
+
+                _logger.LogDebug(
+                    "Applying strategy {Strategy} to event {Id}",
+                    strategy.Name, envelope.Id);
+
+                var transformed = await strategy.TransformAsync(envelope, ct);
+
+                PublishMetric("SuccessfulTransform", 1);
+
+                _downstream.OnNext(transformed);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Transformation failed for {Id}", envelope.Id);
+                PublishMetric("FailedTransform", 1);
+
+                // Surface failure downstream; might be caught by DLQ wrapper.
+                _downstream.OnError(ex);
+            }
+            finally
+            {
+                timer.Stop();
+                PublishMetric("TransformLatencyMs", timer.ElapsedMilliseconds, StandardUnit.Milliseconds);
+            }
+        }
+
+        private ITransformationStrategy? ResolveStrategy(EventEnvelope envelope)
+        {
+            // 1) Metadata override: "strategy"
+            if (envelope.Metadata.TryGetValue("strategy", out var name) &&
+                _registry.TryGet(name, out var explicitStrategy))
+            {
+                return explicitStrategy;
+            }
+
+            // 2) Capability check
+            return _registry.All.FirstOrDefault(s => s.CanHandle(envelope));
+        }
+
+        #region Metrics
+
+        private void PublishMetric(string metricName, double value,
+            StandardUnit unit = StandardUnit.Count)
+        {
+            try
+            {
+                var request = new PutMetricDataRequest
+                {
+                    Namespace = MetricNamespace,
+                    MetricData = new List<MetricDatum>
+                    {
+                        new()
+                        {
+                            MetricName = metricName,
+                            TimestampUtc = DateTime.UtcNow,
+                            Unit = unit,
+                            Value = value
+                        }
+                    }
+                };
+                _ = _cloudWatch.PutMetricDataAsync(request, _cts.Token);
+            }
+            catch (Exception ex)
+            {
+                // Fail-open on metrics to avoid interfering with data flow.
+                _logger.LogDebug(ex, "CloudWatch metric publish failure");
+            }
+        }
+
+        #endregion
+
+        #region IDisposable
+
+        public void Dispose()
+        {
+            _cts.Cancel();
+            _cts.Dispose();
+        }
+
+        #endregion
+    }
+
+    #endregion
+
+    #region Example Strategies
+
+    /// <summary>
+    /// Example concrete strategy: flattens JSON payloads where a "data" wrapper exists.
+    /// </summary>
+    public sealed class FlattenWrapperStrategy : ITransformationStrategy
+    {
+        public string Name => "flatten-wrapper";
+
+        public bool CanHandle(EventEnvelope envelope) =>
+            envelope.Payload["data"] is JObject;
+
+        public Task<EventEnvelope> TransformAsync(EventEnvelope envelope, CancellationToken cancellationToken = default)
+        {
+            var newPayload = (JObject)envelope.Payload["data"]!;
+            var transformed = envelope.WithPayload(newPayload);
+            return Task.FromResult(transformed);
+        }
+    }
+
+    /// <summary>
+    /// Another example: renames a field based on metadata.
+    /// </summary>
+    public sealed class RenameFieldStrategy : ITransformationStrategy
+    {
+        private const string RenameMetadataKey = "rename_field";
+
+        public string Name => "rename-field";
+
+        public bool CanHandle(EventEnvelope envelope) =>
+            envelope.Metadata.TryGetValue(RenameMetadataKey, out var value)
+            && !string.IsNullOrWhiteSpace(value)
+            && envelope.Payload[value] is not null;
+
+        public Task<EventEnvelope> TransformAsync(EventEnvelope envelope, CancellationToken cancellationToken = default)
+        {
+            var fieldToRename = envelope.Metadata[RenameMetadataKey];
+            var newPayload = envelope.Payload.DeepClone() as JObject ?? new JObject();
+            var token = newPayload[fieldToRename];
+            newPayload.Remove(fieldToRename);
+            newPayload[$"{fieldToRename}_renamed"] = token;
+            return Task.FromResult(envelope.WithPayload(newPayload));
+        }
+    }
+
+    #endregion
+}
+```

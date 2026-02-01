@@ -1,0 +1,380 @@
+```csharp
+// File: src/module_71.txt
+// Project: PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+// ---------------------------------------------------------------------------
+// This module hosts the TransformationPipeline infrastructure as well as an
+// example Focus-Time-Ratio transformation strategy.  The pipeline wires
+// multiple strategies together through the Strategy & Observer patterns and
+// executes them with high-throughput, bounded-concurrency blocks from the TPL
+// Dataflow library.
+// ---------------------------------------------------------------------------
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Threading.Tasks.Dataflow;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformations
+{
+    #region Contracts ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Immutable wrapper around any warehouse record (pre- or post-transformation).
+    /// </summary>
+    /// <param name="Source">Logical source system (e.g., "calendar", "git", etc.).</param>
+    /// <param name="Timestamp">Event occurrence time in UTC.</param>
+    /// <param name="Payload">Unstructured key/value bag holding event data.</param>
+    public sealed record DataRecord(
+        string Source,
+        DateTime Timestamp,
+        IReadOnlyDictionary<string, object> Payload)
+    {
+        public static readonly DataRecord Empty =
+            new("unknown", DateTime.MinValue, new Dictionary<string, object>());
+    }
+
+    /// <summary>
+    /// Base contract for any transformation strategy that converts an input
+    /// <see cref="DataRecord"/> to an enriched version of itself or to an
+    /// aggregated KPI record.
+    /// </summary>
+    public interface ITransformationStrategy
+    {
+        /// <summary>
+        /// Globally unique identifier for this strategy.  Used for metrics,
+        /// diagnostics, and registry lookup.
+        /// </summary>
+        string Identifier { get; }
+
+        /// <summary>
+        /// Returns <see langword="true"/> if the strategy can handle the given
+        /// record (cheap heuristic only).  The pipeline short-circuits on the
+        /// first strategy that claims responsibility.
+        /// </summary>
+        bool CanHandle(in DataRecord record);
+
+        /// <summary>
+        /// Performs the actual transformation asynchronously.
+        /// Implementations must be side-effect-free and thread-safe.
+        /// </summary>
+        /// <exception cref="TransformationException">
+        /// Thrown when the transformation fails irrecoverably.
+        /// </exception>
+        Task<DataRecord> TransformAsync(
+            DataRecord record,
+            CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Thrown when a strategy cannot perform its work.  The pipeline will push
+    /// the offending record to the Failure Sink / DLQ together with the
+    /// serialized <see cref="Exception"/>.
+    /// </summary>
+    [Serializable]
+    public sealed class TransformationException : Exception
+    {
+        public TransformationException(string message, Exception? inner = null)
+            : base(message, inner) { }
+    }
+
+    #endregion
+
+    #region Transformation Pipeline Infrastructure ───────────────────────────
+
+    /// <summary>
+    /// Thread-safe registry that holds all available transformation strategies.
+    /// Supports O(1) lookup by identifier and linear scan for
+    /// <see cref="ITransformationStrategy.CanHandle"/>.
+    /// </summary>
+    public sealed class TransformationStrategyRegistry
+    {
+        private readonly ConcurrentDictionary<string, ITransformationStrategy> _strategies = new();
+
+        public void Register(ITransformationStrategy strategy)
+        {
+            ArgumentNullException.ThrowIfNull(strategy);
+            if (!_strategies.TryAdd(strategy.Identifier, strategy))
+            {
+                throw new InvalidOperationException(
+                    $"A strategy with id '{strategy.Identifier}' is already registered.");
+            }
+        }
+
+        public IReadOnlyCollection<ITransformationStrategy> All => _strategies.Values.ToList();
+
+        public ITransformationStrategy? GetById(string id) =>
+            _strategies.TryGetValue(id, out var s) ? s : null;
+    }
+
+    /// <summary>
+    /// High-level component that wires together the registry, the bounded
+    /// concurrency blocks, and the observer notifications.
+    /// </summary>
+    public sealed class TransformationPipeline : IAsyncDisposable
+    {
+        private readonly TransformationStrategyRegistry _registry;
+        private readonly ILogger<TransformationPipeline> _logger;
+        private readonly ActionBlock<DataRecord> _ingressBlock;
+        private readonly BroadcastBlock<DataRecord> _egressBlock;
+        private readonly CancellationTokenSource _cts = new();
+
+        /// <summary>
+        /// Creates a pipeline with the provided registry and logger.
+        /// </summary>
+        /// <param name="degreeOfParallelism">
+        /// Maximum number of concurrent strategy invocations.
+        /// </param>
+        /// <exception cref="ArgumentOutOfRangeException"/>
+        public TransformationPipeline(
+            TransformationStrategyRegistry registry,
+            ILogger<TransformationPipeline> logger,
+            int degreeOfParallelism = 8)
+        {
+            _registry = registry ?? throw new ArgumentNullException(nameof(registry));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+            if (degreeOfParallelism is <= 0 or > 256)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(degreeOfParallelism),
+                    "Must be between 1 and 256 inclusive.");
+            }
+
+            var execBlock = new TransformBlock<DataRecord, DataRecord>(
+                record => ApplyFirstMatchingStrategyAsync(record, _cts.Token),
+                new ExecutionDataflowBlockOptions
+                {
+                    MaxDegreeOfParallelism = degreeOfParallelism,
+                    BoundedCapacity = degreeOfParallelism * 4,
+                    CancellationToken = _cts.Token
+                });
+
+            _egressBlock = new BroadcastBlock<DataRecord>(r => r);
+            _ingressBlock = new ActionBlock<DataRecord>(record =>
+                    execBlock.Post(record),
+                new ExecutionDataflowBlockOptions
+                {
+                    MaxDegreeOfParallelism = 1,
+                    BoundedCapacity = degreeOfParallelism * 8,
+                    CancellationToken = _cts.Token
+                });
+
+            // Wire network: ingress -> exec -> egress
+            execBlock.LinkTo(_egressBlock, new DataflowLinkOptions { PropagateCompletion = true });
+
+            // Propagate completion & fault semantics
+            _ingressBlock.Completion.ContinueWith(t =>
+            {
+                if (t.IsFaulted)
+                    ((IDataflowBlock)_egressBlock).Fault(t.Exception!);
+                else
+                    _egressBlock.Complete();
+            });
+        }
+
+        /// <summary>
+        /// Posts a record into the pipeline asynchronously.
+        /// </summary>
+        public ValueTask<bool> SubmitAsync(
+            DataRecord record,
+            CancellationToken cancellationToken = default)
+        {
+            if (_cts.IsCancellationRequested) return ValueTask.FromResult(false);
+            return _ingressBlock.SendAsync(record, cancellationToken);
+        }
+
+        /// <summary>
+        /// Subscribes an asynchronous observer that is invoked for each
+        /// successful transformation result.
+        /// </summary>
+        public IDisposable Subscribe(Func<DataRecord, Task> onNextAsync)
+        {
+            ArgumentNullException.ThrowIfNull(onNextAsync);
+
+            // TransformBlock guarantees single invocations; we wrap via ActionBlock
+            var observerBlock = new ActionBlock<DataRecord>(onNextAsync, new ExecutionDataflowBlockOptions
+            {
+                MaxDegreeOfParallelism = 4,
+                BoundedCapacity = 128,
+                CancellationToken = _cts.Token
+            });
+
+            var link = _egressBlock.LinkTo(observerBlock,
+                new DataflowLinkOptions { PropagateCompletion = true });
+
+            return new DelegateDisposable(() =>
+            {
+                link.Dispose();
+                observerBlock.Complete();
+            });
+        }
+
+        /// <summary>
+        /// Gracefully completes & waits for pipeline flush.
+        /// </summary>
+        public async ValueTask DisposeAsync()
+        {
+            _ingressBlock.Complete();
+            _cts.CancelAfter(TimeSpan.FromSeconds(30));
+
+            try
+            {
+                await _egressBlock.Completion.ConfigureAwait(false);
+            }
+            finally
+            {
+                _cts.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Picks first strategy whose <see cref="ITransformationStrategy.CanHandle"/>
+        /// returns true, then executes it.  Records that do not match any
+        /// strategy are forwarded unchanged.
+        /// </summary>
+        private async Task<DataRecord> ApplyFirstMatchingStrategyAsync(
+            DataRecord record,
+            CancellationToken ct)
+        {
+            try
+            {
+                var strategy = _registry.All.FirstOrDefault(s => s.CanHandle(record));
+                if (strategy is null)
+                {
+                    _logger.LogDebug("No strategy accepted record from {Source}.  Skipping.",
+                        record.Source);
+                    return record;
+                }
+
+                _logger.LogTrace("Applying strategy {Strategy} to record from {Source}.",
+                    strategy.Identifier, record.Source);
+
+                var transformed = await strategy.TransformAsync(record, ct)
+                    .ConfigureAwait(false);
+
+                return transformed;
+            }
+            catch (TransformationException ex)
+            {
+                // Known transformation error: log and rethrow so caller/DLQ decides fate.
+                _logger.LogWarning(ex, "Strategy failure for record from {Source}", record.Source);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unhandled transformation exception.");
+                throw new TransformationException("Unhandled exception.", ex);
+            }
+        }
+
+        private sealed class DelegateDisposable : IDisposable
+        {
+            private readonly Action _dispose;
+            private int _disposed;
+
+            public DelegateDisposable(Action dispose) => _dispose = dispose;
+
+            public void Dispose()
+            {
+                if (Interlocked.Exchange(ref _disposed, 1) == 0) _dispose();
+            }
+        }
+    }
+
+    #endregion
+
+    #region Example Strategy — Focus Time Ratio ──────────────────────────────
+
+    /// <summary>
+    /// Calculates <c>Focus-Time Ratio = (Total_Focus_Time / Total_Work_Time)</c>
+    /// using calendar events classified via heuristics or ML models.  The
+    /// strategy operates on events that belong to a single employee and a
+    /// single day (UTC).  To avoid expensive IO, windowed aggregations are
+    /// cached for 10 minutes.
+    /// </summary>
+    public sealed class FocusTimeRatioStrategy : ITransformationStrategy
+    {
+        private const string SourceSystem = "calendar";
+        private const string MetricName = "focus_time_ratio";
+        private static readonly TimeSpan CacheTtl = TimeSpan.FromMinutes(10);
+
+        private readonly IMemoryCache _cache;
+        private readonly ILogger<FocusTimeRatioStrategy> _logger;
+
+        public FocusTimeRatioStrategy(IMemoryCache cache, ILogger<FocusTimeRatioStrategy> logger)
+        {
+            _cache = cache ?? throw new ArgumentNullException(nameof(cache));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        public string Identifier => nameof(FocusTimeRatioStrategy);
+
+        public bool CanHandle(in DataRecord record) =>
+            record.Source.Equals(SourceSystem, StringComparison.OrdinalIgnoreCase) &&
+            record.Payload.TryGetValue("employee_id", out _) &&
+            record.Payload.TryGetValue("duration_minutes", out _) &&
+            record.Payload.TryGetValue("is_meeting", out _);
+
+        public async Task<DataRecord> TransformAsync(
+            DataRecord record,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var employeeId = record.Payload["employee_id"].ToString();
+            var duration = Convert.ToInt32(record.Payload["duration_minutes"]);
+            var isMeeting = Convert.ToBoolean(record.Payload["is_meeting"]);
+
+            var key = CacheKey(employeeId, record.Timestamp.Date);
+
+            // Each cache entry is the (focusMinutes, workMinutes) tuple.
+            var (focus, work) = _cache.GetOrCreate(key, entry =>
+            {
+                entry.AbsoluteExpirationRelativeToNow = CacheTtl;
+                return (focus: 0, work: 0);
+            });
+
+            // Update totals
+            work += duration;
+            if (!isMeeting) focus += duration;
+
+            _cache.Set(key, (focus, work), CacheTtl);
+
+            var ratio = work == 0 ? 0 : Math.Round(focus / (double)work, 4);
+
+            // Compose enriched record
+            var transformed = record with
+            {
+                Payload = new Dictionary<string, object>(record.Payload)
+                {
+                    ["metric"] = MetricName,
+                    ["focus_minutes"] = focus,
+                    ["work_minutes"] = work,
+                    [MetricName] = ratio
+                }
+            };
+
+            _logger.LogInformation(
+                "Computed {Metric}={Ratio} for Employee={Employee} on {Date}",
+                MetricName, ratio, employeeId, record.Timestamp.Date);
+
+            // Fake asynchronous call to demonstrate await pattern
+            await Task.Yield();
+
+            return transformed;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static string CacheKey(string employeeId, DateTime dateUtc)
+            => $"{employeeId}:{dateUtc:yyyy-MM-dd}";
+    }
+
+    #endregion
+}
+```

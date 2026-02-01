@@ -1,0 +1,475 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * Module 66 – In-Memory Response Cache
+ *
+ * This module implements a thread-safe, TTL-aware, size-bounded, LRU cache that
+ * is used by the API-Gateway layer to short-circuit expensive repository/service
+ * calls for READ-only REST and GraphQL queries.  It gathers Prometheus-friendly
+ * metrics, integrates with the project-wide structured logger, and is designed
+ * to be embedded (no dynamic allocation beyond cache entries).
+ *
+ * NOTE:  The public surface deliberately hides internal data structures.  Only
+ *        the cache_handle_t pointer is exposed to callers.  All mutation APIs
+ *        acquire & release an internal mutex to guarantee safety in the highly
+ *        concurrent web-server context employed by MercuryMonolith.
+ *
+ *  ╭──────────────────────────────────────────────────────────────────────────╮
+ *  │                       Copyright © 2024 Sandstorm Labs                  │
+ *  │              Licensed under the Business Source License 1.1            │
+ *  ╰──────────────────────────────────────────────────────────────────────────╯
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <errno.h>
+
+#include "uthash.h"           /* Third-party single-header hash map */
+#include "mm_logger.h"        /* Project-wide structured logger      */
+#include "mm_metrics.h"       /* Prometheus exporter abstraction     */
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/*                            Data-Structures                                */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/* Forward declaration so API users can only handle opaque pointer. */
+typedef struct cache          cache_t;
+typedef cache_t*              cache_handle_t;
+
+/* Internal double-linked list node for LRU bookkeeping */
+typedef struct lru_node {
+    struct lru_node *prev;
+    struct lru_node *next;
+} lru_node_t;
+
+/* A single cached key/value pair.  Keys are NULL-terminated strings.
+ * Values are raw bytes (could be JSON, binary, etc). */
+typedef struct cache_entry {
+    char              *key;          /* Hashable key */
+    uint8_t           *value;        /* Arbitrary payload */
+    size_t             value_len;    /* Payload length   */
+    uint32_t           ttl;          /* Per-entry TTL    */
+    time_t             created_at;   /* Unix epoch       */
+
+    lru_node_t         lru;          /* LRU pointers     */
+
+    UT_hash_handle     hh;           /* uthash handle    */
+} cache_entry_t;
+
+/* Prometheus-style metrics for cache usage */
+typedef struct cache_metrics {
+    atomic_uint        hits;
+    atomic_uint        misses;
+    atomic_uint        evictions;
+    atomic_uint        expiries;
+    atomic_uint        items;
+} cache_metrics_t;
+
+struct cache {
+    size_t             capacity;     /* Max # of entries */
+    uint32_t           default_ttl;  /* Fallback TTL (s) */
+    cache_entry_t     *hash_tbl;     /* uthash root      */
+    lru_node_t         lru_head;     /* Dummy head node  */
+
+    pthread_mutex_t    mtx;          /* Global lock      */
+    cache_metrics_t    metrics;      /* Runtime metrics  */
+
+    /* Metric registration handles (opaque to this module) */
+    mm_metric_t       *m_prom_hits;
+    mm_metric_t       *m_prom_misses;
+    mm_metric_t       *m_prom_evictions;
+    mm_metric_t       *m_prom_expiries;
+    mm_metric_t       *m_prom_items;
+};
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/*                         Internal Helper Macros                            */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+#define CACHE_LOCK(c)     do { pthread_mutex_lock(&(c)->mtx);   } while(0)
+#define CACHE_UNLOCK(c)   do { pthread_mutex_unlock(&(c)->mtx); } while(0)
+
+/* Move node to front (MRU) */
+static inline void lru_move_front(lru_node_t *head, lru_node_t *node)
+{
+    /* Remove node */
+    node->prev->next = node->next;
+    node->next->prev = node->prev;
+
+    /* Insert after head */
+    node->next = head->next;
+    node->prev = head;
+    head->next->prev = node;
+    head->next = node;
+}
+
+/* Remove LRU (tail-prev) */
+static inline cache_entry_t* lru_pop_tail(lru_node_t *head)
+{
+    if (head->prev == head) return NULL; /* Empty */
+    lru_node_t *node = head->prev;
+    node->prev->next = head;
+    head->prev = node->prev;
+    return (cache_entry_t*)(((char*)node) - offsetof(cache_entry_t, lru));
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/*                              API Surface                                  */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * cache_create – Allocate and initialize a new cache instance.
+ *
+ * @capacity:     Maximum number of entries in the cache.
+ * @default_ttl:  Time-to-live in seconds if not overridden on put().
+ *
+ * Returns: Opaque cache_handle_t on success, NULL on error (errno set).
+ */
+cache_handle_t cache_create(size_t capacity, uint32_t default_ttl);
+
+/**
+ * cache_destroy – Release all resources owned by the cache.
+ */
+void cache_destroy(cache_handle_t handle);
+
+/**
+ * cache_put – Store a key/value pair with optional TTL.
+ *
+ * Existing entries are replaced.  Ownership of @value is transferred to the
+ * cache; the caller MUST NOT use it afterwards.  If @ttl is 0 the default_ttl
+ * configured at creation is used.
+ *
+ * Returns 0 on success, ‑errno on failure.
+ */
+int cache_put(cache_handle_t handle,
+              const char *key,
+              uint8_t *value,
+              size_t value_len,
+              uint32_t ttl);
+
+/**
+ * cache_get – Retrieve a cached value; caller takes ownership of returned
+ * buffer and must free() it when done.  On cache miss *value_out is set to
+ * NULL.  @value_len_out can be NULL if not needed.
+ *
+ * Returns: 1 on HIT, 0 on MISS, negative errno code on error.
+ */
+int cache_get(cache_handle_t handle,
+              const char *key,
+              uint8_t **value_out,
+              size_t *value_len_out);
+
+/**
+ * cache_prune – Manually purge expired entries.
+ *
+ * This function is automatically invoked from cache_get/put but can be called
+ * explicitly by maintenance threads to keep eviction latency predictable.
+ *
+ * Returns the number of entries freed.
+ */
+size_t cache_prune(cache_handle_t handle);
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/*                      Internal Function Implementations                    */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+static void metrics_init(cache_t *c)
+{
+    c->m_prom_hits     = mm_metrics_register_counter("cache_hits_total",
+                                                     "Total number of cache hits");
+    c->m_prom_misses   = mm_metrics_register_counter("cache_misses_total",
+                                                     "Total number of cache misses");
+    c->m_prom_evictions= mm_metrics_register_counter("cache_evictions_total",
+                                                     "Total number of cache evictions due to capacity limits");
+    c->m_prom_expiries = mm_metrics_register_counter("cache_expiries_total",
+                                                     "Total cached items expired due to TTL");
+    c->m_prom_items    = mm_metrics_register_gauge("cache_items",
+                                                   "Current number of items in cache");
+}
+
+static void metrics_inc(mm_metric_t *m)
+{
+    if (m) mm_metrics_inc(m);
+}
+
+static void metrics_set(mm_metric_t *m, uint64_t v)
+{
+    if (m) mm_metrics_set(m, v);
+}
+
+static void entry_free(cache_entry_t *e)
+{
+    free(e->key);
+    free(e->value);
+    free(e);
+}
+
+/* Remove & free entry from hash and LRU */
+static void evict_entry(cache_t *c, cache_entry_t *e, bool expired)
+{
+    HASH_DEL(c->hash_tbl, e);
+    /* Disconnect from LRU list */
+    e->lru.prev->next = e->lru.next;
+    e->lru.next->prev = e->lru.prev;
+
+    atomic_fetch_sub(&c->metrics.items, 1);
+    metrics_set(c->m_prom_items, atomic_load(&c->metrics.items));
+
+    if (expired) {
+        atomic_fetch_add(&c->metrics.expiries, 1);
+        metrics_inc(c->m_prom_expiries);
+    } else {
+        atomic_fetch_add(&c->metrics.evictions, 1);
+        metrics_inc(c->m_prom_evictions);
+    }
+    entry_free(e);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/*                      Public Function Implementations                      */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+cache_handle_t cache_create(size_t capacity, uint32_t default_ttl)
+{
+    if (capacity == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    cache_t *c = calloc(1, sizeof(cache_t));
+    if (!c) return NULL;
+
+    c->capacity     = capacity;
+    c->default_ttl  = default_ttl ? default_ttl : 300; /* 5 min sensible default */
+
+    /* Initialize dummy LRU head (circular list) */
+    c->lru_head.next = c->lru_head.prev = &c->lru_head;
+
+    if (pthread_mutex_init(&c->mtx, NULL) != 0) {
+        free(c);
+        return NULL;
+    }
+
+    metrics_init(c);
+
+    mm_log_info("cache", "init", "capacity=%zu default_ttl=%u", capacity, c->default_ttl);
+    return c;
+}
+
+void cache_destroy(cache_handle_t handle)
+{
+    if (!handle) return;
+    cache_t *c = handle;
+
+    CACHE_LOCK(c);
+    cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, c->hash_tbl, cur, tmp) {
+        HASH_DEL(c->hash_tbl, cur);
+        entry_free(cur);
+    }
+    CACHE_UNLOCK(c);
+    pthread_mutex_destroy(&c->mtx);
+
+    mm_log_info("cache", "destroy", "remaining=%u",
+                (unsigned)atomic_load(&c->metrics.items));
+    free(c);
+}
+
+static bool is_expired(const cache_entry_t *e)
+{
+    time_t now = time(NULL);
+    return (uint32_t)(now - e->created_at) >= e->ttl;
+}
+
+size_t cache_prune(cache_handle_t handle)
+{
+    if (!handle) return 0;
+    cache_t *c = handle;
+    size_t removed = 0;
+
+    CACHE_LOCK(c);
+    cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, c->hash_tbl, cur, tmp) {
+        if (is_expired(cur)) {
+            evict_entry(c, cur, true);
+            ++removed;
+        }
+    }
+    CACHE_UNLOCK(c);
+    return removed;
+}
+
+int cache_put(cache_handle_t handle,
+              const char *key,
+              uint8_t *value,
+              size_t value_len,
+              uint32_t ttl)
+{
+    if (!handle || !key || !value || value_len == 0) {
+        free(value); /* Caller relinquishes ownership even on error */
+        return -EINVAL;
+    }
+
+    cache_t *c = handle;
+    ttl = ttl ? ttl : c->default_ttl;
+
+    CACHE_LOCK(c);
+
+    /* Overwrite if exists */
+    cache_entry_t *e;
+    HASH_FIND_STR(c->hash_tbl, key, e);
+    if (e) {
+        /* Replace value */
+        free(e->value);
+        e->value      = value;
+        e->value_len  = value_len;
+        e->ttl        = ttl;
+        e->created_at = time(NULL);
+
+        lru_move_front(&c->lru_head, &e->lru);
+
+        CACHE_UNLOCK(c);
+        return 0;
+    }
+
+    /* Allocate new entry */
+    e = calloc(1, sizeof(*e));
+    if (!e) {
+        CACHE_UNLOCK(c);
+        free(value);
+        return -ENOMEM;
+    }
+
+    e->key        = strdup(key);
+    e->value      = value;
+    e->value_len  = value_len;
+    e->ttl        = ttl;
+    e->created_at = time(NULL);
+
+    /* Insert into hash */
+    HASH_ADD_STR(c->hash_tbl, key, e);
+
+    /* Insert into LRU front (after head) */
+    e->lru.prev = &c->lru_head;
+    e->lru.next = c->lru_head.next;
+    c->lru_head.next->prev = &e->lru;
+    c->lru_head.next = &e->lru;
+
+    atomic_fetch_add(&c->metrics.items, 1);
+    metrics_set(c->m_prom_items, atomic_load(&c->metrics.items));
+
+    /* Evict if over capacity */
+    while (atomic_load(&c->metrics.items) > c->capacity) {
+        cache_entry_t *victim = lru_pop_tail(&c->lru_head);
+        if (!victim) break; /* Defensive */
+        evict_entry(c, victim, false);
+    }
+
+    CACHE_UNLOCK(c);
+    return 0;
+}
+
+int cache_get(cache_handle_t handle,
+              const char *key,
+              uint8_t **value_out,
+              size_t *value_len_out)
+{
+    if (!handle || !key || !value_out) return -EINVAL;
+
+    cache_t *c = handle;
+    int rc = 0;
+
+    CACHE_LOCK(c);
+    cache_entry_t *e;
+    HASH_FIND_STR(c->hash_tbl, key, e);
+    if (!e) {
+        atomic_fetch_add(&c->metrics.misses, 1);
+        metrics_inc(c->m_prom_misses);
+        rc = 0; /* MISS */
+        *value_out = NULL;
+    } else if (is_expired(e)) {
+        evict_entry(c, e, true);
+        atomic_fetch_add(&c->metrics.misses, 1);
+        metrics_inc(c->m_prom_misses);
+        rc = 0; /* MISS due to expiry */
+        *value_out = NULL;
+    } else {
+        /* HIT – duplicate value for caller */
+        uint8_t *dup = malloc(e->value_len);
+        if (!dup) {
+            rc = -ENOMEM;
+            *value_out = NULL;
+        } else {
+            memcpy(dup, e->value, e->value_len);
+            *value_out = dup;
+            if (value_len_out) *value_len_out = e->value_len;
+
+            atomic_fetch_add(&c->metrics.hits, 1);
+            metrics_inc(c->m_prom_hits);
+
+            lru_move_front(&c->lru_head, &e->lru);
+            rc = 1; /* HIT */
+        }
+    }
+    CACHE_UNLOCK(c);
+    return rc;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/*                                 Tests                                     */
+/* ────────────────────────────────────────────────────────────────────────── */
+/*
+ * To run local unit tests:
+ *
+ *   gcc -DUNIT_TEST -pthread -std=c11 -O2 src/module_66.c -o cache_test
+ *   ./cache_test
+ */
+#ifdef UNIT_TEST
+#include <assert.h>
+
+static void basic_put_get(void)
+{
+    cache_handle_t c = cache_create(2, 2);
+    assert(c);
+
+    uint8_t *v1 = (uint8_t*)strdup("abc");
+    assert(cache_put(c, "k1", v1, 4, 0) == 0);
+
+    uint8_t *out = NULL;
+    size_t len;
+    assert(cache_get(c, "k1", &out, &len) == 1);
+    assert(len == 4 && strcmp((char*)out, "abc") == 0);
+    free(out);
+
+    cache_destroy(c);
+}
+
+static void eviction_policy(void)
+{
+    cache_handle_t c = cache_create(2, 10);
+
+    cache_put(c, "k1", (uint8_t*)strdup("v1"), 3, 0);
+    cache_put(c, "k2", (uint8_t*)strdup("v2"), 3, 0);
+    cache_put(c, "k3", (uint8_t*)strdup("v3"), 3, 0); /* triggers eviction */
+
+    uint8_t *out;
+    assert(cache_get(c, "k1", &out, NULL) == 0);      /* k1 should be evicted */
+    assert(cache_get(c, "k2", &out, NULL) == 1);
+    free(out);
+
+    cache_destroy(c);
+}
+
+int main(void)
+{
+    basic_put_get();
+    eviction_policy();
+    puts("All cache unit tests passed.");
+    return 0;
+}
+#endif

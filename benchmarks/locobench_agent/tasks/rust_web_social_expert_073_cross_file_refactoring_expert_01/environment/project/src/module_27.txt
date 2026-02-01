@@ -1,0 +1,313 @@
+```rust
+//! src/module_27.rs
+//! -------------------------------------------------------------
+//! Pulses Search–Indexing Service
+//! -------------------------------------------------------------
+//! This module implements a self-contained, production-grade worker
+//! that listens for `PulsePublished` domain events and (re)indexes the
+//! corresponding record into Elasticsearch.  The design follows
+//!   • Repository Pattern (database access is isolated)
+//!   • Service Layer      (SearchIndexer)
+//!   • Async / Event-driven architecture
+//!   • Robust error-handling + observability via `tracing`
+//!
+//! Build dependencies (add to Cargo.toml):
+//! ---------------------------------------
+//! [dependencies]
+//! anyhow      = "1"
+//! async-channel = "1"
+//! async-trait = "0.1"
+//! chrono      = { version = "0.4", features = ["serde"] }
+//! config      = "0.13"
+//! reqwest     = { version = "0.11", features = ["json", "rustls-tls"] }
+//! serde       = { version = "1.0", features = ["derive"] }
+//! serde_json  = "1.0"
+//! sqlx        = { version = "0.7", default-features = false, features = [ "runtime-tokio", "postgres", "macros", "chrono"] }
+//! thiserror   = "1"
+//! tokio       = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+//! tracing     = "0.1"
+//! tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+//!
+//! -------------------------------------------------------------
+//! NOTE: Real broker integration (RabbitMq, NATS, etc.) is replaced by an
+//!       async channel to keep the snippet self-contained.
+//! -------------------------------------------------------------
+
+use anyhow::{Context, Result};
+use async_channel::{Receiver, Sender};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use config::Config;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, FromRow, PgPool};
+use std::{sync::Arc, time::Duration};
+use thiserror::Error;
+use tokio::signal;
+use tracing::{error, info, instrument, warn};
+
+/// -------- Domain Events ----------------------------------------------------
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(tag = "type", content = "payload")]
+pub enum DomainEvent {
+    PulsePublished { pulse_id: i64 },
+    // .. other events left out for brevity
+}
+
+impl DomainEvent {
+    pub fn pulse_published(id: i64) -> Self {
+        DomainEvent::PulsePublished { pulse_id: id }
+    }
+}
+
+/// -------- Domain Model -----------------------------------------------------
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct Pulse {
+    pub id: i64,
+    pub title: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub author_id: i64,
+    pub visibility: String,
+}
+
+/// -------- Configuration ----------------------------------------------------
+#[derive(Debug, Deserialize, Clone)]
+pub struct Settings {
+    pub database_url: String,
+    pub elasticsearch_url: String,
+    #[serde(default = "Settings::default_concurrency")]
+    pub broker_prefetch: usize,
+}
+
+impl Settings {
+    fn default_concurrency() -> usize {
+        32
+    }
+
+    /// Loads settings from (in order):
+    ///   1. `EDUPULSE_` prefixed environment variables
+    ///   2. `./Config.*` (yaml/json/toml)
+    pub fn load() -> Result<Self> {
+        let mut cfg = Config::builder();
+        cfg = cfg
+            .add_source(config::Environment::with_prefix("EDUPULSE").separator("__"))
+            .add_source(config::File::with_name("Config").required(false));
+        cfg.build()?
+            .try_deserialize()
+            .context("Unable to deserialize configuration")
+    }
+}
+
+/// -------- Repository Layer -------------------------------------------------
+#[async_trait]
+pub trait PulseRepository: Send + Sync {
+    async fn find_by_id(&self, id: i64) -> Result<Option<Pulse>>;
+}
+
+pub struct PostgresPulseRepository {
+    pool: PgPool,
+}
+
+impl PostgresPulseRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl PulseRepository for PostgresPulseRepository {
+    #[instrument(skip(self))]
+    async fn find_by_id(&self, id: i64) -> Result<Option<Pulse>> {
+        let pulse = sqlx::query_as::<_, Pulse>(
+            r#"
+            SELECT id, title, description, tags, created_at, author_id, visibility
+            FROM pulses
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to query pulse")?;
+        Ok(pulse)
+    }
+}
+
+/// -------- Search Client ----------------------------------------------------
+#[derive(Debug, Error)]
+pub enum SearchError {
+    #[error("http error: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("unexpected status {status}: {body}")]
+    UnexpectedStatus { status: u16, body: String },
+}
+
+#[async_trait]
+pub trait SearchClient: Send + Sync {
+    async fn index_pulse(&self, pulse: &Pulse) -> std::result::Result<(), SearchError>;
+}
+
+pub struct ElasticSearchClient {
+    endpoint: String,
+    http: Client,
+}
+
+impl ElasticSearchClient {
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        let http = Client::builder()
+            .user_agent("edupulse-search-indexer/1.0")
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("Failed to build reqwest client");
+        Self {
+            endpoint: endpoint.into(),
+            http,
+        }
+    }
+}
+
+#[async_trait]
+impl SearchClient for ElasticSearchClient {
+    #[instrument(skip(self, pulse))]
+    async fn index_pulse(&self, pulse: &Pulse) -> std::result::Result<(), SearchError> {
+        let url = format!("{}/pulses/_doc/{}", self.endpoint, pulse.id);
+        let res = self.http.put(url).json(pulse).send().await?;
+
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            let status = res.status().as_u16();
+            let body = res.text().await.unwrap_or_default();
+            Err(SearchError::UnexpectedStatus { status, body })
+        }
+    }
+}
+
+/// -------- Service Layer ----------------------------------------------------
+pub struct SearchIndexer<R: PulseRepository, S: SearchClient> {
+    repo: Arc<R>,
+    search: Arc<S>,
+}
+
+impl<R: PulseRepository, S: SearchClient> SearchIndexer<R, S> {
+    pub fn new(repo: Arc<R>, search: Arc<S>) -> Self {
+        Self { repo, search }
+    }
+
+    #[instrument(skip(self))]
+    pub async fn handle_event(&self, event: DomainEvent) -> Result<()> {
+        match event {
+            DomainEvent::PulsePublished { pulse_id } => {
+                if let Some(pulse) = self
+                    .repo
+                    .find_by_id(pulse_id)
+                    .await
+                    .context("Repository failure")?
+                {
+                    self.search
+                        .index_pulse(&pulse)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))
+                        .context("Search indexing failed")?;
+                    info!(pulse_id, "Pulse successfully indexed");
+                } else {
+                    warn!(pulse_id, "Pulse not found – ignoring");
+                }
+            }
+            _ => {
+                warn!("Unhandled event: {:?}", event);
+            }
+        };
+        Ok(())
+    }
+}
+
+/// -------- Broker Abstraction ----------------------------------------------
+/// NOTE: In production, swap this out for NATS / RabbitMQ consumer.
+pub struct BrokerConsumer {
+    rx: Receiver<DomainEvent>,
+}
+
+impl BrokerConsumer {
+    pub fn new(rx: Receiver<DomainEvent>) -> Self {
+        Self { rx }
+    }
+    pub async fn next(&self) -> Option<DomainEvent> {
+        self.rx.recv().await.ok()
+    }
+}
+
+/// -------- Application Bootstrap -------------------------------------------
+pub async fn run(settings: Settings, consumer: BrokerConsumer) -> Result<()> {
+    // init db
+    let db = PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&settings.database_url)
+        .await
+        .context("Could not connect to Postgres")?;
+
+    let repo = Arc::new(PostgresPulseRepository::new(db));
+    let search = Arc::new(ElasticSearchClient::new(&settings.elasticsearch_url));
+
+    let indexer = SearchIndexer::new(repo, search);
+
+    // graceful shutdown signal
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install CTRL+C signal handler");
+    };
+
+    tokio::select! {
+        _ = main_loop(indexer, consumer) => {},
+        _ = ctrl_c => {
+            info!("Shutdown signal received");
+        }
+    };
+
+    Ok(())
+}
+
+async fn main_loop<R, S>(
+    indexer: SearchIndexer<R, S>,
+    consumer: BrokerConsumer,
+) -> Result<()>
+where
+    R: PulseRepository + 'static,
+    S: SearchClient + 'static,
+{
+    while let Some(event) = consumer.next().await {
+        if let Err(e) = indexer.handle_event(event).await {
+            error!("Error processing event: {:?}", e);
+        }
+    }
+    Ok(())
+}
+
+/// -------- Example Entrypoint (bin) ----------------------------------------
+/// To compile as a standalone binary, add the following to `src/bin/indexer.rs`:
+//
+//  #[tokio::main]
+//  async fn main() -> anyhow::Result<()> {
+//      tracing_subscriber::fmt()
+//          .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+//          .init();
+//
+//      let settings = Settings::load()?;
+//      
+//      // Simulated broker
+//      let (tx, rx) = async_channel::bounded(1024);
+//      // For demo purposes: pump one event
+//      tokio::spawn(async move {
+//          let _ = tx.send(DomainEvent::pulse_published(42)).await;
+//      });
+//      
+//      crate::module_27::run(settings, BrokerConsumer::new(rx)).await
+//  }
+// ---------------------------------------------------------------------------
+
+```

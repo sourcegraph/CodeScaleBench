@@ -1,0 +1,311 @@
+```rust
+//! src/module_75.rs
+//!
+//! Module 75 – Model-Monitoring Event Bus & Online Drift Detection
+//! --------------------------------------------------------------
+//! This module provides a lightweight, in-process publish/subscribe
+//! message bus that is used throughout the VisuTility Orchestrator
+//! for emitting and listening to *monitoring events* originating
+//! from live computer-vision pipelines (e.g. per-frame inference
+//! latencies, accuracy samples, feature statistics, etc.).
+//!
+//! On top of the generic [`EventBus`], we implement an online concept‐
+//! drift detector (`DriftDetector`) based on the Page-Hinkley test. When
+//! a significant shift in the stream of prediction errors is observed,
+//! the detector raises a [`MonitoringEvent::DriftDetected`].  Other
+//! system components (e.g. the automated retraining service) can
+//! subscribe to these events to decide when to trigger new training
+//! jobs.
+//!
+//! Key design‐goals:
+//!   * **Zero-Allocation fast-path** for high-frequency events
+//!   * Thread-safe, minimal-dependency event bus
+//!   * Clear error propagation & observability
+
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    ops::Deref,
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
+
+use crossbeam_channel::{bounded, Receiver, Sender};
+use thiserror::Error; // derive(Error)
+
+// ---------- Public Event Types ------------------------------------------------
+
+/// Domain-level events that can be emitted by any pipeline stage.
+#[derive(Debug, Clone)]
+pub enum MonitoringEvent {
+    /// Raw per-sample prediction error (ground_truth – prediction).
+    PredictionError {
+        model_name: String,
+        error: f32,
+        timestamp: Instant,
+    },
+
+    /// Drift has been detected by the online detector.
+    DriftDetected {
+        model_name: String,
+        p_value: f32,
+        timestamp: Instant,
+    },
+
+    /// General informational message.
+    Info(String),
+}
+
+// ---------- Error Handling ----------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum MonitorError {
+    #[error("subscriber dropped while sending event")]
+    SubscriberDropped,
+    #[error("event bus is at capacity")]
+    AtCapacity,
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+// ---------- Observer Pattern Traits ------------------------------------------
+
+/// Callback trait that observers (subscribers) must implement.
+pub trait Observer: Send + Sync + 'static {
+    fn on_event(&self, event: &MonitoringEvent) -> Result<(), MonitorError>;
+}
+
+/// Thread-safe smart-pointer to a boxed observer
+pub type ObserverRef = Arc<dyn Observer>;
+
+/// Publish/Subscribe message bus with filtering by event *kind*.
+///
+/// NOTE: We keep the API intentionally narrow. An async/await variant
+/// could be provided through a separate feature flag to avoid pulling
+/// tokio into the core monitoring crate.
+#[derive(Default)]
+pub struct EventBus {
+    inner: RwLock<BusInner>,
+}
+
+#[derive(Default)]
+struct BusInner {
+    // Map from enum discriminant => list of observers
+    subscribers: HashMap<u8, HashSet<ObserverRef>>,
+}
+
+impl EventBus {
+    /// Registers an observer for a particular [`MonitoringEvent`] variant.
+    ///
+    /// It uses `u8` discriminants derived from `core::mem::discriminant`
+    /// to avoid heavy Enum introspection.
+    pub fn subscribe<E: Into<MonitoringEvent>>(
+        &self,
+        event_sample: &E,
+        observer: ObserverRef,
+    ) {
+        let key = discriminant_key(event_sample.into());
+        let mut inner = self.inner.write().expect("poisoned lock");
+        inner
+            .subscribers
+            .entry(key)
+            .or_default()
+            .insert(observer);
+    }
+
+    /// Publish an event to all interested observers.
+    pub fn publish(&self, event: MonitoringEvent) {
+        let key = discriminant_key(&event);
+        let subscribers = {
+            let inner = self.inner.read().expect("poisoned lock");
+            inner.subscribers.get(&key).cloned()
+        };
+
+        if let Some(list) = subscribers {
+            for obs in list {
+                // Ignore individual errors so that one misbehaving subscriber
+                // cannot bring down the entire bus.
+                let _ = obs.on_event(&event);
+            }
+        }
+    }
+}
+
+// Helper: maps enum variant to stable key.
+fn discriminant_key(event: &MonitoringEvent) -> u8 {
+    use std::mem::discriminant;
+    // We have <= 255 variants – safe to cast.
+    discriminant(event) as u8
+}
+
+// ---------- Online Drift Detector ---------------------------------------------
+
+/// Configuration settings for the Page–Hinkley test.
+#[derive(Debug, Clone)]
+pub struct DriftDetectorConfig {
+    pub lambda: f32,        // Magnitude threshold
+    pub alpha: f32,         // Forgetting factor
+    pub min_instances: u32, // Minimum samples before detecting
+}
+
+impl Default for DriftDetectorConfig {
+    fn default() -> Self {
+        Self {
+            lambda: 50.0,
+            alpha: 0.999,
+            min_instances: 30,
+        }
+    }
+}
+
+/// Online drift detector implementing the Page-Hinkley test.
+///
+/// The detector listens to [`MonitoringEvent::PredictionError`] and
+/// publishes [`MonitoringEvent::DriftDetected`] when the cumulative
+/// mean of the error stream shifts significantly.
+pub struct DriftDetector {
+    cfg: DriftDetectorConfig,
+    bus: Arc<EventBus>,
+    rx: Receiver<MonitoringEvent>,
+    tx_internal: Sender<MonitoringEvent>,
+
+    // Internal state
+    cumulative_sum: f32,
+    min_cumulative: f32,
+    sample_count: u32,
+    model_name: String,
+}
+
+impl DriftDetector {
+    /// Spawns a new drift detector subscribed to the given [`EventBus`].
+    ///
+    /// Returns the owned detector instance and an `ObserverRef` that
+    /// is automatically registered on the bus.
+    pub fn new(model_name: impl Into<String>, bus: Arc<EventBus>) -> Self {
+        let (tx, rx) = bounded::<MonitoringEvent>(1024);
+        let obs_ref: ObserverRef = Arc::new(DriftDetectorObserver {
+            tx: tx.clone(),
+        });
+        let detector = Self {
+            cfg: DriftDetectorConfig::default(),
+            bus: bus.clone(),
+            rx,
+            tx_internal: tx,
+            cumulative_sum: 0.0,
+            min_cumulative: 0.0,
+            sample_count: 0,
+            model_name: model_name.into(),
+        };
+
+        // Subscribe for PredictionError events
+        bus.subscribe(
+            &MonitoringEvent::PredictionError {
+                model_name: String::new(),
+                error: 0.0,
+                timestamp: Instant::now(),
+            },
+            obs_ref,
+        );
+        detector
+    }
+
+    /// Starts the blocking event-processing loop.
+    ///
+    /// NOTE: In production we would run this on its own thread or an
+    /// async task. For simplicity we expose it as a blocking call.
+    pub fn run(mut self) -> Result<(), MonitorError> {
+        while let Ok(event) = self.rx.recv() {
+            match event {
+                MonitoringEvent::PredictionError {
+                    model_name,
+                    error,
+                    ..
+                } if model_name == self.model_name => {
+                    self.on_error_sample(error)?;
+                }
+                _ => { /* ignore other events */ }
+            }
+        }
+        Ok(())
+    }
+
+    fn on_error_sample(&mut self, error: f32) -> Result<(), MonitorError> {
+        self.sample_count += 1;
+        let mean = error - error * self.cfg.alpha;
+        self.cumulative_sum += mean;
+        self.min_cumulative = self.min_cumulative.min(self.cumulative_sum);
+
+        let difference = self.cumulative_sum - self.min_cumulative;
+
+        if self.sample_count >= self.cfg.min_instances && difference > self.cfg.lambda {
+            // Drift detected
+            let drift_event = MonitoringEvent::DriftDetected {
+                model_name: self.model_name.clone(),
+                p_value: difference,
+                timestamp: Instant::now(),
+            };
+            self.bus.publish(drift_event);
+            // Reset detector to avoid repeated alerts
+            self.cumulative_sum = 0.0;
+            self.min_cumulative = 0.0;
+            self.sample_count = 0;
+        }
+        Ok(())
+    }
+}
+
+/// Lightweight observer wrapping a `crossbeam_channel::Sender`.
+struct DriftDetectorObserver {
+    tx: Sender<MonitoringEvent>,
+}
+
+impl Observer for DriftDetectorObserver {
+    fn on_event(&self, event: &MonitoringEvent) -> Result<(), MonitorError> {
+        self.tx
+            .send(event.clone())
+            .map_err(|_| MonitorError::SubscriberDropped)
+    }
+}
+
+// ---------- Example Usage -----------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::Rng;
+
+    /// Simple smoke-test feeding random errors into the detector.
+    #[test]
+    fn drift_detector_emits_event() {
+        let bus = Arc::new(EventBus::default());
+        let detector = DriftDetector::new("qa_model", bus.clone());
+
+        // Spawn detector on a background thread
+        let handle = std::thread::spawn(move || detector.run().unwrap());
+
+        // Feed stable low error
+        for _ in 0..50 {
+            let evt = MonitoringEvent::PredictionError {
+                model_name: "qa_model".to_string(),
+                error: rand::thread_rng().gen_range(0.0..1.0),
+                timestamp: Instant::now(),
+            };
+            bus.publish(evt);
+        }
+
+        // Feed high error to trigger drift
+        for _ in 0..50 {
+            let evt = MonitoringEvent::PredictionError {
+                model_name: "qa_model".to_string(),
+                error: rand::thread_rng().gen_range(55.0..60.0),
+                timestamp: Instant::now(),
+            };
+            bus.publish(evt);
+        }
+
+        // Allow some time for the detector
+        std::thread::sleep(Duration::from_millis(500));
+        handle.join().unwrap();
+    }
+}
+```

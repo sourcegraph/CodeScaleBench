@@ -1,0 +1,339 @@
+```csharp
+// File: src/module_46.txt  (logical name: CalendarEventIngestionLambda.cs)
+// Project: PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+// Description:
+//   AWS Lambda entry-point responsible for ingesting raw calendar events from an
+//   EventBridge Pipe, validating contractual integrity, transforming them into
+//   productivity-centric KPIs, then emitting the enriched payload to Kinesis
+//   (hot-path) and S3 (cold-path).  Transformation logic is dispatched via the
+//   Strategy pattern to enable run-time swapping of KPI calculators without
+//   code redeployment.
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon;
+using Amazon.Kinesis;
+using Amazon.Kinesis.Model;
+using Amazon.S3;
+using Amazon.S3.Model;
+using Amazon.Lambda.Core;
+using Amazon.Lambda.KinesisEvents;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.DependencyInjection;
+
+// Assembly attribute required for the AWS Lambda runtime to find the handler.
+[assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
+
+namespace PulseOps.Warehouse.Lambdas.CalendarEventIngestion;
+
+/// <summary>
+/// Lambda entry point.
+/// </summary>
+public sealed class Function
+{
+    private const string OutputStreamEnvVar = "TARGET_KINESIS_STREAM";
+    private const string OutputBucketEnvVar = "TARGET_S3_BUCKET";
+    private const string StrategyEnvVar    = "TRANSFORMATION_STRATEGY"; // e.g. MeetingCostKpi
+
+    private readonly ILogger<Function>   _logger;
+    private readonly IAmazonKinesis      _kinesis;
+    private readonly IAmazonS3          _s3;
+    private readonly ICalendarValidator  _validator;
+    private readonly ITransformationStrategy _strategy;
+    private readonly JsonSerializerOptions _jsonOpts = new(JsonSerializerDefaults.Web)
+    {
+        PropertyNameCaseInsensitive = true,
+        IgnoreReadOnlyFields = true,
+        WriteIndented = false
+    };
+
+    private readonly string _targetStream;
+    private readonly string _targetBucket;
+
+    public Function()
+        : this(BuildServiceProvider(Environment.GetEnvironmentVariables()))
+    { }
+
+    // For DI-friendly testing.
+    public Function(IServiceProvider serviceProvider)
+    {
+        _logger        = serviceProvider.GetRequiredService<ILogger<Function>>();
+        _kinesis       = serviceProvider.GetRequiredService<IAmazonKinesis>();
+        _s3            = serviceProvider.GetRequiredService<IAmazonS3>();
+        _validator     = serviceProvider.GetRequiredService<ICalendarValidator>();
+        _strategy      = serviceProvider.GetRequiredService<ITransformationStrategy>();
+        _targetStream  = Environment.GetEnvironmentVariable(OutputStreamEnvVar) ?? throw new InvalidOperationException($"Missing env var {OutputStreamEnvVar}");
+        _targetBucket  = Environment.GetEnvironmentVariable(OutputBucketEnvVar) ?? throw new InvalidOperationException($"Missing env var {OutputBucketEnvVar}");
+    }
+
+    /// <summary>
+    /// Entry point invoked by AWS Lambda for each batch of Kinesis records.
+    /// </summary>
+    public async Task HandlerAsync(KinesisEvent kinesisEvent, ILambdaContext context)
+    {
+        if (kinesisEvent?.Records == null || kinesisEvent.Records.Count == 0)
+        {
+            _logger.LogWarning("Invocation contained zero Kinesis records.");
+            return;
+        }
+
+        _logger.LogInformation("Processing {Count} Kinesis records.", kinesisEvent.Records.Count);
+
+        var putRequests = new List<PutRecordsRequestEntry>(kinesisEvent.Records.Count);
+
+        foreach (var record in kinesisEvent.Records)
+        {
+            try
+            {
+                var payloadJson = GetDecodedData(record.Kinesis);
+                var calEvent    = JsonSerializer.Deserialize<CalendarEventPayload>(payloadJson, _jsonOpts);
+
+                if (calEvent == null)
+                {
+                    _logger.LogWarning("Skipping record: deserialization returned null.");
+                    continue;
+                }
+
+                _validator.ValidateOrThrow(calEvent);
+
+                var transformed = await _strategy.TransformAsync(calEvent, context, CancellationToken.None);
+
+                var enrichedJson = JsonSerializer.Serialize(transformed, _jsonOpts);
+                var kinesisEntry = new PutRecordsRequestEntry
+                {
+                    PartitionKey = record.Kinesis.PartitionKey,
+                    Data         = new MemoryStream(Encoding.UTF8.GetBytes(enrichedJson))
+                };
+
+                putRequests.Add(kinesisEntry);
+
+                // Write raw event asynchronously to S3 for cold-storage.
+                _ = UploadRawAsync(payloadJson, record, context);
+            }
+            catch (CalendarValidationException vex)
+            {
+                _logger.LogWarning(vex, "Validation failed for PartitionKey {Key}, Seq {Seq}.", record.Kinesis.PartitionKey, record.Kinesis.SequenceNumber);
+                // Business decision: invalid data goes to DLQ (SNS) handled by infra. Here we just swallow.
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error while processing PartitionKey {Key}, Seq {Seq}.", record.Kinesis.PartitionKey, record.Kinesis.SequenceNumber);
+                // Re-throwing fails entire batch, delegating retry to Lambda & Kinesis. Optionally we could fail-split.
+                throw;
+            }
+        }
+
+        if (putRequests.Count > 0)
+        {
+            await PutToKinesisAsync(putRequests);
+            _logger.LogInformation("Successfully published {Count} records to {Stream}.", putRequests.Count, _targetStream);
+        }
+    }
+
+    #region Helpers
+
+    private static string GetDecodedData(KinesisEvent.RecordPayload kinesisData) =>
+        Encoding.UTF8.GetString(kinesisData.Data.Span);
+
+    private async Task UploadRawAsync(string body, KinesisEvent.KinesisEventRecord record, ILambdaContext ctx)
+    {
+        try
+        {
+            var key = $"{DateTime.UtcNow:yyyy/MM/dd}/{Guid.NewGuid()}.json";
+
+            await _s3.PutObjectAsync(new PutObjectRequest
+            {
+                BucketName = _targetBucket,
+                Key        = key,
+                ContentBody= body,
+                ContentType= "application/json"
+            });
+            _logger.LogDebug("Raw event offloaded to s3://{Bucket}/{Key}", _targetBucket, key);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to offload raw event to S3, will continue without blocking.");
+        }
+    }
+
+    private async Task PutToKinesisAsync(IEnumerable<PutRecordsRequestEntry> entries)
+    {
+        var batch = new PutRecordsRequest
+        {
+            StreamName = _targetStream,
+            Records    = new List<PutRecordsRequestEntry>(entries)
+        };
+
+        var response = await _kinesis.PutRecordsAsync(batch);
+
+        if (response.HttpStatusCode != HttpStatusCode.OK || response.FailedRecordCount > 0)
+        {
+            _logger.LogError("Partial failure while writing to Kinesis. Failed: {Count}", response.FailedRecordCount);
+            // Optionally send failed records to DLQ.
+        }
+    }
+
+    private static IServiceProvider BuildServiceProvider(IDictionary environment)
+    {
+        var services = new ServiceCollection();
+
+        // Logging
+        services.AddLogging(cfg => cfg.AddLambdaLogger())
+                .Configure<LoggerFilterOptions>(opts => opts.MinLevel = LogLevel.Information);
+
+        // AWS SDK clients are built with default credentials/region resolution.
+        services.AddAWSService<IAmazonKinesis>();
+        services.AddAWSService<IAmazonS3>();
+
+        // Validators & Strategies
+        services.AddSingleton<ICalendarValidator, SchemaValidator>();
+
+        // Strategy selection at runtime via env var.
+        var strategyName = (Environment.GetEnvironmentVariable(StrategyEnvVar) ?? nameof(MeetingCostKpiStrategy)).Trim();
+
+        services.AddSingleton<ITransformationStrategy>(sp =>
+            strategyName switch
+            {
+                nameof(MeetingCostKpiStrategy) => new MeetingCostKpiStrategy(sp.GetRequiredService<ILogger<MeetingCostKpiStrategy>>()),
+                _ => throw new InvalidOperationException($"Unknown strategy: {strategyName}")
+            });
+
+        return services.BuildServiceProvider();
+    }
+
+    #endregion
+}
+
+#region Domain Models
+
+/// <summary>
+/// Raw calendar event emitted by the upstream ingestion service.
+/// </summary>
+public sealed record CalendarEventPayload
+{
+    public required string  EventId          { get; init; }
+    public required string  Organizer        { get; init; }
+    public required string  Subject          { get; init; }
+    public required DateTimeOffset StartUtc  { get; init; }
+    public required DateTimeOffset EndUtc    { get; init; }
+    public required string[] Attendees       { get; init; }
+    public required bool    IsRecurring      { get; init; }
+    public IDictionary<string, string>? Metadata { get; init; }
+}
+
+/// <summary>
+/// Enriched record ready for downstream analytics.
+/// </summary>
+public sealed record MeetingCostKpiRecord
+{
+    public required string EventId { get; init; }
+    public required double CostUsd { get; init; }
+    public required TimeSpan Duration { get; init; }
+    public required Dictionary<string, object?> Attributes { get; init; }
+}
+
+#endregion
+
+#region Validation
+
+public interface ICalendarValidator
+{
+    void ValidateOrThrow(CalendarEventPayload payload);
+}
+
+public sealed class SchemaValidator : ICalendarValidator
+{
+    private const int MaxTitleLength = 256;
+
+    public void ValidateOrThrow(CalendarEventPayload payload)
+    {
+        if (string.IsNullOrWhiteSpace(payload.EventId))
+            throw new CalendarValidationException("EventId must be non-empty.");
+
+        if (payload.StartUtc >= payload.EndUtc)
+            throw new CalendarValidationException("StartUtc must be before EndUtc.");
+
+        if (payload.Subject.Length > MaxTitleLength)
+            throw new CalendarValidationException($"Subject exceeds max length {MaxTitleLength}.");
+
+        if (payload.Attendees.Length == 0)
+            throw new CalendarValidationException("Must have at least one attendee.");
+    }
+}
+
+public sealed class CalendarValidationException : Exception
+{
+    public CalendarValidationException(string message) : base(message) { }
+}
+
+#endregion
+
+#region Strategy Pattern
+
+/// <summary>
+/// Transformation abstraction.  Implementations must be thread-safe.
+/// </summary>
+public interface ITransformationStrategy
+{
+    Task<MeetingCostKpiRecord> TransformAsync(CalendarEventPayload source, ILambdaContext ctx, CancellationToken ct);
+}
+
+/// <summary>
+/// Sample KPI strategy: estimates cost based on attendee salary bands & meeting duration.
+/// </summary>
+public sealed class MeetingCostKpiStrategy : ITransformationStrategy
+{
+    private readonly ILogger<MeetingCostKpiStrategy> _logger;
+
+    // Simplified static salary lookup. In reality this would query HR data.
+    private static readonly Dictionary<string, double> SalaryByEmail = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["cto@example.com"]       = 250_000,
+        ["vp-eng@example.com"]    = 220_000,
+        ["staff@example.com"]     = 190_000,
+        ["intern@example.com"]    = 60_000
+    };
+
+    public MeetingCostKpiStrategy(ILogger<MeetingCostKpiStrategy> logger) => _logger = logger;
+
+    public Task<MeetingCostKpiRecord> TransformAsync(CalendarEventPayload source, ILambdaContext ctx, CancellationToken ct)
+    {
+        var duration  = source.EndUtc - source.StartUtc;
+        var totalCost = 0.0;
+
+        foreach (var attendee in source.Attendees)
+        {
+            var salary   = SalaryByEmail.TryGetValue(attendee, out var sal) ? sal : 120_000; // default
+            var hourly   = salary / (52 * 40); // Rough hourly cost
+            totalCost   += hourly * duration.TotalHours;
+        }
+
+        var result = new MeetingCostKpiRecord
+        {
+            EventId    = source.EventId,
+            CostUsd    = Math.Round(totalCost, 2),
+            Duration   = duration,
+            Attributes = new Dictionary<string, object?>
+            {
+                ["Subject"]      = source.Subject,
+                ["Organizer"]    = source.Organizer,
+                ["AttendeeCount"]= source.Attendees.Length,
+                ["IsRecurring"]  = source.IsRecurring,
+                ["CapturedAt"]   = DateTimeOffset.UtcNow
+            }
+        };
+
+        _logger.LogDebug("Calculated cost for {EventId}: ${Cost}", source.EventId, result.CostUsd);
+
+        return Task.FromResult(result);
+    }
+}
+
+#endregion
+```

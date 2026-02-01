@@ -1,0 +1,347 @@
+```rust
+//! VisuTility Orchestrator – Monitoring & Observer Layer
+//!
+//! This module implements a generic, thread–safe Observer Pattern that
+//! receives streaming model–performance metrics and triggers responses
+//! such as automated retraining or alerting.  It is intentionally
+//! decoupled from the concrete model–serving layer so that it can be
+//! embedded into synchronous or asynchronous pipelines alike.
+//!
+//! High-level architecture:
+//!   +----------------------------+
+//!   |     MonitoringHub          |  <-- Observable (Subject)
+//!   |  ────────────────────────  |
+//!   |  observers: Vec<...>       |
+//!   +------------┬--------------+
+//!                |
+//!                ▼
+//!   +------------+--------------+  +------------------------+
+//!   |   DriftDetector           |  |  LatencySLOEnforcer    |  ...  <-- Observers
+//!   +---------------------------+  +------------------------+
+//!
+//! Public API surface (stable):
+//!   - MetricEvent, MetricKind
+//!   - MetricObserver, MetricObservable
+//!   - MonitoringHub
+//!   - DriftDetector
+//!
+//! Dependencies:
+//!   - anyhow      : ergonomic error handling
+//!   - thiserror   : custom error derivation
+//!   - chrono      : timestamping
+//!   - parking_lot : low-contention synchronization
+//!   - ndarray     : simple numeric operations (for drift stats)
+//!   - log         : structured logging
+//!
+//! To keep the example self-contained no actual Cargo.toml is shown,
+//! but the above crates must be added with compatible versions.
+
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use log::{debug, error, info, warn};
+use ndarray::{Array1, ArrayView1};
+use parking_lot::RwLock;
+use thiserror::Error;
+
+/// High-level categorisation of telemetry coming from the
+/// model-serving layer.
+#[derive(Clone, Debug)]
+pub enum MetricKind {
+    Accuracy,
+    Precision,
+    Recall,
+    LatencyP99,
+    DriftScore,
+    Custom(String),
+}
+
+/// Single timestamped metric sample.
+#[derive(Clone, Debug)]
+pub struct MetricEvent {
+    pub kind: MetricKind,
+    pub value: f64,
+    pub collected_at: DateTime<Utc>,
+}
+
+impl MetricEvent {
+    /// Convenience constructor with `Utc::now()`.
+    pub fn new(kind: MetricKind, value: f64) -> Self {
+        Self {
+            kind,
+            value,
+            collected_at: Utc::now(),
+        }
+    }
+}
+
+/// Observer interface.  Implementations **must** be thread-safe.
+pub trait MetricObserver: Send + Sync + fmt::Debug {
+    /// Handle an incoming metric.  Implementations should be fast and
+    /// avoid heavy computation on the hot path.
+    fn on_metric(&self, metric: &MetricEvent);
+}
+
+/// Observable (subject) interface.
+pub trait MetricObservable {
+    /// Register a new observer.  Returns a handle that can be used to
+    /// remove the observer later on.
+    fn register(&self, observer: Arc<dyn MetricObserver>) -> ObserverHandle;
+
+    /// Remove an observer by its handle.
+    fn unregister(&self, handle: ObserverHandle) -> Result<()>;
+
+    /// Broadcast an event to all observers.
+    fn notify_all(&self, metric: MetricEvent);
+}
+
+/// Opaque identifier for an observer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ObserverHandle(usize);
+
+/// Errors thrown by the monitoring layer.
+#[derive(Debug, Error)]
+pub enum MonitoringError {
+    #[error("observer not found")]
+    ObserverNotFound,
+}
+
+/// Thread-safe implementation of `MetricObservable`.
+///
+/// Internally uses a `Vec<Option<Arc<dyn MetricObserver>>>` so that
+/// handles remain stable even when elements are removed.
+#[derive(Debug, Default)]
+pub struct MonitoringHub {
+    observers: RwLock<Vec<Option<Arc<dyn MetricObserver>>>>,
+}
+
+impl MonitoringHub {
+    pub fn new() -> Self {
+        Self {
+            observers: RwLock::new(Vec::with_capacity(8)),
+        }
+    }
+}
+
+impl MetricObservable for MonitoringHub {
+    fn register(&self, observer: Arc<dyn MetricObserver>) -> ObserverHandle {
+        let mut guard = self.observers.write();
+        // Reuse vacant slot if possible.
+        for (idx, slot) in guard.iter_mut().enumerate() {
+            if slot.is_none() {
+                slot.replace(observer);
+                info!("Observer registered in reused slot: {idx}");
+                return ObserverHandle(idx);
+            }
+        }
+
+        // Otherwise push to end.
+        let idx = guard.len();
+        guard.push(Some(observer));
+        info!("Observer registered in new slot: {idx}");
+        ObserverHandle(idx)
+    }
+
+    fn unregister(&self, handle: ObserverHandle) -> Result<()> {
+        let mut guard = self.observers.write();
+        match guard.get_mut(handle.0) {
+            Some(slot @ Some(_)) => {
+                slot.take();
+                info!("Observer unregistered: {}", handle.0);
+                Ok(())
+            }
+            Some(None) | None => Err(MonitoringError::ObserverNotFound.into()),
+        }
+    }
+
+    fn notify_all(&self, metric: MetricEvent) {
+        let guard = self.observers.read();
+        for (idx, slot) in guard.iter().enumerate() {
+            if let Some(obs) = slot {
+                debug!("Notify observer {idx:?} with {:?}", metric.kind);
+                obs.on_metric(&metric);
+            }
+        }
+    }
+}
+
+/// A concrete observer that performs simple population-means drift
+/// detection using a rolling window.
+///
+/// ⚠️  Not production-grade statistical rigor, but demonstrates the
+/// required interfaces.
+#[derive(Debug)]
+pub struct DriftDetector {
+    window_size: usize,
+    baseline: RwLock<Array1<f64>>,
+    observed: RwLock<Vec<f64>>,
+    threshold: f64,
+    last_alert: RwLock<Option<SystemTime>>,
+    min_alert_interval: Duration,
+}
+
+impl DriftDetector {
+    pub fn new(baseline_samples: Array1<f64>, window_size: usize, threshold: f64) -> Self {
+        Self {
+            window_size,
+            baseline: RwLock::new(baseline_samples),
+            observed: RwLock::new(Vec::with_capacity(window_size)),
+            threshold,
+            last_alert: RwLock::new(None),
+            min_alert_interval: Duration::from_secs(60 * 5), // 5 minutes
+        }
+    }
+
+    fn mean(arr: ArrayView1<'_, f64>) -> f64 {
+        arr.sum() / arr.len() as f64
+    }
+
+    /// Performs a two-sample means comparison (Welch’s t-test) in a
+    /// highly simplified manner. Returns the absolute difference in
+    /// means.  For performance reasons we do *not* compute p-values
+    /// here.
+    fn drift_score(&self, sample: ArrayView1<'_, f64>) -> f64 {
+        let baseline = self.baseline.read();
+        let mean_current = Self::mean(sample);
+        let mean_baseline = Self::mean(baseline.view());
+        (mean_current - mean_baseline).abs()
+    }
+
+    /// Emit an alert if the drift score exceeds the configured
+    /// threshold and the min-alert interval has elapsed.
+    fn maybe_alert(&self, score: f64) {
+        if score < self.threshold {
+            debug!("Drift score {:.4} below threshold", score);
+            return;
+        }
+
+        let mut guard = self.last_alert.write();
+        let now = SystemTime::now();
+        if let Some(last) = *guard {
+            if now.duration_since(last).unwrap_or_default() < self.min_alert_interval {
+                warn!("Drift detected but alert suppressed due to backoff");
+                return;
+            }
+        }
+
+        *guard = Some(now);
+        // In a real system this would trigger a webhook, enqueue a
+        // message, or write to a pager-duty integration.
+        error!(
+            "🚨  Model drift detected!  score={:.4}  threshold={:.4}",
+            score, self.threshold
+        );
+    }
+}
+
+impl MetricObserver for DriftDetector {
+    fn on_metric(&self, metric: &MetricEvent) {
+        if !matches!(metric.kind, MetricKind::DriftScore) {
+            return; // Ignore unrelated metrics
+        }
+
+        let mut buf = self.observed.write();
+        buf.push(metric.value);
+        if buf.len() < self.window_size {
+            return; // Need more data
+        }
+        if buf.len() > self.window_size {
+            buf.remove(0); // Maintain rolling window
+        }
+
+        // Compute drift score
+        let score = self.drift_score(ArrayView1::from(&buf));
+        self.maybe_alert(score);
+    }
+}
+
+/// Example usage inside an async context.
+///
+/// This function would typically be invoked by the runtime coordination
+/// layer (`Pipeline_Pattern`) to pipe metrics into the monitoring hub.
+#[allow(dead_code)]
+pub async fn demo_monitoring_workflow() -> Result<()> {
+    use tokio::time;
+
+    // Initialize logging for the sake of demonstration.
+    // In production we rely on centralized tracing.
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info");
+    }
+    env_logger::try_init().ok();
+
+    // Build a monitoring hub
+    let hub = Arc::new(MonitoringHub::new());
+
+    // Build a drift detector with dummy baseline
+    let baseline = Array1::from(vec![0.52, 0.49, 0.50, 0.51, 0.48]);
+    let detector = Arc::new(DriftDetector::new(baseline, 10, 0.05));
+
+    // Register it
+    hub.register(detector);
+
+    // Simulate incoming drift-score metrics
+    let mut interval = time::interval(Duration::from_secs(1));
+    for i in 0..30 {
+        interval.tick().await;
+
+        // Fake metric: gradually diverge from baseline
+        let value = 0.50 + (i as f64) * 0.005;
+
+        let event = MetricEvent::new(MetricKind::DriftScore, value);
+        hub.notify_all(event);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Dummy observer for verifying registration & notification.
+    #[derive(Debug)]
+    struct Counter(AtomicUsize);
+
+    impl MetricObserver for Counter {
+        fn on_metric(&self, _metric: &MetricEvent) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn observer_registration_and_notification() {
+        let hub = MonitoringHub::new();
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+
+        let handle = hub.register(counter.clone());
+        hub.notify_all(MetricEvent::new(MetricKind::Accuracy, 0.99));
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+
+        hub.unregister(handle).unwrap();
+        hub.notify_all(MetricEvent::new(MetricKind::Accuracy, 0.98));
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1); // unchanged
+    }
+
+    #[test]
+    fn drift_detector_triggers_alert() {
+        let baseline = Array1::from(vec![0.5; 5]);
+        let detector = DriftDetector::new(baseline, 3, 0.05);
+
+        // Push values that are above threshold
+        detector.on_metric(&MetricEvent::new(MetricKind::DriftScore, 0.6));
+        detector.on_metric(&MetricEvent::new(MetricKind::DriftScore, 0.62));
+        detector.on_metric(&MetricEvent::new(MetricKind::DriftScore, 0.65));
+
+        // After window is full, alert should have been triggered once
+        let last = detector.last_alert.read();
+        assert!(last.is_some());
+    }
+}
+```

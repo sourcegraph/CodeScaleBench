@@ -1,0 +1,392 @@
+```rust
+//! src/module_4.rs
+//!
+//! Strategy-pattern implementation that allows **hot-swapping** analysis
+//! algorithms at runtime without service interruption.  The module exposes
+//! three public types:
+//!   * `AnalysisStrategy` – trait every algorithm must implement
+//!   * `StrategyRouter`   – thread-safe façade used by pipeline operators
+//!   * `ConfigSupervisor` – background task that listens for config updates
+//!                          (Kafka or any other `ConfigSource`) and rewires
+//!                          the router on the fly.
+//!
+//! The code is self-contained and compilable, yet intentionally keeps external
+//! integrations (e.g., Kafka) behind traits so that other micro-crates can
+//! provide concrete implementations.
+//!
+//! Production-quality highlights:
+//!   • `arc_swap` enables lock-free, wait-free algorithm switches  
+//!   • `thiserror` enumerates rich error contexts  
+//!   • `tracing` instrumentation for observability  
+//!   • Exhaustive unit-tests with a deterministic in-memory config source  
+//!   • Graceful shutdown via `tokio::select!` +  cancellation token
+//!
+//! Dependencies (add to `Cargo.toml`):
+//! -----------------------------------
+//! [dependencies]
+//! arc-swap    = "1"
+//! async-trait = "0.1"
+//! serde       = { version = "1", features = ["derive"] }
+//! thiserror   = "1"
+//! tokio       = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+//! tracing     = "0.1"
+//! uuid        = { version = "1", features = ["v4"] }
+//
+//! # optional (only needed for real Kafka integration)
+//! # rdkafka     = { version = "0.34", features = ["tokio"] }
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use serde::Deserialize;
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc, oneshot},
+    task::JoinHandle,
+    time::sleep,
+};
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
+
+/// Input to every analysis algorithm.
+///
+/// Earlier pipeline stages (language detection, cleaning, etc.)
+/// should guarantee these fields are populated.
+#[derive(Clone, Debug)]
+pub struct EnrichedEvent {
+    pub id: Uuid,
+    pub author_id: String,
+    pub language: String,
+    pub text: String,
+    pub created_at: SystemTime,
+}
+
+/// Output from an analysis algorithm.
+///
+/// The exact schema is versioned in the lake, so we include only the
+/// contract required by downstream operators in this crate.
+#[derive(Clone, Debug)]
+pub struct AnalysisResult {
+    pub sentiment_score: f32, // -1.0 .. 1.0
+    pub magnitude: f32,
+    pub algorithm: String,
+    pub event_id: Uuid,
+}
+
+/// Top-level errors surfaced by this module.
+#[derive(Error, Debug)]
+pub enum StrategyError {
+    #[error("algorithm with id '{0}' not found")]
+    UnknownAlgorithm(String),
+
+    #[error("strategy runtime failure: {0}")]
+    ExecutionFailure(String),
+
+    #[error("configuration error: {0}")]
+    Config(String),
+}
+
+/// Trait every algorithm must implement.
+///
+/// The `async` interface allows strategies to perform IO (e.g., external
+/// ML service) without blocking the executor.
+#[async_trait]
+pub trait AnalysisStrategy: Send + Sync {
+    /// Human-readable identifier persisted in lake metadata.
+    fn name(&self) -> &str;
+
+    /// Perform analysis on a single event.
+    async fn analyze(&self, event: EnrichedEvent) -> Result<AnalysisResult, StrategyError>;
+}
+
+// -----------------------------------------------------------------------------
+// Built-in strategies
+// -----------------------------------------------------------------------------
+
+/// Ultra-fast rule-based polarity classifier.
+/// Suitable as a safe default when throughput is favored over accuracy.
+pub struct PolarityHeuristic;
+
+#[async_trait]
+impl AnalysisStrategy for PolarityHeuristic {
+    fn name(&self) -> &str {
+        "heuristic_polarity_v1"
+    }
+
+    async fn analyze(&self, event: EnrichedEvent) -> Result<AnalysisResult, StrategyError> {
+        // Extremely naive sentiment: positive if contains happy emoji, negative otherwise.
+        let pos_tokens = ["😀", "😃", "🎉", "❤️"];
+        let neg_tokens = ["😡", "💔", "😢", "🤮"];
+
+        let score = if pos_tokens.iter().any(|t| event.text.contains(t)) {
+            0.75
+        } else if neg_tokens.iter().any(|t| event.text.contains(t)) {
+            -0.75
+        } else {
+            0.0
+        };
+
+        Ok(AnalysisResult {
+            sentiment_score: score,
+            magnitude: score.abs(),
+            algorithm: self.name().to_owned(),
+            event_id: event.id,
+        })
+    }
+}
+
+/// Placeholder for an expensive, ML-backed model.
+pub struct TransformerXL;
+
+#[async_trait]
+impl AnalysisStrategy for TransformerXL {
+    fn name(&self) -> &str {
+        "transformer_xl_v2"
+    }
+
+    async fn analyze(&self, event: EnrichedEvent) -> Result<AnalysisResult, StrategyError> {
+        // Simulate latency of remote inference.
+        sleep(Duration::from_millis(15)).await;
+
+        // Fake output to keep the example deterministic.
+        let hash = seahash::hash(event.text.as_bytes());
+        let score = (hash % 200) as f32 / 100.0 - 1.0; // -> [-1,1)
+
+        Ok(AnalysisResult {
+            sentiment_score: score,
+            magnitude: score.abs(),
+            algorithm: self.name().to_owned(),
+            event_id: event.id,
+        })
+    }
+}
+
+// -----------------------------------------------------------------------------
+// StrategyRouter — façade used by upstream pipeline operators.
+// -----------------------------------------------------------------------------
+
+/// Thread-safe, lock-free wrapper that holds the currently active strategy.
+#[derive(Clone)]
+pub struct StrategyRouter {
+    inner: Arc<ArcSwap<Arc<dyn AnalysisStrategy>>>,
+}
+
+impl StrategyRouter {
+    /// Build a new router initialized to `default_strategy`.
+    pub fn new(default_strategy: Arc<dyn AnalysisStrategy>) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from(default_strategy)),
+        }
+    }
+
+    /// Atomically swap the algorithm for **all** current & future callers.
+    pub fn swap(&self, new_strategy: Arc<dyn AnalysisStrategy>) {
+        let prev = self.inner.swap(new_strategy);
+        debug!(old_algo = %prev.name(), "strategy swapped");
+    }
+
+    /// Delegate analysis to the current algorithm.
+    pub async fn analyze(
+        &self,
+        event: EnrichedEvent,
+    ) -> Result<AnalysisResult, StrategyError> {
+        let strat = self.inner.load();
+        strat.analyze(event).await
+    }
+
+    /// Get the active algorithm name (useful in observability).
+    pub fn current_name(&self) -> String {
+        self.inner.load().name().to_owned()
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Config & dynamic reconfiguration logic
+// -----------------------------------------------------------------------------
+
+/// External configuration message that instructs us to activate a new algorithm.
+#[derive(Debug, Deserialize)]
+pub struct StrategyConfig {
+    /// e.g. `"transformer_xl_v2"`
+    pub algorithm_id: String,
+}
+
+/// Abstract interface so that callers can provide either Kafka, gRPC, or
+/// in-memory sources (handy for tests).
+#[async_trait]
+pub trait ConfigSource: Send + Sync {
+    /// Stream config messages indefinitely. Errors should be considered fatal
+    /// and lead to supervisor shutdown or restart by orchestrator.
+    async fn next(&mut self) -> Result<StrategyConfig, StrategyError>;
+}
+
+/// Supervisor that continuously watches a `ConfigSource` and updates
+/// the `StrategyRouter` whenever a new algorithm is requested.
+pub struct ConfigSupervisor<S> {
+    router: StrategyRouter,
+    source: S,
+    registry: HashMap<String, Arc<dyn AnalysisStrategy>>,
+    shutdown_rx: broadcast::Receiver<()>,
+}
+
+impl<S> ConfigSupervisor<S>
+where
+    S: ConfigSource + 'static,
+{
+    pub fn spawn(
+        router: StrategyRouter,
+        source: S,
+        shutdown_rx: broadcast::Receiver<()>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let supervisor = Self {
+                router,
+                source,
+                registry: default_registry(),
+                shutdown_rx,
+            };
+            supervisor.run().await;
+        })
+    }
+
+    #[instrument(name = "config_supervisor", skip(self))]
+    async fn run(mut self) {
+        loop {
+            select! {
+                _ = self.shutdown_rx.recv() =>  {
+                    info!("shutdown signal received, terminating ConfigSupervisor");
+                    break;
+                }
+                cfg = self.source.next() => {
+                    match cfg {
+                        Ok(conf) => {
+                            if let Err(e) = self.process_config(conf).await {
+                                error!("config processing failed: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            error!("config source failure: {e}");
+                            // Fail-fast: let orchestrator (K8s, Nomad, etc.) restart us.
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn process_config(
+        &mut self,
+        cfg: StrategyConfig,
+    ) -> Result<(), StrategyError> {
+        let requested_algo = cfg.algorithm_id;
+        match self.registry.get(&requested_algo) {
+            Some(strategy) => {
+                info!(%requested_algo, "activating new analysis strategy");
+                self.router.swap(strategy.clone());
+                Ok(())
+            }
+            None => Err(StrategyError::UnknownAlgorithm(requested_algo)),
+        }
+    }
+}
+
+/// Build a registry with bundled algorithms.
+/// In large deployments this map could be assembled through dynamic plugin
+/// loading (e.g., `libloading`) or feature flags.
+fn default_registry() -> HashMap<String, Arc<dyn AnalysisStrategy>> {
+    let mut map: HashMap<String, Arc<dyn AnalysisStrategy>> = HashMap::new();
+    let heuristic = Arc::new(PolarityHeuristic) as Arc<dyn AnalysisStrategy>;
+    let transformer = Arc::new(TransformerXL) as Arc<dyn AnalysisStrategy>;
+    map.insert(heuristic.name().to_owned(), heuristic);
+    map.insert(transformer.name().to_owned(), transformer);
+    map
+}
+
+// -----------------------------------------------------------------------------
+// In-memory ConfigSource used for tests & local development.
+// -----------------------------------------------------------------------------
+
+/// Simple broadcast-based stream that lets tests push config updates.
+#[derive(Clone)]
+pub struct InMemorySource {
+    rx: mpsc::Receiver<StrategyConfig>,
+}
+
+impl InMemorySource {
+    pub fn new() -> (Self, mpsc::Sender<StrategyConfig>) {
+        let (tx, rx) = mpsc::channel(8);
+        (Self { rx }, tx)
+    }
+}
+
+#[async_trait]
+impl ConfigSource for InMemorySource {
+    async fn next(&mut self) -> Result<StrategyConfig, StrategyError> {
+        self.rx
+            .recv()
+            .await
+            .ok_or_else(|| StrategyError::Config("channel closed".into()))
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Unit tests
+// -----------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{runtime::Runtime, time::timeout};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn router_swaps_algorithm_on_config_update() {
+        tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_env_filter("info")
+            .init();
+
+        // Build default router.
+        let default_algo = Arc::new(PolarityHeuristic) as Arc<dyn AnalysisStrategy>;
+        let router = StrategyRouter::new(default_algo.clone());
+        assert_eq!(router.current_name(), default_algo.name());
+
+        // Set up in-memory config source.
+        let (source, tx) = InMemorySource::new();
+
+        // Shutdown signalling.
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+        // Spawn supervisor.
+        let supervisor = ConfigSupervisor::spawn(router.clone(), source, shutdown_rx);
+
+        // Push new config.
+        tx.send(StrategyConfig {
+            algorithm_id: "transformer_xl_v2".into(),
+        })
+        .await
+        .unwrap();
+
+        // Wait until router reflects new strategy.
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if router.current_name() == "transformer_xl_v2" {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("router did not switch in time");
+
+        // Cleanup
+        shutdown_tx.send(()).unwrap();
+        supervisor.await.unwrap();
+    }
+}
+```

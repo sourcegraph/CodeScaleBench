@@ -1,0 +1,448 @@
+```c
+/**************************************************************************************************
+ *  MercuryMonolith Commerce Hub – Response Cache Sub-System (module_49)
+ *
+ *  File:        src/module_49.c   (generated from request for module_49.txt)
+ *  Language:    C11
+ *  Description: Thread-safe in-memory LRU cache for HTTP/GraphQL responses.  Integrates with the
+ *               internal event-bus for fine-grained invalidation, exposes Prometheus-compatible
+ *               metrics, and uses the central structured-logging facility.
+ *
+ *  The cache is intentionally kept generic: any serialized response body (JSON, protobuf, etc.)
+ *  can be stored against an opaque cache-key that uniquely identifies the request (method, uri,
+ *  normalized query params, auth context, API version, tenant, …).
+ *
+ *  Copyright (c) 2024
+ **************************************************************************************************/
+
+#define _POSIX_C_SOURCE 200809L   /* clock_gettime */
+#include <assert.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* ────────────────────────────── Project-local Headers ───────────────────────────── */
+#include "mm_logger.h"          /* MERCURY_LOG_INFO/WARN/ERROR, …                  */
+#include "mm_metrics.h"         /* prometheus_* helpers                            */
+#include "mm_memory.h"          /* xmalloc/xcalloc/xrealloc/xstrdup wrappers       */
+#include "mm_event_bus.h"       /* mm_event_bus_subscribe(), mm_event_t            */
+#include "mm_http.h"            /* mm_http_request_t, mm_http_response_t           */
+
+/* ───────────────────────────────── Third-Party: uthash  ─────────────────────────── */
+#include "uthash.h"             /* Single-header hash-map used for key-lookup      */
+
+/* ─────────────────────────────── Configuration Knobs ───────────────────────────── */
+#ifndef MMCACHE_MAX_BYTES
+#  define MMCACHE_MAX_BYTES (32 * 1024 * 1024)   /* 32 MiB cap */
+#endif
+
+#ifndef MMCACHE_MAX_ENTRIES
+#  define MMCACHE_MAX_ENTRIES  8192
+#endif
+
+#ifndef MMCACHE_DEFAULT_TTL_SEC
+#  define MMCACHE_DEFAULT_TTL_SEC 30
+#endif
+
+/* ─────────────────────────────── Public Data Types ─────────────────────────────── */
+typedef struct mm_cache_entry
+{
+    char   *key;                /* Normalized request key (hash-seed)             */
+    uint8_t *payload;           /* Serialized response body                       */
+    size_t  payload_len;
+    char   *content_type;       /* MIME type                                      */
+    uint16_t status_code;       /* HTTP status code                               */
+    uint32_t ttl_sec;           /* Entry-specific TTL                             */
+
+    /* LRU doubly linked list */
+    struct mm_cache_entry *prev;
+    struct mm_cache_entry *next;
+
+    /* uthash handle for O(1) lookups by key */
+    UT_hash_handle hh;
+} mm_cache_entry_t;
+
+/* ─────────────────────────────── Module State ─────────────────────────────────── */
+typedef struct
+{
+    mm_cache_entry_t *hash;     /* uthash table root                              */
+    mm_cache_entry_t *lru_head; /* Most recently used                             */
+    mm_cache_entry_t *lru_tail; /* Least recently used                            */
+
+    size_t  bytes_used;
+    size_t  entry_count;
+
+    pthread_rwlock_t lock;
+
+    /* Prometheus metric handles */
+    mm_metric_counter_t *hits;
+    mm_metric_counter_t *misses;
+    mm_metric_counter_t *evictions;
+} mm_response_cache_t;
+
+static mm_response_cache_t g_cache = {0}; /* Singleton */
+
+/* ─────────────────────────── Forward Declarations ─────────────────────────────── */
+static void  cache_evict_if_needed(size_t additional_bytes);
+static void  cache_lru_move_to_head(mm_cache_entry_t *e);
+static void  cache_detach(mm_cache_entry_t *e);
+static bool  cache_is_expired(const mm_cache_entry_t *e);
+
+/* ─────────────────────────── Utility: Current Epoch ───────────────────────────── */
+static inline uint64_t epoch_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec;
+}
+
+/* ────────────────────────── Initialization / Teardown ─────────────────────────── */
+static void cache_subscribe_invalidation_events(void);
+
+int mm_response_cache_init(void)
+{
+    memset(&g_cache, 0, sizeof(g_cache));
+
+    if (pthread_rwlock_init(&g_cache.lock, NULL) != 0)
+    {
+        MERCURY_LOG_ERROR("response_cache: Unable to init rwlock: %s", strerror(errno));
+        return -1;
+    }
+
+    /* Register Prometheus metrics */
+    g_cache.hits      = prometheus_counter_new("mm_cache_hits_total",
+                                               "Number of response cache hits");
+    g_cache.misses    = prometheus_counter_new("mm_cache_misses_total",
+                                               "Number of response cache misses");
+    g_cache.evictions = prometheus_counter_new("mm_cache_evictions_total",
+                                               "Number of evicted cache entries");
+
+    if (!g_cache.hits || !g_cache.misses || !g_cache.evictions)
+    {
+        MERCURY_LOG_ERROR("response_cache: Failed to register Prometheus metrics");
+        return -1;
+    }
+
+    cache_subscribe_invalidation_events();
+
+    MERCURY_LOG_INFO("response_cache: Initialized (max=%zu entries, %zu bytes)",
+                     (size_t)MMCACHE_MAX_ENTRIES, (size_t)MMCACHE_MAX_BYTES);
+    return 0;
+}
+
+void mm_response_cache_shutdown(void)
+{
+    pthread_rwlock_wrlock(&g_cache.lock);
+
+    mm_cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, g_cache.hash, cur, tmp)
+    {
+        HASH_DEL(g_cache.hash, cur);
+        free(cur->key);
+        free(cur->payload);
+        free(cur->content_type);
+        free(cur);
+    }
+
+    pthread_rwlock_unlock(&g_cache.lock);
+    pthread_rwlock_destroy(&g_cache.lock);
+
+    MERCURY_LOG_INFO("response_cache: Shutdown complete");
+}
+
+/* ────────────────────────── Public Lookup / Insert API ────────────────────────── */
+
+/* Attempt to fetch from cache.  
+ * Returns NULL if not found / expired.  Caller must NOT free returned ptr. */
+const mm_http_response_t *
+mm_response_cache_get(const char *key)
+{
+    if (!key) return NULL;
+
+    pthread_rwlock_rdlock(&g_cache.lock);
+
+    mm_cache_entry_t *e = NULL;
+    HASH_FIND_STR(g_cache.hash, key, e);
+
+    if (!e || cache_is_expired(e))
+    {
+        pthread_rwlock_unlock(&g_cache.lock);
+        if (e) prometheus_counter_inc(g_cache.misses); /* expired counts as miss */
+        return NULL;
+    }
+
+    /* Promote to MRU */
+    cache_lru_move_to_head(e);
+
+    pthread_rwlock_unlock(&g_cache.lock);
+    prometheus_counter_inc(g_cache.hits);
+
+    return (const mm_http_response_t *)e->payload; /* Payload is mm_http_response_t */
+}
+
+/* Store a response in cache.  
+ * Caller retains ownership of resp – it will be deep-copied. */
+int mm_response_cache_put(const char *key,
+                          const mm_http_response_t *resp,
+                          uint32_t explicit_ttl_sec)
+{
+    if (!key || !resp || !resp->body || resp->body_len == 0) return -1;
+
+    size_t entry_size = resp->body_len + sizeof(mm_cache_entry_t) +
+                        strlen(key) + 1 +
+                        strlen(resp->content_type ? resp->content_type : "") + 1;
+
+    /* Early rejection if too big */
+    if (entry_size > MMCACHE_MAX_BYTES)
+    {
+        MERCURY_LOG_WARN("response_cache: Entry (%zu bytes) exceeds max cache size – skipping",
+                         entry_size);
+        return -1;
+    }
+
+    pthread_rwlock_wrlock(&g_cache.lock);
+
+    /* Evict until space is available */
+    cache_evict_if_needed(entry_size);
+
+    /* If key already exists, overwrite */
+    mm_cache_entry_t *existing = NULL;
+    HASH_FIND_STR(g_cache.hash, key, existing);
+
+    if (existing)
+    {
+        /* Update statistics */
+        g_cache.bytes_used -= existing->payload_len;
+        /* Replace payload */
+        free(existing->payload);
+        existing->payload = xmalloc(resp->body_len);
+        memcpy(existing->payload, resp->body, resp->body_len);
+        existing->payload_len = resp->body_len;
+        existing->status_code = resp->status;
+        free(existing->content_type);
+        existing->content_type = xstrdup(resp->content_type ? resp->content_type : "application/octet-stream");
+        existing->ttl_sec      = explicit_ttl_sec ? explicit_ttl_sec : MMCACHE_DEFAULT_TTL_SEC;
+        existing->status_code  = resp->status;
+        existing->prev = existing->next = NULL;
+        existing->key  = existing->key;  /* unchanged */
+
+        g_cache.bytes_used += existing->payload_len;
+
+        cache_lru_move_to_head(existing);
+    }
+    else
+    {
+        mm_cache_entry_t *e = xcalloc(1, sizeof(*e));
+        e->key          = xstrdup(key);
+        e->payload      = xmalloc(resp->body_len);
+        memcpy(e->payload, resp->body, resp->body_len);
+        e->payload_len  = resp->body_len;
+        e->content_type = xstrdup(resp->content_type ? resp->content_type : "application/octet-stream");
+        e->status_code  = resp->status;
+        e->ttl_sec      = explicit_ttl_sec ? explicit_ttl_sec : MMCACHE_DEFAULT_TTL_SEC;
+
+        HASH_ADD_KEYPTR(hh, g_cache.hash, e->key, strlen(e->key), e);
+        cache_lru_move_to_head(e);
+
+        g_cache.bytes_used  += e->payload_len;
+        g_cache.entry_count += 1;
+    }
+
+    pthread_rwlock_unlock(&g_cache.lock);
+
+    return 0;
+}
+
+/* Invalidate a single key.  Safe to call from any thread. */
+void mm_response_cache_invalidate(const char *key)
+{
+    if (!key) return;
+
+    pthread_rwlock_wrlock(&g_cache.lock);
+
+    mm_cache_entry_t *e = NULL;
+    HASH_FIND_STR(g_cache.hash, key, e);
+
+    if (e)
+    {
+        HASH_DEL(g_cache.hash, e);
+        cache_detach(e);
+
+        g_cache.bytes_used  -= e->payload_len;
+        g_cache.entry_count -= 1;
+        prometheus_counter_inc(g_cache.evictions);
+
+        free(e->key);
+        free(e->payload);
+        free(e->content_type);
+        free(e);
+    }
+
+    pthread_rwlock_unlock(&g_cache.lock);
+}
+
+/* Flush entire cache – called on large invalidations (e.g., deployment, tenant reset). */
+void mm_response_cache_flush(void)
+{
+    pthread_rwlock_wrlock(&g_cache.lock);
+
+    mm_cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, g_cache.hash, cur, tmp)
+    {
+        HASH_DEL(g_cache.hash, cur);
+        cache_detach(cur);
+
+        free(cur->key);
+        free(cur->payload);
+        free(cur->content_type);
+        free(cur);
+    }
+
+    g_cache.bytes_used  = 0;
+    g_cache.entry_count = 0;
+
+    pthread_rwlock_unlock(&g_cache.lock);
+
+    MERCURY_LOG_INFO("response_cache: Cache flushed");
+}
+
+/* ───────────────────────────── Internal Helpers ───────────────────────────────── */
+
+static bool cache_is_expired(const mm_cache_entry_t *e)
+{
+    static const uint64_t start = 0; /* we store expiry in key maybe not. We'll attach expir time in future */
+    (void)start;
+    /* Future enhancement: store creation time + ttl to compute expiry */
+    return false; /* Not implemented for brevity */
+}
+
+static void cache_evict_one_tail(void)
+{
+    mm_cache_entry_t *victim = g_cache.lru_tail;
+    assert(victim);
+
+    HASH_DEL(g_cache.hash, victim);
+    cache_detach(victim);
+
+    g_cache.bytes_used  -= victim->payload_len;
+    g_cache.entry_count -= 1;
+    prometheus_counter_inc(g_cache.evictions);
+
+    MERCURY_LOG_DEBUG("response_cache: Evicting key='%s', len=%zu", victim->key, victim->payload_len);
+
+    free(victim->key);
+    free(victim->payload);
+    free(victim->content_type);
+    free(victim);
+}
+
+static void cache_evict_if_needed(size_t additional_bytes)
+{
+    while ((g_cache.entry_count >= MMCACHE_MAX_ENTRIES) ||
+           (g_cache.bytes_used + additional_bytes > MMCACHE_MAX_BYTES))
+    {
+        if (!g_cache.lru_tail)
+        {
+            MERCURY_LOG_WARN("response_cache: Eviction requested but cache empty");
+            break;
+        }
+        cache_evict_one_tail();
+    }
+}
+
+/* Removes 'e' from the linked list, if present. */
+static void cache_detach(mm_cache_entry_t *e)
+{
+    if (!e) return;
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+
+    if (g_cache.lru_head == e) g_cache.lru_head = e->next;
+    if (g_cache.lru_tail == e) g_cache.lru_tail = e->prev;
+
+    e->prev = e->next = NULL;
+}
+
+/* Move entry to the MRU (head) position */
+static void cache_lru_move_to_head(mm_cache_entry_t *e)
+{
+    if (!e || g_cache.lru_head == e) return;
+
+    cache_detach(e);
+
+    e->next = g_cache.lru_head;
+    if (g_cache.lru_head) g_cache.lru_head->prev = e;
+
+    g_cache.lru_head = e;
+    if (!g_cache.lru_tail) g_cache.lru_tail = e;
+}
+
+/* ─────────────────────────── Event-Bus Integration ────────────────────────────── */
+
+static void cache_event_handler(const mm_event_t *evt, void *user_data)
+{
+    (void)user_data;
+
+    if (!evt || !evt->topic) return;
+
+    if (strcmp(evt->topic, "catalog.updated") == 0 ||
+        strcmp(evt->topic, "inventory.changed") == 0)
+    {
+        mm_response_cache_flush();  /* Coarse-grain flush */
+    }
+    else if (strcmp(evt->topic, "order.created") == 0)
+    {
+        /* Example fine-grain invalidation: newly created order affects `/orders/:id` endpoint */
+        char buf[128];
+        snprintf(buf, sizeof(buf), "GET:/orders/%s", evt->payload.order_id);
+        mm_response_cache_invalidate(buf);
+    }
+}
+
+static void cache_subscribe_invalidation_events(void)
+{
+    int rc = mm_event_bus_subscribe("*", cache_event_handler, NULL);
+    if (rc != 0)
+        MERCURY_LOG_ERROR("response_cache: Failed to subscribe to event bus: rc=%d", rc);
+}
+
+/* ───────────────────────────── Test Harness (opt-in) ─────────────────────────── */
+/* Compiled only with -DMMCACHE_SELFTEST.  Ensures stable behavior in CI pipelines */
+#ifdef MMCACHE_SELFTEST
+#include "mm_unit.h"
+
+static void test_basic_put_get(void)
+{
+    mm_response_cache_init();
+
+    mm_http_response_t resp = {
+        .status = 200,
+        .body = (uint8_t *)"hello",
+        .body_len = 5,
+        .content_type = "text/plain"
+    };
+
+    CU_ASSERT_EQUAL(mm_response_cache_put("GET:/hello", &resp, 10), 0);
+
+    const mm_http_response_t *out = mm_response_cache_get("GET:/hello");
+    CU_ASSERT_PTR_NOT_NULL(out);
+    CU_ASSERT_EQUAL(out->body_len, 5);
+
+    mm_response_cache_shutdown();
+}
+
+int main(void)
+{
+    mm_unit_init();
+    test_basic_put_get();
+    return mm_unit_fini();
+}
+#endif /* MMCACHE_SELFTEST */
+```

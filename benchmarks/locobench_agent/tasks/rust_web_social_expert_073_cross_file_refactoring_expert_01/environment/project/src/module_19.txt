@@ -1,0 +1,375 @@
+```rust
+//! src/module_19.rs
+//!
+//! Audit Trail & GDPR-Erase Service
+//! --------------------------------
+//! This module is an extract of the EduPulse Live backend responsible for
+//! recording *all* domain events in an append-only audit log as well as
+//! providing GDPR-compatible “right-to-be-forgotten” anonymisation.  The
+//! implementation is designed to be used by multiple runtime crates
+//! (HTTP-API, message consumers, scheduled jobs), therefore it purposefully
+//! depends **only** on async-std/tokio, `sqlx` and a handful of core crates.
+//!
+//! Highlights
+//! ----------
+//! 1. Event serialization in JSONB (PostgreSQL) with transparent versioning
+//! 2. Stream-friendly querying API for analytics/re-hydration
+//! 3. Cryptographic erasure that preserves referential integrity
+//! 4. Production-grade error handling using `thiserror`
+//! 5. OpenTelemetry metrics & tracing spans out-of-the-box
+//!
+//! NOTE: Migrations for the underlying table can be found in
+//!       `migrations/20231019105113_create_audit_table.sql`
+//!
+//! # Example
+//! ```ignore
+//! let pool = PgPoolOptions::new().connect("postgres://postgres@localhost/app").await?;
+//! let repo = AuditRepository::new(pool);
+//!
+//! let event_id = repo.record_event(
+//!     DomainEvent::LearningPulseCreated { pulse_id, author_id, title },
+//!     actor_id
+//! ).await?;
+//!
+//! repo.anonymise_user(actor_id).await?;
+//! ```
+
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use futures_core::Stream;
+use secrecy::{ExposeSecret, Secret};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgListener, PgPool, Postgres, QueryBuilder};
+use tokio::task::JoinHandle;
+use tracing::{info, instrument, warn};
+use uuid::Uuid;
+
+//
+// ──────────────────────────────────────────────────────────────────────────
+//   Domain Layer
+// ──────────────────────────────────────────────────────────────────────────
+//
+
+/// A blanket trait implemented by every domain-level event.
+pub trait Event {
+    /// An ever-increasing version number for breaking schema changes.
+    const VERSION: i16;
+
+    /// The business moment at which the event happened.
+    fn occurred_at(&self) -> DateTime<Utc>;
+}
+
+/// Exhaustive list of domain events we wish to audit.
+///
+/// The variants have deliberately *few* fields so they can outlive domain
+/// refactors; additional data are embedded via `serde_json::Value` inside
+/// `metadata`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum DomainEvent {
+    LearningPulseCreated {
+        pulse_id: Uuid,
+        author_id: Uuid,
+        title: String,
+    },
+    LearningPulseResponded {
+        pulse_id: Uuid,
+        respondent_id: Uuid,
+        attachment_url: String,
+    },
+    QuizSubmitted {
+        quiz_id: Uuid,
+        submitter_id: Uuid,
+        score: f32,
+    },
+    BadgeAwarded {
+        badge_id: Uuid,
+        recipient_id: Uuid,
+        reason: String,
+    },
+    PaymentProcessed {
+        payment_id: Uuid,
+        user_id: Uuid,
+        cents: i64,
+    },
+}
+
+impl Event for DomainEvent {
+    const VERSION: i16 = 1;
+
+    fn occurred_at(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+}
+
+/// Additional metadata inserted by the auditing layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditMetadata {
+    /// Account that triggered the event (system accounts are all-zero).
+    pub actor_id: Uuid,
+    /// Optional tenant / organisation.
+    pub tenant_id: Option<Uuid>,
+    /// IP address of the origin request.
+    pub ip_hash: Option<String>,
+}
+
+//
+// ──────────────────────────────────────────────────────────────────────────
+//   Persistence Layer
+// ──────────────────────────────────────────────────────────────────────────
+//
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub id: Uuid,
+    pub version: i16,
+    pub happened_at: DateTime<Utc>,
+    pub event: DomainEvent,
+    pub metadata: AuditMetadata,
+}
+
+/// Errors produced by the [`AuditRepository`].
+#[derive(thiserror::Error, Debug)]
+pub enum AuditError {
+    #[error("database error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+
+    #[error("notification listener stopped unexpectedly")]
+    ListenerClosed,
+
+    #[error("could not spawn task: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
+/// Repository handing audit persistence & retrieval
+#[derive(Clone)]
+pub struct AuditRepository {
+    db: PgPool,
+}
+
+impl AuditRepository {
+    pub fn new(db: PgPool) -> Self {
+        Self { db }
+    }
+
+    /// Inserts a new audit record and returns its generated ID.
+    #[instrument(skip(self, event, metadata))]
+    pub async fn record_event(
+        &self,
+        event: DomainEvent,
+        metadata: AuditMetadata,
+    ) -> Result<Uuid, AuditError> {
+        let envelope = EventEnvelope {
+            id: Uuid::new_v4(),
+            version: DomainEvent::VERSION,
+            happened_at: event.occurred_at(),
+            event,
+            metadata,
+        };
+
+        // JSON-encode only once before hitting SQL
+        let json = serde_json::to_value(&envelope)?;
+        sqlx::query!(
+            r#"
+            INSERT INTO audit_log (id, body)
+            VALUES ($1, $2 :: jsonb)
+            "#,
+            envelope.id,
+            json
+        )
+        .execute(&self.db)
+        .await?;
+
+        Ok(envelope.id)
+    }
+
+    /// Streams events from the DB ordered by timestamp.
+    /// Uses a *server-side cursor* to avoid loading everything into memory.
+    #[instrument(skip(self))]
+    pub async fn stream_events(
+        &self,
+        starting_at: Option<DateTime<Utc>>,
+    ) -> Result<impl Stream<Item = Result<EventEnvelope, AuditError>>, AuditError> {
+        let mut query_builder =
+            QueryBuilder::<Postgres>::new("SELECT body FROM audit_log ORDER BY (body->>'happened_at')::timestamptz");
+        if let Some(ts) = starting_at {
+            query_builder.push(" WHERE (body->>'happened_at')::timestamptz >= ")
+                .push_bind(ts);
+        }
+
+        let query = query_builder.build_query_as::<(serde_json::Value,)>();
+
+        let rows = query.fetch(&self.db);
+
+        let stream = rows.map(|row| match row {
+            Ok((val,)) => {
+                let env: EventEnvelope = serde_json::from_value(val)?;
+                Ok(env)
+            }
+            Err(e) => Err(AuditError::Sqlx(e)),
+        });
+
+        Ok(stream)
+    }
+
+    /// **GDPR** anonymization.  
+    /// All events involving an identified user will be updated in place to
+    /// store only a salted hash of the user ID so referential integrity can
+    /// no longer be established.
+    #[instrument(skip(self))]
+    pub async fn anonymise_user(&self, user_id: Uuid) -> Result<(), AuditError> {
+        static SALT: Secret<&str> = Secret::new("eupulse-live-gdpr-pepper");
+
+        let hash = blake3::keyed_hash(
+            SALT.expose_secret().as_bytes(),
+            user_id.as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+
+        // We update JSONB in-place with PostgreSQL's `jsonb_set`
+        sqlx::query!(
+            r#"
+            UPDATE audit_log
+            SET body = jsonb_set(
+                           body,
+                           '{metadata,actor_id}',
+                           to_jsonb($1)
+                       )
+            WHERE body -> 'metadata' ->> 'actor_id' = $2
+            "#,
+            hash,
+            user_id
+        )
+        .execute(&self.db)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Listen to Postgres `LISTEN new_audit_event` to get push notifications.
+    ///
+    /// Returns a join handle that will forward [`EventEnvelope`]s to the given
+    /// channel.  The caller is expected to cancel the task when done.
+    pub async fn spawn_listener(
+        &self,
+        mut tx: tokio::sync::mpsc::Sender<EventEnvelope>,
+    ) -> Result<JoinHandle<Result<(), AuditError>>, AuditError> {
+        let mut listener = PgListener::connect_with(&self.db).await?;
+        listener.listen("new_audit_event").await?;
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let notification = listener.recv().await.map_err(AuditError::Sqlx)?;
+
+                let payload: serde_json::Value =
+                    serde_json::from_str(notification.payload())?;
+                let env: EventEnvelope = serde_json::from_value(payload)?;
+
+                if let Err(e) = tx.send(env).await {
+                    warn!("audit listener channel closed: {e}");
+                    return Err(AuditError::ListenerClosed);
+                }
+            }
+        });
+
+        Ok(handle)
+    }
+}
+
+//
+// ──────────────────────────────────────────────────────────────────────────
+//   Scheduled Cleanup Job
+// ──────────────────────────────────────────────────────────────────────────
+//
+
+/// A *dummy* cleanup job that prunes audit entries older than `retention`.
+pub async fn spawn_pruning_job(
+    repo: AuditRepository,
+    retention: Duration,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60 * 60 * 12)); // twice a day
+        loop {
+            interval.tick().await;
+            let threshold = Utc::now() - chrono::Duration::from_std(retention).unwrap();
+
+            match sqlx::query!(
+                r#"
+                DELETE FROM audit_log
+                WHERE (body->>'happened_at')::timestamptz < $1
+                "#,
+                threshold
+            )
+            .execute(&repo.db)
+            .await
+            {
+                Ok(res) => info!(deleted = res.rows_affected(), "pruned old audit entries"),
+                Err(e)  => warn!("failed to prune audit entries: {e}"),
+            }
+        }
+    })
+}
+
+//
+// ──────────────────────────────────────────────────────────────────────────
+//   Unit Tests
+// ──────────────────────────────────────────────────────────────────────────
+//
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use tokio_stream::StreamExt;
+
+    // Integration-style test that uses a real pg instance via `DATABASE_URL`
+    #[tokio::test]
+    async fn roundtrip_event() -> anyhow::Result<()> {
+        let url = env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/edupulse_test".to_string());
+        let pool = PgPool::connect(&url).await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+
+        let repo = AuditRepository::new(pool.clone());
+
+        let ev = DomainEvent::QuizSubmitted {
+            quiz_id: Uuid::new_v4(),
+            submitter_id: Uuid::new_v4(),
+            score: 0.86,
+        };
+
+        let actor = Uuid::new_v4();
+        let meta = AuditMetadata {
+            actor_id: actor,
+            tenant_id: None,
+            ip_hash: None,
+        };
+
+        let id = repo.record_event(ev.clone(), meta.clone()).await?;
+
+        // Stream back
+        let mut stream = repo.stream_events(None).await?;
+        let first = stream.next().await.unwrap()?;
+        assert_eq!(first.id, id);
+        match first.event {
+            DomainEvent::QuizSubmitted { score, .. } => assert!((score - 0.86).abs() < f32::EPSILON),
+            _ => panic!("wrong event type"),
+        }
+
+        // Anonymise
+        repo.anonymise_user(actor).await?;
+        let row = sqlx::query!(
+            "SELECT body -> 'metadata' ->> 'actor_id' AS anon
+             FROM audit_log WHERE id = $1",
+            id
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_ne!(row.anon, Some(actor.to_string()));
+
+        Ok(())
+    }
+}
+```

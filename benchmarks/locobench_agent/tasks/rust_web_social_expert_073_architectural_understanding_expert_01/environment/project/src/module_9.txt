@@ -1,0 +1,428 @@
+```rust
+//! src/module_9.rs
+//!
+//! Outbox/Event‐Sourcing infrastructure for EduPulse Live.
+//!
+//! This module implements the Outbox pattern and provides
+//! secure, reliable publishing of domain events to the system
+//! message broker (NATS in the reference deployment).
+//!
+//! The component is independent from the HTTP layer; it can be
+//! embedded in the main API service or scheduled as a separate,
+//! dedicated binary.  All I/O is asynchronous and cancellation-
+//! safe.  Database access is handled through `sqlx` with compile-
+//! time query checking.  Messages are signed with an Ed25519 key
+//! pair to guarantee authenticity and integrity before being
+//! shipped to external subscribers.
+//!
+//! Dependencies (Cargo.toml excerpt):
+//! ----------------------------------
+//! [dependencies]
+//! async-trait = "0.1"
+//! chrono       = { version = "0.4", features = ["serde"] }
+//! futures      = "0.3"
+//! nats         = { version = "0.23", default-features = false, features = ["tls"] }
+//! ring         = "0.16"
+//! serde        = { version = "1.0", features = ["derive"] }
+//! serde_json   = "1.0"
+//! sqlx         = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
+//! tokio        = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+//! uuid         = { version = "1", features = ["serde", "v4"] }
+//!
+//! # Optional (for local CLI tooling / migrations)
+//! sqlx-cli     = { version = "0.7", default-features = false, features = ["postgres"] }
+//!
+//! Database schema (PostgreSQL):
+//! -----------------------------
+//! ```sql
+//! CREATE TABLE event_outbox (
+//!     id              UUID            PRIMARY KEY,
+//!     aggregate_id    UUID            NOT NULL,
+//!     event_type      TEXT            NOT NULL,
+//!     payload         JSONB           NOT NULL,
+//!     occurred_at     TIMESTAMPTZ     NOT NULL,
+//!     signature       TEXT            NOT NULL,
+//!     sent_at         TIMESTAMPTZ
+//! );
+//! CREATE INDEX ON event_outbox (sent_at) WHERE sent_at IS NULL;
+//! ```
+//!
+//! ------------------------------------------------------------------------
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::{stream, StreamExt, TryFutureExt};
+use ring::signature::{Ed25519KeyPair, KeyPair};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
+use thiserror::Error;
+use tokio::time::sleep;
+use uuid::Uuid;
+
+/// DomainEvent is a marker trait for serializable, JSON–compatible
+/// domain events originating from the core business logic.
+pub trait DomainEvent: Serialize + Send + Sync + 'static {
+    /// Canonical name of the event (e.g., "lesson.published.v1").
+    fn event_type(&self) -> &'static str;
+}
+
+/// Envelope stored in the outbox table.
+///
+/// The struct doubles as the wire format that gets shipped through
+/// the message broker (subject: `edupulse.events.<event_type>`).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub id:           Uuid,
+    pub aggregate_id: Uuid,
+    pub event_type:   String,
+    pub payload:      serde_json::Value,
+    pub occurred_at:  DateTime<Utc>,
+    pub signature:    String,
+}
+
+impl EventEnvelope {
+    /// Returns the NATS subject for this event.
+    pub fn subject(&self) -> String {
+        format!("edupulse.events.{}", self.event_type)
+    }
+}
+
+/// Custom error type bubbles up all possible failure modes.
+#[derive(Debug, Error)]
+pub enum OutboxError {
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+
+    #[error("nats I/O error: {0}")]
+    Nats(#[from] async_nats::Error),
+
+    #[error("crypto error")]
+    Crypto,
+
+    #[error("unexpected: {0}")]
+    Other(String),
+}
+
+/// Repository trait hides persistence details (useful for tests).
+#[async_trait]
+pub trait OutboxRepository {
+    async fn insert(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        envelope: &EventEnvelope,
+    ) -> Result<(), OutboxError>;
+
+    async fn fetch_unsent(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<EventEnvelope>, OutboxError>;
+
+    async fn mark_sent(
+        &self,
+        envelopes: &[EventEnvelope],
+    ) -> Result<(), OutboxError>;
+}
+
+/// Concrete PostgreSQL implementation.
+pub struct PgOutboxRepository {
+    pool: PgPool,
+}
+
+impl PgOutboxRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl OutboxRepository for PgOutboxRepository {
+    async fn insert(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        envelope: &EventEnvelope,
+    ) -> Result<(), OutboxError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO event_outbox (
+                id,
+                aggregate_id,
+                event_type,
+                payload,
+                occurred_at,
+                signature
+            )
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+            envelope.id,
+            envelope.aggregate_id,
+            envelope.event_type,
+            envelope.payload,
+            envelope.occurred_at,
+            envelope.signature
+        )
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn fetch_unsent(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<EventEnvelope>, OutboxError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id,
+                   aggregate_id,
+                   event_type,
+                   payload,
+                   occurred_at,
+                   signature
+            FROM event_outbox
+            WHERE sent_at IS NULL
+            ORDER BY occurred_at
+            LIMIT $1
+            "#,
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| EventEnvelope {
+                id: r.id,
+                aggregate_id: r.aggregate_id,
+                event_type: r.event_type,
+                payload: r.payload,
+                occurred_at: r.occurred_at,
+                signature: r.signature,
+            })
+            .collect())
+    }
+
+    async fn mark_sent(
+        &self,
+        envelopes: &[EventEnvelope],
+    ) -> Result<(), OutboxError> {
+        if envelopes.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<Uuid> = envelopes.iter().map(|e| e.id).collect();
+        sqlx::query!(
+            r#"
+            UPDATE event_outbox
+            SET sent_at = NOW()
+            WHERE id = ANY($1)
+            "#,
+            &ids[..]
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+/// Outbox service coordinates persistence and dispatching.
+pub struct OutboxService<R: OutboxRepository + Send + Sync> {
+    repo:        Arc<R>,
+    nats_url:    String,
+    key_pair:    Arc<Ed25519KeyPair>,
+    // Retry/backoff configuration.
+    max_batch:   i64,
+    poll_every:  Duration,
+}
+
+impl<R: OutboxRepository + Send + Sync> OutboxService<R> {
+    pub fn new(
+        repo: Arc<R>,
+        nats_url: impl Into<String>,
+        key_pair: Ed25519KeyPair,
+    ) -> Self {
+        Self {
+            repo,
+            nats_url: nats_url.into(),
+            key_pair: Arc::new(key_pair),
+            max_batch: 256,
+            poll_every: Duration::from_secs(2),
+        }
+    }
+
+    /// Persists a domain event within an existing transaction.
+    ///
+    /// This method is *synchronous* with respect to the caller’s DB
+    /// transaction; the actual dispatch happens in the background
+    /// daemon spawned by `run_dispatch_loop`.
+    pub async fn stage_event<E: DomainEvent>(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        aggregate_id: Uuid,
+        event: &E,
+    ) -> Result<(), OutboxError> {
+        let payload = serde_json::to_value(event)
+            .map_err(|e| OutboxError::Other(format!("serde: {e}")))?;
+
+        let mut unsigned = EventEnvelope {
+            id:           Uuid::new_v4(),
+            aggregate_id,
+            event_type:   event.event_type().to_owned(),
+            payload,
+            occurred_at:  Utc::now(),
+            signature:    String::new(), // placeholder
+        };
+
+        unsigned.signature = self.sign_payload(&unsigned)?;
+
+        self.repo.insert(tx, &unsigned).await
+    }
+
+    /// Infinite loop: regularly pulls unsent events and publishes them.
+    ///
+    /// Should be run in its own Tokio task; gracefully stops when the
+    /// task is cancelled.
+    pub async fn run_dispatch_loop(self: Arc<Self>) -> Result<(), OutboxError> {
+        let nats_conn = async_nats::connect(self.nats_url.clone()).await?;
+
+        loop {
+            // Fetch up to `max_batch` events that still need sending.
+            let events = self.repo.fetch_unsent(self.max_batch).await?;
+
+            if events.is_empty() {
+                sleep(self.poll_every).await;
+                continue;
+            }
+
+            // We use a `FuturesUnordered` stream to publish in parallel
+            // while still limiting overall memory / network utilisation.
+            let publish_fut = stream::iter(events.clone())
+                .map(|evt| {
+                    let conn = &nats_conn;
+                    async move {
+                        conn.publish(evt.subject(), serde_json::to_vec(&evt)?)
+                            .await
+                            .map_err(OutboxError::from)
+                    }
+                })
+                .buffer_unordered(16)
+                .collect::<Vec<_>>();
+
+            let results = publish_fut.await;
+
+            // Separate errors from successes for partial retries.
+            let (oks, errs): (Vec<_>, Vec<_>) =
+                results.into_iter().partition(Result::is_ok);
+
+            if !oks.is_empty() {
+                // Only mark events sent when the publish actually succeeded.
+                let sent_events: Vec<_> = events
+                    .iter()
+                    .zip(oks)
+                    .filter_map(|(evt, res)| res.ok().map(|_| evt.clone()))
+                    .collect();
+
+                self.repo.mark_sent(&sent_events).await?;
+            }
+
+            if !errs.is_empty() {
+                // Log and backoff; caller decides global error handling.
+                tracing::warn!(
+                    failed = errs.len(),
+                    "Some messages failed to publish; will retry"
+                );
+                // Exponential-ish backoff for noisy neighbours.
+                sleep(self.poll_every * 2).await;
+            }
+        }
+    }
+
+    fn sign_payload(&self, envelope: &EventEnvelope) -> Result<String, OutboxError> {
+        let mut bytes = serde_json::to_vec(envelope)
+            .map_err(|e| OutboxError::Other(format!("serde: {e}")))?;
+
+        // Sign the raw bytes (comment this if you prefer canonical JSON).
+        let sig = self.key_pair.sign(&mut bytes);
+        Ok(base64::encode(sig.as_ref()))
+    }
+}
+
+/// Example domain event.
+///
+/// In real code these live inside domain modules; kept here for demo.
+#[derive(Debug, Serialize)]
+pub struct LessonPublished {
+    pub lesson_id: Uuid,
+    pub title:     String,
+    pub author_id: Uuid,
+    pub tags:      Vec<String>,
+}
+
+impl DomainEvent for LessonPublished {
+    fn event_type(&self) -> &'static str {
+        "lesson.published.v1"
+    }
+}
+
+/// Convenience helper for crafting an Ed25519 key pair from disk/env.
+///
+/// In production you would keep the private key in Hashicorp Vault
+/// or a TPM; this simplistic helper is for local development only.
+pub fn load_signing_key() -> Result<Ed25519KeyPair, OutboxError> {
+    use ring::rand::SystemRandom;
+    use ring::signature::Ed25519KeyPair as Key;
+
+    if let Ok(pkcs8_b64) = std::env::var("EDUPULSE_SIGNING_KEY_B64") {
+        let bytes = base64::decode(pkcs8_b64)
+            .map_err(|_| OutboxError::Crypto)?;
+        Key::from_pkcs8(&bytes).map_err(|_| OutboxError::Crypto)
+    } else {
+        // Auto-generate volatile key when none provided.
+        let rng = SystemRandom::new();
+        let pkcs8 = Key::generate_pkcs8(&rng).map_err(|_| OutboxError::Crypto)?;
+        Ok(Key::from_pkcs8(pkcs8.as_ref()).map_err(|_| OutboxError::Crypto)?)
+    }
+}
+
+/// Bootstraps a producer demo.
+///
+/// This async function illustrates how to embed the Outbox transaction
+/// into domain service logic.  Remove or adjust for production usage.
+pub async fn demo_produce_event(db_url: &str) -> Result<(), OutboxError> {
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(db_url)
+        .await?;
+
+    let repo = Arc::new(PgOutboxRepository::new(pool.clone()));
+    let key_pair = load_signing_key()?;
+    let outbox = Arc::new(OutboxService::new(
+        repo.clone(),
+        "tls://connect.ngs.global".to_string(),
+        key_pair,
+    ));
+
+    // spawn the background dispatcher
+    tokio::spawn(outbox.clone().run_dispatch_loop());
+
+    // Business transaction: create lesson, persist event, commit.
+    let mut tx = pool.begin().await?;
+
+    // Imagine we create a lesson in lessons table here …
+
+    let event = LessonPublished {
+        lesson_id: Uuid::new_v4(),
+        title:     "Algebraic Topology 101".to_owned(),
+        author_id: Uuid::new_v4(),
+        tags:      vec!["math".into(), "topology".into()],
+    };
+
+    outbox
+        .stage_event(&mut tx, event.lesson_id, &event)
+        .await?;
+
+    tx.commit().await?;
+
+    Ok(())
+}
+```

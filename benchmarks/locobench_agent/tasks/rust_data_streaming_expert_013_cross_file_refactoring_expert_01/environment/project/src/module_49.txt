@@ -1,0 +1,384 @@
+```rust
+//! src/module_49.rs
+//!
+//! Strategy-pattern implementation for ChirpPulse analysis algorithms.
+//!
+//! This module exposes:
+//!   1. `AnalysisStrategy` – an async pluggable trait.
+//!   2. Two built-in strategies: `BasicSentimentStrategy` and `ToxicityScoringStrategy`.
+//!   3. `PluginRegistry` – a thread-safe registry that allows insertion, removal and
+//!      execution of strategies at runtime.
+//!   4. `ConfigWatcher` – hot-reloads strategy configuration from disk using `notify`.
+//!
+//! The design embraces asynchronous processing (Tokio), structured logging (`tracing`),
+//! robust error handling (`thiserror`), and testability.
+
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::broadcast;
+use tracing::{debug, error, info, instrument};
+
+/// Represents a raw social event coming off the ingest bus.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SocialEvent {
+    pub id: String,
+    pub user_id: String,
+    pub text: String,
+    pub lang: Option<String>,
+    pub timestamp: i64,
+}
+
+/// Normalized output produced by an [`AnalysisStrategy`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AnalysisResult {
+    pub strategy: String,
+    pub score: f32,
+    pub metadata: serde_json::Value,
+}
+
+/// Domain errors for the strategy layer.
+#[derive(Debug, Error)]
+pub enum StrategyError {
+    #[error("strategy failed – {0}")]
+    Processing(String),
+
+    #[error("strategy '{0}' not found")]
+    NotFound(String),
+
+    #[error("configuration error – {0}")]
+    Config(String),
+
+    #[error(transparent)]
+    External(#[from] anyhow::Error),
+}
+
+/// Trait implemented by every analysis strategy.
+///
+/// The method is asynchronous because expensive ML inference may occur
+/// (remote model server, GPU, etc.).
+#[async_trait]
+pub trait AnalysisStrategy: Send + Sync {
+    /// Human-readable identifier. Must be unique inside a [`PluginRegistry`].
+    fn name(&self) -> &str;
+
+    /// Perform analysis on a single [`SocialEvent`].
+    async fn analyze(&self, event: &SocialEvent) -> Result<AnalysisResult, StrategyError>;
+}
+
+/// Baseline sentiment analysis using a tiny embedded wordlist.
+///
+/// NOTE: Highly simplified for sample purposes.
+pub struct BasicSentimentStrategy {
+    positive: Vec<&'static str>,
+    negative: Vec<&'static str>,
+}
+
+impl Default for BasicSentimentStrategy {
+    fn default() -> Self {
+        Self {
+            positive: vec!["good", "great", "love", "awesome", "fantastic"],
+            negative: vec!["bad", "terrible", "hate", "awful", "worst"],
+        }
+    }
+}
+
+#[async_trait]
+impl AnalysisStrategy for BasicSentimentStrategy {
+    fn name(&self) -> &str {
+        "basic_sentiment"
+    }
+
+    #[instrument(skip(self, event), fields(event_id = %event.id))]
+    async fn analyze(&self, event: &SocialEvent) -> Result<AnalysisResult, StrategyError> {
+        let text = event.text.to_lowercase();
+        let pos_hits = self
+            .positive
+            .iter()
+            .filter(|w| text.contains(&w[..]))
+            .count() as f32;
+        let neg_hits = self
+            .negative
+            .iter()
+            .filter(|w| text.contains(&w[..]))
+            .count() as f32;
+
+        let score = match (pos_hits, neg_hits) {
+            (0.0, 0.0) => 0.0,
+            _ => (pos_hits - neg_hits) / (pos_hits + neg_hits),
+        };
+
+        Ok(AnalysisResult {
+            strategy: self.name().to_string(),
+            score,
+            metadata: serde_json::json!({
+                "positive_hits": pos_hits,
+                "negative_hits": neg_hits
+            }),
+        })
+    }
+}
+
+/// Toy toxicity scoring using regular expressions.
+///
+/// In production, this might proxy a large Transformer model.
+pub struct ToxicityScoringStrategy {
+    toxic_regex: regex::Regex,
+}
+
+impl Default for ToxicityScoringStrategy {
+    fn default() -> Self {
+        Self {
+            toxic_regex: regex::Regex::new(r"(?i)\b(fuck|damn|shit|bitch)\b").unwrap(),
+        }
+    }
+}
+
+#[async_trait]
+impl AnalysisStrategy for ToxicityScoringStrategy {
+    fn name(&self) -> &str {
+        "toxicity_scoring"
+    }
+
+    #[instrument(skip(self, event), fields(event_id = %event.id))]
+    async fn analyze(&self, event: &SocialEvent) -> Result<AnalysisResult, StrategyError> {
+        let text = &event.text;
+        let hit_count = self.toxic_regex.find_iter(text).count() as f32;
+
+        let severity = (hit_count.min(10.0)) / 10.0; // 0.0 – 1.0
+
+        Ok(AnalysisResult {
+            strategy: self.name().to_string(),
+            score: severity,
+            metadata: serde_json::json!({ "hits": hit_count }),
+        })
+    }
+}
+
+/// Thread-safe registry for hot-swappable [`AnalysisStrategy`] instances.
+///
+/// A Tokio `broadcast` channel publishes live reload events to interested
+/// subscribers (e.g., metrics reporters).
+pub struct PluginRegistry {
+    strategies: RwLock<HashMap<String, Arc<dyn AnalysisStrategy>>>,
+    tx_reload: broadcast::Sender<String>,
+}
+
+impl PluginRegistry {
+    /// Construct registry seeded with baseline strategies.
+    pub fn new_baseline() -> Self {
+        let (tx_reload, _) = broadcast::channel(128);
+
+        let mut map: HashMap<String, Arc<dyn AnalysisStrategy>> = HashMap::new();
+        let sentiment = Arc::new(BasicSentimentStrategy::default());
+        map.insert(sentiment.name().to_string(), sentiment);
+
+        let toxicity = Arc::new(ToxicityScoringStrategy::default());
+        map.insert(toxicity.name().to_string(), toxicity);
+
+        Self {
+            strategies: RwLock::new(map),
+            tx_reload,
+        }
+    }
+
+    /// Register or replace a strategy.
+    pub fn register<S>(&self, strat: S)
+    where
+        S: AnalysisStrategy + 'static,
+    {
+        let name = strat.name().to_string();
+        info!(strategy = %name, "Registering analysis strategy");
+        self.strategies.write().insert(name.clone(), Arc::new(strat));
+        let _ = self.tx_reload.send(name);
+    }
+
+    /// Unregister a strategy by identifier.
+    pub fn unregister(&self, name: &str) -> Result<(), StrategyError> {
+        let mut map = self.strategies.write();
+        match map.remove(name) {
+            Some(_) => {
+                info!(strategy = %name, "Unregistered analysis strategy");
+                let _ = self.tx_reload.send(name.to_string());
+                Ok(())
+            }
+            None => Err(StrategyError::NotFound(name.into())),
+        }
+    }
+
+    /// Execute a strategy against an event.
+    pub async fn analyze(
+        &self,
+        strategy: &str,
+        event: &SocialEvent,
+    ) -> Result<AnalysisResult, StrategyError> {
+        let map = self.strategies.read();
+        let strat = map
+            .get(strategy)
+            .ok_or_else(|| StrategyError::NotFound(strategy.into()))?
+            .clone();
+
+        strat.analyze(event).await
+    }
+
+    /// Obtain a read-only snapshot of registered names.
+    pub fn list(&self) -> Vec<String> {
+        self.strategies
+            .read()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    }
+
+    /// Subscribe to live reload notifications.
+    pub fn subscribe(&self) -> broadcast::Receiver<String> {
+        self.tx_reload.subscribe()
+    }
+}
+
+/// Hot-reload arbitrary JSON configuration files.
+///
+/// The watcher publishes file content into a broadcast channel anytime it
+/// detects an on-disk change. Strategies can choose to listen and mutate
+/// state without restarting the process.
+pub struct ConfigWatcher<T>
+where
+    T: for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+{
+    path: PathBuf,
+    tx: broadcast::Sender<T>,
+}
+
+impl<T> ConfigWatcher<T>
+where
+    T: for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+{
+    /// Spawn an asynchronous watcher task.
+    pub fn spawn(path: impl AsRef<Path>) -> Self {
+        let path_buf = path.as_ref().to_path_buf();
+        let (tx, _rx) = broadcast::channel(16);
+
+        // Kick-off initial load so listeners get a first value.
+        if let Err(e) = Self::load_and_send(&path_buf, &tx) {
+            error!(error = ?e, "Initial configuration load failed");
+        }
+
+        tokio::spawn(Self::watch_loop(path_buf.clone(), tx.clone()));
+
+        Self { path: path_buf, tx }
+    }
+
+    /// Subscribe for config updates.
+    pub fn subscribe(&self) -> broadcast::Receiver<T> {
+        self.tx.subscribe()
+    }
+
+    async fn watch_loop(path: PathBuf, tx: broadcast::Sender<T>) {
+        // `notify` delivers events on a synchronous channel. Wrap in blocking
+        // task to avoid stalling async runtime.
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+
+        let mut watcher: RecommendedWatcher =
+            Watcher::new(event_tx, Config::default()).expect("Failed to create watcher");
+        watcher
+            .watch(&path, RecursiveMode::NonRecursive)
+            .expect("Failed to watch config file");
+
+        loop {
+            match event_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(Event { .. }) => {
+                    if let Err(e) = Self::load_and_send(&path, &tx) {
+                        error!(error = ?e, "Failed to reload configuration");
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(e) => {
+                    error!(error = ?e, "Watcher channel error");
+                    break;
+                }
+            }
+        }
+    }
+
+    fn load_and_send(path: &Path, tx: &broadcast::Sender<T>) -> Result<(), StrategyError> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| StrategyError::Config(format!("read {}: {e}", path.display())))?;
+        let cfg: T = serde_json::from_slice(&bytes)
+            .map_err(|e| StrategyError::Config(format!("parse {}: {e}", path.display())))?;
+
+        let _ = tx.send(cfg);
+        debug!(file = %path.display(), "Configuration reloaded");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_basic_sentiment_positive() {
+        let strat = BasicSentimentStrategy::default();
+        let event = SocialEvent {
+            id: "1".into(),
+            user_id: "u".into(),
+            text: "I love this fantastic product!".into(),
+            lang: Some("en".into()),
+            timestamp: 0,
+        };
+
+        let res = strat.analyze(&event).await.unwrap();
+        assert!(res.score > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_registry_flow() {
+        let registry = PluginRegistry::new_baseline();
+        assert!(registry.list().contains(&"basic_sentiment".into()));
+
+        let event = SocialEvent {
+            id: "2".into(),
+            user_id: "u2".into(),
+            text: "This is shit!".into(),
+            lang: Some("en".into()),
+            timestamp: 0,
+        };
+
+        // Built-in strategy
+        let toxicity = registry.analyze("toxicity_scoring", &event).await.unwrap();
+        assert!(toxicity.score > 0.0);
+
+        // Custom ad-hoc strategy
+        struct AlwaysZero;
+        #[async_trait]
+        impl AnalysisStrategy for AlwaysZero {
+            fn name(&self) -> &str {
+                "always_zero"
+            }
+            async fn analyze(
+                &self,
+                _event: &SocialEvent,
+            ) -> Result<AnalysisResult, StrategyError> {
+                Ok(AnalysisResult {
+                    strategy: self.name().to_string(),
+                    score: 0.0,
+                    metadata: serde_json::Value::Null,
+                })
+            }
+        }
+
+        registry.register(AlwaysZero);
+        let res = registry.analyze("always_zero", &event).await.unwrap();
+        assert_eq!(res.score, 0.0);
+    }
+}
+```

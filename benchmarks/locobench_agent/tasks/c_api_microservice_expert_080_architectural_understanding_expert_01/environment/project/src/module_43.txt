@@ -1,0 +1,270 @@
+/**
+ * src/module_43.txt  (yes, the repository uses *.txt for historical reasons)
+ *
+ * Purpose
+ * -------
+ * Rate-limiting middleware inspired by the classic token-bucket algorithm.
+ * The implementation is thread-safe, sharded, lock-efficient and integrates
+ * with the MercuryMonolith logging & metrics subsystems.
+ *
+ * Public API
+ * ----------
+ *  mm_rl_context_t *mm_rl_init(const mm_rl_config_t *cfg);
+ *  bool            mm_rl_allow(mm_rl_context_t *ctx,
+ *                              const char       *api_key,
+ *                              uint32_t          cost);
+ *  void            mm_rl_shutdown(mm_rl_context_t *ctx);
+ *
+ * Compile flags
+ * -------------
+ *  -pthread                       (required for mutexes)
+ *  -D_GNU_SOURCE                  (clock_gettime, POSIX extensions)
+ *
+ * Dependencies
+ * ------------
+ *  • uthash.h          – header-only hash table
+ *  • mm_log.h          – project-wide structured logging facade
+ *  • mm_metrics.h      – Prometheus-compatible counters/histograms
+ *
+ * Author
+ * ------
+ *  MercuryMonolith Core Team  <core@mercury-hub.internal>
+ */
+
+#define _GNU_SOURCE     /* clock_gettime */
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <errno.h>
+
+/* Third-party: https://troydhanson.github.io/uthash/ */
+#include "uthash.h"
+
+/* Project headers (provided elsewhere in the repo) */
+#include "mm_log.h"
+#include "mm_metrics.h"
+
+/* ------------------------------------------------------------------------- */
+/* Configuration & Context Structures                                        */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    uint32_t    capacity;       /* token bucket size */
+    double      refill_rate;    /* tokens per second */
+    uint32_t    shard_count;    /* power of 2 preferred for hashing */
+} mm_rl_config_t;
+
+/* Forward declaration */
+struct mm_rl_bucket_s;
+
+/* Internal bucket – one per API key per shard */
+typedef struct mm_rl_bucket_s
+{
+    char                     api_key[64]; /* bounded, enforced by gateway    */
+    double                   tokens;      /* floating point for precision    */
+    struct timespec          last_refill; /* CLOCK_MONOTONIC                 */
+    UT_hash_handle           hh;          /* uthash linkage                  */
+} mm_rl_bucket_t;
+
+/* One shard holds its own hash table and lock */
+typedef struct {
+    pthread_mutex_t  mtx;
+    mm_rl_bucket_t  *hash;      /* uthash root */
+    uint64_t         hits;      /* statistics  */
+} mm_rl_shard_t;
+
+/* Public handle returned to callers */
+typedef struct {
+    mm_rl_config_t   cfg;
+    mm_rl_shard_t   *shards;
+} mm_rl_context_t;
+
+/* ------------------------------------------------------------------------- */
+/* Helpers                                                                   */
+/* ------------------------------------------------------------------------- */
+
+/* djb2 hash – simple & adequate for key sharding */
+static inline uint32_t
+mm_rl_hash(const char *str)
+{
+    uint32_t hash = 5381;
+    int c;
+    while ((c = *str++))
+        hash = ((hash << 5) + hash) + (uint32_t)c; /* hash * 33 + c */
+    return hash;
+}
+
+static inline double
+timespec_elapsed_sec(const struct timespec *since)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    time_t  sec_diff  = now.tv_sec  - since->tv_sec;
+    long    nsec_diff = now.tv_nsec - since->tv_nsec;
+    return (double)sec_diff + (double)nsec_diff / 1e9;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Public API Implementation                                                 */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Initialize rate-limiter context. Returns NULL on error.
+ */
+mm_rl_context_t *
+mm_rl_init(const mm_rl_config_t *cfg)
+{
+    if (!cfg || cfg->capacity == 0 || cfg->refill_rate <= 0.0 ||
+        cfg->shard_count == 0)
+    {
+        MM_LOG_ERROR("rate_limiter.init", "Invalid configuration");
+        return NULL;
+    }
+
+    mm_rl_context_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        MM_LOG_ERROR_ERRNO("rate_limiter.init", "calloc failed");
+        return NULL;
+    }
+
+    ctx->cfg = *cfg;
+
+    ctx->shards = calloc(cfg->shard_count, sizeof(mm_rl_shard_t));
+    if (!ctx->shards) {
+        MM_LOG_ERROR_ERRNO("rate_limiter.init", "calloc shards failed");
+        free(ctx);
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < cfg->shard_count; ++i) {
+        if (pthread_mutex_init(&ctx->shards[i].mtx, NULL) != 0) {
+            MM_LOG_ERROR("rate_limiter.init",
+                         "pthread_mutex_init failed on shard %u", i);
+            /* clean up previously initialized mutexes */
+            while (i--) pthread_mutex_destroy(&ctx->shards[i].mtx);
+            free(ctx->shards);
+            free(ctx);
+            return NULL;
+        }
+    }
+
+    MM_LOG_INFO("rate_limiter.init",
+                "Rate limiter initialized: capacity=%u, refill_rate=%.2f/s, "
+                "shards=%u",
+                cfg->capacity, cfg->refill_rate, cfg->shard_count);
+
+    mm_metrics_counter_inc("rate_limiter_instances_total");
+    return ctx;
+}
+
+/**
+ * Determine if an operation costing `cost` tokens is allowed
+ * for the specified api_key. Thread-safe.
+ *
+ * Returns true  – request permitted and tokens consumed
+ *         false – request rejected due to insufficient tokens
+ */
+bool
+mm_rl_allow(mm_rl_context_t *ctx, const char *api_key, uint32_t cost)
+{
+    if (ctx == NULL || api_key == NULL || cost == 0) {
+        MM_LOG_WARN("rate_limiter.allow", "Bad arguments");
+        return false;
+    }
+
+    const uint32_t shard_idx = mm_rl_hash(api_key) % ctx->cfg.shard_count;
+    mm_rl_shard_t *shard = &ctx->shards[shard_idx];
+
+    /* Fast path: optimistic read lock could be added here later */
+    if (pthread_mutex_lock(&shard->mtx) != 0) {
+        MM_LOG_ERROR_ERRNO("rate_limiter.allow", "mutex_lock failed");
+        return false;
+    }
+
+    /* Locate or create bucket */
+    mm_rl_bucket_t *bucket = NULL;
+    HASH_FIND_STR(shard->hash, api_key, bucket);
+
+    if (!bucket) {
+        /* New consumer – allocate bucket with full tokens */
+        bucket = calloc(1, sizeof(*bucket));
+        if (!bucket) {
+            MM_LOG_ERROR_ERRNO("rate_limiter.allow", "calloc bucket failed");
+            pthread_mutex_unlock(&shard->mtx);
+            return false;
+        }
+        strncpy(bucket->api_key, api_key, sizeof(bucket->api_key) - 1);
+        bucket->tokens = (double)ctx->cfg.capacity;
+        clock_gettime(CLOCK_MONOTONIC, &bucket->last_refill);
+        HASH_ADD_STR(shard->hash, api_key, bucket);
+    }
+
+    /* Refill tokens according to elapsed time */
+    double elapsed = timespec_elapsed_sec(&bucket->last_refill);
+    double new_tokens = elapsed * ctx->cfg.refill_rate;
+
+    if (new_tokens > 0) {
+        bucket->tokens = bucket->tokens + new_tokens;
+        if (bucket->tokens > ctx->cfg.capacity)
+            bucket->tokens = (double)ctx->cfg.capacity;
+        clock_gettime(CLOCK_MONOTONIC, &bucket->last_refill);
+    }
+
+    bool allowed = false;
+    if (bucket->tokens >= (double)cost) {
+        bucket->tokens -= (double)cost;
+        allowed = true;
+    }
+
+    shard->hits++;
+    pthread_mutex_unlock(&shard->mtx);
+
+    /* Metrics */
+    mm_metrics_counter_inc(allowed
+                           ? "rate_limiter_allow_total"
+                           : "rate_limiter_deny_total");
+
+    /* Optional trace logs at debug level */
+    MM_LOG_DEBUG("rate_limiter.allow",
+                 "api_key=%s allowed=%d tokens_left=%.2f shard=%u",
+                 api_key, allowed, bucket->tokens, shard_idx);
+
+    return allowed;
+}
+
+/**
+ * Gracefully shutdown the rate-limiter and release all resources.
+ */
+void
+mm_rl_shutdown(mm_rl_context_t *ctx)
+{
+    if (!ctx) return;
+
+    for (uint32_t i = 0; i < ctx->cfg.shard_count; ++i) {
+        mm_rl_shard_t *shard = &ctx->shards[i];
+        pthread_mutex_lock(&shard->mtx);
+
+        mm_rl_bucket_t *bucket, *tmp;
+        HASH_ITER(hh, shard->hash, bucket, tmp) {
+            HASH_DEL(shard->hash, bucket);
+            free(bucket);
+        }
+
+        pthread_mutex_unlock(&shard->mtx);
+        pthread_mutex_destroy(&shard->mtx);
+    }
+
+    free(ctx->shards);
+    memset(ctx, 0, sizeof(*ctx));
+    free(ctx);
+
+    MM_LOG_INFO("rate_limiter.shutdown", "Rate limiter destroyed");
+    mm_metrics_counter_inc("rate_limiter_shutdown_total");
+}
+
+/* ------------------------------------------------------------------------- */
+/* End of module_43.txt                                                      */
+/* ------------------------------------------------------------------------- */

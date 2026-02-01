@@ -1,0 +1,340 @@
+/**
+ * MercuryMonolith Commerce Hub
+ * ------------------------------------------
+ * module_37: In-Memory Token-Bucket Rate Limiter
+ *
+ * This module provides a thread-safe, in-process rate-limiting facility that
+ * can be used by the API-Gateway and individual service layers to protect
+ * resources from abuse.  It implements a classic token-bucket algorithm with
+ * per-client buckets, automatic expiration of idle entries, and metrics hooks
+ * for Prometheus-compatible instrumentation.
+ *
+ * The implementation purposefully carries zero external runtime dependencies
+ * (aside from pthreads) and relies on the excellent single-header uthash
+ * library for the bucket map.
+ *
+ * Compile unit:  C11
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <errno.h>
+#include <unistd.h>
+
+#include "uthash.h"              /* Single-header hash map              */
+#include "mm_logger.h"           /* Project-wide structured logger      */
+#include "mm_metrics.h"          /* Prometheus metrics façade           */
+#include "mm_config.h"           /* Key-value configuration reader      */
+#include "mm_time.h"             /* Monotonic clock abstraction         */
+
+/*-------------------------------------------------------------------------*/
+/* Constants & Macros                                                      */
+/*-------------------------------------------------------------------------*/
+
+#ifndef RL_DEFAULT_CAPACITY
+#define RL_DEFAULT_CAPACITY            100.0   /* Tokens per bucket             */
+#endif
+
+#ifndef RL_DEFAULT_REFILL_RATE
+#define RL_DEFAULT_REFILL_RATE         50.0    /* Tokens added per second       */
+#endif
+
+#ifndef RL_DEFAULT_IDLE_TTL
+#define RL_DEFAULT_IDLE_TTL            300     /* Seconds w/o traffic → purge   */
+#endif
+
+#ifndef RL_JANITOR_PERIOD_MS
+#define RL_JANITOR_PERIOD_MS           1000    /* Janitor wake-up interval      */
+#endif
+
+#define RL_METRIC_NS                   "ratelimiter"
+
+/*-------------------------------------------------------------------------*/
+/* Data Structures                                                         */
+/*-------------------------------------------------------------------------*/
+
+/* Per-client token bucket */
+typedef struct rl_bucket {
+    char            key[64];            /* Client identifier (user/IP/etc.) */
+    double          tokens;             /* Current token count              */
+    double          last_refill_ts;     /* CLOCK_MONOTONIC seconds          */
+    time_t          last_seen_wall;     /* time() of most recent request    */
+    UT_hash_handle  hh;                 /* uthash handle                    */
+} rl_bucket_t;
+
+/* Shared rate-limiter instance */
+typedef struct rate_limiter {
+    double          capacity;           /* Max tokens / bucket              */
+    double          refill_rate;        /* Tokens added per second          */
+    uint32_t        idle_ttl_sec;       /* Bucket eviction TTL              */
+
+    rl_bucket_t    *table;              /* Hash map of buckets              */
+    pthread_rwlock_t rwlock;            /* Protects |table|                 */
+
+    atomic_bool     running;            /* Janitor loop control             */
+    pthread_t       janitor_tid;
+
+    /* Metrics handles (opaque) */
+    mm_metric_t    *metric_denied;
+    mm_metric_t    *metric_allowed;
+} rate_limiter_t;
+
+/*-------------------------------------------------------------------------*/
+/* Forward Declarations                                                    */
+/*-------------------------------------------------------------------------*/
+
+static void  *janitor_thread_fn(void *arg);
+static int    bucket_maybe_refill(rl_bucket_t *bucket,
+                                  double capacity,
+                                  double refill_rate,
+                                  double now_sec);
+
+/*-------------------------------------------------------------------------*/
+/* Public API                                                              */
+/*-------------------------------------------------------------------------*/
+
+/**
+ * rl_create()
+ * Construct a new rate limiter using configuration sourced from the project’s
+ * key-value configuration system (env file, CLI flags, etc.).  Caller assumes
+ * ownership of the returned pointer and must invoke rl_destroy() to release
+ * resources.
+ */
+rate_limiter_t *
+rl_create(void)
+{
+    rate_limiter_t *rl = calloc(1, sizeof(*rl));
+    if (!rl) {
+        mm_log_fatal("ratelimiter: allocation failure");
+        return NULL;
+    }
+
+    /* Pull overrides from configuration */
+    rl->capacity     = mm_config_get_double("rate_limit.capacity", RL_DEFAULT_CAPACITY);
+    rl->refill_rate  = mm_config_get_double("rate_limit.refill_rate", RL_DEFAULT_REFILL_RATE);
+    rl->idle_ttl_sec = (uint32_t)mm_config_get_uint("rate_limit.idle_ttl_sec", RL_DEFAULT_IDLE_TTL);
+
+    if (pthread_rwlock_init(&rl->rwlock, NULL) != 0) {
+        mm_log_fatal("ratelimiter: failed to init rwlock: %s", strerror(errno));
+        free(rl);
+        return NULL;
+    }
+
+    /* Register counters with metrics subsystem */
+    rl->metric_denied  = mm_metrics_counter_register(RL_METRIC_NS "_denied_total",
+                                                     "Total requests denied by the rate limiter");
+    rl->metric_allowed = mm_metrics_counter_register(RL_METRIC_NS "_allowed_total",
+                                                     "Total requests allowed by the rate limiter");
+
+    /* Spawn janitor */
+    atomic_init(&rl->running, true);
+    if (pthread_create(&rl->janitor_tid, NULL, janitor_thread_fn, rl) != 0) {
+        mm_log_error("ratelimiter: failed to spawn janitor thread: %s", strerror(errno));
+        /* We can still operate without a janitor; buckets will leak until shutdown */
+    }
+
+    mm_log_info("ratelimiter: initialized (capacity=%.2f, refill_rate=%.2f/s, ttl=%us)",
+                rl->capacity, rl->refill_rate, rl->idle_ttl_sec);
+
+    return rl;
+}
+
+/**
+ * rl_destroy()
+ * Gracefully stops the janitor loop, evicts all buckets, and frees memory.
+ */
+void
+rl_destroy(rate_limiter_t *rl)
+{
+    if (!rl) return;
+
+    atomic_store(&rl->running, false);
+
+    /* Wake janitor so it can exit sooner */
+    pthread_join(rl->janitor_tid, NULL);
+
+    /* Dispose of hash table */
+    pthread_rwlock_wrlock(&rl->rwlock);
+    rl_bucket_t *cur, *tmp;
+    HASH_ITER(hh, rl->table, cur, tmp) {
+        HASH_DEL(rl->table, cur);
+        free(cur);
+    }
+    pthread_rwlock_unlock(&rl->rwlock);
+    pthread_rwlock_destroy(&rl->rwlock);
+
+    free(rl);
+    mm_log_info("ratelimiter: destroyed");
+}
+
+/**
+ * rl_allow()
+ * Attempt to deduct |permits| tokens from the bucket associated with |key|. If
+ * there are sufficient tokens, the request is permitted and zero is returned.
+ * Otherwise, a positive errno-style code is returned (EAGAIN).  Non-zero return
+ * values should result in a HTTP 429 “Too Many Requests” response.
+ */
+int
+rl_allow(rate_limiter_t *rl, const char *key, uint32_t permits)
+{
+    if (!rl || !key) return EINVAL;
+
+    const double permits_d = (double)permits;
+    const double now_sec   = mm_time_now_monotonic();
+
+    /*---- Acquire or create bucket ---------------------------------------*/
+    rl_bucket_t *bucket = NULL;
+
+    /* Fast path: optimistic read lock */
+    pthread_rwlock_rdlock(&rl->rwlock);
+    HASH_FIND_STR(rl->table, key, bucket);
+    pthread_rwlock_unlock(&rl->rwlock);
+
+    if (!bucket) {
+        /* Write lock and check again before creating */
+        pthread_rwlock_wrlock(&rl->rwlock);
+        HASH_FIND_STR(rl->table, key, bucket);
+        if (!bucket) {
+            bucket = calloc(1, sizeof(*bucket));
+            if (!bucket) {
+                pthread_rwlock_unlock(&rl->rwlock);
+                mm_log_error("ratelimiter: bucket malloc failed");
+                return ENOMEM;
+            }
+            strncpy(bucket->key, key, sizeof(bucket->key)-1);
+            bucket->tokens           = rl->capacity;     /* Start full */
+            bucket->last_refill_ts   = now_sec;
+            bucket->last_seen_wall   = time(NULL);
+            HASH_ADD_STR(rl->table, key, bucket);
+        }
+        pthread_rwlock_unlock(&rl->rwlock);
+    }
+
+    /*---- Apply token bucket algorithm -----------------------------------*/
+    int rc = bucket_maybe_refill(bucket, rl->capacity, rl->refill_rate, now_sec);
+    if (rc != 0) {
+        /* Should not happen */
+        return rc;
+    }
+
+    int allowed = 0;
+    if (bucket->tokens >= permits_d) {
+        bucket->tokens -= permits_d;
+        allowed = 1;
+        mm_metrics_counter_inc(rl->metric_allowed, 1);
+    } else {
+        mm_metrics_counter_inc(rl->metric_denied, 1);
+    }
+
+    bucket->last_seen_wall = time(NULL);
+
+    if (allowed)
+        return 0;          /* OK */
+    else
+        return EAGAIN;     /* Throttle */
+}
+
+/*-------------------------------------------------------------------------*/
+/* Internal Helpers                                                        */
+/*-------------------------------------------------------------------------*/
+
+/**
+ * bucket_maybe_refill()
+ * Refill tokens in a bucket based on elapsed time since the last refill.
+ */
+static int
+bucket_maybe_refill(rl_bucket_t *bucket,
+                    double       capacity,
+                    double       refill_rate,
+                    double       now_sec)
+{
+    if (!bucket) return EINVAL;
+
+    const double elapsed = now_sec - bucket->last_refill_ts;
+    if (elapsed <= 0.0)
+        return 0; /* Clock skew or same tick */
+
+    const double delta = elapsed * refill_rate;
+    bucket->tokens = bucket->tokens + delta;
+
+    if (bucket->tokens > capacity)
+        bucket->tokens = capacity;
+
+    bucket->last_refill_ts = now_sec;
+    return 0;
+}
+
+/*-------------------------------------------------------------------------*/
+/* Background Janitor                                                      */
+/*-------------------------------------------------------------------------*/
+
+static void *
+janitor_thread_fn(void *arg)
+{
+    rate_limiter_t *rl = arg;
+    const uint32_t period_ms = RL_JANITOR_PERIOD_MS;
+
+    while (atomic_load(&rl->running)) {
+        const time_t cut_off = time(NULL) - (time_t)rl->idle_ttl_sec;
+
+        /* Acquire write lock for eviction */
+        pthread_rwlock_wrlock(&rl->rwlock);
+        rl_bucket_t *cur, *tmp;
+        HASH_ITER(hh, rl->table, cur, tmp) {
+            if (cur->last_seen_wall < cut_off) {
+                HASH_DEL(rl->table, cur);
+                free(cur);
+            }
+        }
+        pthread_rwlock_unlock(&rl->rwlock);
+
+        mm_sleep_ms(period_ms);
+    }
+    return NULL;
+}
+
+/*-------------------------------------------------------------------------*/
+/* Test Harness (optional)                                                 */
+/*-------------------------------------------------------------------------*/
+#ifdef RL_SELFTEST
+
+/* Compile with:
+ *   cc -DRL_SELFTEST ratelimiter.c -lpthread -o rl_test
+ */
+#include <assert.h>
+
+static void *
+spam(void *ctx)
+{
+    rate_limiter_t *rl = ctx;
+    const char *key = "test-user";
+    for (int i = 0; i < 500; ++i) {
+        if (rl_allow(rl, key, 1) == 0) {
+            // allowed
+        } else {
+            // denied
+            mm_sleep_ms(10);
+        }
+    }
+    return NULL;
+}
+
+int main(void)
+{
+    rate_limiter_t *rl = rl_create();
+    pthread_t t1, t2;
+
+    pthread_create(&t1, NULL, spam, rl);
+    pthread_create(&t2, NULL, spam, rl);
+
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+
+    rl_destroy(rl);
+    return 0;
+}
+#endif /* RL_SELFTEST */

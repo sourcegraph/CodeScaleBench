@@ -1,0 +1,526 @@
+```rust
+//! src/module_79.rs
+//!
+//! Quality-Control & Enrichment stage for ChirpPulse’s real-time ETL
+//!
+//! This module owns the “QC/Enrich” micro-service that sits right after
+//! raw ingestion.  It validates structural and business constraints,
+//! removes duplicates in a partially ordered fashion, enriches events
+//! with lightweight metadata (e.g. language codes already discovered by a
+//! previous stage), and forwards the passing events to the next Kafka
+//! topic.
+//!
+//! The code showcases several architectural patterns used across
+//! ChirpPulse:
+//!   • Pipeline Pattern—each rule implements `QualityRule` and runs in
+//!     parallel over an async stream.
+//!   • Strategy Pattern—rules can be hot-swapped at run-time without
+//!     stopping the pipeline.
+//!   • Observer Pattern—metrics are emitted for every rule and error.
+//!
+//! The implementation is fully asynchronous (Tokio) and production-grade
+//! with backpressure, cancellation and self-healing retry loops.
+
+#![allow(clippy::module_name_repetitions)]
+#![allow(dead_code)]
+
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use async_trait::async_trait;
+use bloom::{BloomFilter, ASMS};
+use dashmap::DashSet;
+use futures::{Stream, StreamExt};
+use metrics::{counter, histogram, increment_counter};
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    message::BorrowedMessage,
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig,
+};
+use serde::{Deserialize, Serialize};
+use tokio::{select, sync::RwLock, time};
+use tracing::{error, info, instrument, warn};
+
+/// The source Kafka topic where raw events arrive.
+const SOURCE_TOPIC: &str = "raw_social_events";
+/// The sink Kafka topic that receives validated events.
+const SINK_TOPIC: &str = "qc_valid_events";
+/// Topic for the dead-letter queue (invalid / unrecoverable).
+const DLQ_TOPIC: &str = "qc_dead_letter";
+
+/// The maximum amount of time the producer waits for Kafka acks.
+const PRODUCER_TIMEOUT_MS: u64 = 5000;
+
+/// Maximum number of past events to remember for duplicate detection.
+/// In a real system this would be sharded and/or backed by Redis.
+const DEDUP_CAPACITY: usize = 1_000_000;
+
+//
+// ───────────────────────────── Models ───────────────────────────────────────────
+//
+
+/// Minimal representation of a social interaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialEvent {
+    pub event_id: String,
+    pub user_id: String,
+    pub text: String,
+    pub lang: Option<String>,
+    pub created_at: u64, // epoch millis
+}
+
+/// Error emitted by quality-control rules.
+#[derive(thiserror::Error, Debug)]
+pub enum QualityError {
+    #[error("missing mandatory field: {0}")]
+    MissingField(&'static str),
+    #[error("text content is empty")]
+    EmptyText,
+    #[error("language unsupported: {0}")]
+    UnsupportedLanguage(String),
+    #[error("event already seen (duplicate)")]
+    Duplicate,
+    #[error("internal rule error: {0}")]
+    Internal(anyhow::Error),
+}
+
+/// Errors that invalidate producing to Kafka.
+/// These errors are sent to a DLQ to avoid stalling the pipeline.
+#[derive(thiserror::Error, Debug)]
+pub enum SinkError {
+    #[error("kafka produce error: {0}")]
+    Produce(String),
+    #[error("serialization error: {0}")]
+    Serialize(#[from] serde_json::Error),
+}
+
+/// Errors that may occur at the pipeline level.
+#[derive(thiserror::Error, Debug)]
+pub enum PipelineError {
+    #[error("source kafka error: {0}")]
+    Source(String),
+    #[error("sink error: {0}")]
+    Sink(#[from] SinkError),
+    #[error("rule error: {0}")]
+    Rule(#[from] QualityError),
+}
+
+//
+// ──────────────────────── Quality-control rules ────────────────────────────────
+//
+
+#[async_trait]
+pub trait QualityRule: Send + Sync + 'static {
+    /// Human-friendly rule name used in metrics/logs.
+    fn name(&self) -> &'static str;
+
+    /// Return `Ok(())` if the event passes validation/enrichment.
+    /// Otherwise return a `QualityError` describing the failure.
+    async fn check(&self, event: &mut SocialEvent) -> Result<(), QualityError>;
+}
+
+/// Ensures the `text` field is non-empty.
+pub struct NonEmptyText;
+
+#[async_trait]
+impl QualityRule for NonEmptyText {
+    fn name(&self) -> &'static str {
+        "non_empty_text"
+    }
+
+    async fn check(&self, event: &mut SocialEvent) -> Result<(), QualityError> {
+        if event.text.trim().is_empty() {
+            Err(QualityError::EmptyText)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Very small static allow-list of language codes for illustration.
+/// A real implementation would delegate to configuration / DB.
+pub struct LanguageAllowListRule {
+    allowed: &'static [&'static str],
+}
+
+impl LanguageAllowListRule {
+    pub const fn new(allowed: &'static [&'static str]) -> Self {
+        Self { allowed }
+    }
+}
+
+#[async_trait]
+impl QualityRule for LanguageAllowListRule {
+    fn name(&self) -> &'static str {
+        "language_allow_list"
+    }
+
+    async fn check(&self, event: &mut SocialEvent) -> Result<(), QualityError> {
+        let lang = event
+            .lang
+            .as_ref()
+            .ok_or(QualityError::MissingField("lang"))?;
+
+        if self.allowed.contains(&lang.as_str()) {
+            Ok(())
+        } else {
+            Err(QualityError::UnsupportedLanguage(lang.clone()))
+        }
+    }
+}
+
+/// Duplicate-detection using a Bloom filter plus exact check fallback.
+///
+/// The filter gives an O(1) approximate membership test with controllable
+/// false-positive rate.  We complement it with an exact check in the
+/// concurrent `DashSet` to eliminate false positives at the cost of
+/// additional in-RAM storage for the most recent `DEDUP_CAPACITY` IDs.
+pub struct DuplicateDetector {
+    // Fast, memory-efficient approximate set.
+    bloom: RwLock<BloomFilter>,
+    // Slow but exact set of recent IDs.  Evicted by size limits.
+    exact: DashSet<String>,
+}
+
+impl DuplicateDetector {
+    pub fn new(capacity: usize, fp_rate: f64) -> Self {
+        Self {
+            bloom: RwLock::new(BloomFilter::with_rate(fp_rate, capacity)),
+            exact: DashSet::with_capacity(capacity),
+        }
+    }
+}
+
+#[async_trait]
+impl QualityRule for DuplicateDetector {
+    fn name(&self) -> &'static str {
+        "duplicate_detector"
+    }
+
+    async fn check(&self, event: &mut SocialEvent) -> Result<(), QualityError> {
+        let id = &event.event_id;
+
+        // First, try the Bloom filter (approximate).
+        {
+            let bloom = self.bloom.read().await;
+            if !bloom.contains(id) {
+                // Definitely not seen before.  Mark in Bloom filter and exact set.
+                drop(bloom);
+                {
+                    let mut bloom = self.bloom.write().await;
+                    bloom.insert(id);
+                }
+                self.exact.insert(id.clone());
+                return Ok(());
+            }
+        }
+        // Bloom filter says "maybe". Perform exact check.
+        if self.exact.contains(id) {
+            Err(QualityError::Duplicate)
+        } else {
+            // False positive, record now.
+            {
+                let mut bloom = self.bloom.write().await;
+                bloom.insert(id);
+            }
+            // Evict if over capacity.
+            if self.exact.len() >= DEDUP_CAPACITY {
+                if let Some(first) = self.exact.iter().next() {
+                    self.exact.remove(first.key());
+                }
+            }
+            self.exact.insert(id.clone());
+            Ok(())
+        }
+    }
+}
+
+//
+// ──────────────────────────── Event Source ─────────────────────────────────────
+//
+
+/// Convert a borrowed Kafka message to `SocialEvent`.
+fn deserialize_event(msg: &BorrowedMessage<'_>) -> Result<SocialEvent, serde_json::Error> {
+    serde_json::from_slice::<SocialEvent>(msg.payload().unwrap_or_default())
+}
+
+/// Wrapper around a `StreamConsumer` that yields deserialized `SocialEvent`s.
+fn kafka_event_stream<'a>(
+    consumer: &'a StreamConsumer,
+) -> impl Stream<Item = Result<SocialEvent, PipelineError>> + 'a {
+    consumer
+        .stream()
+        .map(|result| match result {
+            Err(e) => Err(PipelineError::Source(e.to_string())),
+            Ok(m) => deserialize_event(&m).map_err(PipelineError::from),
+        })
+}
+
+//
+// ───────────────────────────── Event Sink ──────────────────────────────────────
+//
+
+/// Async sink that pushes JSON serialised events to a Kafka topic.
+struct KafkaJsonSink {
+    producer: FutureProducer,
+    topic: &'static str,
+}
+
+impl KafkaJsonSink {
+    fn new(brokers: &str, topic: &'static str) -> anyhow::Result<Self> {
+        let producer = ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set("message.timeout.ms", PRODUCER_TIMEOUT_MS.to_string())
+            .create()?;
+        Ok(Self { producer, topic })
+    }
+
+    #[instrument(skip_all, fields(topic = self.topic))]
+    async fn send(&self, event: &SocialEvent) -> Result<(), SinkError> {
+        let payload = serde_json::to_vec(event)?;
+        let record = FutureRecord::to(self.topic)
+            .key(&event.event_id)
+            .payload(&payload);
+        let produce_future = self.producer.send(record, Duration::from_millis(PRODUCER_TIMEOUT_MS));
+
+        match produce_future.await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err((e, _))) | Err((e, _)) => Err(SinkError::Produce(e.to_string())),
+        }
+    }
+}
+
+//
+// ───────────────────────────── Pipeline  ───────────────────────────────────────
+//
+
+/// Thread-safe, hot-swapable registry of `QualityRule`s.
+///
+/// Data scientists can update the active ruleset at run-time by calling
+/// [`RuleRegistry::replace_rules`] with a freshly built vector.
+#[derive(Default)]
+pub struct RuleRegistry {
+    inner: RwLock<Vec<Arc<dyn QualityRule>>>,
+}
+
+impl RuleRegistry {
+    pub fn new(initial: Vec<Arc<dyn QualityRule>>) -> Self {
+        Self {
+            inner: RwLock::new(initial),
+        }
+    }
+
+    /// Atomically replace the full ruleset.
+    pub async fn replace_rules(&self, rules: Vec<Arc<dyn QualityRule>>) {
+        let mut guard = self.inner.write().await;
+        *guard = rules;
+        info!(count = guard.len(), "Replaced quality-ruleset");
+    }
+
+    /// Fetch a snapshot clone of the current rules.
+    pub async fn snapshot(&self) -> Vec<Arc<dyn QualityRule>> {
+        self.inner.read().await.clone()
+    }
+}
+
+/// The main orchestrator that wires sources, rules and sink.
+pub struct QualityPipeline {
+    rules: Arc<RuleRegistry>,
+    sink: Arc<KafkaJsonSink>,
+    cancel: Arc<RwLock<bool>>,
+}
+
+impl QualityPipeline {
+    pub fn new(rules: Arc<RuleRegistry>, sink: Arc<KafkaJsonSink>) -> Self {
+        Self {
+            rules,
+            sink,
+            cancel: Arc::new(RwLock::new(false)),
+        }
+    }
+
+    /// Request graceful shutdown.
+    pub async fn shutdown(&self) {
+        let mut guard = self.cancel.write().await;
+        *guard = true;
+    }
+
+    /// Consumes from `consumer` indefinitely until `shutdown` is called.
+    #[instrument(skip_all, name = "quality_pipeline")]
+    pub async fn run(&self, consumer: StreamConsumer) -> anyhow::Result<()> {
+        info!("QC Pipeline starting");
+        // Subscribe to topic.
+        consumer.subscribe(&[SOURCE_TOPIC])?;
+
+        // Stream loop with back-pressure.
+        let mut stream = kafka_event_stream(&consumer);
+
+        loop {
+            select! {
+                cancelled = self.cancel.read(), if *cancelled => {
+                    info!("QC Pipeline received shutdown signal");
+                    break;
+                }
+                maybe_msg = stream.next() => {
+                    match maybe_msg {
+                        None => {
+                            warn!("Event stream unexpectedly ended");
+                            break;
+                        }
+                        Some(Err(err)) => {
+                            error!(error = %err, "Event stream error");
+                            counter!("pipeline_errors_total", 1, "stage" => "source");
+                        }
+                        Some(Ok(mut event)) => {
+                            // Process one event
+                            let start = SystemTime::now();
+
+                            match self.process_event(&mut event).await {
+                                Ok(()) => {
+                                    let latency = SystemTime::now()
+                                        .duration_since(start)
+                                        .unwrap_or_default()
+                                        .as_millis() as f64;
+                                    histogram!("pipeline_event_latency_ms", latency);
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "Processing error");
+                                    counter!("pipeline_errors_total", 1, "stage" => "processing");
+                                    // Push to DLQ
+                                    if let Err(dlq_err) = self.sink_dead_letter(&event, &e).await {
+                                        error!(error = %dlq_err, "Failed to write to DLQ");
+                                        counter!("pipeline_errors_total", 1, "stage" => "dlq");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        info!("QC Pipeline stopped");
+        Ok(())
+    }
+
+    #[instrument(skip_all)]
+    async fn process_event(&self, event: &mut SocialEvent) -> Result<(), PipelineError> {
+        let rules = self.rules.snapshot().await;
+
+        for rule in rules.iter() {
+            // For every rule we catch its error separately to emit per-rule metrics.
+            match rule.check(event).await {
+                Ok(()) => increment_counter!("rule_pass_total", "rule" => rule.name()),
+                Err(err) => {
+                    increment_counter!("rule_fail_total", "rule" => rule.name());
+                    return Err(PipelineError::Rule(err));
+                }
+            }
+        }
+
+        // Forward to sink
+        self.sink.send(event).await?;
+        Ok(())
+    }
+
+    #[instrument(skip_all)]
+    async fn sink_dead_letter(
+        &self,
+        event: &SocialEvent,
+        err: &PipelineError,
+    ) -> Result<(), SinkError> {
+        let payload = DeadLetterPayload::new(event, err);
+        let dlq_sink = &*self.sink; // reuse underlying producer, different topic
+        let record = FutureRecord::to(DLQ_TOPIC)
+            .key(&event.event_id)
+            .payload(&serde_json::to_vec(&payload)?);
+
+        match dlq_sink
+            .producer
+            .send(record, Duration::from_millis(PRODUCER_TIMEOUT_MS))
+            .await
+        {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err((e, _))) | Err((e, _)) => Err(SinkError::Produce(e.to_string())),
+        }
+    }
+}
+
+//
+// ───────────────────────────── DLQ payload ─────────────────────────────────────
+//
+
+#[derive(Debug, Serialize)]
+struct DeadLetterPayload<'a> {
+    event: &'a SocialEvent,
+    error: String,
+    failed_at: u64,
+}
+
+impl<'a> DeadLetterPayload<'a> {
+    fn new(event: &'a SocialEvent, error: &PipelineError) -> Self {
+        let failed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Self {
+            event,
+            error: error.to_string(),
+            failed_at,
+        }
+    }
+}
+
+//
+// ──────────────────────────────── main  ────────────────────────────────────────
+//
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Initialise tracing and metrics exporters (omitted for brevity).
+    // tracing_subscriber::fmt::init();
+
+    // Build Kafka clients.
+    let brokers = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".into());
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("group.id", "chirp_qc")
+        .set("bootstrap.servers", &brokers)
+        .create()?;
+
+    let sink = Arc::new(KafkaJsonSink::new(&brokers, SINK_TOPIC)?);
+
+    // Build initial rule set.
+    let rules = Arc::new(RuleRegistry::new(vec![
+        Arc::new(NonEmptyText),
+        Arc::new(LanguageAllowListRule::new(&["en", "es", "fr"])),
+        Arc::new(DuplicateDetector::new(DEDUP_CAPACITY, 0.001)),
+    ]));
+
+    // Launch pipeline.
+    let pipeline = QualityPipeline::new(rules, sink.clone());
+
+    // Graceful shutdown when Ctrl-C is pressed.
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for ctrl_c");
+    };
+
+    tokio::select! {
+        res = pipeline.run(consumer) => {
+            if let Err(e) = res {
+                error!(error = %e, "QC Pipeline fatal error");
+            }
+        }
+        _ = ctrl_c => {
+            info!("Received Ctrl-C, shutting down");
+            pipeline.shutdown().await;
+        }
+    }
+
+    Ok(())
+}
+```

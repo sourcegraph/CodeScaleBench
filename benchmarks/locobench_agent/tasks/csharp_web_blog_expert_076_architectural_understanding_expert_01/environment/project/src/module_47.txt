@@ -1,0 +1,385 @@
+```csharp
+// File: src/module_47.txt
+// Project: TempoScribe Pro – Hexagonal Productivity Blog Suite (web_blog)
+// Language: C#
+//
+// NOTE:
+// This file implements a production–grade Stripe payment adapter that
+// satisfies the IPaymentGatewayPort used by the domain core.  It
+// encapsulates Stripe‐specific concerns (API keys, retries, pagination,
+// idempotency, etc.) behind a technology‐agnostic port, enabling the rest
+// of the system to stay blissfully unaware of Stripe’s SDK.
+//
+// The adapter adds:
+//   • Configurable caching for plan lookups (using IDistributedCache)
+//   • Structured logging (ILogger)
+//   • Resilience w/ Polly retry policies
+//   • Rich error mapping to a domain‐friendly PaymentError
+//
+// External NuGet packages expected (not shown in this file):
+//   • Stripe.net
+//   • Microsoft.Extensions.*
+//   • Polly
+//
+// ────────────────────────────────────────────────────────────────────────────
+
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Polly;
+using Polly.Retry;
+using Stripe;
+
+namespace TempoScribePro.Infrastructure.Payments.StripeAdapter
+{
+    #region Domain-facing Port Interfaces + DTOs
+    /// <summary>
+    /// Technology-agnostic contract used by the core domain to execute payments.
+    /// </summary>
+    public interface IPaymentGatewayPort
+    {
+        Task<PaymentResult> ChargeAsync(PaymentRequest request, CancellationToken token = default);
+        Task<SubscriptionResult> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken token = default);
+        Task<IReadOnlyList<PlanDto>> GetAvailablePlansAsync(CancellationToken token = default);
+    }
+
+    /// <summary>Describes a one-time payment attempt.</summary>
+    public sealed record PaymentRequest(
+        string CustomerEmail,
+        decimal Amount,
+        string CurrencyIso,
+        string PaymentMethodToken,
+        string IdempotencyKey,
+        string MetadataJson);
+
+    /// <summary>Outcome of a one-time charge.</summary>
+    public sealed record PaymentResult(
+        bool IsSuccess,
+        string TransactionId,
+        PaymentError? Error);
+
+    /// <summary>Describes a recurring subscription to be created.</summary>
+    public sealed record SubscriptionRequest(
+        string CustomerEmail,
+        string PlanId,
+        string PaymentMethodToken,
+        string IdempotencyKey,
+        string MetadataJson);
+
+    /// <summary>Outcome of a subscription creation.</summary>
+    public sealed record SubscriptionResult(
+        bool IsSuccess,
+        string SubscriptionId,
+        PaymentError? Error);
+
+    /// <summary>Static details about a pricing plan.</summary>
+    public sealed record PlanDto(
+        string PlanId,
+        string Name,
+        string CurrencyIso,
+        decimal PricePerPeriod,
+        string Interval,
+        bool IsActive);
+
+    /// <summary>Domain-friendly abstraction of payment errors.</summary>
+    public sealed record PaymentError(
+        string Code,
+        string Message,
+        HttpStatusCode? HttpStatus);
+    #endregion
+
+    #region Adapter Configuration
+    /// <summary>POCO bound via IOptions&lt;StripeSettings&gt;.</summary>
+    public sealed class StripeSettings
+    {
+        /// <summary>Secret key assigned by Stripe dashboard.</summary>
+        public string SecretKey { get; init; } = null!;
+
+        /// <summary>Cache TTL for plan lookups (in seconds).</summary>
+        public int PlanCacheSeconds { get; init; } = 300;
+    }
+    #endregion
+
+    #region Adapter Implementation
+    /// <summary>
+    /// Production-ready adapter that speaks Stripe’s dialect and fulfills
+    /// TempoScribe’s <see cref="IPaymentGatewayPort"/> expectations.
+    /// </summary>
+    public sealed class StripePaymentGatewayAdapter : IPaymentGatewayPort
+    {
+        private readonly StripeSettings              _settings;
+        private readonly ILogger<StripePaymentGatewayAdapter> _logger;
+        private readonly IDistributedCache           _cache;
+        private readonly AsyncRetryPolicy            _retryPolicy;
+
+        private readonly CustomerService             _customerService;
+        private readonly PaymentIntentService        _paymentIntentService;
+        private readonly PlanService                 _planService;
+        private readonly SubscriptionService         _subscriptionService;
+
+        public StripePaymentGatewayAdapter(
+            IOptions<StripeSettings>                  settingsOptions,
+            ILogger<StripePaymentGatewayAdapter>      logger,
+            IDistributedCache                         cache)
+        {
+            _settings  = settingsOptions?.Value ?? throw new ArgumentNullException(nameof(settingsOptions));
+            _logger    = logger  ?? throw new ArgumentNullException(nameof(logger));
+            _cache     = cache   ?? throw new ArgumentNullException(nameof(cache));
+
+            StripeConfiguration.ApiKey = _settings.SecretKey;
+
+            // Configure retry for transient network errors
+            _retryPolicy = Policy
+                .Handle<StripeException>(IsTransientStripeError)
+                .Or<ServiceUnavailableException>()
+                .WaitAndRetryAsync(
+                    retryCount: 3,
+                    sleepDurationProvider: attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)),
+                    onRetry: (ex, delay, attempt, _) =>
+                    {
+                        _logger.LogWarning(ex, "Retry {Attempt} after {Delay}s due to transient Stripe error.", attempt, delay.TotalSeconds);
+                    });
+
+            // Initialize Stripe services
+            _customerService      = new CustomerService();
+            _paymentIntentService = new PaymentIntentService();
+            _planService          = new PlanService();
+            _subscriptionService  = new SubscriptionService();
+        }
+
+        #region Public Port Methods
+        public async Task<PaymentResult> ChargeAsync(PaymentRequest request, CancellationToken token = default)
+        {
+            if (request is null) throw new ArgumentNullException(nameof(request));
+
+            // Stripe expects smallest currency unit (e.g., cents)
+            var amountInMinorUnit = (long)(request.Amount * 100);
+
+            try
+            {
+                return await _retryPolicy.ExecuteAsync(async ct =>
+                {
+                    var customer = await CreateOrGetCustomerAsync(request.CustomerEmail, ct);
+
+                    var paymentIntentOptions = new PaymentIntentCreateOptions
+                    {
+                        Amount              = amountInMinorUnit,
+                        Currency            = request.CurrencyIso,
+                        Customer            = customer.Id,
+                        PaymentMethod       = request.PaymentMethodToken,
+                        ConfirmationMethod  = "automatic",
+                        Confirm             = true,
+                        Metadata            = ParseMetadata(request.MetadataJson),
+                    };
+
+                    var intent = await _paymentIntentService.CreateAsync(
+                        paymentIntentOptions,
+                        new RequestOptions
+                        {
+                            IdempotencyKey = request.IdempotencyKey,
+                        },
+                        ct);
+
+                    _logger.LogInformation("Stripe charge successful. Id: {PaymentIntentId}", intent.Id);
+
+                    return new PaymentResult(
+                        IsSuccess     : true,
+                        TransactionId : intent.Id,
+                        Error         : null);
+                }, token);
+            }
+            catch (Exception ex)
+            {
+                var error = MapStripeError(ex);
+                _logger.LogError(ex, "Stripe charge failed: {ErrorMessage}", error?.Message);
+                return new PaymentResult(false, TransactionId: string.Empty, error);
+            }
+        }
+
+        public async Task<SubscriptionResult> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken token = default)
+        {
+            if (request is null) throw new ArgumentNullException(nameof(request));
+
+            try
+            {
+                return await _retryPolicy.ExecuteAsync(async ct =>
+                {
+                    var customer = await CreateOrGetCustomerAsync(request.CustomerEmail, ct);
+
+                    var subscriptionOptions = new SubscriptionCreateOptions
+                    {
+                        Customer    = customer.Id,
+                        Items       = new List<SubscriptionItemOptions>
+                        {
+                            new() { Plan = request.PlanId }
+                        },
+                        DefaultPaymentMethod = request.PaymentMethodToken,
+                        Metadata            = ParseMetadata(request.MetadataJson),
+                    };
+
+                    var subscription = await _subscriptionService.CreateAsync(
+                        subscriptionOptions,
+                        new RequestOptions
+                        {
+                            IdempotencyKey = request.IdempotencyKey,
+                        },
+                        ct);
+
+                    _logger.LogInformation("Stripe subscription created. Id: {SubscriptionId}", subscription.Id);
+
+                    return new SubscriptionResult(
+                        IsSuccess      : true,
+                        SubscriptionId : subscription.Id,
+                        Error          : null);
+                }, token);
+            }
+            catch (Exception ex)
+            {
+                var error = MapStripeError(ex);
+                _logger.LogError(ex, "Stripe subscription failed: {ErrorMessage}", error?.Message);
+                return new SubscriptionResult(false, SubscriptionId: string.Empty, error);
+            }
+        }
+
+        public async Task<IReadOnlyList<PlanDto>> GetAvailablePlansAsync(CancellationToken token = default)
+        {
+            var cacheKey = "StripePlans:v1";
+            var cached   = await _cache.GetStringAsync(cacheKey, token);
+
+            if (cached != null)
+            {
+                _logger.LogDebug("Stripe plans served from cache.");
+                return JsonSerializer.Deserialize<List<PlanDto>>(cached)!;
+            }
+
+            try
+            {
+                var planList = await _retryPolicy.ExecuteAsync(async ct =>
+                {
+                    var plans = await _planService.ListAsync(new PlanListOptions
+                    {
+                        Active   = true,
+                        Limit    = 100,
+                    }, requestOptions: null, cancellationToken: ct);
+
+                    var dtos = new List<PlanDto>();
+
+                    foreach (var plan in plans.Data)
+                    {
+                        // Stripe’s decimal amounts are in minor units
+                        decimal price = plan.AmountDecimal ?? 0;
+                        if (price == 0 && plan.Amount.HasValue)
+                            price = plan.Amount.Value / 100m;
+
+                        dtos.Add(new PlanDto(
+                            PlanId         : plan.Id,
+                            Name           : plan.Nickname ?? plan.Id,
+                            CurrencyIso    : plan.Currency,
+                            PricePerPeriod : price,
+                            Interval       : plan.Interval,
+                            IsActive       : plan.Active));
+                    }
+
+                    return dtos;
+                }, token);
+
+                // Cache serialized plans
+                var json = JsonSerializer.Serialize(planList, new JsonSerializerOptions
+                {
+                    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+                });
+
+                var options = new DistributedCacheEntryOptions
+                {
+                    AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(_settings.PlanCacheSeconds)
+                };
+
+                await _cache.SetStringAsync(cacheKey, json, options, token);
+
+                return planList;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error fetching Stripe plans.");
+                throw; // Let caller decide how to act; plan retrieval is non-critical.
+            }
+        }
+        #endregion
+
+        #region Private helpers
+
+        private async Task<Customer> CreateOrGetCustomerAsync(string email, CancellationToken token)
+        {
+            // Try retrieving existing customer
+            var customers = await _customerService.ListAsync(new CustomerListOptions
+            {
+                Email = email,
+                Limit = 1
+            }, null, token);
+
+            if (customers.Data.Count > 0)
+            {
+                _logger.LogDebug("Found existing Stripe customer for {Email}.", email);
+                return customers.Data[0];
+            }
+
+            // Create new customer
+            var customer = await _customerService.CreateAsync(new CustomerCreateOptions
+            {
+                Email = email
+            }, null, token);
+
+            _logger.LogDebug("Created new Stripe customer {CustomerId} for {Email}.", customer.Id, email);
+            return customer;
+        }
+
+        private static Dictionary<string, string>? ParseMetadata(string? metadataJson)
+        {
+            if (string.IsNullOrWhiteSpace(metadataJson))
+                return null;
+
+            try
+            {
+                return JsonSerializer.Deserialize<Dictionary<string, string>>(metadataJson);
+            }
+            catch
+            {
+                // Ignore malformed metadata to avoid blocking payment
+                return null;
+            }
+        }
+
+        private static bool IsTransientStripeError(StripeException ex)
+        {
+            // 5xx or rate limiting are considered transient
+            return ex.StripeError?.Type == "api_error"
+                   || ex.HttpStatusCode is >= HttpStatusCode.InternalServerError
+                   || ex.StripeError?.Code == "rate_limit";
+        }
+
+        private static PaymentError MapStripeError(Exception ex)
+        {
+            return ex switch
+            {
+                StripeException stripeEx => new PaymentError(
+                    Code       : stripeEx.StripeError?.Code ?? stripeEx.Code.ToString(),
+                    Message    : stripeEx.StripeError?.Message ?? stripeEx.Message,
+                    HttpStatus : stripeEx.HttpStatusCode),
+                _ => new PaymentError(
+                    Code       : "unknown_error",
+                    Message    : ex.Message,
+                    HttpStatus : null)
+            };
+        }
+        #endregion
+    }
+    #endregion
+}
+```

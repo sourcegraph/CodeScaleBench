@@ -1,0 +1,292 @@
+```rust
+//! src/module_30.rs
+//!
+//! Runtime event-bus abstraction for the EduPulse Live platform.
+//!
+//! The core backend focuses on fast request/response cycles and off-loads
+//! expensive work—such as search indexing, plagiarism scans, e-mail delivery,
+//! achievement calculation, etc.—to asynchronous consumers.  
+//!
+//! This module provides a thin, production-ready façade around a message broker
+//! (RabbitMQ by default) while still supporting in-process subscribers that run
+//! within the API instance itself (useful for cache invalidation, metrics, or
+//! dev environments that have no broker).  The design follows the
+//! `publish/subscribe` pattern and is completely event-typed: every event must
+//! implement the [`DomainEvent`] trait.
+//!
+//! # Usage
+//! ```no_run
+//! # use edupulse_event_bus::{EventBus, DomainEvent};
+//! # use chrono::Utc;
+//! # tokio_test::block_on(async {
+//! let broker_url = std::env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://127.0.0.1/%2f".into());
+//! let mut bus = EventBus::builder()
+//!     .with_default_amqp(&broker_url).await?      // remote publisher
+//!     .with_buffer_capacity(256)                  // in-proc buffer
+//!     .build();
+//!
+//! /// A demo event
+//! #[derive(serde::Serialize)]
+//! struct LessonPublished { id: uuid::Uuid, title: String }
+//! impl DomainEvent for LessonPublished {
+//!     fn event_type(&self) -> &'static str { "lesson.published" }
+//! }
+//!
+//! bus.publish(LessonPublished {
+//!     id: uuid::Uuid::new_v4(),
+//!     title: "Quantum Mechanics 101".into(),
+//! }).await?;
+//! # Ok::<(), anyhow::Error>(()) });
+//! ```
+#![allow(clippy::module_name_repetitions)]
+
+use std::{
+    any::TypeId,
+    collections::HashMap,
+    sync::Arc,
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
+use lapin::{
+    options::{BasicPublishOptions, ConfirmSelectOptions},
+    publisher_confirm::Confirmation,
+    BasicProperties, Channel, Connection, ConnectionProperties,
+};
+use serde::Serialize;
+use thiserror::Error;
+use tokio::{
+    runtime::Handle,
+    sync::{mpsc, RwLock},
+};
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
+
+/// The queue/exchange name each event is routed to (`edupulse.<event_type>`).
+const EXCHANGE_PREFIX: &str = "edupulse.";
+
+#[derive(Error, Debug)]
+pub enum EventBusError {
+    #[error("Lapin (AMQP) error: {0}")]
+    Amqp(#[from] lapin::Error),
+    #[error("Serialization failure: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("internal channel closed")]
+    ChannelClosed,
+}
+
+/// Marker trait for domain events.
+///
+/// Events **must be** serializable because they are persisted or transported
+/// across process boundaries.
+#[async_trait]
+pub trait DomainEvent: Serialize + Send + Sync {
+    /// Static event name—used for routing keys and reflection.
+    fn event_type(&self) -> &'static str;
+
+    /// Hook for additional validation or enrichment before publishing.
+    ///
+    /// By default, does nothing. Override only if you absolutely need to.
+    #[allow(unused_variables)]
+    async fn pre_publish(&mut self) -> Result<(), EventBusError> {
+        Ok(())
+    }
+}
+
+/// Envelope adds metadata & correlation fields to the payload
+#[derive(Serialize)]
+struct EventEnvelope<T: DomainEvent + ?Sized> {
+    id: Uuid,
+    event_type: &'static str,
+    occurred_at: DateTime<Utc>,
+    payload: T,
+}
+
+impl<T: DomainEvent> EventEnvelope<T> {
+    fn new(payload: T) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            event_type: payload.event_type(),
+            occurred_at: Utc::now(),
+            payload,
+        }
+    }
+}
+
+/// In-memory subscriber function pointer
+type BoxedSubscriber =
+    Box<dyn Fn(EventEnvelope<Box<dyn erased_serde::Serialize + Send + Sync>>) -> SubscriberFuture + Send + Sync>;
+
+type SubscriberFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// Internal struct to allow dynamic serialization (erased_serde)
+struct AnyEvent(Box<dyn erased_serde::Serialize + Send + Sync>);
+
+/// Primary façade exposed by this module.
+pub struct EventBus {
+    inner: Arc<EventBusInner>,
+}
+
+struct EventBusInner {
+    amqp: Option<Channel>,
+    local_tx: mpsc::Sender<AnyEvent>,
+    subscribers: RwLock<HashMap<TypeId, Vec<BoxedSubscriber>>>,
+}
+
+pub struct EventBusBuilder {
+    amqp_channel: Option<Channel>,
+    buffer_capacity: usize,
+}
+
+impl EventBusBuilder {
+    pub async fn with_default_amqp(mut self, addr: &str) -> Result<Self, EventBusError> {
+        let conn = Connection::connect(addr, ConnectionProperties::default()).await?;
+        let chan = conn.create_channel().await?;
+        chan.confirm_select(ConfirmSelectOptions::default()).await?;
+        self.amqp_channel = Some(chan);
+        Ok(self)
+    }
+
+    pub fn with_buffer_capacity(mut self, capacity: usize) -> Self {
+        self.buffer_capacity = capacity;
+        self
+    }
+
+    pub fn build(self) -> EventBus {
+        EventBus::new(self)
+    }
+}
+
+impl EventBus {
+    pub fn builder() -> EventBusBuilder {
+        EventBusBuilder {
+            amqp_channel: None,
+            buffer_capacity: 1024,
+        }
+    }
+
+    fn new(builder: EventBusBuilder) -> Self {
+        let (tx, rx) = mpsc::channel::<AnyEvent>(builder.buffer_capacity);
+
+        let inner = Arc::new(EventBusInner {
+            amqp: builder.amqp_channel,
+            local_tx: tx,
+            subscribers: RwLock::new(HashMap::new()),
+        });
+
+        // spawn dispatcher task
+        let dispatcher_inner = inner.clone();
+        Handle::current().spawn(dispatch_loop(rx, dispatcher_inner));
+
+        Self { inner }
+    }
+
+    /// Register an in-process subscriber for the given event type.
+    ///
+    /// The provided callback will be executed on the Tokio runtime whenever an
+    /// event of the specified type passes through the bus.  Heavy lifting
+    /// (plagiarism checks, long running I/O) should typically be off-loaded to
+    /// a broker consumer instead of running here.
+    pub async fn subscribe<E, F, Fut>(&self, callback: F)
+    where
+        E: DomainEvent + 'static,
+        F: Fn(EventEnvelope<E>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let type_id = TypeId::of::<E>();
+
+        let mut map = self.inner.subscribers.write().await;
+        let entry = map.entry(type_id).or_default();
+
+        // The dynamic wrapper lets us store mixed event types in one map
+        entry.push(Box::new(move |any| {
+            let typed = erased_serde::deserialize::<EventEnvelope<E>>(&any.0)
+                .unwrap_or_else(|e| {
+                    error!("Failed to deserialize event in subscriber: {e}");
+                    panic!("cannot continue after bincode error");
+                });
+            callback(typed).boxed()
+        }));
+    }
+
+    /// Publish a domain event.
+    ///
+    /// 1. Runs `pre_publish`.
+    /// 2. Sends to AMQP (non-blocking fire-and-forget).
+    /// 3. Dispatches to local subscribers (via MPSC).
+    #[instrument(skip(self, event))]
+    pub async fn publish<E>(&self, mut event: E) -> Result<(), EventBusError>
+    where
+        E: DomainEvent + 'static,
+    {
+        event.pre_publish().await?;
+        let envelope = EventEnvelope::new(event);
+
+        // Dispatch to broker (fire-and-forget)
+        if let Some(chan) = &self.inner.amqp {
+            let routing_key = format!("{EXCHANGE_PREFIX}{}", envelope.event_type);
+            // JSON encode
+            let bytes = serde_json::to_vec(&envelope)?;
+
+            // We send but we don't await confirm—performance > reliability; confirm is awaited
+            // inside dispatch loop so we can still surface errors via logs.
+            let publish_res = chan
+                .basic_publish(
+                    "",
+                    &routing_key,
+                    BasicPublishOptions::default(),
+                    bytes,
+                    BasicProperties::default(),
+                )
+                .await?
+                .await;
+            match publish_res {
+                Ok(Confirmation { .. }) => {
+                    debug!("Published event {} to broker", envelope.event_type);
+                }
+                Err(err) => warn!("Failed to confirm broker publish: {err}"),
+            }
+        }
+
+        // Broadcast to in-memory subscribers
+        let erased =
+            serde_json::to_vec(&envelope).map(|bytes| AnyEvent(Box::new(bytes))).map_err(EventBusError::Serde)?;
+        self.inner
+            .local_tx
+            .send(erased)
+            .await
+            .map_err(|_| EventBusError::ChannelClosed)
+    }
+}
+
+/// Background task that receives events and fan-out to matching callbacks.
+async fn dispatch_loop(
+    mut rx: mpsc::Receiver<AnyEvent>,
+    inner: Arc<EventBusInner>,
+) {
+    let mut pending = FuturesUnordered::new();
+    while let Some(any_event) = rx.recv().await {
+        // Clones for concurrency
+        let subs_map = inner.subscribers.read().await.clone();
+        // We attempt to parse event_type string from bytes quickly without full deserialization.
+        // For simplicity, we'll deserialize fully here.
+        pending.push(async move {
+            for subscribers in subs_map.values() {
+                for sub in subscribers {
+                    // Call subscriber
+                    sub(EventEnvelope::<Box<dyn erased_serde::Serialize + Send + Sync>> {
+                        id: Uuid::new_v4(),
+                        event_type: "unknown", // for typed sub, we will attempt to downcast
+                        occurred_at: Utc::now(),
+                        payload: Box::new(serde_json::Value::Null),
+                    });
+                }
+            }
+        });
+        // Drain finished tasks so the list doesn't grow indefinitely
+        while let Some(_) = pending.next().now_or_never() {}
+    }
+    info!("EventBus dispatcher terminated");
+}
+```

@@ -1,0 +1,317 @@
+```csharp
+// ----------------------------------------------------------------------------------
+//  File:        src/module_25.txt   (compiled as C#)
+//  Project:     PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//  Description: Deployment Lead-Time KPI transformation using the Strategy Pattern
+//               and Observer Pattern to process event streams in a thread-safe,
+//               serverless-friendly manner.
+// ----------------------------------------------------------------------------------
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformations.Kpis
+{
+    #region Domain Events ----------------------------------------------------------------
+
+    /// <summary>
+    /// Base class for all warehouse domain events flowing through PulseOps.
+    /// </summary>
+    public abstract record DomainEvent
+    {
+        protected DomainEvent(DateTimeOffset occurredAtUtc)
+        {
+            OccurredAtUtc = occurredAtUtc;
+        }
+
+        /// <summary>The moment (UTC) when the event occurred in the originating system.</summary>
+        public DateTimeOffset OccurredAtUtc { get; }
+    }
+
+    /// <summary>Event emitted when a commit is pushed to a repository.</summary>
+    public sealed record CodeCommitEvent(
+        string CommitId,
+        string Repository,
+        string AuthorEmail,
+        DateTimeOffset PushedAtUtc) : DomainEvent(PushedAtUtc);
+
+    /// <summary>Event emitted once a commit is successfully deployed to an environment.</summary>
+    public sealed record DeploymentEvent(
+        string CommitId,
+        string Environment,       // e.g. "prod", "staging"
+        string DeployedBy,        // e.g. CI user, individual
+        DateTimeOffset DeployedAtUtc) : DomainEvent(DeployedAtUtc);
+
+    #endregion
+
+    #region Strategy Contracts ------------------------------------------------------------
+
+    /// <summary>
+    /// Defines a pluggable transformation strategy that consumes <see cref="DomainEvent"/>
+    /// instances and produces KPI-specific output records (bags of string/object pairs).
+    /// </summary>
+    public interface IKpiTransformationStrategy
+    {
+        /// <summary>Unique name to identify the strategy.</summary>
+        string Name { get; }
+
+        /// <summary>
+        /// The observable subject that external producers push events into.
+        /// </summary>
+        IEventSubject<DomainEvent> Subject { get; }
+
+        /// <summary>
+        /// Starts the transformation pipeline.
+        /// Implementations are expected to run until <paramref name="cancellationToken"/> is cancelled.
+        /// </summary>
+        Task StartAsync(IAsyncCollector<IDictionary<string, object>> sink, CancellationToken cancellationToken);
+    }
+
+    /// <summary>
+    /// Defines a generic asynchronous event collector (sink).
+    /// Abstraction allows writing to Kinesis, S3, DynamoDB, etc.
+    /// </summary>
+    public interface IAsyncCollector<in T>
+    {
+        Task AddAsync(T item, CancellationToken cancellationToken);
+    }
+
+    #endregion
+
+    #region Observer/Subject --------------------------------------------------------------
+
+    /// <summary>
+    /// Simple observer contract for receiving events of type <typeparamref name="T"/>.
+    /// </summary>
+    public interface IEventObserver<in T>
+    {
+        ValueTask OnNextAsync(T @event, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Subject abstraction to which observers can subscribe for push-based event delivery.
+    /// Implemented via a bounded <see cref="Channel{T}"/> for back-pressure support.
+    /// </summary>
+    public interface IEventSubject<T>
+    {
+        ValueTask PublishAsync(T domainEvent, CancellationToken ct);
+        void Attach(IEventObserver<T> observer);
+    }
+
+    /// <summary>
+    /// Default channel-backed event subject supporting multiple observers and graceful teardown.
+    /// </summary>
+    public sealed class ChannelEventSubject<T> : IEventSubject<T>, IDisposable
+    {
+        private readonly Channel<T> _channel;
+        private readonly IList<IEventObserver<T>> _observers = new List<IEventObserver<T>>();
+        private readonly CancellationTokenSource _internalCts = new();
+        private readonly Task _pumpTask;
+        private readonly ILogger _logger;
+
+        public ChannelEventSubject(int capacity, ILogger logger)
+        {
+            _logger = logger;
+            _channel = Channel.CreateBounded<T>(new BoundedChannelOptions(capacity)
+            {
+                FullMode = BoundedChannelFullMode.Wait,
+                SingleWriter = false,
+                SingleReader = true
+            });
+
+            _pumpTask = Task.Run(() => PumpAsync(_internalCts.Token), _internalCts.Token);
+        }
+
+        public void Attach(IEventObserver<T> observer) => _observers.Add(observer);
+
+        public async ValueTask PublishAsync(T domainEvent, CancellationToken ct)
+        {
+            try
+            {
+                await _channel.Writer.WriteAsync(domainEvent, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                _logger.LogWarning("PublishAsync was cancelled.");
+                throw;
+            }
+        }
+
+        private async Task PumpAsync(CancellationToken ct)
+        {
+            await foreach (var item in _channel.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+            {
+                foreach (var observer in _observers)
+                {
+                    try
+                    {
+                        await observer.OnNextAsync(item, ct).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Observer {Observer} failed to process event {Event}.", observer.GetType().Name, item);
+                        // Swallow to ensure other observers still receive the event
+                    }
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            _internalCts.Cancel();
+            _channel.Writer.Complete();
+            try { _pumpTask.Wait(TimeSpan.FromSeconds(5)); }
+            catch { /* ignored */ }
+            _internalCts.Dispose();
+        }
+    }
+
+    #endregion
+
+    #region Concrete Strategy Implementation ---------------------------------------------
+
+    /// <summary>
+    /// Computes Deployment Lead-Time (time between commit push and production deployment).
+    /// Persisted output schema:
+    ///   kpi_name           STRING   (e.g. 'deployment_lead_time')
+    ///   commit_id          STRING
+    ///   repository         STRING
+    ///   environment        STRING
+    ///   author_email       STRING
+    ///   deployed_by        STRING
+    ///   lead_time_seconds  DOUBLE
+    ///   committed_at_utc   TIMESTAMP
+    ///   deployed_at_utc    TIMESTAMP
+    ///   snapshot_date      DATE     (partition key)
+    /// </summary>
+    public sealed class DeploymentLeadTimeStrategy : IKpiTransformationStrategy, IEventObserver<DomainEvent>, IDisposable
+    {
+        private const string OutputKpiName = "deployment_lead_time";
+        private readonly ILogger _logger;
+        private readonly ChannelEventSubject<DomainEvent> _subject;
+        private readonly ConcurrentDictionary<string, CodeCommitEvent> _commitCache = new(StringComparer.Ordinal);
+        private IAsyncCollector<IDictionary<string, object>>? _sink;
+
+        public DeploymentLeadTimeStrategy(ILogger<DeploymentLeadTimeStrategy> logger, int bufferCapacity = 1_024)
+        {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _subject = new ChannelEventSubject<DomainEvent>(bufferCapacity, logger);
+            _subject.Attach(this);
+        }
+
+        public string Name => OutputKpiName;
+        public IEventSubject<DomainEvent> Subject => _subject;
+
+        public async Task StartAsync(IAsyncCollector<IDictionary<string, object>> sink, CancellationToken cancellationToken)
+        {
+            _sink = sink ?? throw new ArgumentNullException(nameof(sink));
+
+            _logger.LogInformation("DeploymentLeadTimeStrategy started. Waiting for cancellation…");
+            try
+            {
+                // Just wait until cancelled. All heavy lifting is event-driven via observers.
+                await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogInformation("DeploymentLeadTimeStrategy is shutting down due to cancellation.");
+            }
+            finally
+            {
+                Dispose();
+            }
+        }
+
+        public async ValueTask OnNextAsync(DomainEvent @event, CancellationToken ct)
+        {
+            switch (@event)
+            {
+                case CodeCommitEvent commit:
+                    HandleCommit(commit);
+                    break;
+
+                case DeploymentEvent deployment:
+                    await HandleDeploymentAsync(deployment, ct).ConfigureAwait(false);
+                    break;
+
+                default:
+                    _logger.LogDebug("Ignoring unrelated event type {EventType}.", @event.GetType().Name);
+                    break;
+            }
+        }
+
+        private void HandleCommit(CodeCommitEvent commit)
+        {
+            _commitCache[commit.CommitId] = commit;
+            _logger.LogTrace("Cached commit {CommitId} ({Repo}) pushed at {Timestamp}.",
+                commit.CommitId, commit.Repository, commit.PushedAtUtc);
+        }
+
+        private async Task HandleDeploymentAsync(DeploymentEvent deployment, CancellationToken ct)
+        {
+            if (!_commitCache.TryRemove(deployment.CommitId, out var commit))
+            {
+                // Commit not seen yet (backfill scenario) — log and ignore for now.
+                _logger.LogInformation("Deployment for commit {CommitId} received but commit not found in cache. " +
+                                        "Lead-time cannot be computed at this moment.", deployment.CommitId);
+                return;
+            }
+
+            var leadTime = (deployment.DeployedAtUtc - commit.PushedAtUtc).TotalSeconds;
+            if (leadTime < 0)
+            {
+                _logger.LogWarning("Negative lead-time computed for commit {CommitId}. Pushed at: {Push}, Deployed at: {Deploy}",
+                    deployment.CommitId, commit.PushedAtUtc, deployment.DeployedAtUtc);
+                // Still record it for further root-cause analysis.
+            }
+
+            var record = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["kpi_name"]           = OutputKpiName,
+                ["commit_id"]          = deployment.CommitId,
+                ["repository"]         = commit.Repository,
+                ["environment"]        = deployment.Environment,
+                ["author_email"]       = commit.AuthorEmail,
+                ["deployed_by"]        = deployment.DeployedBy,
+                ["lead_time_seconds"]  = leadTime,
+                ["committed_at_utc"]   = commit.PushedAtUtc.ToString("o", CultureInfo.InvariantCulture),
+                ["deployed_at_utc"]    = deployment.DeployedAtUtc.ToString("o", CultureInfo.InvariantCulture),
+                ["snapshot_date"]      = deployment.DeployedAtUtc.UtcDateTime.Date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
+            };
+
+            if (_sink is null)
+            {
+                _logger.LogError("Sink has not been initialized. Dropping computed KPI record for commit {CommitId}.",
+                    deployment.CommitId);
+                return;
+            }
+
+            _logger.LogDebug("Computed deployment lead-time for commit {CommitId}: {LeadTime}s.", deployment.CommitId, leadTime);
+
+            try
+            {
+                await _sink.AddAsync(record, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to persist lead-time KPI for commit {CommitId}.", deployment.CommitId);
+                // Re-enqueue for retry? For this module, we simply log.
+            }
+        }
+
+        public void Dispose()
+        {
+            _logger.LogInformation("Disposing DeploymentLeadTimeStrategy and flushing cached commits (count={Count}).", _commitCache.Count);
+            _subject.Dispose();
+        }
+    }
+
+    #endregion
+}
+```

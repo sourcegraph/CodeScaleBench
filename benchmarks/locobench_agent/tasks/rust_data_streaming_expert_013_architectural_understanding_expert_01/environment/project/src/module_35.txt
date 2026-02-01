@@ -1,0 +1,262 @@
+```rust
+//! module_35: Dynamic, hot-swappable sentiment analysis strategy loader
+//!
+//! This module demonstrates (1) the Strategy Pattern, (2) runtime
+//! configuration hot-reloading, and (3) high-level observability for a
+//! central part of the ChirpPulse data-streaming stack.
+//!
+//! The manager owns a thread-safe handle to the currently-active sentiment
+//! algorithm.  When `module_35.json` is modified (e.g. by a CI pipeline, CLI
+//! tool, or feature-flag rollout), the watcher transparently swaps in the
+//! new implementation without interrupting callers.
+//!
+//! Although the analyzers shipped here are simplified, the boundary surfaces
+//! are production-grade—they isolate lifetimes, thread safety, and error
+//! transparency, so more sophisticated analyzers (e.g. a TensorRT model) can
+//! be introduced with zero changes to downstream code.
+
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+
+use anyhow::{anyhow, Context, Result};
+use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use rand::Rng;
+use serde::Deserialize;
+use tracing::{debug, error, info, instrument};
+
+/// Public output of a sentiment algorithm.
+#[derive(Debug, Clone, Copy)]
+pub struct SentimentScore {
+    /// Range: [-1.0, 1.0] — negative to positive
+    pub polarity: f32,
+    /// 0–1: aggregated toxicity likelihood
+    pub toxicity: f32,
+}
+
+/// Trait defining the sentiment analysis strategy.
+///
+/// All concrete analyzers *must* be safe to share across threads.  Cloning
+/// can be expensive (e.g. if an analyzer wraps a large ML model), so we
+/// impose only `Send + Sync`—callers wrap the boxed trait in `Arc` as needed.
+pub trait SentimentAnalyzer: Send + Sync {
+    /// Perform the analysis
+    fn analyze(&self, text: &str) -> SentimentScore;
+
+    /// Human-readable identifier (for metrics + logs)
+    fn name(&self) -> &'static str;
+}
+
+/// Naive, rule-based analyzer (demo purposes only).
+pub struct RuleBasedAnalyzer;
+
+impl SentimentAnalyzer for RuleBasedAnalyzer {
+    fn analyze(&self, text: &str) -> SentimentScore {
+        // VERY naive: count :) and :( as proxies
+        let mut polarity = 0f32;
+        let mut toxicity = 0f32;
+        for word in text.split_whitespace() {
+            match word {
+                ":)" | "😊" | "❤️" => polarity += 0.2,
+                ":(" | "😡" | "💔" => polarity -= 0.2,
+                _ => {}
+            }
+            if ["hate", "kill", "die"].iter().any(|w| word.eq_ignore_ascii_case(w)) {
+                toxicity += 0.3;
+            }
+        }
+
+        SentimentScore {
+            polarity: polarity.clamp(-1.0, 1.0),
+            toxicity: toxicity.min(1.0),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "rule_based"
+    }
+}
+
+/// Probabilistic, pseudo Naive-Bayes analyzer (stub).
+///
+/// In a real deployment, this would load a persisted model or query a
+/// microservice.  Here we use randomness to mimic non-deterministic scoring.
+pub struct NaiveBayesAnalyzer;
+
+impl SentimentAnalyzer for NaiveBayesAnalyzer {
+    fn analyze(&self, _text: &str) -> SentimentScore {
+        let mut rng = rand::thread_rng();
+        SentimentScore {
+            polarity: rng.gen_range(-1.0..=1.0),
+            toxicity: rng.gen_range(0.0..=1.0),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "naive_bayes"
+    }
+}
+
+/// Deserialize-able runtime config.  Stored in `module_35.json`.
+#[derive(Debug, Deserialize, Clone)]
+struct RuntimeConfig {
+    /// Which algorithm to load
+    algorithm: String,
+}
+
+impl RuntimeConfig {
+    fn load_from(path: &Path) -> Result<Self> {
+        let mut buf = String::new();
+        File::open(path)
+            .with_context(|| format!("opening config file {}", path.display()))?
+            .read_to_string(&mut buf)
+            .context("reading config file")?;
+
+        serde_json::from_str(&buf).context("parsing config JSON")
+    }
+}
+
+/// Type alias simplifies downstream readability
+type SharedAnalyzer = Arc<RwLock<Box<dyn SentimentAnalyzer>>>;
+
+/// Manager that owns the live analyzer and watches for config changes
+pub struct AnalyzerManager {
+    analyzer: SharedAnalyzer,
+    /// Kept alive so the watcher thread isn’t dropped
+    _watcher: RecommendedWatcher,
+}
+
+impl AnalyzerManager {
+    /// Initialize manager and start watching `config_path`.  The call returns
+    /// after the first successful analyzer has been loaded.
+    #[instrument(level = "info", skip(config_path))]
+    pub fn new(config_path: PathBuf) -> Result<Self> {
+        // Initial load
+        let boxed = Self::build_analyzer(&config_path)?;
+        let analyzer = Arc::new(RwLock::new(boxed));
+
+        // Clone for the closure
+        let analyzer_clone = Arc::clone(&analyzer);
+        let path_clone = config_path.clone();
+
+        // We use the `notify` crate’s *blocking* API and spawn a dedicated
+        // thread; this keeps dependencies minimal and prevents the watcher
+        // from accidentally inheriting the Tokio runtime’s context.
+        let mut watcher: RecommendedWatcher = Watcher::new_immediate(move |res| {
+            if let Err(e) = Self::handle_watch_event(res, &path_clone, &analyzer_clone) {
+                error!(error = %e, "failed to handle watch event");
+            }
+        })
+        .context("initializing file watcher")?;
+
+        watcher
+            .configure(NotifyConfig::PreciseEvents(true))
+            .ok(); // best effort
+
+        watcher
+            .watch(&config_path, RecursiveMode::NonRecursive)
+            .with_context(|| format!("watching path {}", config_path.display()))?;
+
+        info!(path = %config_path.display(), "sentiment analyzer manager initialized");
+
+        Ok(Self {
+            analyzer,
+            _watcher: watcher,
+        })
+    }
+
+    /// Public API: analyze a text snippet using the *current* analyzer
+    #[instrument(level = "debug", skip(self, text))]
+    pub fn analyze(&self, text: &str) -> SentimentScore {
+        // Fast path: read lock is uncontested ~99.9% of the time
+        let guard = self.analyzer.read().expect("poisoned lock");
+        guard.analyze(text)
+    }
+
+    /// React to a notify event
+    fn handle_watch_event(
+        res: notify::Result<notify::Event>,
+        config_path: &Path,
+        analyzer_cell: &SharedAnalyzer,
+    ) -> Result<()> {
+        let event = res?;
+        // Ignore generic noise; reload only on *Modify* or *Create*
+        if !matches!(
+            event.kind,
+            EventKind::Modify(_) | EventKind::Create(_) | EventKind::Any
+        ) {
+            return Ok(());
+        }
+
+        debug!(?event.kind, "fs notify update detected");
+
+        let new_analyzer = Self::build_analyzer(config_path)?;
+        {
+            let mut guard = analyzer_cell
+                .write()
+                .map_err(|_| anyhow!("analyzer lock poisoned"))?;
+            *guard = new_analyzer;
+        }
+
+        info!("hot-swapped sentiment analyzer");
+        Ok(())
+    }
+
+    /// Build a boxed analyzer according to the provided config
+    fn build_analyzer(config_path: &Path) -> Result<Box<dyn SentimentAnalyzer>> {
+        let config = RuntimeConfig::load_from(config_path)?;
+        let algo: Box<dyn SentimentAnalyzer> = match config.algorithm.as_str() {
+            "rule_based" => Box::new(RuleBasedAnalyzer),
+            "naive_bayes" => Box::new(NaiveBayesAnalyzer),
+            other => {
+                return Err(anyhow!(
+                    "unknown sentiment algorithm `{other}` (supported: rule_based | naive_bayes)"
+                ))
+            }
+        };
+
+        info!(algo = algo.name(), "loaded sentiment analyzer");
+        Ok(algo)
+    }
+}
+
+//------------  Convenience helper for in-process tests  ----------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, thread};
+
+    fn write_config(path: &Path, algo: &str) {
+        let json = serde_json::json!({ "algorithm": algo }).to_string();
+        fs::write(path, json).unwrap();
+    }
+
+    #[test]
+    fn hot_swap_works() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_config(tmp.path(), "rule_based");
+
+        let mgr = AnalyzerManager::new(tmp.path().to_path_buf()).unwrap();
+        let score_a = mgr.analyze("I love Rust :)");
+
+        // Replace config with a Bayesian analyzer
+        write_config(tmp.path(), "naive_bayes");
+
+        // Give the watcher a moment to pick up the change
+        thread::sleep(Duration::from_millis(350));
+
+        let score_b = mgr.analyze("I love Rust :)");
+        // The second result should be produced by a different algorithm and
+        // thus likely differ from the deterministic rule-based polarity.
+        assert!(
+            (score_a.polarity - score_b.polarity).abs() > f32::EPSILON,
+            "polarity should differ after hot-swap"
+        );
+    }
+}
+```

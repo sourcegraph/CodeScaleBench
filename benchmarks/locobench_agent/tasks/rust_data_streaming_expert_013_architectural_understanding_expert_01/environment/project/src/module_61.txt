@@ -1,0 +1,378 @@
+```rust
+//! module_61.rs
+//!
+//! Real-time enrichment microservice for ChirpPulse.
+//!
+//! Listens to raw `social_events` from Kafka, runs a configurable chain of
+//! enrichers (language detection, toxicity scoring, …) and republishes the
+//! enriched records to `enriched_social_events`.
+//!
+//! The module demonstrates the Strategy Pattern by allowing enrichers to be
+//! swapped at runtime through a YAML configuration file that is watched for
+//! changes. When the file updates, the new pipeline definition is atomically
+//! switched in without dropping in-flight messages.
+//!
+//! Dependencies (add to Cargo.toml):
+//! ---------------------------------
+//! tokio           = { version = "1", features = ["macros", "rt-multi-thread"] }
+//! rdkafka         = { version = "0.34", features = ["tokio"] }
+//! serde           = { version = "1", features = ["derive"] }
+//! serde_yaml      = "0.9"
+//! anyhow          = "1"
+//! thiserror       = "1"
+//! tracing         = "0.1"
+//! tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+//! dashmap         = "5"
+//! notify          = { version = "6", default-features = false, features = ["tokio"] }
+
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use anyhow::Context;
+use dashmap::DashMap;
+use notify::{recommended_watcher, RecursiveMode, Watcher};
+use rdkafka::{
+    config::ClientConfig,
+    consumer::{Consumer, StreamConsumer},
+    message::{BorrowedMessage, OwnedHeaders},
+    producer::{FutureProducer, FutureRecord},
+};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    select,
+    sync::{mpsc, RwLock},
+    task,
+    time,
+};
+use tracing::{error, info, instrument, warn};
+
+// ===========================================================================
+// Domain types
+// ===========================================================================
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialEvent {
+    pub id: String,
+    pub author_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub sentiment_score: Option<f32>,
+    #[serde(flatten)]
+    pub extra: serde_yaml::Value,
+    #[serde(default)]
+    pub processed_at: Option<u128>,
+}
+
+// ===========================================================================
+// Error handling
+// ===========================================================================
+#[derive(thiserror::Error, Debug)]
+pub enum EnrichmentError {
+    #[error("Enricher `{0}` failed: {1}")]
+    EnricherFailure(String, anyhow::Error),
+    #[error("Kafka error: {0}")]
+    Kafka(#[from] rdkafka::error::KafkaError),
+    #[error("Serde error: {0}")]
+    Serde(#[from] serde_yaml::Error),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+// ===========================================================================
+// Enricher Strategy Trait
+// ===========================================================================
+#[async_trait::async_trait]
+pub trait Enricher: Send + Sync {
+    /// Human-readable identifier.
+    fn name(&self) -> &str;
+
+    /// Enriches the event in place. Implementations should avoid expensive
+    /// blocking I/O; if needed, spawn async tasks or offload to thread pools.
+    async fn enrich(&self, event: &mut SocialEvent) -> Result<(), anyhow::Error>;
+}
+
+// ===========================================================================
+// Enricher Implementations
+// ===========================================================================
+
+/// A dummy language detector for demonstration. Replace with a real model.
+pub struct LanguageDetector;
+
+#[async_trait::async_trait]
+impl Enricher for LanguageDetector {
+    fn name(&self) -> &str {
+        "lang_detect/v1"
+    }
+
+    async fn enrich(&self, event: &mut SocialEvent) -> Result<(), anyhow::Error> {
+        if event.language.is_none() {
+            // naïve heuristic
+            let lang = if event.text.chars().any(|c| ('\u{3040}'..='\u{30ff}').contains(&c)) {
+                "ja"
+            } else {
+                "en"
+            };
+            event.language = Some(lang.into());
+        }
+        Ok(())
+    }
+}
+
+/// A stub sentiment scorer; plug in your ML model here.
+pub struct SentimentScorer;
+
+#[async_trait::async_trait]
+impl Enricher for SentimentScorer {
+    fn name(&self) -> &str {
+        "sentiment/v0.1"
+    }
+
+    async fn enrich(&self, event: &mut SocialEvent) -> Result<(), anyhow::Error> {
+        if event.sentiment_score.is_none() {
+            let score = (event.text.len() % 100) as f32 / 100.0; // bogus :-)
+            event.sentiment_score = Some(score);
+        }
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// Pipeline configuration
+// ===========================================================================
+#[derive(Debug, Clone, Deserialize)]
+struct PipelineConfig {
+    enrichers: Vec<String>,
+}
+
+impl PipelineConfig {
+    fn default_path() -> PathBuf {
+        std::env::var("PIPELINE_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/etc/chirppulse/pipeline.yml"))
+    }
+}
+
+// Mapping from names in config to factory fns
+type EnricherFactory =
+    fn() -> Box<dyn Enricher>; // no capture; can be expanded for parametrised constructors
+
+fn registry() -> &'static DashMap<String, EnricherFactory> {
+    static REGISTRY: once_cell::sync::OnceCell<DashMap<String, EnricherFactory>> =
+        once_cell::sync::OnceCell::new();
+    REGISTRY.get_or_init(|| {
+        let map = DashMap::new();
+        map.insert("lang_detect/v1".to_string(), || Box::new(LanguageDetector));
+        map.insert("sentiment/v0.1".to_string(), || Box::new(SentimentScorer));
+        map
+    })
+}
+
+// ===========================================================================
+// Pipeline Manager
+// ===========================================================================
+type SharedPipeline = Arc<RwLock<Vec<Box<dyn Enricher>>>>;
+
+/// Watches a YAML file for modifications and refreshes the pipeline.
+async fn spawn_pipeline_watcher(
+    pipeline: SharedPipeline,
+    mut shutdown: mpsc::Receiver<()>,
+) -> anyhow::Result<()> {
+    let config_path = PipelineConfig::default_path();
+    let (tx_fs, mut rx_fs) = mpsc::channel::<()>(1);
+
+    // Spawn blocking notifier
+    let mut watcher = recommended_watcher(move |_event| {
+        // debounce by sending single signal
+        let _ = tx_fs.try_send(());
+    })?;
+    watcher.watch(&config_path, RecursiveMode::NonRecursive)?;
+
+    // Initial load
+    load_pipeline(&config_path, &pipeline).await?;
+
+    loop {
+        select! {
+            _ = rx_fs.recv() => {
+                if let Err(e) = load_pipeline(&config_path, &pipeline).await {
+                    error!("Failed to reload pipeline: {e:#}");
+                }
+            },
+            _ = shutdown.recv() => {
+                info!("Pipeline watcher shutting down");
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[instrument(skip(pipeline))]
+async fn load_pipeline(path: &PathBuf, pipeline: &SharedPipeline) -> anyhow::Result<()> {
+    let cfg_bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("reading pipeline config at {:?}", path))?;
+
+    let cfg: PipelineConfig = serde_yaml::from_slice(&cfg_bytes)
+        .with_context(|| "parsing pipeline yaml")?;
+
+    let mut vec: Vec<Box<dyn Enricher>> = Vec::with_capacity(cfg.enrichers.len());
+    for name in &cfg.enrichers {
+        if let Some(factory) = registry().get(name) {
+            vec.push(factory());
+        } else {
+            warn!("Unknown enricher `{name}` in config; skipping");
+        }
+    }
+    if vec.is_empty() {
+        warn!("Pipeline config produced empty pipeline; keeping existing");
+        return Ok(());
+    }
+
+    {
+        let mut write_guard = pipeline.write().await;
+        *write_guard = vec;
+    }
+    info!("Pipeline reloaded with {} stages", cfg.enrichers.len());
+    Ok(())
+}
+
+// ===========================================================================
+// Kafka Stream Processor
+// ===========================================================================
+pub struct EnrichmentEngine {
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+    pipeline: SharedPipeline,
+}
+
+impl EnrichmentEngine {
+    pub fn new(kafka_brokers: &str, group_id: &str) -> Result<Self, EnrichmentError> {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", kafka_brokers)
+            .set("group.id", group_id)
+            .set("auto.offset.reset", "earliest")
+            .set("enable.auto.commit", "false")
+            .create()?;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", kafka_brokers)
+            .create()?;
+
+        let pipeline: SharedPipeline = Arc::new(RwLock::new(Vec::new()));
+
+        Ok(Self {
+            consumer,
+            producer,
+            pipeline,
+        })
+    }
+
+    pub async fn run(mut self) -> Result<(), EnrichmentError> {
+        self.consumer
+            .subscribe(&["social_events"])
+            .context("subscribing to topic")?;
+
+        // Spawn pipeline watcher
+        let (tx_shutdown, rx_shutdown) = mpsc::channel::<()>(1);
+        let pipeline_clone = self.pipeline.clone();
+        task::spawn(async move {
+            if let Err(e) = spawn_pipeline_watcher(pipeline_clone, rx_shutdown).await {
+                error!("Pipeline watcher exited with error: {e:#}");
+            }
+        });
+
+        info!("EnrichmentEngine started");
+        loop {
+            let message = match self.consumer.recv().await {
+                Err(e) => {
+                    error!("Kafka error while receiving: {e}; backing off");
+                    time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                Ok(m) => m,
+            };
+
+            let res = self.process_message(&message).await;
+            if let Err(e) = res {
+                error!("Failed to process message: {e:#} – skipping");
+            }
+
+            // Manual commit
+            if let Err(e) = self.consumer.commit_message(&message, rdkafka::consumer::CommitMode::Async) {
+                warn!("Failed to commit offset: {e}");
+            }
+        }
+
+        // unreachable
+        #[allow(unreachable_code)]
+        {
+            // graceful shutdown
+            let _ = tx_shutdown.send(()).await;
+            Ok(())
+        }
+    }
+
+    #[instrument(skip(self, msg), fields(offset = msg.offset()))]
+    async fn process_message(&self, msg: &BorrowedMessage<'_>) -> Result<(), EnrichmentError> {
+        let payload = match msg.payload_view::<str>() {
+            None | Some(Err(_)) => {
+                warn!("Invalid UTF-8 in message; dropping");
+                return Ok(());
+            }
+            Some(Ok(s)) => s,
+        };
+
+        let mut event: SocialEvent = serde_yaml::from_str(payload)?;
+        {
+            let pipeline = self.pipeline.read().await;
+            for enricher in pipeline.iter() {
+                if let Err(err) = enricher.enrich(&mut event).await {
+                    return Err(EnrichmentError::EnricherFailure(enricher.name().into(), err));
+                }
+            }
+        }
+        event.processed_at = Some(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_millis(),
+        );
+
+        let encoded = serde_yaml::to_vec(&event)?;
+        let headers = OwnedHeaders::new().add("content-type", "application/x-yaml");
+
+        let record = FutureRecord::to("enriched_social_events")
+            .payload(&encoded)
+            .key(&event.id)
+            .headers(headers);
+
+        // Fire and forget; we could `await` to handle delivery errors
+        let _ = self.producer.send(record, Duration::from_secs(0));
+
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// Entrypoint
+// ===========================================================================
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .init();
+
+    let brokers = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".into());
+    let group_id = std::env::var("GROUP_ID").unwrap_or_else(|_| "chirppulse-enricher".into());
+
+    let engine = EnrichmentEngine::new(&brokers, &group_id)?;
+    if let Err(e) = engine.run().await {
+        error!("Engine crashed: {e:#}");
+    }
+    Ok(())
+}
+```

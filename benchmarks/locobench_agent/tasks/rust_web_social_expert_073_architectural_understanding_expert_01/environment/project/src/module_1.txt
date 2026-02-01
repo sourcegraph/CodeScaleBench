@@ -1,0 +1,512 @@
+```rust
+//! src/module_1.rs
+//! Authentication & Session Management module for **EduPulse Live – Event-Driven Social Learning Hub**
+//!
+//! This module demonstrates the Repository pattern, a thin Service layer,
+//! domain-event emission, and secure session management (JWT + Redis).
+//! It is self-contained and can be dropped into the larger workspace.
+//!
+//! Dependencies expected in `Cargo.toml` (not shown here):
+//! --------------------------------------------------------------------
+//! [dependencies]
+//! sqlx           = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "uuid"] }
+//! async-trait    = "0.1"
+//! serde          = { version = "1.0", features = ["derive"] }
+//! serde_json     = "1.0"
+//! uuid           = { version = "1", features = ["v4"] }
+//! argon2         = "0.5"
+//! jsonwebtoken   = "8"
+//! chrono         = { version = "0.4", features = ["serde"] }
+//! thiserror      = "1.0"
+//! tracing        = "0.1"
+//! deadpool-redis = { version = "0.12", features = ["rt_tokio_1"] }
+//! anyhow         = "1.0"
+//!
+//! Feature flags: `database_integration`, `session_management`, `user_authentication`
+//! --------------------------------------------------------------------
+
+use std::env;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgRow, PgPool, Row};
+use thiserror::Error;
+use tracing::{error, info};
+use uuid::Uuid;
+
+use argon2::{self, password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use jsonwebtoken::{
+    decode, encode, DecodingKey, EncodingKey, Header, TokenData, Validation,
+};
+
+/// Custom result type for the auth domain
+pub type Result<T, E = AuthError> = std::result::Result<T, E>;
+
+/// Central error enumeration covering common failure scenarios.
+#[derive(Debug, Error)]
+pub enum AuthError {
+    #[error("hashing error")]
+    Hashing(#[from] argon2::password_hash::Error),
+
+    #[error("database error")]
+    Database(#[from] sqlx::Error),
+
+    #[error("invalid credentials")]
+    InvalidCredentials,
+
+    #[error("jwt error")]
+    Jwt(#[from] jsonwebtoken::errors::Error),
+
+    #[error("event bus error: {0}")]
+    EventBus(#[from] anyhow::Error),
+}
+
+/// =============================================================================================
+/// Domain model
+/// =============================================================================================
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub id: Uuid,
+    pub email: String,
+    #[serde(skip_serializing)]
+    pub password_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NewUser {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Session {
+    pub token: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// JWT claims stored in the access token
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    sub: String,
+    exp: usize,
+    iat: usize,
+}
+
+/// =============================================================================================
+/// Repository layer
+/// =============================================================================================
+#[async_trait]
+pub trait UserRepository: Send + Sync {
+    async fn insert(&self, user: &User) -> Result<()>;
+    async fn find_by_email(&self, email: &str) -> Result<Option<User>>;
+    async fn find_by_id(&self, id: Uuid) -> Result<Option<User>>;
+}
+
+pub struct PostgresUserRepository {
+    pool: PgPool,
+}
+
+impl PostgresUserRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl UserRepository for PostgresUserRepository {
+    async fn insert(&self, user: &User) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, email, password_hash, created_at)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(user.id)
+        .bind(&user.email)
+        .bind(&user.password_hash)
+        .bind(user.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn find_by_email(&self, email: &str) -> Result<Option<User>> {
+        let maybe_row = sqlx::query(
+            r#"
+            SELECT id, email, password_hash, created_at
+            FROM users
+            WHERE email = $1
+            "#,
+        )
+        .bind(email)
+        .map(map_row_to_user)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(maybe_row)
+    }
+
+    async fn find_by_id(&self, id: Uuid) -> Result<Option<User>> {
+        let maybe_row = sqlx::query(
+            r#"
+            SELECT id, email, password_hash, created_at
+            FROM users
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .map(map_row_to_user)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(maybe_row)
+    }
+}
+
+/// Helper for mapping a row into a [`User`].
+fn map_row_to_user(row: PgRow) -> User {
+    User {
+        id: row.get("id"),
+        email: row.get("email"),
+        password_hash: row.get("password_hash"),
+        created_at: row.get("created_at"),
+    }
+}
+
+/// =============================================================================================
+/// Event bus abstraction
+/// =============================================================================================
+#[derive(Debug, Serialize)]
+pub enum DomainEvent {
+    UserRegistered { user_id: Uuid, email: String },
+    UserLoggedIn { user_id: Uuid },
+}
+
+#[async_trait]
+pub trait EventBus: Send + Sync {
+    async fn publish(&self, evt: &DomainEvent) -> anyhow::Result<()>;
+}
+
+/// A naive, logging-only event bus implementation. Replace with Kafka/NATS/RabbitMQ as needed.
+pub struct TracingEventBus;
+
+#[async_trait]
+impl EventBus for TracingEventBus {
+    async fn publish(&self, evt: &DomainEvent) -> anyhow::Result<()> {
+        info!(?evt, "domain event published");
+        Ok(())
+    }
+}
+
+/// =============================================================================================
+/// Session cache (Redis)
+/// =============================================================================================
+use deadpool_redis::{cmd, redis::AsyncCommands, Config, Connection, Pool};
+
+pub struct SessionStore {
+    pool: Pool,
+}
+
+impl SessionStore {
+    pub fn new(redis_url: &str) -> anyhow::Result<Self> {
+        let mut cfg = Config::from_url(redis_url);
+        cfg.pool.timeout = Some(std::time::Duration::from_secs(3));
+
+        let pool = cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))?;
+        Ok(Self { pool })
+    }
+
+    async fn put(&self, token: &str, user_id: Uuid, ttl: Duration) -> anyhow::Result<()> {
+        let mut conn: Connection = self.pool.get().await?;
+        cmd("SET")
+            .arg(token)
+            .arg(user_id.to_string())
+            .arg("EX")
+            .arg(ttl.num_seconds())
+            .query_async(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    async fn get_user_id(&self, token: &str) -> anyhow::Result<Option<Uuid>> {
+        let mut conn: Connection = self.pool.get().await?;
+        let resp: Option<String> = conn.get(token).await?;
+        Ok(resp.and_then(|s| Uuid::parse_str(&s).ok()))
+    }
+
+    async fn delete(&self, token: &str) -> anyhow::Result<()> {
+        let mut conn: Connection = self.pool.get().await?;
+        conn.del(token).await?;
+        Ok(())
+    }
+}
+
+/// =============================================================================================
+/// Service layer
+/// =============================================================================================
+pub struct AuthService<R: UserRepository, B: EventBus> {
+    repo: R,
+    event_bus: B,
+    session_store: SessionStore,
+    jwt_secret: String,
+    session_ttl: Duration,
+    argon2: Argon2<'static>,
+}
+
+impl<R: UserRepository, B: EventBus> AuthService<R, B> {
+    /// Create an [`AuthService`] with sensible defaults.  
+    /// `jwt_secret` **must** be a strong, randomly-generated 256-bit key (base64 encoded).
+    pub fn new(repo: R, event_bus: B, session_store: SessionStore, jwt_secret: String) -> Self {
+        Self {
+            repo,
+            event_bus,
+            session_store,
+            jwt_secret,
+            session_ttl: Duration::hours(12),
+            argon2: Argon2::default(),
+        }
+    }
+
+    /// Registers a new user, returning a newly minted [`Session`] on success.
+    pub async fn register_user(&self, new_user: NewUser) -> Result<Session> {
+        if self.repo.find_by_email(&new_user.email).await?.is_some() {
+            return Err(AuthError::InvalidCredentials); // simplified: email already taken
+        }
+
+        let salt = SaltString::generate(&mut rand::thread_rng());
+        let password_hash = self
+            .argon2
+            .hash_password(new_user.password.as_bytes(), &salt)?
+            .to_string();
+
+        let user = User {
+            id: Uuid::new_v4(),
+            email: new_user.email,
+            password_hash,
+            created_at: Utc::now(),
+        };
+
+        self.repo.insert(&user).await?;
+        self.event_bus
+            .publish(&DomainEvent::UserRegistered {
+                user_id: user.id,
+                email: user.email.clone(),
+            })
+            .await?;
+
+        let session = self.create_session(user.id).await?;
+        Ok(session)
+    }
+
+    /// Authenticates a user and returns a valid session token.
+    pub async fn login_user(&self, email: &str, password: &str) -> Result<Session> {
+        let user = self
+            .repo
+            .find_by_email(email)
+            .await?
+            .ok_or(AuthError::InvalidCredentials)?;
+
+        // Verify password
+        let parsed_hash = PasswordHash::new(&user.password_hash)?;
+        self.argon2
+            .verify_password(password.as_bytes(), &parsed_hash)
+            .map_err(|_| AuthError::InvalidCredentials)?;
+
+        let session = self.create_session(user.id).await?;
+
+        self.event_bus
+            .publish(&DomainEvent::UserLoggedIn { user_id: user.id })
+            .await?;
+
+        Ok(session)
+    }
+
+    /// Invalidates an existing session.
+    pub async fn logout_user(&self, token: &str) -> Result<()> {
+        self.session_store
+            .delete(token)
+            .await
+            .map_err(|e| AuthError::EventBus(e.into()))?;
+        Ok(())
+    }
+
+    /// Helper: create a JWT token + Redis cache entry.
+    async fn create_session(&self, user_id: Uuid) -> Result<Session> {
+        let now = Utc::now();
+        let exp = (now + self.session_ttl).timestamp() as usize;
+
+        let claims = Claims {
+            sub: user_id.to_string(),
+            exp,
+            iat: now.timestamp() as usize,
+        };
+
+        let header = Header::default();
+        let token = encode(
+            &header,
+            &claims,
+            &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
+        )?;
+
+        // Cache in Redis for server-side revocation
+        self.session_store
+            .put(&token, user_id, self.session_ttl)
+            .await
+            .map_err(|e| AuthError::EventBus(e.into()))?;
+
+        Ok(Session {
+            token,
+            expires_at: now + self.session_ttl,
+        })
+    }
+
+    /// Validate a token and return the user id embedded in it.
+    pub async fn validate_token(&self, token: &str) -> Result<Uuid> {
+        // 1. Verify signature / expiration
+        let TokenData { claims, .. } = decode::<Claims>(
+            token,
+            &DecodingKey::from_secret(self.jwt_secret.as_bytes()),
+            &Validation::default(),
+        )?;
+
+        // 2. Check server-side revocation list (Redis)
+        if self
+            .session_store
+            .get_user_id(token)
+            .await
+            .map_err(|e| AuthError::EventBus(e.into()))?
+            .is_none()
+        {
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        let uuid = Uuid::parse_str(&claims.sub).map_err(|_| AuthError::InvalidCredentials)?;
+        Ok(uuid)
+    }
+}
+
+/// =============================================================================================
+/// REST handler glue (simplified for brevity). In a real project, this would live in actix-web or
+/// axum route modules. Here we show just enough to demonstrate SVC integration.
+/// =============================================================================================
+#[cfg(feature = "rest_api")]
+pub mod rest {
+    use super::*;
+    use axum::{
+        extract::{Extension, Json},
+        http::StatusCode,
+        response::IntoResponse,
+        routing::post,
+        Router,
+    };
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    pub struct AppState<A> {
+        pub auth_service: Arc<A>,
+    }
+
+    pub fn router<A: 'static + Send + Sync>(
+        state: AppState<A>,
+    ) -> Router
+    where
+        A: AuthServiceTrait,
+    {
+        Router::new()
+            .route("/api/v1/auth/register", post(register::<A>))
+            .route("/api/v1/auth/login", post(login::<A>))
+            .layer(Extension(state))
+    }
+
+    #[async_trait]
+    pub trait AuthServiceTrait: Send + Sync {
+        async fn register(&self, new_user: NewUser) -> Result<Session>;
+        async fn login(&self, email: &str, password: &str) -> Result<Session>;
+    }
+
+    #[async_trait]
+    impl<R, B> AuthServiceTrait for super::AuthService<R, B>
+    where
+        R: UserRepository + 'static,
+        B: EventBus + 'static,
+    {
+        async fn register(&self, new_user: NewUser) -> Result<Session> {
+            self.register_user(new_user).await
+        }
+
+        async fn login(&self, email: &str, password: &str) -> Result<Session> {
+            self.login_user(email, password).await
+        }
+    }
+
+    /// ----------------------------------------
+    /// Route handlers
+    /// ----------------------------------------
+    async fn register<A>(
+        Json(payload): Json<NewUser>,
+        Extension(state): Extension<AppState<A>>,
+    ) -> impl IntoResponse
+    where
+        A: AuthServiceTrait,
+    {
+        match state.auth_service.register(payload).await {
+            Ok(session) => (StatusCode::CREATED, Json(session)).into_response(),
+            Err(e) => {
+                error!("registration error: {e}");
+                (StatusCode::BAD_REQUEST, Json(e.to_string())).into_response()
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct LoginPayload {
+        email: String,
+        password: String,
+    }
+
+    async fn login<A>(
+        Json(payload): Json<LoginPayload>,
+        Extension(state): Extension<AppState<A>>,
+    ) -> impl IntoResponse
+    where
+        A: AuthServiceTrait,
+    {
+        match state
+            .auth_service
+            .login(&payload.email, &payload.password)
+            .await
+        {
+            Ok(session) => (StatusCode::OK, Json(session)).into_response(),
+            Err(e) => {
+                error!("login error: {e}");
+                (StatusCode::UNAUTHORIZED, Json(e.to_string())).into_response()
+            }
+        }
+    }
+}
+
+/// =============================================================================================
+/// Convenience: Build everything from environment variables
+/// =============================================================================================
+#[allow(dead_code)]
+pub async fn build_auth_service() -> anyhow::Result<
+    AuthService<PostgresUserRepository, TracingEventBus>,
+> {
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must be set (postgres connection string)");
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".into());
+    let jwt_secret =
+        env::var("JWT_SECRET").expect("JWT_SECRET must be set (base64 encoded 256-bit random key)");
+
+    let pool = PgPool::connect(&database_url).await?;
+
+    let repo = PostgresUserRepository::new(pool);
+    let bus = TracingEventBus;
+    let session_store = SessionStore::new(&redis_url)?;
+
+    Ok(AuthService::new(repo, bus, session_store, jwt_secret))
+}
+```

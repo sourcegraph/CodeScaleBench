@@ -1,0 +1,390 @@
+```rust
+//! src/module_76.rs
+//!
+//! Pagination & response-caching helpers shared across the API surface of
+//! LedgerLink Nexus.  The primitives in this module are intentionally isolated
+//! from higher-level HTTP concerns so they can be reused from both REST and
+//! GraphQL transports without pulling in actix‐web / axum / juniper etc.
+//!
+//! The abstractions are generic enough to be used by any repository that
+//! supports the common “fetch page, return cursor” contract.
+//!
+//! ────────────────────────────────────────────────────────────────────────────
+
+use std::fmt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use base64::{engine::general_purpose as b64, Engine as _};
+use chrono::{DateTime, Utc};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use thiserror::Error;
+
+///////////////////////////////////////////////////////////////////////////////
+// Pagination
+///////////////////////////////////////////////////////////////////////////////
+
+/// Hard upper-bound for a single page size.  This can be tightened further
+/// through tenant-specific configuration at runtime.
+pub const MAX_PAGE_SIZE: u32 = 500;
+
+/// Query params supplied by the client to paginate a resource list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageRequest {
+    /// The *exclusive* opaque cursor returned by the previous page request.
+    /// Mutually exclusive with `page_number`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+
+    /// 1-based absolute page number for offset-based pagination.  
+    /// Mutually exclusive with `cursor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_number: Option<u32>,
+
+    /// Number of items requested per page.
+    #[serde(default = "PageRequest::default_page_size")]
+    pub page_size: u32,
+}
+
+impl PageRequest {
+    #[inline(always)]
+    fn default_page_size() -> u32 {
+        50
+    }
+
+    /// Performs syntactic validation & sanitisation on user supplied query
+    /// parameters.
+    pub fn validate(self) -> Result<Self, PaginationError> {
+        if self.cursor.is_some() && self.page_number.is_some() {
+            return Err(PaginationError::ParamConflict(
+                "`cursor` and `page_number` cannot be used together".into(),
+            ));
+        }
+
+        if self.page_size == 0 || self.page_size > MAX_PAGE_SIZE {
+            return Err(PaginationError::InvalidPageSize {
+                requested: self.page_size,
+                max_allowed: MAX_PAGE_SIZE,
+            });
+        }
+
+        Ok(self)
+    }
+}
+
+/// Output envelope returned by repositories and bubbled up through the
+/// service layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Page<T>
+where
+    T: Serialize,
+{
+    /// The requested slice of domain objects.
+    pub items: Vec<T>,
+    /// Opaque cursor for the *next* page (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Aggregate count, expensive to compute in some back-ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_count: Option<u64>,
+    /// Caching hints propagated back to the HTTP / GraphQL layer.
+    pub cache_hint: CacheHint,
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Cursor helpers
+///////////////////////////////////////////////////////////////////////////////
+
+/// A strongly-typed cursor payload that can be safely encoded to string and
+/// round-tripped to reconstruct state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorPayload {
+    /// Resource unique identifier the page was anchored on.
+    pub anchor_id: String,
+    /// Timestamp of the anchor row in milliseconds since epoch.  This ensures
+    /// a deterministic ordering for monotonically increasing primary keys.
+    pub anchor_ts: i64,
+    /// Optional per-resource extra state (e.g. tenant id sharding key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<String>,
+}
+
+impl CursorPayload {
+    /// Encodes the payload as URL-safe base64.
+    pub fn encode(&self) -> String {
+        let json = serde_json::to_string(self).expect("CursorPayload serialisation never fails");
+        b64::URL_SAFE_NO_PAD.encode(json.as_bytes())
+    }
+
+    /// Decodes cursor string back into strongly-typed payload.
+    pub fn decode(cursor: &str) -> Result<Self, PaginationError> {
+        let bytes = b64::URL_SAFE_NO_PAD
+            .decode(cursor)
+            .map_err(|e| PaginationError::CursorDecode(e.to_string()))?;
+        let payload: CursorPayload =
+            serde_json::from_slice(&bytes).map_err(|e| PaginationError::CursorDecode(e.to_string()))?;
+        Ok(payload)
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Cache hints
+///////////////////////////////////////////////////////////////////////////////
+
+/// Helper metadata for HTTP `Cache-Control`, GraphQL `@cacheControl`, ETag, …
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheHint {
+    /// Strong entity tag hashed from the response payload.
+    pub etag: String,
+    /// Max age in seconds the response can be cached for by private caches.
+    pub ttl: u64,
+    /// When the underlying domain data was last updated (RFC3339 format).
+    pub last_modified: DateTime<Utc>,
+}
+
+impl CacheHint {
+    /// Computes a new `CacheHint` from the payload bytes using xxHash64.
+    pub fn from_payload<T: Serialize>(payload: &T, ttl: Duration) -> Self {
+        use std::hash::Hasher;
+        use twox_hash::XxHash64;
+
+        let bytes =
+            serde_json::to_vec(payload).expect("Serialization shouldn't fail for cache hint");
+        let mut hasher = XxHash64::with_seed(0);
+        hasher.write(&bytes);
+        let hash = hasher.finish();
+
+        CacheHint {
+            etag: format!("{:x}", hash),
+            ttl: ttl.as_secs(),
+            last_modified: DateTime::<Utc>::from(SystemTime::now()),
+        }
+    }
+
+    /// Converts to a standard HTTP `Cache-Control` header value.
+    pub fn as_http_header(&self) -> String {
+        format!("private, max-age={}", self.ttl)
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Repository trait abstraction
+///////////////////////////////////////////////////////////////////////////////
+
+/// Trait to be implemented by repository structs that wish to expose
+/// cursor-based pagination in a unified fashion.
+#[async_trait::async_trait]
+pub trait PageableRepository {
+    type Item: Serialize + Send + Sync;
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Fetches a paginated collection, given validated `PageRequest` params.
+    async fn fetch_page(
+        &self,
+        req: PageRequest,
+    ) -> Result<Page<Self::Item>, Self::Error>;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Example in-memory implementation (for tests / playground usage only)
+///////////////////////////////////////////////////////////////////////////////
+
+#[cfg(any(test, feature = "mock"))]
+pub mod mock {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    /// In-memory mock repository producing deterministic results for unit tests.
+    pub struct InMemoryLedgerRepo {
+        data: Arc<RwLock<Vec<LedgerEntry>>>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct LedgerEntry {
+        pub id: String,
+        pub amount: i64,
+        pub booked_at: DateTime<Utc>,
+    }
+
+    impl InMemoryLedgerRepo {
+        pub fn new(seed: Vec<LedgerEntry>) -> Self {
+            Self {
+                data: Arc::new(RwLock::new(seed)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PageableRepository for InMemoryLedgerRepo {
+        type Item = LedgerEntry;
+        type Error = PaginationError; // Reuse generic error enum.
+
+        async fn fetch_page(
+            &self,
+            req: PageRequest,
+        ) -> Result<Page<Self::Item>, Self::Error> {
+            let req = req.validate()?;
+
+            // For brevity, only cursorless deterministic pagination is implemented here.
+            // Real implementation would index into the vector accordingly.
+            let page_idx = req.page_number.unwrap_or(1).saturating_sub(1) as usize;
+            let size = req.page_size as usize;
+
+            let data = self.data.read().await;
+            let from = page_idx * size;
+            let until = (from + size).min(data.len());
+            let slice = data[from..until].to_vec();
+
+            let next_cursor = if until < data.len() {
+                Some(CursorPayload {
+                    anchor_id: slice
+                        .last()
+                        .map(|e| e.id.clone())
+                        .unwrap_or_else(|| "0".into()),
+                    anchor_ts: Utc::now().timestamp_millis(),
+                    extra: None,
+                }
+                .encode())
+            } else {
+                None
+            };
+
+            let cache_hint = CacheHint::from_payload(&slice, Duration::from_secs(30));
+
+            Ok(Page {
+                items: slice,
+                next_cursor,
+                total_count: Some(data.len() as u64),
+                cache_hint,
+            })
+        }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Errors
+///////////////////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Error)]
+pub enum PaginationError {
+    #[error("pagination parameter conflict: {0}")]
+    ParamConflict(String),
+
+    #[error("invalid page size {requested} (max allowed: {max_allowed})")]
+    InvalidPageSize {
+        requested: u32,
+        max_allowed: u32,
+    },
+
+    #[error("cursor could not be decoded: {0}")]
+    CursorDecode(String),
+
+    #[error("generic pagination failure: {0}")]
+    Generic(String),
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Display implementations
+///////////////////////////////////////////////////////////////////////////////
+
+impl fmt::Display for CacheHint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "etag={}, ttl={}s, last_modified={}",
+            self.etag, self.ttl, self.last_modified
+        )
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Unit tests
+///////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+    use mock::{InMemoryLedgerRepo, LedgerEntry};
+
+    #[tokio::test]
+    async fn test_pagination_roundtrip() {
+        let seed: Vec<LedgerEntry> = (0..120)
+            .map(|i| LedgerEntry {
+                id: format!("L{}", i),
+                amount: 1_000,
+                booked_at: Utc::now()
+                    - ChronoDuration::minutes(i as i64),
+            })
+            .collect();
+
+        let repo = InMemoryLedgerRepo::new(seed);
+
+        // Fetch first page
+        let page1 = repo
+            .fetch_page(PageRequest {
+                cursor: None,
+                page_number: Some(1),
+                page_size: 50,
+            })
+            .await
+            .expect("page 1");
+
+        assert_eq!(page1.items.len(), 50);
+        assert!(page1.next_cursor.is_some());
+
+        // Fetch second page via cursor
+        let page2 = repo
+            .fetch_page(PageRequest {
+                cursor: page1.next_cursor.clone(),
+                page_number: None,
+                page_size: 50,
+            })
+            .await
+            .expect("page 2");
+
+        assert_eq!(page2.items.len(), 50);
+        assert!(page2.next_cursor.is_some());
+
+        // Ensure ETag differs between pages
+        assert_ne!(page1.cache_hint.etag, page2.cache_hint.etag);
+    }
+
+    #[test]
+    fn cursor_encoding_decoding() {
+        let payload = CursorPayload {
+            anchor_id: "xyz".into(),
+            anchor_ts: 123456789,
+            extra: Some("tenant-42".into()),
+        };
+        let encoded = payload.encode();
+        let decoded = CursorPayload::decode(&encoded).expect("decode");
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn page_request_validation() {
+        // Invalid page size
+        assert!(matches!(
+            PageRequest {
+                cursor: None,
+                page_number: None,
+                page_size: MAX_PAGE_SIZE + 1,
+            }
+            .validate(),
+            Err(PaginationError::InvalidPageSize { .. })
+        ));
+
+        // Mutually exclusive params
+        assert!(matches!(
+            PageRequest {
+                cursor: Some("c".into()),
+                page_number: Some(2),
+                page_size: 10,
+            }
+            .validate(),
+            Err(PaginationError::ParamConflict(_))
+        ));
+    }
+}
+```

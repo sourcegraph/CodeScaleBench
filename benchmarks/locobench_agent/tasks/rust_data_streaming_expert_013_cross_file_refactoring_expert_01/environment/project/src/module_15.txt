@@ -1,0 +1,309 @@
+```rust
+// src/module_15.rs
+//
+// ChirpPulse – Real-Time Social Sentiment Lake
+//
+// Module 15: Sentiment Strategy Runtime
+//
+// This module manages sentiment-analysis strategies that can be swapped at
+// runtime without stopping the stream processor.  A control topic on Kafka
+// emits JSON messages describing either a strategy switch (to one of the
+// pre-built engines) or a dynamic configuration tweak.
+//
+// The StrategyManager owns an atomic pointer to the active strategy and
+// propagates changes to all worker tasks in ~O(1) time using a lock-free
+// double-buffer technique.
+//
+// ──────────────────────────────────────────────────────────────────────────
+// External Crates (add these to Cargo.toml)
+// ──────────────────────────────────────────────────────────────────────────
+// tokio            = { version = "1.34", features = ["rt-multi-thread", "macros"] }
+// rdkafka          = { version = "0.36", features = ["tokio"] }
+// parking_lot      = "0.12"
+// serde            = { version = "1.0", features = ["derive"] }
+// serde_json       = "1.0"
+// anyhow           = "1.0"
+// thiserror        = "1.0"
+// tracing          = "0.1"
+// once_cell        = "1.18"
+// --------------------------------------------------------------------------
+
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{anyhow, Context, Result};
+use parking_lot::RwLock;
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    message::BorrowedMessage,
+    ClientConfig,
+};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info, instrument, warn};
+
+// ──────────────────────────────────────────────────────────────────────────
+// Domain Types
+// ──────────────────────────────────────────────────────────────────────────
+
+/// The end-user sentiment score returned by a strategy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SentimentScore {
+    pub polarity: f32,      // −1.0 (negative) … +1.0 (positive)
+    pub subjectivity: f32,  // 0.0 (objective) … 1.0 (subjective)
+}
+
+/// Trait that every scoring strategy must implement.
+pub trait SentimentStrategy: Send + Sync + 'static {
+    /// Perform a sentiment evaluation on raw text.
+    fn evaluate(&self, text: &str) -> SentimentScore;
+
+    /// Returns a human-friendly identifier.
+    fn name(&self) -> &'static str;
+}
+
+/// A simple baseline strategy that assigns neutral scores.
+#[derive(Debug, Default)]
+pub struct NeutralStrategy;
+
+impl SentimentStrategy for NeutralStrategy {
+    fn evaluate(&self, _text: &str) -> SentimentScore {
+        SentimentScore {
+            polarity: 0.0,
+            subjectivity: 0.0,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "neutral"
+    }
+}
+
+/// Placeholder VADER-like rule-based strategy.
+#[derive(Debug, Default)]
+pub struct VaderStrategy;
+
+impl SentimentStrategy for VaderStrategy {
+    fn evaluate(&self, text: &str) -> SentimentScore {
+        // Very naive placeholder: positive if contains :) else negative if :(.
+        let polarity = if text.contains(":)") {
+            0.8
+        } else if text.contains(":(") {
+            -0.8
+        } else {
+            0.0
+        };
+        SentimentScore {
+            polarity,
+            subjectivity: 0.5,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "vader"
+    }
+}
+
+/// Strategy types that can be activated at runtime.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyKind {
+    Neutral,
+    Vader,
+}
+
+impl StrategyKind {
+    fn into_box(self) -> Box<dyn SentimentStrategy> {
+        match self {
+            StrategyKind::Neutral => Box::<NeutralStrategy>::default(),
+            StrategyKind::Vader => Box::<VaderStrategy>::default(),
+        }
+    }
+}
+
+/// Control-plane message to swap or tune strategies.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ControlMessage {
+    Swap { strategy: StrategyKind },
+    // { "action": "swap", "strategy": "vader" }
+    //
+    // Future actions such as threshold updates, model parameters, etc.
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Strategy Manager
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Manages hot-swappable sentiment strategies.
+///
+/// Internally uses an `Arc<RwLock<Box<dyn SentimentStrategy>>>` to allow
+/// fast concurrent reads (evaluation) and infrequent writes (swap).
+#[derive(Clone)]
+pub struct StrategyManager {
+    inner: Arc<RwLock<Box<dyn SentimentStrategy>>>,
+}
+
+impl StrategyManager {
+    /// Create a new manager with the given default strategy.
+    pub fn new(default: StrategyKind) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(default.into_box())),
+        }
+    }
+
+    /// Evaluate text using the currently active strategy.
+    #[inline(always)]
+    pub fn evaluate(&self, text: &str) -> SentimentScore {
+        // RwLock read guard is much cheaper than mutex.
+        self.inner.read().evaluate(text)
+    }
+
+    /// Swap the active strategy.
+    ///
+    /// Returns the name of the previous strategy.
+    #[instrument(skip(self))]
+    pub fn swap_strategy(&self, new_kind: StrategyKind) -> String {
+        let mut guard = self.inner.write();
+        let previous = guard.name().to_string();
+        *guard = new_kind.into_box();
+        info!(
+            previous = %previous,
+            new = ?new_kind,
+            "Swapped sentiment strategy"
+        );
+        previous
+    }
+
+    /// Spawn an async task that listens to Kafka for control messages.
+    ///
+    /// The caller owns the runtime.
+    pub async fn start_listener(
+        &self,
+        brokers: &str,
+        control_topic: &str,
+        consumer_group: &str,
+    ) -> Result<()> {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set("group.id", consumer_group)
+            .set("enable.partition.eof", "false")
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "true")
+            .create()
+            .context("failed to create kafka consumer")?;
+
+        consumer
+            .subscribe(&[control_topic])
+            .context("failed to subscribe to control topic")?;
+
+        let mgr = self.clone();
+        let topic = control_topic.to_string();
+        tokio::spawn(async move {
+            info!(topic = %topic, "Strategy listener started");
+            let mut last_heartbeat = Instant::now();
+            loop {
+                tokio::select! {
+                    maybe_msg = consumer.recv() => {
+                        match maybe_msg {
+                            Err(err) => {
+                                error!(error = %err, "Kafka error in control stream");
+                                // Exponential backoff or circuit breaker could be added here.
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                            }
+                            Ok(msg) => {
+                                if let Err(err) = handle_control_message(&mgr, msg) {
+                                    error!(error = %err, "Failed to handle control message");
+                                }
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                        // Emit a heartbeat every 10 seconds
+                        let elapsed = last_heartbeat.elapsed().as_secs();
+                        debug!(since_last = elapsed, "Strategy listener heartbeat");
+                        last_heartbeat = Instant::now();
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+}
+
+/// Parse and apply a control message from Kafka.
+fn handle_control_message(
+    mgr: &StrategyManager,
+    msg: BorrowedMessage<'_>,
+) -> Result<()> {
+    let payload = msg
+        .payload_view::<str>()
+        .ok_or_else(|| anyhow!("empty payload"))?
+        .map_err(|e| anyhow!(e))?;
+
+    let control: ControlMessage =
+        serde_json::from_str(payload).context("invalid control message JSON")?;
+
+    match control {
+        ControlMessage::Swap { strategy } => {
+            let previous = mgr.swap_strategy(strategy);
+            info!(
+                previous = %previous,
+                new = ?strategy,
+                offset = msg.offset(),
+                "Control action: swap strategy"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Public API – facade for downstream pipeline stages
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Global strategy manager.
+///
+/// For simplicity the entire application shares one instance.  In real life
+/// this might be injected via DI / service locator.
+pub fn global_manager() -> &'static StrategyManager {
+    use once_cell::sync::Lazy;
+    static INSTANCE: Lazy<StrategyManager> = Lazy::new(|| StrategyManager::new(StrategyKind::Neutral));
+    &INSTANCE
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Unit Tests
+// ──────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swap_and_evaluate() {
+        let mgr = StrategyManager::new(StrategyKind::Neutral);
+        assert_eq!(mgr.evaluate("hello").polarity, 0.0);
+
+        mgr.swap_strategy(StrategyKind::Vader);
+        let score = mgr.evaluate("Great work! :)");
+        assert!(
+            (score.polarity - 0.8).abs() < f32::EPSILON,
+            "Expected polarity 0.8, got {}",
+            score.polarity
+        );
+    }
+
+    #[test]
+    fn control_message_parsing() {
+        let json = r#"{"action":"swap","strategy":"vader"}"#;
+        let msg: ControlMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMessage::Swap { strategy } => assert_eq!(strategy, StrategyKind::Vader),
+        }
+    }
+}
+```

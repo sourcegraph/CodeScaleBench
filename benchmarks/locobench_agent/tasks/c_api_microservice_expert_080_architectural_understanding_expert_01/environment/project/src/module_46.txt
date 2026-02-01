@@ -1,0 +1,459 @@
+```c
+/**
+ * MercuryMonolith Commerce Hub
+ * ------------------------------------
+ * Module 46  – Response Cache (LRU + TTL)
+ *
+ * This component provides an in-memory, thread-safe cache for serialized
+ * HTTP/GraphQL responses.  It is designed to sit behind the gateway layer
+ * and short-circuit downstream processing for cache-friendly routes (GET,
+ * HEAD, and idempotent GraphQL queries).
+ *
+ * Features
+ *   • O(1) lookup/insert using uthash
+ *   •     LRU eviction when size/capacity limits are reached
+ *   •     TTL-based expiry with configurable sweep interval
+ *   •     Prometheus-compatible metrics hooks
+ *   •     Structured logging
+ *
+ * NOTE:
+ *   This file purposely does not reference higher-level types like
+ *   `mm_http_request_t` or `mm_graphql_ctx_t` to keep the dependency tree
+ *   shallow. Callers are responsible for generating unique cache keys
+ *   (e.g., SHA-256(method|path|query|accept-encoding)).
+ */
+
+#include <assert.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "uthash.h"            /* Third-party single-header hash table          */
+#include "mm_logging.h"        /* Project-wide structured logger                */
+#include "mm_metrics.h"        /* Prometheus/StatsD instrumentation helpers     */
+
+/* ----------------------------- Configuration -------------------------------- */
+
+#define MM_CACHE_DEFAULT_MAX_ITEMS   10_000U        /* Fallback capacity      */
+#define MM_CACHE_DEFAULT_TTL_SECONDS 60U            /* Default item lifetime  */
+#define MM_CACHE_SWEEP_SECONDS       15U            /* Background sweep every */
+
+/* Metrics handles (defined elsewhere) */
+static const char *METRIC_HIT          = "cache_response_hit_total";
+static const char *METRIC_MISS         = "cache_response_miss_total";
+static const char *METRIC_EVICT        = "cache_response_evict_total";
+static const char *METRIC_BYTES        = "cache_response_bytes_current";
+static const char *METRIC_ITEMS        = "cache_response_items_current";
+static const char *METRIC_PUT_ERRORS   = "cache_response_put_error_total";
+
+/* ----------------------------- Data Types ----------------------------------- */
+
+/* Doubly-linked list for O(1) LRU update                                        */
+typedef struct mm_rc_lru_node {
+    struct mm_rc_lru_node *prev;
+    struct mm_rc_lru_node *next;
+} mm_rc_lru_node_t;
+
+/* Hash table entry                                                              */
+typedef struct mm_rc_item {
+    char                *key;       /* Null-terminated key (caller generated)  */
+    uint8_t             *blob;      /* Serialized payload                      */
+    size_t               size;      /* Bytes of `blob`                         */
+    time_t               expires_at;/* Epoch when entry becomes invalid        */
+
+    mm_rc_lru_node_t     lru;       /* LRU housekeeping                        */
+    UT_hash_handle       hh;        /* uthash hook                             */
+} mm_rc_item_t;
+
+typedef struct {
+    mm_rc_item_t       *index;          /* uthash root                             */
+    size_t              max_items;      /* Capacity (items)                        */
+    size_t              cur_items;      /* Live items                              */
+    size_t              cur_bytes;      /* Aggregate size                          */
+
+    mm_rc_lru_node_t    lru_head;       /* Sentinel node (circular list)           */
+    pthread_mutex_t     mtx;            /* Global mutex (coarse grain)             */
+
+    atomic_bool         running;        /* Background sweeper control              */
+    pthread_t           sweeper_thread; /* Background sweeper                      */
+
+    uint32_t            ttl_sec;        /* Default TTL (seconds)                   */
+} mm_rc_t;
+
+/* ----------------------------- Local Helpers --------------------------------- */
+
+static inline void lru_init(mm_rc_lru_node_t *sentinel)
+{
+    sentinel->prev = sentinel;
+    sentinel->next = sentinel;
+}
+
+static inline void lru_remove(mm_rc_lru_node_t *node)
+{
+    node->prev->next = node->next;
+    node->next->prev = node->prev;
+    node->prev = node->next = NULL;
+}
+
+static inline void lru_insert_front(mm_rc_lru_node_t *sentinel,
+                                    mm_rc_lru_node_t *node)
+{
+    node->next = sentinel->next;
+    node->prev = sentinel;
+    sentinel->next->prev = node;
+    sentinel->next = node;
+}
+
+/* Evict the least recently used (tail)                                         */
+static mm_rc_item_t *evict_lru(mm_rc_t *rc)
+{
+    if (rc->cur_items == 0) return NULL;
+
+    mm_rc_lru_node_t *lru_tail = rc->lru_head.prev;
+    if (lru_tail == &rc->lru_head) return NULL; /* Should not happen */
+
+    mm_rc_item_t *item = (mm_rc_item_t *) ((char *) lru_tail -
+                                           offsetof(mm_rc_item_t, lru));
+    /* Remove from all structures */
+    lru_remove(&item->lru);
+    HASH_DEL(rc->index, item);
+
+    rc->cur_items--;
+    rc->cur_bytes -= item->size;
+
+    mm_metrics_dec_gauge(METRIC_ITEMS, 1);
+    mm_metrics_dec_gauge_uint64(METRIC_BYTES, (uint64_t) item->size);
+    mm_metrics_inc_counter(METRIC_EVICT, 1);
+
+    /* Free memory */
+    free(item->key);
+    free(item->blob);
+    free(item);
+
+    return item;
+}
+
+static void reap_expired_locked(mm_rc_t *rc, time_t now_epoch)
+{
+    mm_rc_item_t *it, *tmp;
+    HASH_ITER(hh, rc->index, it, tmp) {
+        if (it->expires_at <= now_epoch) {
+            /* Expired – remove */
+            lru_remove(&it->lru);
+            HASH_DEL(rc->index, it);
+
+            rc->cur_items--;
+            rc->cur_bytes -= it->size;
+
+            mm_metrics_dec_gauge(METRIC_ITEMS, 1);
+            mm_metrics_dec_gauge_uint64(METRIC_BYTES, (uint64_t) it->size);
+            mm_metrics_inc_counter(METRIC_EVICT, 1);
+
+            free(it->key);
+            free(it->blob);
+            free(it);
+        }
+    }
+}
+
+static void *sweeper_thr_main(void *arg)
+{
+    mm_rc_t *rc = (mm_rc_t *) arg;
+    while (atomic_load_explicit(&rc->running, memory_order_acquire)) {
+        sleep(MM_CACHE_SWEEP_SECONDS);
+
+        pthread_mutex_lock(&rc->mtx);
+        time_t now = time(NULL);
+        reap_expired_locked(rc, now);
+        pthread_mutex_unlock(&rc->mtx);
+    }
+    return NULL;
+}
+
+/* ----------------------------- API ------------------------------------------ */
+
+/**
+ * rc                     – Cache instance (allocated by caller)
+ * max_items              – Capacity (# items); 0 → default
+ * default_ttl_seconds    – Cached entry lifetime; 0 → default
+ *
+ * Returns 0 on success, non-zero errno on error.
+ */
+int mm_response_cache_init(mm_rc_t *rc, size_t max_items,
+                           uint32_t default_ttl_seconds)
+{
+    if (!rc) return EINVAL;
+
+    memset(rc, 0, sizeof(*rc));
+    lru_init(&rc->lru_head);
+
+    rc->max_items = max_items ? max_items : MM_CACHE_DEFAULT_MAX_ITEMS;
+    rc->ttl_sec   = default_ttl_seconds ? default_ttl_seconds
+                                        : MM_CACHE_DEFAULT_TTL_SECONDS;
+
+    if (pthread_mutex_init(&rc->mtx, NULL) != 0) {
+        return errno;
+    }
+
+    atomic_store(&rc->running, true);
+    if (pthread_create(&rc->sweeper_thread, NULL, sweeper_thr_main, rc) != 0) {
+        pthread_mutex_destroy(&rc->mtx);
+        mm_log_error("cache", "Unable to spawn sweeper thread: %s", strerror(errno));
+        return errno;
+    }
+
+    mm_log_info("cache", "Response cache initialised (capacity=%zu default_ttl=%us)",
+                rc->max_items, rc->ttl_sec);
+    return 0;
+}
+
+/**
+ * Shutdown and free all internal resources. Safe to call if not initialised.
+ */
+void mm_response_cache_shutdown(mm_rc_t *rc)
+{
+    if (!rc || !rc->max_items) return;
+
+    atomic_store(&rc->running, false);
+    pthread_join(rc->sweeper_thread, NULL);
+
+    pthread_mutex_lock(&rc->mtx);
+
+    /* Delete all items */
+    mm_rc_item_t *it, *tmp;
+    HASH_ITER(hh, rc->index, it, tmp) {
+        lru_remove(&it->lru);
+        HASH_DEL(rc->index, it);
+        free(it->key);
+        free(it->blob);
+        free(it);
+    }
+
+    rc->cur_items = 0;
+    rc->cur_bytes = 0;
+
+    pthread_mutex_unlock(&rc->mtx);
+    pthread_mutex_destroy(&rc->mtx);
+
+    mm_log_info("cache", "Response cache shutdown complete");
+}
+
+/**
+ * Retrieve cached blob for `key` into caller buffer.
+ * The returned pointer is owned by the cache and MUST NOT be modified.
+ *
+ * Returns pointer on hit, NULL on miss or expired entry.
+ */
+const uint8_t *mm_response_cache_get(mm_rc_t *rc, const char *key,
+                                     size_t *out_size, uint32_t *out_ttl)
+{
+    if (!rc || !key) return NULL;
+
+    pthread_mutex_lock(&rc->mtx);
+    mm_rc_item_t *item = NULL;
+    HASH_FIND_STR(rc->index, key, item);
+    if (!item) {
+        pthread_mutex_unlock(&rc->mtx);
+        mm_metrics_inc_counter(METRIC_MISS, 1);
+        return NULL;
+    }
+
+    time_t now = time(NULL);
+    if (item->expires_at <= now) {
+        /* Expired – treat as miss and evict */
+        lru_remove(&item->lru);
+        HASH_DEL(rc->index, item);
+
+        rc->cur_items--;
+        rc->cur_bytes -= item->size;
+
+        mm_metrics_dec_gauge(METRIC_ITEMS, 1);
+        mm_metrics_dec_gauge_uint64(METRIC_BYTES, (uint64_t) item->size);
+        mm_metrics_inc_counter(METRIC_EVICT, 1);
+
+        free(item->key);
+        free(item->blob);
+        free(item);
+
+        pthread_mutex_unlock(&rc->mtx);
+        mm_metrics_inc_counter(METRIC_MISS, 1);
+        return NULL;
+    }
+
+    /* Move to front (MRU) */
+    lru_remove(&item->lru);
+    lru_insert_front(&rc->lru_head, &item->lru);
+
+    if (out_size) *out_size = item->size;
+    if (out_ttl)  *out_ttl  = (uint32_t)(item->expires_at - now);
+
+    pthread_mutex_unlock(&rc->mtx);
+    mm_metrics_inc_counter(METRIC_HIT, 1);
+    return item->blob; /* read-only pointer */
+}
+
+/**
+ * Put a new payload (copies data).
+ * If `ttl_override` > 0 it supersedes default TTL.
+ *
+ * Returns 0 on success, errno otherwise.
+ */
+int mm_response_cache_put(mm_rc_t *rc,
+                          const char *key,
+                          const uint8_t *payload,
+                          size_t payload_size,
+                          uint32_t ttl_override)
+{
+    if (!rc || !key || !payload || payload_size == 0) return EINVAL;
+
+    int err = 0;
+    uint32_t ttl = ttl_override ? ttl_override : rc->ttl_sec;
+
+    mm_rc_item_t *item = calloc(1, sizeof(*item));
+    uint8_t *blob_copy = malloc(payload_size);
+    char *key_copy = strdup(key);
+    if (!item || !blob_copy || !key_copy) {
+        err = ENOMEM;
+        goto fail_alloc;
+    }
+
+    memcpy(blob_copy, payload, payload_size);
+
+    item->key        = key_copy;
+    item->blob       = blob_copy;
+    item->size       = payload_size;
+    item->expires_at = time(NULL) + ttl;
+    lru_init(&item->lru);
+
+    pthread_mutex_lock(&rc->mtx);
+
+    /* If an existing item with same key, replace it (maintain capacity) */
+    mm_rc_item_t *existing = NULL;
+    HASH_FIND_STR(rc->index, key_copy, existing);
+    if (existing) {
+        lru_remove(&existing->lru);
+        HASH_DEL(rc->index, existing);
+
+        rc->cur_items--;
+        rc->cur_bytes -= existing->size;
+
+        mm_metrics_dec_gauge(METRIC_ITEMS, 1);
+        mm_metrics_dec_gauge_uint64(METRIC_BYTES, (uint64_t) existing->size);
+
+        free(existing->key);
+        free(existing->blob);
+        free(existing);
+    }
+
+    /* Ensure capacity – remove until size OK (simple heuristic) */
+    while (rc->cur_items >= rc->max_items) {
+        if (!evict_lru(rc)) break;
+    }
+
+    HASH_ADD_KEYPTR(hh, rc->index, item->key, strlen(item->key), item);
+    lru_insert_front(&rc->lru_head, &item->lru);
+
+    rc->cur_items++;
+    rc->cur_bytes += item->size;
+
+    mm_metrics_inc_counter(METRIC_ITEMS, 1); /* Counter is not gauge! */
+    mm_metrics_inc_counter_uint64(METRIC_BYTES, (uint64_t) item->size);
+    mm_metrics_set_gauge(METRIC_ITEMS, (double) rc->cur_items);
+    mm_metrics_set_gauge_uint64(METRIC_BYTES, (uint64_t) rc->cur_bytes);
+
+    pthread_mutex_unlock(&rc->mtx);
+    return 0;
+
+fail_alloc:
+    free(item);
+    free(blob_copy);
+    free(key_copy);
+    mm_metrics_inc_counter(METRIC_PUT_ERRORS, 1);
+    return err;
+}
+
+/**
+ * Remove a single entry (if present). Returns true if an item was invalidated.
+ */
+bool mm_response_cache_invalidate(mm_rc_t *rc, const char *key)
+{
+    if (!rc || !key) return false;
+
+    bool removed = false;
+    pthread_mutex_lock(&rc->mtx);
+    mm_rc_item_t *item = NULL;
+    HASH_FIND_STR(rc->index, key, item);
+    if (item) {
+        lru_remove(&item->lru);
+        HASH_DEL(rc->index, item);
+
+        rc->cur_items--;
+        rc->cur_bytes -= item->size;
+
+        mm_metrics_dec_gauge(METRIC_ITEMS, 1);
+        mm_metrics_dec_gauge_uint64(METRIC_BYTES, (uint64_t) item->size);
+        mm_metrics_inc_counter(METRIC_EVICT, 1);
+
+        free(item->key);
+        free(item->blob);
+        free(item);
+        removed = true;
+    }
+    pthread_mutex_unlock(&rc->mtx);
+    return removed;
+}
+
+/**
+ * Manually purge all entries (e.g., deployment rollout, admin API).
+ */
+void mm_response_cache_flush(mm_rc_t *rc)
+{
+    if (!rc) return;
+
+    pthread_mutex_lock(&rc->mtx);
+    mm_rc_item_t *it, *tmp;
+    HASH_ITER(hh, rc->index, it, tmp) {
+        lru_remove(&it->lru);
+        HASH_DEL(rc->index, it);
+
+        free(it->key);
+        free(it->blob);
+        free(it);
+    }
+    rc->cur_items = 0;
+    rc->cur_bytes = 0;
+    pthread_mutex_unlock(&rc->mtx);
+
+    mm_metrics_set_gauge(METRIC_ITEMS, 0);
+    mm_metrics_set_gauge(METRIC_BYTES, 0);
+    mm_log_warn("cache", "Full cache flush executed");
+}
+
+/* ----------------------------- Testing Hook --------------------------------- */
+#ifdef UNIT_TEST
+#include <stdio.h>
+
+int main(void)
+{
+    mm_rc_t cache;
+    mm_response_cache_init(&cache, 3, 5);
+
+    const char payload[] = "hello world";
+    mm_response_cache_put(&cache, "GET:/v1/foo", (const uint8_t *)payload,
+                          sizeof(payload), 0);
+
+    size_t sz;
+    const uint8_t *ret = mm_response_cache_get(&cache, "GET:/v1/foo", &sz, NULL);
+    assert(ret && sz == sizeof(payload));
+
+    mm_response_cache_shutdown(&cache);
+    puts("All tests passed");
+    return 0;
+}
+#endif
+```

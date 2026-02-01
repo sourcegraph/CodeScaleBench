@@ -1,0 +1,409 @@
+```rust
+//! src/module_85.rs
+//!
+//! Event-sourcing primitives for EduPulse Live.
+//!
+//! This module provides a minimal yet production-ready implementation of a
+//! pluggable event store + event bus that the remaining services depend on.
+//! While the real system wires these components through dependency injection
+//! (a.k.a. the service locator pattern), we expose concrete instances that can
+//! be consumed from higher-level application services (e.g.
+//! `LessonService::publish_lesson`).
+//!
+//! Tech stack
+//! ----------
+//! • PostgreSQL 15  – durable event store via `sqlx`
+//! • NATS 2.10      – low-latency fan-out to downstream consumers
+//! • Tokio 1.x      – async runtime
+//! • Serde          – (de)serialisation of event payloads
+//!
+//! # Database schema
+//! ```sql
+//! CREATE TABLE IF NOT EXISTS event_store (
+//!     id            UUID PRIMARY KEY,
+//!     aggregate_id  UUID       NOT NULL,
+//!     aggregate     TEXT       NOT NULL,
+//!     event_type    TEXT       NOT NULL,
+//!     payload       JSONB      NOT NULL,
+//!     actor_id      UUID,
+//!     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+//! );
+//! ```
+//!
+//! Indexing strategy (not shown) should include `(aggregate_id, created_at)`
+//! and `(event_type)` for efficient GDPR erasure and analytics.
+//!
+//! # Usage
+//! ```rust,no_run
+//! let pool  = PgPoolOptions::new().connect("postgres://…").await?;
+//! let nats  = async_nats::connect("nats://127.0.0.1:4222").await?;
+//!
+//! let store = PostgresEventStore::new(pool.clone());
+//! let bus   = NatsEventBus::new(nats);
+//!
+//! let dispatcher = EventDispatcher::new(store, bus);
+//!
+//! dispatcher.commit(&actor_id, domain_event).await?;
+//! ```
+
+#![allow(clippy::module_name_repetitions)]
+
+use async_nats::{self, Client as NatsClient};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
+use thiserror::Error;
+use tokio::task;
+use tracing::{debug, error, info, instrument};
+use uuid::Uuid;
+
+/// Result alias used throughout this module.
+pub type Result<T, E = EventStoreError> = std::result::Result<T, E>;
+
+/// High-level error enumeration for all event-store-related fallacies.
+#[derive(Error, Debug)]
+pub enum EventStoreError {
+    #[error("database error")]
+    Database(#[from] sqlx::Error),
+
+    #[error("broker error")]
+    Broker(#[from] async_nats::Error),
+
+    #[error("serialization error")]
+    Serialization(#[from] serde_json::Error),
+}
+
+/// Domain-agnostic event envelope.
+///
+/// Payload is stored in polymorphic `DomainEvent` enum; the envelope carries
+/// metadata used across all bounded contexts.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EventEnvelope {
+    pub id: Uuid,
+    pub aggregate_id: Uuid,
+    pub aggregate: String,
+    pub event_type: String,
+    pub payload: DomainEvent,
+
+    /// Actor (user, system service, scheduler) that emitted the event.
+    pub actor_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl EventEnvelope {
+    pub fn new(
+        aggregate: impl Into<String>,
+        aggregate_id: Uuid,
+        actor_id: Option<Uuid>,
+        payload: DomainEvent,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            aggregate_id,
+            aggregate: aggregate.into(),
+            event_type: payload.variant_name(),
+            payload,
+            actor_id,
+            created_at: Utc::now(),
+        }
+    }
+}
+
+/// A sample subset of domain events.
+///
+/// In the real system each bounded context would define its own enum and
+/// register it with the event bus; we keep a consolidated variant list here
+/// for brevity.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type", content = "data")]
+pub enum DomainEvent {
+    LessonPublished {
+        lesson_id: Uuid,
+        course_id: Uuid,
+        title: String,
+    },
+    QuizSubmitted {
+        submission_id: Uuid,
+        quiz_id: Uuid,
+        user_id: Uuid,
+        score_raw: i32,
+    },
+    BadgeAwarded {
+        badge_id: Uuid,
+        user_id: Uuid,
+        reason: String,
+    },
+    PaymentProcessed {
+        payment_id: Uuid,
+        user_id: Uuid,
+        amount_cents: i64,
+        currency: String,
+    },
+}
+
+impl DomainEvent {
+    #[must_use]
+    pub fn variant_name(&self) -> String {
+        match self {
+            Self::LessonPublished { .. } => "LessonPublished",
+            Self::QuizSubmitted { .. } => "QuizSubmitted",
+            Self::BadgeAwarded { .. } => "BadgeAwarded",
+            Self::PaymentProcessed { .. } => "PaymentProcessed",
+        }
+        .to_string()
+    }
+}
+
+/// Abstract event bus for publishing envelopes to a message broker.
+///
+/// Our default implementation uses NATS, but substituting Kafka or RabbitMQ
+/// only requires another implementor for this trait.
+#[async_trait]
+pub trait EventBus: Send + Sync {
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<()>;
+}
+
+/// Abstract persistence layer for event sourcing.
+///
+/// Implementations must guarantee *at-least-once* delivery semantics; i.e.
+/// `commit` either stores the event and returns `Ok`, or does not store it at
+/// all (transaction rollback).
+#[async_trait]
+pub trait EventStore: Send + Sync {
+    async fn commit(&self, envelope: &EventEnvelope) -> Result<()>;
+    async fn stream(&self, aggregate_id: Uuid) -> Result<Vec<EventEnvelope>>;
+}
+
+/// Concrete PostgreSQL implementation of EventStore.
+///
+/// Uses a single table to persist the JSON representation of each event.
+#[derive(Clone)]
+pub struct PostgresEventStore {
+    pool: PgPool,
+}
+
+impl PostgresEventStore {
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl EventStore for PostgresEventStore {
+    #[instrument(skip_all, err)]
+    async fn commit(&self, envelope: &EventEnvelope) -> Result<()> {
+        let json = serde_json::to_value(envelope)?;
+
+        // Using QueryBuilder to avoid dealing with bind order verbosity.
+        let mut builder: QueryBuilder<Postgres> =
+            QueryBuilder::new("INSERT INTO event_store (id, aggregate_id, aggregate, event_type, payload, actor_id, created_at)");
+
+        builder
+            .push_values([envelope], |mut b, e| {
+                b.push_bind(e.id)
+                    .push_bind(e.aggregate_id)
+                    .push_bind(&e.aggregate)
+                    .push_bind(&e.event_type)
+                    .push_bind(&json)
+                    .push_bind(e.actor_id)
+                    .push_bind(e.created_at);
+            });
+
+        builder.build().execute(&self.pool).await?;
+
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn stream(&self, aggregate_id: Uuid) -> Result<Vec<EventEnvelope>> {
+        let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
+            "SELECT payload \
+             FROM event_store \
+             WHERE aggregate_id = $1 \
+             ORDER BY created_at ASC",
+        )
+        .bind(aggregate_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|(value,)| serde_json::from_value(value).map_err(Into::into))
+            .collect()
+    }
+}
+
+/// Concrete NATS implementation of EventBus.
+///
+/// The subject naming convention is: `events.{aggregate}.{event_type}`.
+#[derive(Clone)]
+pub struct NatsEventBus {
+    client: NatsClient,
+}
+
+impl NatsEventBus {
+    #[must_use]
+    pub fn new(client: NatsClient) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl EventBus for NatsEventBus {
+    #[instrument(skip_all, err)]
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<()> {
+        let subject = format!("events.{}.{}", envelope.aggregate, envelope.event_type);
+        let payload = serde_json::to_vec(envelope)?;
+        self.client.publish(subject, payload.into()).await?;
+        Ok(())
+    }
+}
+
+/// Facade that *atomically* persists an event and publishes it to the bus.
+///
+/// Failure modes:
+///  • Database failure  => broker *not* published
+///  • Broker failure    => event *already* persisted, caller should retry
+///
+/// A retry / DLQ mechanism in the platform service reconciles such edge cases.
+/// For brevity we just propagate the error back to the caller.
+#[derive(Clone)]
+pub struct EventDispatcher<S, B>
+where
+    S: EventStore,
+    B: EventBus,
+{
+    store: S,
+    bus: B,
+}
+
+impl<S, B> EventDispatcher<S, B>
+where
+    S: EventStore,
+    B: EventBus,
+{
+    #[must_use]
+    pub fn new(store: S, bus: B) -> Self {
+        Self { store, bus }
+    }
+
+    /// Persist to event store and then publish to broker.
+    #[instrument(skip_all, err)]
+    pub async fn commit(&self, envelope: &EventEnvelope) -> Result<()> {
+        self.store.commit(envelope).await?;
+        self.bus.publish(envelope).await?;
+        Ok(())
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* GDPR – Data Erasure (Soft Delete)                                        */
+/* ------------------------------------------------------------------------ */
+
+/// Remove all personal data linked to the specified `user_id`.
+///
+/// For auditability we retain the event rows but redact PII in the JSON blob.
+///
+/// NOTE: This procedure should be executed inside a database transaction when
+/// called from the admin service.
+#[instrument(skip_all, err)]
+pub async fn gdpr_soft_delete(pool: &PgPool, user_id: Uuid) -> Result<()> {
+    // Perform redaction in-place using Postgres JSONB operators.
+    // Any key containing PII gets replaced with `"<redacted>"`.
+    let query = r#"
+        UPDATE event_store
+        SET    payload = jsonb_set(payload, '{data,user_id}', '"<redacted>"', true)
+        WHERE  payload #>> '{data,user_id}' = $1
+    "#;
+
+    sqlx::query(query)
+        .bind(user_id.to_string())
+        .execute(pool)
+        .await
+        .map_err(Into::into)
+        .map(|_| ())
+}
+
+/* ------------------------------------------------------------------------ */
+/* Boilerplate: Module self-test                                            */
+/* ------------------------------------------------------------------------ */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[tokio::test]
+    async fn round_trip_persistence() -> Result<()> {
+        let url =
+            env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://postgres@localhost/test".into());
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect");
+
+        // Clean slate
+        sqlx::query("DELETE FROM event_store").execute(&pool).await?;
+
+        let store = PostgresEventStore::new(pool.clone());
+
+        let aggregate_id = Uuid::new_v4();
+        let event = DomainEvent::LessonPublished {
+            lesson_id: Uuid::new_v4(),
+            course_id: Uuid::new_v4(),
+            title: "Rust for Safety-Critical Systems".into(),
+        };
+
+        let envelope = EventEnvelope::new("lesson", aggregate_id, None, event);
+
+        store.commit(&envelope).await?;
+
+        let events = store.stream(aggregate_id).await?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "LessonPublished");
+
+        Ok(())
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Optional – Spawnable background task for metrics + dead-letter queue     */
+/* ------------------------------------------------------------------------ */
+
+/// Starts a background task that logs failed broker deliveries into a local
+/// dead-letter queue. This guarantees that events are never silently lost even
+/// if NATS is offline when `commit` is called.
+pub async fn spawn_dead_letter_forwarder<S>(
+    mut rx: tokio::sync::mpsc::Receiver<EventEnvelope>,
+    store: S,
+) where
+    S: EventStore + 'static,
+{
+    task::spawn(async move {
+        while let Some(envelope) = rx.recv().await {
+            if let Err(e) = store.commit(&envelope).await {
+                error!("Failed to persist to dead-letter queue: {e:?}");
+            } else {
+                debug!("Event persisted to dead-letter queue: {}", envelope.id);
+            }
+        }
+    });
+}
+
+/* ------------------------------------------------------------------------ */
+/* Manual feature gate check                                                */
+/* ------------------------------------------------------------------------ */
+
+#[cfg(feature = "compile_time_assertions")]
+mod _ct_assert {
+    use super::*;
+    // Ensures EventEnvelope never grows beyond 512 bytes (cache efficiency).
+    const _: () = {
+        const SIZE: usize = std::mem::size_of::<EventEnvelope>();
+        // (!) Adjust if new fields are added.
+        assert!(SIZE <= 512);
+    };
+}
+```

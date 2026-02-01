@@ -1,0 +1,489 @@
+/**
+ * src/module_19.txt
+ *
+ * MercuryMonolith Commerce Hub – Response Cache (LRU w/ TTL)
+ *
+ * This module implements an in-memory HTTP/GraphQL response cache that is
+ * used by the API-Gateway layer to lower latency for idempotent, frequently
+ * requested resources.  The implementation uses an open-addressed hash table
+ * combined with a doubly-linked list to maintain an LRU eviction policy and
+ * supports per-entry TTLs (time-to-live).
+ *
+ * Thread-safety is achieved through a single read/write lock that allows
+ * multiple concurrent readers while serialising mutating operations.  For
+ * typical read-heavy workloads this provides adequate scalability while
+ * keeping the implementation simple.
+ *
+ * Metrics (Prometheus-compatible) and structured logging are integrated
+ * via the internal metrics.h and logger.h facilities.
+ */
+
+#include <assert.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "logger.h"   /* mercury_log(), LOG_LEVEL_*, etc.              */
+#include "metrics.h"  /* mercury_counter_inc(), mercury_gauge_set()    */
+#include "response_cache.h" /* Public interface for this module        */
+
+/* -------------------------------------------------------------------------- */
+/*                              CONFIGURATION                                 */
+/* -------------------------------------------------------------------------- */
+
+#ifndef MERCURY_CACHE_DEFAULT_MAX_ITEMS
+#    define MERCURY_CACHE_DEFAULT_MAX_ITEMS 8192U
+#endif
+
+#ifndef MERCURY_CACHE_DEFAULT_TTL_SEC
+#    define MERCURY_CACHE_DEFAULT_TTL_SEC  60U
+#endif
+
+/* Internal Prometheus metric names */
+static const char *METRIC_CACHE_HITS      = "mercury_response_cache_hits_total";
+static const char *METRIC_CACHE_MISSES    = "mercury_response_cache_misses_total";
+static const char *METRIC_CACHE_EVICTIONS = "mercury_response_cache_evictions_total";
+static const char *METRIC_CACHE_SIZE      = "mercury_response_cache_items";
+
+/* -------------------------------------------------------------------------- */
+/*                                 TYPES                                      */
+/* -------------------------------------------------------------------------- */
+
+typedef struct cache_entry_t {
+    char           *key;          /* Normalised cache key                  */
+    uint8_t        *payload;      /* Response bytes (immutable)            */
+    size_t          payload_len;
+    uint16_t        status_code;  /* HTTP status / GraphQL envelope code   */
+    uint64_t        expires_at;   /* Epoch-millis when entry becomes stale */
+    uint64_t        hash;         /* Cached hash of key                    */
+
+    /* LRU doubly linked list pointers */
+    struct cache_entry_t *prev;
+    struct cache_entry_t *next;
+} cache_entry_t;
+
+typedef struct {
+    /* Hash table buckets – resolved via linear probing */
+    cache_entry_t **buckets;
+    size_t          bucket_count; /* Must be power of two                 */
+    size_t          size;         /* Number of live entries               */
+    size_t          max_items;    /* Soft limit for eviction              */
+
+    /* LRU list head/tail (most/least recently used) */
+    cache_entry_t  *lru_head;
+    cache_entry_t  *lru_tail;
+
+    /* Synchronisation primitive (RW lock) */
+    pthread_rwlock_t lock;
+
+    /* Default TTL fallback */
+    uint32_t        default_ttl_sec;
+
+    /* Stats */
+    atomic_uint_least64_t hits;
+    atomic_uint_least64_t misses;
+    atomic_uint_least64_t evictions;
+} response_cache_t;
+
+/* -------------------------------------------------------------------------- */
+/*                           STATIC DECLARATIONS                              */
+/* -------------------------------------------------------------------------- */
+
+static uint64_t fnv1a_hash(const char *s);
+static cache_entry_t *entry_create(const char *key, const uint8_t *payload,
+                                   size_t len, uint16_t status, uint32_t ttl_sec,
+                                   uint64_t now_ms);
+static void entry_destroy(cache_entry_t *e);
+static void lru_move_to_front(response_cache_t *c, cache_entry_t *e);
+static void lru_remove(response_cache_t *c, cache_entry_t *e);
+static void cache_evict_if_needed(response_cache_t *c);
+static size_t next_pow2(size_t n);
+static uint64_t now_epoch_millis(void);
+static void metrics_update_size(response_cache_t *c);
+
+/* -------------------------------------------------------------------------- */
+/*                              SINGLETON CACHE                               */
+/* -------------------------------------------------------------------------- */
+
+static response_cache_t g_cache;
+static bool g_cache_initialised = false;
+
+/* -------------------------------------------------------------------------- */
+/*                         PUBLIC API IMPLEMENTATION                          */
+/* -------------------------------------------------------------------------- */
+
+int mercury_cache_init(size_t max_items, uint32_t default_ttl_sec)
+{
+    if (g_cache_initialised) {
+        return 0; /* idempotent */
+    }
+
+    size_t buckets = next_pow2(max_items * 2); /* load factor 0.5 */
+    if (buckets < 16) {
+        buckets = 16;
+    }
+
+    memset(&g_cache, 0, sizeof(g_cache));
+    g_cache.bucket_count     = buckets;
+    g_cache.buckets          = calloc(buckets, sizeof(cache_entry_t *));
+    g_cache.max_items        = max_items ? max_items : MERCURY_CACHE_DEFAULT_MAX_ITEMS;
+    g_cache.default_ttl_sec  = default_ttl_sec ? default_ttl_sec : MERCURY_CACHE_DEFAULT_TTL_SEC;
+
+    if (!g_cache.buckets) {
+        mercury_log(LOG_LEVEL_ERROR, "Response cache initialisation failed: %s", strerror(errno));
+        return -1;
+    }
+
+    if (pthread_rwlock_init(&g_cache.lock, NULL) != 0) {
+        mercury_log(LOG_LEVEL_ERROR, "pthread_rwlock_init failed: %s", strerror(errno));
+        free(g_cache.buckets);
+        return -1;
+    }
+
+    /* Register metrics */
+    mercury_gauge_set(METRIC_CACHE_SIZE, 0);
+    mercury_counter_inc(METRIC_CACHE_HITS, 0);
+    mercury_counter_inc(METRIC_CACHE_MISSES, 0);
+    mercury_counter_inc(METRIC_CACHE_EVICTIONS, 0);
+
+    g_cache_initialised = true;
+    mercury_log(LOG_LEVEL_INFO, "Response cache initialised (capacity=%zu, buckets=%zu, TTL=%us)",
+                g_cache.max_items, g_cache.bucket_count, g_cache.default_ttl_sec);
+    return 0;
+}
+
+void mercury_cache_shutdown(void)
+{
+    if (!g_cache_initialised) return;
+
+    pthread_rwlock_wrlock(&g_cache.lock);
+
+    for (size_t i = 0; i < g_cache.bucket_count; ++i) {
+        cache_entry_t *e = g_cache.buckets[i];
+        if (e) {
+            entry_destroy(e);
+        }
+    }
+    free(g_cache.buckets);
+    g_cache.buckets = NULL;
+    g_cache.bucket_count = g_cache.size = 0;
+
+    pthread_rwlock_unlock(&g_cache.lock);
+    pthread_rwlock_destroy(&g_cache.lock);
+
+    g_cache_initialised = false;
+    mercury_log(LOG_LEVEL_INFO, "Response cache shutdown complete");
+}
+
+bool mercury_cache_get(const char *key,
+                       uint8_t **out_payload, size_t *out_len,
+                       uint16_t *out_status_code)
+{
+    if (!g_cache_initialised || !key) {
+        return false;
+    }
+
+    bool hit = false;
+    uint64_t hash = fnv1a_hash(key);
+    uint64_t now  = now_epoch_millis();
+
+    pthread_rwlock_rdlock(&g_cache.lock);
+
+    size_t idx = hash & (g_cache.bucket_count - 1);
+    for (size_t probe = 0; probe < g_cache.bucket_count; ++probe) {
+        cache_entry_t *e = g_cache.buckets[idx];
+        if (!e) break; /* Not found */
+
+        if (e->hash == hash && strcmp(e->key, key) == 0) {
+            /* Found matching key; check expiry */
+            if (e->expires_at > now) {
+                *out_payload     = e->payload;
+                *out_len         = e->payload_len;
+                *out_status_code = e->status_code;
+                hit = true;
+            }
+            break;
+        }
+        idx = (idx + 1) & (g_cache.bucket_count - 1);
+    }
+
+    pthread_rwlock_unlock(&g_cache.lock);
+
+    if (hit) {
+        atomic_fetch_add_explicit(&g_cache.hits, 1, memory_order_relaxed);
+        mercury_counter_inc(METRIC_CACHE_HITS, 1);
+        /* Need to update LRU ordering – do this in separate write lock */
+        pthread_rwlock_wrlock(&g_cache.lock);
+        size_t idx2 = hash & (g_cache.bucket_count - 1);
+        for (size_t probe = 0; probe < g_cache.bucket_count; ++probe) {
+            cache_entry_t *e = g_cache.buckets[idx2];
+            if (!e) break;
+            if (e->hash == hash && strcmp(e->key, key) == 0 && e->expires_at > now) {
+                lru_move_to_front(&g_cache, e);
+                break;
+            }
+            idx2 = (idx2 + 1) & (g_cache.bucket_count - 1);
+        }
+        pthread_rwlock_unlock(&g_cache.lock);
+        return true;
+    } else {
+        atomic_fetch_add_explicit(&g_cache.misses, 1, memory_order_relaxed);
+        mercury_counter_inc(METRIC_CACHE_MISSES, 1);
+        return false;
+    }
+}
+
+int mercury_cache_put(const char *key,
+                      const uint8_t *payload, size_t len,
+                      uint16_t status_code,
+                      uint32_t ttl_sec /* 0 for default */)
+{
+    if (!g_cache_initialised || !key || !payload || len == 0) {
+        return -1;
+    }
+
+    uint32_t ttl = ttl_sec ? ttl_sec : g_cache.default_ttl_sec;
+    uint64_t now = now_epoch_millis();
+
+    cache_entry_t *new_entry = entry_create(key, payload, len, status_code, ttl, now);
+    if (!new_entry) {
+        return -1;
+    }
+
+    pthread_rwlock_wrlock(&g_cache.lock);
+
+    /* Insert or replace */
+    size_t idx = new_entry->hash & (g_cache.bucket_count - 1);
+    for (size_t probe = 0; probe < g_cache.bucket_count; ++probe) {
+        cache_entry_t *existing = g_cache.buckets[idx];
+        if (!existing) {
+            /* Empty slot */
+            g_cache.buckets[idx] = new_entry;
+            ++g_cache.size;
+            lru_move_to_front(&g_cache, new_entry);
+            break;
+        } else if (existing->hash == new_entry->hash &&
+                   strcmp(existing->key, new_entry->key) == 0) {
+            /* Replace existing entry */
+            lru_remove(&g_cache, existing);
+            entry_destroy(existing);
+            g_cache.buckets[idx] = new_entry;
+            lru_move_to_front(&g_cache, new_entry);
+            break;
+        }
+        idx = (idx + 1) & (g_cache.bucket_count - 1);
+    }
+
+    cache_evict_if_needed(&g_cache);
+    metrics_update_size(&g_cache);
+
+    pthread_rwlock_unlock(&g_cache.lock);
+    return 0;
+}
+
+void mercury_cache_invalidate(const char *key_prefix)
+{
+    if (!g_cache_initialised) return;
+
+    pthread_rwlock_wrlock(&g_cache.lock);
+
+    size_t prefix_len = key_prefix ? strlen(key_prefix) : 0;
+    for (size_t i = 0; i < g_cache.bucket_count; ++i) {
+        cache_entry_t *e = g_cache.buckets[i];
+        if (!e) continue;
+
+        if (!key_prefix || strncmp(e->key, key_prefix, prefix_len) == 0) {
+            lru_remove(&g_cache, e);
+            entry_destroy(e);
+            g_cache.buckets[i] = NULL;
+            --g_cache.size;
+            mercury_log(LOG_LEVEL_DEBUG, "Cache invalidated: %s", e->key);
+        }
+    }
+
+    metrics_update_size(&g_cache);
+    pthread_rwlock_unlock(&g_cache.lock);
+}
+
+/* -------------------------------------------------------------------------- */
+/*                         INTERNAL HELPER FUNCTIONS                          */
+/* -------------------------------------------------------------------------- */
+
+static uint64_t fnv1a_hash(const char *s)
+{
+    uint64_t hash = 14695981039346656037ULL;
+    while (*s) {
+        hash ^= (unsigned char)(*s++);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static cache_entry_t *entry_create(const char *key, const uint8_t *payload,
+                                   size_t len, uint16_t status, uint32_t ttl_sec,
+                                   uint64_t now_ms)
+{
+    cache_entry_t *e = calloc(1, sizeof(*e));
+    if (!e) return NULL;
+
+    e->key = strdup(key);
+    if (!e->key) {
+        free(e);
+        return NULL;
+    }
+
+    e->payload = malloc(len);
+    if (!e->payload) {
+        free(e->key);
+        free(e);
+        return NULL;
+    }
+    memcpy(e->payload, payload, len);
+
+    e->payload_len = len;
+    e->status_code = status;
+    e->expires_at  = now_ms + ((uint64_t)ttl_sec * 1000ULL);
+    e->hash        = fnv1a_hash(key);
+
+    return e;
+}
+
+static void entry_destroy(cache_entry_t *e)
+{
+    if (!e) return;
+    free(e->key);
+    free(e->payload);
+    free(e);
+}
+
+static void lru_move_to_front(response_cache_t *c, cache_entry_t *e)
+{
+    if (c->lru_head == e) {
+        return; /* Already at front */
+    }
+
+    /* Remove from list if in list */
+    if (e->prev || e->next || c->lru_tail == e) {
+        lru_remove(c, e);
+    }
+
+    /* Insert at head */
+    e->next     = c->lru_head;
+    e->prev     = NULL;
+    if (c->lru_head) {
+        c->lru_head->prev = e;
+    }
+    c->lru_head = e;
+    if (!c->lru_tail) {
+        c->lru_tail = e;
+    }
+}
+
+static void lru_remove(response_cache_t *c, cache_entry_t *e)
+{
+    if (!e) return;
+
+    if (e->prev) {
+        e->prev->next = e->next;
+    } else {
+        c->lru_head = e->next;
+    }
+    if (e->next) {
+        e->next->prev = e->prev;
+    } else {
+        c->lru_tail = e->prev;
+    }
+
+    e->prev = e->next = NULL;
+}
+
+static void cache_evict_if_needed(response_cache_t *c)
+{
+    uint64_t now = now_epoch_millis();
+
+    /* First reap expired entries */
+    cache_entry_t *iter = c->lru_tail;
+    while (iter) {
+        cache_entry_t *prev = iter->prev;
+        if (iter->expires_at <= now ||
+            c->size > c->max_items)  /* force eviction if over capacity */
+        {
+            /* Remove from hash table */
+            size_t idx = iter->hash & (c->bucket_count - 1);
+            for (size_t probe = 0; probe < c->bucket_count; ++probe) {
+                if (c->buckets[idx] == iter) {
+                    c->buckets[idx] = NULL;
+                    break;
+                }
+                idx = (idx + 1) & (c->bucket_count - 1);
+            }
+
+            lru_remove(c, iter);
+            entry_destroy(iter);
+            --c->size;
+            atomic_fetch_add_explicit(&c->evictions, 1, memory_order_relaxed);
+            mercury_counter_inc(METRIC_CACHE_EVICTIONS, 1);
+        }
+        iter = prev;
+    }
+}
+
+static size_t next_pow2(size_t n)
+{
+    size_t v = 1;
+    while (v < n) v <<= 1;
+    return v;
+}
+
+static uint64_t now_epoch_millis(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
+
+static void metrics_update_size(response_cache_t *c)
+{
+    mercury_gauge_set(METRIC_CACHE_SIZE, (double)c->size);
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                TEST HARNESS                                */
+/* -------------------------------------------------------------------------- */
+#ifdef RESPONSE_CACHE_SELFTEST
+
+/* Simple self-test when compiled standalone */
+int main(void)
+{
+    if (mercury_cache_init(4, 2) != 0) {
+        fprintf(stderr, "Cache init failed\n");
+        return 1;
+    }
+
+    const char *key = "/v1/products?sku=123";
+    const char *resp = "{\"name\":\"widget\",\"price\":9.99}";
+    mercury_cache_put(key, (const uint8_t *)resp, strlen(resp)+1, 200, 1);
+
+    uint8_t *payload;
+    size_t len;
+    uint16_t status;
+    bool hit = mercury_cache_get(key, &payload, &len, &status);
+    printf("GET 1: hit=%d, payload=%s\n", hit, payload);
+
+    sleep(2); /* Wait for expiry */
+
+    hit = mercury_cache_get(key, &payload, &len, &status);
+    printf("GET 2: hit=%d\n", hit);
+
+    mercury_cache_shutdown();
+    return 0;
+}
+
+#endif /* RESPONSE_CACHE_SELFTEST */

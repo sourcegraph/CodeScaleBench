@@ -1,0 +1,255 @@
+```rust
+//! src/utils.rs
+//!
+//! General-purpose utilities shared across ChirpPulse services.
+//! Focus areas:
+//!   • Robust async retry with exponential back-off + jitter
+//!   • Task-spawn helpers with structured tracing
+//!   • Lightweight timing/metrics wrappers
+//!   • Misc. helpers (partition hashing, env access)
+//!
+//! These helpers allow individual micro-services to remain lean while still
+//! benefiting from consistent observability and failure-handling semantics.
+
+use rand::{thread_rng, Rng};
+use std::{
+    future::Future,
+    hash::Hasher,
+    pin::Pin,
+    time::{Duration, Instant},
+};
+use tokio::{task::JoinHandle, time::sleep};
+use tracing::{error, instrument, warn};
+
+/// Re-export a boxed error to simplify generic signatures within the
+/// application. We rely on `Send + Sync` so values can freely cross
+/// thread/async boundaries.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Unified error type for the `utils` module.
+///
+/// Use domain-specific errors in your service crates; convert to/from
+/// `UtilError` when necessary (e.g. for back-pressure signalling).
+#[derive(thiserror::Error, Debug)]
+pub enum UtilError {
+    /// All attempts have been consumed without success.
+    #[error("retries exhausted after {0} attempts")]
+    RetriesExhausted(usize),
+}
+
+/// Default maximum retry attempts when the caller supplies `0`.
+const DEFAULT_MAX_ATTEMPTS: usize = 5;
+
+/// Attempt an asynchronous operation multiple times with exponential back-off
+/// and ±20 % jitter.
+///
+/// • `operation` is an async closure producing `Result<T, E>`.  
+/// • `max_attempts == 0` triggers [`DEFAULT_MAX_ATTEMPTS`].  
+/// • `base_delay` is the initial sleep duration; it doubles each attempt.  
+///
+/// All errors are mapped to [`BoxError`] so we can treat them uniformly.
+///
+/// Example
+/// -------
+/// ```rust,no_run
+/// use chirp_pulse_utils::{retry_async, BoxError};
+/// use std::time::Duration;
+///
+/// async fn fetch() -> Result<(), BoxError> {
+///     // ... call a flaky upstream service ...
+/// #   Ok(())
+/// }
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), BoxError> {
+///     retry_async(
+///         || async { fetch().await },
+///         4,
+///         Duration::from_millis(100),
+///     )
+///     .await?;
+///     Ok(())
+/// }
+/// ```
+#[instrument(level = "trace", skip(operation))]
+pub async fn retry_async<F, Fut, T>(
+    mut operation: F,
+    max_attempts: usize,
+    base_delay: Duration,
+) -> Result<T, UtilError>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, BoxError>> + Send,
+    T: Send + 'static,
+{
+    let max_attempts = if max_attempts == 0 {
+        DEFAULT_MAX_ATTEMPTS
+    } else {
+        max_attempts
+    };
+
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+
+        match operation().await {
+            Ok(val) => return Ok(val),
+            Err(err) => {
+                if attempt >= max_attempts {
+                    error!(attempt, error = %err, "operation failed; retry limit reached");
+                    return Err(UtilError::RetriesExhausted(attempt));
+                }
+
+                // Calc delay = base * 2^(attempt-1) ±20 % jitter
+                let exp_delay = base_delay * 2_u32.pow((attempt - 1) as u32);
+                let jitter_factor = thread_rng().gen_range(0.8..=1.2);
+                let sleep_for = exp_delay.mul_f32(jitter_factor as f32);
+
+                warn!(
+                    attempt,
+                    max_attempts,
+                    error = %err,
+                    retry_in_ms = sleep_for.as_millis(),
+                    "operation failed; retrying…"
+                );
+
+                sleep(sleep_for).await;
+            }
+        }
+    }
+}
+
+/// Spawn a Tokio task with a meaningful name and automatic error logging.
+///
+/// Panics inside the task are propagated to the parent runtime (Tokio
+/// already aborts by default). _Error_ values returned from the task are
+/// logged but do **not** bubble up, preventing accidental unawaited
+/// `JoinHandle` leaks.
+///
+/// Returns the [`JoinHandle`] so callers may `.await`/`.abort()` as needed.
+///
+/// ```rust,no_run
+/// use chirp_pulse_utils::{spawn_named_task, BoxError};
+///
+/// async fn job() -> Result<(), BoxError> {
+///     // ... do work ...
+/// #   Ok(())
+/// }
+///
+/// let handle = spawn_named_task("my_background_job", job());
+/// ```
+pub fn spawn_named_task<F>(name: &'static str, fut: F) -> JoinHandle<()>
+where
+    F: Future<Output = Result<(), BoxError>> + Send + 'static,
+{
+    tokio::task::Builder::new()
+        .name(name)
+        .spawn(async move {
+            if let Err(err) = fut.await {
+                error!(task = name, error = %err, "task exited with error");
+            }
+        })
+        .expect("failed to spawn task")
+}
+
+/// Time an async operation and submit the duration as a histogram metric.
+///
+/// Even if `metrics` is disabled at compile-time, the no-op macro
+/// ensures zero runtime cost.
+///
+/// ```rust,no_run
+/// use chirp_pulse_utils::measure_time_async;
+///
+/// # async fn compute() {}
+/// let _ = measure_time_async("my_op.latency_seconds", || async { compute().await }).await;
+/// ```
+#[instrument(level = "trace", skip(operation))]
+pub async fn measure_time_async<F, Fut, T>(metric_name: &'static str, operation: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    let start = Instant::now();
+    let res = operation().await;
+    let elapsed = start.elapsed();
+    metrics::histogram!(metric_name, elapsed.as_secs_f64());
+    res
+}
+
+/// Retrieve the value of an environment variable or panic with a descriptive
+/// message. Suitable for required configuration keys that should fail fast
+/// during service boot.
+pub fn env_var(key: &str) -> String {
+    match std::env::var(key) {
+        Ok(v) => v,
+        Err(_) => {
+            let msg = format!("environment variable `{key}` must be set");
+            error!("{msg}");
+            panic!("{msg}");
+        }
+    }
+}
+
+/// Compute a stable 64-bit partition key for the given input string.
+///
+/// We use FNV-1a (fast, non-cryptographic) so identical inputs always hash to
+/// the same value, enabling event-ordering guarantees when producing to
+/// Kafka/Kinesis.
+///
+/// Example:
+/// ```
+/// use chirp_pulse_utils::partition_key_from_str;
+/// let key = partition_key_from_str("@elonmusk");
+/// ```
+pub fn partition_key_from_str(input: &str) -> u64 {
+    let mut hasher = fnv::FnvHasher::default();
+    hasher.write(input.as_bytes());
+    hasher.finish()
+}
+
+/////////////////////////////
+//           Tests         //
+/////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::runtime::Runtime;
+
+    #[test]
+    fn hash_is_stable() {
+        let a = partition_key_from_str("hello");
+        let b = partition_key_from_str("hello");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn retry_succeeds_eventually() {
+        let rt = Runtime::new().unwrap();
+        let mut failures_left = 2usize;
+
+        let result = rt
+            .block_on(async {
+                retry_async(
+                    || {
+                        Box::pin(async {
+                            if failures_left > 0 {
+                                failures_left -= 1;
+                                Err("transient failure".into())
+                            } else {
+                                Ok(123u32)
+                            }
+                        }) as Pin<Box<dyn Future<Output = Result<u32, BoxError>> + Send>>
+                    },
+                    5,
+                    Duration::from_millis(10),
+                )
+                .await
+            })
+            .unwrap();
+
+        assert_eq!(result, 123);
+        assert_eq!(failures_left, 0);
+    }
+}
+```

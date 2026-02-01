@@ -1,0 +1,418 @@
+//! module_30 - Data Quality Gate & Stream Monitor
+//! This module provides a pluggable data-quality validation engine that can be wired
+//! directly into Kafka consumer loops.
+//! It is designed to run in the ChirpPulse real-time stream processing services.
+
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use humantime::format_duration;
+use log::{debug, error, info, warn};
+use metrics::{counter, gauge, histogram};
+use once_cell::sync::Lazy;
+use regex::Regex;
+use serde_json::Value;
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{mpsc, Semaphore},
+    task::JoinHandle,
+    time::{interval, sleep, Instant},
+};
+
+/// Maximum number of concurrent validation jobs.
+/// (safeguard to protect service from spikes)
+const MAX_CONCURRENCY: usize = 256;
+
+/// Interval at which internal health metrics are flushed.
+const METRIC_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Wrapper around serde_json::Value that represents an incoming social event.
+#[derive(Debug, Clone)]
+pub struct SocialRecord {
+    pub raw: Value,
+    pub received_at: DateTime<Utc>,
+    /// Topic name (twitter, reddit, etc.)
+    pub source_topic: String,
+    /// Kafka offset (or any position marker)
+    pub offset: i64,
+}
+
+#[derive(Debug, Error)]
+pub enum QualityError {
+    #[error("required field `{0}` missing")]
+    MissingField(String),
+    #[error("field `{0}` failed regex validation")]
+    RegexMismatch(String),
+    #[error("language detection mismatch: expected {expected}, got {actual}")]
+    LanguageMismatch { expected: String, actual: String },
+    #[error("custom engine error: {0}")]
+    Custom(String),
+}
+
+#[async_trait]
+pub trait DataQualityCheck: Send + Sync {
+    /// Name of the check (used for logging & metrics).
+    fn name(&self) -> &'static str;
+
+    /// Validate the provided record.
+    async fn validate(&self, record: &SocialRecord) -> Result<(), QualityError>;
+}
+
+/// Data quality check that asserts the presence of a non-empty field.
+pub struct RequiredFieldCheck {
+    field: &'static str,
+}
+impl RequiredFieldCheck {
+    pub fn new(field: &'static str) -> Self {
+        Self { field }
+    }
+}
+
+#[async_trait]
+impl DataQualityCheck for RequiredFieldCheck {
+    fn name(&self) -> &'static str {
+        "required_field"
+    }
+
+    async fn validate(&self, record: &SocialRecord) -> Result<(), QualityError> {
+        match record.raw.get(self.field) {
+            Some(v) if !v.is_null() => Ok(()),
+            _ => Err(QualityError::MissingField(self.field.into())),
+        }
+    }
+}
+
+/// Data quality check that applies a regex to a string field.
+pub struct RegexFieldCheck {
+    field: &'static str,
+    regex: &'static Regex,
+}
+
+impl RegexFieldCheck {
+    pub const fn new(field: &'static str, regex: &'static Regex) -> Self {
+        Self { field, regex }
+    }
+}
+
+#[async_trait]
+impl DataQualityCheck for RegexFieldCheck {
+    fn name(&self) -> &'static str {
+        "regex_field"
+    }
+
+    async fn validate(&self, record: &SocialRecord) -> Result<(), QualityError> {
+        match record.raw.get(self.field) {
+            Some(Value::String(s)) if self.regex.is_match(s) => Ok(()),
+            _ => Err(QualityError::RegexMismatch(self.field.into())),
+        }
+    }
+}
+
+/// Central engine that orchestrates execution of data-quality checks for incoming records.
+pub struct QualityGate {
+    checks: Vec<Arc<dyn DataQualityCheck>>,
+    semaphore: Arc<Semaphore>,
+    reporter: mpsc::UnboundedSender<QualityReport>,
+}
+
+impl QualityGate {
+    /// Build a new QualityGate with the provided checks.
+    pub fn new(checks: Vec<Arc<dyn DataQualityCheck>>) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let gate = Self {
+            checks,
+            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENCY)),
+            reporter: tx,
+        };
+        gate.spawn_report_collector(rx);
+        gate
+    }
+
+    /// Validates a batch of social records concurrently. Returns handles that can be awaited
+    /// for completion.
+    pub fn validate_batch(&self, batch: Vec<SocialRecord>) -> Vec<JoinHandle<()>> {
+        let mut handles = Vec::with_capacity(batch.len());
+
+        for record in batch {
+            let permit = match self.semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    // Should be exceedingly rare, but ensures we never panic.
+                    warn!("QualityGate semaphore at capacity; stalling new validations");
+                    // Acquire asynchronously to wait.
+                    let semaphore = self.semaphore.clone();
+                    handles.push(tokio::spawn(async move {
+                        let _permit = semaphore.acquire().await;
+                        drop(_permit);
+                    }));
+                    continue;
+                }
+            };
+
+            let checks = self.checks.clone();
+            let tx = self.reporter.clone();
+
+            handles.push(tokio::spawn(async move {
+                let _alive_permit = permit; // keep permit alive for duration
+                let mut issues = Vec::new();
+
+                for check in &checks {
+                    match check.validate(&record).await {
+                        Ok(()) => {
+                            counter!(
+                                "chirppulse_quality_check_pass_total",
+                                1,
+                                "check" => check.name()
+                            );
+                        }
+                        Err(err) => {
+                            counter!(
+                                "chirppulse_quality_check_fail_total",
+                                1,
+                                "check" => check.name(),
+                                "source_topic" => record.source_topic.as_str()
+                            );
+                            issues.push(err);
+                        }
+                    }
+                }
+
+                let report = QualityReport {
+                    record_meta: RecordMeta {
+                        source_topic: record.source_topic,
+                        offset: record.offset,
+                        received_at: record.received_at,
+                    },
+                    issues,
+                };
+
+                if let Err(e) = tx.send(report) {
+                    error!("quality report channel closed unexpectedly: {e}");
+                }
+            }));
+        }
+
+        handles
+    }
+
+    /// Background task that aggregates and dumps quality reports.
+    fn spawn_report_collector(&self, mut rx: mpsc::UnboundedReceiver<QualityReport>) {
+        tokio::spawn(async move {
+            let mut buffer: Vec<QualityReport> = Vec::with_capacity(10_000);
+            let mut ticker = interval(METRIC_FLUSH_INTERVAL);
+
+            loop {
+                select! {
+                    maybe_report = rx.recv() => {
+                        match maybe_report {
+                            Some(report) => buffer.push(report),
+                            None => {
+                                debug!("QualityGate report channel closed; terminating collector");
+                                break;
+                            }
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        if !buffer.is_empty() {
+                            Self::flush_reports(std::mem::take(&mut buffer));
+                        }
+                    }
+                }
+            }
+
+            // final flush
+            if !buffer.is_empty() {
+                Self::flush_reports(buffer);
+            }
+        });
+    }
+
+    fn flush_reports(batch: Vec<QualityReport>) {
+        let total_issues: usize = batch.iter().map(|r| r.issues.len()).sum();
+        gauge!("chirppulse_quality_pending_reports", 0.0);
+        histogram!("chirppulse_quality_issues_per_batch", total_issues as f64);
+
+        if total_issues > 0 {
+            info!(
+                "QualityGate flushed {} problematic records containing {} total issues",
+                batch.len(),
+                total_issues
+            );
+            // In production this would be persisted to a DLQ, external store, or alerting bus.
+            for report in &batch {
+                for issue in &report.issues {
+                    warn!(
+                        "[DQ] topic={} offset={} issue={}",
+                        report.record_meta.source_topic, report.record_meta.offset, issue
+                    );
+                }
+            }
+        } else {
+            debug!(
+                "QualityGate flushed {} clean records (no issues)",
+                batch.len()
+            );
+        }
+    }
+}
+
+/// Metadata we carry around for observability purposes.
+/// Kept separate from the `SocialRecord` to avoid cloning the full JSON document.
+#[derive(Debug, Clone)]
+pub struct RecordMeta {
+    pub source_topic: String,
+    pub offset: i64,
+    pub received_at: DateTime<Utc>,
+}
+
+/// A single validation report for a social record.
+#[derive(Debug)]
+pub struct QualityReport {
+    pub record_meta: RecordMeta,
+    pub issues: Vec<QualityError>,
+}
+
+/// A small helper that encapsulates an exponential back-off policy.
+///
+/// This is useful when interacting with external systems (e.g. Kafka, S3)
+/// where transient failures are expected during high traffic peaks.
+pub struct Backoff {
+    next_delay: Duration,
+    max_delay: Duration,
+}
+
+impl Backoff {
+    pub const fn new(initial: Duration, max_delay: Duration) -> Self {
+        Self {
+            next_delay: initial,
+            max_delay,
+        }
+    }
+
+    /// Wait for the current backoff delay, then exponentially increase it.
+    pub async fn snooze(&mut self) {
+        let wait = self.next_delay.min(self.max_delay);
+        debug!("backoff sleeping for {}", format_duration(wait));
+        sleep(wait).await;
+        self.next_delay = (self.next_delay * 2).min(self.max_delay);
+    }
+
+    /// Reset the backoff delay to initial value.
+    pub fn reset(&mut self, initial: Duration) {
+        self.next_delay = initial;
+    }
+}
+
+/// A simple health-check watchdog that notifies if consumer lag grows beyond thresholds.
+pub struct LagMonitor {
+    window: Duration,
+    critical_threshold: u64,
+    last_offsets: HashMap<String, i64>,
+    last_check: Instant,
+}
+
+impl LagMonitor {
+    pub fn new(window: Duration, critical_threshold: u64) -> Self {
+        Self {
+            window,
+            critical_threshold,
+            last_offsets: HashMap::new(),
+            last_check: Instant::now(),
+        }
+    }
+
+    /// Update the latest committed offset for the given topic.
+    pub fn record_offset(&mut self, topic: &str, offset: i64) {
+        self.last_offsets.insert(topic.to_owned(), offset);
+    }
+
+    /// Returns true if lag is considered healthy.
+    pub fn is_healthy(&mut self, fetch_lag: impl Fn(&str) -> Option<u64>) -> bool {
+        if self.last_check.elapsed() < self.window {
+            return true;
+        }
+        self.last_check = Instant::now();
+
+        for (topic, offset) in &self.last_offsets {
+            if let Some(lag) = fetch_lag(topic) {
+                gauge!("chirppulse_consumer_lag", lag as f64, "topic" => topic.clone());
+
+                if lag > self.critical_threshold {
+                    error!(
+                        "LagMonitor detected critical lag on topic `{}` ({} messages behind)",
+                        topic, lag
+                    );
+                    return false;
+                } else {
+                    debug!(
+                        "LagMonitor topic `{}` healthy (lag = {})",
+                        topic, lag
+                    );
+                }
+            } else {
+                warn!(
+                    "LagMonitor unable to fetch lag for topic `{}`; assuming unhealthy",
+                    topic
+                );
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Pre-compiled regular expressions to prevent recompilation at runtime.
+static MENTION_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^@\w{1,15}$").unwrap());
+
+/// Example of how to wire everything into an asynchronous consumer loop.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn validate_required_field() {
+        let checks: Vec<Arc<dyn DataQualityCheck>> =
+            vec![Arc::new(RequiredFieldCheck::new("text"))];
+
+        let gate = QualityGate::new(checks);
+
+        let record_ok = SocialRecord {
+            raw: json!({"text": "hello world"}),
+            received_at: Utc::now(),
+            source_topic: "twitter_dev".into(),
+            offset: 42,
+        };
+
+        let record_bad = SocialRecord {
+            raw: json!({"foo": "bar"}),
+            received_at: Utc::now(),
+            source_topic: "twitter_dev".into(),
+            offset: 43,
+        };
+
+        let handles = gate.validate_batch(vec![record_ok, record_bad]);
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn backoff_behaviour() {
+        let mut backoff = Backoff::new(Duration::from_millis(10), Duration::from_millis(80));
+        for expected in [10, 20, 40, 80, 80] {
+            let before = Instant::now();
+            backoff.snooze().await;
+            let slept = before.elapsed().as_millis();
+            assert!(slept as u64 >= expected);
+        }
+        backoff.reset(Duration::from_millis(10));
+        assert_eq!(backoff.next_delay, Duration::from_millis(10));
+    }
+}

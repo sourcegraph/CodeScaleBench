@@ -1,0 +1,303 @@
+```csharp
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformations.Focus
+{
+    #region Contracts
+
+    /// <summary>
+    /// Contract for a transformation strategy that converts an inbound stream of <typeparamref name="TIn"/>
+    /// into an outbound stream of <typeparamref name="TOut"/> asynchronously.
+    /// </summary>
+    /// <typeparam name="TIn">Inbound event shape.</typeparam>
+    /// <typeparam name="TOut">Outbound event shape.</typeparam>
+    public interface IAsyncTransformationStrategy<TIn, TOut>
+    {
+        /// <summary>
+        /// Executes the transformation.
+        /// </summary>
+        /// <remarks>
+        /// Implementations must be thread-safe and cancellation-aware.
+        /// </remarks>
+        /// <param name="events">Input event stream.</param>
+        /// <param name="outputWriter">Output sink.</param>
+        /// <param name="cancellationToken">Co-operative cancellation token.</param>
+        Task TransformAsync(
+            IAsyncEnumerable<TIn> events,
+            IAsyncEventWriter<TOut> outputWriter,
+            CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Generic abstraction over the target to which a transformation strategy
+    /// writes its outbound records (e.g., Kinesis, S3, DynamoDB, etc.).
+    /// </summary>
+    public interface IAsyncEventWriter<in T>
+    {
+        /// <summary>
+        /// Persists a single record asynchronously.
+        /// </summary>
+        Task WriteAsync(T record, CancellationToken cancellationToken = default);
+    }
+
+    #endregion
+
+    #region Domain Models
+
+    /// <summary>
+    /// Raw, denormalised data-lake event representing a unit of productive activity.
+    /// </summary>
+    public sealed record RawProductivityEvent(
+        string   EmployeeId,
+        DateTime TimestampUtc,
+        EventKind Kind,
+        TimeSpan Duration);
+
+    /// <summary>
+    /// The kinds of tracked activity we are interested in.
+    /// </summary>
+    public enum EventKind
+    {
+        FocusSession,
+        Meeting
+    }
+
+    /// <summary>
+    /// KPI record that will be published downstream.
+    /// </summary>
+    public sealed record FocusTimeRatioKpi(
+        string   EmployeeId,
+        DateTime Date,          // UTC date bucket (yyyy-MM-dd)
+        double   FocusMinutes,
+        double   MeetingMinutes,
+        double   FocusRatio)    // FocusMinutes / (FocusMinutes + MeetingMinutes)
+    {
+        public string PartitionKey => EmployeeId;
+    }
+
+    #endregion
+
+    /// <summary>
+    /// Transformation strategy that calculates Focus-Time Ratio per employee per UTC-day
+    /// from a heterogeneous stream of productivity events.
+    /// </summary>
+    public sealed class FocusTimeRatioTransformation :
+        IAsyncTransformationStrategy<RawProductivityEvent, FocusTimeRatioKpi>, IDisposable
+    {
+        // Flush every X seconds or when buffer exceeds Y employees.
+        private readonly TimeSpan _flushInterval = TimeSpan.FromSeconds(30);
+        private readonly int      _maxBufferSize;
+
+        private readonly ILogger<FocusTimeRatioTransformation>? _logger;
+        private readonly ConcurrentDictionary<(string EmployeeId, DateTime Date), Aggregate> _buffer = new();
+
+        private readonly Timer _flushTimer;
+
+        public FocusTimeRatioTransformation(
+            ILogger<FocusTimeRatioTransformation>? logger = null,
+            int maxBufferSize                          = 5_000)
+        {
+            _logger        = logger;
+            _maxBufferSize = maxBufferSize;
+            _flushTimer    = new Timer(_ => FlushBufferAsync().ConfigureAwait(false), null,
+                                       _flushInterval, _flushInterval);
+        }
+
+        public async Task TransformAsync(
+            IAsyncEnumerable<RawProductivityEvent> events,
+            IAsyncEventWriter<FocusTimeRatioKpi>   outputWriter,
+            CancellationToken                      cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(events);
+            ArgumentNullException.ThrowIfNull(outputWriter);
+
+            await foreach (var evt in events.WithCancellation(cancellationToken)
+                                            .ConfigureAwait(false))
+            {
+                var date = evt.TimestampUtc.Date;
+
+                var key = (evt.EmployeeId, date);
+                _buffer.AddOrUpdate(
+                    key,
+                    static k => Aggregate.New(k.EmployeeId, k.date, evt),
+                    static (_, existing) => existing.Add(evt));
+
+                // Pro-actively flush if buffer grows large.
+                if (_buffer.Count >= _maxBufferSize)
+                {
+                    await FlushBufferAsync(outputWriter, cancellationToken)
+                               .ConfigureAwait(false);
+                }
+            }
+
+            // Final flush after stream completes.
+            await FlushBufferAsync(outputWriter, cancellationToken)
+                       .ConfigureAwait(false);
+        }
+
+        #region Buffer & Flushing
+
+        private async Task FlushBufferAsync(
+            IAsyncEventWriter<FocusTimeRatioKpi>? writer = default,
+            CancellationToken                     ct     = default)
+        {
+            if (_buffer.IsEmpty) return;
+
+            var channel = Channel.CreateUnbounded<FocusTimeRatioKpi>(
+                new UnboundedChannelOptions
+                {
+                    SingleReader      = false,
+                    SingleWriter      = false,
+                    AllowSynchronousContinuations = false
+                });
+
+            // Producer: convert aggregates into KPI DTOs.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    foreach (var (key, aggregate) in _buffer.ToArray())
+                    {
+                        // Remove from buffer atomically if still exists.
+                        if (_buffer.TryRemove(key, out var agg))
+                        {
+                            var kpi = agg.ToKpi();
+
+                            await channel.Writer
+                                         .WriteAsync(kpi, ct)
+                                         .ConfigureAwait(false);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Failed while enqueuing KPIs for flush.");
+                }
+                finally
+                {
+                    channel.Writer.Complete();
+                }
+            }, ct);
+
+            // Consumer: write out via provided writer (if streaming), else just log.
+            await foreach (var kpi in channel.Reader.ReadAllAsync(ct)
+                                                    .ConfigureAwait(false))
+            {
+                try
+                {
+                    if (writer is not null)
+                    {
+                        await writer.WriteAsync(kpi, ct)
+                                    .ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        _logger?.LogInformation(
+                            "KPI flushed (dry-run): {kpi}",
+                            JsonSerializer.Serialize(kpi));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning(
+                        ex,
+                        "Failed to persist KPI for EmployeeId={EmployeeId} Date={Date}",
+                        kpi.EmployeeId,
+                        kpi.Date.ToString("yyyy-MM-dd",
+                                          CultureInfo.InvariantCulture));
+                }
+            }
+        }
+
+        #endregion
+
+        #region Aggregate – private helper
+
+        private sealed class Aggregate
+        {
+            public string   EmployeeId     { get; }
+            public DateTime Date           { get; }
+            public double   FocusMinutes   { get; private set; }
+            public double   MeetingMinutes { get; private set; }
+
+            private Aggregate(string employeeId, DateTime date)
+            {
+                EmployeeId = employeeId;
+                Date       = date;
+            }
+
+            public static Aggregate New(string employeeId, DateTime date, RawProductivityEvent evt)
+            {
+                var agg = new Aggregate(employeeId, date);
+                return agg.Add(evt);
+            }
+
+            /// <summary>
+            /// Thread-safe accumulation of a new event into the aggregate.
+            /// </summary>
+            public Aggregate Add(RawProductivityEvent evt)
+            {
+                var minutes = evt.Duration.TotalMinutes;
+                switch (evt.Kind)
+                {
+                    case EventKind.FocusSession:
+                        InterlockedAdd(ref FocusMinutes, minutes);
+                        break;
+
+                    case EventKind.Meeting:
+                        InterlockedAdd(ref MeetingMinutes, minutes);
+                        break;
+                }
+
+                return this;
+            }
+
+            public FocusTimeRatioKpi ToKpi()
+            {
+                var total = FocusMinutes + MeetingMinutes;
+                var ratio = total == 0 ? 0 : FocusMinutes / total;
+
+                return new FocusTimeRatioKpi(
+                    EmployeeId,
+                    Date,
+                    Math.Round(FocusMinutes,   2),
+                    Math.Round(MeetingMinutes, 2),
+                    Math.Round(ratio,          4));
+            }
+
+            private static void InterlockedAdd(ref double location, double value)
+            {
+                double newCurrentValue, currentValue;
+                do
+                {
+                    currentValue   = location;
+                    newCurrentValue = currentValue + value;
+                }
+                while (Math.Abs(
+                           Interlocked.CompareExchange(
+                               ref location,
+                               newCurrentValue,
+                               currentValue) - currentValue) > double.Epsilon);
+            }
+        }
+
+        #endregion
+
+        public void Dispose()
+        {
+            _flushTimer.Dispose();
+            // One last synchronous flush in case app is shutting down abruptly.
+            FlushBufferAsync().GetAwaiter().GetResult();
+        }
+    }
+}
+```

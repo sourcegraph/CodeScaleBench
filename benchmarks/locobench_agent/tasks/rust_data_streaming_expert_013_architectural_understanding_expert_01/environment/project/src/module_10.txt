@@ -1,0 +1,403 @@
+```rust
+//! src/module_10.rs
+//!
+//! Dynamic enrichment pipeline with hot-swappable strategies.
+//! This module represents a self-contained “micro-pipeline” that can be embedded
+//! in any streaming consumer (e.g., a Kafka consumer task).  It demonstrates:
+//!   • Strategy Pattern for pluggable enrichment algorithms  
+//!   • Thread-safe hot-swap at runtime (no restart required)  
+//!   • Observability hooks (structured logging + metrics)  
+//!   • Graceful error handling and back-pressure aware execution
+//!
+//! The code is designed to be production-ready; it depends only on mature crates
+//! and is agnostic to the surrounding runtime (Tokio, async-std, etc.).
+//!
+//! # Usage
+//! ```rust,no_run
+//! use chirp_pulse::pipeline::{DynamicPipeline, ToxicityScorer, LanguageDetector};
+//!
+//! #[tokio::main(flavor = "multi_thread")]
+//! async fn main() -> anyhow::Result<()> {
+//!     let pipeline = DynamicPipeline::builder()
+//!         .with_stage("lang_detect", LanguageDetector::default())
+//!         .with_stage("toxicity", ToxicityScorer::default())
+//!         .build();
+//!
+//!     pipeline.run_stream(kafka_stream()).await?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! In production this module would live in its own crate; for brevity we expose
+//! everything under `crate::pipeline`.
+
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
+use async_trait::async_trait;
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use tokio::{
+    select,
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Generic result alias used across pipeline components.
+pub type Result<T, E = PipelineError> = std::result::Result<T, E>;
+
+/// Domain error type for pipeline failures.
+#[derive(thiserror::Error, Debug)]
+pub enum PipelineError {
+    #[error("stage `{0}` failed: {1}")]
+    StageFailed(&'static str, anyhow::Error),
+
+    #[error("stream cancellation requested")]
+    Cancelled,
+
+    #[error("channel closed unexpectedly")]
+    ChannelClosed,
+}
+
+/// A social event ingested from the upstream broker.
+///
+/// In the real platform this struct is produced by a fully-typed Avro/Protobuf
+/// schema but we simplify here for demonstration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialEvent {
+    pub id: String,
+    pub author: String,
+    pub payload: String,
+    pub lang: Option<String>,
+    pub toxicity_score: Option<f32>,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// Trait representing an enrichment stage.
+///
+/// The stage receives a mutable reference so it can either return a transformed
+/// copy or update in place.
+#[async_trait]
+pub trait EnrichmentStage: Send + Sync + 'static {
+    /// A human-readable, unique name.
+    fn name(&self) -> &'static str;
+
+    /// Process an item. Implementations should strive to be async-safe,
+    /// returning quickly or performing IO in a cooperative fashion.
+    async fn process(&self, ev: &mut SocialEvent) -> Result<()>;
+}
+
+/// Simple rule-based language detector.
+#[derive(Default)]
+pub struct LanguageDetector;
+
+#[async_trait]
+impl EnrichmentStage for LanguageDetector {
+    fn name(&self) -> &'static str {
+        "language_detector"
+    }
+
+    #[instrument(name = "language_detection", skip(self, ev))]
+    async fn process(&self, ev: &mut SocialEvent) -> Result<()> {
+        // Extremely naïve language detection: presence of “¿” → Spanish
+        if ev.payload.contains('¿') {
+            ev.lang = Some("es".into());
+        } else if ev.payload.bytes().any(|b| b >= 0xC0) {
+            ev.lang = Some("und".into()); // Unknown non-ASCII
+        } else {
+            ev.lang = Some("en".into());
+        }
+        Ok(())
+    }
+}
+
+/// Toxicity scorer using a mock ML model.
+///
+/// In production this might call out to a TensorFlow Serving instance or
+/// ONNX runtime; we simulate latency with `tokio::time::sleep`.
+#[derive(Default)]
+pub struct ToxicityScorer;
+
+#[async_trait]
+impl EnrichmentStage for ToxicityScorer {
+    fn name(&self) -> &'static str {
+        "toxicity_scorer"
+    }
+
+    #[instrument(name = "toxicity_scoring", skip(self, ev))]
+    async fn process(&self, ev: &mut SocialEvent) -> Result<()> {
+        // Simulate expensive inference
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        // Pseudo-random score based on payload length
+        ev.toxicity_score = Some((ev.payload.len() % 100) as f32 / 100.0);
+        Ok(())
+    }
+}
+
+/// Thread-safe collection of enrichment stages that can be updated at runtime.
+#[derive(Clone)]
+pub struct StageRegistry {
+    inner: Arc<RwLock<HashMap<&'static str, Arc<dyn EnrichmentStage>>>>,
+}
+
+impl StageRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn insert<S: EnrichmentStage>(&self, stage: S) {
+        let mut map = self.inner.write();
+        map.insert(stage.name(), Arc::new(stage));
+        info!(stage = %stage.name(), "registered enrichment stage");
+    }
+
+    pub fn remove(&self, name: &'static str) -> Option<Arc<dyn EnrichmentStage>> {
+        let mut map = self.inner.write();
+        let removed = map.remove(name);
+        if removed.is_some() {
+            warn!(stage = %name, "unregistered enrichment stage");
+        }
+        removed
+    }
+
+    pub fn list(&self) -> Vec<&'static str> {
+        self.inner.read().keys().copied().collect()
+    }
+
+    pub fn snapshot(&self) -> Vec<Arc<dyn EnrichmentStage>> {
+        self.inner.read().values().cloned().collect()
+    }
+}
+
+/// Metrics emitted by the pipeline.
+#[derive(Debug, Clone)]
+pub struct PipelineMetrics {
+    pub processed: u64,
+    pub failed: u64,
+    pub lag_ms: u64,
+}
+
+/// A dynamic, stoppable pipeline.
+///
+/// Internally it spins up an async task that:
+///   • reads from an upstream stream (user-supplied)  
+///   • applies currently registered stages in insertion order  
+///   • publishes enriched events to a downstream sender (user-supplied)
+pub struct DynamicPipeline {
+    stages: StageRegistry,
+    shutdown_tx: watch::Sender<bool>,
+    metrics_rx: watch::Receiver<PipelineMetrics>,
+    handle: JoinHandle<Result<()>>,
+}
+
+impl DynamicPipeline {
+    pub fn builder() -> PipelineBuilder {
+        PipelineBuilder::default()
+    }
+
+    /// Gracefully shuts down the pipeline, waiting for the internal task to
+    /// flush in-flight events (bounded by `grace_period`).
+    pub async fn stop(self, grace_period: Duration) -> Result<()> {
+        self.shutdown_tx.send_replace(true);
+        let res = tokio::time::timeout(grace_period, self.handle)
+            .await
+            .map_err(|_| PipelineError::Cancelled)??;
+        Ok(res)
+    }
+
+    /// Returns a read-only view into live metrics.
+    pub fn metrics(&self) -> watch::Receiver<PipelineMetrics> {
+        self.metrics_rx.clone()
+    }
+
+    /// Exposes the underlying registry for hot-swapping.
+    pub fn registry(&self) -> StageRegistry {
+        self.stages.clone()
+    }
+}
+
+/// Builder pattern for ergonomic pipeline creation.
+#[derive(Default)]
+pub struct PipelineBuilder {
+    stages: StageRegistry,
+}
+
+impl PipelineBuilder {
+    pub fn with_stage<S: EnrichmentStage>(mut self, _id: &'static str, stage: S) -> Self {
+        self.stages.insert(stage);
+        self
+    }
+
+    /// Construct and spawn the pipeline.
+    ///
+    /// `input` – Any async stream that yields `SocialEvent`s  
+    /// `output` – An `mpsc::Sender` where enriched events will be pushed
+    pub fn spawn<I>(
+        self,
+        mut input: I,
+        output: mpsc::Sender<SocialEvent>,
+    ) -> DynamicPipeline
+    where
+        I: futures_core::Stream<Item = SocialEvent> + Send + 'static,
+    {
+        let stages = self.stages;
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let metrics = PipelineMetrics {
+            processed: 0,
+            failed: 0,
+            lag_ms: 0,
+        };
+        let (metrics_tx, metrics_rx) = watch::channel(metrics.clone());
+
+        let handle: JoinHandle<Result<()>> = tokio::spawn(async move {
+            let counter = AtomicU64::new(0);
+            let mut most_recent_ts = Instant::now();
+
+            loop {
+                select! {
+                    _ = shutdown_rx.changed() => {
+                        info!("pipeline shutdown requested");
+                        break;
+                    },
+                    maybe_ev = input.next() => {
+                        let mut ev = match maybe_ev {
+                            Some(ev) => ev,
+                            None => break, // upstream closed
+                        };
+
+                        let start = Instant::now();
+                        let mut failed_stage = None;
+
+                        for stage in stages.snapshot() {
+                            if let Err(e) = stage.process(&mut ev).await {
+                                failed_stage = Some((stage.name(), e));
+                                break;
+                            }
+                        }
+
+                        if let Some((name, err)) = failed_stage {
+                            error!(stage = %name, error = %err, id=%ev.id, "event failed");
+                            metrics_tx.send_if_modified(|m| {
+                                m.failed += 1;
+                                true
+                            });
+                            continue; // Skip publishing bad event
+                        }
+
+                        // Publish enriched event downstream (may exert back-pressure).
+                        if output.send(ev).await.is_err() {
+                            return Err(PipelineError::ChannelClosed);
+                        }
+
+                        let elapsed = start.elapsed().as_millis() as u64;
+                        most_recent_ts = Instant::now();
+                        let processed = counter.fetch_add(1, Ordering::Relaxed) + 1;
+
+                        metrics_tx.send_if_modified(|m| {
+                            m.processed = processed;
+                            m.lag_ms = elapsed;
+                            true
+                        });
+                    }
+                }
+            }
+
+            let runtime = most_recent_ts.elapsed();
+            info!(
+                processed = counter.load(Ordering::Relaxed),
+                runtime_ms = runtime.as_millis(),
+                "pipeline terminated"
+            );
+            Ok(())
+        });
+
+        DynamicPipeline {
+            stages,
+            shutdown_tx,
+            metrics_rx,
+            handle,
+        }
+    }
+}
+
+// ===============================
+// Helper functions for testing
+// ===============================
+
+/// Create a fake event stream that yields `n` random events.
+pub fn fake_stream(
+    n: usize,
+    delay: Duration,
+) -> impl futures_core::Stream<Item = SocialEvent> + Send + 'static {
+    use futures_util::stream;
+    use rand::{distributions::Alphanumeric, Rng};
+
+    stream::iter(0..n).then(move |_| {
+        let delay = delay.clone();
+        async move {
+            tokio::time::sleep(delay).await;
+            let random_text: String = rand::thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(20)
+                .map(char::from)
+                .collect();
+
+            SocialEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                author: "alice".into(),
+                payload: random_text,
+                lang: None,
+                toxicity_score: None,
+                timestamp: chrono::Utc::now(),
+            }
+        }
+    })
+}
+
+/// Convenience helper for quick smoke tests.
+///
+/// Run with `cargo test -- --nocapture` to observe tracing output.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipeline_smoke_test() {
+        tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_test_writer()
+            .init();
+
+        let (tx_out, mut rx_out) = mpsc::channel::<SocialEvent>(32);
+        let stream = fake_stream(10, Duration::from_millis(5));
+        let pipeline = PipelineBuilder::default()
+            .with_stage("lang", LanguageDetector::default())
+            .with_stage("tox", ToxicityScorer::default())
+            .spawn(stream, tx_out);
+
+        let mut received = 0usize;
+        while let Some(ev) = rx_out.recv().await {
+            debug!(?ev, "received enriched event");
+            assert!(ev.lang.is_some());
+            assert!(ev.toxicity_score.is_some());
+            received += 1;
+            if received == 10 {
+                break;
+            }
+        }
+
+        pipeline.stop(Duration::from_secs(2)).await.unwrap();
+    }
+}
+```

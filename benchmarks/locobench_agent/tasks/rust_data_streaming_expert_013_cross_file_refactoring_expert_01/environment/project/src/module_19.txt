@@ -1,0 +1,413 @@
+```rust
+//! module_19 – Real-time Sentiment Processor
+//!
+//! This module owns the Kafka “sentiment-enrichment” micro-service.  It
+//! subscribes to the raw‐tweet topic, enriches each message with a sentiment
+//! score, and republishes the result to an “enriched” topic.  A hot-swappable
+//! strategy pattern allows data-scientists to deploy new algorithms without
+//! downtime.  Prometheus metrics and structured logging provide first-class
+//! observability.
+
+#![allow(clippy::missing_errors_doc)]
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use futures::StreamExt;
+use once_cell::sync::Lazy;
+use prometheus::{
+    register_histogram, register_int_counter, Encoder, Histogram, IntCounter, TextEncoder,
+};
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    error::KafkaError,
+    message::BorrowedMessage,
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Message,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::{
+    sync::{mpsc, RwLock},
+    task,
+    time::timeout,
+};
+
+/// Hard upper-limit on processing latency we’re willing to wait for on each
+/// message before declaring back-pressure and dropping it.
+const MAX_PROCESSING_LATENCY: Duration = Duration::from_secs(2);
+
+static MSG_PROCESSED: Lazy<IntCounter> =
+    Lazy::new(|| register_int_counter!("msg_processed_total", "Total messages processed").unwrap());
+
+static MSG_FAILED: Lazy<IntCounter> =
+    Lazy::new(|| register_int_counter!("msg_failed_total", "Total messages that failed").unwrap());
+
+static MSG_LATENCY: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "msg_latency_seconds",
+        "Latency of sentiment processing",
+        vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0]
+    )
+    .unwrap()
+});
+
+/// -------- Public DTOs ------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SocialEvent {
+    pub id: String,
+    pub text: String,
+    pub lang: Option<String>,
+    pub timestamp: i64,
+    /// Map of arbitrary additional fields injected by other enrichment stages.
+    #[serde(default)]
+    pub meta: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SentimentEvent {
+    pub id: String,
+    pub sentiment: f32,
+    pub version: String,
+    pub timestamp: i64,
+    #[serde(flatten)]
+    pub meta: HashMap<String, serde_json::Value>,
+}
+
+/// -------- Strategy Pattern --------------------------------------------------
+
+/// SentimentStrategy is the hot-swappable analysis contract.  New algorithms
+/// just implement the trait and can be loaded at runtime.
+pub trait SentimentStrategy: Send + Sync + 'static {
+    /// Returns an opaque version string (e.g., git‐sha) that is attached to
+    /// each output so downstream consumers know which algorithm scored it.
+    fn version(&self) -> &str;
+
+    /// Calculates a sentiment score in range −1.0 … 1.0 (inclusive).
+    fn score(&self, text: &str) -> f32;
+}
+
+/// A very small rule-based reference algorithm.
+#[derive(Default)]
+pub struct RuleBasedStrategy {
+    version: String,
+}
+
+impl RuleBasedStrategy {
+    pub fn new(version: impl Into<String>) -> Self {
+        Self {
+            version: version.into(),
+        }
+    }
+}
+impl SentimentStrategy for RuleBasedStrategy {
+    fn version(&self) -> &str {
+        &self.version
+    }
+
+    fn score(&self, text: &str) -> f32 {
+        let text = text.to_ascii_lowercase();
+        let pos = ["good", "great", "love", "excellent", "yay"]
+            .iter()
+            .filter(|w| text.contains(**w))
+            .count() as f32;
+        let neg = ["bad", "terrible", "hate", "awful", "angry"]
+            .iter()
+            .filter(|w| text.contains(**w))
+            .count() as f32;
+
+        (pos - neg).clamp(-4.0, 4.0) / 4.0
+    }
+}
+
+/// A stubbed ML-based strategy that pretends to query a ML micro-service.
+pub struct MlWeightedStrategy {
+    version: String,
+    weights: Vec<f32>,
+}
+
+impl MlWeightedStrategy {
+    pub fn new(version: impl Into<String>, weights: Vec<f32>) -> Self {
+        Self {
+            version: version.into(),
+            weights,
+        }
+    }
+}
+
+impl SentimentStrategy for MlWeightedStrategy {
+    fn version(&self) -> &str {
+        &self.version
+    }
+
+    fn score(&self, text: &str) -> f32 {
+        // Mock inference: hash text into deterministic float, weight blend.
+        let hash = seahash::hash(text.as_bytes());
+        let mut acc = 0.0;
+        for (idx, w) in self.weights.iter().enumerate() {
+            let bit = ((hash >> (idx % 63)) & 1) as f32;
+            acc += bit * w;
+        }
+        acc.tanh() // keeps result in −1 … 1
+    }
+}
+
+/// Factory method that reads a JSON config blob and returns the corresponding
+/// concrete strategy.  Invalid configs fall back to the safe
+/// RuleBasedStrategy.
+pub fn build_strategy_from_cfg(cfg: &serde_json::Value) -> Box<dyn SentimentStrategy> {
+    match cfg.get("kind").and_then(|v| v.as_str()) {
+        Some("ml_weighted") => {
+            let version = cfg
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let weights = cfg
+                .get("weights")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_f64())
+                        .map(|v| v as f32)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            Box::new(MlWeightedStrategy::new(version, weights))
+        }
+        _ => {
+            let version = cfg
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("rule_based");
+            Box::new(RuleBasedStrategy::new(version))
+        }
+    }
+}
+
+/// -------- Core Processor ----------------------------------------------------
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProcessorError {
+    #[error("Kafka error: {0}")]
+    Kafka(#[from] KafkaError),
+    #[error("Serde error: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("Channel closed")]
+    ChannelClosed,
+}
+
+/// SentimentProcessor manages the Kafka consumer/producer pair together with
+/// its current analysis strategy (protected by RwLock for live upgrades).
+pub struct SentimentProcessor {
+    strategy: Arc<RwLock<Box<dyn SentimentStrategy>>>,
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+    producer_topic: String,
+}
+
+impl SentimentProcessor {
+    pub fn new(
+        consumer: StreamConsumer,
+        producer: FutureProducer,
+        producer_topic: impl Into<String>,
+        strategy: Box<dyn SentimentStrategy>,
+    ) -> Self {
+        Self {
+            strategy: Arc::new(RwLock::new(strategy)),
+            consumer,
+            producer,
+            producer_topic: producer_topic.into(),
+        }
+    }
+
+    /// Replaces the running algorithm at runtime.
+    pub async fn hot_swap_strategy(&self, cfg: serde_json::Value) {
+        let mut guard = self.strategy.write().await;
+        *guard = build_strategy_from_cfg(&cfg);
+        tracing::info!(
+            algorithm = guard.version(),
+            "🔄 Swapped sentiment strategy at runtime"
+        );
+    }
+
+    /// Main async loop — consumes, processes, publishes.
+    pub async fn run(self) -> Result<(), ProcessorError> {
+        let Self {
+            strategy,
+            consumer,
+            producer,
+            producer_topic,
+        } = self;
+
+        loop {
+            let borrowed_msg = consumer.recv().await?;
+            let processing_start = SystemTime::now();
+            let fut = Self::process_message(
+                borrowed_msg,
+                strategy.clone(),
+                producer.clone(),
+                &producer_topic,
+            );
+
+            match timeout(MAX_PROCESSING_LATENCY, fut).await {
+                Ok(Ok(())) => MSG_PROCESSED.inc(),
+                Ok(Err(e)) => {
+                    MSG_FAILED.inc();
+                    tracing::warn!(error = %e, "Failed to process message")
+                }
+                Err(_) => {
+                    MSG_FAILED.inc();
+                    tracing::warn!("Message processing timed out");
+                }
+            }
+
+            if let Ok(elapsed) = processing_start.elapsed() {
+                MSG_LATENCY.observe(elapsed.as_secs_f64());
+            }
+        }
+    }
+
+    async fn process_message(
+        msg: BorrowedMessage<'_>,
+        strategy: Arc<RwLock<Box<dyn SentimentStrategy>>>,
+        producer: FutureProducer,
+        producer_topic: &str,
+    ) -> Result<(), ProcessorError> {
+        let payload = std::str::from_utf8(msg.payload().unwrap_or_default()).unwrap_or("");
+        let mut event: SocialEvent = serde_json::from_str(payload)?;
+
+        let guard = strategy.read().await;
+        let sentiment = guard.score(&event.text);
+        let version = guard.version().to_owned();
+        drop(guard); // release lock ASAP
+
+        let enriched = SentimentEvent {
+            id: event.id.clone(),
+            sentiment,
+            version,
+            timestamp: event.timestamp,
+            meta: event.meta.drain().collect(),
+        };
+
+        let out_payload = serde_json::to_vec(&enriched)?;
+        producer
+            .send(
+                FutureRecord::to(producer_topic)
+                    .payload(&out_payload)
+                    .key(&event.id),
+                Duration::from_secs(0),
+            )
+            .await
+            .map_err(|(e, _)| e)?;
+
+        Ok(())
+    }
+}
+
+/// -------- Service Bootstrap -------------------------------------------------
+
+/// Spawns an HTTP endpoint (default 0.0.0.0:9102) that exposes `/metrics`.
+async fn spawn_metrics_endpoint(port: u16) {
+    use hyper::{
+        service::{make_service_fn, service_fn},
+        Body, Response, Server,
+    };
+
+    let make_svc = make_service_fn(|_conn| async {
+        Ok::<_, std::convert::Infallible>(service_fn(|_req| async {
+            let encoder = TextEncoder::new();
+            let metric_families = prometheus::gather();
+            let mut buf = Vec::new();
+            encoder.encode(&metric_families, &mut buf).unwrap();
+            Ok::<_, std::convert::Infallible>(Response::new(Body::from(buf)))
+        }))
+    });
+
+    let addr = ([0, 0, 0, 0], port).into();
+    let server = Server::bind(&addr).serve(make_svc);
+
+    tracing::info!("📈 Prometheus metrics listening on {addr}");
+    if let Err(e) = server.await {
+        tracing::error!(error = %e, "Metrics server failed");
+    }
+}
+
+/// Builds a pre-configured Kafka client config with sensible defaults in this
+/// environment.
+fn kafka_base_config() -> ClientConfig {
+    let mut cfg = ClientConfig::new();
+    cfg.set("bootstrap.servers", std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".into()))
+        .set("group.id", "chirppulse-sentiment")
+        .set("enable.auto.commit", "true")
+        .set("auto.offset.reset", "latest");
+    cfg
+}
+
+/// Blocking main entry point (called from workspace `main.rs`)
+pub async fn launch_service() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+
+    let raw_topic = std::env::var("RAW_TOPIC").unwrap_or_else(|_| "social_raw".into());
+    let enriched_topic =
+        std::env::var("ENRICHED_TOPIC").unwrap_or_else(|_| "social_enriched".into());
+
+    let consumer: StreamConsumer = kafka_base_config()
+        .create()
+        .expect("Failed to create consumer");
+    consumer.subscribe(&[&raw_topic])?;
+
+    let producer: FutureProducer = kafka_base_config()
+        .create()
+        .expect("Failed to create producer");
+
+    // Read initial algorithm config from disk or fall back to defaults.
+    let initial_cfg = std::fs::read_to_string("strategy.json")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({ "kind": "rule_based", "version": "boot" }));
+
+    let strategy = build_strategy_from_cfg(&initial_cfg);
+    let processor = SentimentProcessor::new(consumer, producer, enriched_topic, strategy);
+
+    // Spawn metrics HTTP server.
+    task::spawn(spawn_metrics_endpoint(9102));
+
+    // Hot-swap listener via local mpsc channel for simplicity.
+    let (tx, mut rx) = mpsc::unbounded_channel::<serde_json::Value>();
+
+    // Watch for file changes every 30 s and push new configs into channel.
+    task::spawn(async move {
+        let mut last_contents = initial_cfg.to_string();
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            match std::fs::read_to_string("strategy.json") {
+                Ok(c) if c != last_contents => {
+                    last_contents = c.clone();
+                    if let Ok(json_cfg) = serde_json::from_str(&c) {
+                        let _ = tx.send(json_cfg);
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Spawn task that receives config updates.
+    let strat_handle = processor.strategy.clone();
+    task::spawn(async move {
+        while let Some(cfg) = rx.recv().await {
+            strat_handle.write().await.replace_with(|_| build_strategy_from_cfg(&cfg));
+            tracing::info!("🔧 Strategy updated via file-watcher");
+        }
+    });
+
+    processor.run().await?;
+    Ok(())
+}
+```

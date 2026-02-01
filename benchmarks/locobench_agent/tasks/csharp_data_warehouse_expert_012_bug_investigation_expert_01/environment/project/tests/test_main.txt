@@ -1,0 +1,182 @@
+```csharp
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.Kinesis.Model;
+using Moq;
+using PulseOps.Warehouse.Core.Messaging;
+using PulseOps.Warehouse.Core.Processing;
+using PulseOps.Warehouse.Core.Processing.Contracts;
+using PulseOps.Warehouse.Core.Processing.Engine;
+using PulseOps.Warehouse.Core.Processing.Results;
+using PulseOps.Warehouse.Core.Telemetry;
+using PulseOps.Warehouse.Shared;
+using Xunit;
+
+namespace PulseOps.Warehouse.Tests.Integration
+{
+    /// <summary>
+    /// End-to-end tests that exercise the Transformation Engine in the context
+    /// of a streaming invocation while mocking out external dependencies such as
+    /// PagerDuty and the Dead-Letter-Queue.
+    /// </summary>
+    public sealed class TransformationEngineSpecs
+    {
+        private readonly Mock<ITransformationStrategyFactory> _strategyFactoryMock = new();
+        private readonly Mock<IDeadLetterQueue> _dlqMock = new();
+        private readonly Mock<IPagerDutyClient> _pagerDutyMock = new();
+        private readonly Mock<IWarehouseLogger> _loggerMock = new();
+
+        private readonly TransformationEngine _sut;
+
+        public TransformationEngineSpecs()
+        {
+            _sut = new TransformationEngine(
+                _strategyFactoryMock.Object,
+                _dlqMock.Object,
+                _pagerDutyMock.Object,
+                _loggerMock.Object);
+        }
+
+        [Fact(DisplayName = "Happy-path: engine delegates to correct strategy and returns Success")]
+        public async Task Engine_Delegates_To_Strategy_And_Returns_Success()
+        {
+            // Arrange
+            var kinesisRecord = new Record
+            {
+                Data = BinaryUtils.ToMemoryStream(JsonSerializer.SerializeToUtf8Bytes(new { hello = "world" }))
+            };
+
+            var fakeRequest = new TransformationRequest("json:foo/bar", kinesisRecord);
+            var fakeResponse = new TransformationSuccess("unit-test-payload");
+
+            var strategyMock = new Mock<ITransformationStrategy>();
+            strategyMock
+                .Setup(s => s.TransformAsync(fakeRequest, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(fakeResponse);
+
+            _strategyFactoryMock
+                .Setup(f => f.Create(It.IsAny<string>()))
+                .Returns(strategyMock.Object);
+
+            // Act
+            var result = await _sut.HandleAsync(fakeRequest, CancellationToken.None);
+
+            // Assert
+            Assert.IsType<TransformationSuccess>(result);
+            Assert.Equal("unit-test-payload", ((TransformationSuccess)result).Output);
+            strategyMock.Verify(s => s.TransformAsync(fakeRequest, It.IsAny<CancellationToken>()), Times.Once);
+            _dlqMock.VerifyNoOtherCalls();
+            _pagerDutyMock.VerifyNoOtherCalls();
+        }
+
+        [Fact(DisplayName = "Failure-path: strategy throws, engine emits DLQ + PagerDuty and returns Failure")]
+        public async Task Engine_Emits_DLQ_And_PagerDuty_On_Failure()
+        {
+            // Arrange
+            var record = new Record
+            {
+                Data = BinaryUtils.ToMemoryStream("bogus-payload")
+            };
+
+            var request = new TransformationRequest("text/bogus", record);
+            var ex = new InvalidOperationException("Boom");
+
+            var strategyMock = new Mock<ITransformationStrategy>();
+            strategyMock
+                .Setup(s => s.TransformAsync(request, It.IsAny<CancellationToken>()))
+                .ThrowsAsync(ex);
+
+            _strategyFactoryMock
+                .Setup(f => f.Create(It.IsAny<string>()))
+                .Returns(strategyMock.Object);
+
+            // Act
+            var result = await _sut.HandleAsync(request, CancellationToken.None);
+
+            // Assert
+            Assert.IsType<TransformationFailure>(result);
+
+            _dlqMock.Verify(d => d.EnqueueAsync(It.Is<DeadLetterMessage>(m =>
+                m.Payload == "bogus-payload" &&
+                m.ExceptionType == ex.GetType().FullName), It.IsAny<CancellationToken>()), Times.Once);
+
+            _pagerDutyMock.Verify(p => p.TriggerAsync(It.Is<PagerDutyEvent>(e =>
+                e.Title.Contains("Transformation Failure") &&
+                e.Details.Contains("Boom"))), Times.Once);
+
+            _loggerMock.Verify(l => l.Error(It.IsAny<string>(), ex), Times.Once);
+        }
+
+        [Fact(DisplayName = "Parallel-processing: engine can handle multiple concurrent requests without race conditions")]
+        public async Task Engine_Processes_Messages_In_Parallel()
+        {
+            // Arrange
+            const int messageCount = 250;
+
+            var barrier = new Barrier(2); // ensure strategies overlap in execution
+
+            var strategyMock = new Mock<ITransformationStrategy>();
+            strategyMock
+                .Setup(s => s.TransformAsync(It.IsAny<TransformationRequest>(), It.IsAny<CancellationToken>()))
+                .Returns(async (TransformationRequest req, CancellationToken _) =>
+                {
+                    barrier.SignalAndWait(TimeSpan.FromSeconds(5)); // force concurrency
+                    await Task.Delay(10, _);
+                    return new TransformationSuccess(req.ToString());
+                });
+
+            _strategyFactoryMock
+                .Setup(f => f.Create(It.IsAny<string>()))
+                .Returns(strategyMock.Object);
+
+            var requests = Enumerable.Range(0, messageCount)
+                .Select(i => new TransformationRequest(
+                    $"json://unit-test/{i}",
+                    new Record { Data = BinaryUtils.ToMemoryStream($"{{\"index\":{i}}}") }))
+                .ToList();
+
+            // Act
+            var results = new ConcurrentBag<ITransformationResult>();
+
+            await Task.WhenAll(requests.Select(async r =>
+            {
+                var result = await _sut.HandleAsync(r, CancellationToken.None);
+                results.Add(result);
+            }));
+
+            // Assert
+            Assert.Equal(messageCount, results.Count);
+            Assert.All(results, r => Assert.IsType<TransformationSuccess>(r));
+            strategyMock.Verify(s =>
+                s.TransformAsync(It.IsAny<TransformationRequest>(), It.IsAny<CancellationToken>()),
+                Times.Exactly(messageCount));
+        }
+
+        [Theory(DisplayName = "Strategy resolution: factory selects correct strategy based on content-type")]
+        [InlineData("application/calendar+json", typeof(CalendarEventStrategy))]
+        [InlineData("application/vnd.github.webhook+json", typeof(GitHubWebhookStrategy))]
+        [InlineData("text/x-log", typeof(CiCdLogStrategy))]
+        public void Factory_Returns_Correct_Strategy_Given_Content_Type(string contentType, Type expectedType)
+        {
+            // Arrange
+            var factory = new TransformationStrategyFactory(new []
+            {
+                new CalendarEventStrategy(),
+                new GitHubWebhookStrategy(),
+                new CiCdLogStrategy()
+            });
+
+            // Act
+            var strategy = factory.Create(contentType);
+
+            // Assert
+            Assert.IsType(expectedType, strategy);
+        }
+    }
+}
+```

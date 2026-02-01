@@ -1,0 +1,349 @@
+```rust
+//! src/module_41.txt
+//!
+//! Event-driven infrastructure for EduPulse Live.
+//!
+//! This module provides a lightweight, in-process event bus that is able to
+//! fan-out strongly-typed domain events to an arbitrary number of asynchronous
+//! handlers while also mirroring the event stream to an external broker
+//! (Kafka, NATS, RabbitMQ, etc.) when available.
+//!
+//! Highlights
+//! ----------
+//! • Strongly-typed `DomainEvent` trait with automatic envelope creation  
+//! • Tokio-powered broadcast channel for low-latency pub/sub inside the API  
+//! • Back-off + retry when dispatching to fallible handlers  
+//! • Hot-pluggable external publisher via `dyn OutboundTransport`  
+//!
+//! NOTE:  This is *not* a full-blown event-sourcing framework; it is a pragmatic
+//!        layer that keeps the core API thin while still decoupling heavy
+//!        post-processing workloads.
+
+#![allow(clippy::missing_errors_doc)]
+
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use backoff::{future::retry, ExponentialBackoff};
+use futures::{future::BoxFuture, StreamExt};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::Value;
+use tokio::{
+    sync::{broadcast, RwLock},
+    task::{JoinHandle, JoinSet},
+};
+use uuid::Uuid;
+
+/// A blanket trait implemented by all domain events.
+///
+/// Domain events are immutable facts that *already happened*.
+pub trait DomainEvent:
+    Debug + Send + Sync + Serialize + DeserializeOwned + 'static
+{
+    /// A canonical logical name, e.g. `"lesson.published"`.
+    const EVENT_NAME: &'static str;
+}
+
+/// A wrapper carrying any concrete domain event together with generic metadata.
+///
+/// Events are serialized using a stable, versioned JSON representation so they
+/// can be consumed by heterogeneous services written in different languages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    /// Globally unique, monotonic identifier.
+    pub id: Uuid,
+    /// The logical event name (duplicated from the payload’s associated const).
+    pub name: String,
+    /// Unix epoch (milliseconds) when the event was raised.
+    pub occurred_at: u128,
+    /// Arbitrary key/value bag (tenant ID, correlation ID, etc.).
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub meta: HashMap<String, String>,
+    /// The actual business payload.
+    #[serde(flatten)]
+    pub payload: Value,
+}
+
+impl EventEnvelope {
+    /// Serialize a strongly-typed event into its JSON envelope form.
+    pub fn from_event<E>(event: &E) -> Result<Self>
+    where
+        E: DomainEvent,
+    {
+        let payload = serde_json::to_value(event)
+            .context("failed to serialize domain event payload")?;
+
+        Ok(Self {
+            id: Uuid::new_v4(),
+            name: E::EVENT_NAME.to_string(),
+            occurred_at: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("system time before epoch")
+                .as_millis(),
+            meta: HashMap::default(),
+            payload,
+        })
+    }
+
+    /// Attempt to deserialize the envelope back into its concrete Rust type.
+    pub fn to_event<E>(&self) -> Result<E>
+    where
+        E: DomainEvent,
+    {
+        if self.name != E::EVENT_NAME {
+            return Err(anyhow!(
+                "event name mismatch: expected {}, found {}",
+                E::EVENT_NAME,
+                self.name
+            ));
+        }
+
+        serde_json::from_value(self.payload.clone())
+            .context("failed to deserialize event payload")
+    }
+}
+
+/// Signature for a function that asynchronously handles a domain event.
+pub type HandlerFn = Arc<
+    dyn Fn(EventEnvelope) -> BoxFuture<'static, Result<()>> + Send + Sync + 'static,
+>;
+
+/// Transport abstraction that writes envelopes to an external message broker.
+///
+/// Implementations should be **non-blocking** and resilient to intermittent
+/// connectivity failures.
+#[async_trait]
+pub trait OutboundTransport: Send + Sync + 'static {
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<()>;
+}
+
+/// Idiomatic error raised when dispatching an event.
+///
+/// All errors bubble up via `anyhow::Error` to avoid leaking concrete types.
+#[derive(thiserror::Error, Debug)]
+pub enum DispatchError {
+    #[error("handler failed after retries: {0}")]
+    HandlerFailed(anyhow::Error),
+
+    #[error("outbound transport failure")]
+    Transport(anyhow::Error),
+}
+
+/// The in-process event bus.
+///
+/// • Uses `tokio::broadcast` to deliver events with minimal contention.  
+/// • Each handler is executed inside its own task and retried with exponential
+///   back-off to shield the caller from transient issues.  
+/// • Users can attach an `OutboundTransport` at runtime (or swap it out for
+///   testability).
+#[derive(Clone)]
+pub struct EventBus {
+    tx: broadcast::Sender<EventEnvelope>,
+    handlers: Arc<RwLock<Vec<HandlerFn>>>,
+    outbound: Option<Arc<dyn OutboundTransport>>,
+}
+
+impl EventBus {
+    /// Construct a new bus capable of holding 1k pending events before
+    /// back-pressure kicks in.
+    pub fn new(buffer: usize) -> Self {
+        let (tx, _) = broadcast::channel(buffer);
+        Self {
+            tx,
+            handlers: Arc::default(),
+            outbound: None,
+        }
+    }
+
+    /// Attach an external transport (e.g. Kafka) for mirror-publishing.
+    pub fn with_outbound_transport<T: OutboundTransport>(mut self, t: T) -> Self {
+        self.outbound = Some(Arc::new(t));
+        self
+    }
+
+    /// Register an asynchronous handler.
+    ///
+    /// The handler is executed sequentially **per** event instance, yet
+    /// concurrently with other handlers. A single failing handler will not
+    /// impact the others; its error will be logged and propagated.
+    pub async fn register_handler<F, Fut>(&self, f: F)
+    where
+        F: Fn(EventEnvelope) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let handler: HandlerFn =
+            Arc::new(move |e| Box::pin(f(e)));
+        self.handlers.write().await.push(handler);
+    }
+
+    /// Publish a strongly-typed domain event.
+    ///
+    /// The function returns **after** the event has been put on the local
+    /// channel. Handlers run in the background.
+    pub async fn publish<E>(&self, event: E) -> Result<(), DispatchError>
+    where
+        E: DomainEvent,
+    {
+        let envelope =
+            EventEnvelope::from_event(&event).map_err(DispatchError::HandlerFailed)?;
+
+        // 1. Fan-out to local subscribers.
+        self.tx
+            .send(envelope.clone())
+            .map_err(|e| DispatchError::HandlerFailed(anyhow!(e)))?;
+
+        // 2. Mirror to external transport if configured.
+        if let Some(t) = &self.outbound {
+            t.publish(&envelope)
+                .await
+                .map_err(DispatchError::Transport)?;
+        }
+
+        Ok(())
+    }
+
+    /// Spawn the dispatcher loop that receives envelopes and pumps them into
+    /// the registered handler set.
+    ///
+    /// Call this once during application start-up.
+    pub fn start(self) -> JoinHandle<()> {
+        let mut rx = self.tx.subscribe();
+        tokio::spawn(async move {
+            let mut tasks = JoinSet::new();
+
+            while let Ok(envelope) = rx.recv().await {
+                let handlers = self.handlers.read().await.clone();
+
+                for h in handlers {
+                    let env_clone = envelope.clone();
+                    tasks.spawn(Self::invoke_handler(h, env_clone));
+                }
+
+                // Reap finished tasks to avoid memory leaks.
+                while let Some(res) = tasks.join_next().await {
+                    if let Err(e) = res {
+                        tracing::error!("event handler task panicked: {e}");
+                    }
+                }
+            }
+        })
+    }
+
+    async fn invoke_handler(handler: HandlerFn, envelope: EventEnvelope) {
+        let op = || async {
+            handler(envelope.clone()).await
+        };
+
+        let backoff = ExponentialBackoff {
+            max_elapsed_time: Some(Duration::from_secs(30)),
+            ..ExponentialBackoff::default()
+        };
+
+        if let Err(e) = retry(backoff, op).await {
+            tracing::error!(
+                event_id = ?envelope.id,
+                event_name = %envelope.name,
+                "handler permanently failed: {e}"
+            );
+        }
+    }
+}
+
+/* ==== Sample Domain Events & Handlers =================================== */
+
+/// A teacher published a new lesson visible to students.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LessonPublished {
+    pub lesson_id: Uuid,
+    pub teacher_id: Uuid,
+    pub title: String,
+}
+
+impl DomainEvent for LessonPublished {
+    const EVENT_NAME: &'static str = "lesson.published";
+}
+
+/// Illustrative handler indexing new lessons into the search subsystem.
+pub async fn search_indexer_handler(env: EventEnvelope) -> Result<()> {
+    let evt: LessonPublished = env.to_event()?;
+
+    tracing::info!(
+        "indexing lesson '{}' (id = {}) into search backend",
+        evt.title,
+        evt.lesson_id
+    );
+
+    // Pretend we call Elasticsearch or Meilisearch here.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    Ok(())
+}
+
+/// Dummy outbound transport used in development.
+///
+/// Instead of hitting Kafka we just log the envelope.
+pub struct LogTransport;
+
+#[async_trait]
+impl OutboundTransport for LogTransport {
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<()> {
+        tracing::debug!(?envelope, "mirrored to external broker (noop)");
+        Ok(())
+    }
+}
+
+/* ==== Module-level tests ================================================ */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn roundtrip_envelope() {
+        let evt = LessonPublished {
+            lesson_id: Uuid::new_v4(),
+            teacher_id: Uuid::new_v4(),
+            title: "Quantum Mechanics 101".to_string(),
+        };
+
+        let envelope = EventEnvelope::from_event(&evt).unwrap();
+        let deserialized: LessonPublished = envelope.to_event().unwrap();
+
+        assert_eq!(deserialized.title, evt.title);
+    }
+
+    #[tokio::test]
+    async fn in_process_publish_and_handle() {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+        let bus = EventBus::new(16).with_outbound_transport(LogTransport);
+        bus.register_handler(|_env| async {
+            COUNTER.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        bus.start();
+
+        bus.publish(LessonPublished {
+            lesson_id: Uuid::new_v4(),
+            teacher_id: Uuid::new_v4(),
+            title: "Async Rust".to_string(),
+        })
+        .await
+        .unwrap();
+
+        // Wait for the handler to run.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
+    }
+}
+```

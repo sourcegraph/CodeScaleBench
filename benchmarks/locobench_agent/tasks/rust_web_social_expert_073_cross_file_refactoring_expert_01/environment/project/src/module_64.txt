@@ -1,0 +1,354 @@
+```rust
+//! src/module_64.rs
+//!
+//! “Event-Bus” abstraction + Kafka implementation for EduPulse Live.
+//!
+//! The module provides:
+//! 1. A `DomainEvent` enum that captures the most common events emitted by the core API.
+//! 2. An `EventEnvelope` wrapper with metadata useful for audit-logging and GDPR erase trails.
+//! 3. An `EventBus` trait with async `publish` / `subscribe` operations.
+//! 4. A production-ready Kafka implementation (`KafkaEventBus`) using `rdkafka`.
+//! 5. A small “audit trail” consumer that persists raw events into PostgreSQL via `sqlx`.
+//!
+//! The code purposefully hides low-level details behind traits, enabling unit tests to depend on
+//! in-memory stubs while production builds can toggle the `kafka`/`postgres` features.
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::{Stream, StreamExt};
+use rdkafka::{
+    consumer::{CommitMode, Consumer, StreamConsumer},
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Message,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::task::JoinHandle;
+use tracing::{debug, error, info, instrument};
+use uuid::Uuid;
+
+/// Kafka topic used for system-wide domain events.
+pub const DOMAIN_EVENT_TOPIC: &str = "edu_pulse_domain_events";
+
+/// Shared error type for the event layer.
+#[derive(Debug, Error)]
+pub enum EventBusError {
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("kafka error: {0}")]
+    Kafka(#[from] rdkafka::error::KafkaError),
+
+    #[error("sqlx error: {0}")]
+    #[cfg(feature = "postgres")]
+    Sqlx(#[from] sqlx::Error),
+
+    #[error("stream closed")]
+    StreamClosed,
+
+    #[error("unknown error")]
+    Unknown,
+}
+
+/// Metadata attached to every `DomainEvent` when sent across the wire.
+///
+/// Keeps the envelope format extensible while allowing GDPR-compatible deletes
+/// through `subject_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope<T: Serialize + for<'de> Deserialize<'de>> {
+    pub id: Uuid,
+    pub subject_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub payload: T,
+}
+
+/// High-level domain events emitted by EduPulse Live.
+///
+/// NOTE: Each variant must remain backward-compatible once published.
+/// Use additive changes only; never reorder or remove existing variants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+#[non_exhaustive]
+pub enum DomainEvent {
+    LessonPublished {
+        lesson_id: Uuid,
+        author_id: Uuid,
+        title: String,
+    },
+    LearningPulseCreated {
+        pulse_id: Uuid,
+        teacher_id: Uuid,
+        course_id: Uuid,
+        prompt: String,
+        expires_at: DateTime<Utc>,
+    },
+    PulseSubmissionReceived {
+        submission_id: Uuid,
+        pulse_id: Uuid,
+        student_id: Uuid,
+        artefact_url: String,
+    },
+    QuizSubmitted {
+        quiz_id: Uuid,
+        attempt_id: Uuid,
+        student_id: Uuid,
+        score: f32,
+    },
+    BadgeAwarded {
+        badge_id: Uuid,
+        recipient_id: Uuid,
+        reason: String,
+    },
+}
+
+/// Asynchronous, streaming event bus abstraction.
+///
+/// `publish` pushes an event to the broker and resolves when the broker acks.
+/// `subscribe` yields a *cold* stream that starts delivering events once awaited.
+///
+/// Cloneable by design: cloning a bus creates another handle to the same
+/// backend (producer + consumer group).
+#[async_trait]
+pub trait EventBus: Send + Sync + Clone + 'static {
+    /// Publish an outbound envelope.
+    async fn publish(&self, evt: EventEnvelope<DomainEvent>) -> Result<(), EventBusError>;
+
+    /// Subscribe to a *broadcast* of domain events.
+    ///
+    /// Each subscriber is assigned a unique consumer group by default.
+    async fn subscribe(
+        &self,
+    ) -> Result<
+        Box<dyn Stream<Item = Result<EventEnvelope<DomainEvent>, EventBusError>> + Send + Unpin>,
+        EventBusError,
+    >;
+}
+
+/// Kafka-backed implementation.
+///
+/// The struct owns both a producer and a consumer (joined via a unique group id).
+#[derive(Clone)]
+pub struct KafkaEventBus {
+    producer: FutureProducer,
+    consumer: StreamConsumer,
+}
+
+impl KafkaEventBus {
+    /// Build from environment variables (see `README.md`).
+    ///
+    /// Required:
+    /// - `KAFKA_BROKERS`
+    /// - `SERVICE_NAME` (used for consumer group)
+    pub fn from_env() -> Result<Self, EventBusError> {
+        let brokers = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".into());
+        let service_name = std::env::var("SERVICE_NAME").unwrap_or_else(|_| "edu_pulse".into());
+        let group_id = format!("{service_name}-{}", Uuid::new_v4());
+
+        let common_config = || {
+            let mut cfg = ClientConfig::new();
+            cfg.set("bootstrap.servers", &brokers)
+                .set("enable.idempotence", "true")
+                .set("message.timeout.ms", "5000");
+            cfg
+        };
+
+        let producer = common_config()
+            .clone()
+            .create::<FutureProducer>()
+            .map_err(EventBusError::Kafka)?;
+
+        let consumer = common_config()
+            .set("group.id", group_id)
+            .set("auto.offset.reset", "earliest")
+            .create::<StreamConsumer>()
+            .map_err(EventBusError::Kafka)?;
+
+        consumer
+            .subscribe(&[DOMAIN_EVENT_TOPIC])
+            .map_err(EventBusError::Kafka)?;
+
+        Ok(Self { producer, consumer })
+    }
+}
+
+#[async_trait]
+impl EventBus for KafkaEventBus {
+    #[instrument(skip(self, evt), fields(event_id = %evt.id))]
+    async fn publish(&self, evt: EventEnvelope<DomainEvent>) -> Result<(), EventBusError> {
+        let payload = serde_json::to_vec(&evt)?;
+        self.producer
+            .send(
+                FutureRecord::to(DOMAIN_EVENT_TOPIC)
+                    .payload(&payload)
+                    .key(&evt.subject_id.as_bytes()),
+                Duration::from_secs(0),
+            )
+            .await
+            .map_err(|(e, _)| EventBusError::Kafka(e))?; // propagate only the Kafka error
+        debug!("Published event: {:?}", evt.id);
+        Ok(())
+    }
+
+    async fn subscribe(
+        &self,
+    ) -> Result<
+        Box<dyn Stream<Item = Result<EventEnvelope<DomainEvent>, EventBusError>> + Send + Unpin>,
+        EventBusError,
+    > {
+        let stream = self
+            .consumer
+            .stream()
+            .map(|msg| match msg {
+                Err(e) => Err(EventBusError::Kafka(e)),
+                Ok(m) => {
+                    if let Some(payload) = m.payload() {
+                        let envelope: EventEnvelope<DomainEvent> = serde_json::from_slice(payload)?;
+                        // manual commit ‑ we commit after successful deserialization
+                        if let Err(e) = self.consumer.commit_message(&m, CommitMode::Async) {
+                            error!(err = %e, "Failed to commit offset");
+                        }
+                        Ok(envelope)
+                    } else {
+                        Err(EventBusError::StreamClosed)
+                    }
+                }
+            });
+        Ok(Box::new(stream))
+    }
+}
+
+/// Spawn a Tokio task that listens for events *only* to persist them to PostgreSQL for
+/// immutable auditing / GDPR tracing.
+///
+/// Use feature flag `postgres` to enable.
+///
+/// The table schema (PostgreSQL) expected by this routine:
+///
+/// ```sql
+/// CREATE TABLE IF NOT EXISTS audit_trail (
+///     id            UUID PRIMARY KEY,
+///     subject_id    UUID NOT NULL,
+///     created_at    TIMESTAMPTZ NOT NULL,
+///     event_type    TEXT NOT NULL,
+///     event_json    JSONB NOT NULL
+/// );
+/// ```
+#[cfg(feature = "postgres")]
+pub fn spawn_audit_trail_consumer<B>(
+    bus: B,
+    pool: sqlx::PgPool,
+) -> JoinHandle<Result<(), EventBusError>>
+where
+    B: EventBus,
+{
+    tokio::spawn(async move {
+        let mut stream = bus.subscribe().await?;
+        info!("Audit-trail consumer started.");
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(envelope) => {
+                    let event_type = match &envelope.payload {
+                        DomainEvent::LessonPublished { .. } => "LessonPublished",
+                        DomainEvent::LearningPulseCreated { .. } => "LearningPulseCreated",
+                        DomainEvent::PulseSubmissionReceived { .. } => "PulseSubmissionReceived",
+                        DomainEvent::QuizSubmitted { .. } => "QuizSubmitted",
+                        DomainEvent::BadgeAwarded { .. } => "BadgeAwarded",
+                    };
+                    if let Err(e) = sqlx::query!(
+                        r#"
+                        INSERT INTO audit_trail (id, subject_id, created_at, event_type, event_json)
+                        VALUES ($1, $2, $3, $4, $5)
+                        "#,
+                        envelope.id,
+                        envelope.subject_id,
+                        envelope.created_at,
+                        event_type,
+                        serde_json::to_value(&envelope.payload)?,
+                    )
+                    .execute(&pool)
+                    .await
+                    {
+                        error!(err = %e, "Failed to persist audit event");
+                    }
+                }
+                Err(e) => error!(err = %e, "Error while reading from event stream"),
+            }
+        }
+        Err(EventBusError::StreamClosed)
+    })
+}
+
+/// Utility to build an `EventEnvelope` from a raw `DomainEvent`.
+pub fn envelope(event: DomainEvent) -> EventEnvelope<DomainEvent> {
+    let subject_id = match &event {
+        DomainEvent::LessonPublished { lesson_id, .. } => *lesson_id,
+        DomainEvent::LearningPulseCreated { pulse_id, .. } => *pulse_id,
+        DomainEvent::PulseSubmissionReceived { submission_id, .. } => *submission_id,
+        DomainEvent::QuizSubmitted { attempt_id, .. } => *attempt_id,
+        DomainEvent::BadgeAwarded { recipient_id, .. } => *recipient_id,
+    };
+    EventEnvelope {
+        id: Uuid::new_v4(),
+        subject_id,
+        created_at: Utc::now(),
+        payload: event,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::{pin_mut, TryStreamExt};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// In-memory stub for unit tests.
+    #[derive(Clone, Default)]
+    struct MemoryBus {
+        inner: Arc<Mutex<Vec<EventEnvelope<DomainEvent>>>>,
+    }
+
+    #[async_trait]
+    impl EventBus for MemoryBus {
+        async fn publish(&self, evt: EventEnvelope<DomainEvent>) -> Result<(), EventBusError> {
+            self.inner.lock().await.push(evt);
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+        ) -> Result<
+            Box<
+                dyn Stream<Item = Result<EventEnvelope<DomainEvent>, EventBusError>>
+                    + Send
+                    + Unpin,
+            >,
+            EventBusError,
+        > {
+            let events = self.inner.lock().await.clone();
+            let stream = futures::stream::iter(events.into_iter().map(Ok));
+            Ok(Box::new(stream))
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_and_receive_memory_bus() {
+        let bus = MemoryBus::default();
+        let evt = envelope(DomainEvent::BadgeAwarded {
+            badge_id: Uuid::new_v4(),
+            recipient_id: Uuid::new_v4(),
+            reason: "Top Scorer".into(),
+        });
+
+        bus.publish(evt.clone()).await.unwrap();
+        let stream = bus.subscribe().await.unwrap();
+        pin_mut!(stream);
+
+        let received: Vec<_> = stream.try_collect().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].id, evt.id);
+    }
+}
+```

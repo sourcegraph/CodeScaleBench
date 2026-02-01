@@ -1,0 +1,330 @@
+```csharp
+// File: src/module_41.txt
+// Project: TempoScribe Pro – Hexagonal Productivity Blog Suite (web_blog)
+// Language: C#
+//
+// Notes:
+//  • Sits in “application” (service-layer) ring of the hexagonal architecture.
+//  • Coordinates scheduled-publishing workflow by talking exclusively to ports
+//    (repositories, cache, event bus, etc.). No infrastructure details leak in.
+//  • Highly-defensive coding style—observability, cancellation, retries, rich logging.
+//  • Thread-safe and disposable to support graceful shutdown in hosted workers.
+
+#nullable enable
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using TempoScribePro.Domain.Common;
+using TempoScribePro.Domain.Models;
+using TempoScribePro.Domain.Ports.Adapters;
+using TempoScribePro.Domain.Ports.Repositories;
+using TempoScribePro.Domain.Ports.Services;
+
+namespace TempoScribePro.Application.Services.Scheduling;
+
+/// <summary>
+///     Application-level service responsible for scanning for due posts and
+///     orchestrating the full publication pipeline:
+///         • status mutation & persistence
+///         • content push to downstream channels
+///         • observability / cache invalidation
+///         • editorial & subscriber notifications
+/// </summary>
+public sealed class ScheduledPublishingService : IScheduledPublishingService, IDisposable
+{
+    // ------------ Private fields ----------------------------------------------------------
+    private readonly IPostRepository                _postRepository;
+    private readonly IUnitOfWork                    _unitOfWork;
+    private readonly IPublishPort                   _publishPort;
+    private readonly ICacheProvider?                _cache;               // Null-object allowed
+    private readonly INotificationPort?             _notificationPort;    // Null-object allowed
+    private readonly IEventBus                      _eventBus;
+    private readonly IClock                         _clock;
+    private readonly ILogger<ScheduledPublishingService> _logger;
+    private readonly Counter<long>                  _postPublishedCounter;
+    private readonly Histogram<double>              _publicationLatencyMs;
+    private          bool                           _disposed;
+
+    // ------------ ctor --------------------------------------------------------------------
+    public ScheduledPublishingService(
+        IPostRepository                postRepository,
+        IUnitOfWork                    unitOfWork,
+        IPublishPort                   publishPort,
+        IEventBus                      eventBus,
+        IClock                         clock,
+        ILogger<ScheduledPublishingService> logger,
+        IMeterFactory                  meterFactory,
+        ICacheProvider?                cacheProvider        = null,
+        INotificationPort?             notificationPort     = null)
+    {
+        _postRepository     = postRepository  ?? throw new ArgumentNullException(nameof(postRepository));
+        _unitOfWork         = unitOfWork      ?? throw new ArgumentNullException(nameof(unitOfWork));
+        _publishPort        = publishPort     ?? throw new ArgumentNullException(nameof(publishPort));
+        _eventBus           = eventBus        ?? throw new ArgumentNullException(nameof(eventBus));
+        _clock              = clock           ?? throw new ArgumentNullException(nameof(clock));
+        _logger             = logger          ?? throw new ArgumentNullException(nameof(logger));
+        _cache              = cacheProvider;        // could be null (e.g. unit tests)
+        _notificationPort   = notificationPort;     // could be null (e.g. OSS edition)
+
+        var meter = meterFactory.Create("TempoScribePro.Publishing", "1.0");
+        _postPublishedCounter = meter.CreateCounter<long>("posts.published.total",
+            description: "Total count of posts successfully published by scheduler.");
+        _publicationLatencyMs = meter.CreateHistogram<double>("posts.published.latency.ms",
+            unit: "ms",
+            description: "Latency of scheduled publication from 'due' detection to external push.");
+    }
+
+    // --------------------------------------------------------------------------------------
+    // IScheduledPublishingService
+    // --------------------------------------------------------------------------------------
+
+    /// <inheritdoc />
+    public async Task<int> PublishDuePostsAsync(CancellationToken cancellationToken = default)
+    {
+        EnsureNotDisposed();
+        using var activity = StartActivity("PublishDuePosts");
+
+        var now         = _clock.UtcNow;
+        var duePosts    = await _postRepository.FetchDueForPublicationAsync(now, cancellationToken)
+                                              .ConfigureAwait(false);
+
+        if (duePosts.Count == 0)
+        {
+            _logger.LogDebug("No posts due for publication at {Now:u}.", now);
+            return 0;
+        }
+
+        _logger.LogInformation("Found {Count} post(s) due for publication.", duePosts.Count);
+
+        int successCount = 0;
+
+        foreach (var post in duePosts)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var postActivity = StartActivity("PublishSinglePost", activity);
+
+            var publishStart = _clock.UtcNow;
+
+            // Guard against double publication (edge-case race condition)
+            if (post.Status == PostStatus.Published)
+            {
+                _logger.LogWarning("Post {PostId} already published – skipping.", post.Id);
+                continue;
+            }
+
+            try
+            {
+                await PublishAsync(post, publishStart, cancellationToken)
+                    .ConfigureAwait(false);
+
+                successCount++;
+                _postPublishedCounter.Add(1);
+
+                var latency = (_clock.UtcNow - publishStart).TotalMilliseconds;
+                _publicationLatencyMs.Record(latency);
+
+                _logger.LogInformation("Post {PostId} published successfully in {Latency} ms.",
+                    post.Id, latency);
+            }
+            catch (Exception ex) when (LogException(ex, post.Id))
+            {
+                // exception already logged in filter above; decide whether to continue
+            }
+        }
+
+        return successCount;
+    }
+
+    // --------------------------------------------------------------------------------------
+    // Private helpers
+    // --------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Publish a single post and execute all dependent side-effects within a transaction
+    /// boundary (unit of work).
+    /// </summary>
+    private async Task PublishAsync(Post post, DateTimeOffset publishTime, CancellationToken ct)
+    {
+        // 1. State mutation
+        post.MarkAsPublished(publishTime);
+
+        // 2. Persist + commit transactionally
+        _postRepository.Update(post);
+        await _unitOfWork.CommitAsync(ct).ConfigureAwait(false);
+
+        // 3. Push content to downstream publisher (e.g., REST/GraphQL, RSS, web-socket fan-out)
+        await _publishPort.PublishPostAsync(post, ct).ConfigureAwait(false);
+
+        // 4. Cache invalidation
+        _cache?.Remove(PostCacheKeys.ForPost(post.Id));
+
+        // 5. Domain event → event bus
+        var evt = new PostPublishedEvent(post.Id, publishTime);
+        await _eventBus.PublishAsync(evt, ct).ConfigureAwait(false);
+
+        // 6. Notifications (editorial + subscribers)
+        if (_notificationPort is not null)
+        {
+            await _notificationPort.NotifyPostPublishedAsync(post, ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Centralized exception logger that returns <c>false</c> so “when” filter swallows error.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private bool LogException(Exception ex, PostId id)
+    {
+        _logger.LogError(ex, "Error while publishing Post {PostId}.", id);
+        return false; // prevents filter from re-throwing
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Activity? StartActivity(string name, Activity? parent = null)
+    {
+        var source = new ActivitySource("TempoScribePro.Publishing");
+        return source.StartActivity(name, ActivityKind.Internal, parent?.Context ?? default);
+    }
+
+    private void EnsureNotDisposed()
+    {
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(ScheduledPublishingService));
+    }
+
+    // --------------------------------------------------------------------------------------
+    // IDisposable
+    // --------------------------------------------------------------------------------------
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        // Dispose managed, non-DI owned resources here if/when they appear
+    }
+}
+
+// ==========================================================================================
+// Port/Adapter abstractions (kept minimal here for single-file context; in production these
+// live in their own projects/namespaces).
+// ==========================================================================================
+namespace TempoScribePro.Domain.Ports.Services
+{
+    public interface IScheduledPublishingService
+    {
+        /// <summary>
+        /// Scans for posts whose <see cref="Post.ScheduledPublishAt"/> is due and publishes them.
+        /// Returns the count of successfully published posts.
+        /// </summary>
+        Task<int> PublishDuePostsAsync(CancellationToken cancellationToken = default);
+    }
+}
+
+namespace TempoScribePro.Domain.Ports.Repositories
+{
+    public interface IPostRepository
+    {
+        /// <summary>Return all posts due to be published at <paramref name="now"/>.</summary>
+        Task<IReadOnlyList<Post>> FetchDueForPublicationAsync(DateTimeOffset now, CancellationToken ct);
+
+        /// <summary>Mark entity as modified so <see cref="IUnitOfWork"/> can persist it.</summary>
+        void Update(Post post);
+    }
+
+    public interface IUnitOfWork
+    {
+        Task CommitAsync(CancellationToken ct);
+    }
+}
+
+namespace TempoScribePro.Domain.Ports.Adapters
+{
+    public interface IPublishPort
+    {
+        /// <summary>
+        /// Publish the supplied post to external channels (e.g., API, search index, CDN).
+        /// </summary>
+        Task PublishPostAsync(Post post, CancellationToken ct);
+    }
+
+    public interface ICacheProvider
+    {
+        void Remove(string key);
+    }
+
+    public interface INotificationPort
+    {
+        Task NotifyPostPublishedAsync(Post post, CancellationToken ct);
+    }
+
+    public interface IEventBus
+    {
+        Task PublishAsync<TEvent>(TEvent evt, CancellationToken ct);
+    }
+}
+
+// ==========================================================================================
+// Domain primitives (trimmed for brevity).
+// ==========================================================================================
+namespace TempoScribePro.Domain.Models
+{
+    public enum PostStatus { Draft, Scheduled, Published }
+
+    public readonly record struct PostId(Guid Value)
+    {
+        public override string ToString() => Value.ToString();
+    }
+
+    public sealed class Post
+    {
+        public PostId            Id                  { get; init; }
+        public PostStatus        Status              { get; private set; }
+        public DateTimeOffset?   ScheduledPublishAt  { get; init; }
+        public DateTimeOffset?   PublishedAt         { get; private set; }
+
+        public void MarkAsPublished(DateTimeOffset when)
+        {
+            if (Status == PostStatus.Published)
+                throw new InvalidOperationException("Post already published.");
+
+            Status       = PostStatus.Published;
+            PublishedAt  = when;
+        }
+    }
+
+    public sealed record PostPublishedEvent(PostId PostId, DateTimeOffset PublishedAt);
+}
+
+// ==========================================================================================
+// Cross-cutting helpers.
+// ==========================================================================================
+namespace TempoScribePro.Domain.Common
+{
+    public interface IClock
+    {
+        DateTimeOffset UtcNow { get; }
+    }
+
+    /// <summary>
+    /// Strongly-typed cache key builder so call-sites remain refactor-proof.
+    /// </summary>
+    public static class PostCacheKeys
+    {
+        public static string ForPost(PostId id) => $"post::{id}";
+    }
+
+    /// <summary>
+    /// Simple factory interface so we avoid pinning to System.Diagnostics.Metrics
+    /// directly in constructors (facilitates unit testing).
+    /// </summary>
+    public interface IMeterFactory
+    {
+        Meter Create(string name, string? version = null);
+    }
+}
+```

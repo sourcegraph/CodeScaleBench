@@ -1,0 +1,352 @@
+```rust
+//! module_45: Dynamic, hot-swappable sentiment–analysis engine
+//!
+//! This module owns the “brain” of ChirpPulse’s sentiment stack.  It exposes a
+//! single entry‐point, `SentimentEngine`, that may be shared across an entire
+//! process (`Arc<SentimentEngine>`).  The engine loads a concrete
+//! implementation of `SentimentAlgorithm` based on a small YAML
+//! configuration file (by default: `config/sentiment.yml`).  As soon as that
+//! file changes, the engine atomically swaps the active strategy in a
+//! lock-free manner—no restarts, no request loss, no data races.
+//
+//! Production highlights
+//! • Strategy pattern (trait objects) with async execution                 │
+//! • Live-reconfiguration through `notify` file-watcher                    │
+//! • ArcSwap for wait-free, thread-safe swapping                            │
+//! • Observability via `tracing` and robust error handling (`anyhow`)       │
+//! • Two built-in strategies: “Vader” (pure Rust) and “BERT” (remote call)  │
+//
+//! The goal is not ML accuracy; stub implementations are provided so the
+//! surrounding plumbing is realistic and non-trivial.
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use reqwest::Client;
+use serde::Deserialize;
+use tokio::{
+    select,
+    sync::mpsc::{unbounded_channel, UnboundedReceiver},
+    task,
+    time,
+};
+use tracing::{error, info, warn};
+
+/// A numeric sentiment representation.
+///
+/// polarity  ∈ [-1.0, +1.0]  (-1 = very negative, +1 = very positive)
+/// magnitude ∈ [ 0.0, +∞ )   (0  = no emotion, high means more emotional)
+#[derive(Debug, Clone, Copy)]
+pub struct SentimentScore {
+    pub polarity: f32,
+    pub magnitude: f32,
+}
+
+/// Common interface every algorithm must adhere to.
+///
+/// Implementations need to be `Send + Sync` because they will be accessed
+/// concurrently from many tasks.  All heavy lifting happens asynchronously.
+#[async_trait]
+pub trait SentimentAlgorithm: Send + Sync {
+    async fn analyze(&self, text: &str) -> Result<SentimentScore>;
+}
+
+/// The production-quality sentiment engine.
+///
+/// Internally wraps an `ArcSwap` holding the current implementation
+/// (`Arc<dyn SentimentAlgorithm>`).
+#[derive(Clone)]
+pub struct SentimentEngine {
+    algo: Arc<ArcSwap<Arc<dyn SentimentAlgorithm>>>,
+}
+
+impl SentimentEngine {
+    /// Create a new engine and start file-watcher for hot swapping.
+    ///
+    /// # Arguments
+    /// * `config_path` – Path to YAML file describing which strategy to load.
+    ///
+    /// # Failure
+    /// Returns an error if the initial configuration cannot be loaded.
+    pub async fn new<P: AsRef<Path>>(config_path: P) -> Result<Self> {
+        let cfg_path = config_path.as_ref().to_path_buf();
+        let initial_algo = load_algorithm(&cfg_path)
+            .await
+            .with_context(|| "failed to load initial sentiment algorithm")?;
+
+        let engine = Self {
+            algo: Arc::new(ArcSwap::from_pointee(initial_algo)),
+        };
+
+        // kick off background watcher
+        let engine_clone = engine.clone();
+        task::spawn(async move {
+            if let Err(e) = watch_config(cfg_path, engine_clone).await {
+                error!(error = %e, "config watcher exited with error");
+            }
+        });
+
+        Ok(engine)
+    }
+
+    /// Public API used by other services in ChirpPulse.
+    ///
+    /// It is fully lock-free: a clone of the underlying `Arc` is read via
+    /// `ArcSwap::load`, then the async algorithm runs.
+    pub async fn analyze(&self, text: &str) -> Result<SentimentScore> {
+        let algo = self.algo.load();
+        algo.analyze(text).await
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Concrete algorithms
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/// Very small heuristic implementation (no external deps).
+pub struct VaderSentiment;
+
+#[async_trait]
+impl SentimentAlgorithm for VaderSentiment {
+    async fn analyze(&self, text: &str) -> Result<SentimentScore> {
+        // Extremely naive sentiment heuristic: count :) versus :( tokens
+        let positive = text.matches(":)").count() as f32;
+        let negative = text.matches(":(").count() as f32;
+
+        let total = positive + negative + 1e-6; // avoid div/0
+        let polarity = (positive - negative) / total;
+        let magnitude = total.log10().max(0.0);
+
+        Ok(SentimentScore {
+            polarity,
+            magnitude,
+        })
+    }
+}
+
+/// Delegates sentiment inference to an external HTTP microservice.
+pub struct BertRemote {
+    client: Client,
+    endpoint: String,
+}
+
+impl BertRemote {
+    fn new(endpoint: String, timeout: Duration) -> Self {
+        Self {
+            client: Client::builder()
+                .timeout(timeout)
+                .user_agent("ChirpPulse/BERT-Sentiment 1.0")
+                .build()
+                .expect("reqwest builder cannot fail here"),
+            endpoint,
+        }
+    }
+}
+
+#[async_trait]
+impl SentimentAlgorithm for BertRemote {
+    async fn analyze(&self, text: &str) -> Result<SentimentScore> {
+        #[derive(Deserialize)]
+        struct ApiResponse {
+            polarity: f32,
+            magnitude: f32,
+        }
+
+        let resp = self
+            .client
+            .post(&self.endpoint)
+            .json(&serde_json::json!({ "text": text }))
+            .send()
+            .await
+            .context("request to BertRemote failed")?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("BERT service returned non-success: {}", resp.status());
+        }
+
+        let parsed: ApiResponse = resp.json().await.context("invalid JSON from BERT")?;
+        Ok(SentimentScore {
+            polarity: parsed.polarity,
+            magnitude: parsed.magnitude,
+        })
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Configuration handling + hot reload
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/// Minimal YAML config format.
+///
+/// # Examples
+/// ```yaml
+/// strategy: bert     # "vader" | "bert"
+/// bert:
+///   endpoint: "http://bert-svc:8080/api/v1/sentiment"
+///   timeout_ms: 800
+/// ```
+#[derive(Debug, Deserialize)]
+struct Config {
+    pub strategy: Strategy,
+    #[serde(default)]
+    pub bert: Option<BertCfg>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Strategy {
+    Vader,
+    Bert,
+}
+
+#[derive(Debug, Deserialize)]
+struct BertCfg {
+    pub endpoint: String,
+    #[serde(default = "default_timeout")]
+    pub timeout_ms: u64,
+}
+
+fn default_timeout() -> u64 {
+    1_000
+}
+
+/// Load algorithm from YAML config file.
+async fn load_algorithm(path: &Path) -> Result<Arc<dyn SentimentAlgorithm>> {
+    let data = fs::read_to_string(path)
+        .with_context(|| format!("unable to read config '{}'", path.display()))?;
+    let cfg: Config =
+        serde_yaml::from_str(&data).context("failed to deserialize sentiment YAML config")?;
+
+    match cfg.strategy {
+        Strategy::Vader => Ok(Arc::new(VaderSentiment)),
+        Strategy::Bert => {
+            let bert_cfg = cfg
+                .bert
+                .with_context(|| "bert strategy selected but [bert] section missing")?;
+            Ok(Arc::new(BertRemote::new(
+                bert_cfg.endpoint,
+                Duration::from_millis(bert_cfg.timeout_ms),
+            )))
+        }
+    }
+}
+
+/// Watch the config file; push events into a channel so we can
+/// debounce inside async context.
+async fn watch_config(path: PathBuf, engine: SentimentEngine) -> Result<()> {
+    let (tx, rx) = unbounded_channel();
+    let mut watcher = new_watcher(tx)?;
+
+    watcher
+        .watch(&path, RecursiveMode::NonRecursive)
+        .with_context(|| format!("unable to watch {:?}", path))?;
+
+    process_events(path, engine, rx).await
+}
+
+/// Create a synchronous blocking watcher (Notify runs in its own thread).
+fn new_watcher(tx: UnboundedSender<()>) -> Result<RecommendedWatcher> {
+    let watcher = RecommendedWatcher::new(
+        move |res: Result<Event, notify::Error>| match res {
+            Ok(_) => {
+                // Send a unit if at least one event came through.
+                let _ = tx.send(());
+            }
+            Err(e) => error!(error = %e, "file-watch error"),
+        },
+        NotifyConfig::default(),
+    )
+    .context("failed to create file watcher")?;
+    Ok(watcher)
+}
+
+/// Debounce events and reload algorithm atomically.
+///
+/// We wait `DEBOUNCE_MS` after the *last* filesystem event before reloading
+/// to avoid partial writes.
+async fn process_events(
+    path: PathBuf,
+    engine: SentimentEngine,
+    mut rx: UnboundedReceiver<()>,
+) -> Result<()> {
+    const DEBOUNCE_MS: u64 = 250;
+
+    loop {
+        // Block until we receive at least one change event.
+        rx.recv().await;
+        // Now begin debounce window.
+        loop {
+            select! {
+                _ = rx.recv() => {
+                    // Got another event; restart debounce timer.
+                    continue;
+                }
+                _ = time::sleep(Duration::from_millis(DEBOUNCE_MS)) => {
+                    break;
+                }
+            }
+        }
+
+        info!("detected change in {:?}, reloading sentiment strategy", path);
+        match load_algorithm(&path).await {
+            Ok(algo) => {
+                engine.algo.store(algo);
+                info!("sentiment strategy hot-swapped successfully");
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to reload sentiment config; keeping previous strategy");
+            }
+        }
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Unit tests (can be run with `cargo test -p data_streaming`)
+ * ──────────────────────────────────────────────────────────────────────── */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn vader_basic() {
+        let algo = VaderSentiment;
+        let score = algo.analyze("hello :)").await.unwrap();
+        assert!(score.polarity > 0.0);
+    }
+
+    #[tokio::test]
+    async fn engine_hot_swap() {
+        // Create a temp config file
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("sentiment.yml");
+        fs::write(&config_path, "strategy: vader\n").unwrap();
+
+        let engine = SentimentEngine::new(&config_path).await.unwrap();
+        let orig = engine.analyze(":)").await.unwrap();
+
+        // Overwrite with BERT config pointing to invalid endpoint.
+        fs::write(
+            &config_path,
+            "strategy: bert\nbert:\n  endpoint: \"http://localhost:9\"\n",
+        )
+        .unwrap();
+
+        // Wait for watcher to pick it up
+        time::sleep(Duration::from_millis(600)).await;
+
+        let swapped = engine.analyze(":)").await;
+        // BERT call should fail, so engine keeps old strategy and still succeeds.
+        assert!(swapped.is_ok());
+        assert_eq!(orig.polarity, swapped.unwrap().polarity);
+    }
+}
+```

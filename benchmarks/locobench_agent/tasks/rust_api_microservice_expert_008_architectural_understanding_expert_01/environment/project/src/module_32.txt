@@ -1,0 +1,341 @@
+```rust
+//! LedgerLink Nexus – Ledger Entry Repository & Service Layer Component
+//! -------------------------------------------------------------------
+//! This module is responsible for fetching ledger entries in a paginated,
+//! read-optimised manner.  It combines PostgreSQL as the source of truth
+//! with Redis as a short-lived, per-tenant, per-query cache to reduce
+//! round-trips on hot paths (dashboard charts, account snapshots, etc.).
+//!
+//! The public surface area is a single async façade (`LedgerEntryService`)
+//! which orchestrates the underlying `LedgerEntryRepository` and shields
+//! callers from cache concerns, retry logic and tracing boiler-plate.
+//!
+//! The code illustrates the following LedgerLink architectural cornerstones:
+//!   • Repository Pattern (data-access isolation)
+//!   • Command/Query Service Layer
+//!   • Pagination helpers (seek-based, opaque cursor)
+//!   • Response-caching (Redis, configurable TTL)
+//!
+//! Note:  SQL schema and Redis deployment are expected to exist externally.
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use rand::{distributions::Alphanumeric, Rng};
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgRow, query, PgPool, Row};
+use thiserror::Error;
+use tokio::time::timeout;
+use tracing::{debug, instrument, warn};
+
+/// The canonical ledger entry domain model.
+///
+/// In keeping with CQRS conventions, the model is not exposed directly to the
+/// public API layer.  Instead, a projection (DTO) should be returned.  For
+/// brevity, we reuse the model here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub id: i64,
+    pub tenant_id: String,
+    pub account_id: String,
+    pub amount_minor_units: i64,
+    pub currency: String,
+    pub posting_ts: DateTime<Utc>,
+}
+
+/// Seek-based pagination cursor.
+///
+/// The cursor hides the implementation detail (the posting timestamp) from the
+/// caller.  It is encoded as URL-safe base64.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cursor(String);
+
+impl Cursor {
+    /// Generate a cursor from a timestamp.
+    pub fn from_ts(ts: DateTime<Utc>) -> Self {
+        Self(base64::encode_config(
+            ts.timestamp_millis().to_string(),
+            base64::URL_SAFE_NO_PAD,
+        ))
+    }
+
+    /// Decode a cursor to a timestamp (falling back to epoch if malformed).
+    pub fn into_ts(self) -> DateTime<Utc> {
+        let ts = base64::decode_config(self.0, base64::URL_SAFE_NO_PAD)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        DateTime::<Utc>::from_utc(
+            chrono::NaiveDateTime::from_timestamp_millis(ts).unwrap_or_default(),
+            Utc,
+        )
+    }
+}
+
+/// Generic pagination envelope.
+///
+/// `items` will be empty when the end of the result-set has been reached.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<Cursor>,
+}
+
+/// Errors bubbled up by the repository or service layer.
+#[derive(Debug, Error)]
+pub enum LedgerError {
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+    #[error("cache error: {0}")]
+    Cache(#[from] redis::RedisError),
+    #[error("operation timed out")]
+    Timeout,
+}
+
+/// Repository contract for read operations.
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    async fn fetch_paginated(
+        &self,
+        tenant_id: &str,
+        account_id: &str,
+        cursor: Option<Cursor>,
+        limit: u16,
+    ) -> Result<Page<LedgerEntry>, LedgerError>;
+}
+
+/// PostgreSQL implementation of the repository.
+pub struct PgLedgerEntryRepository {
+    pool: PgPool,
+}
+
+impl PgLedgerEntryRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for PgLedgerEntryRepository {
+    #[instrument(
+        skip_all,
+        level = "debug",
+        err,
+        fields(tenant = %tenant_id, account = %account_id, limit)
+    )]
+    async fn fetch_paginated(
+        &self,
+        tenant_id: &str,
+        account_id: &str,
+        cursor: Option<Cursor>,
+        limit: u16,
+    ) -> Result<Page<LedgerEntry>, LedgerError> {
+        let limit = limit.clamp(1, 500) as i64;
+
+        // Seek position: default to now + 1 ms (fetch latest)
+        let seek_ts = cursor
+            .map(Cursor::into_ts)
+            .unwrap_or_else(|| Utc::now() + chrono::Duration::milliseconds(1));
+
+        let rows = query(
+            r#"
+            SELECT  id,
+                    tenant_id,
+                    account_id,
+                    amount_minor_units,
+                    currency,
+                    posting_ts
+            FROM    ledger_entries
+            WHERE   tenant_id     = $1
+            AND     account_id    = $2
+            AND     posting_ts    < $3       -- seek
+            ORDER BY posting_ts   DESC
+            LIMIT   $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(account_id)
+        .bind(seek_ts)
+        .bind(limit + 1) // fetch one extra element to determine next cursor
+        .map(|row: PgRow| LedgerEntry {
+            id: row.get("id"),
+            tenant_id: row.get("tenant_id"),
+            account_id: row.get("account_id"),
+            amount_minor_units: row.get("amount_minor_units"),
+            currency: row.get("currency"),
+            posting_ts: row.get("posting_ts"),
+        })
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut iter = rows.into_iter();
+        let mut items: Vec<LedgerEntry> = iter.by_ref().take(limit as usize).collect();
+
+        // Determine next cursor if there are more rows
+        let next_cursor = iter
+            .next()
+            .map(|entry| Cursor::from_ts(entry.posting_ts));
+
+        // Reverse to ascending for client UX
+        items.reverse();
+
+        Ok(Page { items, next_cursor })
+    }
+}
+
+/// Service layer façade with transparent caching & timeout budget.
+pub struct LedgerEntryService<R: LedgerEntryRepository> {
+    repo: R,
+    redis: redis::aio::ConnectionManager,
+    /// Cache expiration (seconds)
+    ttl_seconds: u64,
+    /// Total budget for DB + cache round-trip
+    timeout: Duration,
+}
+
+impl<R: LedgerEntryRepository> LedgerEntryService<R> {
+    pub fn new(repo: R, redis: redis::aio::ConnectionManager) -> Self {
+        Self {
+            repo,
+            redis,
+            ttl_seconds: 30,
+            timeout: Duration::from_secs(3),
+        }
+    }
+
+    /// Composite cache key to retain multi-tenant safety.
+    fn make_cache_key(
+        tenant_id: &str,
+        account_id: &str,
+        cursor: &Option<Cursor>,
+        limit: u16,
+    ) -> String {
+        let salt: String = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(4)
+            .map(char::from)
+            .collect();
+        format!(
+            "llnx:ledger:{tenant}:{acct}:{cursor}:{limit}:{salt}",
+            tenant = tenant_id,
+            acct = account_id,
+            cursor = cursor
+                .as_ref()
+                .map(|c| c.0.clone())
+                .unwrap_or_else(|| "head".into()),
+            limit = limit
+        )
+    }
+
+    /// Fetch paginated ledger entries with read-through cache.
+    #[instrument(skip_all, level = "debug", err)]
+    pub async fn list_entries(
+        &self,
+        tenant_id: &str,
+        account_id: &str,
+        cursor: Option<Cursor>,
+        limit: u16,
+    ) -> Result<Page<LedgerEntry>, LedgerError> {
+        let cache_key = Self::make_cache_key(tenant_id, account_id, &cursor, limit);
+        let mut redis_conn = self.redis.clone();
+
+        // Try cache
+        if let Ok(Some(blob)) = redis_conn.get::<_, Vec<u8>>(&cache_key).await {
+            debug!("cache hit");
+            if let Ok(page) = bincode::deserialize::<Page<LedgerEntry>>(&blob) {
+                return Ok(page);
+            }
+        }
+
+        debug!("cache miss – querying repository");
+
+        // Guard DB & cache write with budget
+        let page = match timeout(
+            self.timeout,
+            self.repo
+                .fetch_paginated(tenant_id, account_id, cursor.clone(), limit),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                warn!("repository call timed out");
+                return Err(LedgerError::Timeout);
+            }
+        };
+
+        // Fire-and-forget cache population
+        let ttl = self.ttl_seconds as usize;
+        let blob = bincode::serialize(&page).expect("serializable Page");
+        tokio::spawn(async move {
+            if let Err(e) = redis_conn.set_ex::<_, _, ()>(cache_key, blob, ttl).await {
+                warn!("failed to write cache: {e}");
+            }
+        });
+
+        Ok(page)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    /// Spin up a temporary Postgres + Redis using testcontainers when running
+    /// the entire workspace tests.  For CI brevity, we default to env-vars.
+    #[tokio::test]
+    async fn pagination_roundtrip() {
+        let pg_dsn = env::var("TEST_PG_DSN")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/ledger_test".into());
+        let pool = PgPool::connect(&pg_dsn)
+            .await
+            .expect("pg reachable");
+
+        let client = redis::Client::open("redis://127.0.0.1/")
+            .expect("redis url");
+        let redis_mgr = redis::aio::ConnectionManager::new(client)
+            .await
+            .expect("redis conn");
+
+        let repo = PgLedgerEntryRepository::new(pool.clone());
+        let service = LedgerEntryService::new(repo, redis_mgr);
+
+        // Seed one entry
+        sqlx::query!(
+            r#"
+            INSERT INTO ledger_entries
+            (tenant_id, account_id, amount_minor_units, currency, posting_ts)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            "tenant_a",
+            "acct_x",
+            10_i64,
+            "USD",
+            Utc::now(),
+        )
+        .execute(&pool)
+        .await
+        .expect("insert ok");
+
+        // First page
+        let page1 = service
+            .list_entries("tenant_a", "acct_x", None, 10)
+            .await
+            .expect("page1 ok");
+        assert!(!page1.items.is_empty());
+
+        // Second page should be empty (only one row inserted)
+        if let Some(cursor) = page1.next_cursor {
+            let page2 = service
+                .list_entries("tenant_a", "acct_x", Some(cursor), 10)
+                .await
+                .expect("page2 ok");
+            assert!(page2.items.is_empty());
+        }
+    }
+}
+```

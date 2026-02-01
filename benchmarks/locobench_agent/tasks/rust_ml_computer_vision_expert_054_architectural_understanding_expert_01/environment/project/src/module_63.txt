@@ -1,0 +1,425 @@
+```rust
+//! src/module_63.rs
+//!
+//! Automated retraining & hyper-parameter tuning utilities for
+//! VisuTility Orchestrator (ml_computer_vision).
+//!
+//! This module demonstrates a mixture of Factory, Strategy, and Observer
+//! patterns.  The public surface area is intentionally small so the
+//! implementation may evolve without breaking downstream crates.
+
+#![allow(clippy::needless_pass_by_value)]
+
+use chrono::{DateTime, Utc};
+use crossbeam_channel::{bounded, Receiver, Sender};
+use log::{debug, error, info, warn};
+use rand::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+/// Result alias local to this module.
+type Result<T, E = RetrainError> = std::result::Result<T, E>;
+
+/// Domain error for the retraining / monitoring subsystem.
+#[derive(thiserror::Error, Debug)]
+pub enum RetrainError {
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
+    #[error("hyperparameter tuning failed: {0}")]
+    TuningFailed(String),
+    #[error("job execution failed: {0}")]
+    JobFailed(String),
+    #[error("observer dispatch error: {0}")]
+    Dispatch(String),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// Metric kinds emitted from online evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MetricKind {
+    Accuracy,
+    Precision,
+    Recall,
+    F1,
+    LatencyMs,
+}
+
+/// Snapshot over metrics at a point in time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MetricsSnapshot {
+    pub ts: DateTime<Utc>,
+    pub values: HashMap<MetricKind, f64>,
+}
+
+impl MetricsSnapshot {
+    pub fn new(values: HashMap<MetricKind, f64>) -> Self {
+        Self { ts: Utc::now(), values }
+    }
+
+    /// Helper to fetch a metric value, returning None if missing.
+    pub fn get(&self, kind: MetricKind) -> Option<f64> {
+        self.values.get(&kind).copied()
+    }
+}
+
+/// Comparator used by threshold conditions.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum Comparator {
+    GreaterEq,
+    LessEq,
+}
+
+impl Comparator {
+    pub fn compare(&self, lhs: f64, rhs: f64) -> bool {
+        match self {
+            Comparator::GreaterEq => lhs >= rhs,
+            Comparator::LessEq => lhs <= rhs,
+        }
+    }
+}
+
+/// Condition that fires when a metric crosses a threshold.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThresholdCondition {
+    metric: MetricKind,
+    threshold: f64,
+    cmp: Comparator,
+}
+
+impl ThresholdCondition {
+    pub fn new(metric: MetricKind, threshold: f64, cmp: Comparator) -> Self {
+        Self { metric, threshold, cmp }
+    }
+
+    pub fn is_triggered(&self, snapshot: &MetricsSnapshot) -> bool {
+        snapshot
+            .get(self.metric)
+            .map(|val| self.cmp.compare(val, self.threshold))
+            .unwrap_or(false)
+    }
+}
+
+/// Observer pattern: events emitted by monitoring loop.
+#[derive(Clone, Debug)]
+pub enum MonitorEvent {
+    Metrics(MetricsSnapshot),
+    RetrainRequested { reason: String, snapshot: MetricsSnapshot },
+}
+
+pub trait Observer: Send + Sync {
+    fn on_event(&self, event: &MonitorEvent);
+}
+
+pub type DynObserver = Arc<dyn Observer>;
+
+/// Thread-safe event bus.
+#[derive(Clone, Default)]
+pub struct EventBus {
+    subscribers: Arc<Mutex<Vec<DynObserver>>>,
+}
+
+impl EventBus {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn subscribe(&self, ob: DynObserver) {
+        self.subscribers.lock().unwrap().push(ob);
+    }
+
+    pub fn publish(&self, evt: MonitorEvent) {
+        let subs = self.subscribers.lock().unwrap().clone();
+        for ob in subs {
+            ob.on_event(&evt);
+        }
+    }
+}
+
+/// Strategy trait for hyperparameter tuning.
+pub trait HyperparameterTuner: Send + Sync {
+    fn tune(
+        &self,
+        space: &ConfigSpace,
+        evaluator: &(dyn Fn(&HyperParams) -> f64 + Send + Sync),
+    ) -> Result<HyperParams>;
+}
+
+/// Hyperparameter config blob (domain-agnostic key/value map).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HyperParams(pub HashMap<String, f64>);
+
+impl fmt::Display for HyperParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pairs: Vec<String> = self
+            .0
+            .iter()
+            .map(|(k, v)| format!("{k}={v:.4}"))
+            .collect();
+        write!(f, "{}", pairs.join(", "))
+    }
+}
+
+/// Search space for hyperparams.
+#[derive(Clone, Debug)]
+pub struct ConfigSpace {
+    pub ranges: HashMap<String, (f64, f64)>,
+}
+
+impl ConfigSpace {
+    pub fn validate(&self) -> Result<()> {
+        if self.ranges.is_empty() {
+            return Err(RetrainError::InvalidConfig(
+                "hyperparam search space cannot be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Concrete tuner using random search.
+pub struct RandomSearchTuner {
+    iterations: usize,
+    rng: Mutex<StdRng>,
+}
+
+impl RandomSearchTuner {
+    pub fn new(iterations: usize, seed: u64) -> Self {
+        Self { iterations, rng: Mutex::new(StdRng::seed_from_u64(seed)) }
+    }
+}
+
+impl HyperparameterTuner for RandomSearchTuner {
+    fn tune(
+        &self,
+        space: &ConfigSpace,
+        evaluator: &(dyn Fn(&HyperParams) -> f64 + Send + Sync),
+    ) -> Result<HyperParams> {
+        space.validate()?;
+        let mut best_score = f64::NEG_INFINITY;
+        let mut best_params = None;
+
+        for _ in 0..self.iterations {
+            let params = {
+                let mut rng = self.rng.lock().unwrap();
+                let map = space
+                    .ranges
+                    .iter()
+                    .map(|(k, (lo, hi))| (k.clone(), rng.gen_range(*lo..=*hi)))
+                    .collect();
+                HyperParams(map)
+            };
+
+            let score = evaluator(&params);
+            debug!("Random search candidate {params} scored {score:.5}");
+            if score > best_score {
+                best_score = score;
+                best_params = Some(params);
+            }
+        }
+
+        best_params.ok_or_else(|| {
+            RetrainError::TuningFailed("no candidate generated in random search".into())
+        })
+    }
+}
+
+/// Client stub for the internal model registry.
+pub trait ModelRegistry: Send + Sync {
+    fn register_model(&self, params: &HyperParams) -> Result<String>; // returns model version
+}
+
+/// A fake in-memory model registry, appropriate for testing.
+pub struct InMemoryRegistry {
+    store: Mutex<Vec<(String, HyperParams)>>,
+}
+
+impl Default for InMemoryRegistry {
+    fn default() -> Self {
+        Self { store: Mutex::new(Vec::new()) }
+    }
+}
+
+impl ModelRegistry for InMemoryRegistry {
+    fn register_model(&self, params: &HyperParams) -> Result<String> {
+        let mut store = self.store.lock().unwrap();
+        let version = format!("v{}", store.len() + 1);
+        store.push((version.clone(), params.clone()));
+        Ok(version)
+    }
+}
+
+/// Observer that triggers retraining when conditions are met.
+pub struct RetrainObserver {
+    condition: ThresholdCondition,
+    tx: Sender<MonitorEvent>,
+}
+
+impl RetrainObserver {
+    pub fn new(condition: ThresholdCondition, tx: Sender<MonitorEvent>) -> Self {
+        Self { condition, tx }
+    }
+}
+
+impl Observer for RetrainObserver {
+    fn on_event(&self, event: &MonitorEvent) {
+        if let MonitorEvent::Metrics(snapshot) = event {
+            if self.condition.is_triggered(snapshot) {
+                let reason = format!(
+                    "Metric {:?} crossed threshold {} {:?}",
+                    self.condition.metric, self.condition.cmp, self.condition.threshold
+                );
+                let _ = self.tx.send(MonitorEvent::RetrainRequested {
+                    reason,
+                    snapshot: snapshot.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// Job that performs end-to-end retraining & registration.
+pub struct RetrainingJob<R: ModelRegistry + 'static> {
+    tuner: Arc<dyn HyperparameterTuner>,
+    registry: Arc<R>,
+    config_space: ConfigSpace,
+    receiver: Receiver<MonitorEvent>,
+}
+
+impl<R: ModelRegistry + 'static> RetrainingJob<R> {
+    pub fn spawn(
+        tuner: Arc<dyn HyperparameterTuner>,
+        registry: Arc<R>,
+        config_space: ConfigSpace,
+        receiver: Receiver<MonitorEvent>,
+    ) -> thread::JoinHandle<()> {
+        thread::Builder::new()
+            .name("retraining-job".into())
+            .spawn(move || {
+                let job = Self { tuner, registry, config_space, receiver };
+                if let Err(e) = job.run() {
+                    error!("Retraining job exited with error: {e:#}");
+                }
+            })
+            .expect("failed to spawn retraining thread")
+    }
+
+    fn run(&self) -> Result<()> {
+        loop {
+            match self.receiver.recv() {
+                Ok(MonitorEvent::RetrainRequested { reason, snapshot }) => {
+                    info!("Retrain requested: {reason}. Snapshot: {:?}", snapshot);
+
+                    // Domain-specific evaluator closure.
+                    let evaluator = |hp: &HyperParams| self.simulate_model_eval(hp);
+
+                    let best_params = self.tuner.tune(&self.config_space, &evaluator)?;
+                    let version = self.registry.register_model(&best_params)?;
+
+                    info!("🚀  Deployed new model {version} with params {best_params}");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    warn!("Retraining receiver closed: {err}");
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Simulate expensive model training & evaluation. In real deployment
+    /// this would call out to GPU workloads or distributed jobs.
+    fn simulate_model_eval(&self, hp: &HyperParams) -> f64 {
+        let sleep_ms = 50 + (hp.0.len() as u64 * 10);
+        thread::sleep(Duration::from_millis(sleep_ms));
+        // Pretend lower learning_rate results in better accuracy
+        -hp.0.get("learning_rate").copied().unwrap_or(0.01)
+    }
+}
+
+/// Minimal monitoring loop that ingests live metrics (simulated here).
+pub struct MonitoringLoop {
+    bus: EventBus,
+    tx: Sender<MonitorEvent>,
+}
+
+impl MonitoringLoop {
+    pub fn new(bus: EventBus, tx: Sender<MonitorEvent>) -> Self {
+        Self { bus, tx }
+    }
+
+    pub fn start(self) -> thread::JoinHandle<()> {
+        thread::Builder::new()
+            .name("monitoring-loop".into())
+            .spawn(move || {
+                let mut rng = rand::thread_rng();
+                loop {
+                    // Simulated live metric stream.
+                    let mut values = HashMap::new();
+                    values.insert(MetricKind::Accuracy, rng.gen_range(0.7..0.95));
+                    values.insert(MetricKind::LatencyMs, rng.gen_range(30.0..80.0));
+                    let snapshot = MetricsSnapshot::new(values);
+
+                    self.bus.publish(MonitorEvent::Metrics(snapshot.clone()));
+                    if self.tx.send(MonitorEvent::Metrics(snapshot)).is_err() {
+                        break; // exit if retraining side is gone
+                    }
+
+                    thread::sleep(Duration::from_secs(5));
+                }
+            })
+            .expect("failed to spawn monitoring thread")
+    }
+}
+
+/// Bootstrap convenience function tying every piece together.
+pub fn bootstrap_demo() {
+    // Wiring.
+    let bus = EventBus::new();
+    let (tx_retrain, rx_retrain) = bounded::<MonitorEvent>(1024);
+
+    let cond = ThresholdCondition::new(MetricKind::Accuracy, 0.8, Comparator::LessEq);
+    let retrain_observer = Arc::new(RetrainObserver::new(cond, tx_retrain.clone()));
+    bus.subscribe(retrain_observer);
+
+    let tuner = Arc::new(RandomSearchTuner::new(24, 42));
+    let registry = Arc::new(InMemoryRegistry::default());
+
+    let mut space = HashMap::new();
+    space.insert("learning_rate".into(), (0.0001, 0.05));
+    let config_space = ConfigSpace { ranges: space };
+
+    RetrainingJob::spawn(tuner, registry, config_space, rx_retrain);
+    MonitoringLoop::new(bus, tx_retrain).start();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn threshold_condition_triggers() {
+        let mut values = HashMap::new();
+        values.insert(MetricKind::Accuracy, 0.75);
+        let snap = MetricsSnapshot::new(values);
+
+        let cond = ThresholdCondition::new(MetricKind::Accuracy, 0.8, Comparator::LessEq);
+        assert!(cond.is_triggered(&snap));
+    }
+
+    #[test]
+    fn random_search_produces_result() {
+        let mut space = HashMap::new();
+        space.insert("x".into(), (0.0, 1.0));
+        let cfg = ConfigSpace { ranges: space };
+
+        let tuner = RandomSearchTuner::new(10, 1);
+        let evaluator = |hp: &HyperParams| hp.0.get("x").copied().unwrap_or(0.0);
+        let best = tuner.tune(&cfg, &evaluator).unwrap();
+        assert!(best.0.get("x").copied().unwrap() >= 0.8);
+    }
+}
+```

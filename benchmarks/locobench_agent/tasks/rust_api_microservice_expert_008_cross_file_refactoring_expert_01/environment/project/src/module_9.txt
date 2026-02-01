@@ -1,0 +1,284 @@
+```rust
+// src/module_9.txt
+//
+// LedgerLink Nexus – Response Cache Layer
+//
+// This module offers a high-level, type-safe Redis response-caching facility
+// that can be consumed by the Command/Query service layer.  It is intentionally
+// generic so that REST controllers, GraphQL resolvers or any background job can
+// opt-in to transparent caching with minimal boilerplate.
+//
+// Key concepts
+//  * CacheKey      – Namespaced, content-addressed identifier
+//  * CachePolicy   – TTL & behaviour configuration
+//  * ResponseCache – Async Redis wrapper with tracing & metrics
+//  * Cacheable     – Trait to describe how queries are serialized & keyed
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
+#![allow(clippy::module_name_repetitions)]
+
+use std::{
+    fmt,
+    hash::Hasher,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use async_trait::async_trait;
+use blake3::Hasher as Blake3;
+use redis::{aio::ConnectionManager, AsyncCommands};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::RwLock;
+use tracing::{debug, error, instrument, trace};
+
+/// Unified error type for cache operations.
+#[derive(Debug, Error)]
+pub enum CacheError {
+    #[error("redis error: {0}")]
+    Redis(#[from] redis::RedisError),
+
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("time error: {0}")]
+    Time(#[from] std::time::SystemTimeError),
+}
+
+/// TTL & behaviour for a cache entry.
+///
+/// NOTE: Additional knobs (stale-while-revalidate, soft/hard limits, etc.)
+/// could be added here when needed.
+#[derive(Debug, Clone, Copy)]
+pub struct CachePolicy {
+    pub ttl: Duration,
+}
+
+impl CachePolicy {
+    /// Shorthand for a 5-minute cache policy.
+    pub const SHORT: Self = Self {
+        ttl: Duration::from_secs(60 * 5),
+    };
+
+    /// Shorthand for a 1-hour cache policy.
+    pub const MEDIUM: Self = Self {
+        ttl: Duration::from_secs(60 * 60),
+    };
+
+    /// Shorthand for a 1-day cache policy.
+    pub const LONG: Self = Self {
+        ttl: Duration::from_secs(60 * 60 * 24),
+    };
+}
+
+/// Extension trait describing how a query/result pair should be cached.
+#[async_trait]
+pub trait Cacheable: Sized + Serialize + DeserializeOwned + Send + Sync + 'static {
+    /// Unique stable identifier for the tenant or system scope.
+    ///
+    /// Combining tenant id and API version into the namespace makes sure two
+    /// organisations cannot collide in Redis, even if they send identical
+    /// payloads.
+    fn namespace(&self) -> String;
+
+    /// The cache policy that should be applied for this query.
+    fn policy(&self) -> CachePolicy;
+
+    /// Producer function to compute the response when a cache-miss occurs.
+    async fn resolve(&self) -> Result<Self, CacheError>;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ResponseCache
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Thread-safe, cheaply cloneable cache wrapper.
+///
+/// Internally wraps a `tokio-redis` connection manager to play well with the
+/// async runtime.  Contains an in-process read/write lock guard around the
+/// connection to avoid stampeding‐herd scenarios in high load.
+#[derive(Clone)]
+pub struct ResponseCache {
+    conn: Arc<RwLock<ConnectionManager>>,
+    prefix: String,
+}
+
+impl ResponseCache {
+    /// Create a new instance from an existing Redis connection.
+    pub fn new(prefix: impl Into<String>, conn: ConnectionManager) -> Self {
+        Self {
+            conn: Arc::new(RwLock::new(conn)),
+            prefix: prefix.into(),
+        }
+    }
+
+    /// Assemble a namespaced key for Redis.  Uses BLAKE3 on the raw bytes to
+    /// generate a short, collision-resistant digest.
+    fn build_key(&self, namespace: &str, payload: &[u8]) -> String {
+        let mut h = Blake3::new();
+        h.update(payload);
+        let digest = h.finalize();
+        format!("{}:{}:{}", self.prefix, namespace, digest.to_hex())
+    }
+
+    /// Serialize & store an item in Redis with the provided policy.
+    #[instrument(skip(self, value), fields(namespace = %ns, key = %key))]
+    async fn write<T>(&self, ns: &str, key: &str, value: &T, policy: CachePolicy) -> Result<(), CacheError>
+    where
+        T: Serialize + Send + Sync,
+    {
+        let payload = serde_json::to_vec(value)?;
+        let mut conn = self.conn.write().await;
+
+        debug!("caching response – ttl={}s, bytes={}", policy.ttl.as_secs(), payload.len());
+        conn.set_ex::<&str, Vec<u8>, ()>(key, payload, policy.ttl.as_secs() as usize)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Attempt to read & deserialize a value; returns Ok(None) on cache-miss.
+    #[instrument(skip(self))]
+    async fn read<T>(&self, key: &str) -> Result<Option<T>, CacheError>
+    where
+        T: DeserializeOwned,
+    {
+        let mut conn = self.conn.write().await;
+
+        let raw: Option<Vec<u8>> = conn.get(key).await?;
+        if let Some(blob) = raw {
+            trace!("cache hit – key={}, bytes={}", key, blob.len());
+            let deserialized = serde_json::from_slice::<T>(&blob)?;
+            Ok(Some(deserialized))
+        } else {
+            trace!("cache miss – key={}", key);
+            Ok(None)
+        }
+    }
+
+    /// Public helper to retrieve a cached entry or compute & populate it.
+    ///
+    ///     let result: MyDto = cache.get_or_resolve(&query).await?;
+    ///
+    #[instrument(skip(self, query))]
+    pub async fn get_or_resolve<Q>(&self, query: &Q) -> Result<Q, CacheError>
+    where
+        Q: Cacheable,
+    {
+        let ns = query.namespace();
+        let payload = serde_json::to_vec(query)?;
+        let key = self.build_key(&ns, &payload);
+
+        // 1. Attempt to read
+        if let Some(res) = self.read::<Q>(&key).await? {
+            return Ok(res);
+        }
+
+        // 2. Miss → resolve & fill cache
+        let resolved = query.resolve().await?;
+        self.write(&ns, &key, &resolved, query.policy()).await?;
+
+        Ok(resolved)
+    }
+
+    /// Remove all keys for a given tenant namespace.  Useful when a ledger
+    /// mutation happens and cached projections must be invalidated.
+    #[instrument(skip(self))]
+    pub async fn purge_namespace(&self, namespace: &str) -> Result<u64, CacheError> {
+        let pattern = format!("{}:{}:*", self.prefix, namespace);
+        let mut conn = self.conn.write().await;
+        // NOTE: SCAN could be more graceful for prod, kept simple here.
+        let keys: Vec<String> = conn.keys(pattern).await?;
+        let deleted: u64 = conn.del(keys).await?;
+        debug!("purged {} stale cache entries under '{}'", deleted, namespace);
+        Ok(deleted)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sample DTO + Cacheable impl for demonstration
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerSnapshotQuery {
+    /// Tenant/organisation id
+    pub tenant_id: uuid::Uuid,
+
+    /// ISO-8601 date
+    pub as_of: chrono::NaiveDate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerSnapshot {
+    pub tenant_id: uuid::Uuid,
+    pub as_of: chrono::NaiveDate,
+    pub balance: rust_decimal::Decimal,
+    pub generated_at: u64, // unix-epoch (ms)
+}
+
+#[async_trait]
+impl Cacheable for LedgerSnapshot {
+    fn namespace(&self) -> String {
+        format!("tenant:{}:v1", self.tenant_id)
+    }
+
+    fn policy(&self) -> CachePolicy {
+        CachePolicy::MEDIUM
+    }
+
+    /// Heavy-weight computation stub – in reality this would call the service
+    /// layer, maybe hitting Postgres and performing aggregations.
+    async fn resolve(&self) -> Result<Self, CacheError> {
+        // Fake CPU-bound work to showcase async behaviour.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        Ok(Self {
+            tenant_id: self.tenant_id,
+            as_of: self.as_of,
+            balance: rust_decimal::Decimal::new(123456, 2),
+            generated_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)?
+                .as_millis() as u64,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit tests (cargo test -p api_microservice -- src/module_9.txt)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use redis::Client;
+    use tokio::runtime::Runtime;
+
+    // ⚠️ Requires a local Redis instance (default URL).
+    #[test]
+    fn cache_roundtrip() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let client = Client::open("redis://127.0.0.1/").unwrap();
+            let manager = ConnectionManager::new(client).await.unwrap();
+
+            let cache = ResponseCache::new("nexus", manager);
+
+            let query = LedgerSnapshot {
+                tenant_id: uuid::Uuid::new_v4(),
+                as_of: chrono::NaiveDate::from_ymd_opt(2024, 1, 30).unwrap(),
+                balance: rust_decimal::Decimal::ZERO,
+                generated_at: 0,
+            };
+
+            // initial resolve – should miss, populate cache
+            let _ = cache.get_or_resolve(&query).await.unwrap();
+
+            // second call – should hit
+            let snap2 = cache.get_or_resolve(&query).await.unwrap();
+
+            assert_eq!(snap2.balance, rust_decimal::Decimal::new(123456, 2));
+        });
+    }
+}
+```

@@ -1,0 +1,499 @@
+/*
+ * MercuryMonolith Commerce Hub – Response Cache
+ *
+ * File: src/module_9.txt  (compiled as C source)
+ *
+ * A high-performance, thread-safe, TTL-aware LRU cache for HTTP/GraphQL
+ * responses.  The cache implements an open-addressing hash-map for O(1)
+ * look-ups, an intrusive doubly-linked list for O(1) LRU eviction,
+ * fine-grained read/write locking, atomic Prometheus-compatible metrics,
+ * and pluggable logging hooks.
+ *
+ * The module is intentionally self-contained (single compilation unit)
+ * to ease static-linking & dead-code elimination when particular build
+ * profiles disable response caching.
+ *
+ * Compile with:  -std=c11 -pthread
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdatomic.h>
+#include <string.h>
+#include <time.h>
+#include <errno.h>
+#include <pthread.h>
+
+/* ---------------------------------------------------------------------------
+ * Logging abstraction (resolves to the project-wide structured logger)
+ * --------------------------------------------------------------------------- */
+#ifndef MM_LOGGER_H
+#define MM_LOGGER_H
+
+/* Fallback logger for stand-alone compilation / unit-tests.                */
+#ifndef MM_LOG_LEVEL
+#define MM_LOG_LEVEL 3 /* 0=NONE 1=ERROR 2=WARN 3=INFO 4=DEBUG              */
+#endif
+
+#define MM_LOG(level, fmt, ...)                                                        \
+    do {                                                                               \
+        if ((level) <= MM_LOG_LEVEL) {                                                 \
+            const char *_lvl = (level) == 1 ? "ERROR" :                                \
+                               (level) == 2 ? "WARN"  :                                \
+                               (level) == 3 ? "INFO"  : "DEBUG";                       \
+            fprintf(stderr, "[%s] (%s:%d) " fmt "\n", _lvl, __FILE__, __LINE__,        \
+                    ##__VA_ARGS__);                                                    \
+        }                                                                              \
+    } while (0)
+
+#define MM_LOG_ERROR(...) MM_LOG(1, __VA_ARGS__)
+#define MM_LOG_WARN(...)  MM_LOG(2, __VA_ARGS__)
+#define MM_LOG_INFO(...)  MM_LOG(3, __VA_ARGS__)
+#define MM_LOG_DEBUG(...) MM_LOG(4, __VA_ARGS__)
+
+#endif /* MM_LOGGER_H */
+
+
+/* ---------------------------------------------------------------------------
+ * Hash helpers (FNV-1a 64-bit)
+ * --------------------------------------------------------------------------- */
+static inline uint64_t
+mm_fnv1a_hash(const char *data)
+{
+    uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char *p = (const unsigned char *)data; *p; ++p) {
+        hash ^= *p;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+/* ---------------------------------------------------------------------------
+ * Cache structures
+ * --------------------------------------------------------------------------- */
+typedef struct mm_cache_entry_s {
+    char                      *key;
+    uint8_t                   *blob;
+    size_t                     size;
+    uint64_t                   created_at_epoch; /* seconds */
+    struct mm_cache_entry_s   *prev;  /* MRU/LRU doubly-linked list */
+    struct mm_cache_entry_s   *next;
+    struct mm_cache_entry_s   *hnext; /* bucket chain */
+} mm_cache_entry_t;
+
+typedef struct {
+    /* configuration */
+    size_t                     capacity;   /* maximum # of entries          */
+    uint32_t                   ttl_sec;    /* time-to-live for each entry   */
+    size_t                     bucket_cnt; /* hash-map buckets (power of 2) */
+
+    /* data */
+    mm_cache_entry_t         **buckets;    /* bucket_cnt-sized array        */
+    mm_cache_entry_t          *mru;        /* list head (most recently used)*/
+    mm_cache_entry_t          *lru;        /* list tail (least recently used)*/
+    size_t                     size;       /* current # of entries          */
+
+    /* concurrency */
+    pthread_rwlock_t           lock;       /* global rw-lock                */
+
+    /* metrics */
+    atomic_uint_fast64_t       hits;
+    atomic_uint_fast64_t       misses;
+    atomic_uint_fast64_t       evictions;
+} mm_cache_t;
+
+
+/* ---------------------------------------------------------------------------
+ * Forward declarations
+ * --------------------------------------------------------------------------- */
+static void      mm_cache_lru_move_to_front(mm_cache_t *c, mm_cache_entry_t *e);
+static void      mm_cache_evict_lru(mm_cache_t *c);
+static void      mm_cache_unlink(mm_cache_t *c, mm_cache_entry_t *e);
+static void      mm_cache_free_entry(mm_cache_entry_t *e);
+
+/* ---------------------------------------------------------------------------
+ * Public API
+ * --------------------------------------------------------------------------- */
+mm_cache_t *
+mm_cache_create(size_t capacity,
+                uint32_t ttl_sec,
+                size_t bucket_hint_power_of_two)
+{
+    if (capacity == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    mm_cache_t *cache = calloc(1, sizeof(*cache));
+    if (!cache) {
+        return NULL; /* errno set by calloc */
+    }
+
+    cache->capacity   = capacity;
+    cache->ttl_sec    = ttl_sec ? ttl_sec : 60; /* default 1 min */
+    cache->bucket_cnt = 1ULL << bucket_hint_power_of_two;
+
+    cache->buckets = calloc(cache->bucket_cnt, sizeof(mm_cache_entry_t *));
+    if (!cache->buckets) {
+        free(cache);
+        return NULL;
+    }
+
+    if (pthread_rwlock_init(&cache->lock, NULL) != 0) {
+        free(cache->buckets);
+        free(cache);
+        return NULL;
+    }
+
+    MM_LOG_INFO("Response cache initialized: capacity=%zu ttl=%us buckets=%zu",
+                cache->capacity, cache->ttl_sec, cache->bucket_cnt);
+    return cache;
+}
+
+void
+mm_cache_destroy(mm_cache_t *cache)
+{
+    if (!cache) return;
+
+    pthread_rwlock_wrlock(&cache->lock);
+
+    for (size_t i = 0; i < cache->bucket_cnt; ++i) {
+        mm_cache_entry_t *e = cache->buckets[i];
+        while (e) {
+            mm_cache_entry_t *next = e->hnext;
+            mm_cache_free_entry(e);
+            e = next;
+        }
+    }
+    free(cache->buckets);
+
+    pthread_rwlock_unlock(&cache->lock);
+    pthread_rwlock_destroy(&cache->lock);
+    free(cache);
+
+    MM_LOG_INFO("Response cache destroyed");
+}
+
+static inline time_t
+mm_now_sec(void)
+{
+    return time(NULL);
+}
+
+/*
+ * Return NULL on miss / expired        – misses++ on both conditions
+ * Return malloc()-ed blob on hit       – caller must free(*payload)
+ *
+ * out_size may be NULL if caller doesn't need blob length.
+ */
+uint8_t *
+mm_cache_get(mm_cache_t *cache,
+             const char *key,
+             size_t *out_size)
+{
+    if (!cache || !key) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    uint64_t h = mm_fnv1a_hash(key);
+    size_t bucket_idx = h & (cache->bucket_cnt - 1);
+
+    pthread_rwlock_rdlock(&cache->lock);
+
+    mm_cache_entry_t *e;
+    for (e = cache->buckets[bucket_idx]; e; e = e->hnext) {
+        if (strcmp(e->key, key) == 0) break;
+    }
+
+    if (!e) {
+        atomic_fetch_add_explicit(&cache->misses, 1, memory_order_relaxed);
+        pthread_rwlock_unlock(&cache->lock);
+        return NULL; /* miss */
+    }
+
+    /* Check TTL */
+    if ((uint64_t)(mm_now_sec() - e->created_at_epoch) > cache->ttl_sec) {
+        /* Upgrade to write lock to evict */
+        pthread_rwlock_unlock(&cache->lock);
+        pthread_rwlock_wrlock(&cache->lock);
+        mm_cache_unlink(cache, e);
+        atomic_fetch_add_explicit(&cache->misses, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&cache->evictions, 1, memory_order_relaxed);
+        mm_cache_free_entry(e);
+        pthread_rwlock_unlock(&cache->lock);
+        return NULL; /* expired */
+    }
+
+    /* Hit! Copy payload for safe return */
+    uint8_t *copy = malloc(e->size);
+    if (!copy) {
+        pthread_rwlock_unlock(&cache->lock);
+        return NULL; /* errno set */
+    }
+    memcpy(copy, e->blob, e->size);
+    if (out_size) *out_size = e->size;
+
+    /* Move to front (MRU) if not already */
+    if (cache->mru != e) {
+        /* Upgrade to write lock (lock upgrade pattern) */
+        pthread_rwlock_unlock(&cache->lock);
+        pthread_rwlock_wrlock(&cache->lock);
+        mm_cache_lru_move_to_front(cache, e);
+        pthread_rwlock_unlock(&cache->lock);
+    } else {
+        pthread_rwlock_unlock(&cache->lock);
+    }
+
+    atomic_fetch_add_explicit(&cache->hits, 1, memory_order_relaxed);
+    return copy;
+}
+
+/*
+ * Insert or update an item (deep-copies blob).
+ * Returns 0 on success, ‑1 on allocation error.
+ */
+int
+mm_cache_put(mm_cache_t *cache,
+             const char *key,
+             const uint8_t *blob,
+             size_t size)
+{
+    if (!cache || !key || !blob || !size) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    mm_cache_entry_t *new_e = NULL;
+
+    /* Allocate outside lock to minimize critical-section */
+    new_e = calloc(1, sizeof(*new_e));
+    if (!new_e) return -1;
+
+    new_e->key = strdup(key);
+    if (!new_e->key) {
+        free(new_e);
+        return -1;
+    }
+
+    new_e->blob = malloc(size);
+    if (!new_e->blob) {
+        free(new_e->key);
+        free(new_e);
+        return -1;
+    }
+    memcpy(new_e->blob, blob, size);
+    new_e->size              = size;
+    new_e->created_at_epoch  = mm_now_sec();
+
+    uint64_t h = mm_fnv1a_hash(key);
+    size_t bucket_idx = h & (cache->bucket_cnt - 1);
+
+    pthread_rwlock_wrlock(&cache->lock);
+
+    /* Replace existing? */
+    mm_cache_entry_t *e;
+    for (e = cache->buckets[bucket_idx]; e; e = e->hnext) {
+        if (strcmp(e->key, key) == 0) break;
+    }
+    if (e) {
+        /* Update in place (retain list placement) */
+        free(e->blob);
+        free(e->key);
+
+        e->key              = new_e->key;
+        e->blob             = new_e->blob;
+        e->size             = new_e->size;
+        e->created_at_epoch = new_e->created_at_epoch;
+
+        free(new_e); /* only wrapper */
+        mm_cache_lru_move_to_front(cache, e);
+    } else {
+        /* Insert into bucket chain head */
+        new_e->hnext          = cache->buckets[bucket_idx];
+        cache->buckets[bucket_idx] = new_e;
+
+        /* Insert into MRU list front */
+        new_e->next = cache->mru;
+        if (cache->mru)
+            cache->mru->prev = new_e;
+        cache->mru = new_e;
+        if (!cache->lru)
+            cache->lru = new_e;
+
+        cache->size++;
+
+        /* Eviction if overflow */
+        if (cache->size > cache->capacity) {
+            mm_cache_evict_lru(cache);
+        }
+    }
+
+    pthread_rwlock_unlock(&cache->lock);
+    return 0;
+}
+
+int
+mm_cache_remove(mm_cache_t *cache, const char *key)
+{
+    if (!cache || !key) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint64_t h = mm_fnv1a_hash(key);
+    size_t bucket_idx = h & (cache->bucket_cnt - 1);
+
+    pthread_rwlock_wrlock(&cache->lock);
+
+    mm_cache_entry_t **pp = &cache->buckets[bucket_idx];
+    for (; *pp; pp = &(*pp)->hnext) {
+        if (strcmp((*pp)->key, key) == 0) {
+            mm_cache_entry_t *victim = *pp;
+            *pp = victim->hnext;
+
+            mm_cache_unlink(cache, victim);
+            mm_cache_free_entry(victim);
+            atomic_fetch_add_explicit(&cache->evictions, 1, memory_order_relaxed);
+            pthread_rwlock_unlock(&cache->lock);
+            return 0;
+        }
+    }
+
+    pthread_rwlock_unlock(&cache->lock);
+    return -1; /* not found */
+}
+
+typedef struct {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    uint64_t current_size;
+} mm_cache_metrics_t;
+
+mm_cache_metrics_t
+mm_cache_metrics(mm_cache_t *cache)
+{
+    mm_cache_metrics_t m = {0};
+    if (!cache) return m;
+
+    m.hits      = atomic_load_explicit(&cache->hits, memory_order_relaxed);
+    m.misses    = atomic_load_explicit(&cache->misses, memory_order_relaxed);
+    m.evictions = atomic_load_explicit(&cache->evictions, memory_order_relaxed);
+
+    pthread_rwlock_rdlock(&cache->lock);
+    m.current_size = cache->size;
+    pthread_rwlock_unlock(&cache->lock);
+
+    return m;
+}
+
+/* ---------------------------------------------------------------------------
+ * Internal helpers
+ * --------------------------------------------------------------------------- */
+static void
+mm_cache_lru_move_to_front(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    if (c->mru == e) return;
+
+    /* unlink e from current list position */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru  == e)          c->lru  = e->prev;
+
+    /* insert at front */
+    e->prev = NULL;
+    e->next = c->mru;
+    if (c->mru) c->mru->prev = e;
+    c->mru = e;
+    if (!c->lru)
+        c->lru = e;
+}
+
+static void
+mm_cache_unlink(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    /* Remove from bucket chain will be done by caller */
+    /* unlink from LRU list */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->mru == e) c->mru = e->next;
+    if (c->lru == e) c->lru = e->prev;
+    c->size--;
+}
+
+static void
+mm_cache_evict_lru(mm_cache_t *c)
+{
+    if (!c->lru) return;
+    mm_cache_entry_t *victim = c->lru;
+
+    /* Remove from bucket chain */
+    uint64_t h = mm_fnv1a_hash(victim->key);
+    size_t bucket_idx = h & (c->bucket_cnt - 1);
+
+    mm_cache_entry_t **pp = &c->buckets[bucket_idx];
+    for (; *pp; pp = &(*pp)->hnext) {
+        if (*pp == victim) {
+            *pp = victim->hnext;
+            break;
+        }
+    }
+
+    mm_cache_unlink(c, victim);
+    mm_cache_free_entry(victim);
+
+    atomic_fetch_add_explicit(&c->evictions, 1, memory_order_relaxed);
+    MM_LOG_DEBUG("LRU eviction performed");
+}
+
+static void
+mm_cache_free_entry(mm_cache_entry_t *e)
+{
+    if (!e) return;
+    free(e->key);
+    free(e->blob);
+    free(e);
+}
+
+/* ---------------------------------------------------------------------------
+ * Self-test harness (compile with ‑DMM_CACHE_TEST)
+ * --------------------------------------------------------------------------- */
+#ifdef MM_CACHE_TEST
+#include <assert.h>
+
+static void
+test_basic()
+{
+    mm_cache_t *c = mm_cache_create(2, 1 /* TTL */, 4 /* 16 buckets */);
+    assert(c);
+
+    (void)mm_cache_put(c, "a", (const uint8_t *)"apple", 6);
+    (void)mm_cache_put(c, "b", (const uint8_t *)"banana", 7);
+
+    size_t n;
+    uint8_t *p = mm_cache_get(c, "a", &n);
+    assert(p && n == 6 && strcmp((char *)p, "apple") == 0);
+    free(p);
+
+    p = mm_cache_get(c, "c", NULL);
+    assert(!p);
+
+    /* force eviction */
+    (void)mm_cache_put(c, "c", (const uint8_t *)"cherry", 7);
+
+    p = mm_cache_get(c, "b", NULL); /* 'b' should be evicted (LRU) */
+    assert(!p);
+
+    mm_cache_destroy(c);
+    MM_LOG_INFO("All cache unit tests passed");
+}
+
+int main(void)
+{
+    test_basic();
+    return 0;
+}
+#endif /* MM_CACHE_TEST */

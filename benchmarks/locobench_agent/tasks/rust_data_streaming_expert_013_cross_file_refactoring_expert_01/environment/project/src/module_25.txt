@@ -1,0 +1,319 @@
+```rust
+//! module_25.rs
+//!
+//! Resilient, self-healing Kafka consumer infrastructure used by ChirpPulse’s
+//! real-time sentiment lake.  The module owns:
+//!   • Transparent restart & back-off logic when offsets regress or partitions
+//!     rebalance unexpectedly.
+//!   • A minimal Strategy interface (`DataProcessor`) that allows data-science
+//!     teams to hot-swap algorithms without recompiling the core ingest plane.
+//!   • Built-in observability (Prometheus + `tracing`) so that SREs can reason
+//!     about throughput, lag, & failures in one place.
+//!
+//! NOTE: The code purposefully avoids concrete business logic; instead, it
+//! focuses on the “platform” aspects (error handling, metrics, etc.).
+//!
+//! Dependencies (Cargo.toml excerpts):
+//! -----------------------------------
+//! [dependencies]
+//! anyhow          = "1.0"
+//! async-trait     = "0.1"
+//! futures         = "0.3"
+//! metrics         = { version = "0.20", features = ["std"] }
+//! prometheus      = "0.13"
+//! rand            = "0.8"
+//! rdkafka         = { version = "0.34", features = ["tokio", "cmake-build"] }
+//! thiserror       = "1.0"
+//! tokio           = { version = "1.32", features = ["rt-multi-thread", "macros", "time"] }
+//! tracing         = "0.1"
+//! tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::Result;
+use async_trait::async_trait;
+use futures::{future::FutureExt, stream::StreamExt};
+use rand::Rng;
+use rdkafka::{
+    consumer::{CommitMode, Consumer, ConsumerContext, Rebalance, StreamConsumer},
+    error::KafkaResult,
+    message::BorrowedMessage,
+    ClientConfig, TopicPartitionList,
+};
+use thiserror::Error;
+use tokio::sync::Notify;
+use tokio::time::{sleep, timeout};
+use tracing::{error, info, instrument, warn};
+
+/// Upper bound on how long we wait for a message batch before declaring the
+/// consumer as “stalled”.  Configurable via the `RESILIENT_CONSUMER_POLL_MS`
+/// environment variable.
+const DEFAULT_POLL_TIMEOUT_MS: u64 = 300;
+
+/// Max consecutive failures before opening the circuit.
+const DEFAULT_CIRCUIT_THRESHOLD: u32 = 5;
+
+/// Randomization factor added to exponential back-off to avoid thundering herd.
+const JITTER_FACTOR: f64 = 0.3;
+
+/// -------------- Error Types -------------------------------------------------
+
+#[derive(Error, Debug)]
+pub enum ResilientError {
+    #[error("processing failed: {0}")]
+    Processing(#[from] anyhow::Error),
+
+    #[error("message timed out after {0:?}")]
+    Timeout(Duration),
+
+    #[error("circuit breaker opened")]
+    CircuitOpen,
+}
+
+/// -------------- Circuit Breaker --------------------------------------------
+
+#[derive(Debug)]
+struct CircuitBreaker {
+    failures: u32,
+    threshold: u32,
+    open: bool,
+}
+
+impl CircuitBreaker {
+    fn new(threshold: u32) -> Self {
+        Self {
+            failures: 0,
+            threshold,
+            open: false,
+        }
+    }
+
+    fn record_success(&mut self) {
+        self.failures = 0;
+        self.open = false;
+    }
+
+    fn record_failure(&mut self) {
+        self.failures += 1;
+        if self.failures >= self.threshold {
+            self.open = true;
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.open
+    }
+
+    fn reset(&mut self) {
+        self.failures = 0;
+        self.open = false;
+    }
+}
+
+/// -------------- Strategy Trait ---------------------------------------------
+
+/// Trait implemented by concrete business-logic processors (language detection,
+/// toxicity scoring, influencer extraction, …).
+#[async_trait]
+pub trait DataProcessor: Send + Sync + 'static {
+    /// Called for every [`BorrowedMessage`] pulled from Kafka.
+    ///
+    /// Returning an error increments the circuit breaker; unrecoverable errors
+    /// bubble up and trigger a consumer recovery cycle.
+    async fn process(&self, msg: &BorrowedMessage<'_>) -> Result<()>;
+}
+
+/// -------------- Consumer Context -------------------------------------------
+/// Custom context so we can hook into rebalances & log them via `tracing`.
+#[derive(Default)]
+struct LoggingConsumerContext;
+
+impl ConsumerContext for LoggingConsumerContext {
+    fn rebalance(&self, rebalance: Rebalance) -> KafkaResult<()> {
+        match rebalance {
+            Rebalance::Assign(tpl) => {
+                info!(?tpl, "Partitions assigned");
+            }
+            Rebalance::Revoke => {
+                warn!("Partitions revoked");
+            }
+            Rebalance::Error(e) => {
+                error!(error = %e, "Rebalance error");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// -------------- Resilient Consumer -----------------------------------------
+
+pub struct ResilientConsumer<P>
+where
+    P: DataProcessor,
+{
+    consumer: StreamConsumer<LoggingConsumerContext>,
+    processor: Arc<P>,
+    poll_timeout: Duration,
+    breaker: CircuitBreaker,
+    shutdown: Arc<Notify>,
+}
+
+impl<P> ResilientConsumer<P>
+where
+    P: DataProcessor,
+{
+    pub fn create<K: Into<String>>(brokers: K, group_id: K, topic: K, processor: P) -> Result<Self> {
+        let ctx = LoggingConsumerContext::default();
+        let consumer: StreamConsumer<_> = ClientConfig::new()
+            .set("bootstrap.servers", &brokers.into())
+            .set("group.id", &group_id.into())
+            .set("enable.partition.eof", "false")
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .create_with_context(ctx)?;
+
+        consumer.subscribe(&[&topic.into()])?;
+
+        Ok(Self {
+            consumer,
+            processor: Arc::new(processor),
+            poll_timeout: Duration::from_millis(
+                std::env::var("RESILIENT_CONSUMER_POLL_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(DEFAULT_POLL_TIMEOUT_MS),
+            ),
+            breaker: CircuitBreaker::new(DEFAULT_CIRCUIT_THRESHOLD),
+            shutdown: Arc::new(Notify::new()),
+        })
+    }
+
+    /// Initiates a graceful shutdown—e.g. from a termination signal.
+    pub fn shutdown(&self) {
+        self.shutdown.notify_one();
+    }
+
+    /// Spawns the consumer onto the tokio runtime.  Will run until `shutdown`
+    /// is invoked or unrecoverable failure occurs.
+    #[instrument(skip(self))]
+    pub async fn run(mut self) -> Result<()> {
+        let mut backoff = Duration::from_secs(1);
+
+        loop {
+            tokio::select! {
+                _ = self.shutdown.notified() => {
+                    info!("Shutdown requested. Draining offsets…");
+                    self.consumer.commit_consumer_state(CommitMode::Sync)?;
+                    return Ok(());
+                }
+
+                maybe_msg = self.consumer.stream().next() => {
+                    match maybe_msg {
+                        None => {
+                            // Consumer stream ended—probably due to a rebalance.
+                            warn!("Kafka stream closed; recreating consumer in {backoff:?}");
+                            sleep(backoff).await;
+                            backoff = Self::next_backoff(backoff);
+                            continue;
+                        }
+
+                        Some(Err(e)) => {
+                            error!(error = %e, "Kafka error");
+                            self.breaker.record_failure();
+                            if self.breaker.is_open() {
+                                Self::handle_circuit_open(backoff).await;
+                                backoff = Self::next_backoff(backoff);
+                            }
+                        }
+
+                        Some(Ok(msg)) => {
+                            let processor = Arc::clone(&self.processor);
+                            let commit_handle = self.consumer.clone();
+                            let breaker_ref = &mut self.breaker;
+
+                            let elapsed = Instant::now();
+
+                            // Spawn per-message task so we can apply a timeout.
+                            let task = async move {
+                                processor.process(&msg).await?;
+                                commit_handle.commit_message(&msg, CommitMode::Async)?;
+                                Ok::<(), anyhow::Error>(())
+                            };
+
+                            match timeout(self.poll_timeout, task).await {
+                                Ok(Ok(())) => {
+                                    metrics::increment_counter!("messages_processed_total");
+                                    let delta = elapsed.elapsed().as_millis() as f64;
+                                    metrics::histogram!("message_process_latency_ms", delta);
+                                    breaker_ref.record_success();
+                                    backoff = Duration::from_secs(1); // Reset back-off.
+                                }
+                                Ok(Err(e)) => {
+                                    error!(error = ?e, "Processing error");
+                                    metrics::increment_counter!("message_processing_errors_total");
+                                    breaker_ref.record_failure();
+                                }
+                                Err(_) => {
+                                    warn!("Message processing timed out");
+                                    breaker_ref.record_failure();
+                                }
+                            }
+
+                            if breaker_ref.is_open() {
+                                Self::handle_circuit_open(backoff).await;
+                                backoff = Self::next_backoff(backoff);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Exponential back-off with jitter.
+    fn next_backoff(prev: Duration) -> Duration {
+        let secs = (prev.as_secs_f64() * 2.0).min(60.0);
+        let jitter = rand::thread_rng().gen_range(1.0 - JITTER_FACTOR..=1.0 + JITTER_FACTOR);
+        Duration::from_secs_f64(secs * jitter)
+    }
+
+    async fn handle_circuit_open(backoff: Duration) {
+        error!(
+            "Circuit breaker tripped.  Pausing consumption for {backoff:?}…"
+        );
+        metrics::increment_counter!("consumer_circuit_open_total");
+        sleep(backoff).await;
+    }
+}
+
+/// -------------- Example Processor ------------------------------------------
+/// Prefixing with `test_` so that it’s compiled in test builds only.
+/// Replace this with an actual algorithm in production.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rdkafka::message::BorrowedMessage;
+
+    struct NoopProcessor;
+
+    #[async_trait]
+    impl DataProcessor for NoopProcessor {
+        async fn process(&self, _msg: &BorrowedMessage<'_>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_backoff_calculation() {
+        let mut backoff = Duration::from_secs(1);
+        for _ in 0..5 {
+            backoff = ResilientConsumer::<NoopProcessor>::next_backoff(backoff);
+            assert!(backoff <= Duration::from_secs(60));
+            assert!(backoff >= Duration::from_secs_f64(1.0));
+        }
+    }
+}
+```

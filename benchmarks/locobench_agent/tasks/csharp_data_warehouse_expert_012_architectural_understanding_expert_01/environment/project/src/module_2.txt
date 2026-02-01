@@ -1,0 +1,392 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.Kinesis;
+using Amazon.Kinesis.Model;
+using Amazon.Lambda.Core;
+using Amazon.Lambda.KinesisEvents;
+using Amazon.S3;
+using Amazon.S3.Transfer;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+
+// Assembly attribute to enable the Lambda function's JSON input to be converted into a .NET class.
+[assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
+
+namespace PulseOps.Warehouse.Serverless.Transformations
+{
+    /// <summary>
+    ///     Lambda entry point that consumes raw analytics events from a Kinesis Data Stream,
+    ///     invokes the appropriate transformation strategy, and finally persists the enriched
+    ///     event to S3 and/or downstream Kinesis streams.
+    /// </summary>
+    public sealed class TransformationLambda
+    {
+        private const string DefaultBucketEnvVar = "TRANSFORMED_BUCKET";
+        private const string OutputStreamEnvVar = "OUTPUT_STREAM";
+
+        private readonly IServiceProvider _serviceProvider;
+        private readonly ITransformationDispatcher _dispatcher;
+        private readonly IAmazonS3 _s3Client;
+        private readonly IAmazonKinesis _kinesisClient;
+        private readonly ILogger<TransformationLambda> _logger;
+
+        public TransformationLambda()
+            : this(ConfigureServices())
+        {
+        }
+
+        // For unit tests
+        public TransformationLambda(IServiceProvider serviceProvider)
+        {
+            _serviceProvider = serviceProvider;
+            _dispatcher      = _serviceProvider.GetRequiredService<ITransformationDispatcher>();
+            _s3Client        = _serviceProvider.GetRequiredService<IAmazonS3>();
+            _kinesisClient   = _serviceProvider.GetRequiredService<IAmazonKinesis>();
+            _logger          = _serviceProvider.GetRequiredService<ILogger<TransformationLambda>>();
+        }
+
+        /// <summary>
+        ///     Lambda handler for Kinesis events.
+        /// </summary>
+        /// <param name="kinesisEvent">Kinesis batch</param>
+        /// <param name="context">Lambda context</param>
+        /// <returns>Task</returns>
+        public async Task HandleAsync(KinesisEvent kinesisEvent, ILambdaContext context)
+        {
+            _logger.LogInformation("Received {RecordCount} records in batch {RequestId}", 
+                kinesisEvent.Records.Count, context.AwsRequestId);
+
+            var uploadTasks = new List<Task>();
+
+            foreach (var record in kinesisEvent.Records)
+            {
+                uploadTasks.Add(ProcessRecordAsync(record, context));
+            }
+
+            await Task.WhenAll(uploadTasks).ConfigureAwait(false);
+            _logger.LogInformation("Successfully processed batch {RequestId}", context.AwsRequestId);
+        }
+
+        private async Task ProcessRecordAsync(KinesisEvent.KinesisEventRecord record, ILambdaContext context)
+        {
+            CancellationToken token = context.CancellationToken;
+
+            if (token.IsCancellationRequested)
+            {
+                _logger.LogWarning("Cancellation requested before processing record");
+                return;
+            }
+
+            RawEvent raw;
+            try
+            {
+                var payloadJson = Encoding.UTF8.GetString(record.Kinesis.Data.Span);
+                raw = JsonSerializer.Deserialize<RawEvent>(payloadJson, JsonOptions.Options)
+                      ?? throw new InvalidDataException("Unable to deserialize event.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to deserialize record; pushing to DLQ");
+                await PushToDlqAsync(record).ConfigureAwait(false);
+                return;
+            }
+
+            try
+            {
+                var transformed = await _dispatcher.TransformAsync(raw, token).ConfigureAwait(false);
+                await PersistAsync(transformed, token).ConfigureAwait(false);
+            }
+            catch (TransformationNotFoundException ex)
+            {
+                _logger.LogWarning(ex, "No transformation found for EventType={EventType}", raw.EventType);
+                await PushToDlqAsync(record).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unhandled error while processing record");
+                await PushToDlqAsync(record).ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>
+        /// Persist the transformed event to S3 (parquet or json) and optionally fan out to a downstream Kinesis stream.
+        /// </summary>
+        private async Task PersistAsync(TransformedEvent evt, CancellationToken token)
+        {
+            var bucket = Environment.GetEnvironmentVariable(DefaultBucketEnvVar) 
+                         ?? throw new InvalidOperationException($"{DefaultBucketEnvVar} not configured");
+
+            var key = $"{evt.EventType}/{evt.OccurredAt:yyyy/MM/dd/HH}/{Guid.NewGuid():N}.json";
+
+            var json = JsonSerializer.Serialize(evt, JsonOptions.Options);
+
+            await using var memStream = new MemoryStream(Encoding.UTF8.GetBytes(json));
+
+            var uploadRequest = new TransferUtilityUploadRequest
+            {
+                BucketName  = bucket,
+                Key         = key,
+                InputStream = memStream,
+                ContentType = "application/json"
+            };
+
+            var transfer = new TransferUtility(_s3Client);
+            await transfer.UploadAsync(uploadRequest, token).ConfigureAwait(false);
+            _logger.LogDebug("Written transformed event to s3://{Bucket}/{Key}", bucket, key);
+
+            var outputStream = Environment.GetEnvironmentVariable(OutputStreamEnvVar);
+            if (!string.IsNullOrEmpty(outputStream))
+            {
+                await _kinesisClient.PutRecordAsync(new PutRecordRequest
+                {
+                    StreamName   = outputStream,
+                    Data         = memStream,
+                    PartitionKey = evt.TenantId
+                }, token).ConfigureAwait(false);
+                _logger.LogDebug("Pushed transformed event to Kinesis stream {Stream}", outputStream);
+            }
+        }
+
+        private Task PushToDlqAsync(KinesisEvent.KinesisEventRecord record)
+        {
+            // For brevity, we omit DLQ implementation details.
+            // In production, this would push to an SQS queue or SNS topic.
+            _logger.LogWarning("DLQ push simulated for SequenceNumber={Seq}", record.Kinesis.SequenceNumber);
+            return Task.CompletedTask;
+        }
+
+        #region IoC Setup
+
+        private static IServiceProvider ConfigureServices()
+        {
+            var services = new ServiceCollection();
+            services.AddLogging(builder =>
+            {
+                builder
+                    .AddLambdaLogger()
+                    .SetMinimumLevel(LogLevel.Information);
+            });
+
+            services.AddAWSService<IAmazonS3>();
+            services.AddAWSService<IAmazonKinesis>();
+
+            services.AddSingleton<ITransformationDispatcher, TransformationDispatcher>();
+            
+            // Register transformation strategies
+            services.AddSingleton<ITransformationStrategy, FocusTimeStrategy>();
+            services.AddSingleton<ITransformationStrategy, DeploymentLeadTimeStrategy>();
+            services.AddSingleton<ITransformationStrategy, MeetingCostStrategy>();
+
+            return services.BuildServiceProvider();
+        }
+
+        #endregion
+    }
+
+    #region Models
+
+    internal sealed record RawEvent
+    {
+        public string  TenantId   { get; init; } = null!;
+        public string  EventType  { get; init; } = null!;
+        public DateTimeOffset OccurredAt { get; init; }
+        public JsonElement Payload { get; init; }
+    }
+
+    internal sealed record TransformedEvent
+    {
+        public string TenantId { get; init; } = null!;
+        public string EventType { get; init; } = null!;
+        public DateTimeOffset OccurredAt { get; init; }
+        public IDictionary<string, object?> Metrics { get; init; } = new Dictionary<string, object?>();
+        public string Version { get; init; } = "1.0";
+    }
+
+    #endregion
+
+    #region Dispatcher and Strategies
+
+    /// <summary>
+    ///     Exception thrown when no transformation strategy exists for a given event type.
+    /// </summary>
+    public sealed class TransformationNotFoundException : Exception
+    {
+        public TransformationNotFoundException(string eventType)
+            : base($"No transformation registered for event type '{eventType}'")
+        {
+        }
+    }
+
+    /// <summary>
+    ///     Observer/Strategy bridge that routes RawEvent objects to the correct transformation strategy.
+    /// </summary>
+    public interface ITransformationDispatcher
+    {
+        Task<TransformedEvent> TransformAsync(RawEvent raw, CancellationToken token);
+    }
+
+    internal sealed class TransformationDispatcher : ITransformationDispatcher
+    {
+        private readonly IDictionary<string, ITransformationStrategy> _strategyMap;
+        private readonly ILogger<TransformationDispatcher> _logger;
+
+        public TransformationDispatcher(IEnumerable<ITransformationStrategy> strategies,
+                                        ILogger<TransformationDispatcher> logger)
+        {
+            _logger = logger;
+            _strategyMap = new ConcurrentDictionary<string, ITransformationStrategy>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var strategy in strategies)
+            {
+                if (_strategyMap.ContainsKey(strategy.EventType))
+                {
+                    _logger.LogWarning("Duplicate strategy registration for EventType={EventType}", strategy.EventType);
+                    continue;
+                }
+
+                _strategyMap[strategy.EventType] = strategy;
+            }
+        }
+
+        public Task<TransformedEvent> TransformAsync(RawEvent raw, CancellationToken token)
+        {
+            if (!_strategyMap.TryGetValue(raw.EventType, out var strategy))
+            {
+                throw new TransformationNotFoundException(raw.EventType);
+            }
+
+            return strategy.TransformAsync(raw, token);
+        }
+    }
+
+    /// <summary>
+    ///     Implemented by classes that convert RawEvent payloads into structured
+    ///     KPI-friendly metrics or aggregations.
+    /// </summary>
+    public interface ITransformationStrategy
+    {
+        string EventType { get; }
+        Task<TransformedEvent> TransformAsync(RawEvent raw, CancellationToken token);
+    }
+
+    /// <summary>
+    ///     Calculates developer focus time ratio from IDE/coding session events.
+    /// </summary>
+    internal sealed class FocusTimeStrategy : ITransformationStrategy
+    {
+        private const string MetricName = "focus_time_minutes";
+
+        public string EventType => "IDE_SESSION";
+
+        public Task<TransformedEvent> TransformAsync(RawEvent raw, CancellationToken token)
+        {
+            // Example transformation: extract "activeMinutes" from payload.
+            if (!raw.Payload.TryGetProperty("activeMinutes", out var activeMinutesElement) ||
+                !activeMinutesElement.TryGetInt32(out var activeMinutes))
+            {
+                throw new InvalidDataException("Missing activeMinutes in payload");
+            }
+
+            var transformed = new TransformedEvent
+            {
+                TenantId   = raw.TenantId,
+                EventType  = "FOCUS_TIME",
+                OccurredAt = raw.OccurredAt,
+                Metrics    = new Dictionary<string, object?>
+                {
+                    [MetricName] = activeMinutes
+                }
+            };
+
+            return Task.FromResult(transformed);
+        }
+    }
+
+    /// <summary>
+    ///     Computes deployment lead time from CI/CD pipeline events.
+    /// </summary>
+    internal sealed class DeploymentLeadTimeStrategy : ITransformationStrategy
+    {
+        private const string MetricName = "deployment_lead_time_seconds";
+
+        public string EventType => "CI_PIPELINE_COMPLETED";
+
+        public Task<TransformedEvent> TransformAsync(RawEvent raw, CancellationToken token)
+        {
+            var startedAt  = raw.Payload.GetProperty("pipelineStartedAt").GetDateTimeOffset();
+            var finishedAt = raw.Payload.GetProperty("pipelineFinishedAt").GetDateTimeOffset();
+            var duration   = (finishedAt - startedAt).TotalSeconds;
+
+            var transformed = new TransformedEvent
+            {
+                TenantId   = raw.TenantId,
+                EventType  = "DEPLOYMENT_LEAD_TIME",
+                OccurredAt = raw.OccurredAt,
+                Metrics    = new Dictionary<string, object?>
+                {
+                    [MetricName] = duration
+                }
+            };
+
+            return Task.FromResult(transformed);
+        }
+    }
+
+    /// <summary>
+    ///     Calculates estimated meeting cost from calendar events.
+    /// </summary>
+    internal sealed class MeetingCostStrategy : ITransformationStrategy
+    {
+        private const string MetricName = "meeting_cost_usd";
+        private const decimal HourlyCostDefault = 75m;
+
+        public string EventType => "CALENDAR_MEETING";
+
+        public Task<TransformedEvent> TransformAsync(RawEvent raw, CancellationToken token)
+        {
+            int attendeeCount = raw.Payload.GetProperty("attendeeCount").GetInt32();
+            decimal hourlyRate = raw.Payload.TryGetProperty("hourlyRateUsd", out var rateElement) &&
+                                 rateElement.TryGetDecimal(out var rate)
+                                 ? rate
+                                 : HourlyCostDefault;
+
+            var durationMinutes = raw.Payload.GetProperty("durationMinutes").GetInt32();
+            var cost = attendeeCount * hourlyRate * (durationMinutes / 60m);
+
+            var transformed = new TransformedEvent
+            {
+                TenantId   = raw.TenantId,
+                EventType  = "MEETING_COST",
+                OccurredAt = raw.OccurredAt,
+                Metrics    = new Dictionary<string, object?>
+                {
+                    [MetricName] = Math.Round(cost, 2)
+                }
+            };
+
+            return Task.FromResult(transformed);
+        }
+    }
+
+    #endregion
+
+    #region Utilities
+
+    internal static class JsonOptions
+    {
+        public static readonly JsonSerializerOptions Options = new()
+        {
+            PropertyNameCaseInsensitive = true,
+            PropertyNamingPolicy        = JsonNamingPolicy.CamelCase,
+            WriteIndented               = false
+        };
+    }
+
+    #endregion
+}

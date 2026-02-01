@@ -1,0 +1,441 @@
+```rust
+//! src/module_67.rs
+//!
+//! Hyper-parameter tuning engine for the VisuTility Orchestrator.
+//!
+//! This module showcases usage of several architectural patterns:
+//!   • Strategy Pattern         – Pluggable search strategies
+//!   • Observer Pattern         – Emit real-time tuning progress events
+//!   • Factory Pattern          – Dynamically construct strategies at runtime
+//!
+//! The engine is intentionally generic so it can be re-used by both
+//!   – synchronous batch training jobs, and
+//!   – asynchronous long-running streaming jobs.
+//!
+//! ─────────────────────────────────────────────────────────────────────────────
+
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    fmt::Debug,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use rand::{distributions::Uniform, prelude::*};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    sync::{broadcast, mpsc},
+    task::JoinHandle,
+    time::timeout,
+};
+
+/// Thread-safe alias used throughout the project.
+pub type Shared<T> = Arc<Mutex<T>>;
+
+/// Custom result type for the tuning module.
+pub type Result<T> = std::result::Result<T, TunerError>;
+
+/// Error enumeration for the tuner.
+#[derive(Debug, Error)]
+pub enum TunerError {
+    #[error("hyper-parameter search was cancelled")]
+    Cancelled,
+    #[error("hyper-parameter trial exceeded timeout of {0:?}")]
+    TrainingTimeout(Duration),
+    #[error("training subsystem: {0}")]
+    TrainingSubsystem(String),
+    #[error("internal tuner error: {0}")]
+    Internal(String),
+}
+
+/// ==========================================================================
+/// Traits
+/// ==========================================================================
+
+/// Abstraction over any model that can be trained with a key/value parameter
+/// map and returns a metric (e.g., accuracy, loss, mAP, F1-score).
+pub trait TrainableModel: Send + Sync + 'static {
+    /// Trains the model with the provided hyper-parameters.
+    ///
+    /// The call is expected to be CPU/GPU bound. To avoid blocking the async
+    /// runtime, users **should** offload compute-heavy work onto a dedicated
+    /// thread pool (e.g., `tokio::task::spawn_blocking`).
+    fn train(&self, params: &HyperParams) -> Result<Metric>;
+}
+
+/// Target metric value returned from a training run.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct Metric(pub f64);
+
+/// Type alias for hyper-parameters.
+pub type HyperParams = HashMap<String, HyperValue>;
+
+/// Mappable hyper-parameter value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HyperValue {
+    Int(i64),
+    Float(f64),
+    Text(String),
+    Bool(bool),
+}
+
+impl HyperValue {
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            HyperValue::Int(i) => Some(*i as f64),
+            HyperValue::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+}
+
+/// Strategy pattern: defines a search algorithm used by the tuner.
+pub trait SearchStrategy: Send + Sync + 'static {
+    /// Returns the next candidate hyper-parameters to evaluate,
+    /// or `None` if search space is exhausted.
+    fn next_candidate(&mut self) -> Option<HyperParams>;
+
+    /// Notifies the strategy that a trial has finished.
+    fn report_result(&mut self, params: &HyperParams, metric: Metric);
+}
+
+/// Observer pattern: listen to tuning progress.
+pub trait TuningObserver: Send + Sync + 'static {
+    fn on_trial_started(&self, trial_id: usize, params: &HyperParams);
+    fn on_trial_completed(&self, trial_id: usize, params: &HyperParams, metric: Metric);
+    fn on_completed(&self, best_params: &HyperParams, best_metric: Metric);
+}
+
+/// ==========================================================================
+/// Search Strategies
+/// ==========================================================================
+
+/// Grid search over a fixed search space.
+pub struct GridSearch {
+    queue: VecDeque<HyperParams>,
+}
+
+impl GridSearch {
+    pub fn new(search_space: HashMap<String, Vec<HyperValue>>) -> Self {
+        let mut queue = VecDeque::new();
+
+        // Expand cartesian product
+        fn expand(
+            keys: &[String],
+            idx: usize,
+            space: &HashMap<String, Vec<HyperValue>>,
+            acc: &mut HyperParams,
+            out: &mut VecDeque<HyperParams>,
+        ) {
+            if idx == keys.len() {
+                out.push_back(acc.clone());
+                return;
+            }
+
+            let key = &keys[idx];
+            if let Some(values) = space.get(key) {
+                for val in values {
+                    acc.insert(key.clone(), val.clone());
+                    expand(keys, idx + 1, space, acc, out);
+                }
+                acc.remove(key);
+            }
+        }
+
+        let keys: Vec<String> = search_space.keys().cloned().collect();
+        let mut acc = HyperParams::default();
+        expand(&keys, 0, &search_space, &mut acc, &mut queue);
+
+        Self { queue }
+    }
+}
+
+impl SearchStrategy for GridSearch {
+    fn next_candidate(&mut self) -> Option<HyperParams> {
+        self.queue.pop_front()
+    }
+
+    fn report_result(&mut self, _params: &HyperParams, _metric: Metric) {
+        // GridSearch is brute-force; we don’t adapt based on results
+    }
+}
+
+/// Random search inside a numerical hyper-cube.
+pub struct RandomSearch {
+    specs: Vec<(String, RangeSpec)>,
+    rng: ThreadRng,
+    seen: HashSet<HyperParams>,
+    max_iters: usize,
+}
+
+pub enum RangeSpec {
+    Int { min: i64, max: i64 },
+    Float { min: f64, max: f64 },
+    Choice(Vec<HyperValue>),
+}
+
+impl RandomSearch {
+    pub fn new(specs: Vec<(String, RangeSpec)>, max_iters: usize) -> Self {
+        Self {
+            specs,
+            rng: thread_rng(),
+            seen: HashSet::new(),
+            max_iters,
+        }
+    }
+}
+
+impl SearchStrategy for RandomSearch {
+    fn next_candidate(&mut self) -> Option<HyperParams> {
+        if self.seen.len() >= self.max_iters {
+            return None;
+        }
+
+        for _ in 0..32 {
+            let mut params = HyperParams::new();
+            for (name, spec) in &self.specs {
+                let val = match spec {
+                    RangeSpec::Int { min, max } => {
+                        let dist = Uniform::new_inclusive(*min, *max);
+                        HyperValue::Int(self.rng.sample(dist))
+                    }
+                    RangeSpec::Float { min, max } => {
+                        let dist = Uniform::new(*min, *max);
+                        HyperValue::Float(self.rng.sample(dist))
+                    }
+                    RangeSpec::Choice(choices) => {
+                        let idx = self.rng.gen_range(0..choices.len());
+                        choices[idx].clone()
+                    }
+                };
+                params.insert(name.clone(), val);
+            }
+
+            if self.seen.insert(params.clone()) {
+                return Some(params);
+            }
+        }
+
+        None // give up generating a unique candidate
+    }
+
+    fn report_result(&mut self, _params: &HyperParams, _metric: Metric) {
+        // Could implement adaptive sampling here (e.g., Bayesian)
+    }
+}
+
+/// ==========================================================================
+/// Observer Implementations
+/// ==========================================================================
+
+/// Lightweight logger observer that prints tuning progress to stdout.
+pub struct LoggerObserver;
+
+impl TuningObserver for LoggerObserver {
+    fn on_trial_started(&self, trial_id: usize, params: &HyperParams) {
+        println!("⇢ Trial #{trial_id} started with params: {params:?}");
+    }
+    fn on_trial_completed(&self, trial_id: usize, params: &HyperParams, metric: Metric) {
+        println!("✓ Trial #{trial_id} completed. metric={:?}; params={params:?}", metric);
+    }
+    fn on_completed(&self, best_params: &HyperParams, best_metric: Metric) {
+        println!("★ Tuning completed. best_metric={:?}; best_params={best_params:?}", best_metric);
+    }
+}
+
+/// ==========================================================================
+/// Tuner Engine
+/// ==========================================================================
+
+/// Configuration for the tuner engine.
+#[derive(Debug, Clone)]
+pub struct TunerConfig {
+    pub max_duration: Option<Duration>,
+    pub trial_timeout: Option<Duration>,
+    pub max_trials: Option<usize>,
+}
+
+/// Hyper-parameter tuner.
+///
+/// The tuner spawns blocking training tasks on the Tokio runtime and relays
+/// updates to a broadcast channel so multiple observers can subscribe.
+pub struct HyperparameterTuner<M>
+where
+    M: TrainableModel,
+{
+    model: Arc<M>,
+    strategy: Box<dyn SearchStrategy>,
+    observers: Vec<Arc<dyn TuningObserver>>,
+    cfg: TunerConfig,
+}
+
+impl<M> HyperparameterTuner<M>
+where
+    M: TrainableModel,
+{
+    pub fn builder(model: M) -> TunerBuilder<M> {
+        TunerBuilder {
+            model,
+            strategy: None,
+            observers: vec![Arc::new(LoggerObserver)],
+            cfg: TunerConfig {
+                max_duration: Some(Duration::from_secs(30 * 60)),
+                trial_timeout: Some(Duration::from_secs(10 * 60)),
+                max_trials: None,
+            },
+        }
+    }
+
+    /// Blocks until tuning completes or is cancelled.
+    pub async fn run(mut self) -> Result<(HyperParams, Metric)> {
+        let start_time = Instant::now();
+
+        let mut best_metric = Metric(f64::NEG_INFINITY);
+        let mut best_params = HyperParams::new();
+
+        let mut trial_id = 0;
+
+        loop {
+            // Budget checks
+            if let Some(max_trials) = self.cfg.max_trials {
+                if trial_id >= max_trials {
+                    break;
+                }
+            }
+            if let Some(max_dur) = self.cfg.max_duration {
+                if start_time.elapsed() >= max_dur {
+                    break;
+                }
+            }
+
+            // Ask the strategy for next params set
+            let Some(params) = self.strategy.next_candidate() else {
+                break; // search exhausted
+            };
+
+            for obs in &self.observers {
+                obs.on_trial_started(trial_id, &params);
+            }
+
+            // Execute training in blocking thread
+            let model = self.model.clone();
+            let trial_fut = tokio::task::spawn_blocking(move || model.train(&params));
+
+            let trial_res = if let Some(tt) = self.cfg.trial_timeout {
+                match timeout(tt, trial_fut).await {
+                    Ok(r) => r.map_err(|e| TunerError::Internal(e.to_string()))?,
+                    Err(_) => Err(TunerError::TrainingTimeout(tt)),
+                }
+            } else {
+                trial_fut.await.map_err(|e| TunerError::Internal(e.to_string()))?
+            }?;
+
+            self.strategy.report_result(&params, trial_res);
+
+            if trial_res > best_metric {
+                best_metric = trial_res;
+                best_params = params.clone();
+            }
+
+            for obs in &self.observers {
+                obs.on_trial_completed(trial_id, &params, trial_res);
+            }
+
+            trial_id += 1;
+        }
+
+        for obs in &self.observers {
+            obs.on_completed(&best_params, best_metric);
+        }
+
+        Ok((best_params, best_metric))
+    }
+}
+
+/// Builder for `HyperparameterTuner`.
+pub struct TunerBuilder<M>
+where
+    M: TrainableModel,
+{
+    model: M,
+    strategy: Option<Box<dyn SearchStrategy>>,
+    observers: Vec<Arc<dyn TuningObserver>>,
+    cfg: TunerConfig,
+}
+
+impl<M> TunerBuilder<M>
+where
+    M: TrainableModel,
+{
+    pub fn strategy(mut self, strategy: Box<dyn SearchStrategy>) -> Self {
+        self.strategy = Some(strategy);
+        self
+    }
+
+    pub fn add_observer<O: TuningObserver>(mut self, observer: O) -> Self {
+        self.observers.push(Arc::new(observer));
+        self
+    }
+
+    pub fn config(mut self, cfg: TunerConfig) -> Self {
+        self.cfg = cfg;
+        self
+    }
+
+    pub fn build(self) -> HyperparameterTuner<M> {
+        HyperparameterTuner {
+            model: Arc::new(self.model),
+            strategy: self.strategy.expect("search strategy must be provided"),
+            observers: self.observers,
+            cfg: self.cfg,
+        }
+    }
+}
+
+/// ==========================================================================
+/// Example Dummy Implementation (feature-gated for tests & doctests only)
+/// ==========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyModel;
+
+    impl TrainableModel for DummyModel {
+        fn train(&self, params: &HyperParams) -> Result<Metric> {
+            // Fake metric: negative L2 distance to (lr=0.01, depth=5)
+            let lr = params
+                .get("lr")
+                .and_then(HyperValue::as_f64)
+                .ok_or_else(|| TunerError::TrainingSubsystem("missing lr".into()))?;
+            let depth = params
+                .get("depth")
+                .and_then(HyperValue::as_f64)
+                .ok_or_else(|| TunerError::TrainingSubsystem("missing depth".into()))?;
+
+            let diff = (lr - 0.01).powi(2) + (depth - 5.0).powi(2);
+            Ok(Metric(-diff))
+        }
+    }
+
+    #[tokio::test]
+    async fn tuner_finds_optimal_region() -> anyhow::Result<()> {
+        let search_space = HashMap::from([
+            ("lr".into(), vec![0.1.into(), 0.01.into(), 0.001.into()]),
+            ("depth".into(), vec![3.into(), 5.into(), 7.into()]),
+        ]);
+
+        let tuner = HyperparameterTuner::builder(DummyModel)
+            .strategy(Box::new(GridSearch::new(search_space)))
+            .build();
+
+        let (best_params, best_metric) = tuner.run().await?;
+        assert!(best_metric.0 > -1e-9); // Should reach very close to zero
+        assert_eq!(best_params.get("depth").unwrap(), &HyperValue::Int(5));
+        Ok(())
+    }
+}
+```

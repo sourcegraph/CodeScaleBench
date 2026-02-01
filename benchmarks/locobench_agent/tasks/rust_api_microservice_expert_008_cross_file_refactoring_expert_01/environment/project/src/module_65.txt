@@ -1,0 +1,371 @@
+```rust
+//! src/module_65.rs
+//!
+//! High-level Service implementation (CQS “Query” side) for fetching
+//! paginated ledger entries with transparent Redis-backed response caching.
+//!
+//! ┌───────────────────────────────┐
+//! │ View (HTTP / GraphQL payload) │
+//! └──────────────┬────────────────┘
+//!                ▼
+//!   LedgerEntryListQuery (validated, user-facing DTO)
+//!                │  (TryInto)
+//!                ▼
+//!        PaginationCursor (internal)
+//!                │
+//!                ▼
+//!   LedgerEntryService::list_with_cache()
+//!                │
+//!        ┌───────┴────────┐
+//!        ▼                ▼
+//!  Redis (cache)    Postgres Repository
+//!        └───────┬────────┘
+//!                ▼
+//!     PaginatedResponse<LedgerEntryView>
+//!
+//! The module demonstrates:
+//!   • request validation (validator crate)
+//!   • pagination helpers
+//!   • Redis response caching with hedged expiration
+//!   • structured error envelopes
+//!   • tracing-based structured logging
+
+use std::convert::{TryFrom, TryInto};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use deadpool_redis::{redis::AsyncCommands, Pool as RedisPool};
+use futures::TryStreamExt;
+use serde::{Deserialize, Serialize};
+use tokio_postgres::Row;
+use tracing::{debug, error, instrument};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+use crate::{
+    error::{ApiResult, ServiceError},
+    logging::TracingSpanExt,
+    repository::ledger::{LedgerEntryRepository, PgLedgerEntryRepository},
+};
+
+/// Maximum number of rows the API allows a consumer to request per page.
+/// Prevents abuse and unbounded result sets.
+const MAX_PAGE_SIZE: u16 = 500;
+
+/// Time-to-live for cached paginated responses.
+const CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Public, user-facing query parameters (View) for listing ledger entries.
+///
+/// They arrive from HTTP querystring or GraphQL arguments and are validated
+/// before being converted to the internal [`PaginationCursor`].
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct LedgerEntryListQuery {
+    /// 1-based page index.
+    #[validate(range(min = 1))]
+    pub page: Option<u32>,
+
+    /// Amount of rows per page.
+    #[validate(range(min = 1, max = 500))]
+    pub per_page: Option<u16>,
+
+    /// Optional inclusive start date filter (RFC-3339).
+    #[validate(custom = "validate_rfc3339")]
+    pub start_date: Option<String>,
+
+    /// Optional inclusive end date filter (RFC-3339).
+    #[validate(custom = "validate_rfc3339")]
+    pub end_date: Option<String>,
+}
+
+/// DTO consumed by lower layers (Service / Repository).
+/// Values are fully validated so invariants can be relied upon.
+#[derive(Debug, Clone)]
+pub struct PaginationCursor {
+    pub offset: u32,
+    pub limit: u16,
+    pub start_date: Option<DateTime<Utc>>,
+    pub end_date: Option<DateTime<Utc>>,
+}
+
+/// Domain model for a single ledger entry (very simplified).
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerEntryView {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub description: Option<String>,
+}
+
+/// Envelope returned to the caller.
+///
+/// It mimics popular paginated APIs (GitHub, Stripe) and is forward-compatible
+/// with cursor-based pagination when we decide to upgrade.
+#[derive(Debug, Serialize)]
+pub struct PaginatedResponse<T> {
+    pub data: Vec<T>,
+    pub page: u32,
+    pub per_page: u16,
+    pub total: u64,
+    pub has_more: bool,
+}
+
+/* ------------------------------------------------------------------------- */
+/* ------------------------ Request <-> Cursor impls ----------------------- */
+/* ------------------------------------------------------------------------- */
+
+impl TryFrom<LedgerEntryListQuery> for PaginationCursor {
+    type Error = ServiceError;
+
+    fn try_from(value: LedgerEntryListQuery) -> Result<Self, Self::Error> {
+        value.validate()?;
+
+        let limit = value.per_page.unwrap_or(50);
+        if limit > MAX_PAGE_SIZE {
+            return Err(ServiceError::validation(
+                "per_page",
+                format!(
+                    "Requested page size ({limit}) exceeds API maximum ({MAX_PAGE_SIZE})"
+                ),
+            ));
+        }
+
+        let page = value.page.unwrap_or(1);
+        let offset = (page - 1) * limit as u32;
+
+        let start_date = parse_optional_datetime(value.start_date)?;
+        let end_date = parse_optional_datetime(value.end_date)?;
+
+        if let (Some(start), Some(end)) = (start_date, end_date) {
+            if start > end {
+                return Err(ServiceError::validation(
+                    "date_range",
+                    "start_date must be before end_date",
+                ));
+            }
+        }
+
+        Ok(PaginationCursor {
+            offset,
+            limit,
+            start_date,
+            end_date,
+        })
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* ------------------------- LedgerEntry Service --------------------------- */
+/* ------------------------------------------------------------------------- */
+
+#[async_trait]
+pub trait LedgerEntryService {
+    async fn list_with_cache(
+        &self,
+        tenant_id: Uuid,
+        query: LedgerEntryListQuery,
+    ) -> ApiResult<PaginatedResponse<LedgerEntryView>>;
+}
+
+pub struct LedgerEntryServiceImpl<R: LedgerEntryRepository + Send + Sync> {
+    repo: R,
+    redis: RedisPool,
+}
+
+impl<R: LedgerEntryRepository + Send + Sync> LedgerEntryServiceImpl<R> {
+    pub fn new(repo: R, redis: RedisPool) -> Self {
+        Self { repo, redis }
+    }
+
+    /// Builds the cache key. A tenant-scoped namespace mitigates key
+    /// collisions across clients sharing the same Redis cluster.
+    fn cache_key(tenant_id: Uuid, cursor: &PaginationCursor) -> String {
+        format!(
+            "tenant:{}:ledger:list:v1:{}:{}:{}:{}",
+            tenant_id,
+            cursor.offset,
+            cursor.limit,
+            cursor
+                .start_date
+                .map(|d| d.timestamp())
+                .unwrap_or_default(),
+            cursor
+                .end_date
+                .map(|d| d.timestamp())
+                .unwrap_or_default()
+        )
+    }
+}
+
+#[async_trait]
+impl<R> LedgerEntryService for LedgerEntryServiceImpl<R>
+where
+    R: LedgerEntryRepository + Send + Sync,
+{
+    #[instrument(
+        skip_all,
+        fields(tenant_id=%tenant_id, offset, limit),
+        err
+    )]
+    async fn list_with_cache(
+        &self,
+        tenant_id: Uuid,
+        query: LedgerEntryListQuery,
+    ) -> ApiResult<PaginatedResponse<LedgerEntryView>> {
+        let cursor: PaginationCursor = query.try_into()?;
+
+        tracing::Span::current().record("offset", cursor.offset);
+        tracing::Span::current().record("limit", cursor.limit);
+
+        let key = Self::cache_key(tenant_id, &cursor);
+
+        // Check Redis first
+        if let Ok(mut client) = self.redis.get().await {
+            match client.get::<_, Vec<u8>>(&key).await {
+                Ok(blob) if !blob.is_empty() => {
+                    debug!("Cache hit for {}", &key);
+                    if let Ok(resp) = serde_json::from_slice::<PaginatedResponse<LedgerEntryView>>(&blob)
+                    {
+                        return Ok(resp);
+                    } else {
+                        // Malformed payload, purge key and proceed to DB
+                        let _ = client.del::<_, ()>(&key).await;
+                        debug!("Purged malformed cache entry {}", &key);
+                    }
+                }
+                Ok(_) | Err(_) => {
+                    debug!("Cache miss for {}", &key);
+                    // Continue to DB
+                }
+            }
+        }
+
+        // Fetch from repository
+        let (rows, total) = self
+            .repo
+            .list_ledger_entries(tenant_id, &cursor)
+            .await
+            .map_err(ServiceError::from)?;
+
+        let data = rows.into_iter().map(LedgerEntryView::from).collect::<Vec<_>>();
+        let has_more = (cursor.offset as u64 + data.len() as u64) < total;
+
+        let response = PaginatedResponse {
+            data,
+            page: (cursor.offset / cursor.limit as u32) + 1,
+            per_page: cursor.limit,
+            total,
+            has_more,
+        };
+
+        // Populate cache (fire-and-forget)
+        let _ = {
+            let payload = serde_json::to_vec(&response);
+            let redis = self.redis.clone();
+            async move {
+                if let (Ok(mut client), Ok(blob)) = (redis.get().await, payload) {
+                    let _: Result<(), _> = client
+                        .set_ex(&key, blob, CACHE_TTL.as_secs() as usize)
+                        .await;
+                }
+            }
+        };
+
+        Ok(response)
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* --------------------- Repository (trait + mapping) ---------------------- */
+/* ------------------------------------------------------------------------- */
+
+/// Postgres row → domain mapping.
+impl From<Row> for LedgerEntryView {
+    fn from(row: Row) -> Self {
+        LedgerEntryView {
+            id: row.get("id"),
+            tenant_id: row.get("tenant_id"),
+            timestamp: row.get("timestamp"),
+            amount_minor: row.get("amount_minor"),
+            currency: row.get("currency"),
+            description: row.get("description"),
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* ------------------------------ Utilities -------------------------------- */
+/* ------------------------------------------------------------------------- */
+
+/// Custom validator for RFC-3339 timestamps.
+fn validate_rfc3339(date: &str) -> Result<(), ValidationError> {
+    match DateTime::parse_from_rfc3339(date) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(ValidationError::new("invalid_datetime")),
+    }
+}
+
+fn parse_optional_datetime(
+    input: Option<String>,
+) -> Result<Option<DateTime<Utc>>, ServiceError> {
+    match input {
+        Some(raw) => Ok(Some(
+            DateTime::parse_from_rfc3339(&raw)
+                .map_err(|_| ServiceError::validation("datetime", "Invalid RFC-3339 timestamp"))?
+                .with_timezone(&Utc),
+        )),
+        None => Ok(None),
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* -------------------------- Unit-level tests ----------------------------- */
+/* ------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn convert_valid_query() {
+        let q = LedgerEntryListQuery {
+            page: Some(2),
+            per_page: Some(100),
+            start_date: None,
+            end_date: None,
+        };
+
+        let cursor: PaginationCursor = q.try_into().expect("conversion failed");
+        assert_eq!(cursor.offset, 100);
+        assert_eq!(cursor.limit, 100);
+    }
+
+    #[test]
+    fn reject_large_page_size() {
+        let q = LedgerEntryListQuery {
+            page: Some(1),
+            per_page: Some(999),
+            start_date: None,
+            end_date: None,
+        };
+
+        let err = PaginationCursor::try_from(q).unwrap_err();
+        assert!(matches!(err, ServiceError::Validation { .. }));
+    }
+
+    #[test]
+    fn validate_date_range() {
+        let q = LedgerEntryListQuery {
+            page: Some(1),
+            per_page: Some(10),
+            start_date: Some("2025-01-01T00:00:00Z".into()),
+            end_date: Some("2024-01-01T00:00:00Z".into()),
+        };
+
+        assert!(PaginationCursor::try_from(q).is_err());
+    }
+}
+```

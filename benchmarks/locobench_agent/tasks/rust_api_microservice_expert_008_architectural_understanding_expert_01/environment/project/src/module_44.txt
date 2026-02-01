@@ -1,0 +1,665 @@
+```rust
+//! src/module_44.rs
+//!
+//! LedgerLink Nexus – Module 44
+//! High-volume Ledger Entry listing with
+//!  • JWT authentication
+//!  • strong request validation
+//!  • pagination helpers
+//!  • Redis response-level caching
+//!  • SQLx/PostgreSQL repository
+//!  • structured tracing-based logging
+//!
+//! This module is *self-contained*; it wires its own Axum router that can be
+//! mounted by the service bootstrapper (see `src/main.rs`). In production the
+//! shared state (`PgPool`, `RedisPool`, …) is handed-in via `Extension`.
+
+use std::{
+    fmt::{self, Display},
+    sync::Arc,
+    time::Duration,
+};
+
+use axum::{
+    async_trait,
+    extract::{Extension, FromRequestParts, Query, TypedHeader},
+    headers::{authorization::Bearer, Authorization},
+    http::{request::Parts, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::get,
+    Json, Router,
+};
+use chrono::{DateTime, Utc};
+use deadpool_redis::{redis::AsyncCommands, Connection as RedisConn, Pool as RedisPool};
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgRow, FromRow, PgPool, Row};
+use thiserror::Error;
+use tokio::time::timeout;
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//  DOMAIN  ////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub account_code: String,
+    pub currency: String,
+    pub amount_minor: i64,
+    pub occurred_at: DateTime<Utc>,
+    pub description: Option<String>,
+}
+
+impl<'r> FromRow<'r, PgRow> for LedgerEntry {
+    fn from_row(row: &PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            tenant_id: row.try_get("tenant_id")?,
+            account_code: row.try_get("account_code")?,
+            currency: row.try_get("currency")?,
+            amount_minor: row.try_get("amount_minor")?,
+            occurred_at: row.try_get("occurred_at")?,
+            description: row.try_get("description")?,
+        })
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//  VIEW-MODEL (DTO) ///////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Serialize)]
+pub struct LedgerEntryDto {
+    pub id: Uuid,
+    pub account_code: String,
+    pub currency: String,
+    pub amount_minor: i64,
+    pub occurred_at: DateTime<Utc>,
+    pub description: Option<String>,
+}
+
+impl From<LedgerEntry> for LedgerEntryDto {
+    fn from(src: LedgerEntry) -> Self {
+        Self {
+            id: src.id,
+            account_code: src.account_code,
+            currency: src.currency,
+            amount_minor: src.amount_minor,
+            occurred_at: src.occurred_at,
+            description: src.description,
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//  REQUEST SCHEMA /////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+const MAX_PER_PAGE: u16 = 250;
+
+#[derive(Debug, Deserialize, Validate)]
+pub struct ListQuery {
+    #[validate(custom = "validate_page")]
+    pub page: Option<u32>,
+
+    #[validate(custom = "validate_per_page")]
+    pub per_page: Option<u16>,
+
+    /// Optional filter on ledger account
+    #[serde(default)]
+    #[validate(length(min = 1, max = 30))]
+    pub account_code: Option<String>,
+}
+
+fn validate_page(v: &Option<u32>) -> Result<(), ValidationError> {
+    if let Some(page) = v {
+        if *page == 0 {
+            return Err(ValidationError::new("page_must_be_positive"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_per_page(v: &Option<u16>) -> Result<(), ValidationError> {
+    if let Some(per_page) = v {
+        if *per_page == 0 || *per_page > MAX_PER_PAGE {
+            return Err(ValidationError::new("per_page_out_of_range"));
+        }
+    }
+    Ok(())
+}
+
+impl Default for ListQuery {
+    fn default() -> Self {
+        Self {
+            page: Some(1),
+            per_page: Some(50),
+            account_code: None,
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//  PAGINATION UTILITIES ///////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Serialize)]
+pub struct Paginated<T> {
+    pub data: Vec<T>,
+    pub page: u32,
+    pub per_page: u16,
+    pub total_items: u64,
+    pub total_pages: u32,
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//  AUTHENTICATION MIDDLEWARE //////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#[derive(Clone)]
+pub struct JwtAuth {
+    pub tenant_id: Uuid,
+    pub user_id: Uuid,
+}
+
+#[derive(Debug, Error)]
+pub enum AuthError {
+    #[error("Unauthorized")]
+    Unauthorized,
+}
+
+#[async_trait]
+impl<S> FromRequestParts<S> for JwtAuth
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let TypedHeader(Authorization(bearer)) =
+            TypedHeader::<Authorization<Bearer>>::from_request_parts(parts, _state)
+                .await
+                .map_err(|_| ApiError::unauthorized())?;
+
+        // In real life, validate signature & claims with proper key rotation
+        let token_str = bearer.token();
+
+        // For demonstration, we expect "tenant:<tenant_id>:user:<user_id>"
+        let mut iter = token_str.split(':');
+        let prefix = iter.next().unwrap_or_default();
+        if prefix != "tenant" {
+            return Err(ApiError::unauthorized());
+        }
+        let tenant_id = iter
+            .next()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .ok_or_else(ApiError::unauthorized)?;
+
+        let prefix2 = iter.next().unwrap_or_default();
+        if prefix2 != "user" {
+            return Err(ApiError::unauthorized());
+        }
+        let user_id = iter
+            .next()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .ok_or_else(ApiError::unauthorized)?;
+
+        Ok(Self { tenant_id, user_id })
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//  REPOSITORY /////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    async fn list(
+        &self,
+        tenant_id: Uuid,
+        query: &ListQuery,
+    ) -> Result<(Vec<LedgerEntry>, u64), RepositoryError>;
+}
+
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("DB error: {0}")]
+    Db(#[from] sqlx::Error),
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//  SQLx IMPLEMENTATION ////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+pub struct PgLedgerEntryRepo {
+    pool: PgPool,
+}
+
+impl PgLedgerEntryRepo {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for PgLedgerEntryRepo {
+    #[instrument(skip(self, query))]
+    async fn list(
+        &self,
+        tenant_id: Uuid,
+        query: &ListQuery,
+    ) -> Result<(Vec<LedgerEntry>, u64), RepositoryError> {
+        let page = query.page.unwrap_or(1);
+        let per_page = query.per_page.unwrap_or(50) as i64;
+        let offset = ((page - 1) as i64) * per_page;
+
+        // Filtering
+        let (entries, total): (Vec<LedgerEntry>, i64) = if let Some(ref account) = query.account_code
+        {
+            let rows = sqlx::query_as::<_, LedgerEntry>(
+                r#"
+                SELECT *
+                FROM ledger_entries
+                WHERE tenant_id = $1
+                  AND account_code = $2
+                ORDER BY occurred_at DESC
+                OFFSET $3
+                LIMIT $4
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(account)
+            .bind(offset)
+            .bind(per_page)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let total: (i64,) = sqlx::query_as(
+                r#"
+                SELECT COUNT(*) as count
+                FROM ledger_entries
+                WHERE tenant_id = $1
+                  AND account_code = $2
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(account)
+            .fetch_one(&self.pool)
+            .await?;
+
+            (rows, total.0)
+        } else {
+            let rows = sqlx::query_as::<_, LedgerEntry>(
+                r#"
+                SELECT *
+                FROM ledger_entries
+                WHERE tenant_id = $1
+                ORDER BY occurred_at DESC
+                OFFSET $2
+                LIMIT $3
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(offset)
+            .bind(per_page)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let total: (i64,) = sqlx::query_as(
+                r#"
+                SELECT COUNT(*) as count
+                FROM ledger_entries
+                WHERE tenant_id = $1
+                "#,
+            )
+            .bind(tenant_id)
+            .fetch_one(&self.pool)
+            .await?;
+
+            (rows, total.0)
+        };
+
+        Ok((entries, total as u64))
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//  SERVICE LAYER /////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+pub struct LedgerEntryQuerySvc<R> {
+    repo: Arc<R>,
+    redis: RedisPool,
+}
+
+impl<R> LedgerEntryQuerySvc<R>
+where
+    R: LedgerEntryRepository + 'static,
+{
+    pub fn new(repo: Arc<R>, redis: RedisPool) -> Self {
+        Self { repo, redis }
+    }
+
+    fn cache_key(tenant: Uuid, query: &ListQuery) -> String {
+        let filter = query.account_code.as_deref().unwrap_or("_");
+        let page = query.page.unwrap_or(1);
+        let per_page = query.per_page.unwrap_or(50);
+        format!("ledger_entries:{tenant}:{filter}:{page}:{per_page}")
+    }
+
+    #[instrument(skip(self))]
+    pub async fn list(
+        &self,
+        tenant: Uuid,
+        query: ListQuery,
+    ) -> Result<Paginated<LedgerEntryDto>, ServiceError> {
+        // 1. Try cache (30ms timeout to avoid head-of-line blocking)
+        let key = Self::cache_key(tenant, &query);
+        if let Ok(Some(raw)) = self.try_fetch_cache(&key).await {
+            debug!(%tenant, %key, "Cache hit");
+            return serde_json::from_slice::<Paginated<LedgerEntryDto>>(&raw)
+                .map_err(ServiceError::CacheSerialization);
+        }
+
+        // 2. Query repository
+        debug!(%tenant, "Cache miss – querying DB");
+        let (entries, total) = self.repo.list(tenant, &query).await?;
+        let dto: Vec<LedgerEntryDto> = entries.into_iter().map(Into::into).collect();
+
+        let page = query.page.unwrap_or(1);
+        let per_page = query.per_page.unwrap_or(50);
+        let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+
+        let payload = Paginated {
+            data: dto,
+            page,
+            per_page,
+            total_items: total,
+            total_pages,
+        };
+
+        // 3. Backfill cache (best-effort)
+        let _ = self.persist_cache(&key, &payload).await;
+
+        Ok(payload)
+    }
+
+    async fn try_fetch_cache(&self, key: &str) -> Result<Option<Vec<u8>>, ServiceError> {
+        let mut conn: RedisConn = self.redis.get().await?;
+        // short timeout to protect against redis hiccups
+        let result: Option<Vec<u8>> =
+            timeout(Duration::from_millis(30), conn.get(key)).await??;
+        Ok(result)
+    }
+
+    async fn persist_cache<T: Serialize>(&self, key: &str, value: &T) -> Result<(), ServiceError> {
+        let mut conn: RedisConn = self.redis.get().await?;
+        let data = serde_json::to_vec(value)?;
+        let _: () = conn
+            .set_ex(key, data, 60) // 60 seconds TTL
+            .await
+            .map_err(ServiceError::Cache)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("repository error: {0}")]
+    Repo(#[from] RepositoryError),
+
+    #[error("redis error: {0}")]
+    Cache(#[from] deadpool_redis::redis::RedisError),
+
+    #[error("serialization error: {0}")]
+    CacheSerialization(#[from] serde_json::Error),
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//  API HANDLER ////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#[instrument(skip_all, fields(tenant=%auth.tenant_id, user=%auth.user_id))]
+pub async fn list_ledger_entries_handler<R>(
+    auth: JwtAuth,
+    Extension(svc): Extension<Arc<LedgerEntryQuerySvc<R>>>,
+    headers: HeaderMap,
+    Query(mut query): Query<ListQuery>,
+) -> Result<Response, ApiError>
+where
+    R: LedgerEntryRepository + 'static,
+{
+    // Merge defaults
+    if query.page.is_none() {
+        query.page = Some(1);
+    }
+    if query.per_page.is_none() {
+        query.per_page = Some(50);
+    }
+
+    // Validate
+    query
+        .validate()
+        .map_err(|e| ApiError::validation("query", e.to_string()))?;
+
+    let result = svc.list(auth.tenant_id, query).await?;
+    let json = Json(result);
+
+    // Add pagination hints as response headers
+    let mut resp = json.into_response();
+    {
+        let headers = resp.headers_mut();
+        headers.insert("x-total-items", result.total_items.into());
+        headers.insert("x-total-pages", result.total_pages.into());
+    }
+    Ok(resp)
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//  API ROUTER FACTORY /////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+pub fn router<R>(
+    svc: Arc<LedgerEntryQuerySvc<R>>,
+) -> Router
+where
+    R: LedgerEntryRepository + 'static,
+{
+    Router::new()
+        .route("/ledger_entries", get(list_ledger_entries_handler::<R>))
+        .layer(Extension(svc))
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//  API-LEVEL ERROR ENVELOPE ///////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Serialize)]
+struct ErrorEnvelope<'a> {
+    code: &'a str,
+    message: &'a str,
+    details: Option<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("validation error")]
+    Validation { field: &'static str, message: String },
+
+    #[error("authentication failed")]
+    Unauthorized,
+
+    #[error("internal error")]
+    Internal,
+}
+
+impl ApiError {
+    fn validation(field: &'static str, message: String) -> Self {
+        Self::Validation { field, message }
+    }
+
+    fn unauthorized() -> Self {
+        Self::Unauthorized
+    }
+}
+
+impl From<ServiceError> for ApiError {
+    fn from(e: ServiceError) -> Self {
+        match e {
+            ServiceError::Repo(repo_err) => {
+                error!(error = %repo_err, "Repository error");
+                ApiError::Internal
+            }
+            ServiceError::Cache(_) | ServiceError::CacheSerialization(_) => {
+                warn!(error = %e, "Cache layer trouble");
+                // Degrade gracefully – still return 200 with DB data if possible.
+                ApiError::Internal
+            }
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, envelope) = match &self {
+            ApiError::Validation { field, message } => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope {
+                    code: "validation_error",
+                    message: "Payload validation failed",
+                    details: Some(format!("{field}: {message}")),
+                },
+            ),
+            ApiError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                ErrorEnvelope {
+                    code: "unauthorized",
+                    message: "Authorization required",
+                    details: None,
+                },
+            ),
+            ApiError::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorEnvelope {
+                    code: "internal_error",
+                    message: "Unexpected server error",
+                    details: None,
+                },
+            ),
+        };
+
+        let body = Json(envelope).into_response().into_body();
+        (status, body).into_response()
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//  DISPLAY HELPERS ////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+impl Display for RepositoryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Error::fmt(self, f)
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//  TESTS //////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deadpool_redis::Config as RedisConfig;
+    use sqlx::{Executor, PgPoolOptions};
+
+    async fn init_pg() -> PgPool {
+        // For demonstration this spins an in-memory (file-backed) Postgres using `pg_tmp`,
+        // or connect to TEST_DATABASE_URL. In CI configure accordingly.
+        let db_url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/ledgerlink_test".into());
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&db_url)
+            .await
+            .expect("Failed to connect to Postgres");
+
+        pool.execute(
+            r#"
+            CREATE TEMPORARY TABLE IF NOT EXISTS ledger_entries (
+                id UUID PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                account_code TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                amount_minor BIGINT NOT NULL,
+                occurred_at TIMESTAMPTZ NOT NULL,
+                description TEXT
+            )
+            "#,
+        )
+        .await
+        .unwrap();
+
+        pool
+    }
+
+    async fn init_redis() -> RedisPool {
+        let cfg = RedisConfig::from_url("redis://127.0.0.1/");
+        cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_list_pagination() {
+        let pg = init_pg().await;
+        let redis = init_redis().await;
+
+        let repo = Arc::new(PgLedgerEntryRepo::new(pg.clone()));
+        let svc = LedgerEntryQuerySvc::new(repo, redis.clone());
+
+        // Seed two ledger entries
+        let tenant = Uuid::new_v4();
+        for i in 0..2 {
+            sqlx::query(
+                r#"
+                INSERT INTO ledger_entries (id, tenant_id, account_code, currency,
+                                            amount_minor, occurred_at, description)
+                VALUES ($1,$2,$3,$4,$5, NOW(), $6)
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(tenant)
+            .bind(format!("400{}", i))
+            .bind("USD")
+            .bind(1000_i64)
+            .bind(Some("seed"))
+            .execute(&pg)
+            .await
+            .unwrap();
+        }
+
+        let payload = ListQuery {
+            page: Some(1),
+            per_page: Some(1),
+            account_code: None,
+        };
+
+        let res = svc
+            .list(tenant, payload.clone())
+            .await
+            .expect("service call failed");
+
+        assert_eq!(res.total_items, 2);
+        assert_eq!(res.data.len(), 1);
+
+        // Cache hit path
+        let res2 = svc.list(tenant, payload).await.unwrap();
+        assert_eq!(res2.data.len(), 1);
+    }
+}
+```

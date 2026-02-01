@@ -1,0 +1,215 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * Module: Response Cache (LRU, TTL-aware)
+ * File:    src/module_10.txt         (compiled as .c)
+ *
+ * Responsibilities:
+ *   - Provide in-process response cache with TTL eviction semantics
+ *   - O(1) lookup / insert using HASH + doubly-linked list (classic LRU)
+ *   - Thread-safe with minimal contention (RW-lock + background janitor)
+ *   - Emit Prometheus-style metrics via mm_metrics
+ *
+ * Notes:
+ *   - uthash (https://troydhanson.github.io/uthash/) is used for the hash-table
+ *   - All strings are treated as binary blobs. Caller owns input buffers.
+ *   - This module is self-contained and may be embedded in multiple services.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <pthread.h>
+#include <time.h>
+#include <stdatomic.h>
+#include <errno.h>
+
+#include "uthash.h"        /* Single-header hash-table  */
+#include "mm_logger.h"     /* Project logger            */
+#include "mm_metrics.h"    /* Prometheus metrics helper */
+
+#define MERCURY_CACHE_VERSION          "1.0.0"
+#define MERCURY_CACHE_DEFAULT_CAPCITY  4096
+#define MERCURY_CACHE_JANITOR_SPIN_MS  1000   /* 1 second */
+
+/* Forward declarations */
+struct cache_entry;
+
+/* Doubly-linked list entry + uthash node */
+typedef struct cache_entry {
+    char               *key;
+    size_t              key_len;
+
+    uint64_t            expiry_epoch_ms;   /* absolute epoch (ms)  */
+    uint32_t            value_len;
+    uint8_t            *value;            /* malloc-ed buffer     */
+
+    struct cache_entry *prev;             /* LRU prev */
+    struct cache_entry *next;             /* LRU next */
+
+    UT_hash_handle      hh;               /* uthash handle (key)  */
+} cache_entry_t;
+
+/* Response cache handle */
+typedef struct {
+    cache_entry_t     *lookup;            /* uthash root          */
+    cache_entry_t     *lru_head;          /* Most recently used   */
+    cache_entry_t     *lru_tail;          /* Least recently used  */
+
+    size_t             capacity;          /* Max # entries        */
+    size_t             size;              /* Current # entries    */
+
+    pthread_rwlock_t   lock;              /* Global RW lock       */
+    pthread_t          janitor_tid;       /* Cleaner thread       */
+    atomic_bool        janitor_stop;      /* Control flag         */
+
+    /* Metrics counters (atomic for lock-free reads) */
+    atomic_uint_fast64_t m_hits;
+    atomic_uint_fast64_t m_misses;
+    atomic_uint_fast64_t m_evictions;
+    atomic_uint_fast64_t m_puts;
+} mercury_cache_t;
+
+
+/* -------------------- Utility helpers ------------------------------------ */
+
+/* Returns current epoch time in milliseconds */
+static inline uint64_t
+_now_epoch_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME_COARSE, &ts);
+    return ((uint64_t)ts.tv_sec * 1000ULL) + (ts.tv_nsec / 1000000ULL);
+}
+
+/* Attach entry to LRU front (MRU) */
+static inline void
+_lru_attach_front(mercury_cache_t *c, cache_entry_t *e)
+{
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head)
+        c->lru_head->prev = e;
+    c->lru_head = e;
+    if (c->lru_tail == NULL)
+        c->lru_tail = e;
+}
+
+/* Detach entry from LRU list */
+static inline void
+_lru_detach(mercury_cache_t *c, cache_entry_t *e)
+{
+    if (e->prev)
+        e->prev->next = e->next;
+    if (e->next)
+        e->next->prev = e->prev;
+    if (c->lru_head == e)
+        c->lru_head = e->next;
+    if (c->lru_tail == e)
+        c->lru_tail = e->prev;
+    e->prev = e->next = NULL;
+}
+
+/* Move entry to front (MRU) */
+static inline void
+_lru_promote(mercury_cache_t *c, cache_entry_t *e)
+{
+    if (c->lru_head == e)
+        return;
+    _lru_detach(c, e);
+    _lru_attach_front(c, e);
+}
+
+/* Drop the LRU (tail) item */
+static void
+_evict_lru(mercury_cache_t *c)
+{
+    cache_entry_t *victim = c->lru_tail;
+    if (!victim)
+        return;
+
+    _lru_detach(c, victim);
+    HASH_DEL(c->lookup, victim);
+
+    atomic_fetch_add_explicit(&c->m_evictions, 1, memory_order_relaxed);
+
+    free(victim->key);
+    free(victim->value);
+    free(victim);
+
+    c->size--;
+    mm_log_debug("cache: evicted LRU; size=%zu", c->size);
+}
+
+/* Evict expired entries (called from janitor) */
+static size_t
+_purge_expired(mercury_cache_t *c, uint64_t now_ms)
+{
+    size_t purged = 0;
+
+    cache_entry_t *e, *tmp;
+    HASH_ITER(hh, c->lookup, e, tmp) {
+        if (e->expiry_epoch_ms && e->expiry_epoch_ms < now_ms) {
+            _lru_detach(c, e);
+            HASH_DEL(c->lookup, e);
+
+            free(e->key);
+            free(e->value);
+            free(e);
+            c->size--;
+            purged++;
+        }
+    }
+    return purged;
+}
+
+/* -------------------- Public API ----------------------------------------- */
+
+/*
+ * mercury_cache_init
+ *   Initialize a cache handle with given capacity.
+ *   Returns 0 on success, errno on failure.
+ */
+int
+mercury_cache_init(mercury_cache_t *c, size_t capacity)
+{
+    if (!c)
+        return EINVAL;
+
+    memset(c, 0, sizeof(*c));
+    c->capacity = (capacity == 0) ? MERCURY_CACHE_DEFAULT_CAPCITY : capacity;
+
+    if (pthread_rwlock_init(&c->lock, NULL) != 0)
+        return errno;
+
+    atomic_init(&c->janitor_stop, false);
+
+    /* Spawn janitor thread */
+    int rc = pthread_create(&c->janitor_tid, NULL,
+                            (void *(*)(void *)) /* cast */
+                            (void *)&(void *){
+                                /* anonymous function using GCC extension */
+                            }, NULL);
+
+    /* We cannot use lambda; use static function */
+    return 0;
+}
+
+We cannot continue; realize we need actual janitor function etc.
+
+Let's write janitor thread function:
+
+static void *_janitor_thread(void *arg);
+
+In init, call pthread_create.
+
+Return 0.
+
+Let's implement.
+
+We can't use lambda. Let's implement _janitor_thread.
+
+Also add cleanup function.
+
+Let's produce final code.
+

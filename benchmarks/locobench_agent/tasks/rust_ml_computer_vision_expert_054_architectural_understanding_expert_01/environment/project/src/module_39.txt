@@ -1,0 +1,396 @@
+```rust
+//! src/module_39.rs
+//!
+//! Model Monitoring, Drift Detection, and Automated Retraining Trigger
+//! -------------------------------------------------------------------
+//! This module wires together three of the core capabilities described in
+//! the VisuTility Orchestrator architecture:
+//!
+//! 1. Model‐Monitoring (Utility-Ops layer)
+//! 2. Observer Pattern implementation (DriftDetector)
+//! 3. Strategy Pattern to select a concrete `RetrainTrigger` at runtime
+//!
+//! The code is completely self-contained yet production-grade: it is fully
+//! asynchronous, uses channel fan-out for event delivery, provides robust
+//! error handling through `thiserror`, and is designed to be embedded in
+//! the wider orchestrator without modification.
+//!
+//! NOTE: In an actual repository this file would be named `mod.rs` inside a
+//! `module_39` folder or simply `module_39.rs`.  The surrounding crate must
+//! enable the following dependencies in `Cargo.toml`:
+//
+//! ```toml
+//! [dependencies]
+//! tokio          = { version = "1", features = ["macros", "rt-multi-thread"] }
+//! serde          = { version = "1", features = ["derive"] }
+//! thiserror      = "1"
+//! tracing        = "0.1"
+//! anyhow         = "1"
+//! ```
+//!
+//! --------------------------------------------------------------------
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc, oneshot, Mutex},
+    task::JoinHandle,
+};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Public type alias for metric broadcast channel
+pub type MetricSender = broadcast::Sender<MetricEvent>;
+pub type MetricReceiver = broadcast::Receiver<MetricEvent>;
+
+/// MetricKind enumerates the metrics that can be observed.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq, Hash)]
+pub enum MetricKind {
+    /// Classic classification accuracy
+    Accuracy,
+    /// F1 score for imbalanced datasets
+    F1Score,
+    /// Average inference latency in milliseconds
+    InferenceLatency,
+}
+
+/// Logical identifier for a concrete model instance.
+#[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq, Hash)]
+pub struct ModelVersion {
+    /// e.g. `"object_detector"`
+    pub name: String,
+    /// Semantic versioning (`"1.2.3"`), git-hash, or other scheme.
+    pub version: String,
+}
+
+impl ModelVersion {
+    pub fn as_key(&self) -> String {
+        format!("{}:{}", self.name, self.version)
+    }
+}
+
+/// An emitted monitoring datapoint.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MetricEvent {
+    pub model: ModelVersion,
+    pub kind: MetricKind,
+    pub value: f64,
+    pub timestamp: SystemTime,
+}
+
+/// Domain-specific error type for this module.
+#[derive(Error, Debug)]
+pub enum ModuleError {
+    #[error("channel send error: {0}")]
+    ChannelSend(#[from] broadcast::error::SendError<MetricEvent>),
+
+    #[error("channel receive error: {0}")]
+    ChannelRecv(#[from] broadcast::error::RecvError),
+
+    #[error("request timeout")]
+    Timeout,
+
+    #[error("internal: {0}")]
+    Internal(String),
+}
+
+/// Observer trait – any component interested in metric events implements this.
+#[async_trait::async_trait]
+pub trait Observer: Send + Sync {
+    async fn on_event(&self, event: MetricEvent);
+}
+
+/// Strategy trait that encapsulates how retraining is executed.
+#[async_trait::async_trait]
+pub trait RetrainTrigger: Send + Sync {
+    /// Called when drift is detected and retraining needs to be initiated
+    async fn trigger_retraining(
+        &self,
+        model: &ModelVersion,
+        reason: &str,
+    ) -> Result<(), ModuleError>;
+}
+
+/// Simple FIFO job-queue based implementation of [`RetrainTrigger`].
+pub struct QueueBasedRetrainTrigger {
+    tx: mpsc::Sender<RetrainRequest>,
+}
+
+impl QueueBasedRetrainTrigger {
+    pub fn new(tx: mpsc::Sender<RetrainRequest>) -> Self {
+        Self { tx }
+    }
+}
+
+#[async_trait::async_trait]
+impl RetrainTrigger for QueueBasedRetrainTrigger {
+    #[instrument(skip_all, fields(model = %model.as_key(), reason))]
+    async fn trigger_retraining(
+        &self,
+        model: &ModelVersion,
+        reason: &str,
+    ) -> Result<(), ModuleError> {
+        let request = RetrainRequest {
+            model: model.clone(),
+            reason: reason.to_string(),
+        };
+        self.tx
+            .send(request)
+            .await
+            .map_err(|e| ModuleError::Internal(format!("queue send: {e}")))
+    }
+}
+
+/// Message that is forwarded to a job scheduler for retraining.
+#[derive(Debug)]
+pub struct RetrainRequest {
+    pub model: ModelVersion,
+    pub reason: String,
+}
+
+/// DriftDetector implements [`Observer`] and checks if a metric crosses
+/// configured thresholds.  If so, it calls into a [`RetrainTrigger`].
+///
+/// The detector keeps exponential moving averages (EMA) for certain metrics
+/// to reduce false positives stemming from noise.
+pub struct DriftDetector {
+    /// EMA smoothing factor (0 < alpha ≤ 1)
+    alpha: f64,
+    /// Per model+metric rolling average
+    ema: Mutex<HashMap<(String, MetricKind), f64>>,
+    /// Thresholds after which retraining is triggered
+    thresholds: HashMap<MetricKind, f64>,
+    /// Strategy for executing retraining
+    retrain_trigger: Arc<dyn RetrainTrigger>,
+}
+
+impl DriftDetector {
+    pub fn new(
+        alpha: f64,
+        thresholds: HashMap<MetricKind, f64>,
+        retrain_trigger: Arc<dyn RetrainTrigger>,
+    ) -> Self {
+        Self {
+            alpha,
+            ema: Mutex::new(HashMap::new()),
+            thresholds,
+            retrain_trigger,
+        }
+    }
+
+    /// Evaluate whether the updated EMA violates the threshold.
+    async fn evaluate(
+        &self,
+        key: (String, MetricKind),
+        ema_value: f64,
+        original_event: &MetricEvent,
+    ) {
+        if let Some(threshold) = self.thresholds.get(&key.1) {
+            let drift_detected = match key.1 {
+                MetricKind::InferenceLatency => ema_value > *threshold,
+                // For accuracy/F1 we consider degradation (lower is worse).
+                MetricKind::Accuracy | MetricKind::F1Score => ema_value < *threshold,
+            };
+
+            if drift_detected {
+                let reason = format!(
+                    "EMA for {:?} breached threshold {threshold:.3}, current {ema_value:.3}",
+                    key.1
+                );
+                warn!(model = %original_event.model.as_key(), ?reason, "Drift detected");
+
+                // Fire and forget – we do not want to block the observer loop
+                let trigger = Arc::clone(&self.retrain_trigger);
+                let model = original_event.model.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = trigger.trigger_retraining(&model, &reason).await {
+                        error!(error = ?e, "Failed to dispatch retrain trigger");
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Observer for DriftDetector {
+    #[instrument(skip(self, event))]
+    async fn on_event(&self, event: MetricEvent) {
+        let key = (event.model.as_key(), event.kind);
+        let mut ema_lock = self.ema.lock().await;
+        let entry = ema_lock.entry(key.clone()).or_insert(event.value);
+
+        // EMA update
+        *entry = self.alpha * event.value + (1.0 - self.alpha) * *entry;
+        let ema_val = *entry;
+        drop(ema_lock); // Release lock early
+
+        self.evaluate(key, ema_val, &event).await;
+    }
+}
+
+/// MetricBus – observable subject.
+/// Producers call `send_metric()`, observers subscribe via `add_observer()`.
+pub struct MetricBus {
+    sender: MetricSender,
+    observers: Mutex<Vec<Arc<dyn Observer>>>,
+}
+
+impl MetricBus {
+    pub fn new(buffer: usize) -> Self {
+        let (sender, _) = broadcast::channel(buffer);
+        Self {
+            sender,
+            observers: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Send a new metric to all observers and broadcast channel listeners.
+    pub async fn send_metric(&self, metric: MetricEvent) -> Result<(), ModuleError> {
+        // 1. Broadcast to async subscribers
+        self.sender.send(metric.clone())?;
+
+        // 2. Fan-out to Observer trait objects
+        // Note: fan-outs happen concurrently to prevent head-of-line blocking.
+        let observers = self.observers.lock().await.clone();
+        for obs in observers {
+            let evt = metric.clone();
+            tokio::spawn(async move { obs.on_event(evt).await });
+        }
+        Ok(())
+    }
+
+    /// Subscribe a new Observer
+    pub async fn add_observer(&self, observer: Arc<dyn Observer>) {
+        let mut observers = self.observers.lock().await;
+        observers.push(observer);
+    }
+
+    /// Low-level receiver for raw stream consumption.
+    pub fn subscribe_raw(&self) -> MetricReceiver {
+        self.sender.subscribe()
+    }
+}
+
+// ---------------------------------------------------------------------
+// Example supervisor wiring everything together.
+// ---------------------------------------------------------------------
+
+/// Supervisor wires `MetricBus`, `DriftDetector`, and a queue-based
+/// retraining trigger into a cohesive background service.
+///
+/// The service lifecycle can be controlled via the `shutdown` oneshot.
+pub struct Supervisor {
+    _bg_task: JoinHandle<()>,
+    /// allows external components to emit new metrics
+    pub bus: Arc<MetricBus>,
+    /// sending side of retrain queue (primarily for tests)
+    pub retrain_tx: mpsc::Sender<RetrainRequest>,
+}
+
+impl Supervisor {
+    pub fn new() -> Self {
+        // Central metric bus with ring-buffer of 1024 events
+        let bus = Arc::new(MetricBus::new(1024));
+
+        // Job queue for retraining requests
+        let (retrain_tx, mut retrain_rx) = mpsc::channel::<RetrainRequest>(64);
+        let trigger: Arc<dyn RetrainTrigger> =
+            Arc::new(QueueBasedRetrainTrigger::new(retrain_tx.clone()));
+
+        // DriftDetector with sensible defaults
+        let detector = DriftDetector::new(
+            0.25, /* alpha */
+            HashMap::from([
+                (MetricKind::Accuracy, 0.85),
+                (MetricKind::F1Score, 0.80),
+                (MetricKind::InferenceLatency, 150.0), // ms
+            ]),
+            trigger,
+        );
+
+        // Register observer
+        tokio::spawn({
+            let bus = Arc::clone(&bus);
+            let detector = Arc::new(detector);
+            async move { bus.add_observer(detector).await }
+        });
+
+        // Background task: process retrain requests
+        let bg_task = tokio::spawn(async move {
+            while let Some(req) = retrain_rx.recv().await {
+                info!(
+                    model = %req.model.as_key(),
+                    reason = %req.reason,
+                    "Scheduling retraining job"
+                );
+                // TODO: integrate with internal ML pipeline scheduler
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            debug!("Retrain queue drained – background task exiting");
+        });
+
+        Self {
+            _bg_task: bg_task,
+            bus,
+            retrain_tx,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Example usage in an async context
+// ---------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::timeout;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_drift_detector_triggers_retraining() {
+        let supervisor = Supervisor::new();
+
+        let model = ModelVersion {
+            name: "test_detector".into(),
+            version: "0.1.0".into(),
+        };
+
+        // Send accuracy consistently below threshold to guarantee drift
+        for _ in 0..10 {
+            supervisor
+                .bus
+                .send_metric(MetricEvent {
+                    model: model.clone(),
+                    kind: MetricKind::Accuracy,
+                    value: 0.5,
+                    timestamp: SystemTime::now(),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Expect at least one retrain request within 2 seconds
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let mut retrain_rx = supervisor.retrain_tx.subscribe();
+
+        tokio::spawn(async move {
+            // Wait for any retrain message
+            if retrain_rx.recv().await.is_ok() {
+                let _ = ack_tx.send(());
+            }
+        });
+
+        timeout(Duration::from_secs(2), ack_rx)
+            .await
+            .expect("Retraining not triggered in time")
+            .expect("Ack channel closed");
+    }
+}
+```

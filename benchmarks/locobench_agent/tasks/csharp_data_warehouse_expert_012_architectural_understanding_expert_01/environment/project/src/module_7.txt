@@ -1,0 +1,421 @@
+```csharp
+// File: src/module_7.txt
+// NOTE: The .txt extension is intentional—this file is dynamically compiled in a
+//       Lambda environment via Amazon.Lambda.RuntimeSupport.  DO NOT RENAME.
+//
+// PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+// Module 7: Transformation Strategy Registry + Execution Engine
+//
+// This module is responsible for:
+//
+//   • Discovering all ITransformationStrategy implementations in the current
+//     assembly (and optionally in referenced assemblies).
+//   • Mapping each strategy to a domain-specific EventType at runtime.
+//   • Executing strategies in parallel for a batch of EventEnvelope messages.
+//   • Providing robust error handling, observability, and graceful fallback
+//     semantics whenever a matching strategy is missing.
+//
+// The code below adheres to .NET 6+ best-practices and is production-ready.
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
+namespace PulseOps.Warehouse.Transformations
+{
+    #region Domain Contracts ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Wraps a raw event coming from the event streaming fabric (Kinesis or SQS).
+    /// </summary>
+    public sealed record EventEnvelope(
+        string EventId,
+        string EventType,
+        DateTimeOffset Timestamp,
+        JsonElement  Payload);
+
+    /// <summary>
+    /// Output produced by a transformation strategy; will be persisted by downstream
+    /// storage lambdas or Glue jobs.  Kept intentionally generic.
+    /// </summary>
+    public sealed record TransformationResult(
+        string EventId,
+        string EventType,
+        DateTimeOffset ProcessedAtUtc,
+        JsonElement TransformedPayload);
+
+    /// <summary>
+    /// Implement this interface to create a new domain-specific transformation.
+    /// </summary>
+    public interface ITransformationStrategy
+    {
+        /// <summary>
+        /// Friendly, unique identifier for this strategy — usually equals the
+        /// canonical EventType the strategy can handle.
+        /// </summary>
+        string StrategyKey { get; }
+
+        /// <summary>
+        /// Executes domain-specific data transformation logic on a single event.
+        /// Implementations must be thread-safe.
+        /// </summary>
+        ValueTask<TransformationResult> TransformAsync(
+            EventEnvelope     envelope,
+            CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Decorate a concrete strategy with this attribute to register it for one
+    /// or more EventTypes.  The registry will automatically wire things up.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Class, AllowMultiple = true, Inherited = false)]
+    public sealed class HandlesEventAttribute : Attribute
+    {
+        public HandlesEventAttribute(string eventType) => EventType = eventType;
+        public string EventType { get; }
+    }
+
+    #endregion
+
+    #region Transformation Registry ────────────────────────────────────────────
+
+    /// <summary>
+    /// Discovers and caches the mapping between EventType → ITransformationStrategy.
+    /// Thread-safe and lazy-loaded.  Intended to be instantiated once per Lambda
+    /// execution environment (static singleton).
+    /// </summary>
+    public sealed class TransformationStrategyRegistry
+    {
+        private readonly ILogger _logger;
+        private readonly ConcurrentDictionary<string, ITransformationStrategy> _cache = new();
+
+        public TransformationStrategyRegistry(ILogger? logger = null)
+        {
+            _logger = logger ?? NullLogger.Instance;
+            DiscoverStrategies();
+        }
+
+        /// <summary>
+        /// Retrieves the strategy for a given event type, or null if none found.
+        /// </summary>
+        public ITransformationStrategy? Resolve(string eventType)
+        {
+            if (string.IsNullOrWhiteSpace(eventType))
+                return null;
+
+            _cache.TryGetValue(eventType, out var strategy);
+            return strategy;
+        }
+
+        /// <summary>
+        /// Scans loaded assemblies for implementations of ITransformationStrategy
+        /// decorated with <see cref="HandlesEventAttribute"/>.
+        /// </summary>
+        private void DiscoverStrategies()
+        {
+            var sw = Stopwatch.StartNew();
+
+            // To reduce cold-start, limit to assemblies starting with "PulseOps".
+            var candidateAssemblies = AppDomain.CurrentDomain
+                                              .GetAssemblies()
+                                              .Where(a => a.GetName().Name?.StartsWith("PulseOps") == true);
+
+            foreach (var assembly in candidateAssemblies)
+            {
+                foreach (var strategyType in assembly.GetTypes()
+                                                     .Where(t => !t.IsAbstract &&
+                                                                 !t.IsInterface &&
+                                                                 typeof(ITransformationStrategy).IsAssignableFrom(t)))
+                {
+                    var handlesAttrs = strategyType.GetCustomAttributes<HandlesEventAttribute>(false)
+                                                   .ToArray();
+
+                    if (!handlesAttrs.Any())
+                    {
+                        _logger.LogWarning(
+                            "Transformation strategy {Strategy} implements ITransformationStrategy but " +
+                            "is not decorated with [HandlesEvent].  Skipping automatic registration.",
+                            strategyType.FullName);
+
+                        continue;
+                    }
+
+                    // Instantiate via parameterless ctor; fail fast if missing.
+                    if (Activator.CreateInstance(strategyType) is not ITransformationStrategy instance)
+                    {
+                        _logger.LogError(
+                            "Failed to instantiate transformation strategy {Strategy}.  Ensure it has a " +
+                            "public parameterless constructor.",
+                            strategyType.FullName);
+                        continue;
+                    }
+
+                    foreach (var handles in handlesAttrs)
+                    {
+                        var eventType = handles.EventType;
+
+                        if (!_cache.TryAdd(eventType, instance))
+                        {
+                            _logger.LogError(
+                                "Duplicate strategy registration attempted for EventType '{EventType}'.  " +
+                                "Strategy {Strategy} will be ignored.",
+                                eventType,
+                                strategyType.FullName);
+                        }
+                        else
+                        {
+                            _logger.LogInformation(
+                                "Registered transformation strategy {Strategy} for EventType '{EventType}'.",
+                                strategyType.FullName,
+                                eventType);
+                        }
+                    }
+                }
+            }
+
+            sw.Stop();
+            _logger.LogInformation(
+                "TransformationStrategyRegistry initialized with {Count} strategies in {ElapsedMs} ms.",
+                _cache.Count,
+                sw.ElapsedMilliseconds);
+        }
+    }
+
+    #endregion
+
+    #region Execution Engine ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Orchestrates parallel execution of transformations for a collection of events.
+    /// </summary>
+    public sealed class TransformationEngine
+    {
+        private readonly TransformationStrategyRegistry _registry;
+        private readonly ILogger                         _logger;
+
+        public TransformationEngine(
+            TransformationStrategyRegistry registry,
+            ILogger?                       logger = null)
+        {
+            _registry = registry ?? throw new ArgumentNullException(nameof(registry));
+            _logger   = logger ?? NullLogger.Instance;
+        }
+
+        /// <summary>
+        /// Executes transformations for the provided event batch.
+        /// </summary>
+        /// <returns>A stream of successful <see cref="TransformationResult"/>s.</returns>
+        /// <remarks>
+        ///   • Runs each transformation in an isolated task to contain failures.<br/>
+        ///   • Strategies are expected to be stateless / thread-safe.<br/>
+        ///   • Failures are logged and surfaced via <paramref name="onError"/> callback.
+        /// </remarks>
+        public async IAsyncEnumerable<TransformationResult> TransformAsync(
+            IEnumerable<EventEnvelope>           batch,
+            Func<EventEnvelope, Exception, Task>? onError            = null,
+            [EnumeratorCancellation]
+            CancellationToken                    cancellationToken   = default)
+        {
+            ArgumentNullException.ThrowIfNull(batch);
+
+            var throttler = new SemaphoreSlim(Environment.ProcessorCount * 2);
+
+            foreach (var envelope in batch)
+            {
+                await throttler.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+                _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var strategy = _registry.Resolve(envelope.EventType);
+
+                            if (strategy is null)
+                            {
+                                // Graceful fallback: log + surface via callback.
+                                var ex = new InvalidOperationException(
+                                    $"No transformation strategy registered for EventType '{envelope.EventType}'.");
+
+                                await HandleErrorAsync(envelope, ex, onError).ConfigureAwait(false);
+                                return;
+                            }
+
+                            var result = await strategy.TransformAsync(envelope, cancellationToken)
+                                                       .ConfigureAwait(false);
+
+                            yieldResult(result); // Local function invocation
+                        }
+                        catch (Exception ex) when (!ex.IsCritical())
+                        {
+                            // Non-fatal exceptions are logged and optionally forwarded.
+                            await HandleErrorAsync(envelope, ex, onError).ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            throttler.Release();
+                        }
+                    },
+                    cancellationToken);
+            }
+
+            // Local helper to yield result back to caller in thread-safe manner.
+            void yieldResult(TransformationResult result)
+            {
+                // Channel-like behavior, but purposefully simple to keep dependencies down.
+                lock (_yieldLock)
+                {
+                    _results.Enqueue(result);
+                    _yieldSignal.Release();
+                }
+            }
+
+            // Internal queue & signal to serialize yield return across tasks.
+            var _results     = new ConcurrentQueue<TransformationResult>();
+            var _yieldSignal = new SemaphoreSlim(0);
+            var _yieldLock   = new object();
+
+            // Drain queue until all tasks complete.
+            var pendingTasks = throttler.CurrentCount;
+
+            while (pendingTasks > 0)
+            {
+                await _yieldSignal.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+                while (_results.TryDequeue(out var result))
+                {
+                    yield return result;
+                }
+
+                // When throttler count equals max, all tasks are done.
+                pendingTasks = throttler.CurrentCount;
+            }
+        }
+
+        private Task HandleErrorAsync(
+            EventEnvelope                 envelope,
+            Exception                     ex,
+            Func<EventEnvelope, Exception, Task>? onError)
+        {
+            _logger.LogError(
+                ex,
+                "Error while transforming EventId {EventId} (Type: {EventType}).",
+                envelope.EventId,
+                envelope.EventType);
+
+            return onError is null ? Task.CompletedTask : onError(envelope, ex);
+        }
+    }
+
+    #endregion
+
+    #region Sample Strategies ──────────────────────────────────────────────────
+
+    /// <summary>
+    /// Sample transformation for calendar events — computes meeting cost.
+    /// </summary>
+    [HandlesEvent("CalendarEvent")]
+    public sealed class CalendarEventTransformationStrategy : ITransformationStrategy
+    {
+        public string StrategyKey => "CalendarEvent";
+
+        public ValueTask<TransformationResult> TransformAsync(
+            EventEnvelope     envelope,
+            CancellationToken cancellationToken = default)
+        {
+            // Extract standard fields
+            var payload = envelope.Payload;
+
+            var attendees = payload.GetProperty("attendees").GetArrayLength();
+            var duration  = payload.GetProperty("durationMinutes").GetInt32();
+            var avgSalary = payload.GetProperty("averageSalaryPerMinute").GetDecimal();
+
+            var cost = attendees * duration * avgSalary;
+
+            var transformed = new
+            {
+                envelope.EventId,
+                envelope.Timestamp,
+                MeetingCost = cost,
+                Original    = payload
+            };
+
+            var json = JsonSerializer.SerializeToElement(transformed);
+
+            return ValueTask.FromResult(
+                new TransformationResult(
+                    envelope.EventId,
+                    envelope.EventType,
+                    DateTimeOffset.UtcNow,
+                    json));
+        }
+    }
+
+    /// <summary>
+    /// Sample transformation for CI/CD logs — computes lead-time in minutes.
+    /// </summary>
+    [HandlesEvent("CICDLog")]
+    public sealed class CicdLogTransformationStrategy : ITransformationStrategy
+    {
+        public string StrategyKey => "CICDLog";
+
+        public ValueTask<TransformationResult> TransformAsync(
+            EventEnvelope     envelope,
+            CancellationToken cancellationToken = default)
+        {
+            var payload = envelope.Payload;
+
+            var commitTime   = payload.GetProperty("commitTimeUtc").GetDateTimeOffset();
+            var deployTime   = payload.GetProperty("deployTimeUtc").GetDateTimeOffset();
+            var leadTimeMins = (deployTime - commitTime).TotalMinutes;
+
+            var transformed = new
+            {
+                envelope.EventId,
+                envelope.Timestamp,
+                LeadTimeMinutes = leadTimeMins,
+                Original        = payload
+            };
+
+            var json = JsonSerializer.SerializeToElement(transformed);
+
+            return ValueTask.FromResult(
+                new TransformationResult(
+                    envelope.EventId,
+                    envelope.EventType,
+                    DateTimeOffset.UtcNow,
+                    json));
+        }
+    }
+
+    #endregion
+
+    #region Helper Extensions ──────────────────────────────────────────────────
+
+    internal static class ExceptionExtensions
+    {
+        private static readonly HashSet<Type> _critical =
+        [
+            typeof(StackOverflowException),
+            typeof(OutOfMemoryException),
+            typeof(AccessViolationException),
+            typeof(AppDomainUnloadedException),
+            typeof(BadImageFormatException),
+            typeof(CannotUnloadAppDomainException),
+            typeof(InvalidProgramException)
+        ];
+
+        public static bool IsCritical(this Exception ex) => _critical.Contains(ex.GetType());
+    }
+
+    #endregion
+}
+```

@@ -1,0 +1,387 @@
+```rust
+//! ChirpPulse – Sentiment Processing Micro-service
+//! ------------------------------------------------
+//! This module owns the real-time sentiment analysis component.  It
+//! illustrates how the platform supports hot-swappable algorithms
+//! (Strategy pattern) while sustaining 24/7 ingestion throughput.
+//!
+//! Responsibilities
+//! ----------------
+//! 1.  Stream tweets from Kafka topic `raw.social.text`.
+//! 2.  Enrich messages with an inline sentiment score.
+//! 3.  Publish results to Kafka topic `enriched.social.sentiment`.
+//! 4.  Allow data scientists to switch the underlying sentiment model
+//!     by editing a small YAML file – no restarts required.
+//!
+//! The code relies on Tokio for async runtime, `rdkafka` for Kafka
+//! connectivity, and `notify` for watching configuration changes.
+//!
+//! NOTE: Certain pieces (e.g. real ML inference) are stubbed.  Replace
+//! them with actual calls to your TensorFlow/ONNX runtime of choice.
+
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+
+use futures::StreamExt;
+use lazy_static::lazy_static;
+use metrics::{counter, gauge};
+use notify::{watcher, DebouncedEvent, RecursiveMode, Watcher};
+use rdkafka::{
+    config::ClientConfig,
+    consumer::{Consumer, StreamConsumer},
+    error::KafkaError,
+    message::{BorrowedMessage, OwnedHeaders},
+    producer::{FutureProducer, FutureRecord},
+};
+use serde::Deserialize;
+use thiserror::Error;
+use tokio::{runtime::Runtime, task};
+
+////////////////////////////////////////////////////////////////
+// Domain Models
+////////////////////////////////////////////////////////////////
+
+/// A lightweight sentiment score representation.
+#[derive(Debug, Clone)]
+pub struct SentimentScore {
+    /// Continuous score in range [-1.0, 1.0]
+    pub polarity: f32,
+    /// Optional magnitude to express confidence.
+    pub magnitude: f32,
+}
+
+impl SentimentScore {
+    pub fn neutral() -> Self {
+        Self {
+            polarity: 0.0,
+            magnitude: 0.0,
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////
+// Strategy Pattern: Sentiment Algorithms
+////////////////////////////////////////////////////////////////
+
+/// Common interface for sentiment strategies.
+pub trait SentimentAlgorithm: Send + Sync + 'static {
+    fn name(&self) -> &'static str;
+    fn analyze(&self, text: &str) -> SentimentScore;
+}
+
+/// Baseline, rule-based sentiment algorithm.
+pub struct RuleBasedAlgorithm;
+
+impl SentimentAlgorithm for RuleBasedAlgorithm {
+    fn name(&self) -> &'static str {
+        "rule_based_v1"
+    }
+
+    fn analyze(&self, text: &str) -> SentimentScore {
+        // Naïve heuristic: positive if it contains "love", negative if "hate".
+        let lower = text.to_lowercase();
+        if lower.contains("love") {
+            SentimentScore {
+                polarity: 0.8,
+                magnitude: 0.9,
+            }
+        } else if lower.contains("hate") {
+            SentimentScore {
+                polarity: -0.8,
+                magnitude: 0.9,
+            }
+        } else {
+            SentimentScore::neutral()
+        }
+    }
+}
+
+/// ML-driven (stubbed) sentiment algorithm.
+pub struct MlAlgorithm;
+
+impl SentimentAlgorithm for MlAlgorithm {
+    fn name(&self) -> &'static str {
+        "bert_base_uncased"
+    }
+
+    fn analyze(&self, text: &str) -> SentimentScore {
+        // TODO: replace with real inference call
+        let hash = seahash::hash(text.as_bytes());
+        let polarity = ((hash % 200) as f32 - 100.0) / 100.0; // pseudo-random
+        SentimentScore {
+            polarity,
+            magnitude: polarity.abs(),
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////
+// Runtime Hot-Swap Configuration
+////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Deserialize)]
+struct ConfigFile {
+    /// Strategy identifier, e.g. "rule_based" or "bert".
+    algorithm: String,
+    /// Kafka bootstrap servers.
+    kafka_brokers: String,
+    /// Consumer group id.
+    consumer_group: String,
+}
+
+impl Default for ConfigFile {
+    fn default() -> Self {
+        Self {
+            algorithm: "rule_based".into(),
+            kafka_brokers: "localhost:9092".into(),
+            consumer_group: "chirppulse.sentiment".into(),
+        }
+    }
+}
+
+/// Resolver that converts a string identifier into a boxed algorithm.
+fn resolve_algorithm(id: &str) -> Arc<dyn SentimentAlgorithm> {
+    match id {
+        "rule_based" => Arc::new(RuleBasedAlgorithm),
+        "bert" | "ml" => Arc::new(MlAlgorithm),
+        other => {
+            log::warn!("Unknown algorithm '{}', falling back to rule-based", other);
+            Arc::new(RuleBasedAlgorithm)
+        }
+    }
+}
+
+/// Thread-safe container holding the current strategy.
+#[derive(Clone)]
+struct AlgorithmRegistry {
+    inner: Arc<RwLock<Arc<dyn SentimentAlgorithm>>>,
+}
+
+impl AlgorithmRegistry {
+    fn new(initial: Arc<dyn SentimentAlgorithm>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(initial)),
+        }
+    }
+
+    fn get(&self) -> Arc<dyn SentimentAlgorithm> {
+        self.inner.read().unwrap().clone()
+    }
+
+    fn swap(&self, new_algo: Arc<dyn SentimentAlgorithm>) {
+        let mut guard = self.inner.write().unwrap();
+        *guard = new_algo;
+    }
+}
+
+////////////////////////////////////////////////////////////////
+// Error Handling
+////////////////////////////////////////////////////////////////
+
+#[derive(Error, Debug)]
+pub enum ServiceError {
+    #[error("Kafka error: {0}")]
+    Kafka(#[from] KafkaError),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Configuration: {0}")]
+    Config(String),
+}
+
+////////////////////////////////////////////////////////////////
+// Kafka Record Utility
+////////////////////////////////////////////////////////////////
+
+fn build_output_record<'a>(
+    input: &BorrowedMessage<'a>,
+    score: &SentimentScore,
+) -> FutureRecord<'a, Vec<u8>, Vec<u8>> {
+    let mut headers = OwnedHeaders::new().add("sentiment_algo", "v1");
+    headers = headers.add("polarity", &format!("{:.3}", score.polarity));
+    headers = headers.add("magnitude", &format!("{:.3}", score.magnitude));
+
+    FutureRecord::to("enriched.social.sentiment")
+        .payload(input.payload().unwrap_or_default())
+        .key(input.key().unwrap_or_default())
+        .headers(headers)
+}
+
+////////////////////////////////////////////////////////////////
+// Sentiment Service
+////////////////////////////////////////////////////////////////
+
+pub struct SentimentService {
+    registry: AlgorithmRegistry,
+    cfg: ConfigFile,
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+}
+
+impl SentimentService {
+    pub fn bootstrap(cfg_path: PathBuf) -> Result<Self, ServiceError> {
+        // Load configuration or fallback to defaults.
+        let cfg = std::fs::read_to_string(&cfg_path)
+            .ok()
+            .and_then(|s| serde_yaml::from_str(&s).ok())
+            .unwrap_or_default();
+
+        // Strategy registry.
+        let registry = AlgorithmRegistry::new(resolve_algorithm(&cfg.algorithm));
+
+        // Kafka plumbing.
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.kafka_brokers)
+            .set("enable.partition.eof", "false")
+            .set("group.id", &cfg.consumer_group)
+            .set("auto.offset.reset", "earliest")
+            .create()?;
+
+        consumer.subscribe(&["raw.social.text"])?;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.kafka_brokers)
+            .create()?;
+
+        Ok(Self {
+            registry,
+            cfg,
+            consumer,
+            producer,
+        })
+    }
+
+    /// Spawn background watcher that hot-swaps strategies when config file changes.
+    fn spawn_config_watcher(&self, path: PathBuf) {
+        let registry = self.registry.clone();
+        task::spawn_blocking(move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut watcher = watcher(tx, Duration::from_secs(2)).unwrap();
+            watcher.watch(&path, RecursiveMode::NonRecursive).unwrap();
+
+            loop {
+                match rx.recv() {
+                    Ok(DebouncedEvent::Write(_)) | Ok(DebouncedEvent::Create(_)) => {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if let Ok(cfg) = serde_yaml::from_str::<ConfigFile>(&content) {
+                                log::info!("Config update detected – switching to '{}'", cfg.algorithm);
+                                registry.swap(resolve_algorithm(&cfg.algorithm));
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::error!("Config watcher error: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Run the main processing loop.  This is an async function but we also
+    /// offer a blocking `run_forever` for convenience.
+    pub async fn run(&self) -> Result<(), ServiceError> {
+        let mut stream = self.consumer.stream();
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Err(e) => {
+                    log::error!("Kafka error while polling: {}", e);
+                    counter!("sentiment.kafka_errors", 1);
+                }
+                Ok(msg) => {
+                    // Deserialize message (utf-8, ignoring invalid bytes).
+                    let payload = std::str::from_utf8(msg.payload().unwrap_or_default()).unwrap_or("");
+
+                    // Apply current algorithm.
+                    let algo = self.registry.get();
+                    let score = algo.analyze(payload);
+                    gauge!("sentiment.score", score.polarity as f64);
+
+                    // Produce enriched record.
+                    let record = build_output_record(&msg, &score);
+                    let produce_future = self.producer.send(record, Duration::from_secs(0));
+
+                    // Fire-and-forget, but log on error.
+                    tokio::spawn(async move {
+                        if let Err((e, _)) = produce_future.await {
+                            log::error!("Failed to send enriched record: {}", e);
+                            counter!("sentiment.produce_errors", 1);
+                        }
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Convenience method to block the current thread and run the service.
+    pub fn run_forever(mut self, cfg_path: PathBuf) -> Result<(), ServiceError> {
+        // Spawn watcher.
+        self.spawn_config_watcher(cfg_path);
+
+        // Tokio runtime for async tasks.
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            loop {
+                if let Err(e) = self.run().await {
+                    log::error!("Service loop terminated with error: {}", e);
+                }
+                // Brief back-off to avoid tight error loops.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        Ok(())
+    }
+}
+
+////////////////////////////////////////////////////////////////
+// Entrypoint (only compiled for binary target)
+// Allows the same file to be used as a library in unit tests.
+////////////////////////////////////////////////////////////////
+
+#[cfg(all(feature = "bin", not(test)))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let cfg_path = std::env::var("CHIRPPULSE_CFG").unwrap_or_else(|_| "config/sentiment.yaml".into());
+    let service = SentimentService::bootstrap(PathBuf::from(&cfg_path))?;
+    service.run_forever(PathBuf::from(cfg_path))?;
+    Ok(())
+}
+
+////////////////////////////////////////////////////////////////
+// Unit Tests (basic sanity)
+////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rule_based_positive() {
+        let algo = RuleBasedAlgorithm;
+        let s = algo.analyze("I love Rust!");
+        assert!(s.polarity > 0.0);
+    }
+
+    #[test]
+    fn rule_based_negative() {
+        let algo = RuleBasedAlgorithm;
+        let s = algo.analyze("I hate bugs.");
+        assert!(s.polarity < 0.0);
+    }
+
+    #[test]
+    fn ml_algorithm_deterministic() {
+        let algo = MlAlgorithm;
+        let s1 = algo.analyze("same input");
+        let s2 = algo.analyze("same input");
+        assert!((s1.polarity - s2.polarity).abs() < f32::EPSILON);
+    }
+}
+```

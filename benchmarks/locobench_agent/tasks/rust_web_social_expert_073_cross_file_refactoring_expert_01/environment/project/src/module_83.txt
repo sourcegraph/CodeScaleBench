@@ -1,0 +1,355 @@
+```rust
+//! src/module_83.rs
+//!
+//! Event‐driven “Learning Pulse” submission workflow.
+//!
+//! This module owns the domain logic for:
+//!   1. Persisting a student’s reply to a Learning Pulse.
+//!   2. Emitting the corresponding [`DomainEvent::PulseSubmitted`] so that
+//!      downstream services (plagiarism check, rubric scoring, notifications, …)
+//!      can react asynchronously.
+//!
+//! The code follows the Repository pattern and depends on an `EventPublisher`
+//! abstraction so that the core logic stays agnostic of a particular broker
+//! (RabbitMQ, NATS, Kafka, etc.).
+//!
+//! # Example
+//! ```ignore
+//! let pool = PgPoolOptions::new().connect("postgres://…").await?;
+//! let publisher = AmqpPublisher::new(amqp_config).await?;
+//! let repo       = SqlLearningPulseSubmissionRepository::new(pool.clone());
+//! let service    = LearningPulseService::new(repo, publisher);
+//!
+//! service
+//!     .submit(SubmitCommand {
+//!         pulse_id: Uuid::parse_str("…")?,
+//!         student_id: Uuid::parse_str("…")?,
+//!         message: "Here is my answer".into(),
+//!         attachment_url: None,
+//!     })
+//!     .await?;
+//! ```
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgRow, FromRow, PgPool, Row};
+use thiserror::Error;
+use tokio::task;
+use tracing::{error, instrument, warn};
+use uuid::Uuid;
+
+/// Result alias with the module’s custom [`Error`].
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Domain errors that might occur while handling a submission.
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("event publication failed: {0}")]
+    EventPublish(#[from] anyhow::Error),
+
+    #[error("pulse not found: {0}")]
+    PulseNotFound(Uuid),
+
+    #[error("submission already exists")]
+    DuplicateSubmission,
+
+    #[error("unexpected: {0}")]
+    Unexpected(String),
+}
+
+/* --------------------------------------------------------------------------
+   Data Transfer Objects
+   -------------------------------------------------------------------------- */
+
+/// Incoming command object, typically created by the HTTP layer
+/// after performing authentication & validation.
+#[derive(Debug)]
+pub struct SubmitCommand {
+    pub pulse_id: Uuid,
+    pub student_id: Uuid,
+    pub message: String,
+    pub attachment_url: Option<String>,
+}
+
+/* --------------------------------------------------------------------------
+   Domain Model
+   -------------------------------------------------------------------------- */
+
+/// Aggregate root representing a student’s submission to a `LearningPulse`.
+#[derive(Debug, Clone)]
+pub struct LearningPulseSubmission {
+    pub id: Uuid,
+    pub pulse_id: Uuid,
+    pub student_id: Uuid,
+    pub message: String,
+    pub attachment_url: Option<String>,
+    pub submitted_at: DateTime<Utc>,
+}
+
+impl From<SubmitCommand> for LearningPulseSubmission {
+    fn from(cmd: SubmitCommand) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            pulse_id: cmd.pulse_id,
+            student_id: cmd.student_id,
+            message: cmd.message,
+            attachment_url: cmd.attachment_url,
+            submitted_at: Utc::now(),
+        }
+    }
+}
+
+/* --------------------------------------------------------------------------
+   Repository Abstraction
+   -------------------------------------------------------------------------- */
+
+#[async_trait]
+pub trait LearningPulseSubmissionRepository: Send + Sync {
+    async fn save(&self, submission: &LearningPulseSubmission) -> Result<()>;
+
+    /// Guard to avoid duplicates. An index on (pulse_id, student_id) is
+    /// recommended to enforce uniqueness at the DB level, too.
+    async fn exists(
+        &self,
+        pulse_id: Uuid,
+        student_id: Uuid,
+    ) -> Result<bool>;
+}
+
+pub struct SqlLearningPulseSubmissionRepository {
+    pool: PgPool,
+}
+
+impl SqlLearningPulseSubmissionRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LearningPulseSubmissionRepository for SqlLearningPulseSubmissionRepository {
+    #[instrument(skip(self, submission))]
+    async fn save(&self, submission: &LearningPulseSubmission) -> Result<()> {
+        sqlx::query!(
+            r#"
+            INSERT INTO learning_pulse_submissions (
+                id,
+                pulse_id,
+                student_id,
+                message,
+                attachment_url,
+                submitted_at
+            ) VALUES ( $1, $2, $3, $4, $5, $6 )
+            "#,
+            submission.id,
+            submission.pulse_id,
+            submission.student_id,
+            submission.message,
+            submission.attachment_url,
+            submission.submitted_at
+        )
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(Error::from)
+    }
+
+    #[instrument(skip(self))]
+    async fn exists(
+        &self,
+        pulse_id: Uuid,
+        student_id: Uuid,
+    ) -> Result<bool> {
+        let count: i64 = sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) as "count!"
+            FROM learning_pulse_submissions
+            WHERE pulse_id = $1
+              AND student_id = $2
+            "#,
+            pulse_id,
+            student_id
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count > 0)
+    }
+}
+
+/* --------------------------------------------------------------------------
+   Event Definitions
+   -------------------------------------------------------------------------- */
+
+/// All domain events emitted by the “Learning Pulse” bounded context.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DomainEvent {
+    PulseSubmitted(PulseSubmittedEvent),
+}
+
+/// Payload for [`DomainEvent::PulseSubmitted`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PulseSubmittedEvent {
+    pub submission_id: Uuid,
+    pub pulse_id: Uuid,
+    pub student_id: Uuid,
+    pub submitted_at: DateTime<Utc>,
+}
+
+/* --------------------------------------------------------------------------
+   Event Publisher Abstraction
+   -------------------------------------------------------------------------- */
+
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, event: &DomainEvent) -> Result<()>;
+}
+
+/// A no‐op in‐memory bus, useful for unit tests.
+pub struct InMemoryPublisher;
+
+#[async_trait]
+impl EventPublisher for InMemoryPublisher {
+    async fn publish(&self, event: &DomainEvent) -> Result<()> {
+        // We just log the event; in prod, a concrete impl would push to a broker.
+        tracing::info!(?event, "published event (noop)");
+        Ok(())
+    }
+}
+
+/* --------------------------------------------------------------------------
+   Service Layer
+   -------------------------------------------------------------------------- */
+
+pub struct LearningPulseService<R, P>
+where
+    R: LearningPulseSubmissionRepository,
+    P: EventPublisher,
+{
+    repo: R,
+    publisher: P,
+}
+
+impl<R, P> LearningPulseService<R, P>
+where
+    R: LearningPulseSubmissionRepository,
+    P: EventPublisher,
+{
+    pub fn new(repo: R, publisher: P) -> Self {
+        Self { repo, publisher }
+    }
+
+    /// Validates, persists, and fires a [`DomainEvent::PulseSubmitted`].
+    #[instrument(skip(self))]
+    pub async fn submit(&self, cmd: SubmitCommand) -> Result<()> {
+        // Guard against duplicates (fast path).
+        if self.repo.exists(cmd.pulse_id, cmd.student_id).await? {
+            warn!(
+                pulse_id = %cmd.pulse_id,
+                student_id = %cmd.student_id,
+                "duplicate submission attempt"
+            );
+            return Err(Error::DuplicateSubmission);
+        }
+
+        // Convert into an aggregate root and persist.
+        let submission: LearningPulseSubmission = cmd.into();
+        self.repo.save(&submission).await?;
+
+        // Emit event asynchronously – don’t block the request path.
+        let publisher = &self.publisher;
+        let event = DomainEvent::PulseSubmitted(PulseSubmittedEvent {
+            submission_id: submission.id,
+            pulse_id: submission.pulse_id,
+            student_id: submission.student_id,
+            submitted_at: submission.submitted_at,
+        });
+
+        // Spawn on Tokio to keep the service snappy. Errors are logged
+        // and bubbled up (because we `await` the JoinHandle immediately
+        // after spawn), so the caller knows if publication failed.
+        let handle = task::spawn(async move { publisher.publish(&event).await });
+        handle
+            .await
+            .map_err(|e| Error::Unexpected(e.to_string()))??;
+
+        Ok(())
+    }
+}
+
+/* --------------------------------------------------------------------------
+   Tests
+   -------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::{Executor, PgPoolOptions};
+
+    #[tokio::test]
+    async fn submit_happy_path_persists_and_emits() -> Result<()> {
+        tracing_subscriber::fmt()
+            .with_env_filter("debug")
+            .try_init()
+            .ok();
+
+        // Provision an in‐memory Postgres instance (requires `sqlx-postgres` test-feature
+        // and `testcontainers` in real setups). For brevity, we connect to
+        // DATABASE_URL if provided; otherwise, we skip.
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/edupulse_test".into());
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+
+        // Ensure table exists for the test.
+        pool.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS learning_pulse_submissions (
+                id              uuid PRIMARY KEY,
+                pulse_id        uuid NOT NULL,
+                student_id      uuid NOT NULL,
+                message         text NOT NULL,
+                attachment_url  text,
+                submitted_at    timestamptz NOT NULL,
+
+                UNIQUE (pulse_id, student_id)
+            )
+            "#,
+        )
+        .await?;
+
+        // Clean slate.
+        pool.execute("TRUNCATE learning_pulse_submissions").await?;
+
+        let repo = SqlLearningPulseSubmissionRepository::new(pool.clone());
+        let publisher = InMemoryPublisher;
+        let service = LearningPulseService::new(repo, publisher);
+
+        let cmd = SubmitCommand {
+            pulse_id: Uuid::new_v4(),
+            student_id: Uuid::new_v4(),
+            message: "42".into(),
+            attachment_url: Some("https://files.edupulse.dev/answer.png".into()),
+        };
+
+        service.submit(cmd).await?;
+
+        // Verify persistence.
+        let count: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) FROM learning_pulse_submissions"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(count, 1);
+
+        Ok(())
+    }
+}
+```

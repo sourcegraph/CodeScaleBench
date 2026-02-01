@@ -1,0 +1,359 @@
+```rust
+//! LedgerLink Nexus – Pagination + Cache Hint Utilities
+//!
+//! This module centralises request-side pagination parsing and response-side
+//! pagination metadata / cache hints for the REST & GraphQL surfaces.  It is
+//! deliberately framework-agnostic *except* for the optional Axum helpers
+//! behind the `axum` feature flag so that other runtimes (e.g. tonic gRPC)
+//! can re-use the core logic without pulling in `tower`.
+//!
+//! Typical usage (Axum):
+//!
+//! ```rust,ignore
+//! use axum::{routing::get, Router};
+//! use ledgerlink_nexus::http_utils::{Paginated, Pagination, CacheHint};
+//!
+//! async fn list_entries(
+//!     Pagination(pager): Pagination,
+//!     State(svc): State<Arc<EntryService>>
+//! ) -> Paginated<Vec<EntryDto>> {
+//!     let (items, total) = svc.fetch_entries(pager.offset(), pager.limit()).await?;
+//!
+//!     Ok(Paginated::new(items, pager, total)
+//!         .with_cache(CacheHint::private().max_age_secs(30)))
+//! }
+//!
+//! let app = Router::new().route("/entries", get(list_entries));
+//! ```
+
+#![allow(clippy::module_name_repetitions)] // Intentional
+
+use std::cmp::min;
+use std::fmt;
+use std::num::NonZeroU32;
+use std::str::FromStr;
+use std::time::{Duration, SystemTime};
+
+use http::{header, HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Maximum number of items a client may request per page.
+pub const MAX_PER_PAGE: u32 = 500;
+
+/// Default page size when the client omits `per_page`.
+pub const DEFAULT_PER_PAGE: u32 = 50;
+
+/// ------------------------------------------------------------------------------------------------
+/// Pagination core
+/// ------------------------------------------------------------------------------------------------
+
+/// The *validated* pagination values parsed from query parameters or GraphQL arguments.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Pager {
+    page: NonZeroU32,
+    per_page: NonZeroU32,
+}
+
+impl Pager {
+    /// Creates a new `Pager`, clamping `per_page` to [`MAX_PER_PAGE`].
+    pub fn new(page: u32, per_page: u32) -> Self {
+        let page = NonZeroU32::new(page).unwrap_or_else(|| NonZeroU32::new(1).unwrap());
+        let per_page_clamped = min(per_page, MAX_PER_PAGE).max(1);
+        // SAFETY: we ensured per_page_clamped >= 1
+        let per_page = NonZeroU32::new(per_page_clamped).unwrap();
+        Self { page, per_page }
+    }
+
+    /// Zero-based row offset (suitable for SQL `OFFSET` clause).
+    #[inline]
+    pub const fn offset(self) -> u64 {
+        (self.page.get() as u64 - 1) * self.per_page.get() as u64
+    }
+
+    /// Row limit (suitable for SQL `LIMIT` clause).
+    #[inline]
+    pub const fn limit(self) -> u32 {
+        self.per_page.get()
+    }
+
+    /// Total number of pages given a `total_row_count` (*must* be the complete
+    /// count ignoring pagination).
+    pub const fn total_pages(self, total_row_count: u64) -> u64 {
+        if total_row_count == 0 {
+            0
+        } else {
+            (total_row_count + self.per_page.get() as u64 - 1) / self.per_page.get() as u64
+        }
+    }
+}
+
+/// Internal representation of raw query parameters before validation.
+#[derive(Debug, Deserialize)]
+pub struct RawPager {
+    #[serde(default)]
+    page: Option<u32>,
+    #[serde(rename = "per_page", default)]
+    per_page: Option<u32>,
+}
+
+impl From<RawPager> for Pager {
+    fn from(raw: RawPager) -> Self {
+        let page = raw.page.unwrap_or(1);
+        let per_page = raw.per_page.unwrap_or(DEFAULT_PER_PAGE);
+        Pager::new(page, per_page)
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Cache-control helpers
+/// ------------------------------------------------------------------------------------------------
+
+/// Structured wrapper around (potentially composite) cache directives.
+#[derive(Debug, Clone)]
+pub struct CacheHint {
+    max_age: Duration,
+    privacy: CachePrivacy,
+    must_revalidate: bool,
+    etag: Option<String>,
+    last_modified: Option<SystemTime>,
+}
+
+impl CacheHint {
+    /// Create a new cache hint with explicit privacy.
+    pub fn new(privacy: CachePrivacy) -> Self {
+        Self {
+            max_age: Duration::from_secs(0),
+            privacy,
+            must_revalidate: false,
+            etag: None,
+            last_modified: None,
+        }
+    }
+
+    /// Mark cache as public.
+    pub fn public() -> Self {
+        Self::new(CachePrivacy::Public)
+    }
+
+    /// Mark cache as private.
+    pub fn private() -> Self {
+        Self::new(CachePrivacy::Private)
+    }
+
+    /// How long the representation may be cached for (in seconds).
+    pub fn max_age_secs(mut self, secs: u64) -> Self {
+        self.max_age = Duration::from_secs(secs);
+        self
+    }
+
+    /// Attach an ETag.
+    pub fn with_etag<S: Into<String>>(mut self, etag: S) -> Self {
+        self.etag = Some(etag.into());
+        self
+    }
+
+    /// Attach a Last-Modified time.
+    pub fn with_last_modified(mut self, ts: SystemTime) -> Self {
+        self.last_modified = Some(ts);
+        self
+    }
+
+    /// Require caches to re-validate after expiry.
+    pub fn must_revalidate(mut self) -> Self {
+        self.must_revalidate = true;
+        self
+    }
+
+    /// Render into HTTP headers.
+    pub fn apply_headers(&self, headers: &mut HeaderMap) {
+        use std::fmt::Write;
+
+        let mut cache_control = String::new();
+        let _ = write!(
+            cache_control,
+            "{}",
+            match self.privacy {
+                CachePrivacy::Public => "public",
+                CachePrivacy::Private => "private",
+            }
+        );
+        let _ = write!(cache_control, ", max-age={}", self.max_age.as_secs());
+
+        if self.must_revalidate {
+            cache_control.push_str(", must-revalidate");
+        }
+
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_str(&cache_control).unwrap(),
+        );
+
+        if let Some(etag) = &self.etag {
+            headers.insert(header::ETAG, HeaderValue::from_str(etag).unwrap());
+        }
+        if let Some(last_modified) = self.last_modified {
+            if let Ok(rfc) = httpdate::fmt_http_date(last_modified) {
+                headers.insert(
+                    header::LAST_MODIFIED,
+                    HeaderValue::from_str(&rfc).unwrap(),
+                );
+            }
+        }
+    }
+}
+
+/// Public vs.
+#[derive(Debug, Clone, Copy)]
+pub enum CachePrivacy {
+    Public,
+    Private,
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Axum integration – behind feature flag
+/// ------------------------------------------------------------------------------------------------
+#[cfg(feature = "axum")]
+mod axum_impls {
+    use super::*;
+    use axum::extract::FromRequest;
+    use axum::http::{Request, StatusCode};
+    use axum::{response::IntoResponse, Json};
+
+    /// Extractor that validates pagination query parameters and fails *early*
+    /// with a `400 Bad Request` on malformed input.
+    ///
+    /// Usage:
+    ///
+    /// ```rust,ignore
+    /// async fn handler(Pagination(pager): Pagination) { ... }
+    /// ```
+    pub struct Pagination(pub Pager);
+
+    #[derive(Debug, Error)]
+    enum PaginationError {
+        #[error("invalid pagination parameters")]
+        Invalid,
+    }
+
+    impl IntoResponse for PaginationError {
+        fn into_response(self) -> axum::response::Response {
+            (StatusCode::BAD_REQUEST, self.to_string()).into_response()
+        }
+    }
+
+    #[axum::async_trait]
+    impl<S, B> FromRequest<S, B> for Pagination
+    where
+        B: Send + 'static,
+        S: Send + Sync,
+    {
+        type Rejection = PaginationError;
+
+        async fn from_request(req: Request<B>, _: &mut S) -> Result<Self, Self::Rejection> {
+            let query = req.uri().query().unwrap_or_default();
+            let raw: RawPager = serde_qs::from_str(query).map_err(|_| PaginationError::Invalid)?;
+            Ok(Self(raw.into()))
+        }
+    }
+
+    /// Envelope for paginated responses which auto-injects pagination metadata
+    /// into response headers *and* optionally sets caching directives.
+    ///
+    /// ```
+    /// Ok(Paginated::new(items, pager, total).with_cache(CacheHint::public()))
+    /// ```
+    pub struct Paginated<T> {
+        body: T,
+        pager: Pager,
+        total: u64,
+        cache: Option<CacheHint>,
+    }
+
+    impl<T> Paginated<T> {
+        pub fn new(body: T, pager: Pager, total: u64) -> Self {
+            Self {
+                body,
+                pager,
+                total,
+                cache: None,
+            }
+        }
+
+        pub fn with_cache(mut self, hint: CacheHint) -> Self {
+            self.cache = Some(hint);
+            self
+        }
+    }
+
+    impl<T> IntoResponse for Paginated<T>
+    where
+        T: Serialize,
+    {
+        fn into_response(self) -> axum::response::Response {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "X-Pagination-Page",
+                HeaderValue::from_str(&self.pager.page.get().to_string()).unwrap(),
+            );
+            headers.insert(
+                "X-Pagination-Per-Page",
+                HeaderValue::from_str(&self.pager.per_page.get().to_string()).unwrap(),
+            );
+            headers.insert(
+                "X-Pagination-Total",
+                HeaderValue::from_str(&self.total.to_string()).unwrap(),
+            );
+            headers.insert(
+                "X-Pagination-Pages",
+                HeaderValue::from_str(&self.pager.total_pages(self.total).to_string()).unwrap(),
+            );
+
+            if let Some(cache) = &self.cache {
+                cache.apply_headers(&mut headers);
+            }
+
+            (headers, Json(self.body)).into_response()
+        }
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Testing
+/// ------------------------------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pager_offset_limit() {
+        let p = Pager::new(3, 25);
+        assert_eq!(p.offset(), 50);
+        assert_eq!(p.limit(), 25);
+    }
+
+    #[test]
+    fn per_page_clamped_to_max() {
+        let p = Pager::new(1, MAX_PER_PAGE + 100);
+        assert_eq!(p.limit(), MAX_PER_PAGE);
+    }
+
+    #[test]
+    fn total_pages_calculation() {
+        let p = Pager::new(1, 30);
+        assert_eq!(p.total_pages(0), 0);
+        assert_eq!(p.total_pages(29), 1);
+        assert_eq!(p.total_pages(30), 1);
+        assert_eq!(p.total_pages(31), 2);
+    }
+
+    #[test]
+    fn cache_hint_header_render() {
+        let hint = CacheHint::public().max_age_secs(60);
+        let mut headers = HeaderMap::new();
+        hint.apply_headers(&mut headers);
+        let cc = headers.get(header::CACHE_CONTROL).unwrap();
+        assert_eq!(cc.to_str().unwrap(), "public, max-age=60");
+    }
+}
+```

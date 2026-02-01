@@ -1,0 +1,283 @@
+```csharp
+// File: src/module_40.txt
+// Project: PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//
+// Purpose:
+//     Implements a concrete Transformation Strategy that converts raw
+//     calendar-event telemetry into a Focus-Time KPI payload suitable for
+//     downstream storage / visualization.  This module showcases the
+//     Strategy, Pipeline, and Observer patterns that underpin the broader
+//     PulseOps data-warehouse architecture.
+//
+// ReSharper disable MemberCanBePrivate.Global
+// ReSharper disable ClassNeverInstantiated.Global
+
+using System;
+using System.Buffers;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOpsWarehouse.Transformations.Calendar
+{
+    #region Public Records / DTOs
+
+    /// <summary>
+    ///     Raw event as ingested from SaaS calendar providers (M365 / Google).
+    ///     This model is the *canonical* representation inside the PulseOps
+    ///     data-lake—avoiding provider-specific quirks at later stages.
+    /// </summary>
+    public sealed record CalendarEvent
+    {
+        public required string UserId { get; init; }
+        public required string EventId { get; init; }
+        public required DateTimeOffset StartUtc { get; init; }
+        public required DateTimeOffset EndUtc { get; init; }
+
+        /// <summary>
+        ///     Meeting, PTO, Focus, OutOfOffice, etc.
+        /// </summary>
+        public required string EventType { get; init; }
+
+        /// <summary>
+        ///     Micro-cost of the event in USD, pre-calculated upstream.
+        /// </summary>
+        public decimal CostUsd { get; init; }
+
+        /// <summary>
+        ///     Serialized JSON payload from the original provider (optional).
+        ///     Stored for ML / audit scenarios.
+        /// </summary>
+        public string? RawPayloadJson { get; init; }
+    }
+
+    /// <summary>
+    ///     Focus-time KPI payload.
+    /// </summary>
+    public sealed record FocusTimeKpi
+    {
+        public required string UserId { get; init; }
+        public required DateOnly Day { get; init; }
+        public required TimeSpan TotalWork { get; init; }
+        public required TimeSpan Focus { get; init; }
+        public required decimal MeetingCostUsd { get; init; }
+
+        /// <summary>
+        ///     Ratio in the range 0..1.  Null when <see cref="TotalWork" /> is 0.
+        /// </summary>
+        public decimal? FocusRatio =>
+            TotalWork == TimeSpan.Zero
+                ? null
+                : Convert.ToDecimal(Focus.TotalMinutes / TotalWork.TotalMinutes);
+    }
+
+    #endregion
+
+    #region Infrastructure ‑ Contracts
+
+    /// <summary>
+    ///     Generic strategy interface for ETL transformations.
+    /// </summary>
+    /// <typeparam name="TIn">Input record type.</typeparam>
+    /// <typeparam name="TOut">Output record type.</typeparam>
+    public interface ITransformationStrategy<in TIn, TOut>
+    {
+        /// <summary>
+        ///     Transforms the specified events.
+        /// </summary>
+        /// <param name="input">Upstream async enumerable.</param>
+        /// <param name="ct">Cancellation token.</param>
+        /// <returns>Asynchronous enumeration of <typeparamref name="TOut" />.</returns>
+        IAsyncEnumerable<TOut> TransformAsync(IAsyncEnumerable<TIn> input,
+            CancellationToken ct = default);
+    }
+
+    /// <summary>
+    ///     Common plumbing for concrete strategies—logging, validation, etc.
+    /// </summary>
+    public abstract class TransformationStrategyBase<TIn, TOut>
+        : ITransformationStrategy<TIn, TOut>
+    {
+        protected TransformationStrategyBase(ILogger logger)
+        {
+            Logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        protected ILogger Logger { get; }
+
+        public abstract IAsyncEnumerable<TOut> TransformAsync(
+            IAsyncEnumerable<TIn> input, CancellationToken ct = default);
+    }
+
+    #endregion
+
+    #region Concrete Strategy
+
+    /// <summary>
+    ///     Calculates <see cref="FocusTimeKpi" /> per user-day.
+    /// </summary>
+    public sealed class FocusTimeRatioTransformationStrategy
+        : TransformationStrategyBase<CalendarEvent, FocusTimeKpi>
+    {
+        // Workday boundaries (customizable via DI in real-world usage)
+        private static readonly TimeSpan WorkdayStart = TimeSpan.FromHours(8);
+        private static readonly TimeSpan WorkdayEnd = TimeSpan.FromHours(18);
+
+        private const string EventTypeMeeting = "Meeting";
+
+        public FocusTimeRatioTransformationStrategy(ILogger<FocusTimeRatioTransformationStrategy> logger)
+            : base(logger)
+        {
+        }
+
+        public override async IAsyncEnumerable<FocusTimeKpi> TransformAsync(
+            IAsyncEnumerable<CalendarEvent> input,
+            [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            Guard.AgainstNull(input);
+
+            // Materialize events per user in a lookup for concurrent processing.
+            var lookup = new ConcurrentDictionary<(string UserId, DateOnly Day),
+                List<CalendarEvent>>();
+
+            await foreach (var evt in input.WithCancellation(ct)
+                                           .ConfigureAwait(false))
+            {
+                ValidateEvent(evt);
+
+                var day = DateOnly.FromDateTime(evt.StartUtc.UtcDateTime);
+                lookup.GetOrAdd((evt.UserId, day), _ => new List<CalendarEvent>())
+                       .Add(evt);
+            }
+
+            // Parallelize across user-days—bounded by CPU cores.
+            var results = new ConcurrentBag<FocusTimeKpi>();
+
+            Parallel.ForEach(lookup,
+                new ParallelOptions { CancellationToken = ct },
+                kvp =>
+                {
+                    var ((userId, day), events) = kvp;
+                    try
+                    {
+                        var kpi = ComputeFocusKpi(userId, day, events);
+                        results.Add(kpi);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogError(ex,
+                            "Failed to compute FocusTime KPI for {UserId} on {Day}",
+                            userId, day);
+                    }
+                });
+
+            foreach (var kpi in results.OrderBy(x => x.UserId)
+                                       .ThenBy(x => x.Day))
+            {
+                yield return kpi;
+            }
+        }
+
+        #region Helpers
+
+        private static void ValidateEvent(CalendarEvent evt)
+        {
+            if (evt.EndUtc <= evt.StartUtc)
+                throw new ArgumentException(
+                    $"CalendarEvent {evt.EventId} has EndUtc <= StartUtc.");
+
+            if (string.IsNullOrWhiteSpace(evt.UserId))
+                throw new ArgumentException(
+                    $"CalendarEvent {evt.EventId} has empty UserId.");
+        }
+
+        private static FocusTimeKpi ComputeFocusKpi(string userId,
+            DateOnly day,
+            IEnumerable<CalendarEvent> events)
+        {
+            // Clip the work-interval to company-wide policy.
+            var workStart = day.ToDateTime(TimeOnly.FromTimeSpan(WorkdayStart),
+                DateTimeKind.Utc);
+            var workEnd = day.ToDateTime(TimeOnly.FromTimeSpan(WorkdayEnd),
+                DateTimeKind.Utc);
+
+            var workInterval = (Start: workStart, End: workEnd);
+
+            var focusMinutes = 0.0;
+            var meetingCost = 0m;
+
+            foreach (var evt in events)
+            {
+                var overlapped = OverlapMinutes(workInterval.Start, workInterval.End,
+                    evt.StartUtc.UtcDateTime, evt.EndUtc.UtcDateTime);
+
+                if (overlapped <= 0)
+                    continue;
+
+                if (string.Equals(evt.EventType, EventTypeMeeting,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    // Meeting time does NOT classify as focus.
+                    meetingCost += evt.CostUsd;
+                }
+                else
+                {
+                    focusMinutes += overlapped;
+                }
+            }
+
+            var totalWorkMinutes = (workInterval.End - workInterval.Start).TotalMinutes;
+            return new FocusTimeKpi
+            {
+                UserId = userId,
+                Day = day,
+                TotalWork = TimeSpan.FromMinutes(totalWorkMinutes),
+                Focus = TimeSpan.FromMinutes(focusMinutes),
+                MeetingCostUsd = Decimal.Round(meetingCost, 2,
+                    MidpointRounding.AwayFromZero)
+            };
+        }
+
+        /// <summary>
+        ///     Returns the duration (in minutes) where [aStart, aEnd] overlaps
+        ///     with [bStart, bEnd], 0 when disjoint.
+        /// </summary>
+        private static double OverlapMinutes(DateTime aStart, DateTime aEnd,
+            DateTime bStart, DateTime bEnd)
+        {
+            var start = aStart > bStart ? aStart : bStart;
+            var end = aEnd < bEnd ? aEnd : bEnd;
+            var delta = (end - start).TotalMinutes;
+            return delta > 0 ? delta : 0;
+        }
+
+        #endregion
+    }
+
+    #endregion
+
+    #region Utilities
+
+    /// <summary>
+    ///     Guard clauses for defensive programming.
+    /// </summary>
+    internal static class Guard
+    {
+        public static void AgainstNull([NotNull] object? value,
+            string? name = null)
+        {
+            if (value is null)
+                throw new ArgumentNullException(name);
+        }
+    }
+
+    #endregion
+}
+```

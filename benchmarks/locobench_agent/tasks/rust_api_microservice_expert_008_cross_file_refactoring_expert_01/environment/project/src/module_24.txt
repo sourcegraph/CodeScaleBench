@@ -1,0 +1,391 @@
+```rust
+//! LedgerLink Nexus – Ledger Entry Query Service
+//! ---------------------------------------------
+//! This module wires together validation, repository access, caching and logging
+//! to deliver paginated ledger-entry results.  It is representative of the
+//! Command/Query service layer used throughout the LedgerLink Nexus code-base.
+//
+//! The service is intentionally self-contained so that it can be reused by both
+//! REST and GraphQL transport adapters without leaking implementation details.
+
+use std::{fmt, sync::Arc};
+
+use anyhow::Context as AnyhowContext;
+use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, Utc};
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use thiserror::Error;
+use tokio::time::{timeout, Duration};
+use tracing::{debug, error, info, instrument};
+use validator::{Validate, ValidationError};
+
+/// The maximum number of items a caller is allowed to request per page.
+const MAX_PER_PAGE: u32 = 250;
+/// Redis TTL for cached query results.
+const CACHE_TTL_SECS: usize = 30;
+
+/// Application-level error type for the query service.
+#[derive(Debug, Error)]
+pub enum LedgerQueryError {
+    #[error("validation error: {0}")]
+    Validation(String),
+
+    #[error("database error")]
+    Database(#[from] sqlx::Error),
+
+    #[error("cache error: {0}")]
+    Cache(String),
+
+    #[error("internal error")]
+    Internal(#[from] anyhow::Error),
+}
+
+/// Lightweight domain representation (persisted table).
+#[derive(Debug)]
+pub struct LedgerEntry {
+    pub id: i64,
+    pub tenant_id: uuid::Uuid,
+    pub account_id: String,
+    pub amount: rust_decimal::Decimal,
+    pub currency: String,
+    pub booking_date: NaiveDate,
+    pub captured_at: DateTime<Utc>,
+}
+
+/// DTO (View-Model) returned to external clients.
+///
+/// Separating it from the domain model allows us to:
+/// * hide fields (e.g. `tenant_id`)
+/// * add serialization hints
+/// * add forward-compatibility changes without touching persistence layer
+#[derive(Debug, Serialize)]
+pub struct LedgerEntryDto {
+    pub id: i64,
+    pub account_id: String,
+    pub amount: String, // decimal ↦ string for precision-safe JSON
+    pub currency: String,
+    pub booking_date: NaiveDate,
+    pub captured_at: DateTime<Utc>,
+}
+
+impl From<LedgerEntry> for LedgerEntryDto {
+    fn from(src: LedgerEntry) -> Self {
+        Self {
+            id: src.id,
+            account_id: src.account_id,
+            amount: src.amount.normalize().to_string(),
+            currency: src.currency,
+            booking_date: src.booking_date,
+            captured_at: src.captured_at,
+        }
+    }
+}
+
+/// Query parameters sent by the client.
+///
+/// Validation is performed via the `validator` crate.
+#[derive(Debug, Deserialize, Validate)]
+pub struct LedgerEntryQuery {
+    #[validate(length(min = 1, max = 64))]
+    pub account_id: Option<String>,
+
+    #[validate(custom = "validate_date_range")]
+    pub from: Option<NaiveDate>,
+
+    pub to: Option<NaiveDate>,
+
+    #[validate(range(min = 1))]
+    pub page: Option<u32>,
+
+    #[validate(range(min = 1, max = "MAX_PER_PAGE"))]
+    pub per_page: Option<u32>,
+}
+
+fn validate_date_range(from: &Option<NaiveDate>) -> Result<(), ValidationError> {
+    // Additional cross-field checks happen later in the service,
+    // but this shows how custom validation hooks are installed.
+    if let Some(date) = from {
+        if *date > Utc::now().date_naive() {
+            return Err(ValidationError::new("future_date"));
+        }
+    }
+    Ok(())
+}
+
+/// A generic paginated wrapper used across the API.
+#[derive(Debug, Serialize)]
+pub struct Paginated<T> {
+    pub items: Vec<T>,
+    pub page: u32,
+    pub per_page: u32,
+    pub total: u64,
+}
+
+/// Repository abstraction isolating persistence.
+///
+/// Having an async trait here lets us wire in different back-ends
+/// (Postgres, mock/in-memory, etc.) without touching higher layers.
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    async fn fetch_entries(
+        &self,
+        tenant_id: uuid::Uuid,
+        query: &LedgerEntryQuery,
+    ) -> Result<(Vec<LedgerEntry>, u64), sqlx::Error>;
+}
+
+/// Concrete Postgres implementation backed by sqlx.
+pub struct PgLedgerEntryRepository {
+    pool: PgPool,
+}
+
+impl PgLedgerEntryRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for PgLedgerEntryRepository {
+    #[instrument(level = "debug", skip_all, fields(tenant_id = %tenant_id))]
+    async fn fetch_entries(
+        &self,
+        tenant_id: uuid::Uuid,
+        q: &LedgerEntryQuery,
+    ) -> Result<(Vec<LedgerEntry>, u64), sqlx::Error> {
+        // This query is purposely simplified. A real implementation would use
+        // dynamic SQL or SQLx’s query builder to conditionally add filters.
+        let page = q.page.unwrap_or(1);
+        let per_page = q.per_page.unwrap_or(50);
+
+        let items = sqlx::query_as!(
+            LedgerEntry,
+            r#"
+            SELECT id,
+                   tenant_id,
+                   account_id,
+                   amount,
+                   currency,
+                   booking_date,
+                   captured_at
+            FROM ledger_entries
+            WHERE tenant_id = $1
+              AND ($2::text IS NULL OR account_id = $2)
+              AND ($3::date IS NULL OR booking_date >= $3)
+              AND ($4::date IS NULL OR booking_date <= $4)
+            ORDER BY booking_date DESC
+            LIMIT $5 OFFSET $6
+            "#,
+            tenant_id,
+            q.account_id,
+            q.from,
+            q.to,
+            per_page as i64,
+            ((page - 1) * per_page) as i64
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let total: i64 = sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*)
+            FROM ledger_entries
+            WHERE tenant_id = $1
+              AND ($2::text IS NULL OR account_id = $2)
+              AND ($3::date IS NULL OR booking_date >= $3)
+              AND ($4::date IS NULL OR booking_date <= $4)
+            "#,
+            tenant_id,
+            q.account_id,
+            q.from,
+            q.to
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok((items, total as u64))
+    }
+}
+
+/// Redis façade new-typed to avoid key/TTL leakage.
+pub struct Cache(Arc<redis::Client>);
+
+impl Cache {
+    pub fn new(client: redis::Client) -> Self {
+        Self(Arc::new(client))
+    }
+
+    async fn get_or_set<F, T>(&self, key: &str, ttl_secs: usize, f: F) -> Result<T, LedgerQueryError>
+    where
+        F: std::future::Future<Output = Result<T, LedgerQueryError>> + Send,
+        T: Serialize + for<'de> Deserialize<'de> + Send + Clone,
+    {
+        let mut con = self
+            .0
+            .get_async_connection()
+            .await
+            .map_err(|e| LedgerQueryError::Cache(e.to_string()))?;
+
+        // Try cache first
+        if let Ok(cached_bytes): Result<Vec<u8>, _> = con.get(key).await {
+            if !cached_bytes.is_empty() {
+                let val = bincode::deserialize(&cached_bytes)
+                    .map_err(|e| LedgerQueryError::Cache(e.to_string()))?;
+                return Ok(val);
+            }
+        }
+
+        // Fallback to the expensive function
+        let val = f.await?;
+        // Ignore failures when populating cache but log them.
+        if let Ok(serialized) = bincode::serialize(&val) {
+            let set_res: Result<(), _> = con.set_ex(key, serialized, ttl_secs).await;
+            if let Err(e) = set_res {
+                error!(error = %e, "failed to cache response");
+            }
+        }
+        Ok(val)
+    }
+}
+
+/// The service exposed to transport layers.
+///
+/// It orchestrates validation, caching and repository IO.
+pub struct LedgerEntryQueryService<R: LedgerEntryRepository> {
+    repo: Arc<R>,
+    cache: Cache,
+}
+
+impl<R: LedgerEntryRepository> LedgerEntryQueryService<R> {
+    pub fn new(repo: Arc<R>, cache: Cache) -> Self {
+        Self { repo, cache }
+    }
+
+    /// Fetch ledger entries for the given tenant.
+    ///
+    /// On success returns a paginated DTO collection.
+    #[instrument(skip(self), level = "info", err)]
+    pub async fn handle(
+        &self,
+        tenant_id: uuid::Uuid,
+        query: LedgerEntryQuery,
+    ) -> Result<Paginated<LedgerEntryDto>, LedgerQueryError> {
+        // ---------------------------------------------------------------------
+        // 1. Validate input DTO
+        // ---------------------------------------------------------------------
+        query
+            .validate()
+            .map_err(|e| LedgerQueryError::Validation(e.to_string()))?;
+
+        if let (Some(from), Some(to)) = (query.from, query.to) {
+            if from > to {
+                return Err(LedgerQueryError::Validation(
+                    "`from` date cannot be after `to` date".into(),
+                ));
+            }
+        }
+
+        let page = query.page.unwrap_or(1);
+        let per_page = query.per_page.unwrap_or(50);
+
+        // ---------------------------------------------------------------------
+        // 2. Check cache
+        // ---------------------------------------------------------------------
+        let cache_key = format!(
+            "ledger:{tenant}:{hash}",
+            tenant = tenant_id,
+            hash = blake3::hash(
+                &serde_json::to_vec(&query)
+                    .expect("Vec<u8> from query will never fail") // safe: only serializing primitives
+            )
+        );
+
+        let repo = self.repo.clone();
+        let cache_clone = self.cache.clone();
+        let tenant = tenant_id;
+
+        let paginated: Paginated<LedgerEntryDto> = cache_clone
+            .get_or_set(&cache_key, CACHE_TTL_SECS, async move {
+                // -----------------------------------------------------------------
+                // 3. Fetch from repository
+                // -----------------------------------------------------------------
+                let (entries, total) = repo
+                    .fetch_entries(tenant, &query)
+                    .await
+                    .context("repo.fetch_entries")?;
+
+                // -----------------------------------------------------------------
+                // 4. Map to DTO
+                // -----------------------------------------------------------------
+                let items = entries.into_iter().map(LedgerEntryDto::from).collect();
+
+                Ok(Paginated {
+                    items,
+                    page,
+                    per_page,
+                    total,
+                })
+            })
+            .await?;
+
+        info!(items = paginated.items.len(), "ledger entries retrieved");
+        Ok(paginated)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests (can be run via `cargo test --lib --all-features`)
+// -----------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    struct FakeRepo {
+        store: Arc<Mutex<HashMap<uuid::Uuid, Vec<LedgerEntry>>>>,
+    }
+
+    #[async_trait]
+    impl LedgerEntryRepository for FakeRepo {
+        async fn fetch_entries(
+            &self,
+            tenant_id: uuid::Uuid,
+            _query: &LedgerEntryQuery,
+        ) -> Result<(Vec<LedgerEntry>, u64), sqlx::Error> {
+            // A fake implementation that bypasses database.
+            let map = self.store.lock().await;
+            let entries = map.get(&tenant_id).cloned().unwrap_or_default();
+            let total = entries.len() as u64;
+            Ok((entries, total))
+        }
+    }
+
+    fn build_service() -> LedgerEntryQueryService<FakeRepo> {
+        let repo = Arc::new(FakeRepo {
+            store: Arc::new(Mutex::new(HashMap::new())),
+        });
+        // Use a local Redis instance for integration tests; replace with a fake
+        // in-memory cache for unit tests (not shown here for brevity).
+        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+        LedgerEntryQueryService::new(repo, Cache::new(client))
+    }
+
+    #[tokio::test]
+    async fn validation_fails_for_bad_page_size() {
+        let svc = build_service();
+        let query = LedgerEntryQuery {
+            account_id: None,
+            from: None,
+            to: None,
+            page: Some(0),
+            per_page: Some(10),
+        };
+        let tenant_id = uuid::Uuid::new_v4();
+        let res = svc.handle(tenant_id, query).await;
+        assert!(matches!(res, Err(LedgerQueryError::Validation(_))));
+    }
+}
+```

@@ -1,0 +1,370 @@
+```rust
+//! LedgerLink Nexus – Ledger Entry Query Service
+//!
+//! This module glues together pagination, validation, repository calls and
+//! Redis-backed response caching for high-volume ledger entry look-ups.  It
+//! demonstrates the CQRS philosophy used across the code base: the public
+//! facade (`LedgerEntryQueryService`) is read-only; mutating commands live
+//! elsewhere.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
+use deadpool_redis::{redis::AsyncCommands, Connection as RedisConnection, Pool as RedisPool};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::task;
+use tracing::{debug, instrument};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Domain Model
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct LedgerEntry {
+    pub id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
+    pub account_id: uuid::Uuid,
+    pub posted_at: DateTime<Utc>,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub description: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Repository Abstraction
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("database error: {0}")]
+    Database(anyhow::Error),
+    #[error("resource not found")]
+    NotFound,
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+}
+
+#[async_trait::async_trait]
+pub trait LedgerEntryRepository: Send + Sync + 'static {
+    async fn find(
+        &self,
+        tenant_id: uuid::Uuid,
+        filter: LedgerEntryFilter,
+        page: Pagination,
+    ) -> Result<(Vec<LedgerEntry>, PageInfo), RepositoryError>;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Query Parameters (View-Model)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Client-visible pagination hints
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Pagination {
+    /// 1-based page index
+    pub page: u32,
+    /// page size (bounded in [`Pagination::sanitize`])
+    pub per_page: u32,
+}
+
+impl Pagination {
+    const MAX_PAGE_SIZE: u32 = 250;
+
+    pub fn sanitize(mut self) -> Self {
+        if self.page == 0 {
+            self.page = 1;
+        }
+        self.per_page = self.per_page.clamp(1, Self::MAX_PAGE_SIZE);
+        self
+    }
+
+    pub fn offset_limit(&self) -> (u32, u32) {
+        let offset = (self.page - 1) * self.per_page;
+        (offset, self.per_page)
+    }
+}
+
+/// Client-visible filter fields
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LedgerEntryFilter {
+    pub account_id: Option<uuid::Uuid>,
+    pub posted_from: Option<DateTime<Utc>>,
+    pub posted_to: Option<DateTime<Utc>>,
+}
+
+/// Extra meta data returned alongside a paged response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageInfo {
+    pub page: u32,
+    pub per_page: u32,
+    pub total_pages: u32,
+    pub total_items: u64,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DTO (View)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEntryView {
+    pub id: uuid::Uuid,
+    pub account_id: uuid::Uuid,
+    pub posted_at: DateTime<Utc>,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub description: Option<String>,
+}
+
+impl From<LedgerEntry> for LedgerEntryView {
+    fn from(e: LedgerEntry) -> Self {
+        LedgerEntryView {
+            id: e.id,
+            account_id: e.account_id,
+            posted_at: e.posted_at,
+            amount_minor: e.amount_minor,
+            currency: e.currency,
+            description: e.description,
+        }
+    }
+}
+
+/// Envelope returned to the API gateway
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PagedLedgerEntries {
+    pub entries: Vec<LedgerEntryView>,
+    pub page_info: PageInfo,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public Service Layer
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum QueryServiceError {
+    #[error("repository: {0}")]
+    Repository(#[from] RepositoryError),
+    #[error("cache: {0}")]
+    Cache(anyhow::Error),
+}
+
+#[derive(Clone)]
+pub struct LedgerEntryQueryService {
+    repo: Arc<dyn LedgerEntryRepository>,
+    redis: RedisPool,
+    cache_ttl: Duration,
+}
+
+impl LedgerEntryQueryService {
+    pub fn new(
+        repo: Arc<dyn LedgerEntryRepository>,
+        redis: RedisPool,
+        cache_ttl: Duration,
+    ) -> Self {
+        Self {
+            repo,
+            redis,
+            cache_ttl,
+        }
+    }
+
+    #[instrument(skip(self))]
+    pub async fn query(
+        &self,
+        tenant_id: uuid::Uuid,
+        filter: LedgerEntryFilter,
+        pagination: Pagination,
+    ) -> Result<PagedLedgerEntries, QueryServiceError> {
+        // Sanitize user input first
+        let pagination = pagination.sanitize();
+        let cache_key = Self::make_cache_key(tenant_id, &filter, &pagination);
+
+        // 1) Try Redis
+        if let Some(cached) = self.fetch_cached(&cache_key).await? {
+            debug!("cache hit for {cache_key}");
+            return Ok(cached);
+        }
+
+        // 2) Hit repository
+        let (entries, page_info) = self
+            .repo
+            .find(tenant_id, filter.clone(), pagination)
+            .await?;
+
+        let response = PagedLedgerEntries {
+            entries: entries.into_iter().map(LedgerEntryView::from).collect(),
+            page_info,
+        };
+
+        // 3) Fire-and-forget cache insert
+        self.insert_cache(cache_key, &response).await;
+
+        Ok(response)
+    }
+
+    fn make_cache_key(
+        tenant_id: uuid::Uuid,
+        filter: &LedgerEntryFilter,
+        pagination: &Pagination,
+    ) -> String {
+        // NB:  sha1 would be smaller, but explicit is fine
+        format!(
+            "ledger:entries:{}:{:x?}:{:?}:{:?}",
+            tenant_id, filter, pagination.page, pagination.per_page
+        )
+    }
+
+    #[instrument(skip(self))]
+    async fn fetch_cached(
+        &self,
+        key: &str,
+    ) -> Result<Option<PagedLedgerEntries>, QueryServiceError> {
+        let mut conn = self.get_redis().await?;
+        let json: Option<String> = conn.get(key).await.map_err(anyhow::Error::from)?;
+        json.map(|s| serde_json::from_str(&s).map_err(anyhow::Error::from))
+            .transpose()
+            .map_err(QueryServiceError::Cache)
+    }
+
+    #[instrument(skip(self, response))]
+    async fn insert_cache(&self, key: String, response: &PagedLedgerEntries) {
+        let payload = match serde_json::to_string(response) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("failed to serialize cache entry: {e:?}");
+                return;
+            }
+        };
+        let ttl = self.cache_ttl;
+        let pool = self.redis.clone();
+
+        task::spawn(async move {
+            if let Ok(mut conn) = pool.get().await {
+                let _: Result<(), _> = conn
+                    .set_ex::<_, _, ()>(key, payload, ttl.as_secs() as usize)
+                    .await;
+            }
+        });
+    }
+
+    async fn get_redis(&self) -> Result<RedisConnection, QueryServiceError> {
+        self.redis.get().await.map_err(|e| QueryServiceError::Cache(e.into()))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dummy Repository Implementation (for unit tests / local dev)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// This implementation is for demonstration purposes only.  A production
+/// version would use `sqlx` or `diesel` to stream rows from Postgres.
+pub struct InMemoryLedgerEntryRepository {
+    data: Arc<Vec<LedgerEntry>>,
+}
+
+impl InMemoryLedgerEntryRepository {
+    pub fn new(data: Vec<LedgerEntry>) -> Self {
+        Self { data: Arc::new(data) }
+    }
+}
+
+#[async_trait::async_trait]
+impl LedgerEntryRepository for InMemoryLedgerEntryRepository {
+    async fn find(
+        &self,
+        tenant_id: uuid::Uuid,
+        filter: LedgerEntryFilter,
+        page: Pagination,
+    ) -> Result<(Vec<LedgerEntry>, PageInfo), RepositoryError> {
+        // naive search impl
+        let mut items: Vec<_> = self
+            .data
+            .iter()
+            .filter(|e| e.tenant_id == tenant_id)
+            .cloned()
+            .collect();
+
+        if let Some(acc) = filter.account_id {
+            items.retain(|e| e.account_id == acc);
+        }
+        if let Some(from) = filter.posted_from {
+            items.retain(|e| e.posted_at >= from);
+        }
+        if let Some(to) = filter.posted_to {
+            items.retain(|e| e.posted_at <= to);
+        }
+
+        items.sort_by_key(|e| e.posted_at);
+
+        let total_items = items.len() as u64;
+        let total_pages =
+            ((total_items as f64) / page.per_page as f64).ceil().max(1.0) as u32;
+
+        let (offset, limit) = page.offset_limit();
+        let slice = items
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect::<Vec<_>>();
+
+        Ok((
+            slice,
+            PageInfo {
+                page: page.page,
+                per_page: page.per_page,
+                total_pages,
+                total_items,
+            },
+        ))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deadpool_redis::Config;
+
+    #[tokio::test]
+    async fn pagination_sanitize() {
+        let p = Pagination { page: 0, per_page: 10 }.sanitize();
+        assert_eq!(p.page, 1);
+    }
+
+    #[tokio::test]
+    async fn query_service_returns_data() {
+        let tenant = uuid::Uuid::new_v4();
+        let repo = InMemoryLedgerEntryRepository::new(vec![LedgerEntry {
+            id: uuid::Uuid::new_v4(),
+            tenant_id: tenant,
+            account_id: uuid::Uuid::new_v4(),
+            posted_at: Utc::now(),
+            amount_minor: 100,
+            currency: "USD".into(),
+            description: None,
+        }]);
+
+        let repo: Arc<dyn LedgerEntryRepository> = Arc::new(repo);
+
+        // create meaningless local Redis pool (won't connect)
+        let redis_pool = Config::from_url("redis://127.0.0.1/")
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .unwrap();
+
+        let svc = LedgerEntryQueryService::new(repo, redis_pool, Duration::from_secs(1));
+
+        let result = svc
+            .query(tenant, LedgerEntryFilter::default(), Pagination { page: 1, per_page: 10 })
+            .await
+            .unwrap();
+
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.page_info.total_items, 1);
+    }
+}
+```

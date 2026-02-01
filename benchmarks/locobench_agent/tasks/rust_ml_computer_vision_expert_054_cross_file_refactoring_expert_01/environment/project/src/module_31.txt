@@ -1,0 +1,420 @@
+```rust
+//! src/module_31.rs
+//!
+//! Monitoring & Retraining Sub-system (Utility Ops layer)
+//!
+//! This module provides a small, but production-grade, implementation of the
+//! Observer pattern that powers model-monitoring and automated-retraining
+//! workflows.
+//!
+//!  • `MonitoringEvent` encapsulates domain events emitted by live models.
+//!  • `Observer` is a trait implemented by any component that reacts to events.
+//!  • `EventBus` is an async, fan-out dispatcher with dynamic subscription.
+//!  • `RetrainingTrigger` listens for metric deterioration or drift and
+//!    schedules retraining jobs via the internal `ModelRegistry`.
+//!  • `AlertDispatcher` forwards critical events to an external alerting stack
+//!    (e.g. Kafka, PagerDuty, e-mail, …).
+//!
+//! Although the API is small, it is engineered around real-world constraints:
+//!    – back-pressure handling (`tokio::sync::mpsc`)  
+//!    – asynchronous observers (`async_trait`)  
+//!    – robust error propagation (`thiserror`)  
+//!    – defensive cloning and Arc-based sharing for safety and performance.
+
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use semver::Version;
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::mpsc,
+    task::JoinHandle,
+    time::{sleep, timeout},
+};
+
+/// Domain identifier for a concrete, versioned model artefact.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ModelId {
+    pub name:       String,
+    pub version:    Version,
+    pub deployed_at: DateTime<Utc>,
+}
+
+/// Key performance indicators for a running model.
+#[derive(Clone, Debug)]
+pub struct ModelMetrics {
+    pub model:        ModelId,
+    pub accuracy:     f32,
+    pub precision:    f32,
+    pub recall:       f32,
+    pub f1:           f32,
+    pub captured_at:  DateTime<Utc>,
+}
+
+/// Statistical test result indicating significant data drift.
+#[derive(Clone, Debug)]
+pub struct DriftStatus {
+    pub model:       ModelId,
+    pub p_value:     f32,
+    pub magnitude:   f32,
+    pub detected_at: DateTime<Utc>,
+}
+
+/// Envelope for all monitoring events emitted by the Serving-Ops layer.
+#[derive(Clone, Debug)]
+pub enum MonitoringEvent {
+    Metrics(ModelMetrics),
+    Drift(DriftStatus),
+}
+
+/// Generic error returned by an [`Observer`] implementation.
+#[derive(Debug, Error)]
+pub enum ObserverError {
+    #[error("Upstream I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Registry error: {0}")]
+    Registry(String),
+
+    #[error("Unknown observer error: {0}")]
+    Other(String),
+}
+
+/// Observer trait – suppliers implement this to receive live events.
+///
+/// Note: The trait is `async` thanks to `async_trait` so that observers can
+/// perform I/O without blocking the dispatcher.
+#[async_trait]
+pub trait Observer: Send + Sync + 'static {
+    async fn on_event(&self, event: &MonitoringEvent) -> Result<(), ObserverError>;
+}
+
+/// Fan-out async event bus.
+///
+/// The bus maintains a receiver loop and broadcasts incoming events to all
+/// registered observers. It is deliberately simple – if an observer fails, we
+/// log the error but keep dispatching to the rest.
+pub struct EventBus {
+    tx:     mpsc::Sender<MonitoringEvent>,
+    handle: JoinHandle<()>,
+}
+
+impl EventBus {
+    /// Create a new [`EventBus`] with the given queue capacity.
+    pub fn new(capacity: usize) -> Self {
+        let (tx, mut rx) = mpsc::channel::<MonitoringEvent>(capacity);
+        // Observers can be added dynamically via a cloned sender.
+        let mut observers: Vec<Arc<dyn Observer>> = Vec::new();
+
+        let handle = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                // Dispatch clone so observers cannot mutate original event.
+                for obs in &observers {
+                    let evt_clone = event.clone();
+                    // Fire and forget; other observers must not block.
+                    let obs = Arc::clone(obs);
+                    tokio::spawn(async move {
+                        if let Err(e) = obs.on_event(&evt_clone).await {
+                            tracing::warn!(
+                                error = %e,
+                                ?evt_clone,
+                                "observer error while handling event"
+                            );
+                        }
+                    });
+                }
+            }
+            tracing::info!("event-bus terminated – no further monitoring events");
+        });
+
+        Self { tx, handle }
+    }
+
+    /// Register a new observer. Safe to call at any time.
+    pub fn subscribe<O>(&self, observer: O)
+    where
+        O: Observer,
+    {
+        // We achieve dynamic mutability by cloning sender and pushing a special
+        // control event that adds the observer to the internal list.
+        // Simpler for demo: require clients to call `add_observer` _before_
+        // sending events.
+        let observers_ptr = self
+            .handle
+            .task()
+            .as_ref()
+            .and_then(|t| t.downcast_ref::<Vec<Arc<dyn Observer>>>());
+
+        if let Some(vec) = observers_ptr {
+            vec.push(Arc::new(observer));
+        }
+    }
+
+    /// Emit a single [`MonitoringEvent`] to all subscribers.
+    pub async fn publish(&self, evt: MonitoringEvent) -> Result<(), mpsc::error::SendError<MonitoringEvent>> {
+        self.tx.send(evt).await
+    }
+
+    /// Graceful shutdown with timeout – waits for the background task to end.
+    pub async fn shutdown(self, deadline: Duration) {
+        drop(self.tx); // close channel
+        if let Err(e) = timeout(deadline, self.handle).await {
+            tracing::warn!("event-bus did not shut down within {:?}: {:?}", deadline, e);
+        }
+    }
+}
+
+/// Minimal interface for the Model Registry.
+///
+/// Keeps the example self-contained while still resembling a real component.
+/// A production implementation would expose far more functionality.
+#[async_trait]
+pub trait ModelRegistry: Send + Sync {
+    async fn schedule_retraining(&self, model: &ModelId) -> Result<(), ObserverError>;
+}
+
+/// Concrete observer that triggers retraining when metrics fall below a
+/// configurable threshold OR when p-value indicates strong drift.
+pub struct RetrainingTrigger<R: ModelRegistry> {
+    registry: Arc<R>,
+    min_f1:   f32,
+    max_p:    f32,
+}
+
+impl<R: ModelRegistry> RetrainingTrigger<R> {
+    pub fn new(registry: Arc<R>, min_f1: f32, max_p: f32) -> Self {
+        Self { registry, min_f1, max_p }
+    }
+}
+
+#[async_trait]
+impl<R: ModelRegistry> Observer for RetrainingTrigger<R> {
+    async fn on_event(&self, event: &MonitoringEvent) -> Result<(), ObserverError> {
+        match event {
+            MonitoringEvent::Metrics(m) if m.f1 < self.min_f1 => {
+                tracing::info!(
+                    model = %m.model.name,
+                    version = %m.model.version,
+                    f1 = m.f1,
+                    "F1 below threshold – scheduling retraining"
+                );
+                self.registry.schedule_retraining(&m.model).await?;
+            }
+            MonitoringEvent::Drift(d) if d.p_value < self.max_p => {
+                tracing::info!(
+                    model = %d.model.name,
+                    version = %d.model.version,
+                    p_value = d.p_value,
+                    "Statistical drift detected – scheduling retraining"
+                );
+                self.registry.schedule_retraining(&d.model).await?;
+            }
+            _ => {} // ignore
+        }
+        Ok(())
+    }
+}
+
+/// Generic alert message forwarded to incident-management or messaging stacks.
+#[derive(Clone, Debug)]
+pub struct AlertMessage {
+    pub subject: String,
+    pub body:    String,
+    pub created: SystemTime,
+}
+
+/// Observer that converts critical events into alerts.
+/// Uses its own bounded queue to tolerate short-lived outages of the
+/// downstream alerting system.
+pub struct AlertDispatcher {
+    tx: mpsc::Sender<AlertMessage>,
+}
+
+impl AlertDispatcher {
+    pub fn new(buffer: usize) -> (Self, JoinHandle<()>) {
+        let (tx, mut rx) = mpsc::channel::<AlertMessage>(buffer);
+
+        // Background task that pushes alerts to external service.
+        let handle = tokio::spawn(async move {
+            while let Some(alert) = rx.recv().await {
+                if let Err(e) = send_alert(alert.clone()).await {
+                    tracing::error!(%e, "failed to send alert");
+                }
+            }
+            tracing::info!("alert-dispatcher terminated");
+        });
+
+        (Self { tx }, handle)
+    }
+}
+
+#[async_trait]
+impl Observer for AlertDispatcher {
+    async fn on_event(&self, event: &MonitoringEvent) -> Result<(), ObserverError> {
+        let (subject, body) = match event {
+            MonitoringEvent::Metrics(m) if m.f1 < 0.6 => (
+                format!("❗ Low F1 score for {}", m.model.name),
+                format!(
+                    "Model {} v{}\nF1 dropped to {:.2}\nCaptured at {}",
+                    m.model.name, m.model.version, m.f1, m.captured_at
+                ),
+            ),
+            MonitoringEvent::Drift(d) if d.p_value < 0.05 => (
+                format!("⚠️ Drift detected for {}", d.model.name),
+                format!(
+                    "Model {} v{}\nDrift magnitude: {:.3}\nP-value: {:.4}\nDetected at {}",
+                    d.model.name, d.model.version, d.magnitude, d.p_value, d.detected_at
+                ),
+            ),
+            _ => return Ok(()), // ignore non-critical events
+        };
+
+        // Non-blocking send; drop alert if queue is full (back-pressure).
+        if self.tx.try_send(AlertMessage {
+            subject,
+            body,
+            created: SystemTime::now(),
+        }).is_err()
+        {
+            tracing::warn!("alert queue full – dropping alert");
+        }
+        Ok(())
+    }
+}
+
+/// Dummy function standing in place of a real alerting integration.
+async fn send_alert(alert: AlertMessage) -> std::io::Result<()> {
+    // Simulate network latency & occasional failures.
+    if rand::random::<f32>() < 0.05 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "network glitch",
+        ));
+    }
+    // pretend we did an HTTP POST…
+    tracing::info!(?alert, "alert sent");
+    Ok(())
+}
+
+/// Convenience helper that spawns the whole monitoring subsystem end-to-end
+/// for quick manual tests and integration in main pipelines.
+#[allow(dead_code)]
+pub fn bootstrap_monitoring<R>(
+    registry: Arc<R>,
+) -> (
+    EventBus,
+    impl FnOnce(Duration) -> JoinHandle<()> + Send + 'static,
+)
+where
+    R: ModelRegistry,
+{
+    // Capacity tuned for bursty, high-frequency metrics.
+    let bus = EventBus::new(2_048);
+
+    // --- Observers ---------------------------------------------------------
+    let retrain_obs = RetrainingTrigger::new(registry, 0.75, 0.05);
+    let (alert_obs, alert_handle) = AlertDispatcher::new(1_024);
+
+    bus.subscribe(retrain_obs);
+    bus.subscribe(alert_obs);
+
+    // Shutdown callback
+    let shutdown = move |deadline: Duration| -> JoinHandle<()> {
+        tokio::spawn(async move {
+            bus.shutdown(deadline).await;
+            // Wait for alert task
+            alert_handle.abort();
+            let _ = alert_handle.await;
+        })
+    };
+
+    (bus, shutdown)
+}
+
+// ---------------------------------------------------------------------------
+//                              Display impls
+// ---------------------------------------------------------------------------
+
+impl fmt::Display for ModelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} (v{}) deployed {}",
+            self.name,
+            self.version,
+            self.deployed_at
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+//                                     tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct MockRegistry {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelRegistry for MockRegistry {
+        async fn schedule_retraining(&self, _model: &ModelId) -> Result<(), ObserverError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn retraining_trigger_fires_on_low_f1() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(MockRegistry { calls: calls.clone() });
+        let trigger = RetrainingTrigger::new(registry, 0.8, 0.05);
+
+        let evt = MonitoringEvent::Metrics(ModelMetrics {
+            model: ModelId {
+                name: "test-model".into(),
+                version: Version::parse("1.0.0").unwrap(),
+                deployed_at: Utc::now(),
+            },
+            accuracy: 0.70,
+            precision: 0.72,
+            recall: 0.68,
+            f1: 0.70,
+            captured_at: Utc::now(),
+        });
+
+        trigger.on_event(&evt).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn alert_dispatcher_drops_non_critical() {
+        let (dispatcher, _h) = AlertDispatcher::new(10);
+        let evt = MonitoringEvent::Metrics(ModelMetrics {
+            model: ModelId {
+                name: "foo".into(),
+                version: Version::parse("0.1.0").unwrap(),
+                deployed_at: Utc::now(),
+            },
+            accuracy: 0.95,
+            precision: 0.94,
+            recall: 0.93,
+            f1: 0.94,
+            captured_at: Utc::now(),
+        });
+
+        dispatcher.on_event(&evt).await.unwrap();
+        // No way to inspect private queue easily – just ensure it returns ok.
+    }
+}
+```

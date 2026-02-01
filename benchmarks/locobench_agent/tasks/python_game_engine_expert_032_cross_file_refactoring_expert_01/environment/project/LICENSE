@@ -1,0 +1,556 @@
+"""
+LedgerQuest Engine – Licensing Subsystem
+========================================
+
+This module provides runtime-license verification, entitlement checks,
+and lightweight usage metering for serverless workloads.
+
+Although stored in ``LedgerQuestEngine/LICENSE`` for historical reasons,
+the file is a **Python source** module so that it can be imported as
+``ledgerquest.license`` at runtime while still satisfying repositories
+that expect a LICENSE file at the project-root.
+
+Core Features
+-------------
+1. HMAC-based license token validation (JWT-lite).
+2. Entitlement introspection (edition, expiration, tenant limits, etc.).
+3. Pluggable secret/key resolution (env-var, AWS SSM, AWS Secrets Manager).
+4. Fast, in-process caching to avoid repeated signature work.
+5. Low-footprint usage metering that can be pushed to CloudWatch logs
+   or any custom sink through an observer callback.
+
+The implementation is dependency-light (standard library only) so that
+cold-start latency inside AWS Lambda remains minimal.  Optional AWS
+dependencies (``boto3``) are imported lazily and guarded behind feature
+flags.
+
+Example
+-------
+
+>>> from ledgerquest.license import LicenseManager
+>>> manager = LicenseManager()                 # auto-loads LIC token from env
+>>> print(manager.license.type)               # -> "ENTERPRISE"
+>>> manager.assert_within_entitlement(tenants=3)
+
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import os
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
+from functools import lru_cache
+from hashlib import sha256
+from hmac import HMAC
+from types import MappingProxyType
+from typing import Callable, Dict, MutableMapping, Optional
+
+_LOGGER = logging.getLogger(__name__)
+_LOGGER.addHandler(logging.NullHandler())
+
+###############################################################################
+# Exceptions
+###############################################################################
+
+
+class LicenseError(RuntimeError):
+    """Base class for all license-related exceptions."""
+
+
+class LicenseInvalidError(LicenseError):
+    """The license string is malformed or signature validation failed."""
+
+
+class LicenseExpiredError(LicenseError):
+    """The license is no longer valid."""
+
+
+class EntitlementError(LicenseError):
+    """An action exceeds the allowed entitlements of the license."""
+
+
+###############################################################################
+# Data Models
+###############################################################################
+
+
+class LicenseType(str, Enum):
+    COMMUNITY = "COMMUNITY"
+    ENTERPRISE = "ENTERPRISE"
+    TRIAL = "TRIAL"
+
+
+@dataclass(frozen=True)
+class Entitlements:
+    """
+    Declarative entitlements attached to a license.
+
+    Attributes
+    ----------
+    max_tenants:
+        Maximum number of tenants supported by this license.
+    max_concurrent_players:
+        Optional hard-limit for simultaneous WebSocket connections.
+    """
+
+    max_tenants: int
+    max_concurrent_players: Optional[int] = None
+
+    @staticmethod
+    def from_dict(raw: Dict[str, int | None]) -> "Entitlements":
+        return Entitlements(
+            max_tenants=int(raw.get("max_tenants", 1)),
+            max_concurrent_players=(
+                int(raw["max_concurrent_players"])
+                if raw.get("max_concurrent_players") is not None
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class License:
+    """
+    Immutable license representation.
+    """
+
+    key_id: str
+    type: LicenseType
+    issued_at: datetime
+    expires_at: datetime
+    entitlements: Entitlements
+    signature_algo: str = "HS256"
+
+    @staticmethod
+    def from_payload(payload: Dict[str, str | Dict[str, int]]) -> "License":
+        try:
+            issued = datetime.fromtimestamp(int(payload["iat"]), tz=timezone.utc)
+            expires = datetime.fromtimestamp(int(payload["exp"]), tz=timezone.utc)
+            license_type = LicenseType(payload["typ"])
+        except (KeyError, ValueError) as exc:
+            raise LicenseInvalidError("Missing or invalid license attributes") from exc
+
+        entitlements = Entitlements.from_dict(payload.get("ent", {}))
+
+        return License(
+            key_id=str(payload.get("kid", "unknown")),
+            type=license_type,
+            issued_at=issued,
+            expires_at=expires,
+            entitlements=entitlements,
+        )
+
+    @property
+    def is_expired(self) -> bool:
+        return datetime.now(tz=timezone.utc) > self.expires_at
+
+
+###############################################################################
+# Support Functions
+###############################################################################
+
+
+def _urlsafe_b64decode(data: str) -> bytes:
+    """Decode urlsafe base64 strings, adding padding if required."""
+    padding = 4 - (len(data) % 4)
+    if padding and padding != 4:
+        data += "=" * padding
+    return base64.urlsafe_b64decode(data.encode())
+
+
+def _urlsafe_b64encode(data: bytes) -> str:
+    """Encode urlsafe base64 without padding (for assertions/tests)."""
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def _hmac_verify(
+    secret: bytes,
+    signed_data: bytes,
+    signature: str,
+) -> bool:
+    expected = HMAC(secret, signed_data, sha256).digest()
+    return hmac_compare_digest(expected, base64.urlsafe_b64decode(signature + "=="))
+
+
+@lru_cache(maxsize=64)
+def hmac_compare_digest(left: bytes, right: bytes) -> bool:
+    """
+    Wrapper for ``hmac.compare_digest`` with LRU cache to slightly
+    speed up repeated calls with identical inputs (common in Lambda
+    concurrency pools).
+    """
+    from hmac import compare_digest
+
+    return compare_digest(left, right)
+
+
+###############################################################################
+# Secret Resolution
+###############################################################################
+
+
+def _secret_from_env() -> Optional[str]:
+    return os.getenv("LEDGERQUEST_LICENSE_SECRET")
+
+
+def _secret_from_ssm(parameter_name: str) -> Optional[str]:
+    """
+    Lazy-import boto3 so that environments without AWS deps do not fail.
+    """
+    try:
+        import boto3
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        ssm = boto3.client("ssm")
+        resp = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+        return resp["Parameter"]["Value"]
+    except (ImportError, BotoCoreError, ClientError) as exc:
+        _LOGGER.debug("Could not fetch secret from SSM: %s", exc, exc_info=False)
+        return None
+
+
+def resolve_secret() -> str:
+    """
+    Resolve the shared HMAC secret from the following locations (first hit wins):
+
+    1. Environment variable ``LEDGERQUEST_LICENSE_SECRET``.
+    2. AWS Systems Manager Parameter Store
+       (name defined in ``LEDGERQUEST_LICENSE_SECRET_PARAM`` env var).
+    3. Fallback to hard-coded default **FOR DEVELOPMENT ONLY**.
+
+    Raises
+    ------
+    LicenseError
+        If no secret could be resolved.
+    """
+    secret = _secret_from_env()
+    if secret:
+        return secret
+
+    param_name = os.getenv("LEDGERQUEST_LICENSE_SECRET_PARAM")
+    if param_name:
+        secret = _secret_from_ssm(param_name)
+        if secret:
+            return secret
+
+    default_secret = os.getenv("LEDGERQUEST_LICENSE_DEFAULT_SECRET")
+    if default_secret:
+        _LOGGER.warning(
+            "Using default secret. This should only happen in local development."
+        )
+        return default_secret
+
+    raise LicenseError(
+        "Unable to resolve license secret. "
+        "Set LEDGERQUEST_LICENSE_SECRET or configure an SSM parameter."
+    )
+
+
+###############################################################################
+# License Token Handling (JWT-lite)
+###############################################################################
+
+def parse_license_token(token: str, secret: str) -> License:
+    """
+    Parse and validate a LedgerQuest license token.
+
+    The token format loosely follows JWT (header.payload.signature) but
+    is *NOT* a full JWT implementation.  Supported algorithms: HS256.
+
+    Parameters
+    ----------
+    token:
+        The license string.
+    secret:
+        Shared HMAC secret used for signature validation.
+
+    Returns
+    -------
+    License
+        A validated license instance.
+
+    Raises
+    ------
+    LicenseInvalidError
+        If the token is malformed or the signature is invalid.
+    LicenseExpiredError
+        If the license is time-expired.
+    """
+    try:
+        header_b64, payload_b64, signature_b64 = token.split(".")
+    except ValueError as exc:  # not enough values to unpack
+        raise LicenseInvalidError("License token is malformed") from exc
+
+    try:
+        header = json.loads(_urlsafe_b64decode(header_b64))
+        payload = json.loads(_urlsafe_b64decode(payload_b64))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise LicenseInvalidError("Invalid base64 encoded header or payload") from exc
+
+    algo = header.get("alg")
+    if algo != "HS256":
+        raise LicenseInvalidError(f"Unsupported algorithm {algo}")
+
+    signed_part = f"{header_b64}.{payload_b64}".encode()
+    if not _hmac_verify(secret.encode(), signed_part, signature_b64):
+        raise LicenseInvalidError("Signature validation failed")
+
+    license_obj = License.from_payload(payload)
+    if license_obj.is_expired:
+        raise LicenseExpiredError("License has expired")
+
+    return license_obj
+
+
+###############################################################################
+# Usage Metering
+###############################################################################
+
+class MeterEvent(str, Enum):
+    TENANT_CREATED = "tenant_created"
+    PLAYER_CONNECTED = "player_connected"
+    PLAYER_DISCONNECTED = "player_disconnected"
+
+
+class UsageMeter:
+    """
+    Lightweight, thread-safe usage meter.
+
+    Events are kept in-memory and can be flushed to a sink via
+    `flush()` (called automatically by the singleton LicenseManager).
+
+    For serverless environments a per-process store is usually enough;
+    if you need global aggregation push events to CloudWatch Logs or a
+    custom Firehose stream.
+    """
+
+    _lock = threading.Lock()
+
+    def __init__(self) -> None:
+        self._counters: MutableMapping[str, int] = {}
+
+    def increment(self, event: MeterEvent, amount: int = 1) -> None:
+        with self._lock:
+            self._counters[event.value] = self._counters.get(event.value, 0) + amount
+        _LOGGER.debug("Meter increment: %s += %d", event.value, amount)
+
+    def snapshot(self) -> MappingProxyType[str, int]:
+        with self._lock:
+            return MappingProxyType(self._counters.copy())
+
+    def flush(self, sink: Callable[[Dict[str, int]], None]) -> None:
+        with self._lock:
+            snapshot = self._counters.copy()
+            self._counters.clear()
+        if snapshot:
+            sink(snapshot)
+
+
+###############################################################################
+# License Manager (Singleton)
+###############################################################################
+
+class LicenseManager:
+    """
+    Singleton responsible for license token loading, validation,
+    entitlement checks, and periodic meter flushing.
+    """
+
+    _instance: "LicenseManager" | None = None
+    _instance_lock = threading.Lock()
+
+    FLUSH_INTERVAL_SECONDS = int(os.getenv("LEDGERQUEST_METER_FLUSH_SEC", "60"))
+
+    def __new__(cls, *args, **kwargs) -> "LicenseManager":  # noqa: D401
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._init_singleton(*args, **kwargs)
+            return cls._instance
+
+    # --------------------------------------------------------------------- #
+    # Internal Initialiser
+    # --------------------------------------------------------------------- #
+
+    def _init_singleton(
+        self,
+        token: Optional[str] = None,
+        secret: Optional[str] = None,
+        meter_sink: Optional[Callable[[Dict[str, int]], None]] = None,
+    ) -> None:
+        self._secret = secret or resolve_secret()
+
+        token = token or os.getenv("LEDGERQUEST_LICENSE_KEY")
+        if not token:
+            raise LicenseError(
+                "No license token provided. "
+                "Set LEDGERQUEST_LICENSE_KEY or pass it to LicenseManager()."
+            )
+
+        self.license: License = parse_license_token(token, self._secret)
+        _LOGGER.info(
+            "Loaded LedgerQuest license %s (type=%s, expires=%s)",
+            self.license.key_id,
+            self.license.type,
+            self.license.expires_at.isoformat(),
+        )
+
+        self._meter = UsageMeter()
+        self._meter_sink = meter_sink or self._default_meter_sink
+        self._last_flush = time.time()
+
+    # --------------------------------------------------------------------- #
+    # Public API
+    # --------------------------------------------------------------------- #
+
+    def record_event(self, event: MeterEvent, count: int = 1) -> None:
+        """
+        Record a usage event.  The manager automatically flushes at
+        `FLUSH_INTERVAL_SECONDS`.
+        """
+        self._meter.increment(event, count)
+        if time.time() - self._last_flush > self.FLUSH_INTERVAL_SECONDS:
+            self._flush_meter()
+
+    def assert_within_entitlement(
+        self,
+        *,
+        tenants: Optional[int] = None,
+        concurrent_players: Optional[int] = None,
+    ) -> None:
+        """
+        Verify that requested resource usage does not exceed license limits.
+
+        Raises
+        ------
+        EntitlementError
+            On violation of configured limits.
+        """
+        ent = self.license.entitlements
+        if tenants is not None and tenants > ent.max_tenants:
+            raise EntitlementError(
+                f"Tenant limit exceeded: {tenants} > {ent.max_tenants}"
+            )
+
+        if (
+            ent.max_concurrent_players is not None
+            and concurrent_players is not None
+            and concurrent_players > ent.max_concurrent_players
+        ):
+            raise EntitlementError(
+                "Concurrent player limit exceeded: "
+                f"{concurrent_players} > {ent.max_concurrent_players}"
+            )
+
+    # --------------------------------------------------------------------- #
+    # Private Helpers
+    # --------------------------------------------------------------------- #
+
+    def _flush_meter(self) -> None:
+        try:
+            self._meter.flush(self._meter_sink)
+        finally:
+            self._last_flush = time.time()
+
+    @staticmethod
+    def _default_meter_sink(snapshot: Dict[str, int]) -> None:
+        _LOGGER.info("Usage meter snapshot: %s", snapshot)
+
+
+###############################################################################
+# Module-level Convenience Functions
+###############################################################################
+
+# Expose a lazily-initialised singleton at import-time.  Importers can
+# override by instantiating their own manager if needed.
+
+try:
+    manager = LicenseManager()
+except LicenseError as exc:
+    # Defer fatal errors until actually used to avoid breaking non-core
+    # tooling such as sphinx, pytest collection, etc.
+    _LOGGER.warning("LicenseManager initialisation failed: %s", exc)
+    manager = None  # type: ignore
+
+
+def record_event(event: MeterEvent, count: int = 1) -> None:
+    """
+    Convenience wrapper around the global ``manager`` singleton.
+    """
+    if manager is None:
+        _LOGGER.debug("LicenseManager not initialised; event ignored.")
+        return
+    manager.record_event(event, count)
+
+
+def assert_entitlement(
+    *,
+    tenants: Optional[int] = None,
+    concurrent_players: Optional[int] = None,
+) -> None:
+    """
+    Assert entitlements using the global ``manager``.
+    """
+    if manager is None:
+        _LOGGER.debug("LicenseManager not initialised; entitlement check skipped.")
+        return
+    manager.assert_within_entitlement(
+        tenants=tenants,
+        concurrent_players=concurrent_players,
+    )
+
+
+###############################################################################
+# CLI Utility
+###############################################################################
+
+def _print_license_info() -> None:
+    """
+    Lightweight CLI helper:
+
+    $ python -m ledgerquest.license
+    """
+    from argparse import ArgumentParser
+
+    parser = ArgumentParser(description="LedgerQuest License Utility")
+    parser.add_argument(
+        "--token",
+        help="License token to parse (defaults to env var)",
+        default=os.getenv("LEDGERQUEST_LICENSE_KEY"),
+    )
+    parser.add_argument(
+        "--secret",
+        help="Shared secret (defaults to resolver chain)",
+        default=os.getenv("LEDGERQUEST_LICENSE_SECRET"),
+    )
+
+    args = parser.parse_args()
+
+    if not args.token:
+        print("License token is required (--token or LEDGERQUEST_LICENSE_KEY)", file=sys.stderr)
+        sys.exit(1)
+
+    secret = args.secret or resolve_secret()
+    lic = parse_license_token(args.token, secret)
+
+    print("License OK")
+    print(f"  Key ID:      {lic.key_id}")
+    print(f"  Type:        {lic.type}")
+    print(f"  Issued At:   {lic.issued_at.isoformat()}")
+    print(f"  Expires At:  {lic.expires_at.isoformat()}")
+    print("  Entitlements:")
+    print(f"    Max Tenants:           {lic.entitlements.max_tenants}")
+    print(
+        f"    Max Concurrent Players: {lic.entitlements.max_concurrent_players or 'unlimited'}"
+    )
+
+
+if __name__ == "__main__":
+    _print_license_info()

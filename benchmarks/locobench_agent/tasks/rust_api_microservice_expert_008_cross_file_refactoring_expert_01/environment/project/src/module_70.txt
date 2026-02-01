@@ -1,0 +1,284 @@
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    num::NonZeroUsize,
+    time::{Duration, Instant},
+};
+
+use async_trait::async_trait;
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use validator::{Validate, ValidationError};
+
+/// Centralised error type for LedgerLink Nexus.
+///
+/// This error is intentionally *opinionated*: each variant maps to a
+/// user-facing HTTP status code via the API-gateway layer.  Avoid
+/// leaking implementation details—wrap lower-level errors into one of
+/// the opaque variants where possible.
+#[derive(Debug, Error)]
+pub enum NexusError {
+    #[error("validation error: {0}")]
+    Validation(String),
+
+    #[error("database error: {0}")]
+    Database(String),
+
+    #[error("cache error: {0}")]
+    Cache(String),
+
+    #[error("unauthorized")]
+    Unauthorized,
+
+    #[error("forbidden")]
+    Forbidden,
+
+    #[error("resource not found")]
+    NotFound,
+
+    #[error("unexpected error: {0}")]
+    Unexpected(String),
+}
+
+impl From<validator::ValidationErrors> for NexusError {
+    fn from(err: validator::ValidationErrors) -> Self {
+        NexusError::Validation(err.to_string())
+    }
+}
+
+/// Validated pagination DTO (View-Model).
+///
+/// This struct is deserialised from URL-query parameters *or* GraphQL
+/// arguments.  Validation is performed eagerly so the service layer
+/// may assume a sound state.
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct Pagination {
+    /// 1-based page index (max 100 000 for sanity).
+    #[validate(custom = "validate_page")]
+    pub page: NonZeroUsize,
+
+    /// Items per page.  Guardrails protect the database from
+    /// unbounded scans.  Hard-coded upper limit comes from SREs after
+    /// load-testing the reconciliation workloads.
+    #[validate(range(min = 1, max = 250))]
+    pub per_page: NonZeroUsize,
+
+    /// Optional SQL/GraphQL order expression, e.g. `created_at:desc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<String>,
+}
+
+fn validate_page(page: &NonZeroUsize) -> Result<(), ValidationError> {
+    if page.get() > 100_000 {
+        let mut err = ValidationError::new("page_out_of_bounds");
+        err.message = Some("page must not exceed 100 000".into());
+        return Err(err);
+    }
+    Ok(())
+}
+
+impl Default for Pagination {
+    fn default() -> Self {
+        Pagination {
+            page: NonZeroUsize::new(1).unwrap(),
+            per_page: NonZeroUsize::new(50).unwrap(),
+            order_by: None,
+        }
+    }
+}
+
+impl Pagination {
+    /// Converts a raw query string (`page=…`) into a validated struct.
+    pub fn from_query(query: &str) -> Result<Self, NexusError> {
+        let mut dto: Pagination =
+            serde_qs::from_str(query).map_err(|e| NexusError::Validation(e.to_string()))?;
+        dto.validate()?;
+        Ok(dto)
+    }
+
+    #[inline]
+    pub fn offset(&self) -> u64 {
+        ((self.page.get() - 1) * self.per_page.get()) as u64
+    }
+
+    #[inline]
+    pub fn limit(&self) -> u64 {
+        self.per_page.get() as u64
+    }
+
+    /// Returns a fragment suitable for embedding in a cache-key.
+    pub fn to_cache_fragment(&self) -> String {
+        format!(
+            "p{}-pp{}-ob{}",
+            self.page,
+            self.per_page,
+            self.order_by.as_deref().unwrap_or("")
+        )
+    }
+}
+
+/// Extend sqlx queries with typed pagination.
+///
+/// ```no_run
+/// let pagination = Pagination::default();
+/// let mut rows = sqlx::query("SELECT * FROM ledger_entries LIMIT $1 OFFSET $2")
+///     .apply_pagination(&pagination)
+///     .fetch_all(&pool)
+///     .await?;
+/// ```
+#[async_trait]
+pub trait ApplyPagination<'q, DB>
+where
+    DB: sqlx::Database,
+{
+    fn apply_pagination(
+        self,
+        p: &Pagination,
+    ) -> sqlx::query::Query<'q, DB, <DB as sqlx::database::HasArguments<'q>>::Arguments>;
+}
+
+#[async_trait]
+impl<'q> ApplyPagination<'q, sqlx::Postgres>
+    for sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>
+{
+    fn apply_pagination(
+        mut self,
+        p: &Pagination,
+    ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+        // Order: LIMIT then OFFSET to keep bind indices stable.
+        self = self.bind(p.limit() as i64).bind(p.offset() as i64);
+        self
+    }
+}
+
+/// Simple time-based in-memory cache.
+///
+/// Production deployments should prefer the Redis implementation
+/// (provides multi-node consistency and persistence).  This fallback
+/// is useful for tests, local development or edge deployments.
+#[derive(Debug)]
+pub struct TimedCache<K, V> {
+    ttl: Duration,
+    inner: RwLock<std::collections::HashMap<K, (Instant, V)>>,
+}
+
+impl<K, V> TimedCache<K, V>
+where
+    K: Eq + Hash + Clone,
+    V: Clone,
+{
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            inner: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Get value from cache or compute/insert on miss.
+    ///
+    /// `compute` is executed *once* per key (with write-lock) when the
+    /// entry is absent or stale.  Errors from `compute` are bubbled
+    /// up to the caller.  This is important because the caller may
+    /// want to translate them to HTTP 5xx/4xx codes.
+    pub fn get_or_try_insert_with<F>(&self, key: K, compute: F) -> Result<V, NexusError>
+    where
+        F: FnOnce() -> Result<V, NexusError>,
+    {
+        // Fast path: read-lock
+        {
+            let guard = self.inner.read();
+            if let Some((moment, val)) = guard.get(&key) {
+                if moment.elapsed() < self.ttl {
+                    return Ok(val.clone());
+                }
+            }
+        }
+
+        // Slow path: upgrade to write-lock
+        let mut guard = self.inner.write();
+        match guard.get(&key) {
+            Some((moment, val)) if moment.elapsed() < self.ttl => Ok(val.clone()),
+            _ => {
+                let val = compute()?;
+                guard.insert(key, (Instant::now(), val.clone()));
+                Ok(val)
+            }
+        }
+    }
+}
+
+/// Blanket trait that hashes an object into a `u64`.
+///
+/// Can be overridden to incorporate stable fields only (excluding e.g.
+/// volatile timestamps).
+pub trait CacheKey {
+    fn cache_key(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        self.hash(&mut h);
+        h.finish()
+    }
+}
+
+impl<T> CacheKey for T where T: Hash {}
+
+/// Envelope used by REST/GraphQL resolvers for paginated resources.
+#[derive(Debug, Serialize)]
+pub struct Paginated<T> {
+    pub data: Vec<T>,
+    pub page: usize,
+    pub per_page: usize,
+    pub total: usize,
+}
+
+impl<T> Paginated<T> {
+    pub fn new(data: Vec<T>, pagination: &Pagination, total: usize) -> Self {
+        Paginated {
+            data,
+            page: pagination.page.get(),
+            per_page: pagination.per_page.get(),
+            total,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pagination_math() {
+        let p = Pagination {
+            page: NonZeroUsize::new(3).unwrap(),
+            per_page: NonZeroUsize::new(20).unwrap(),
+            order_by: None,
+        };
+        assert_eq!(p.offset(), 40);
+        assert_eq!(p.limit(), 20);
+    }
+
+    #[test]
+    fn pagination_query_deserialises() {
+        let q = "page=2&per_page=10&order_by=created_at:desc";
+        let p = Pagination::from_query(q).unwrap();
+        assert_eq!(p.page.get(), 2);
+        assert_eq!(p.per_page.get(), 10);
+        assert_eq!(p.order_by.unwrap(), "created_at:desc");
+    }
+
+    #[test]
+    fn timed_cache_basic() {
+        let cache: TimedCache<&'static str, usize> = TimedCache::with_ttl(Duration::from_secs(2));
+
+        let first = cache
+            .get_or_try_insert_with("answer", || Ok(42))
+            .expect("compute should succeed");
+        assert_eq!(first, 42);
+
+        // Second retrieval hits cache
+        let second = cache
+            .get_or_try_insert_with("answer", || Ok(13))
+            .expect("should still succeed");
+        assert_eq!(second, 42);
+    }
+}

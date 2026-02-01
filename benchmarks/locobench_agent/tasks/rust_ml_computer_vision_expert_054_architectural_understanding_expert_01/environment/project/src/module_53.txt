@@ -1,0 +1,458 @@
+```rust
+//! Module 53 – Hyper-Parameter Tuning & Monitoring Integration
+//! ----------------------------------------------------------
+//! This module glues together three major concerns in the VisuTility Orchestrator:
+//! 1. Live collection of model–performance metrics coming from Serving-Ops.
+//! 2. Observer-Pattern broadcast of those metrics to interested components.
+//! 3. Strategy-Pattern hyper-parameter tuning algorithms that leverage the
+//!    latest metrics to propose improved configurations.
+//!
+//! The module purposefully stays generic (no hard-coded CV model details) so it
+//! can be reused by any vision model registered in the internal Model-Registry.
+//!
+//! Key concepts implemented below:
+//! • ModelMetrics          – Lightweight, serializable metrics snapshot.
+//! • MetricsPublisher      – Observable broadcaster (tokio::broadcast).
+//! • HyperparameterTuner   – Strategy trait with async proposal interface.
+//! • GridTuner/BayesianTuner – Two concrete strategy implementations.
+//! • TunerFactory          – Factory-Pattern for runtime strategy selection.
+//! • AutoTuningService     – End-to-end orchestrator that wires everything up.
+//!
+//! Author: VisuTility Core Team
+//! License: Apache-2.0
+
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use log::{debug, error, info, warn};
+use rand::{distributions::Uniform, prelude::Distribution, rngs::ThreadRng};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{broadcast, Mutex};
+use tokio::time;
+
+/// A minimal set of model-quality metrics we care about during tuning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelMetrics {
+    /// Overall model accuracy over the most recent validation window.
+    pub accuracy: f32,
+    /// Mean inference latency in milliseconds.
+    pub latency_ms: f32,
+    /// Timestamp when the metrics were recorded.
+    pub captured_at: Instant,
+}
+
+impl ModelMetrics {
+    pub fn is_good_enough(&self, min_accuracy: f32, max_latency: f32) -> bool {
+        self.accuracy >= min_accuracy && self.latency_ms <= max_latency
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                       Observer Pattern – Metrics Bus                       */
+/* -------------------------------------------------------------------------- */
+
+/// Buffer size used for the broadcast channel.
+const METRICS_BUFFER: usize = 128;
+
+/// Component that publishes `ModelMetrics` events so that any number of
+/// subscribers can react (e.g. dashboards, alerting, tuners, auditors).
+#[derive(Clone)]
+pub struct MetricsPublisher {
+    inner: broadcast::Sender<ModelMetrics>,
+}
+
+impl MetricsPublisher {
+    /// Create a new publisher / broadcast channel.
+    pub fn new() -> Self {
+        let (tx, _rx) = broadcast::channel(METRICS_BUFFER);
+        Self { inner: tx }
+    }
+
+    /// Send a metrics snapshot to all subscribers, logging on error.
+    pub fn publish(&self, metrics: ModelMetrics) {
+        if let Err(err) = self.inner.send(metrics) {
+            warn!("MetricsPublisher: failed to broadcast metrics: {err}");
+        }
+    }
+
+    /// Register a new subscriber for the metrics stream.
+    pub fn subscribe(&self) -> broadcast::Receiver<ModelMetrics> {
+        self.inner.subscribe()
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*              Strategy Pattern – Hyper-parameter Tuning Trait              */
+/* -------------------------------------------------------------------------- */
+
+/// Canonical list of tunable hyper-parameters for computer-vision models.
+/// This is intentionally generic; individual model adapters perform mapping
+/// between these and their low-level framework/graph parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HyperParams {
+    pub learning_rate: f32,
+    pub weight_decay: f32,
+    pub batch_size: usize,
+    pub augmentation_prob: f32,
+}
+
+impl Default for HyperParams {
+    fn default() -> Self {
+        Self {
+            learning_rate: 3e-4,
+            weight_decay: 1e-2,
+            batch_size: 32,
+            augmentation_prob: 0.5,
+        }
+    }
+}
+
+/// Behaviour that each tuning strategy must implement.
+#[async_trait]
+pub trait HyperparameterTuner: Send + Sync {
+    /// Consume recent metrics & propose a new hyper-parameters set.
+    async fn propose(
+        &mut self,
+        latest_metrics: &ModelMetrics,
+    ) -> Result<HyperParams>;
+
+    /// Optional hook so that external orchestration code can name the strategy.
+    fn name(&self) -> &'static str;
+}
+
+/* ----------------------- Concrete Strategy: Grid Search ------------------- */
+
+/// Very small fixed search-space grid-search tuner.
+/// Good as a baseline and for deterministic troubleshooting sessions.
+pub struct GridTuner {
+    grid: Vec<HyperParams>,
+    cursor: usize,
+}
+
+impl GridTuner {
+    pub fn new() -> Self {
+        // Build a tiny but combinatorically diverse grid.
+        let learning_rates = vec![1e-3, 3e-4, 1e-4];
+        let weight_decays = vec![1e-1, 1e-2];
+        let batch_sizes = vec![16, 32, 64];
+        let aug_probs = vec![0.3, 0.5, 0.8];
+
+        let mut grid = Vec::new();
+        for lr in &learning_rates {
+            for wd in &weight_decays {
+                for bs in &batch_sizes {
+                    for ap in &aug_probs {
+                        grid.push(HyperParams {
+                            learning_rate: *lr,
+                            weight_decay: *wd,
+                            batch_size: *bs,
+                            augmentation_prob: *ap,
+                        });
+                    }
+                }
+            }
+        }
+
+        Self { grid, cursor: 0 }
+    }
+}
+
+#[async_trait]
+impl HyperparameterTuner for GridTuner {
+    async fn propose(
+        &mut self,
+        _latest_metrics: &ModelMetrics,
+    ) -> Result<HyperParams> {
+        if self.cursor >= self.grid.len() {
+            return Err(anyhow!("GridTuner has exhausted its search space"));
+        }
+        let proposal = self.grid[self.cursor].clone();
+        self.cursor += 1;
+        Ok(proposal)
+    }
+
+    fn name(&self) -> &'static str {
+        "GridTuner"
+    }
+}
+
+/* --------------------- Concrete Strategy: Bayesian Tuner ------------------ */
+
+/// Crude Bayesian optimisation tuner using a Gaussian-like exploration.
+/// In production we would leverage a dedicated crate (e.g., `bayes_opt`),
+/// but for this reference implementation we keep it self-contained.
+pub struct BayesianTuner {
+    rng: ThreadRng,
+    /// History of tried params and their resulting accuracy so we can
+    /// bias towards the best ones (simplified Thompson Sampling).
+    history: VecDeque<(HyperParams, f32 /* accuracy */)>,
+    /// Maximum amount of history entries to keep in memory.
+    history_capacity: usize,
+}
+
+impl BayesianTuner {
+    pub fn new() -> Self {
+        Self {
+            rng: rand::thread_rng(),
+            history: VecDeque::new(),
+            history_capacity: 200,
+        }
+    }
+
+    /// Internal helper that returns a weighted sampling distribution over
+    /// previous params (higher accuracy → higher weight).
+    fn weighted_sample(&mut self) -> Option<HyperParams> {
+        if self.history.is_empty() {
+            return None;
+        }
+        // Build CDF based on accuracy.
+        let total_acc: f32 = self.history.iter().map(|(_, acc)| acc).sum();
+        if total_acc == 0.0 {
+            return None;
+        }
+        let mut rng_val: f32 = rand::random();
+        for (params, acc) in self.history.iter() {
+            rng_val -= *acc / total_acc;
+            if rng_val <= 0.0 {
+                return Some(params.clone());
+            }
+        }
+        self.history.back().map(|(p, _)| p.clone())
+    }
+}
+
+#[async_trait]
+impl HyperparameterTuner for BayesianTuner {
+    async fn propose(
+        &mut self,
+        latest_metrics: &ModelMetrics,
+    ) -> Result<HyperParams> {
+        // Persist the last known good params and accuracy for future sampling.
+        if let Some(prev) = self.history.back() {
+            // Only store if the model is improving and the change is meaningful.
+            if latest_metrics.accuracy > prev.1 + 0.002 {
+                let mut entry = prev.clone();
+                entry.1 = latest_metrics.accuracy;
+                self.history.push_back(entry);
+                if self.history.len() > self.history_capacity {
+                    self.history.pop_front();
+                }
+            }
+        }
+
+        // Either sample near a historically good configuration or sample random.
+        let base = self.weighted_sample().unwrap_or_else(|| HyperParams::default());
+
+        // Jitter around the base parameters.
+        let lr_dist = Uniform::new(0.5, 1.5);
+        let wd_dist = Uniform::new(0.5, 1.5);
+        let aug_dist = Uniform::new(-0.1f32, 0.1f32);
+
+        let mut proposal = base.clone();
+        proposal.learning_rate *= lr_dist.sample(&mut self.rng);
+        proposal.weight_decay *= wd_dist.sample(&mut self.rng);
+        proposal.augmentation_prob =
+            (proposal.augmentation_prob + aug_dist.sample(&mut self.rng)).clamp(0.0, 1.0);
+        // Pick a nearby batch size (±1 step).
+        proposal.batch_size = match self.rng.gen_range(0..=2) {
+            0 if proposal.batch_size > 8 => proposal.batch_size / 2,
+            2 => proposal.batch_size * 2,
+            _ => proposal.batch_size,
+        }
+        .clamp(8, 256);
+
+        Ok(proposal)
+    }
+
+    fn name(&self) -> &'static str {
+        "BayesianTuner"
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                           Factory Pattern – Builder                        */
+/* -------------------------------------------------------------------------- */
+
+/// Enumeration of all supported tuner implementations.
+#[derive(Debug, Clone, Copy)]
+pub enum TunerType {
+    Grid,
+    Bayesian,
+}
+
+pub struct TunerFactory;
+
+impl TunerFactory {
+    pub fn build(tuner: TunerType) -> Arc<Mutex<dyn HyperparameterTuner>> {
+        match tuner {
+            TunerType::Grid => Arc::new(Mutex::new(GridTuner::new())),
+            TunerType::Bayesian => Arc::new(Mutex::new(BayesianTuner::new())),
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                 Auto-Tuning Service – End-to-End Orchestrator              */
+/* -------------------------------------------------------------------------- */
+
+/// Interval between automatic tuning rounds (default = 30 minutes).
+const DEFAULT_TUNING_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// Service that connects the metrics stream with the tuner and emits new
+/// hyper-parameters whenever the strategy decides an update is needed.
+/// The produced configs are sent back to Model-Ops to trigger re-training.
+pub struct AutoTuningService {
+    metrics_sub: broadcast::Receiver<ModelMetrics>,
+    tuner: Arc<Mutex<dyn HyperparameterTuner>>,
+    min_accuracy: f32,
+    max_latency_ms: f32,
+    interval: Duration,
+}
+
+impl AutoTuningService {
+    /// Construct and wire the background service.
+    pub fn new(
+        publisher: MetricsPublisher,
+        tuner: Arc<Mutex<dyn HyperparameterTuner>>,
+        min_accuracy: f32,
+        max_latency_ms: f32,
+    ) -> Self {
+        Self {
+            metrics_sub: publisher.subscribe(),
+            tuner,
+            min_accuracy,
+            max_latency_ms,
+            interval: DEFAULT_TUNING_INTERVAL,
+        }
+    }
+
+    /// Adjustable interval mainly used in integration tests.
+    pub fn with_interval(mut self, interval: Duration) -> Self {
+        self.interval = interval;
+        self
+    }
+
+    /// Spawn the service in its own asynchronous task. The join-handle is
+    /// returned so the caller can manage lifecycle (e.g. cancel on shutdown).
+    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move { self.run().await })
+    }
+
+    async fn run(mut self) {
+        let mut ticker = time::interval(self.interval);
+        let mut latest_metrics: Option<ModelMetrics> = None;
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = ticker.tick() => {
+                    if let Some(metrics) = &latest_metrics {
+                        if metrics.is_good_enough(self.min_accuracy, self.max_latency_ms) {
+                            debug!("AutoTuningService: metrics already above threshold – skip round");
+                            continue;
+                        }
+                        info!("AutoTuningService: triggering tuner `{}`", self.tuner.lock().await.name());
+                        match self.tuner.lock().await.propose(metrics).await {
+                            Ok(new_params) => {
+                                // In production, we would invoke Model-Ops here.
+                                info!(
+                                    "AutoTuningService: proposed new params: lr={:.5}, wd={:.5}, bs={}, aug={:.2}",
+                                    new_params.learning_rate,
+                                    new_params.weight_decay,
+                                    new_params.batch_size,
+                                    new_params.augmentation_prob,
+                                );
+                                // TODO: send to training scheduler via gRPC/kafka/etc.
+                            }
+                            Err(err) => {
+                                error!("AutoTuningService: tuner error: {err:#}");
+                            }
+                        }
+                    } else {
+                        debug!("AutoTuningService: no metrics yet – waiting");
+                    }
+                }
+
+                // Receive metrics asynchronously; ignore errors when channel is lagging.
+                res = self.metrics_sub.recv() => match res {
+                    Ok(m) => {
+                        latest_metrics = Some(m);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!("AutoTuningService: skipped {skipped} lagged metric messages");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        warn!("AutoTuningService: metrics channel closed – terminating");
+                        return;
+                    }
+                },
+            }
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                   Tests                                    */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn grid_tuner_exhausts() {
+        let mut tuner = GridTuner::new();
+        let dummy_metrics = ModelMetrics {
+            accuracy: 0.1,
+            latency_ms: 100.0,
+            captured_at: Instant::now(),
+        };
+        let total = tuner.grid.len();
+        for _ in 0..total {
+            assert!(tuner.propose(&dummy_metrics).await.is_ok());
+        }
+        // Next call should error.
+        assert!(tuner.propose(&dummy_metrics).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bayesian_tuner_returns_params() {
+        let mut tuner = BayesianTuner::new();
+        let metrics = ModelMetrics {
+            accuracy: 0.5,
+            latency_ms: 50.0,
+            captured_at: Instant::now(),
+        };
+        let params = tuner.propose(&metrics).await.unwrap();
+        assert!(params.learning_rate > 0.0);
+    }
+
+    #[tokio::test]
+    async fn auto_tuning_service_triggers() {
+        let publisher = MetricsPublisher::new();
+        let tuner = TunerFactory::build(TunerType::Grid);
+
+        // The first tuning interval is shortened for the sake of the test.
+        let service = AutoTuningService::new(publisher.clone(), tuner, 0.9, 40.0)
+            .with_interval(Duration::from_millis(200));
+        let handle = service.spawn();
+
+        // Publish a few poor metrics so that the service triggers.
+        publisher.publish(ModelMetrics {
+            accuracy: 0.2,
+            latency_ms: 120.0,
+            captured_at: Instant::now(),
+        });
+
+        // Wait up to 1 second for the task to run at least once.
+        assert!(timeout(Duration::from_secs(1), handle).await.is_err());
+    }
+}
+```

@@ -1,0 +1,498 @@
+```rust
+//! src/module_68.rs
+//!
+//! Event-driven plumbing for the “Learning Pulse” workflow.
+//!
+//! The code below demonstrates how a single bounded context (“learning pulses”)
+//! reacts to a `SubmissionCreated` domain event and orchestrates **two**
+//! asynchronous side-effects:
+//!   1. A plagiarism check through an external HTTP service.
+//!   2. A rubric-based automatic scoring job.
+//!
+//! Once each task finishes the appropriate *follow-up* event is published so
+//! that other micro-services (notifications, analytics, etc.) can react
+//! independently.
+//!
+//! # Compile features
+//!
+//! - `amqp` – use a real RabbitMQ event-bus (enabled in CI / prod).
+//! - *none* – fall back to an in-memory event-bus for local development & tests.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::{mpsc, RwLock};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+use tracing::{debug, error, info, instrument, warn};
+
+/// Correlation identifier propagated across bounded contexts.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CorrelationId(String);
+
+impl CorrelationId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+}
+
+/// A marker trait implemented by *every* domain event.
+///
+/// The obvious choice would be enum-dispatch, however a trait object allows new
+/// events to be added without modifying a central enum – a desirable property
+/// in a highly modular micro-service code-base.
+#[async_trait]
+pub trait DomainEvent: Send + Sync {
+    /// Type discriminator (`"submission.created"`, `"plagiarism.checked"`, …).
+    fn event_type(&self) -> &'static str;
+
+    /// Monotonic temporal marker.
+    fn occurred_at(&self) -> DateTime<Utc>;
+
+    /// Correlation id used for distributed tracing.
+    fn correlation_id(&self) -> &CorrelationId;
+
+    /// Serialize event instance to JSON for transport on the wire.
+    fn to_json(&self) -> Result<Vec<u8>, EventError> {
+        serde_json::to_vec(self).map_err(EventError::serialization)
+    }
+}
+
+/// Business-level error type for this module.
+#[derive(Debug, Error)]
+pub enum EventError {
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("http error: {0}")]
+    Http(#[from] reqwest::Error),
+
+    #[error("event bus error: {0}")]
+    EventBus(String),
+
+    #[error("timeout waiting for plagiarism service")]
+    TimeOut,
+
+    #[error("unexpected response from plagiarism service: {0}")]
+    InvalidPlagiarismResponse(String),
+}
+
+impl EventError {
+    fn serialization(err: serde_json::Error) -> Self {
+        Self::Serialization(err)
+    }
+}
+
+/// Concrete domain event emitted when a student uploads a submission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmissionCreated {
+    pub submission_id: String,
+    pub author_id: String,
+    pub pulse_id: String,
+    pub content: String,
+    pub occurred_at: DateTime<Utc>,
+    pub correlation_id: CorrelationId,
+}
+
+#[async_trait]
+impl DomainEvent for SubmissionCreated {
+    fn event_type(&self) -> &'static str {
+        "submission.created"
+    }
+
+    fn occurred_at(&self) -> DateTime<Utc> {
+        self.occurred_at
+    }
+
+    fn correlation_id(&self) -> &CorrelationId {
+        &self.correlation_id
+    }
+}
+
+/// Event emitted after plagiarism verification finishes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlagiarismChecked {
+    pub submission_id: String,
+    pub similarity_score: f32,
+    pub is_suspect: bool,
+    pub occurred_at: DateTime<Utc>,
+    pub correlation_id: CorrelationId,
+}
+
+#[async_trait]
+impl DomainEvent for PlagiarismChecked {
+    fn event_type(&self) -> &'static str {
+        "plagiarism.checked"
+    }
+
+    fn occurred_at(&self) -> DateTime<Utc> {
+        self.occurred_at
+    }
+
+    fn correlation_id(&self) -> &CorrelationId {
+        &self.correlation_id
+    }
+}
+
+/// Event emitted after the automatic score is calculated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoScoreCompleted {
+    pub submission_id: String,
+    pub score: u8,
+    pub rubric_version: String,
+    pub occurred_at: DateTime<Utc>,
+    pub correlation_id: CorrelationId,
+}
+
+#[async_trait]
+impl DomainEvent for AutoScoreCompleted {
+    fn event_type(&self) -> &'static str {
+        "autoscore.completed"
+    }
+
+    fn occurred_at(&self) -> DateTime<Utc> {
+        self.occurred_at
+    }
+
+    fn correlation_id(&self) -> &CorrelationId {
+        &self.correlation_id
+    }
+}
+
+/// Event bus abstraction.
+#[async_trait]
+pub trait EventBus {
+    async fn publish(&self, event: &(dyn DomainEvent + 'static)) -> Result<(), EventError>;
+
+    /// Subscribe with a channel of boxed events.   
+    ///
+    /// In real life we would use strongly typed channels; for brevity we
+    /// down-cast at the consuming site.
+    async fn subscribe(&self) -> mpsc::Receiver<Box<dyn DomainEvent>>;
+}
+
+/// In-memory implementation (dev / tests).
+pub struct InMemoryEventBus {
+    tx: mpsc::Sender<Box<dyn DomainEvent>>,
+    rx: RwLock<mpsc::Receiver<Box<dyn DomainEvent>>>,
+}
+
+impl InMemoryEventBus {
+    pub fn new(buffer: usize) -> Self {
+        let (tx, rx) = mpsc::channel(buffer);
+        Self {
+            tx,
+            rx: RwLock::new(rx),
+        }
+    }
+}
+
+#[async_trait]
+impl EventBus for InMemoryEventBus {
+    async fn publish(&self, event: &(dyn DomainEvent + 'static)) -> Result<(), EventError> {
+        let mut cloned = Vec::new();
+        // Re-serialize to guarantee we send a **copy** (preventing accidental
+        // mutation from other tasks).
+        let bytes = event.to_json()?;
+        let evt_type = event.event_type();
+        cloned.extend_from_slice(&bytes);
+
+        let deserialized: Box<dyn DomainEvent> = match evt_type {
+            "submission.created" => {
+                let ev: SubmissionCreated = serde_json::from_slice(&cloned)?;
+                Box::new(ev)
+            }
+            "plagiarism.checked" => {
+                let ev: PlagiarismChecked = serde_json::from_slice(&cloned)?;
+                Box::new(ev)
+            }
+            "autoscore.completed" => {
+                let ev: AutoScoreCompleted = serde_json::from_slice(&cloned)?;
+                Box::new(ev)
+            }
+            _ => {
+                warn!("unrecognized event type on in-memory bus: {evt_type}");
+                return Ok(());
+            }
+        };
+        self.tx
+            .send(deserialized)
+            .await
+            .map_err(|e| EventError::EventBus(e.to_string()))
+    }
+
+    async fn subscribe(&self) -> mpsc::Receiver<Box<dyn DomainEvent>> {
+        self.rx.write().await.recv().await;
+        // clone underlying channel
+        let mut rx = self.rx.write().await;
+        rx.clone()
+    }
+}
+
+/// Application service orchestrating plagiarism & auto-scoring.
+pub struct LearningPulseService {
+    event_bus: Arc<dyn EventBus + Send + Sync>,
+    http: reqwest::Client,
+    plagiarism_endpoint: String,
+    rubric_store: Arc<RubricRepository>,
+}
+
+impl LearningPulseService {
+    pub fn new(
+        event_bus: Arc<dyn EventBus + Send + Sync>,
+        plagiarism_endpoint: impl Into<String>,
+        rubric_store: Arc<RubricRepository>,
+    ) -> Self {
+        Self {
+            event_bus,
+            http: reqwest::Client::new(),
+            plagiarism_endpoint: plagiarism_endpoint.into(),
+            rubric_store,
+        }
+    }
+
+    /// Run the long-running background task.
+    pub fn spawn(self: Arc<Self>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut rx = self.event_bus.subscribe().await;
+            info!("learning-pulse service ready to process events");
+            while let Some(evt) = rx.recv().await {
+                if let Some(submission_evt) = evt.downcast_ref::<SubmissionCreated>() {
+                    let svc = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = svc.process_submission(submission_evt.clone()).await {
+                            error!(?err, "failed to process submission");
+                        }
+                    });
+                }
+            }
+        })
+    }
+
+    #[instrument(skip_all, fields(submission_id = %submission.submission_id))]
+    async fn process_submission(&self, submission: SubmissionCreated) -> Result<(), EventError> {
+        let correlation_id = submission.correlation_id.clone();
+
+        // 1) Spawn plagiarism request
+        let plagiarism_future = self
+            .request_plagiarism_check(&submission)
+            .await
+            .map(|res| PlagiarismChecked {
+                submission_id: submission.submission_id.clone(),
+                similarity_score: res.score,
+                is_suspect: res.is_suspect,
+                occurred_at: Utc::now(),
+                correlation_id: correlation_id.clone(),
+            });
+
+        match plagiarism_future {
+            Ok(evt) => {
+                self.event_bus.publish(&evt).await?;
+            }
+            Err(e) => error!(?e, "plagiarism check failed"),
+        }
+
+        // 2) Spawn scoring
+        let score_evt = self
+            .auto_score(&submission)
+            .await
+            .map(|score| AutoScoreCompleted {
+                submission_id: submission.submission_id.clone(),
+                score,
+                rubric_version: self.rubric_store.latest_version(),
+                occurred_at: Utc::now(),
+                correlation_id,
+            })?;
+
+        self.event_bus.publish(&score_evt).await?;
+        Ok(())
+    }
+
+    /// Calls the external plagiarism API (with timeout protection).
+    async fn request_plagiarism_check(
+        &self,
+        submission: &SubmissionCreated,
+    ) -> Result<PlagiarismResponse, EventError> {
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            submission_id: &'a str,
+            content: &'a str,
+            student_id: &'a str,
+        }
+
+        let body = Payload {
+            submission_id: &submission.submission_id,
+            content: &submission.content,
+            student_id: &submission.author_id,
+        };
+
+        let request = self
+            .http
+            .post(&self.plagiarism_endpoint)
+            .json(&body)
+            .build()?;
+
+        let response = timeout(Duration::from_secs(8), self.http.execute(request)).await;
+
+        let response = match response {
+            Ok(res) => res?,
+            Err(_) => return Err(EventError::TimeOut),
+        };
+
+        if response.status() != StatusCode::OK {
+            return Err(EventError::InvalidPlagiarismResponse(format!(
+                "status {}",
+                response.status()
+            )));
+        }
+
+        let result: PlagiarismApiPayload = response.json().await?;
+        Ok(result.into())
+    }
+
+    /// Very naive auto-scoring based on a rubric repository.
+    async fn auto_score(&self, submission: &SubmissionCreated) -> Result<u8, EventError> {
+        let rubric = self.rubric_store.fetch_current().await;
+        let words = submission.content.split_whitespace().count() as u32;
+        let mut score = 0;
+
+        if words >= rubric.min_word_count {
+            score += 60;
+        }
+        if submission.content.contains("because") {
+            score += 15;
+        }
+        if submission.content.contains("therefore") {
+            score += 15;
+        }
+        if submission.content.ends_with('.') {
+            score += 10;
+        }
+        Ok(score.min(100) as u8)
+    }
+}
+
+/// DTO returned from the remote plagiarism service.
+#[derive(Debug, Deserialize)]
+struct PlagiarismApiPayload {
+    score: f32,
+    is_suspect: bool,
+}
+
+#[derive(Debug)]
+struct PlagiarismResponse {
+    score: f32,
+    is_suspect: bool,
+}
+
+impl From<PlagiarismApiPayload> for PlagiarismResponse {
+    fn from(val: PlagiarismApiPayload) -> Self {
+        Self {
+            score: val.score,
+            is_suspect: val.is_suspect,
+        }
+    }
+}
+
+/// Simplistic rubric repository.
+/// In production this would talk to Postgres or Config Service.
+#[derive(Default)]
+pub struct RubricRepository {
+    current: RwLock<Rubric>,
+}
+
+/// Represents a single rubric configuration.
+#[derive(Debug, Clone)]
+pub struct Rubric {
+    version: String,
+    min_word_count: u32,
+}
+
+impl RubricRepository {
+    pub async fn fetch_current(&self) -> Rubric {
+        self.current.read().await.clone()
+    }
+
+    pub fn latest_version(&self) -> String {
+        self.current
+            .blocking_read()
+            .version
+            .clone()
+    }
+
+    #[allow(dead_code)]
+    pub async fn update(&self, rubric: Rubric) {
+        *self.current.write().await = rubric;
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
+// Example bootstrap – would live in `main.rs` in the actual micro-service.
+// ----------------------------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::EnvFilter;
+
+    #[tokio::test]
+    async fn submission_flow_emits_follow_up_events() {
+        // Initialize test logger
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .try_init();
+
+        let bus: Arc<dyn EventBus + Send + Sync> = Arc::new(InMemoryEventBus::new(16));
+
+        let rubric_store = Arc::new(RubricRepository::default());
+        rubric_store
+            .update(Rubric {
+                version: "v1".into(),
+                min_word_count: 5,
+            })
+            .await;
+
+        let service = Arc::new(LearningPulseService::new(
+            bus.clone(),
+            "http://localhost:1234/plagiarism", // mocked in this test
+            rubric_store,
+        ));
+
+        service.spawn();
+
+        // Fire off a submission
+        let evt = SubmissionCreated {
+            submission_id: "sub-123".into(),
+            author_id: "user-456".into(),
+            pulse_id: "pulse-789".into(),
+            content: "I think therefore I am. Because logic.".into(),
+            occurred_at: Utc::now(),
+            correlation_id: CorrelationId::new(),
+        };
+
+        bus.publish(&evt).await.unwrap();
+
+        // Wait briefly to allow background tasks to finish
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Assert we have some messages in the bus.  
+        // (In a real test we would use a mock / spy implementation.)
+        let mut rx = bus.subscribe().await;
+        let mut seen: HashMap<&'static str, usize> = HashMap::new();
+        let start = Utc::now();
+        while Utc::now().signed_duration_since(start).num_milliseconds() < 500 {
+            if let Ok(Some(msg)) = timeout(Duration::from_millis(50), rx.recv()).await {
+                *seen.entry(msg.event_type()).or_default() += 1;
+            }
+        }
+
+        assert!(seen.get("plagiarism.checked").cloned().unwrap_or(0) >= 1);
+        assert!(seen.get("autoscore.completed").cloned().unwrap_or(0) >= 1);
+    }
+}
+```

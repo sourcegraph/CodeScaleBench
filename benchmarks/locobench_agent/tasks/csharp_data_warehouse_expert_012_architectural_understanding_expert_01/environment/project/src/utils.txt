@@ -1,0 +1,310 @@
+```csharp
+// File: src/utils.txt
+// NOTE: The file extension is intentionally *.txt to satisfy project-generation tooling.
+//       Down-stream build steps rename it to *.cs before compilation.
+
+using System;
+using System.Buffers;
+using System.Collections.Generic;
+using System.Net;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.DynamoDBv2;
+using Amazon.DynamoDBv2.Model;
+using Amazon.Runtime;
+using Amazon.Runtime.Internal;
+using Amazon.Runtime.Internal.Transform;
+using Microsoft.Extensions.Logging;
+using Polly;
+using Polly.Contrib.WaitAndRetry;
+
+namespace PulseOps.Warehouse.Common
+{
+    /// <summary>
+    /// A bag of high-leverage, production-ready utilities that are shared among the
+    /// PulseOps Warehouse Lambda micro-components.  
+    ///  • Structured logging helpers  
+    ///  • Polly-based retry policy with full-jitter exponential back-off  
+    ///  • System.Text.Json configuration & converters  
+    ///  • Idempotency primitives (hashing + DynamoDB conditional write)  
+    ///  • Generic batching & pagination helpers  
+    /// </summary>
+    public static class Utils
+    {
+        #region ---------- JSON ----------
+        private static readonly Lazy<JsonSerializerOptions> _lazyJsonOptions = new(CreateDefaultJsonOptions);
+
+        /// <summary>
+        /// Lazily materialized, project-wide <see cref="JsonSerializerOptions"/> instance.
+        /// Use this instance everywhere to guarantee canonical wire formats.
+        /// </summary>
+        public static JsonSerializerOptions JsonOptions => _lazyJsonOptions.Value;
+
+        private static JsonSerializerOptions CreateDefaultJsonOptions()
+        {
+            var opts = new JsonSerializerOptions
+            {
+                PropertyNamingPolicy            = JsonNamingPolicy.CamelCase,
+                DefaultIgnoreCondition          = JsonIgnoreCondition.WhenWritingNull,
+                WriteIndented                   = false,
+                AllowTrailingCommas            = true,
+                Converters =
+                {
+                    new JsonStringEnumConverter(JsonNamingPolicy.CamelCase),
+                    new DateTimeUtcConverter()
+                }
+            };
+
+            return opts;
+        }
+
+        /// <summary>
+        /// Serializes the supplied value using the shared <see cref="JsonOptions"/>.
+        /// </summary>
+        public static string ToJson<T>(this T value) =>
+            JsonSerializer.Serialize(value, JsonOptions);
+
+        /// <summary>
+        /// Deserializes the supplied JSON payload using the shared <see cref="JsonOptions"/>.
+        /// </summary>
+        public static T? FromJson<T>(this string json) =>
+            JsonSerializer.Deserialize<T>(json, JsonOptions);
+
+        private sealed class DateTimeUtcConverter : JsonConverter<DateTime>
+        {
+            public override DateTime Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+            {
+                var dt = reader.GetDateTime();
+                return dt.Kind == DateTimeKind.Utc
+                    ? dt
+                    : DateTime.SpecifyKind(dt, DateTimeKind.Utc);
+            }
+
+            public override void Write(Utf8JsonWriter writer, DateTime value, JsonSerializerOptions options)
+            {
+                writer.WriteStringValue(value.ToUniversalTime());
+            }
+        }
+        #endregion
+
+        #region ---------- LOGGING ----------
+        /// <summary>
+        /// Emits a DEBUG log with the object's JSON representation.
+        /// </summary>
+        public static void LogDebugAsJson<T>(this ILogger logger, string message, T obj)
+        {
+            if (logger.IsEnabled(LogLevel.Debug))
+            {
+                logger.LogDebug("{Message} | Payload={Payload}", message, obj.ToJson());
+            }
+        }
+        #endregion
+
+        #region ---------- RETRY POLICY ----------
+        /// <summary>
+        /// Creates a flexible Polly async retry policy with the following characteristics:
+        ///  • Full-jitter exponential back-off (AWS Architecture best practice)  
+        ///  • Retries Amazon throttling or transient network glitches (5XX, 429, RequestLimitExceeded, etc.)  
+        ///  • Propagates original exception once retry budget is depleted  
+        /// </summary>
+        public static IAsyncPolicy CreateAwsRetryPolicy(
+            ILogger logger,
+            int maxRetries                         = 5,
+            Func<int, TimeSpan>? sleepDurations    = null)
+        {
+            sleepDurations ??= retryAttempt => Backoff.FullJitterBackoff(
+                medianFirstRetryDelay: TimeSpan.FromMilliseconds(250),
+                retryCount:            maxRetries)[retryAttempt];
+
+            bool TransientAwsError(Exception e) =>
+                e switch
+                {
+                    AmazonServiceException ase when
+                        ase.StatusCode is HttpStatusCode.TooManyRequests
+                                         or HttpStatusCode.InternalServerError
+                                         or HttpStatusCode.BadGateway
+                                         or HttpStatusCode.ServiceUnavailable
+                                         or HttpStatusCode.GatewayTimeout
+                        => true,
+                    WebException => true,
+                    _             => false
+                };
+
+            return Policy
+                .Handle<Exception>(TransientAwsError)
+                .WaitAndRetryAsync(
+                    retryCount: maxRetries,
+                    sleepDurationProvider: sleepDurations,
+                    onRetry: (ex, ts, attempt, ctx) =>
+                    {
+                        logger.LogWarning(
+                            ex,
+                            "Transient AWS error detected — backing off {Delay} (attempt {Attempt}/{Max})",
+                            ts, attempt, maxRetries);
+                    });
+        }
+        #endregion
+
+        #region ---------- IDEMPOTENCY ----------
+        private const string IdempotencyTableName = "pulseops_idempotency";
+
+        /// <summary>
+        /// Generates a SHA-256 hash for <paramref name="payload"/>.  
+        /// By default the resulting 32-byte hash is returned as unpadded Base64 to be compact yet URL-safe.
+        /// </summary>
+        public static string ComputeDeterministicHash(ReadOnlySpan<byte> payload, bool base64 = true)
+        {
+            Span<byte> hash      = stackalloc byte[32]; // SHA-256
+            bool rented          = false;
+            Span<byte> buffer    = payload;
+
+            if (!payload.TryCopyTo(hash)) // Rare path — very large payload, rent array
+            {
+                rented  = true;
+                var arr = ArrayPool<byte>.Shared.Rent(payload.Length);
+                payload.CopyTo(arr);
+                buffer = arr.AsSpan(0, payload.Length);
+
+                using var sha = SHA256.Create();
+                sha.TryComputeHash(buffer, hash, out _);
+
+                ArrayPool<byte>.Shared.Return(arr);
+            }
+            else
+            {
+                using var sha = SHA256.Create();
+                sha.TryComputeHash(buffer, hash, out _);
+            }
+
+            return base64
+                ? Convert.ToBase64String(hash).TrimEnd('=')
+                : Convert.ToHexString(hash);
+        }
+
+        /// <summary>
+        /// Attempts to register an idempotent execution in DynamoDB.
+        /// If the <paramref name="hash"/> already exists, <c>false</c> is returned and callers are
+        /// expected to SHORT-CIRCUIT, guaranteeing "exactly-once" semantics.
+        /// </summary>
+        public static async Task<bool> TryRegisterExecutionAsync(
+            this IAmazonDynamoDB dynamo,
+            string               hash,
+            TimeSpan             ttl,
+            CancellationToken    ct  = default)
+        {
+            ArgumentNullException.ThrowIfNull(hash);
+
+            var nowEpochSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var ttlEpoch        = nowEpochSeconds + (long)ttl.TotalSeconds;
+
+            var request = new PutItemRequest
+            {
+                TableName = IdempotencyTableName,
+                Item = new Dictionary<string, AttributeValue>
+                {
+                    ["pk"]   = new() { S = hash },
+                    ["ttl"]  = new() { N = ttlEpoch.ToString() }
+                },
+                ConditionExpression = "attribute_not_exists(pk)"
+            };
+
+            try
+            {
+                await dynamo.PutItemAsync(request, ct).ConfigureAwait(false);
+                return true; // Successfully registered
+            }
+            catch (ConditionalCheckFailedException)
+            {
+                return false; // Duplicate invocation
+            }
+        }
+        #endregion
+
+        #region ---------- BATCHING ----------
+        /// <summary>
+        /// Splits an <see cref="IEnumerable{T}"/> into equally sized chunks.
+        /// </summary>
+        public static IEnumerable<IReadOnlyList<T>> Chunkify<T>(
+            this IEnumerable<T> source,
+            int chunkSize)
+        {
+            if (chunkSize <= 0)
+                throw new ArgumentOutOfRangeException(nameof(chunkSize), "Chunk size must be > 0.");
+
+            using var enumerator = source.GetEnumerator();
+
+            while (enumerator.MoveNext())
+            {
+                var batch = new List<T>(capacity: chunkSize) { enumerator.Current };
+
+                for (int i = 1; i < chunkSize && enumerator.MoveNext(); i++)
+                    batch.Add(enumerator.Current);
+
+                yield return batch;
+            }
+        }
+
+        /// <summary>
+        /// Consumes an async sequence (or API that returns Task<IEnumerable{T}>) page-by-page
+        /// and aggregates the items into <paramref name="buffer"/> until the <paramref name="predicate"/> returns <c>false</c>.
+        /// A typical use-case is DynamoDB paginate-until-consumed pattern.
+        /// </summary>
+        public static async Task<List<T>> CollectWhileAsync<T>(
+            Func<string?, Task<(IReadOnlyList<T> Page, string? NextToken)>> pageLoader,
+            Predicate<T> predicate,
+            List<T>? buffer = null,
+            CancellationToken ct = default)
+        {
+            buffer ??= new List<T>();
+
+            string? token = null;
+
+            do
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var (page, next) = await pageLoader(token).ConfigureAwait(false);
+
+                foreach (var item in page)
+                {
+                    if (!predicate(item))
+                        return buffer;
+
+                    buffer.Add(item);
+                }
+
+                token = next;
+            }
+            while (token is not null);
+
+            return buffer;
+        }
+        #endregion
+
+        #region ---------- TIME ----------
+        /// <summary>
+        /// Floors the given <see cref="DateTime"/> down to the nearest minute boundary.
+        /// </summary>
+        public static DateTime FloorToMinute(this DateTime dt) =>
+            new(dt.Ticks - (dt.Ticks % TimeSpan.TicksPerMinute), DateTimeKind.Utc);
+
+        /// <summary>
+        /// Floors the given <see cref="DateTime"/> down by <paramref name="quantum"/> interval.
+        /// Commonly used to bucket temporal metrics (e.g., 5-minute focus windows).
+        /// </summary>
+        public static DateTime Floor(this DateTime dt, TimeSpan quantum)
+        {
+            if (dt.Kind != DateTimeKind.Utc)
+                dt = dt.ToUniversalTime();
+
+            long ticks = dt.Ticks / quantum.Ticks * quantum.Ticks;
+            return new DateTime(ticks, DateTimeKind.Utc);
+        }
+        #endregion
+    }
+}
+```

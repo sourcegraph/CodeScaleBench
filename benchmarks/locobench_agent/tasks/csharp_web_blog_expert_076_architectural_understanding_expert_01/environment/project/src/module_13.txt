@@ -1,0 +1,300 @@
+```csharp
+// File: src/module_13.txt
+// TempoScribe Pro – Hexagonal Productivity Blog Suite (web_blog)
+//
+// This source file lives inside the “Core” (domain) layer.  It contains the
+// production-grade service that powers TempoScribe’s scheduled-publishing
+// automation.  Nothing here is allowed to depend on infrastructure details
+// such as EF-Core, MongoDB, Cron libraries, or ASP.NET hosting classes.  All
+// external concerns are referenced through ports (interfaces), enabling easy
+// swapping, mocking, and testability.
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Polly;
+using Polly.Retry;
+
+namespace TempoScribePro.Core.Services.Automation
+{
+    #region Ports (Domain-Facing Interfaces)
+
+    /// <summary>
+    /// Abstraction for retrieving draft posts that are eligible for publishing.
+    /// </summary>
+    public interface IPostRepository
+    {
+        /// <summary>
+        /// Gets posts that should be published at or before the supplied timestamp.
+        /// </summary>
+        Task<IReadOnlyList<ScheduledPost>> GetDueScheduledPostsAsync(DateTimeOffset asOf, int batchSize, CancellationToken ct);
+
+        /// <summary>
+        /// Marks the supplied post as published and sets its PublishedAt timestamp.
+        /// </summary>
+        Task PublishAsync(PostId postId, DateTimeOffset publishedAt, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Marker type used to make persistence atomic whenever required.
+    /// </summary>
+    public interface IUnitOfWork : IAsyncDisposable
+    {
+        Task CommitAsync(CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Supplies temporal information detached from System.DateTime.UtcNow to
+    /// ease deterministic testing and simulate time travel.
+    /// </summary>
+    public interface IClock
+    {
+        DateTimeOffset UtcNow { get; }
+    }
+
+    /// <summary>
+    /// Dispatches domain events to interested subscribers (e.g. email workers,
+    /// Slack bridges, analytics collectors, etc.).
+    /// </summary>
+    public interface IDomainEventPublisher
+    {
+        Task PublishAsync<TEvent>(TEvent @event, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Invalidates any front-end or CDN caches once a post has been published.
+    /// </summary>
+    public interface ICacheInvalidator
+    {
+        Task InvalidatePostAsync(PostId postId, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Allows passing logging responsibility to whichever adapter gets wired at runtime
+    /// (Serilog, NLog, Console, Application Insights, …).
+    /// </summary>
+    public interface ILogger
+    {
+        void Info(string message, params object[] args);
+        void Warning(string message, params object[] args);
+        void Error(Exception ex, string message, params object[] args);
+    }
+
+    #endregion
+
+    #region Domain Primitives
+
+    /// <summary>
+    /// Strongly-typed PostId to avoid primitive obsession.
+    /// </summary>
+    public readonly record struct PostId(Guid Value)
+    {
+        public static implicit operator Guid(PostId id) => id.Value;
+        public override string ToString() => Value.ToString();
+    }
+
+    /// <summary>
+    /// Lightweight projection retrieved from the repository.  Only fields relevant
+    /// to scheduled publishing are included to avoid over-fetching.
+    /// </summary>
+    public sealed class ScheduledPost
+    {
+        public PostId Id { get; init; }
+        public DateTimeOffset ScheduledAt { get; init; }
+        public bool IsPremium { get; init; } // For future extensibility.
+        public override string ToString() => $"Post({Id}, ScheduledAt={ScheduledAt:u})";
+    }
+
+    /// <summary>
+    /// Domain event representing the fact that a post was automatically published.
+    /// </summary>
+    public sealed class PostPublishedEvent
+    {
+        public PostId PostId { get; }
+        public DateTimeOffset PublishedAt { get; }
+
+        public PostPublishedEvent(PostId postId, DateTimeOffset publishedAt)
+        {
+            PostId      = postId;
+            PublishedAt = publishedAt;
+        }
+    }
+
+    #endregion
+
+    /// <summary>
+    ///     Core service orchestrating scheduled publishing.  It is intentionally
+    ///     stateless and agnostic of hosting; the outer layer (e.g. a hosted service
+    ///     in ASP.NET Core) will invoke <see cref="RunOnceAsync"/> at whatever cadence
+    ///     makes sense (e.g. every minute via a cron scheduler, on demand via API,
+    ///     or during a background queue drain).
+    /// 
+    ///     The service must be safe for concurrent execution and re-entrancy.  To
+    ///     achieve this we use an <see cref="AsyncKeyLock"/> to serialise overlapping
+    ///     invocations and Polly for transient fault handling.
+    /// </summary>
+    public sealed class PublishingAutomationScheduler
+    {
+        private const int DefaultBatchSize = 50;
+
+        private readonly IPostRepository      _postRepository;
+        private readonly IUnitOfWork          _unitOfWork;
+        private readonly IDomainEventPublisher _events;
+        private readonly ICacheInvalidator    _cache;
+        private readonly IClock               _clock;
+        private readonly ILogger              _log;
+
+        private readonly AsyncKeyLock _mutex = new();
+
+        private readonly AsyncRetryPolicy _retryPolicy = Policy
+            .Handle<Exception>(ex => !(ex is OperationCanceledException))
+            .WaitAndRetryAsync(
+                retryCount: 3,
+                sleepDurationProvider: attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)),
+                onRetry: (ex, delay, attempt, ctx) =>
+                {
+                    var logger = (ILogger)ctx["log"];
+                    logger.Warning("Retrying publishing batch after failure ({Attempt}/3). Delaying {Delay}. Error: {Message}", attempt, delay, ex.Message);
+                });
+
+        public PublishingAutomationScheduler(
+            IPostRepository postRepository,
+            IUnitOfWork unitOfWork,
+            IDomainEventPublisher events,
+            ICacheInvalidator cache,
+            IClock clock,
+            ILogger log)
+        {
+            _postRepository = postRepository  ?? throw new ArgumentNullException(nameof(postRepository));
+            _unitOfWork     = unitOfWork      ?? throw new ArgumentNullException(nameof(unitOfWork));
+            _events         = events          ?? throw new ArgumentNullException(nameof(events));
+            _cache          = cache           ?? throw new ArgumentNullException(nameof(cache));
+            _clock          = clock           ?? throw new ArgumentNullException(nameof(clock));
+            _log            = log             ?? throw new ArgumentNullException(nameof(log));
+        }
+
+        /// <summary>
+        /// Executes a single scan-and-publish cycle.
+        /// </summary>
+        public async Task RunOnceAsync(CancellationToken ct = default)
+        {
+            // Ensure only one publishing batch is running at a time.
+            using var lease = await _mutex.AcquireAsync(ct);
+
+            if (!lease.Acquired)
+            {
+                _log.Info("PublishingAutomationScheduler skipped because another instance is already running.");
+                return;
+            }
+
+            // Polly context provides the ILogger instance to the onRetry delegate.
+            var pollyCtx = new Context().With("log", _log);
+
+            await _retryPolicy.ExecuteAsync(async _ =>
+            {
+                var now = _clock.UtcNow;
+                _log.Info("Starting scheduled publishing cycle @ {Time:u}", now);
+
+                var duePosts = await _postRepository.GetDueScheduledPostsAsync(now, DefaultBatchSize, ct);
+
+                if (duePosts.Count == 0)
+                {
+                    _log.Info("No scheduled posts found for publishing @ {Time:u}", now);
+                    return;
+                }
+
+                _log.Info("Found {Count} posts ready for publishing.", duePosts.Count);
+
+                foreach (var post in duePosts)
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    await PublishPostAsync(post, now, ct);
+                }
+
+                await _unitOfWork.CommitAsync(ct);
+
+                _log.Info("Scheduled publishing cycle finished. {Count} posts published.", duePosts.Count);
+            }, pollyCtx).ConfigureAwait(false);
+        }
+
+        private async Task PublishPostAsync(ScheduledPost post, DateTimeOffset now, CancellationToken ct)
+        {
+            try
+            {
+                _log.Info("Publishing {Post}", post);
+
+                await _postRepository.PublishAsync(post.Id, now, ct);
+
+                // Fire domain event for observers (analytics, notifications, etc.)
+                await _events.PublishAsync(new PostPublishedEvent(post.Id, now), ct);
+
+                // Bust caches after commit so the freshly published post shows up instantly
+                // for end-users.  If cache invalidation fails we still consider the business
+                // transaction successful, but we log and let observers handle stale caches.
+                await SafeInvalidateCacheAsync(post.Id, ct);
+            }
+            catch (Exception ex) when (!(ex is OperationCanceledException))
+            {
+                _log.Error(ex, "Failed to publish {Post}", post);
+                throw; // Let Polly handle retries; UoW will roll back if supported.
+            }
+        }
+
+        private async Task SafeInvalidateCacheAsync(PostId postId, CancellationToken ct)
+        {
+            try
+            {
+                await _cache.InvalidatePostAsync(postId, ct);
+            }
+            catch (Exception ex) when (!(ex is OperationCanceledException))
+            {
+                _log.Warning("Cache invalidation failed for Post {PostId}. This will be retried by external cache sweeper. Error: {Message}", postId, ex.Message);
+            }
+        }
+
+        #region Nested Utility – AsyncKeyLock
+
+        /// <summary>
+        /// Slim async lock to ensure single-threaded execution without blocking threads.
+        /// </summary>
+        private sealed class AsyncKeyLock
+        {
+            private readonly SemaphoreSlim _semaphore = new(1, 1);
+
+            public async Task<Lease> AcquireAsync(CancellationToken ct)
+            {
+                var acquired = await _semaphore.WaitAsync(0, ct).ConfigureAwait(false);
+                return new Lease(this, acquired);
+            }
+
+            private void Release()
+            {
+                _semaphore.Release();
+            }
+
+            public readonly struct Lease : IDisposable
+            {
+                private readonly AsyncKeyLock _owner;
+                public bool Acquired { get; }
+
+                internal Lease(AsyncKeyLock owner, bool acquired)
+                {
+                    _owner    = owner;
+                    Acquired  = acquired;
+                }
+
+                public void Dispose()
+                {
+                    if (Acquired)
+                        _owner.Release();
+                }
+            }
+        }
+
+        #endregion
+    }
+}
+```

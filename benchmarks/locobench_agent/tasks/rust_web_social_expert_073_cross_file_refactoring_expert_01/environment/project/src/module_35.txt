@@ -1,0 +1,498 @@
+```rust
+//! module_35 – Event-sourced learning-pulse subsystem
+//!
+//! This module demonstrates how EduPulse Live persists and publishes
+//! domain events for the “learning-pulse” feature using an out-box pattern.
+//!
+//! Production-quality concerns addressed in this file
+//! --------------------------------------------------
+//! • Service-layer abstraction (`LearningPulseService`)  
+//! • Repository pattern backed by `sqlx` (`PgLearningPulseRepo`)  
+//! • Event store + message publisher decoupling  
+//! • Asynchronous, cancel-safe I/O (`tokio`, `sqlx::transaction`)  
+//! • Structured error handling with context propagation (`anyhow`, `thiserror`)  
+//! • Serde-powered event serialization (JSONB column + NATS transport)  
+//! • TLS-first NATS client configuration  
+//!
+//! Compile with:  
+//! `cargo build --features runtime-tokio-rustls,sqlx-postgres,nats`
+//!
+//! Database schema (PostgreSQL)
+//! ----------------------------
+//! ```sql
+//! CREATE TABLE IF NOT EXISTS learning_pulses (
+//!     id              UUID            PRIMARY KEY,
+//!     title           TEXT            NOT NULL,
+//!     author_id       UUID            NOT NULL,
+//!     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+//! );
+ //!
+//! CREATE TABLE IF NOT EXISTS domain_event_outbox (
+//!     id              BIGSERIAL       PRIMARY KEY,
+//!     aggregate_id    UUID            NOT NULL,
+//!     event_type      TEXT            NOT NULL,
+//!     payload         JSONB           NOT NULL,
+//!     occurred_at     TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+//!     dispatched      BOOLEAN         NOT NULL DEFAULT FALSE
+//! );
+//! ```
+
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
+use thiserror::Error;
+use tokio::time;
+use tracing::{error, info};
+use uuid::Uuid;
+
+// -----------------------------------------------------------------------------
+// Common types & traits
+// -----------------------------------------------------------------------------
+
+/// A domain event emitted by an aggregate root.
+///
+/// Every event has:
+/// • a stable, unique id (for idempotency)  
+/// • the id of the aggregate it belongs to  
+/// • an ISO-timestamp of when it occurred within the domain  
+/// • a semantic `event_type` string used for routing on the message bus  
+/// • a `version` field that allows evolving schema without breaking consumers
+#[typetag::serde(tag = "event_type", rename_all = "snake_case")]
+pub trait DomainEvent: Send + Sync {
+    fn event_id(&self) -> Uuid;
+    fn aggregate_id(&self) -> Uuid;
+    fn occurred_at(&self) -> DateTime<Utc>;
+    fn version(&self) -> u8;
+}
+
+/// Generic envelope stored in the outbox and delivered to the broker.
+#[derive(Serialize, Deserialize)]
+struct EventEnvelope {
+    pub event_id: Uuid,
+    pub aggregate_id: Uuid,
+    pub event_type: String,
+    pub occurred_at: DateTime<Utc>,
+    pub version: u8,
+    pub payload: serde_json::Value,
+}
+
+impl EventEnvelope {
+    fn new<E: DomainEvent + Serialize + ?Sized>(event: &E) -> Result<Self> {
+        Ok(Self {
+            event_id: event.event_id(),
+            aggregate_id: event.aggregate_id(),
+            event_type: std::any::type_name::<E>().to_string(), // e.g. "learning_pulse::Created"
+            occurred_at: event.occurred_at(),
+            version: event.version(),
+            payload: serde_json::to_value(event)?,
+        })
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Learning-pulse domain
+// -----------------------------------------------------------------------------
+
+/// Aggregate root for a learning pulse.
+///
+/// Only minimal data is stored here. Business rules live in `impl`.
+#[derive(Debug, Clone)]
+pub struct LearningPulse {
+    pub id: Uuid,
+    pub title: String,
+    pub author_id: Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
+impl LearningPulse {
+    /// Factory method ensuring invariants
+    pub fn new(title: impl Into<String>, author_id: Uuid) -> Result<(Self, LearningPulseCreated)> {
+        let title = title.into();
+        if title.trim().is_empty() {
+            return Err(DomainError::Validation(
+                "Title must not be empty".into(),
+            )
+            .into());
+        }
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+
+        let pulse = Self {
+            id,
+            title: title.clone(),
+            author_id,
+            created_at,
+        };
+        let evt = LearningPulseCreated {
+            id,
+            title,
+            author_id,
+            occurred_at: created_at,
+            version: 1,
+        };
+        Ok((pulse, evt))
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Events
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LearningPulseCreated {
+    pub id: Uuid,
+    pub title: String,
+    pub author_id: Uuid,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub occurred_at: DateTime<Utc>,
+    pub version: u8,
+}
+
+#[typetag::serde]
+impl DomainEvent for LearningPulseCreated {
+    fn event_id(&self) -> Uuid {
+        self.id
+    }
+    fn aggregate_id(&self) -> Uuid {
+        self.id
+    }
+    fn occurred_at(&self) -> DateTime<Utc> {
+        self.occurred_at
+    }
+    fn version(&self) -> u8 {
+        self.version
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Repositories
+// -----------------------------------------------------------------------------
+
+#[async_trait]
+pub trait LearningPulseRepository: Send + Sync {
+    async fn insert(&self, pulse: &LearningPulse, tx: &mut Transaction<'_, Postgres>) -> Result<()>;
+    async fn by_id(&self, id: Uuid) -> Result<Option<LearningPulse>>;
+}
+
+/// PostgreSQL implementation using `sqlx`
+pub struct PgLearningPulseRepo;
+
+#[async_trait]
+impl LearningPulseRepository for PgLearningPulseRepo {
+    async fn insert(
+        &self,
+        pulse: &LearningPulse,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<()> {
+        sqlx::query!(
+            r#"INSERT INTO learning_pulses (id, title, author_id, created_at)
+               VALUES ($1, $2, $3, $4)"#,
+            pulse.id,
+            pulse.title,
+            pulse.author_id,
+            pulse.created_at
+        )
+        .execute(&mut *tx)
+        .await
+        .context("insert learning pulse")?;
+        Ok(())
+    }
+
+    async fn by_id(&self, id: Uuid) -> Result<Option<LearningPulse>> {
+        let rec = sqlx::query!(
+            r#"SELECT id, title, author_id, created_at
+               FROM learning_pulses WHERE id = $1"#,
+            id,
+        )
+        .fetch_optional(self.pool()?)
+        .await
+        .context("fetch learning pulse")?;
+
+        if let Some(r) = rec {
+            Ok(Some(LearningPulse {
+                id: r.id,
+                title: r.title,
+                author_id: r.author_id,
+                created_at: r.created_at,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl PgLearningPulseRepo {
+    fn pool(&self) -> Result<&PgPool> {
+        PG_POOL.get().ok_or_else(|| anyhow::anyhow!("pool not initialised"))
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Event store
+// -----------------------------------------------------------------------------
+
+#[async_trait]
+pub trait EventStore: Send + Sync {
+    async fn append(
+        &self,
+        envelope: &EventEnvelope,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<()>;
+
+    /// Atomically mark an event as dispatched.
+    async fn mark_dispatched(&self, id: i64) -> Result<()>;
+}
+
+pub struct PgEventStore;
+
+#[async_trait]
+impl EventStore for PgEventStore {
+    async fn append(
+        &self,
+        envelope: &EventEnvelope,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<()> {
+        sqlx::query!(
+            r#"INSERT INTO domain_event_outbox
+               (aggregate_id, event_type, payload)
+               VALUES ($1, $2, $3)"#,
+            envelope.aggregate_id,
+            envelope.event_type,
+            envelope.payload
+        )
+        .execute(&mut *tx)
+        .await
+        .context("append to outbox")?;
+        Ok(())
+    }
+
+    async fn mark_dispatched(&self, id: i64) -> Result<()> {
+        sqlx::query!(
+            r#"UPDATE domain_event_outbox
+               SET dispatched = TRUE
+               WHERE id = $1"#,
+            id
+        )
+        .execute(PG_POOL.get().unwrap())
+        .await?;
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Message broker publisher
+// -----------------------------------------------------------------------------
+
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<()>;
+}
+
+/// NATS IO implementation with Rustls TLS.
+pub struct NatsPublisher {
+    connection: async_nats::Client,
+}
+
+impl NatsPublisher {
+    pub async fn connect() -> Result<Self> {
+        // The NATS url should use tls: e.g. "tls://broker.prod.edupulse.live:4222"
+        let url = std::env::var("NATS_URL").unwrap_or_else(|_| "tls://localhost:4222".into());
+        let connection = async_nats::connect(url).await.context("connect nats")?;
+        Ok(Self { connection })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for NatsPublisher {
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<()> {
+        let subject = format!("{}.v{}", envelope.event_type, envelope.version);
+        let payload = serde_json::to_vec(envelope)?;
+        self.connection
+            .publish(subject, payload.into())
+            .await
+            .context("nats publish")?;
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Service layer
+// -----------------------------------------------------------------------------
+
+pub struct LearningPulseService<R: LearningPulseRepository, E: EventStore, P: EventPublisher> {
+    repo: Arc<R>,
+    store: Arc<E>,
+    publisher: Arc<P>,
+    pool: Arc<PgPool>,
+}
+
+impl<R, E, P> LearningPulseService<R, E, P>
+where
+    R: LearningPulseRepository + 'static,
+    E: EventStore + 'static,
+    P: EventPublisher + 'static,
+{
+    pub fn new(repo: R, store: E, publisher: P, pool: PgPool) -> Self {
+        Self {
+            repo: Arc::new(repo),
+            store: Arc::new(store),
+            publisher: Arc::new(publisher),
+            pool: Arc::new(pool),
+        }
+    }
+
+    /// Create a learning pulse and publish the corresponding event.
+    ///
+    /// Uses the out-box pattern: events are stored in the same tx as
+    /// the aggregate write; a background task flushes them to NATS.
+    pub async fn create_pulse(&self, title: &str, author_id: Uuid) -> Result<Uuid> {
+        let mut tx = self.pool.begin().await?;
+        let (pulse, evt) = LearningPulse::new(title, author_id)?;
+        self.repo.insert(&pulse, &mut tx).await?;
+        let envelope = EventEnvelope::new(&evt)?;
+        self.store.append(&envelope, &mut tx).await?;
+        tx.commit().await?;
+
+        // fire-and-forget: real project would delegate to a queue consumer
+        let publisher = self.publisher.clone();
+        tokio::spawn(async move {
+            if let Err(err) = publisher.publish(&envelope).await {
+                error!(?err, "failed to publish LearningPulseCreated");
+            }
+        });
+
+        Ok(pulse.id)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Error handling
+// -----------------------------------------------------------------------------
+
+#[derive(Error, Debug)]
+pub enum DomainError {
+    #[error("validation error: {0}")]
+    Validation(String),
+}
+
+// -----------------------------------------------------------------------------
+// Initialisation helpers
+// -----------------------------------------------------------------------------
+
+/// Shared, lazily-initialised PostgreSQL pool (used by repo & store).
+static PG_POOL: once_cell::sync::OnceCell<PgPool> = once_cell::sync::OnceCell::new();
+
+/// Start the background outbox dispatcher to guarantee at-least-once delivery.
+///
+/// Batches undispatched rows and publishes them, marking them dispatched on success.
+/// Sleeps for `interval` between sweeps.
+pub async fn start_outbox_dispatcher<E, P>(
+    store: Arc<E>,
+    publisher: Arc<P>,
+    interval: Duration,
+    pool: Arc<PgPool>,
+) -> Result<()>
+where
+    E: EventStore + 'static,
+    P: EventPublisher + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = flush_once(&store, &publisher, &pool).await {
+                error!(?err, "outbox flush failure");
+            }
+            time::sleep(interval).await;
+        }
+    });
+    Ok(())
+}
+
+async fn flush_once<E, P>(store: &Arc<E>, publisher: &Arc<P>, pool: &Arc<PgPool>) -> Result<()>
+where
+    E: EventStore + 'static,
+    P: EventPublisher + 'static,
+{
+    let mut tx = pool.begin().await?;
+    let rows = sqlx::query!(
+        r#"SELECT id,
+                  aggregate_id,
+                  event_type,
+                  payload,
+                  occurred_at,
+                  dispatched
+           FROM domain_event_outbox
+           WHERE dispatched = FALSE
+           ORDER BY occurred_at
+           LIMIT 50
+        "#
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    for row in rows {
+        let envelope = EventEnvelope {
+            event_id: Uuid::new_v4(), // Not stored; only used for broker duplication protection
+            aggregate_id: row.aggregate_id,
+            event_type: row.event_type,
+            occurred_at: row.occurred_at,
+            version: 1,
+            payload: row.payload,
+        };
+        publisher.publish(&envelope).await?;
+        store.mark_dispatched(row.id).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Application bootstrap example
+// -----------------------------------------------------------------------------
+
+/// One-shot bootstrap for Actix-web / Axum etc.  
+/// Not compiled by default – only illustrative.
+///
+/// ```ignore
+/// #[tokio::main]
+/// async fn main() -> anyhow::Result<()> {
+///     tracing_subscriber::fmt::init();
+///
+///     let pool = PgPoolOptions::new()
+///         .max_connections(5)
+///         .connect(&std::env::var("DATABASE_URL")?)
+///         .await?;
+///     PG_POOL.set(pool.clone()).unwrap();
+///
+///     let publisher = NatsPublisher::connect().await?;
+///
+///     let svc = LearningPulseService::new(
+///         PgLearningPulseRepo,
+///         PgEventStore,
+///         publisher.clone(),
+///         pool.clone(),
+///     );
+///
+///     start_outbox_dispatcher(
+///         Arc::new(PgEventStore),
+///         Arc::new(publisher),
+///         Duration::from_secs(5),
+///         Arc::new(pool),
+///     )
+///     .await?;
+///
+///     // Create a pulse
+///     let pulse_id = svc
+///         .create_pulse("Explain the CAP theorem in 3 sentences", Uuid::new_v4())
+///         .await?;
+///     println!("pulse id: {pulse_id}");
+///
+///     Ok(())
+/// }
+/// ```
+```

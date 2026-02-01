@@ -1,0 +1,421 @@
+```rust
+//! src/module_50.rs
+//!
+//! Ledger Entry Query Service with pagination, request-level validation and
+//! Redis-backed response caching.  This module deliberately focuses on the
+//! “Query” half of CQRS, while remaining agnostic of the web framework that
+//! ultimately wires it up to REST/GraphQL routes.
+//!
+//! The code is intended to be production–ready: it embraces asynchronous I/O,
+//! proper error handling, structured logging (via `tracing`) and defensive
+//! validation.  It also demonstrates the Repository pattern, exposing a domain
+//! interface and hiding persistence details (PostgreSQL in our case).
+//!
+//! NOTE: Some crate features (e.g. `sqlx` macros) require the corresponding
+//! Cargo.toml declarations elsewhere in the project:
+//
+//! ```toml
+//! [dependencies]
+//! async-trait = "0.1"
+//! chrono       = { version = "0.4", features = ["serde"] }
+//! deadpool-redis = { version = "0.13", features = ["tokio1"] }
+//! redis        = { version = "0.23", default-features = false, features = ["aio"] }
+//! serde        = { version = "1", features = ["derive"] }
+//! sqlx         = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono"] }
+//! thiserror    = "1"
+//! tracing      = "0.1"
+//! uuid         = { version = "1", features = ["serde", "v4"] }
+//! ```
+//!
+//! # Overview
+//!
+//! • `LedgerEntry`: Domain Model  
+//! • `LedgerEntryView`: DTO for external representation  
+//! • `Pagination`: Helper for page/size bounds + validation  
+//! • `LedgerEntryRepository`: Trait exposing database access  
+//! • `PostgresLedgerEntryRepository`: SQLx implementation  
+//! • `LedgerQueryService`: Orchestrates repository and cache
+
+#![allow(clippy::missing_errors_doc)] // Errors are documented in `LedgerError`
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use deadpool_redis::redis::AsyncCommands;
+use deadpool_redis::Pool as RedisPool;
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgQueryResult, PgPool, Row};
+use std::{fmt, sync::Arc, time::Duration};
+use thiserror::Error;
+use tracing::{debug, error, instrument, warn};
+use uuid::Uuid;
+
+// -----------------------------------------------------------------------------
+// Domain Model
+// -----------------------------------------------------------------------------
+
+/// Immutable ledger entry (domain model).
+#[derive(Debug, Clone)]
+pub struct LedgerEntry {
+    pub id:            Uuid,
+    pub account_id:    Uuid,
+    pub amount_minor:  i64,          // Monetary minor units (e.g., cents)
+    pub currency:      String,
+    pub entry_type:    EntryType,
+    pub created_at:    DateTime<Utc>,
+    pub description:   Option<String>,
+}
+
+/// Enum for debit / credit classification.
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "ledger_entry_type", rename_all = "lowercase")]
+pub enum EntryType {
+    Debit,
+    Credit,
+}
+
+// -----------------------------------------------------------------------------
+// DTO / View Model
+// -----------------------------------------------------------------------------
+
+/// External representation of a ledger entry.
+/// Keeps internal invariants hidden and provides
+/// forward-compatibility via versioned fields.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LedgerEntryView {
+    pub id:           Uuid,
+    pub account_id:   Uuid,
+    pub amount:       String, // e.g., `"123.45 USD"`
+    pub direction:    EntryType,
+    pub created_at:   DateTime<Utc>,
+    pub description:  Option<String>,
+}
+
+impl From<LedgerEntry> for LedgerEntryView {
+    fn from(src: LedgerEntry) -> Self {
+        let sign = if src.entry_type == EntryType::Debit { "-" } else { "" };
+        // Assume 2 decimal places for simplicity; a production system would
+        // leverage `rust_decimal` or similar.
+        let amount_major = (src.amount_minor as f64) / 100.0;
+        LedgerEntryView {
+            id:          src.id,
+            account_id:  src.account_id,
+            amount:      format!("{}{:.2} {}", sign, amount_major.abs(), src.currency),
+            direction:   src.entry_type,
+            created_at:  src.created_at,
+            description: src.description,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Pagination
+// -----------------------------------------------------------------------------
+
+const MAX_PER_PAGE: u32 = 250;
+
+/// Strongly-typed pagination request (pre-validated).
+#[derive(Debug, Copy, Clone)]
+pub struct Pagination {
+    pub page:     u32,
+    pub per_page: u32,
+}
+
+impl Pagination {
+    /// Validate and create a Pagination instance.
+    pub fn new(page: u32, per_page: u32) -> Result<Self, LedgerError> {
+        if page == 0 {
+            return Err(LedgerError::validation("`page` must be >= 1"));
+        }
+        if per_page == 0 || per_page > MAX_PER_PAGE {
+            return Err(LedgerError::validation(&format!(
+                "`per_page` must be in 1..={MAX_PER_PAGE}"
+            )));
+        }
+        Ok(Self { page, per_page })
+    }
+
+    pub fn offset_limit(self) -> (i64, i64) {
+        (
+            ((self.page - 1) * self.per_page) as i64,
+            self.per_page as i64,
+        )
+    }
+}
+
+/// Server response envelope for paginated lists.
+#[derive(Debug, Serialize)]
+pub struct Paginated<T> {
+    pub data:       Vec<T>,
+    pub total:      u64,
+    pub page:       u32,
+    pub per_page:   u32,
+}
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Domain-level error type.
+#[derive(Debug, Error)]
+pub enum LedgerError {
+    #[error("Validation error: {0}")]
+    Validation(String),
+
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("Cache error: {0}")]
+    Cache(#[from] deadpool_redis::redis::RedisError),
+
+    #[error("Internal error: {0}")]
+    Internal(String),
+}
+
+impl LedgerError {
+    fn validation(msg: &str) -> Self { Self::Validation(msg.to_owned()) }
+}
+
+impl actix_web::ResponseError for LedgerError {} // Optional integration
+
+// -----------------------------------------------------------------------------
+// Repository Trait
+// -----------------------------------------------------------------------------
+
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync + fmt::Debug {
+    /// Return (entries, total) for a given account with pagination.
+    async fn fetch_by_account(
+        &self,
+        account_id: Uuid,
+        pagination: Pagination,
+    ) -> Result<(Vec<LedgerEntry>, u64), LedgerError>;
+}
+
+// -----------------------------------------------------------------------------
+// Repository Implementation (PostgreSQL)
+// -----------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct PostgresLedgerEntryRepository {
+    pool: PgPool,
+}
+
+impl PostgresLedgerEntryRepository {
+    pub fn new(pool: PgPool) -> Self { Self { pool } }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for PostgresLedgerEntryRepository {
+    #[instrument(skip(self))]
+    async fn fetch_by_account(
+        &self,
+        account_id: Uuid,
+        pagination: Pagination,
+    ) -> Result<(Vec<LedgerEntry>, u64), LedgerError> {
+        let (offset, limit) = pagination.offset_limit();
+
+        let mut tx = self.pool.begin().await?;
+
+        let entries: Vec<LedgerEntry> = sqlx::query!(
+            r#"
+            SELECT id, account_id, amount_minor, currency, entry_type as "entry_type: EntryType",
+                   created_at, description
+              FROM ledger_entries
+             WHERE account_id = $1
+             ORDER BY created_at DESC
+             OFFSET $2 LIMIT $3
+            "#,
+            account_id,
+            offset,
+            limit
+        )
+        .map(|row| LedgerEntry {
+            id:           row.id,
+            account_id:   row.account_id,
+            amount_minor: row.amount_minor,
+            currency:     row.currency,
+            entry_type:   row.entry_type,
+            created_at:   row.created_at,
+            description:  row.description,
+        })
+        .fetch_all(&mut *tx)
+        .await?;
+
+        // Total rows
+        let total: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) FROM ledger_entries WHERE account_id = $1"#,
+            account_id
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok((entries, total as u64))
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Service Layer
+// -----------------------------------------------------------------------------
+
+const CACHE_TTL: Duration = Duration::from_secs(60); // 1-minute soft TTL
+
+#[derive(Clone)]
+pub struct LedgerQueryService {
+    repo:      Arc<dyn LedgerEntryRepository>,
+    cache:     RedisPool,
+}
+
+impl LedgerQueryService {
+    pub fn new<R>(repo: R, cache: RedisPool) -> Self
+    where
+        R: LedgerEntryRepository + 'static,
+    {
+        Self {
+            repo: Arc::new(repo),
+            cache,
+        }
+    }
+
+    /// Fetch paginated ledger entries with Redis caching.
+    ///
+    /// Cache key is constructed from `account_id/page/per_page`.
+    #[instrument(skip(self))]
+    pub async fn list_entries(
+        &self,
+        account_id: Uuid,
+        pagination: Pagination,
+    ) -> Result<Paginated<LedgerEntryView>, LedgerError> {
+        let cache_key = format!(
+            "ledger:v1:entries:{}:{}:{}",
+            account_id, pagination.page, pagination.per_page
+        );
+
+        // Step 1. Try cache
+        let mut redis_con = self.cache.get().await?;
+        if let Ok(Some(cached_json)) = redis_con.get::<_, String>(&cache_key).await {
+            debug!(%cache_key, "Cache hit for ledger entries");
+            let paginated: Paginated<LedgerEntryView> = serde_json::from_str(&cached_json)
+                .map_err(|e| LedgerError::Internal(e.to_string()))?;
+            return Ok(paginated);
+        }
+        debug!(%cache_key, "Cache miss for ledger entries");
+
+        // Step 2. Query repository
+        let (entries, total) = self.repo.fetch_by_account(account_id, pagination).await?;
+
+        let data: Vec<_> = entries.into_iter().map(LedgerEntryView::from).collect();
+
+        let result = Paginated {
+            data:     data.clone(),
+            total,
+            page:     pagination.page,
+            per_page: pagination.per_page,
+        };
+
+        // Step 3. Fire-and-forget cache population
+        let cache_payload = serde_json::to_string(&result)
+            .map_err(|e| LedgerError::Internal(e.to_string()))?;
+        let mut redis_con_clone = redis_con.clone();
+        tokio::spawn(async move {
+            let _: Result<(), _> = redis_con_clone
+                .set_ex::<_, _, ()>(&cache_key, cache_payload, CACHE_TTL.as_secs() as usize)
+                .await;
+        });
+
+        Ok(result)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Unit Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deadpool_redis::{Config as RedisConfig, Runtime};
+    use sqlx::{Executor, PgPool, Postgres};
+    use std::str::FromStr;
+
+    async fn setup_pg() -> PgPool {
+        let pool = PgPool::connect("postgres://postgres:postgres@localhost/ledger_test")
+            .await
+            .expect("PG pool");
+        pool.execute(
+            r#"
+            CREATE TEMP TABLE IF NOT EXISTS ledger_entries (
+                id UUID PRIMARY KEY,
+                account_id UUID NOT NULL,
+                amount_minor BIGINT NOT NULL,
+                currency TEXT NOT NULL,
+                entry_type ledger_entry_type NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                description TEXT
+            );
+            "#,
+        )
+        .await
+        .unwrap();
+        pool
+    }
+
+    async fn setup_redis() -> RedisPool {
+        let mut cfg = RedisConfig::default();
+        cfg.url = Some("redis://127.0.0.1/".into());
+        cfg.create_pool(Some(Runtime::Tokio1)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pagination_validation() {
+        assert!(Pagination::new(0, 10).is_err());
+        assert!(Pagination::new(1, 0).is_err());
+        assert!(Pagination::new(1, MAX_PER_PAGE + 1).is_err());
+        assert!(Pagination::new(1, 50).is_ok());
+    }
+
+    #[tokio::test]
+    async fn query_service_flow() -> Result<(), LedgerError> {
+        let pg_pool = setup_pg().await;
+        let redis_pool = setup_redis().await;
+
+        // Seed DB
+        let account_id = Uuid::new_v4();
+        let entry_id = Uuid::new_v4();
+        let now = Utc::now();
+        sqlx::query!(
+            r#"
+            INSERT INTO ledger_entries (id, account_id, amount_minor, currency,
+                                        entry_type, created_at, description)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+            entry_id,
+            account_id,
+            12345i64,
+            "USD",
+            EntryType::Credit as EntryType,
+            now,
+            Some("seed data")
+        )
+        .execute(&pg_pool)
+        .await?;
+
+        // Service
+        let repo = PostgresLedgerEntryRepository::new(pg_pool);
+        let service = LedgerQueryService::new(repo, redis_pool);
+
+        let pagination = Pagination::new(1, 10).unwrap();
+        let first = service
+            .list_entries(account_id, pagination)
+            .await
+            .expect("first call");
+        assert_eq!(first.total, 1);
+        assert_eq!(first.data.len(), 1);
+
+        // Second call should hit cache (we rely on logs but we can still call).
+        let _second = service.list_entries(account_id, pagination).await?;
+        Ok(())
+    }
+}
+```

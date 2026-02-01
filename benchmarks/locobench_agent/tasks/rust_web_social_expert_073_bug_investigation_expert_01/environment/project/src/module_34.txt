@@ -1,0 +1,405 @@
+```rust
+//! src/module_34.rs
+//!
+//! Audit trail & GDPR-erasure support for EduPulse Live.
+//!
+//! This module listens to domain events that flow through the message broker,
+//! persists an immutable audit trail in Postgres (via `sqlx`), and optionally
+//! indexes the events in Meilisearch for fast compliance searches.
+//!
+//! It provides helpers to:
+//!  1. Persist any `DomainEvent` that implements `serde::Serialize`.
+//!  2. Query the audit log by user, event type, or date range.
+//!  3. Trigger GDPR “right-to-be-forgotten” procedures while preserving a
+//!     cryptographic tombstone of the erasure request.
+//!
+//! The code below is “production-grade”: non-blocking, structured logging,
+//! proper error bubbling, and feature-gated search integration.
+//!
+//! NOTE: …
+#![allow(dead_code)]
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::TryStreamExt;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use tokio::sync::RwLock;
+use tracing::{error, info, instrument};
+use uuid::Uuid;
+
+#[cfg(feature = "search")]
+use meilisearch_sdk::{
+    client::*,
+    indexes::Index,
+    document::Document,
+};
+
+/// Unique wrapper around a `Uuid` for stronger typing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EventId(Uuid);
+
+impl EventId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+/// Tag that every domain event must expose.
+#[async_trait]
+pub trait DomainEvent: Serialize + Send + Sync {
+    /// Name of the event, e.g. `"LessonPublished"`.
+    fn event_type(&self) -> &'static str;
+
+    /// The principal user (if any) related to this event.
+    fn user_id(&self) -> Option<Uuid>;
+
+    /// Occurrence in UTC.
+    fn occurred_at(&self) -> DateTime<Utc>;
+}
+
+/// Concrete audit-trail record stored in Postgres.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuditLogEntry {
+    pub id:          EventId,
+    pub event_type:  String,
+    pub payload:     serde_json::Value,
+    pub user_id:     Option<Uuid>,
+    pub occurred_at: DateTime<Utc>,
+}
+
+/// Repository abstraction (Repository pattern).
+#[async_trait]
+pub trait AuditLogRepository: Send + Sync {
+    async fn persist<E: DomainEvent>(&self, event: &E) -> Result<()>;
+    async fn fetch_by_user(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AuditLogEntry>>;
+    async fn forget_user(&self, user_id: Uuid) -> Result<()>;
+}
+
+/// PostgreSQL implementation.
+pub struct PostgresAuditRepo {
+    pool: PgPool,
+
+    #[cfg(feature = "search")]
+    index: Option<Index>,
+}
+
+impl PostgresAuditRepo {
+    /// Establish a new repository.
+    ///
+    /// # Parameters
+    ///
+    /// * `pg_dsn` – Postgres connection string.
+    /// * `max_conns` – Maximum connection pool size.
+    #[instrument(level = "info", skip_all)]
+    pub async fn new(pg_dsn: &str, max_conns: u32) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_conns)
+            .connect(pg_dsn)
+            .await
+            .context("cannot connect to Postgres")?;
+
+        // Ensure table exists; in real code migrations run separately.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id          UUID PRIMARY KEY,
+                event_type  TEXT NOT NULL,
+                payload     JSONB NOT NULL,
+                user_id     UUID,
+                occurred_at TIMESTAMPTZ NOT NULL
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+
+        #[cfg(feature = "search")]
+        let index = {
+            let client = Client::new("http://localhost:7700", "masterKey");
+            let idx = client.get_or_create("audit_log").await?;
+            idx.set_primary_key("id").await?;
+            Some(idx)
+        };
+
+        Ok(Self {
+            pool,
+            #[cfg(feature = "search")]
+            index,
+        })
+    }
+}
+
+#[async_trait]
+impl AuditLogRepository for PostgresAuditRepo {
+    #[instrument(level = "debug", skip_all, err)]
+    async fn persist<E: DomainEvent>(&self, event: &E) -> Result<()> {
+        // Serialize payload now to avoid borrowing issues & corruption later.
+        let payload = serde_json::to_value(event).context("serialize event payload")?;
+        let id = EventId::new();
+
+        sqlx::query(
+            r#"
+            INSERT INTO audit_log (id, event_type, payload, user_id, occurred_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(id.0)
+        .bind(event.event_type())
+        .bind(&payload)
+        .bind(event.user_id())
+        .bind(event.occurred_at())
+        .execute(&self.pool)
+        .await
+        .context("insert audit record")?;
+
+        #[cfg(feature = "search")]
+        if let Some(index) = &self.index {
+            // We implement Document manually instead of deriving to avoid trait bound collision.
+            #[derive(Serialize)]
+            struct SearchDoc<'a> {
+                id: Uuid,
+                event_type: &'a str,
+                user_id: Option<Uuid>,
+                occurred_at: DateTime<Utc>,
+            }
+
+            let doc = SearchDoc {
+                id: id.0,
+                event_type: event.event_type(),
+                user_id: event.user_id(),
+                occurred_at: event.occurred_at(),
+            };
+
+            // Non-blocking; Meilisearch handles indexing eventually.
+            let _ = index.add_documents(&[doc], None).await;
+        }
+
+        Ok(())
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    async fn fetch_by_user(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AuditLogEntry>> {
+        let mut cursor = sqlx::query(
+            r#"
+            SELECT id, event_type, payload, user_id, occurred_at
+            FROM audit_log
+            WHERE user_id = $1
+            ORDER BY occurred_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch(&self.pool);
+
+        let mut out = Vec::new();
+        while let Some(row) = cursor.try_next().await? {
+            out.push(AuditLogEntry {
+                id: EventId(row.try_get::<Uuid, _>("id")?),
+                event_type: row.try_get("event_type")?,
+                payload: row.try_get::<serde_json::Value, _>("payload")?,
+                user_id: row.try_get("user_id")?,
+                occurred_at: row.try_get("occurred_at")?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// GDPR “right-to-erasure”.
+    ///
+    /// We do *soft* deletion: PII is wiped, but an audit tombstone remains.
+    #[instrument(level = "warn", skip(self))]
+    async fn forget_user(&self, user_id: Uuid) -> Result<()> {
+        let tx = self.pool.begin().await?;
+
+        // 1. Wipe personal data (example table).
+        sqlx::query("UPDATE users SET email = NULL, name = NULL WHERE id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // 2. Insert a tombstone audit.
+        let tombstone = serde_json::json!({
+            "reason": "gdpr_forget_user",
+            "user_id": user_id,
+            "ts": Utc::now(),
+        });
+
+        sqlx::query(
+            r#"
+            INSERT INTO audit_log (id, event_type, payload, user_id, occurred_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind("UserErased")
+        .bind(&tombstone)
+        .bind(user_id)
+        .bind(Utc::now())
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        #[cfg(feature = "search")]
+        if let Some(index) = &self.index {
+            let _ = index.delete_documents(&[user_id.to_string()]).await;
+        }
+
+        Ok(())
+    }
+}
+
+/// High-level façade (Service Layer).
+#[derive(Clone)]
+pub struct AuditService {
+    repo: Arc<dyn AuditLogRepository>,
+    /// Cached config with live reload (demonstration).
+    cfg:  Arc<RwLock<ServiceConfig>>,
+}
+
+impl AuditService {
+    pub fn new(repo: Arc<dyn AuditLogRepository>, cfg: ServiceConfig) -> Self {
+        Self {
+            repo,
+            cfg: Arc::new(RwLock::new(cfg)),
+        }
+    }
+
+    pub async fn update_config(&self, new_cfg: ServiceConfig) {
+        let mut guard = self.cfg.write().await;
+        *guard = new_cfg;
+        info!(?*guard, "audit service config updated");
+    }
+
+    /// Persist an event; if capturing fails we *log & bubble*.
+    #[instrument(level = "info", skip(self, event), fields(ev = event.event_type()))]
+    pub async fn record<E: DomainEvent>(&self, event: &E) -> Result<()> {
+        // Toggle via config at runtime (ex: maintenance window).
+        if !self.cfg.read().await.enabled {
+            info!("audit service disabled, skipping persist");
+            return Ok(());
+        }
+
+        if let Err(err) = self.repo.persist(event).await {
+            error!(error = %err, "failed to persist audit event");
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    pub async fn events_for_user(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AuditLogEntry>> {
+        self.repo.fetch_by_user(user_id, limit, offset).await
+    }
+
+    pub async fn gdpr_forget_user(&self, user_id: Uuid) -> Result<()> {
+        self.repo.forget_user(user_id).await
+    }
+}
+
+/// Runtime-switchable service config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceConfig {
+    pub enabled: bool,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/* ==== Example domain events ================================================= */
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LessonPublished {
+    pub lesson_id:  Uuid,
+    pub course_id:  Uuid,
+    pub author_id:  Uuid,
+    pub published_at: DateTime<Utc>,
+}
+
+#[async_trait]
+impl DomainEvent for LessonPublished {
+    fn event_type(&self) -> &'static str {
+        "LessonPublished"
+    }
+
+    fn user_id(&self) -> Option<Uuid> {
+        Some(self.author_id)
+    }
+
+    fn occurred_at(&self) -> DateTime<Utc> {
+        self.published_at
+    }
+}
+
+/* ==== Unit tests (tokio) ==================================================== */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use once_cell::sync::Lazy;
+
+    static RT_LOG: Lazy<()> = Lazy::new(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .try_init();
+    });
+
+    async fn init_repo() -> PostgresAuditRepo {
+        let _ = *RT_LOG; // init logging once
+        // For tests we spin a transient database (use `docker-compose` CI) or
+        // connect to `$TEST_DATABASE_URL`.
+        let dsn = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must be set for integration tests");
+
+        PostgresAuditRepo::new(&dsn, 5)
+            .await
+            .expect("cannot create repo")
+    }
+
+    #[tokio::test]
+    async fn record_and_fetch() {
+        let repo = init_repo().await;
+        let svc  = AuditService::new(Arc::new(repo), ServiceConfig::default());
+
+        let ev = LessonPublished {
+            lesson_id:  Uuid::new_v4(),
+            course_id:  Uuid::new_v4(),
+            author_id:  Uuid::new_v4(),
+            published_at: Utc::now(),
+        };
+
+        svc.record(&ev).await.expect("record failed");
+
+        let entries = svc.events_for_user(ev.author_id, 10, 0)
+            .await
+            .expect("fetch failed");
+
+        assert!(!entries.is_empty());
+        assert_eq!(entries[0].event_type, "LessonPublished");
+    }
+}
+```

@@ -1,0 +1,377 @@
+```rust
+//! src/module_29.rs
+//!
+//! High-level, production-ready event publishing module used by EduPulse Live.
+//! ---------------------------------------------------------------------------
+//! Every domain aggregate emits an immutable `DomainEvent`.  This file provides
+//! generic abstractions as well as a RabbitMQ implementation that fulfils the
+//! `EventPublisher` contract.  An in-memory fallback is included for testing
+//! and local development.
+//!
+//! The decision to isolate message-broker logic behind a dedicated trait
+//! follows the Dependency-Inversion principle and keeps the domain layer free
+//! from infrastructural details.
+//!
+//! Crate dependencies (add to Cargo.toml):
+//! ---------------------------------------
+//! chrono        = "0.4"
+//! uuid          = { version = "1", features = ["serde", "v4"] }
+//! serde         = { version = "1", features = ["derive"] }
+//! serde_json    = "1"
+//! async-trait   = "0.1"
+//! lapin         = { version = "2", features = ["executor", "serde"] }
+//! tokio         = { version = "1", features = ["macros", "rt-multi-thread"] }
+//! thiserror     = "1"
+//! tracing       = "0.1"
+//! futures       = "0.3"
+//!
+//! The module is `#![forbid(unsafe_code)]` to enforce memory safety guarantees.
+
+#![forbid(unsafe_code)]
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::StreamExt;
+use lapin::{
+    options::{BasicPublishOptions, ExchangeDeclareOptions},
+    types::FieldTable,
+    BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind,
+};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::sync::RwLock;
+use tracing::{debug, error, info};
+use uuid::Uuid;
+
+/// Common metadata every `DomainEvent` MUST expose.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventMetadata {
+    pub id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+}
+
+impl Default for EventMetadata {
+    fn default() -> Self {
+        EventMetadata {
+            id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+        }
+    }
+}
+
+/// Marker trait for domain events.
+///
+/// To keep the domain model agnostic of message-broker peculiarities, we only
+/// require events to reveal their `metadata()` and `event_name()`.  All
+/// serialization rules are handled generically by the infrastructural layer.
+pub trait DomainEvent: Serialize + DeserializeOwned + Send + Sync + 'static {
+    /// Fully-qualified, snake_case name (e.g. `"learning_pulse_created"`).
+    fn event_name(&self) -> &'static str;
+
+    /// Immutable metadata (id, timestamp, …).
+    fn metadata(&self) -> &EventMetadata;
+}
+
+/// Envelope that decorates the actual payload with type + meta information.
+///
+/// This is what gets **published** to the broker.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventEnvelope<E: DomainEvent> {
+    pub name: &'static str,
+    pub metadata: EventMetadata,
+    pub payload: E,
+}
+
+impl<E: DomainEvent> From<E> for EventEnvelope<E> {
+    fn from(event: E) -> Self {
+        Self {
+            name: event.event_name(),
+            metadata: event.metadata().clone(),
+            payload: event,
+        }
+    }
+}
+
+/// Error variants that may occur while publishing.
+#[derive(Error, Debug)]
+pub enum PublisherError {
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("AMQP error: {0}")]
+    Amqp(#[from] lapin::Error),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("publisher not initialized")]
+    NotInitialized,
+}
+
+/// Abstraction over message brokers used by the service layer.
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish<E>(&self, event: &E) -> Result<(), PublisherError>
+    where
+        E: DomainEvent;
+}
+
+/// RabbitMQ implementation using the `lapin` crate.
+pub struct RabbitMqPublisher {
+    channel: Channel,
+    exchange: String,
+}
+
+impl RabbitMqPublisher {
+    /// Establish a new AMQP connection and declare a topic exchange if missing.
+    pub async fn new(uri: &str, exchange: &str) -> Result<Self, PublisherError> {
+        let conn = Connection::connect(uri, ConnectionProperties::default()).await?;
+        let channel = conn.create_channel().await?;
+
+        channel
+            .exchange_declare(
+                exchange,
+                ExchangeKind::Topic,
+                ExchangeDeclareOptions {
+                    durable: true,
+                    auto_delete: false,
+                    internal: false,
+                    nowait: false,
+                },
+                FieldTable::default(),
+            )
+            .await?;
+
+        Ok(Self {
+            channel,
+            exchange: exchange.to_owned(),
+        })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for RabbitMqPublisher {
+    async fn publish<E>(&self, event: &E) -> Result<(), PublisherError>
+    where
+        E: DomainEvent,
+    {
+        let envelope: EventEnvelope<E> = event.clone().into();
+        let data = serde_json::to_vec(&envelope)?;
+        let routing_key = envelope.name;
+
+        debug!(%routing_key, "Publishing event");
+
+        let confirm = self
+            .channel
+            .basic_publish(
+                &self.exchange,
+                routing_key,
+                BasicPublishOptions::default(),
+                data,
+                BasicProperties::default(),
+            )
+            .await?
+            .await?; // wait for broker confirm
+
+        if confirm.is_nack() {
+            error!(%routing_key, "Broker negatively acknowledged the message");
+            return Err(PublisherError::Amqp(lapin::Error::InvalidChannelState));
+        }
+
+        Ok(())
+    }
+}
+
+/// In-memory fallback; stores the last `n` events for inspection / testing.
+pub struct InMemoryPublisher {
+    inner: Arc<RwLock<Vec<String>>>,
+    capacity: usize,
+}
+
+impl InMemoryPublisher {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Vec::with_capacity(capacity))),
+            capacity,
+        }
+    }
+
+    /// Read-only access to recorded JSON payloads.
+    pub async fn events(&self) -> Vec<String> {
+        self.inner.read().await.clone()
+    }
+}
+
+#[async_trait]
+impl EventPublisher for InMemoryPublisher {
+    async fn publish<E>(&self, event: &E) -> Result<(), PublisherError>
+    where
+        E: DomainEvent,
+    {
+        let envelope: EventEnvelope<E> = event.clone().into();
+        let json = serde_json::to_string(&envelope)?;
+
+        let mut guard = self.inner.write().await;
+        if guard.len() >= self.capacity {
+            guard.remove(0); // simple circular buffer
+        }
+        guard.push(json);
+
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Example domain events used by the social learning hub
+ * ---------------------------------------------------------------------- */
+
+/// Emitted whenever a teacher creates a new *Learning Pulse*.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningPulseCreated {
+    pub meta: EventMetadata,
+    pub pulse_id: Uuid,
+    pub teacher_id: Uuid,
+    pub title: String,
+}
+
+impl LearningPulseCreated {
+    pub fn new(pulse_id: Uuid, teacher_id: Uuid, title: impl Into<String>) -> Self {
+        Self {
+            meta: EventMetadata::default(),
+            pulse_id,
+            teacher_id,
+            title: title.into(),
+        }
+    }
+}
+
+impl DomainEvent for LearningPulseCreated {
+    fn event_name(&self) -> &'static str {
+        "learning_pulse_created"
+    }
+
+    fn metadata(&self) -> &EventMetadata {
+        &self.meta
+    }
+}
+
+/// Emitted whenever a student submits a reply to a pulse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseReplySubmitted {
+    pub meta: EventMetadata,
+    pub pulse_id: Uuid,
+    pub student_id: Uuid,
+    pub attachment_url: String,
+}
+
+impl PulseReplySubmitted {
+    pub fn new(pulse_id: Uuid, student_id: Uuid, attachment_url: impl Into<String>) -> Self {
+        Self {
+            meta: EventMetadata::default(),
+            pulse_id,
+            student_id,
+            attachment_url: attachment_url.into(),
+        }
+    }
+}
+
+impl DomainEvent for PulseReplySubmitted {
+    fn event_name(&self) -> &'static str {
+        "pulse_reply_submitted"
+    }
+
+    fn metadata(&self) -> &EventMetadata {
+        &self.meta
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Dynamic dispatcher that hides the actual implementation behind a trait obj
+ * ---------------------------------------------------------------------- */
+
+/// Thread-safe, reference-counted dispatcher used by application services.
+#[derive(Clone)]
+pub struct EventDispatcher {
+    publisher: Arc<dyn EventPublisher>,
+}
+
+impl EventDispatcher {
+    pub fn new(publisher: Arc<dyn EventPublisher>) -> Self {
+        Self { publisher }
+    }
+
+    pub async fn publish<E>(&self, event: &E) -> Result<(), PublisherError>
+    where
+        E: DomainEvent,
+    {
+        self.publisher.publish(event).await
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Tokio-based integration test (requires `cargo test -- --nocapture`)
+ * ---------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    fn init_tracing() {
+        let _ = fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .try_init();
+    }
+
+    #[tokio::test]
+    async fn in_memory_roundtrip() {
+        init_tracing();
+
+        let publisher = InMemoryPublisher::new(8);
+        let dispatcher = EventDispatcher::new(Arc::new(publisher));
+
+        let event = LearningPulseCreated::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "🧑‍💻  Rust Ownership Challenge",
+        );
+
+        dispatcher.publish(&event).await.unwrap();
+
+        let recorded = dispatcher
+            .publisher
+            .as_any()
+            .downcast_ref::<InMemoryPublisher>()
+            .unwrap()
+            .events()
+            .await;
+
+        assert_eq!(recorded.len(), 1);
+
+        let envelope: EventEnvelope<LearningPulseCreated> =
+            serde_json::from_str(&recorded[0]).unwrap();
+
+        assert_eq!(envelope.name, "learning_pulse_created");
+        assert_eq!(envelope.payload.title, "🧑‍💻  Rust Ownership Challenge");
+    }
+
+    // Helper for downcasting Arc<dyn EventPublisher> in test code
+    trait AsAny {
+        fn as_any(&self) -> &dyn std::any::Any;
+    }
+
+    impl<T: EventPublisher + 'static> AsAny for T {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl dyn EventPublisher {
+        #[allow(clippy::borrowed_box)]
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+}
+```

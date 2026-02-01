@@ -1,0 +1,389 @@
+```rust
+//! Module 37 – Model‐Monitoring utilities
+//! ======================================
+//! This module is a **self-contained** piece of infrastructure that can be
+//! dropped into the VisuTility Orchestrator without touching the remainder of
+//! the code-base.  It offers a *Strategy-based* drift detector and an
+//! *Observer-based* metric broadcaster that other layers can subscribe to for
+//! automated retraining, alerting, or on-the-fly hyper-parameter tuning.
+//!
+//! It demonstrates several architectural ideas pervasive in the project:
+//!   * Stable trait-based interfaces (`DriftStrategy`, `ModelMetricObserver`)
+//!   * Factory helpers (`DriftStrategyFactory`)
+//!   * Thread-safe, **zero-copy** event fan-out via `crossbeam_channel`
+//!   * Robust error handling powered by `anyhow`
+//!
+//! The code purposefully avoids leaking internal mutable state by wrapping it
+//! inside `Mutex`/`RwLock` so callers can safely share the structs between
+//! threads or asynchronous tasks.
+//
+// ----------------------------------------------------------------------------
+// External dependencies
+// ----------------------------------------------------------------------------
+
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use anyhow::{Context, Result};
+use crossbeam_channel::{unbounded, Receiver, Sender};
+
+// ----------------------------------------------------------------------------
+// Domain structs
+// ----------------------------------------------------------------------------
+
+/// Immutable payload representing one inference-or monitoring-time metric
+/// coming from a model endpoint.
+#[derive(Debug, Clone)]
+pub struct MetricEvent {
+    /// Wall-clock timestamp when the metric was recorded.
+    pub timestamp: Instant,
+    /// End-to-end latency in **milliseconds**.
+    pub latency_ms: u64,
+    /// Accuracy metric as a floating point value between 0–1.
+    pub accuracy: f64,
+}
+
+/// A drift event signals that the health of a model has deteriorated and some
+/// mitigating action—*e.g.* retraining—should be considered.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DriftEvent {
+    /// Accuracy has fallen below an acceptable level.
+    AccuracyDegraded {
+        previous: f64,
+        current: f64,
+    },
+}
+
+// ----------------------------------------------------------------------------
+// Observer pattern — Metric fan-out
+// ----------------------------------------------------------------------------
+
+/// An observer that can be notified whenever a new [`MetricEvent`] is ingested.
+pub trait ModelMetricObserver: Send + Sync {
+    fn on_metric(&self, metric: &MetricEvent);
+}
+
+/// Thread-safe broadcaster that keeps a list of observers and notifies them
+/// whenever a new metric arrives.
+///
+/// Clones are **cheap** because internally we only clone an `Arc`.
+#[derive(Clone)]
+pub struct MetricMonitor {
+    observers: Arc<Mutex<Vec<Arc<dyn ModelMetricObserver>>>>,
+}
+
+impl MetricMonitor {
+    /// Construct an empty monitor.
+    pub fn new() -> Self {
+        Self {
+            observers: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Register a new observer.
+    pub fn register<O>(&self, observer: Arc<O>)
+    where
+        O: ModelMetricObserver + 'static,
+    {
+        let mut list = self
+            .observers
+            .lock()
+            .expect("poisoned lock while registering observer");
+        list.push(observer);
+    }
+
+    /// Ingest a metric, broadcasting it to all registered observers.
+    pub fn ingest(&self, metric: MetricEvent) {
+        let guard = self
+            .observers
+            .lock()
+            .expect("poisoned lock while ingesting metric");
+
+        for obs in guard.iter() {
+            obs.on_metric(&metric);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Strategy pattern — Drift detectors
+// ----------------------------------------------------------------------------
+
+/// Pluggable detection strategy that decides if a metric history indicates
+/// model drift.
+pub trait DriftStrategy: Send + Sync {
+    /// Records a metric value (accuracy) and optionally returns a drift event.
+    fn record(&mut self, accuracy: f64) -> Option<DriftEvent>;
+}
+
+/// Simple moving-window threshold strategy.
+///
+/// If any accuracy in the last `window` elements drops below
+/// `min_accuracy`, a drift event is fired.
+pub struct SimpleThresholdStrategy {
+    window: usize,
+    min_accuracy: f64,
+    history: Vec<f64>,
+}
+
+impl SimpleThresholdStrategy {
+    pub fn new(window: usize, min_accuracy: f64) -> Self {
+        Self {
+            window,
+            min_accuracy,
+            history: Vec::with_capacity(window),
+        }
+    }
+}
+
+impl DriftStrategy for SimpleThresholdStrategy {
+    fn record(&mut self, accuracy: f64) -> Option<DriftEvent> {
+        // Maintain bounded history
+        if self.history.len() == self.window {
+            self.history.remove(0);
+        }
+        let previous = self.history.last().copied().unwrap_or(accuracy);
+        self.history.push(accuracy);
+
+        if accuracy < self.min_accuracy {
+            return Some(DriftEvent::AccuracyDegraded {
+                previous,
+                current: accuracy,
+            });
+        }
+        None
+    }
+}
+
+/// Z-score based strategy for detecting anomalies in accuracy trends.
+///
+///   * `window` – how many recent points to keep for mean/std calculation
+///   * `z_threshold` – magnitude of the z-score deemed “anomalous”
+pub struct ZScoreStrategy {
+    window: usize,
+    z_threshold: f64,
+    history: Vec<f64>,
+}
+
+impl ZScoreStrategy {
+    pub fn new(window: usize, z_threshold: f64) -> Self {
+        Self {
+            window,
+            z_threshold,
+            history: Vec::with_capacity(window),
+        }
+    }
+}
+
+impl DriftStrategy for ZScoreStrategy {
+    fn record(&mut self, accuracy: f64) -> Option<DriftEvent> {
+        // Add new value and cap window size
+        if self.history.len() == self.window {
+            self.history.remove(0);
+        }
+        self.history.push(accuracy);
+
+        // Need at least 2 points to compute stdev
+        if self.history.len() < 2 {
+            return None;
+        }
+
+        let mean: f64 = self.history.iter().sum::<f64>() / self.history.len() as f64;
+        let variance: f64 = self
+            .history
+            .iter()
+            .map(|v| (v - mean).powi(2))
+            .sum::<f64>()
+            / (self.history.len() as f64 - 1.0);
+        let stddev = variance.sqrt();
+
+        if stddev == 0.0 {
+            return None; // too little variance, nothing we can say
+        }
+
+        let z_score = (accuracy - mean).abs() / stddev;
+        if z_score > self.z_threshold {
+            let previous = *self.history.iter().rev().nth(1).unwrap();
+            return Some(DriftEvent::AccuracyDegraded {
+                previous,
+                current: accuracy,
+            });
+        }
+
+        None
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Factory helpers
+// ----------------------------------------------------------------------------
+
+/// Enumerated strategy flavours for ergonomic, configuration-driven selection.
+pub enum DriftStrategyKind {
+    SimpleThreshold { window: usize, min_accuracy: f64 },
+    ZScore { window: usize, z_threshold: f64 },
+}
+
+/// Build a boxed strategy from the enum.
+///
+/// This avoids leaking concrete types in higher-level APIs and plays well with
+/// **serde-deserialised** configuration files.
+pub struct DriftStrategyFactory;
+
+impl DriftStrategyFactory {
+    pub fn build(kind: DriftStrategyKind) -> Box<dyn DriftStrategy> {
+        match kind {
+            DriftStrategyKind::SimpleThreshold {
+                window,
+                min_accuracy,
+            } => Box::new(SimpleThresholdStrategy::new(window, min_accuracy)),
+            DriftStrategyKind::ZScore {
+                window,
+                z_threshold,
+            } => Box::new(ZScoreStrategy::new(window, z_threshold)),
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Drift detector — Observer implementation
+// ----------------------------------------------------------------------------
+
+/// Observer that wraps a [`DriftStrategy`] and publishes `DriftEvent`s
+/// downstream on a non-blocking channel.
+pub struct DriftDetector {
+    strategy: Mutex<Box<dyn DriftStrategy>>,
+    event_sender: Sender<DriftEvent>,
+}
+
+impl DriftDetector {
+    /// Construct a detector and return `(detector, event_receiver)`.
+    pub fn new(kind: DriftStrategyKind) -> (Arc<Self>, Receiver<DriftEvent>) {
+        let (tx, rx) = unbounded::<DriftEvent>();
+
+        let detector = Arc::new(Self {
+            strategy: Mutex::new(DriftStrategyFactory::build(kind)),
+            event_sender: tx,
+        });
+
+        (detector, rx)
+    }
+}
+
+impl ModelMetricObserver for DriftDetector {
+    fn on_metric(&self, metric: &MetricEvent) {
+        if let Ok(mut strat) = self.strategy.lock() {
+            if let Some(event) = strat.record(metric.accuracy) {
+                // Non-blocking send; if channel is full/drop it so we
+                // never stall hot inference path.
+                let _ = self.event_sender.try_send(event);
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// High-level façade — tie everything together
+// ----------------------------------------------------------------------------
+
+/// Convenience wrapper that boots a monitor + drift detector in one shot.
+pub struct MonitoringBootstrap {
+    pub monitor: MetricMonitor,
+    pub drift_events: Receiver<DriftEvent>,
+}
+
+impl MonitoringBootstrap {
+    pub fn new(kind: DriftStrategyKind) -> Self {
+        let monitor = MetricMonitor::new();
+        let (detector, rx) = DriftDetector::new(kind);
+        monitor.register(detector);
+
+        Self {
+            monitor,
+            drift_events: rx,
+        }
+    }
+
+    /// Example helper showing how callers might feed metrics.  In real life,
+    /// this would likely be called by middleware intercepting production
+    /// inference requests.
+    pub fn feed(&self, accuracy: f64, latency_ms: u64) -> Result<()> {
+        let metric = MetricEvent {
+            timestamp: Instant::now(),
+            latency_ms,
+            accuracy,
+        };
+
+        self.monitor
+            .ingest(metric); // cannot fail — observer errors are isolated
+
+        Ok(())
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Unit tests
+// ----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn threshold_strategy_triggers_drift() {
+        let bootstrap = MonitoringBootstrap::new(DriftStrategyKind::SimpleThreshold {
+            window: 3,
+            min_accuracy: 0.8,
+        });
+
+        // Ingest healthy metrics
+        bootstrap.feed(0.9, 20).unwrap();
+        assert!(bootstrap.drift_events.try_recv().is_err());
+
+        // Ingest bad metric
+        bootstrap.feed(0.6, 25).unwrap();
+        let event = bootstrap
+            .drift_events
+            .recv_timeout(Duration::from_secs(1))
+            .expect("drift event should be raised");
+
+        assert_eq!(
+            event,
+            DriftEvent::AccuracyDegraded {
+                previous: 0.9,
+                current: 0.6
+            }
+        );
+    }
+
+    #[test]
+    fn zscore_strategy_filters_noise() {
+        let bootstrap = MonitoringBootstrap::new(DriftStrategyKind::ZScore {
+            window: 5,
+            z_threshold: 2.0,
+        });
+
+        // Stable metrics around 0.9
+        for _ in 0..5 {
+            bootstrap.feed(0.9, 20).unwrap();
+        }
+        assert!(bootstrap.drift_events.try_recv().is_err());
+
+        // Spike down should trigger drift
+        bootstrap.feed(0.5, 22).unwrap();
+        let event = bootstrap
+            .drift_events
+            .recv_timeout(Duration::from_secs(1))
+            .expect("drift event should be raised");
+
+        assert_eq!(
+            event,
+            DriftEvent::AccuracyDegraded {
+                previous: 0.9,
+                current: 0.5
+            }
+        );
+    }
+}
+```

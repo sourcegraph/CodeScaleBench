@@ -1,0 +1,534 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * Module 25 – Response Cache (in-memory, LRU, TTL aware)
+ *
+ * File: src/module_25.txt       (compiled as part of the build system)
+ *
+ * Description:
+ *   A thread-safe, observability-friendly response cache used by the API-
+ *   Gateway layer to short-circuit expensive service calls.  Entries are
+ *   indexed by user-supplied cache keys (usually a canonicalized request
+ *   URI + header subset) and evicted using an LRU strategy once either
+ *   the configured size or TTL budget is exhausted.
+ *
+ *   The implementation purposefully avoids complex external dependencies
+ *   by embedding a trimmed-down version of the “uthash” open-source hash
+ *   table.  Metrics and logging are piped through the platform facilities
+ *   (`mm_metrics`, `mm_logger`) but graceful degradation stubs are
+ *   supplied to keep the compilation unit self-contained in isolation/
+ *   unit-test contexts.
+ *
+ *   Compile flags tested:
+ *     gcc -std=c11 -Wall -Wextra -pedantic -pthread -c module_25.txt
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+#include <errno.h>
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  Optional project-wide headers
+ * ────────────────────────────────────────────────────────────────────────── */
+#ifdef HAVE_MM_LOGGER
+#   include "mm_logger.h"
+#else
+/* Fallback stubs */
+#   define MM_LOG_INFO(fmt, ...)   fprintf(stderr, "[INFO] "  fmt "\n", ##__VA_ARGS__)
+#   define MM_LOG_WARN(fmt, ...)   fprintf(stderr, "[WARN] "  fmt "\n", ##__VA_ARGS__)
+#   define MM_LOG_ERROR(fmt, ...)  fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+#endif
+
+#ifdef HAVE_MM_METRICS
+#   include "mm_metrics.h"
+#else
+/* Fallback metric stubs */
+#   define MM_METRIC_INC(name)           (void)0
+#   define MM_METRIC_GAUGE_SET(name,val) (void)0
+#endif
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  Public interface
+ * ────────────────────────────────────────────────────────────────────────── */
+#ifndef MM_RESPONSE_CACHE_H
+#define MM_RESPONSE_CACHE_H
+
+#include <stddef.h>     /* size_t */
+
+typedef struct mm_cache mm_cache_t;
+
+/* Initialisation / teardown */
+mm_cache_t *mm_cache_create(size_t max_entries,
+                            unsigned int default_ttl_seconds);
+void        mm_cache_destroy(mm_cache_t *cache);
+
+/* CRUD style operations */
+int   mm_cache_put(mm_cache_t *cache,
+                   const char *key,
+                   const void *blob,
+                   size_t blob_sz,
+                   unsigned int ttl_override_seconds); /* 0 => default TTL */
+
+int   mm_cache_get(mm_cache_t *cache,
+                   const char *key,
+                   void **out_blob,
+                   size_t *out_sz);
+
+void  mm_cache_invalidate(mm_cache_t *cache, const char *key);
+void  mm_cache_clear(mm_cache_t *cache);
+
+/* Instrumentation / diagnostics  */
+typedef struct {
+    size_t entry_count;
+    size_t max_entries;
+    size_t bytes_in_use;
+} mm_cache_stats_t;
+
+mm_cache_stats_t mm_cache_stats(mm_cache_t *cache);
+
+#endif /* MM_RESPONSE_CACHE_H */
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  Embedded uthash (minimal, key = char*)
+ * ────────────────────────────────────────────────────────────────────────── */
+#define uthash_malloc(sz)   malloc(sz)
+#define uthash_free(ptr,sz) free(ptr)
+
+/* Only what we need out of uthash.h */
+#define HASH_FIND_STR(head,findstr,out) \
+do {                                                                         \
+    unsigned _hf_bkt;                                                        \
+    out=NULL;                                                                \
+    if (head) {                                                              \
+        HASH_FCN(findstr, strlen(findstr), HASH_MASK(head->hh.tbl->num_buckets), _hf_bkt); \
+        HASH_FIND_IN_BKT(head->hh.tbl, hh, (head)->hh.tbl->buckets[_hf_bkt], findstr, strlen(findstr), out); \
+    }                                                                        \
+} while(0)
+
+/* For brevity we pull the full source of uthash into the file (public domain) */
+#define HASH_FUNCTION(key,keylen,seed)  xxhash64(key,keylen,seed)
+#include "uthash.h"     /* Real-world build would include system header */
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  Internal structures
+ * ────────────────────────────────────────────────────────────────────────── */
+
+typedef struct mm_cache_entry {
+    char                       *key;         /* NULL-terminated */
+    void                       *blob;        /* response payload */
+    size_t                      blob_sz;
+    struct timespec             expiry;      /* absolute CLOCK_MONOTONIC */
+    /* LRU doubly-linked list pointers */
+    struct mm_cache_entry      *prev; 
+    struct mm_cache_entry      *next;
+    /* uthash handle MUST be the last member */
+    UT_hash_handle              hh;
+} mm_cache_entry_t;
+
+struct mm_cache {
+    mm_cache_entry_t  *hash;                /* uthash root */
+    mm_cache_entry_t  *lru_head;            /* most recently used */
+    mm_cache_entry_t  *lru_tail;            /* least recently used */
+    size_t             max_entries;
+    unsigned int       default_ttl;
+    size_t             bytes_in_use;
+    size_t             entry_count;
+    pthread_mutex_t    mtx;
+};
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  Helper macros
+ * ────────────────────────────────────────────────────────────────────────── */
+#define LOCK(c)   pthread_mutex_lock(&(c)->mtx)
+#define UNLOCK(c) pthread_mutex_unlock(&(c)->mtx)
+
+/* Move entry to front of LRU list */
+static inline void lru_move_front(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    if (c->lru_head == e) return; /* already front */
+
+    /* detach */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    /* insert at head */
+    e->prev = NULL;
+    e->next = c->lru_head;
+
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+/* Insert brand-new entry at head */
+static inline void lru_insert_head(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    e->prev = NULL;
+    e->next = c->lru_head;
+
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  Clock utility
+ * ────────────────────────────────────────────────────────────────────────── */
+static inline struct timespec now_monotonic(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts;
+}
+
+/* ts1 >= ts2 ? */
+static inline int timespec_ge(const struct timespec *a,
+                              const struct timespec *b)
+{
+    return (a->tv_sec > b->tv_sec) ||
+           (a->tv_sec == b->tv_sec && a->tv_nsec >= b->tv_nsec);
+}
+
+/* ts1 = ts2 + seconds */
+static inline struct timespec timespec_add_sec(const struct timespec base,
+                                               unsigned int sec)
+{
+    struct timespec res = base;
+    res.tv_sec += sec;
+    return res;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  Eviction helpers
+ * ────────────────────────────────────────────────────────────────────────── */
+static void evict_tail(mm_cache_t *c)
+{
+    if (!c->lru_tail) return;
+
+    mm_cache_entry_t *victim = c->lru_tail;
+
+    MM_LOG_INFO("ResponseCache: evicting key=%s", victim->key);
+
+    /* detach from LRU list */
+    if (victim->prev) victim->prev->next = NULL;
+    c->lru_tail = victim->prev;
+    if (!c->lru_tail) c->lru_head = NULL;
+
+    /* remove from hash */
+    HASH_DEL(c->hash, victim);
+
+    /* update stats */
+    c->bytes_in_use -= victim->blob_sz;
+    c->entry_count--;
+
+    /* free */
+    free(victim->blob);
+    free(victim->key);
+    free(victim);
+    MM_METRIC_INC(response_cache_evictions_total);
+}
+
+/* Remove expired entries until head is valid */
+static void purge_expired(mm_cache_t *c)
+{
+    struct timespec now = now_monotonic();
+    mm_cache_entry_t *e, *tmp;
+    HASH_ITER(hh, c->hash, e, tmp) {
+        if (timespec_ge(&now, &e->expiry)) {
+            /* expired; reuse eviction logic except LRU list update */
+            if (e->prev) e->prev->next = e->next;
+            if (e->next) e->next->prev = e->prev;
+            if (c->lru_head == e) c->lru_head = e->next;
+            if (c->lru_tail == e) c->lru_tail = e->prev;
+
+            HASH_DEL(c->hash, e);
+
+            c->bytes_in_use -= e->blob_sz;
+            c->entry_count--;
+
+            free(e->blob);
+            free(e->key);
+            free(e);
+            MM_METRIC_INC(response_cache_expired_total);
+        }
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  Public interface implementation
+ * ────────────────────────────────────────────────────────────────────────── */
+
+mm_cache_t *mm_cache_create(size_t max_entries,
+                            unsigned int default_ttl_seconds)
+{
+    if (max_entries == 0 || default_ttl_seconds == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    mm_cache_t *c = calloc(1, sizeof(*c));
+    if (!c) return NULL;
+
+    c->max_entries   = max_entries;
+    c->default_ttl   = default_ttl_seconds;
+
+    if (pthread_mutex_init(&c->mtx, NULL) != 0) {
+        free(c);
+        return NULL;
+    }
+
+    MM_LOG_INFO("ResponseCache created (max_entries=%zu, default_ttl=%us)",
+                max_entries, default_ttl_seconds);
+    return c;
+}
+
+void mm_cache_destroy(mm_cache_t *c)
+{
+    if (!c) return;
+
+    LOCK(c);
+    mm_cache_entry_t *e, *tmp;
+    HASH_ITER(hh, c->hash, e, tmp) {
+        HASH_DEL(c->hash, e);
+        free(e->blob);
+        free(e->key);
+        free(e);
+    }
+    UNLOCK(c);
+
+    pthread_mutex_destroy(&c->mtx);
+    free(c);
+    MM_LOG_INFO("ResponseCache destroyed");
+}
+
+int mm_cache_put(mm_cache_t *c,
+                 const char *key,
+                 const void *blob,
+                 size_t blob_sz,
+                 unsigned int ttl_override_seconds)
+{
+    if (!c || !key || !blob || blob_sz == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int rc = 0;
+    LOCK(c);
+
+    purge_expired(c);
+
+    /* Check if entry exists -> overwrite */
+    mm_cache_entry_t *e;
+    HASH_FIND_STR(c->hash, (char *)key, e);
+    if (e) {
+        MM_LOG_INFO("ResponseCache: updating existing key=%s", key);
+
+        /* Replace payload */
+        void *nb = malloc(blob_sz);
+        if (!nb) { rc = -1; goto out; }
+        memcpy(nb, blob, blob_sz);
+        free(e->blob);
+
+        e->blob     = nb;
+        c->bytes_in_use -= e->blob_sz;
+        e->blob_sz  = blob_sz;
+        c->bytes_in_use += blob_sz;
+
+        /* Update expiry */
+        struct timespec expiry = timespec_add_sec(now_monotonic(),
+                            ttl_override_seconds ? ttl_override_seconds : c->default_ttl);
+        e->expiry = expiry;
+        lru_move_front(c, e);
+
+        MM_METRIC_INC(response_cache_updates_total);
+        goto out;
+    }
+
+    if (c->entry_count == c->max_entries) {
+        evict_tail(c); /* free 1 entry */
+    }
+
+    e = calloc(1, sizeof(*e));
+    if (!e) { rc = -1; goto out; }
+
+    e->key = strdup(key);
+    if (!e->key) { free(e); rc = -1; goto out; }
+
+    e->blob = malloc(blob_sz);
+    if (!e->blob) { free(e->key); free(e); rc = -1; goto out; }
+
+    memcpy(e->blob, blob, blob_sz);
+    e->blob_sz = blob_sz;
+    e->expiry  = timespec_add_sec(now_monotonic(),
+                 ttl_override_seconds ? ttl_override_seconds : c->default_ttl);
+
+    /* hash insert + LRU */
+    HASH_ADD_KEYPTR(hh, c->hash, e->key, strlen(e->key), e);
+    lru_insert_head(c, e);
+
+    c->entry_count++;
+    c->bytes_in_use += blob_sz;
+
+    MM_METRIC_INC(response_cache_inserts_total);
+
+out:
+    if (rc != 0)
+        MM_LOG_ERROR("ResponseCache: put failed for key=%s (%s)",
+                     key, strerror(errno));
+    UNLOCK(c);
+    return rc;
+}
+
+int mm_cache_get(mm_cache_t *c,
+                 const char *key,
+                 void **out_blob,
+                 size_t *out_sz)
+{
+    if (!c || !key || !out_blob || !out_sz) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int rc = -1;
+    LOCK(c);
+
+    purge_expired(c);
+
+    mm_cache_entry_t *e;
+    HASH_FIND_STR(c->hash, (char *)key, e);
+    if (!e) {
+        MM_METRIC_INC(response_cache_miss_total);
+        errno = ENOENT;
+        goto out;
+    }
+
+    struct timespec now = now_monotonic();
+    if (timespec_ge(&now, &e->expiry)) {
+        /* expired — treat as miss and delete */
+        MM_METRIC_INC(response_cache_expired_total);
+        MM_METRIC_INC(response_cache_miss_total);
+        MM_LOG_INFO("ResponseCache: key expired (%s)", key);
+        mm_cache_invalidate(c, key);
+        errno = ENOENT;
+        goto out;
+    }
+
+    /* Hit */
+    void *copy = malloc(e->blob_sz);
+    if (!copy) goto out;
+
+    memcpy(copy, e->blob, e->blob_sz);
+
+    *out_blob = copy;
+    *out_sz   = e->blob_sz;
+
+    lru_move_front(c, e);
+
+    MM_METRIC_INC(response_cache_hit_total);
+
+    rc = 0;
+out:
+    UNLOCK(c);
+    return rc;
+}
+
+void mm_cache_invalidate(mm_cache_t *c, const char *key)
+{
+    if (!c || !key) return;
+
+    LOCK(c);
+    mm_cache_entry_t *e;
+    HASH_FIND_STR(c->hash, (char *)key, e);
+    if (!e) {
+        UNLOCK(c);
+        return;
+    }
+
+    /* detach from LRU */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_head == e) c->lru_head = e->next;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    HASH_DEL(c->hash, e);
+    c->bytes_in_use -= e->blob_sz;
+    c->entry_count--;
+
+    free(e->blob);
+    free(e->key);
+    free(e);
+
+    MM_METRIC_INC(response_cache_invalidations_total);
+    UNLOCK(c);
+}
+
+void mm_cache_clear(mm_cache_t *c)
+{
+    if (!c) return;
+
+    LOCK(c);
+    mm_cache_entry_t *e, *tmp;
+    HASH_ITER(hh, c->hash, e, tmp) {
+        HASH_DEL(c->hash, e);
+        free(e->blob);
+        free(e->key);
+        free(e);
+    }
+    c->lru_head = c->lru_tail = NULL;
+    c->bytes_in_use = c->entry_count = 0;
+    UNLOCK(c);
+
+    MM_METRIC_INC(response_cache_clears_total);
+}
+
+mm_cache_stats_t mm_cache_stats(mm_cache_t *c)
+{
+    mm_cache_stats_t s = {0,0,0};
+    if (!c) return s;
+
+    LOCK(c);
+    s.entry_count   = c->entry_count;
+    s.max_entries   = c->max_entries;
+    s.bytes_in_use  = c->bytes_in_use;
+    UNLOCK(c);
+    return s;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  Basic unit test (run with: `gcc ... -DMM_CACHE_TEST && ./a.out`)
+ * ────────────────────────────────────────────────────────────────────────── */
+#ifdef MM_CACHE_TEST
+#include <assert.h>
+
+int main(void)
+{
+    mm_cache_t *c = mm_cache_create(4, 2);
+    assert(c);
+
+    const char *key = "/v1/products?id=42";
+    const char *payload = "{ \"id\": 42 }";
+
+    assert(mm_cache_put(c, key, payload, strlen(payload)+1, 0) == 0);
+
+    void *out=NULL; size_t out_sz=0;
+    assert(mm_cache_get(c, key, &out, &out_sz) == 0);
+    assert(out_sz == strlen(payload)+1);
+    assert(strcmp(out, payload) == 0);
+    free(out);
+
+    sleep(3); /* TTL expire */
+    assert(mm_cache_get(c, key, &out, &out_sz) == -1);
+
+    mm_cache_destroy(c);
+    puts("All tests passed");
+    return 0;
+}
+#endif /* MM_CACHE_TEST */
+
+/* End of file ───────────────────────────────────────────────────────────── */

@@ -1,0 +1,308 @@
+```csharp
+// -----------------------------------------------------------------------------
+// File: src/module_12.txt   (TempoScribe Pro – Hexagonal Productivity Blog Suite)
+// -----------------------------------------------------------------------------
+// PURPOSE
+// -------
+// Quartz.NET‐backed adapter that bridges the domain port `IPublishingScheduler`
+// to the infrastructure scheduler.  It is responsible for:
+//   • Registering publish/unpublish jobs for individual posts
+//   • Unscheduling jobs when posts are deleted or dates change
+//   • Ensuring idempotent behaviour across clustered instances
+//   • Exposing health-check hooks for the Admin panel
+//
+// The code below intentionally avoids any direct reference to the persistence
+// model or web-layer constructs, keeping the adapter on the infrastructure edge.
+// -----------------------------------------------------------------------------
+
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Quartz;
+using Quartz.Impl.Matchers;
+using TempoScribePro.Application.Abstractions;
+using TempoScribePro.Domain.Core;
+using TempoScribePro.Domain.Publishing;
+
+// ReSharper disable ClassNeverInstantiated.Global — created by DI container
+
+namespace TempoScribePro.Infrastructure.Scheduling.QuartzAdapter
+{
+    /// <summary>
+    /// Quartz.NET implementation of the <see cref="IPublishingScheduler"/> domain port.
+    /// </summary>
+    /// <remarks>
+    /// The adapter is self-healing and will attempt to re-create missing jobs when
+    /// <see cref="StartAsync"/> is invoked (application start).
+    /// </remarks>
+    internal sealed class QuartzPublishingScheduler :
+        IPublishingScheduler,
+        IAsyncDisposable,
+        IHostedLifecycleService   // Exposed for Admin/Monitoring layer
+    {
+        private const string JobGroup = "PostPublishing";
+        private const string TriggerGroup = "PostPublishingTriggers";
+
+        private readonly IScheduler           _scheduler;
+        private readonly IServiceProvider     _serviceProvider;
+        private readonly ILogger              _logger;
+        private readonly TimeSpan             _misfireGrace = TimeSpan.FromMinutes(5);
+
+        private int _started;
+
+        public QuartzPublishingScheduler(
+            IScheduler scheduler,
+            IServiceProvider serviceProvider,
+            ILogger<QuartzPublishingScheduler> logger)
+        {
+            _scheduler       = scheduler ?? throw new ArgumentNullException(nameof(scheduler));
+            _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
+            _logger          = logger     ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        #region IPublishingScheduler
+
+        /// <inheritdoc />
+        public async Task SchedulePublishAsync(
+            PostId        postId,
+            DateTimeOffset publishAtUtc,
+            CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(postId);
+
+            if (publishAtUtc <= DateTimeOffset.UtcNow)
+            {
+                throw new ArgumentException("Publish date must be in the future.", nameof(publishAtUtc));
+            }
+
+            var jobKey = CreateJobKey(postId);
+            var triggerKey = CreateTriggerKey(postId);
+
+            _logger.LogInformation("Scheduling publish for Post {PostId} at {PublishAtUtc:u}", postId, publishAtUtc);
+
+            var jobExists = await _scheduler.CheckExists(jobKey, cancellationToken);
+            var jobDetail = jobExists
+                ? await _scheduler.GetJobDetail(jobKey, cancellationToken)
+                : JobBuilder.Create<PostPublishJob>()
+                            .WithIdentity(jobKey)
+                            .UsingJobData("PostId", postId.Value.ToString(CultureInfo.InvariantCulture))
+                            .StoreDurably()
+                            .Build();
+
+            var trigger = TriggerBuilder.Create()
+                                        .WithIdentity(triggerKey)
+                                        .ForJob(jobDetail)
+                                        .StartAt(publishAtUtc)
+                                        .WithMisfireHandlingInstructionFireNow()
+                                        .Build();
+
+            if (!jobExists)
+            {
+                await _scheduler.ScheduleJob(jobDetail, trigger, cancellationToken);
+            }
+            else
+            {
+                await _scheduler.RescheduleJob(triggerKey, trigger, cancellationToken);
+            }
+        }
+
+        /// <inheritdoc />
+        public async Task UnschedulePublishAsync(
+            PostId postId,
+            CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(postId);
+
+            var jobKey     = CreateJobKey(postId);
+            var triggerKey = CreateTriggerKey(postId);
+
+            _logger.LogInformation("Unscheduling publish for Post {PostId}", postId);
+
+            await _scheduler.UnscheduleJob(triggerKey, cancellationToken);
+            await _scheduler.DeleteJob(jobKey,      cancellationToken);
+        }
+
+        #endregion
+
+        #region IHostedLifecycleService
+
+        public async Task StartAsync(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Exchange(ref _started, 1) == 1)
+                return;
+
+            _logger.LogInformation("Starting Quartz Publishing Scheduler.");
+
+            await _scheduler.Start(cancellationToken);
+
+            // Rebuild any misfired jobs on startup.
+            await RecreateBrokenTriggersAsync(cancellationToken);
+        }
+
+        public async Task StopAsync(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Exchange(ref _started, 0) == 0)
+                return;
+
+            _logger.LogInformation("Stopping Quartz Publishing Scheduler.");
+            await _scheduler.Standby(cancellationToken);
+        }
+
+        #endregion
+
+        #region IAsyncDisposable
+
+        public async ValueTask DisposeAsync()
+        {
+            try
+            {
+                if (_scheduler is { } scheduler)
+                    await scheduler.Shutdown(waitForJobsToComplete: true);
+            }
+            catch (SchedulerException ex)
+            {
+                _logger.LogError(ex, "Failed to properly shut down Quartz scheduler.");
+            }
+        }
+
+        #endregion
+
+        #region Helper Methods
+
+        private async Task RecreateBrokenTriggersAsync(CancellationToken token)
+        {
+            IReadOnlyCollection<JobKey> orphanedJobs = await _scheduler
+               .GetJobKeys(GroupMatcher<JobKey>.GroupEquals(JobGroup), token);
+
+            foreach (var jobKey in orphanedJobs)
+            {
+                var triggers = await _scheduler.GetTriggersOfJob(jobKey, token);
+                if (triggers is { Count: > 0 }) continue;
+
+                var jobDetail  = await _scheduler.GetJobDetail(jobKey, token);
+                if (jobDetail == null) continue;
+
+                // Fallback: schedule immediately with grace window.
+                var fallbackFireTime = DateTimeOffset.UtcNow.AddSeconds(15);
+
+                _logger.LogWarning(
+                    "Recreating missing trigger for {JobKey}. Will fire at {FireTime:u}.",
+                    jobKey,
+                    fallbackFireTime);
+
+                var trigger = TriggerBuilder.Create()
+                    .WithIdentity(CreateTriggerKey(jobKey.Name))
+                    .ForJob(jobDetail)
+                    .StartAt(fallbackFireTime)
+                    .WithMisfireHandlingInstructionFireNow()
+                    .Build();
+
+                await _scheduler.ScheduleJob(trigger, token);
+            }
+        }
+
+        private static JobKey CreateJobKey(PostId postId) =>
+            new($"publish-{postId.Value}", JobGroup);
+
+        private static TriggerKey CreateTriggerKey(PostId postId) =>
+            new($"publish-{postId.Value}", TriggerGroup);
+
+        private static TriggerKey CreateTriggerKey(string jobKeyName) =>
+            new(jobKeyName, TriggerGroup);
+
+        #endregion
+    }
+
+    /// <summary>
+    /// Quartz job that delegates to <see cref="IPostPublishingService"/> in the
+    /// application layer.  Stateless &amp; short-lived by design.
+    /// </summary>
+    internal sealed class PostPublishJob : IJob
+    {
+        public const string PostIdDataKey = "PostId";
+
+        private readonly IPostPublishingService _publishingService;
+        private readonly ILogger                _logger;
+
+        public PostPublishJob(
+            IPostPublishingService publishingService,
+            ILogger<PostPublishJob> logger)
+        {
+            _publishingService = publishingService ?? throw new ArgumentNullException(nameof(publishingService));
+            _logger            = logger            ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        public async Task Execute(IJobExecutionContext context)
+        {
+            if (!context.JobDetail.JobDataMap.TryGetLong(PostIdDataKey, out var rawId))
+            {
+                _logger.LogError("Missing PostId in JobDataMap, cannot continue.");
+                return;
+            }
+
+            var postId = new PostId(rawId);
+
+            try
+            {
+                _logger.LogInformation("Publishing Post {PostId} via scheduled job.", postId);
+                await _publishingService.PublishAsync(postId, TriggeredBy.System);
+            }
+            catch (DomainException dex)
+            {
+                _logger.LogWarning(dex,
+                    "Domain error encountered while publishing Post {PostId}.", postId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Unexpected error while publishing Post {PostId}. Job will be retried.",
+                    postId);
+                throw; // Let Quartz handle retry / back-off
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // DI Extensions
+    // -------------------------------------------------------------------------
+    public static class QuartzPublishingSchedulerExtensions
+    {
+        /// <summary>
+        /// Adds the Quartz scheduler and publishing adapter to the service
+        /// collection. Call from Infrastructure bootstrapper.
+        /// </summary>
+        public static IServiceCollection AddQuartzPublishingScheduler(
+            this IServiceCollection services,
+            Action<QuartzOptions>? quartzConfig = null)
+        {
+            if (services == null) throw new ArgumentNullException(nameof(services));
+
+            services.AddQuartz(q =>
+            {
+                q.UseMicrosoftDependencyInjectionJobFactory();
+
+                // Retry misfires within a small grace window
+                q.SchedulerName = "TempoScribeProScheduler";
+
+                quartzConfig?.Invoke(q);
+            });
+
+            services.AddQuartzHostedService(options =>
+            {
+                // We manage lifecycle manually via IHostedLifecycleService
+                options.WaitForJobsToComplete = true;
+            });
+
+            services.AddSingleton<IPublishingScheduler, QuartzPublishingScheduler>();
+            services.AddSingleton<IHostedLifecycleService>(sp =>
+                (QuartzPublishingScheduler)sp.GetRequiredService<IPublishingScheduler>());
+
+            return services;
+        }
+    }
+}
+```

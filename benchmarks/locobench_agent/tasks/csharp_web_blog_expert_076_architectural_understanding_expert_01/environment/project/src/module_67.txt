@@ -1,0 +1,281 @@
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using TempoScribePro.Domain.Common;
+using TempoScribePro.Domain.Publishing;
+using TempoScribePro.Domain.Publishing.Events;
+using TempoScribePro.Domain.Ports;
+using TempoScribePro.Infrastructure.Logging;
+
+namespace TempoScribePro.Application.Publishing
+{
+    /// <summary>
+    ///     Core domain service responsible for automatically publishing posts whose
+    ///     scheduled time has elapsed.  Orchestrates persistence,
+    ///     domain events, distributed locking, and editor notifications
+    ///     while remaining infrastructure-agnostic via ports.
+    /// </summary>
+    public class ScheduledPublishingService : IScheduledPublishingService
+    {
+        private readonly IPostRepository           _postRepository;
+        private readonly IUnitOfWork               _unitOfWork;
+        private readonly IDateTimeProvider         _clock;
+        private readonly IDomainEventDispatcher    _eventDispatcher;
+        private readonly INotificationPort         _notificationPort;
+        private readonly IDistributedLockManager   _lockManager;
+        private readonly IAppLogger<ScheduledPublishingService> _logger;
+
+        public ScheduledPublishingService(
+            IPostRepository                 postRepository,
+            IUnitOfWork                     unitOfWork,
+            IDateTimeProvider               clock,
+            IDomainEventDispatcher          eventDispatcher,
+            INotificationPort               notificationPort,
+            IDistributedLockManager         lockManager,
+            IAppLogger<ScheduledPublishingService> logger)
+        {
+            _postRepository   = postRepository  ?? throw new ArgumentNullException(nameof(postRepository));
+            _unitOfWork       = unitOfWork      ?? throw new ArgumentNullException(nameof(unitOfWork));
+            _clock            = clock           ?? throw new ArgumentNullException(nameof(clock));
+            _eventDispatcher  = eventDispatcher ?? throw new ArgumentNullException(nameof(eventDispatcher));
+            _notificationPort = notificationPort?? throw new ArgumentNullException(nameof(notificationPort));
+            _lockManager      = lockManager     ?? throw new ArgumentNullException(nameof(lockManager));
+            _logger           = logger          ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        /// <summary>
+        ///     Pulls all posts that are in a <see cref="PostStatus.Scheduled"/> state
+        ///     and have reached their <see cref="Post.ScheduledPublishAt"/> timestamp.
+        ///     Saving, event dispatching, and notifications are executed inside a single
+        ///     unit-of-work to guarantee atomicity.
+        /// </summary>
+        /// <param name="ct">Cancellation token propagated from the caller.</param>
+        /// <returns>The number of posts successfully published.</returns>
+        public async Task<int> PublishDuePostsAsync(CancellationToken ct = default)
+        {
+            var now = _clock.UtcNow;
+            _logger.Trace("ScheduledPublishingService started at {UtcNow}", now);
+
+            // 1. Collect candidates. We purposefully pull a *small* configurable window
+            //    to stay side-effect-free for large backlogs.
+            IReadOnlyList<Post> duePosts;
+            try
+            {
+                duePosts = await _postRepository.FetchScheduledBeforeAsync(now, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(ex, "Failed to query scheduled posts");
+                return 0;
+            }
+
+            if (duePosts.Count == 0)
+            {
+                _logger.Debug("No due posts found at {UtcNow}", now);
+                return 0;
+            }
+
+            _logger.Debug("{Count} post(s) are due for publishing", duePosts.Count);
+
+            var publishedCount = 0;
+
+            // 2. Iterate and publish atomically per post to reduce transaction
+            //    contention. A distributed lock prevents a second worker from
+            //    racing this one in horizontally-scaled environments.
+            foreach (var post in duePosts)
+            {
+                var lockKey = $"post:publish:{post.Id:N}";
+
+                await using var distributedLock = await _lockManager.TryAcquireAsync(lockKey, TimeSpan.FromSeconds(30), ct);
+                if (!distributedLock.Acquired)
+                {
+                    _logger.Warn("Could not acquire lock for Post {PostId}. Skipping.", post.Id);
+                    continue;
+                }
+
+                // Double-check state after lock acquisition (could have been published by another node).
+                if (post.Status != PostStatus.Scheduled || post.ScheduledPublishAt > now)
+                {
+                    _logger.Trace("Post {PostId} no longer eligible after lock acquisition", post.Id);
+                    continue;
+                }
+
+                post.Publish(now);
+
+                try
+                {
+                    // Domain rules may raise events that mutate additional invariants.
+                    await _postRepository.UpdateAsync(post, ct);
+                    await _unitOfWork.CommitAsync(ct);
+
+                    await _eventDispatcher.DispatchAsync(new PostPublishedEvent(post.Id, now), ct);
+                    await NotifyEditorsAsync(post, ct);
+
+                    publishedCount++;
+                    _logger.Info("Post {PostId} published successfully", post.Id);
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error(ex, "Failed to publish Post {PostId}", post.Id);
+                    // Rollback is implicit; unit of work will dispose transaction on failure.
+                }
+            }
+
+            _logger.Info("ScheduledPublishingService finished. {Count} post(s) published.", publishedCount);
+            return publishedCount;
+        }
+
+        #region Helpers
+
+        private Task NotifyEditorsAsync(Post post, CancellationToken ct)
+        {
+            var message = new NotificationMessage(
+                subject : $"Your post \"{post.Title}\" is now live!",
+                body    : $"Congrats! \"{post.Title}\" was published at {post.PublishedAt:u}. View it here: {post.PublicUrl}",
+                recipients : post.Contributors.Select(u => u.Email));
+
+            return _notificationPort.SendAsync(message, ct);
+        }
+
+        #endregion
+    }
+
+    #region Port (interface) definitions
+
+    /// <summary>
+    ///     Inbound port for automation jobs that wish to trigger scheduled publishing.
+    ///     Exposed by the domain so that adapters can orchestrate invocation
+    ///     (e.g., a Quartz.NET trigger, Azure Function, or Hangfire job).
+    /// </summary>
+    public interface IScheduledPublishingService
+    {
+        Task<int> PublishDuePostsAsync(CancellationToken ct = default);
+    }
+
+    /// <summary>Repository abstraction for persisting <see cref="Post"/> entities.</summary>
+    public interface IPostRepository
+    {
+        Task<IReadOnlyList<Post>> FetchScheduledBeforeAsync(DateTimeOffset utcThreshold, CancellationToken ct = default);
+        Task UpdateAsync(Post post, CancellationToken ct = default);
+    }
+
+    /// <summary>Cross-cutting unit of work; may wrap a SQL transaction.</summary>
+    public interface IUnitOfWork : IAsyncDisposable
+    {
+        Task CommitAsync(CancellationToken ct = default);
+    }
+
+    /// <summary>
+    ///     Allows adapters (Redis, SQL advisory locks, etc.) to implement
+    ///     cross-process mutual exclusion.
+    /// </summary>
+    public interface IDistributedLock : IAsyncDisposable
+    {
+        bool Acquired { get; }
+    }
+
+    public interface IDistributedLockManager
+    {
+        Task<IDistributedLock> TryAcquireAsync(
+            string              resource,
+            TimeSpan            timeout,
+            CancellationToken   ct = default);
+    }
+
+    /// <summary>Clock abstraction to avoid DateTimeOffset.UtcNow sprinkled everywhere.</summary>
+    public interface IDateTimeProvider
+    {
+        DateTimeOffset UtcNow { get; }
+    }
+
+    /// <summary>Domain events should be dispatched to handlers via this port.</summary>
+    public interface IDomainEventDispatcher
+    {
+        Task DispatchAsync<TEvent>(TEvent @event, CancellationToken ct = default)
+            where TEvent : IDomainEvent;
+    }
+
+    public interface IDomainEvent { }
+
+    public class PostPublishedEvent : IDomainEvent
+    {
+        public PostPublishedEvent(Guid postId, DateTimeOffset publishedAt)
+        {
+            PostId      = postId;
+            PublishedAt = publishedAt;
+        }
+
+        public Guid            PostId      { get; }
+        public DateTimeOffset  PublishedAt { get; }
+    }
+
+    public interface INotificationPort
+    {
+        Task SendAsync(NotificationMessage message, CancellationToken ct = default);
+    }
+
+    public record NotificationMessage(string subject, string body, IEnumerable<string> recipients);
+
+    #endregion
+
+    #region Domain model (simplified)
+
+    /// <summary>
+    ///     Aggregate root representing a blog post within TempoScribe Pro.
+    ///     Only the properties/behaviors pertinent to publishing are included.
+    /// </summary>
+    public class Post
+    {
+        private readonly List<Contributor> _contributors = new();
+
+        public Guid              Id                 { get; init; }
+        public string            Title              { get; private set; } = null!;
+        public PostStatus        Status             { get; private set; }
+        public DateTimeOffset?   ScheduledPublishAt { get; private set; }
+        public DateTimeOffset?   PublishedAt        { get; private set; }
+        public Uri               PublicUrl          { get; private set; } = null!;
+        public IReadOnlyList<Contributor> Contributors => _contributors;
+
+        /// <summary>
+        ///     Transitions the post from <see cref="PostStatus.Scheduled"/> to <see cref="PostStatus.Published"/>.
+        ///     Throws <see cref="DomainRuleException"/> if business rules are violated.
+        /// </summary>
+        public void Publish(DateTimeOffset utcNow)
+        {
+            if (Status != PostStatus.Scheduled)
+                throw new DomainRuleException($"Post is in invalid state '{Status}' for publishing.");
+
+            if (utcNow < ScheduledPublishAt)
+                throw new DomainRuleException("Cannot publish before scheduled time.");
+
+            Status      = PostStatus.Published;
+            PublishedAt = utcNow;
+            // PublicUrl would normally be generated by routing conventions here.
+        }
+    }
+
+    public enum PostStatus
+    {
+        Draft      = 0,
+        Scheduled  = 1,
+        Published  = 2,
+        Archived   = 3
+    }
+
+    public record Contributor(Guid UserId, string Email);
+
+    #endregion
+
+    #region Common / Shared
+
+    public class DomainRuleException : Exception
+    {
+        public DomainRuleException(string message) : base(message) { }
+    }
+
+    #endregion
+}
+```

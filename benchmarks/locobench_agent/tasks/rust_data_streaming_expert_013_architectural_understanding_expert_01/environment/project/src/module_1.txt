@@ -1,0 +1,417 @@
+```rust
+//! ChirpPulse – Sentiment Analysis Module
+//! --------------------------------------
+//! This module implements a pluggable sentiment–analysis subsystem that can be
+//! hot-swapped at runtime.  It follows the Strategy Pattern, allowing data-science
+//! teams to experiment with new algorithms without redeploying the entire data
+//! pipeline.
+//!
+//! The key abstraction is `SentimentAnalyzer`: an async-capable trait whose
+//! implementations score a message in real time.  A thread-safe `AnalyzerRegistry`
+//! stores live implementations, while `SentimentWorker` applies them to inbound
+//! social messages coming from upstream Kafka consumers.
+//!
+//! Dependencies (Cargo.toml):
+//! ```toml
+//! [dependencies]
+//! tokio        = { version = "1", features = ["full"] }
+//! anyhow       = "1"
+//! parking_lot  = "0.12"
+//! tracing      = "0.1"
+//! serde        = { version = "1", features = ["derive"] }
+//! serde_json   = "1"
+//! once_cell    = "1"
+//! ```
+//!
+//! NOTE: In production this module would live in `src/sentiment.rs`; however, we
+//! emit it here as `module_1.txt` to satisfy scaffold constraints.
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use tokio::{
+    select,
+    sync::mpsc::{Receiver, Sender},
+    task,
+    time::sleep,
+};
+use tracing::{debug, error, info};
+
+/// Unique identifier for social messages.
+///
+/// In the real system this would be a Snowflake or ULID generated upstream.
+pub type MessageId = u128;
+
+/// Basic representation of a social message produced by the ingest service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialMessage {
+    pub id: MessageId,
+    pub timestamp: SystemTime,
+    pub lang: String,
+    pub user_id: String,
+    pub text: String,
+
+    /// Arbitrary metadata originating from upstream pipelines (e.g. geo, source).
+    #[serde(flatten)]
+    pub metadata: serde_json::Value,
+}
+
+/// Result of a sentiment analysis run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentimentScore {
+    /// Numerical polarity in range [-1.0, 1.0].
+    pub polarity: f32,
+    /// Magnitude of emotion regardless of polarity.
+    pub magnitude: f32,
+    /// Coarse bucket used by dashboards.
+    pub label: SentimentLabel,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum SentimentLabel {
+    Negative,
+    Neutral,
+    Positive,
+}
+
+impl SentimentLabel {
+    pub fn from_polarity(polarity: f32) -> SentimentLabel {
+        match polarity {
+            p if p < -0.15 => SentimentLabel::Negative,
+            p if p > 0.15 => SentimentLabel::Positive,
+            _ => SentimentLabel::Neutral,
+        }
+    }
+}
+
+/// Error returned by analyzer implementations.
+#[derive(thiserror::Error, Debug)]
+pub enum AnalyzerError {
+    #[error("language {0:?} not supported")]
+    UnsupportedLanguage(String),
+
+    #[error("internal algorithm failure: {0}")]
+    Internal(String),
+}
+
+/// Contract each sentiment algorithm must fulfill.
+///
+/// The analysis is `async` so implementations may call external services or
+/// run expensive CPU inference in a separate thread pool.
+#[async_trait::async_trait]
+pub trait SentimentAnalyzer: Send + Sync + 'static {
+    /// User-friendly name of the algorithm (e.g. "vader", "nbayes").
+    fn name(&self) -> &'static str;
+
+    /// True if this implementation can handle the given language code.
+    fn supports_lang(&self, lang: &str) -> bool;
+
+    /// Compute sentiment for a message.
+    async fn analyze(&self, msg: &SocialMessage) -> std::result::Result<SentimentScore, AnalyzerError>;
+}
+
+/// Thread-safe registry mapping algorithm name → implementation.
+///
+/// The registry is global but may be scoped if desired.
+#[derive(Default)]
+pub struct AnalyzerRegistry {
+    inner: RwLock<HashMap<String, Arc<dyn SentimentAnalyzer>>>,
+}
+
+impl AnalyzerRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a new analyzer.  Returns previous implementation if present.
+    pub fn register<A>(&self, analyzer: A) -> Option<Arc<dyn SentimentAnalyzer>>
+    where
+        A: SentimentAnalyzer,
+    {
+        let name = analyzer.name();
+        info!(algo = name, "Registering sentiment analyzer");
+        self.inner.write().insert(name.to_owned(), Arc::new(analyzer))
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<dyn SentimentAnalyzer>> {
+        self.inner.read().get(name).cloned()
+    }
+
+    pub fn all(&self) -> Vec<String> {
+        self.inner.read().keys().cloned().collect()
+    }
+}
+
+// Expose a global registry via `once_cell` for convenience.
+pub static REGISTRY: Lazy<AnalyzerRegistry> = Lazy::new(AnalyzerRegistry::new);
+
+/// Domain object produced by the worker and forwarded into the lake.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichedMessage {
+    pub original: SocialMessage,
+    pub sentiment: SentimentScore,
+}
+
+/// Consumes inbound messages, enriches them with sentiment, and forwards.
+///
+/// In production this worker would be part of a larger async task group that
+/// scales horizontally via a Kafka consumer group.
+pub struct SentimentWorker {
+    algorithm_name: String,
+    rx_inbound: Receiver<SocialMessage>,
+    tx_outbound: Sender<EnrichedMessage>,
+}
+
+impl SentimentWorker {
+    pub fn new(
+        algorithm_name: impl Into<String>,
+        rx_inbound: Receiver<SocialMessage>,
+        tx_outbound: Sender<EnrichedMessage>,
+    ) -> Self {
+        Self {
+            algorithm_name: algorithm_name.into(),
+            rx_inbound,
+            tx_outbound,
+        }
+    }
+
+    pub async fn run(mut self) -> Result<()> {
+        // Resolve algorithm on startup.
+        let analyzer = REGISTRY
+            .get(&self.algorithm_name)
+            .with_context(|| format!("Sentiment analyzer '{}' not registered", self.algorithm_name))?;
+
+        info!(
+            algo = %self.algorithm_name,
+            "Sentiment worker started"
+        );
+
+        while let Some(msg) = self.rx_inbound.recv().await {
+            let analyzer = analyzer.clone();
+            let tx = self.tx_outbound.clone();
+
+            // Spawn each analysis in its own task to maximize throughput.
+            task::spawn(async move {
+                match analyzer.analyze(&msg).await {
+                    Ok(score) => {
+                        let enriched = EnrichedMessage {
+                            original: msg,
+                            sentiment: score,
+                        };
+                        if let Err(e) = tx.send(enriched).await {
+                            error!(error = %e, "Failed to forward enriched message");
+                        }
+                    }
+                    Err(err) => {
+                        error!(
+                            msg_id = msg.id,
+                            algo = analyzer.name(),
+                            err = %err,
+                            "Sentiment analysis failed"
+                        );
+                    }
+                }
+            });
+        }
+
+        info!("Worker stream exhausted; shutting down.");
+        Ok(())
+    }
+}
+
+/* ---------------------------------------------------------------------------
+   Built-in analyzer implementations
+--------------------------------------------------------------------------- */
+
+/// A toy-quality port of the VADER lexicon algorithm.
+///
+/// In production, use a crate or ML model instead.  We mock calculation logic.
+pub struct VaderAnalyzer {
+    /// Example: lexicon map word → polarity weight
+    lexicon: HashMap<String, f32>,
+}
+
+impl VaderAnalyzer {
+    pub fn new() -> Self {
+        Self {
+            lexicon: vec![
+                ("good".into(), 0.7),
+                ("great".into(), 0.9),
+                ("bad".into(), -0.7),
+                ("terrible".into(), -0.9),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SentimentAnalyzer for VaderAnalyzer {
+    fn name(&self) -> &'static str {
+        "vader"
+    }
+
+    fn supports_lang(&self, lang: &str) -> bool {
+        lang.eq_ignore_ascii_case("en")
+    }
+
+    async fn analyze(&self, msg: &SocialMessage) -> std::result::Result<SentimentScore, AnalyzerError> {
+        if !self.supports_lang(&msg.lang) {
+            return Err(AnalyzerError::UnsupportedLanguage(msg.lang.clone()));
+        }
+
+        // Extremely naive lexicon scan.
+        let mut score_sum = 0f32;
+        let mut hits = 0u32;
+
+        for token in msg.text.split_whitespace() {
+            if let Some(weight) = self.lexicon.get(&token.to_lowercase()) {
+                score_sum += *weight;
+                hits += 1;
+            }
+        }
+
+        let polarity = if hits == 0 { 0.0 } else { score_sum / hits as f32 };
+        let magnitude = polarity.abs();
+        let label = SentimentLabel::from_polarity(polarity);
+
+        Ok(SentimentScore {
+            polarity,
+            magnitude,
+            label,
+        })
+    }
+}
+
+/// Naive Bayes (mock) implementation; demonstrates multiple algorithms.
+///
+/// Here we pretend to have a trained model loaded from disk.
+pub struct NaiveBayesAnalyzer {
+    lang: String,
+    // Placeholder for model parameters.
+    priors: HashMap<SentimentLabel, f32>,
+}
+
+impl NaiveBayesAnalyzer {
+    pub fn new(lang: &str) -> Self {
+        Self {
+            lang: lang.to_owned(),
+            priors: vec![
+                (SentimentLabel::Negative, 0.33),
+                (SentimentLabel::Neutral, 0.34),
+                (SentimentLabel::Positive, 0.33),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SentimentAnalyzer for NaiveBayesAnalyzer {
+    fn name(&self) -> &'static str {
+        "naive_bayes"
+    }
+
+    fn supports_lang(&self, lang: &str) -> bool {
+        self.lang.eq_ignore_ascii_case(lang)
+    }
+
+    async fn analyze(&self, msg: &SocialMessage) -> std::result::Result<SentimentScore, AnalyzerError> {
+        if !self.supports_lang(&msg.lang) {
+            return Err(AnalyzerError::UnsupportedLanguage(msg.lang.clone()));
+        }
+
+        // Dummy calculation based purely on priors and text length.
+        let len_factor = (msg.text.len() % 100) as f32 / 100.0;
+        let polarity = self.priors.get(&SentimentLabel::Positive).copied().unwrap_or(0.0)
+            - self.priors.get(&SentimentLabel::Negative).copied().unwrap_or(0.0)
+            + (len_factor - 0.5) * 0.2;
+
+        let label = SentimentLabel::from_polarity(polarity);
+        Ok(SentimentScore {
+            polarity,
+            magnitude: polarity.abs(),
+            label,
+        })
+    }
+}
+
+/* ---------------------------------------------------------------------------
+   Self-test harness (only compiled with `cargo test`)
+--------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn message(text: &str) -> SocialMessage {
+        SocialMessage {
+            id: 1,
+            timestamp: SystemTime::now(),
+            lang: "en".to_string(),
+            user_id: "u123".to_string(),
+            text: text.to_owned(),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_vader_analyzer() {
+        let analyzer = VaderAnalyzer::new();
+        let msg = message("good great");
+        let score = analyzer.analyze(&msg).await.unwrap();
+        assert!(score.polarity > 0.0);
+        assert_eq!(score.label, SentimentLabel::Positive);
+    }
+
+    #[tokio::test]
+    async fn test_worker_flow() -> Result<()> {
+        // Prepare channels.
+        let (tx_in, rx_in) = mpsc::channel(4);
+        let (tx_out, mut rx_out) = mpsc::channel(4);
+
+        // Register algo.
+        REGISTRY.register(VaderAnalyzer::new());
+
+        tokio::spawn(async move {
+            let worker = SentimentWorker::new("vader", rx_in, tx_out);
+            worker.run().await.unwrap();
+        });
+
+        tx_in.send(message("bad terrible")).await.unwrap();
+        sleep(Duration::from_millis(50)).await; // Wait for processing.
+
+        let enriched = rx_out.recv().await.expect("missing enriched");
+        assert_eq!(enriched.sentiment.label, SentimentLabel::Negative);
+        Ok(())
+    }
+}
+
+/* ---------------------------------------------------------------------------
+   Module bootstrap – called by the application during startup
+--------------------------------------------------------------------------- */
+
+/// Initialize the module (register default analyzers).
+///
+/// This function is **idempotent** and may safely be called multiple times.
+pub fn init() {
+    static INIT: Lazy<()> = Lazy::new(|| {
+        info!("Initializing Sentiment Analysis module");
+        REGISTRY.register(VaderAnalyzer::new());
+        REGISTRY.register(NaiveBayesAnalyzer::new("en"));
+    });
+
+    // Trigger global initialization.
+    Lazy::force(&INIT);
+}
+```

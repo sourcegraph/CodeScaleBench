@@ -1,0 +1,383 @@
+```rust
+//! src/module_36.rs
+//!
+//! Learning-Pulse domain module.
+//!
+//! This module handles the life-cycle of a `LearningPulseResponse`:
+//!   1.  Persist the response in Postgres via `sqlx`.
+//!   2.  Emit a domain event onto the message broker (RabbitMQ) so that
+//!      downstream services (plagiarism check, rubric scoring, notifications,
+//!      adaptive recommendation, search indexing, etc.) can react
+//!      asynchronously.
+//!
+//! The code is production-ready, uses Tokio for async, `tracing` for
+//! structured logging and `thiserror` for rich error handling.  
+//! All public APIs are expressed as traits to facilitate dependency
+//! injection and unit testing.
+//
+//  ┌───────────────────────────────────────────────┐
+//  │                                               │
+//  │  HTTP Layer (Actix-web / Axum)                │
+//  │           │                                   │
+//  │           ▼                                   │
+//  │  --------LearningPulseService --------------- │
+//  │    │ persist()             │ publish()        │
+//  │    ▼                       ▼                  │
+//  │ PostgresRepository   RabbitMqEventPublisher   │
+//  │                                               │
+//  └───────────────────────────────────────────────┘
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{spawn, task::JoinHandle};
+use tracing::{error, info};
+use uuid::Uuid;
+
+//
+// ────────────────────────── Domain Models ──────────────────────────
+//
+
+/// Unique identifier type aliases just to provide extra compile-time safety.
+pub type PulseId = Uuid;
+pub type ResponseId = Uuid;
+pub type UserId = Uuid;
+
+/// A student reply to a Learning Pulse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningPulseResponse {
+    pub id: ResponseId,
+    pub pulse_id: PulseId,
+    pub author_id: UserId,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Helper DTO used by service callers (presentation layer) to submit a reply.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubmitResponseInput {
+    pub pulse_id: PulseId,
+    pub content: String,
+}
+
+/// Additional request context extracted by auth/session middleware.
+#[derive(Debug, Clone)]
+pub struct RequestContext {
+    pub user_id: UserId,
+    /// Trace ID injected by instrumentation middleware so logs can be
+    /// correlated end-to-end.
+    pub trace_id: Uuid,
+}
+
+//
+// ───────────────────── Repository (Persistence) Layer ─────────────────────
+//
+
+/// Storage abstraction for `LearningPulseResponse`.
+#[async_trait]
+pub trait ResponseRepository: Send + Sync {
+    async fn insert(
+        &self,
+        response: &LearningPulseResponse,
+    ) -> Result<(), RepositoryError>;
+}
+
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+//
+// ──────────────────────── Event / Messaging Layer ─────────────────────────
+//
+
+/// An event emitted whenever a student submits a response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseSubmittedEvent {
+    pub response_id: ResponseId,
+    pub pulse_id: PulseId,
+    pub author_id: UserId,
+    pub occurred_at: DateTime<Utc>,
+}
+
+/// Generic publisher interface.
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish<T: Serialize + Send + Sync>(
+        &self,
+        routing_key: &str,
+        payload: &T,
+    ) -> Result<(), PublisherError>;
+}
+
+#[derive(Debug, Error)]
+pub enum PublisherError {
+    #[error("broker error: {0}")]
+    Broker(#[from] lapin::Error),
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+}
+
+//
+// ──────────────────────────── Service Layer ────────────────────────────────
+//
+
+/// Business-logic errors surfaced to controllers/UI layer.
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+    #[error(transparent)]
+    Publisher(#[from] PublisherError),
+}
+
+/// Service orchestrating repository + broker actions atomically.
+pub struct LearningPulseService<R, P>
+where
+    R: ResponseRepository + 'static,
+    P: EventPublisher + 'static,
+{
+    repo: Arc<R>,
+    publisher: Arc<P>,
+}
+
+impl<R, P> LearningPulseService<R, P>
+where
+    R: ResponseRepository + 'static,
+    P: EventPublisher + 'static,
+{
+    pub fn new(repo: Arc<R>, publisher: Arc<P>) -> Self {
+        Self { repo, publisher }
+    }
+
+    /// Persist response and asynchronously publish event.
+    ///
+    /// The response is committed first; event publication runs in the
+    /// background—if it fails, we log the failure but keep the write durable
+    /// (outbox pattern could be used to guarantee eventual publish).
+    pub async fn submit_response(
+        &self,
+        input: SubmitResponseInput,
+        ctx: RequestContext,
+    ) -> Result<LearningPulseResponse, ServiceError> {
+        // Construct domain entity
+        let response = LearningPulseResponse {
+            id: Uuid::new_v4(),
+            pulse_id: input.pulse_id,
+            author_id: ctx.user_id,
+            content: input.content,
+            created_at: Utc::now(),
+        };
+
+        // 1) Persist to the database
+        self.repo.insert(&response).await?;
+
+        // 2) Fire-and-forget event publication
+        let publisher = self.publisher.clone();
+        let event = ResponseSubmittedEvent {
+            response_id: response.id,
+            pulse_id: response.pulse_id,
+            author_id: response.author_id,
+            occurred_at: response.created_at,
+        };
+        let trace_id = ctx.trace_id;
+
+        spawn(async move {
+            if let Err(e) = publisher
+                .publish("learning_pulse.response_submitted", &event)
+                .await
+            {
+                error!(
+                    %trace_id,
+                    error = %e,
+                    "failed to publish ResponseSubmittedEvent"
+                );
+            } else {
+                info!(%trace_id, "ResponseSubmittedEvent published");
+            }
+        });
+
+        Ok(response)
+    }
+}
+
+//
+// ────────────────── Concrete Infrastructure Implementations ───────────────
+//
+
+use sqlx::{postgres::PgPoolOptions, PgPool};
+
+/// Production Postgres implementation.
+///
+/// The struct is clone-able because `PgPool` is internally reference counted.
+#[derive(Clone)]
+pub struct PostgresResponseRepository {
+    pool: PgPool,
+}
+
+impl PostgresResponseRepository {
+    pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(database_url)
+            .await?;
+
+        // Run migrations (idempotent).  In production, migrations are executed
+        // separately by CI/CD pipelines; we keep this for dev/integ test
+        // convenience.
+        sqlx::migrate!().run(&pool).await?;
+
+        Ok(Self { pool })
+    }
+}
+
+#[async_trait]
+impl ResponseRepository for PostgresResponseRepository {
+    async fn insert(
+        &self,
+        response: &LearningPulseResponse,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO learning_pulse_responses
+                    (id, pulse_id, author_id, content, created_at)
+            VALUES  ($1, $2,       $3,        $4,      $5)
+            "#,
+            response.id,
+            response.pulse_id,
+            response.author_id,
+            response.content,
+            response.created_at,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+use lapin::{
+    options::BasicPublishOptions,
+    publisher_confirm::Confirmation,
+    types::FieldTable,
+    BasicProperties, Channel, Connection, ConnectionProperties,
+};
+
+/// RabbitMQ implementation using `lapin`.
+#[derive(Clone)]
+pub struct RabbitMqEventPublisher {
+    channel: Channel,
+}
+
+impl RabbitMqEventPublisher {
+    pub async fn connect(uri: &str) -> Result<Self, lapin::Error> {
+        let conn = Connection::connect(uri, ConnectionProperties::default()).await?;
+        let channel = conn.create_channel().await?;
+        Ok(Self { channel })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for RabbitMqEventPublisher {
+    async fn publish<T: Serialize + Send + Sync>(
+        &self,
+        routing_key: &str,
+        payload: &T,
+    ) -> Result<(), PublisherError> {
+        let data = serde_json::to_vec(payload)?;
+
+        let confirm: Confirmation = self
+            .channel
+            .basic_publish(
+                "edupulse_domain",                // exchange
+                routing_key,
+                BasicPublishOptions::default(),
+                &data,
+                BasicProperties::default()
+                    .with_content_type("application/json".into())
+                    .with_delivery_mode(2), // persistent
+            )
+            .await?
+            .await?; // wait for ack
+
+        if confirm.is_nack() {
+            Err(lapin::Error::InvalidAck.into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+//
+// ───────────────────────────── Unit Tests ────────────────────────────────
+//
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use tokio::sync::Mutex;
+
+    /// In-memory test double for repository layer.
+    struct InMemoryRepo {
+        storage: Mutex<VecDeque<LearningPulseResponse>>,
+    }
+
+    impl InMemoryRepo {
+        fn new() -> Self {
+            Self {
+                storage: Mutex::new(VecDeque::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ResponseRepository for InMemoryRepo {
+        async fn insert(
+            &self,
+            response: &LearningPulseResponse,
+        ) -> Result<(), RepositoryError> {
+            self.storage.lock().await.push_back(response.clone());
+            Ok(())
+        }
+    }
+
+    /// Test double for the publisher layer.
+    struct StubPublisher;
+
+    #[async_trait]
+    impl EventPublisher for StubPublisher {
+        async fn publish<T: Serialize + Send + Sync>(
+            &self,
+            _routing_key: &str,
+            _payload: &T,
+        ) -> Result<(), PublisherError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_response_persists_and_publishes() {
+        let svc = LearningPulseService::new(
+            Arc::new(InMemoryRepo::new()),
+            Arc::new(StubPublisher),
+        );
+
+        let input = SubmitResponseInput {
+            pulse_id: Uuid::new_v4(),
+            content: "E = mc^2".into(),
+        };
+
+        let ctx = RequestContext {
+            user_id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
+        };
+
+        let resp = svc.submit_response(input, ctx).await.unwrap();
+
+        assert_eq!(resp.content, "E = mc^2");
+    }
+}
+```

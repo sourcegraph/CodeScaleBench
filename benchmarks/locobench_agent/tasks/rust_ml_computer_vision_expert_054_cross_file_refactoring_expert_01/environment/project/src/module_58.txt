@@ -1,0 +1,416 @@
+```rust
+//! Module 58 — Model-Monitoring utilities for VisuTility Orchestrator.
+//!
+//! This module contains a small but production-ready *model-drift monitoring*
+//! subsystem.  It showcases how internal subsystems are written in the project:
+//!   • Strongly-typed, documented, and testable code.  
+//!   • Async-ready, because inference and monitoring often happen on separate
+//!     executors.  
+//!   • Trait-centric to enable hot-swapping of concrete implementations at run-
+//!     time (Factory + Strategy patterns).  
+//!   • Observer pattern to decouple drift detection from side-effects such as
+//!     logging, alerting, or automated retraining triggers.
+
+#![allow(clippy::too_many_arguments)]
+
+use async_trait::async_trait;
+use log::{error, info, warn};
+use ndarray::{Array1, ArrayView1};
+use rand::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+use thiserror::Error;
+use tokio::sync::mpsc;
+
+/// Re-export the most important public types.
+pub use engine::{DriftResult, DriftStatus, MonitoringEngine};
+
+/// Errors that can occur in the monitoring subsystem.
+#[derive(Debug, Error)]
+pub enum MonitoringError {
+    #[error("Received empty vector for {0}")]
+    EmptySample(&'static str),
+    #[error("Vector size mismatch — reference: {reference}, test: {test}")]
+    SizeMismatch { reference: usize, test: usize },
+    #[error("Internal computation error: {0}")]
+    Internal(String),
+}
+
+/// Drift detection result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriftResult {
+    pub model_version: String,
+    pub timestamp: SystemTime,
+    pub statistic: f32,
+    pub p_value: f32,
+    pub status: DriftStatus,
+}
+
+impl fmt::Display for DriftResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[{model}] {status:?} (D={stat:.4}, p={p:.4}) at {ts:?}",
+            model = self.model_version,
+            status = self.status,
+            stat = self.statistic,
+            p = self.p_value,
+            ts = self.timestamp
+        )
+    }
+}
+
+/// High-level drift status.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum DriftStatus {
+    Stable,
+    Warning,
+    Drifted,
+}
+
+/// An observation batch arriving from the Serving-Ops layer.
+#[derive(Debug)]
+pub struct SampleBatch {
+    /// Model identifier (semantic version or hash)
+    pub model_version: String,
+    /// Reference distribution (usually training data).
+    pub reference: Array1<f32>,
+    /// Recently produced predictions or features to compare against `reference`.
+    pub test: Array1<f32>,
+    /// Opaque metadata (camera id, tenant id, etc.)
+    pub meta: Option<String>,
+}
+
+/// Generic trait for drift detectors.  Swappable via Factory pattern.
+#[async_trait]
+pub trait DriftDetector: Send + Sync {
+    async fn evaluate(
+        &self,
+        reference: ArrayView1<'_, f32>,
+        test: ArrayView1<'_, f32>,
+    ) -> Result<(f32, f32, DriftStatus), MonitoringError>;
+}
+
+/// Observer pattern: every observer receives drift events but decides what to
+/// do with them (log, persist, emit metric, trigger retraining, …).
+#[async_trait]
+pub trait DriftObserver: Send + Sync {
+    async fn on_update(&self, result: &DriftResult);
+}
+
+/* -------------------------------------------------------------------------- */
+/*                         Kolmogorov–Smirnov Detector                        */
+/* -------------------------------------------------------------------------- */
+
+/// Parameters for the KS drift detector.
+#[derive(Debug, Clone)]
+pub struct KSConfig {
+    /// Significance level (α) for the KS test. Typical values: 0.01, 0.05.
+    pub alpha: f32,
+}
+
+impl Default for KSConfig {
+    fn default() -> Self {
+        Self { alpha: 0.05 }
+    }
+}
+
+/// A very small, dependency-free Kolmogorov–Smirnov implementation.
+///
+/// *Note*: For production we might delegate to `statrs` or `kdam`, but this
+/// compact implementation keeps the dependency tree slim and is “good enough”.
+pub struct KSDriftDetector {
+    cfg: KSConfig,
+}
+
+impl KSDriftDetector {
+    pub fn new(cfg: KSConfig) -> Self {
+        Self { cfg }
+    }
+
+    /// Naïve but deterministic two-sample KS statistic.
+    fn ks_statistic(
+        &self,
+        reference: ArrayView1<'_, f32>,
+        test: ArrayView1<'_, f32>,
+    ) -> Result<f32, MonitoringError> {
+        if reference.is_empty() {
+            return Err(MonitoringError::EmptySample("reference"));
+        }
+        if test.is_empty() {
+            return Err(MonitoringError::EmptySample("test"));
+        }
+
+        // Collect unique sorted points across both samples.
+        let mut points = BTreeSet::new();
+        reference.iter().for_each(|v| {
+            // Hash collisions are fine; we use ordered values.
+            points.insert(*v);
+        });
+        test.iter().for_each(|v| {
+            points.insert(*v);
+        });
+
+        let n = reference.len() as f32;
+        let m = test.len() as f32;
+
+        let mut d_max = 0.0f32;
+        let mut cdf_ref = 0.0f32;
+        let mut cdf_test = 0.0f32;
+
+        let mut idx_ref = 0usize;
+        let mut idx_test = 0usize;
+
+        // Convert to Vec for indexed access.
+        let ref_sorted = {
+            let mut v = reference.to_vec();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v
+        };
+        let test_sorted = {
+            let mut v = test.to_vec();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v
+        };
+
+        for point in points {
+            while idx_ref < ref_sorted.len() && ref_sorted[idx_ref] <= point {
+                idx_ref += 1;
+            }
+            while idx_test < test_sorted.len() && test_sorted[idx_test] <= point {
+                idx_test += 1;
+            }
+
+            cdf_ref = idx_ref as f32 / n;
+            cdf_test = idx_test as f32 / m;
+            d_max = d_max.max((cdf_ref - cdf_test).abs());
+        }
+
+        Ok(d_max)
+    }
+
+    /// Approximate p-value using the asymptotic Kolmogorov distribution.
+    fn ks_p_value(&self, n: usize, m: usize, d: f32) -> f32 {
+        // Effective sample size.
+        let en = ((n * m) as f32 / (n + m) as f32).sqrt();
+        let lambda = (en + 0.12 + 0.11 / en) * d;
+        // Kolmogorov asymptotic formula.
+        let mut sum = 0.0f32;
+        for i in 1..=100 {
+            let term = (-2.0 * i as f32 * i as f32 * lambda * lambda).exp();
+            sum += (-1.0f32).powi((i - 1) as i32) * term;
+        }
+        (2.0 * sum).clamp(0.0, 1.0)
+    }
+}
+
+#[async_trait]
+impl DriftDetector for KSDriftDetector {
+    async fn evaluate(
+        &self,
+        reference: ArrayView1<'_, f32>,
+        test: ArrayView1<'_, f32>,
+    ) -> Result<(f32, f32, DriftStatus), MonitoringError> {
+        let d = self.ks_statistic(reference, test)?;
+        let p = self.ks_p_value(reference.len(), test.len(), d);
+
+        // Interpret the statistical evidence.
+        let status = if p > self.cfg.alpha {
+            DriftStatus::Stable
+        } else if d < 0.25 {
+            DriftStatus::Warning
+        } else {
+            DriftStatus::Drifted
+        };
+
+        Ok((d, p, status))
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                               Observers/Sinks                              */
+/* -------------------------------------------------------------------------- */
+
+/// Simple observer that writes drift status to the logging subsystem.
+pub struct LoggingObserver;
+
+impl LoggingObserver {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl DriftObserver for LoggingObserver {
+    async fn on_update(&self, result: &DriftResult) {
+        match result.status {
+            DriftStatus::Stable => info!("{result}"),
+            DriftStatus::Warning => warn!("{result}"),
+            DriftStatus::Drifted => error!("{result}"),
+        }
+    }
+}
+
+/// Dummy observer that triggers automated retraining through an MPSC channel.
+/// In real life this would enqueue jobs to an orchestration system (Argo, Airflow, …).
+pub struct RetrainTrigger {
+    tx: mpsc::Sender<String>,
+}
+
+impl RetrainTrigger {
+    pub fn new(tx: mpsc::Sender<String>) -> Self {
+        Self { tx }
+    }
+}
+
+#[async_trait]
+impl DriftObserver for RetrainTrigger {
+    async fn on_update(&self, result: &DriftResult) {
+        if matches!(result.status, DriftStatus::Drifted) {
+            if let Err(e) = self
+                .tx
+                .send(format!("retrain::{}", result.model_version))
+                .await
+            {
+                error!("Unable to enqueue retraining job: {e}");
+            }
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              Monitoring Engine                             */
+/* -------------------------------------------------------------------------- */
+
+mod engine {
+    use super::*;
+
+    /// Core orchestrator that glues Detectors and Observers together.
+    pub struct MonitoringEngine {
+        detector: Arc<dyn DriftDetector>,
+        observers: Vec<Arc<dyn DriftObserver>>,
+    }
+
+    impl MonitoringEngine {
+        /// Construct an engine with one detector and N observers.
+        pub fn new(
+            detector: Arc<dyn DriftDetector>,
+            observers: Vec<Arc<dyn DriftObserver>>,
+        ) -> Self {
+            Self {
+                detector,
+                observers,
+            }
+        }
+
+        /// Synchronous evaluation convenience wrapper.
+        pub async fn evaluate(
+            &self,
+            batch: &SampleBatch,
+        ) -> Result<DriftResult, MonitoringError> {
+            let (stat, p_value, status) = self
+                .detector
+                .evaluate(batch.reference.view(), batch.test.view())
+                .await?;
+
+            let result = DriftResult {
+                model_version: batch.model_version.clone(),
+                timestamp: SystemTime::now(),
+                statistic: stat,
+                p_value,
+                status,
+            };
+
+            for obs in &self.observers {
+                obs.on_update(&result).await;
+            }
+
+            Ok(result)
+        }
+
+        /// Async loop that listens for incoming `SampleBatch`es.
+        pub async fn run(
+            &self,
+            mut rx: mpsc::Receiver<SampleBatch>,
+            shutdown: tokio::sync::watch::Receiver<()>,
+        ) {
+            tokio::pin!(shutdown);
+
+            loop {
+                tokio::select! {
+                    biased;
+
+                    _ = shutdown.changed() => {
+                        info!("MonitoringEngine received shutdown signal");
+                        break;
+                    }
+
+                    Some(batch) = rx.recv() => {
+                        if let Err(e) = self.evaluate(&batch).await {
+                            error!("Monitoring failure: {e}");
+                        }
+                    }
+
+                    else => break,
+                }
+            }
+            info!("MonitoringEngine loop terminated");
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                   Tests                                    */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    #[tokio::test]
+    async fn test_ks_detector_basics() {
+        let detector = KSDriftDetector::new(KSConfig { alpha: 0.05 });
+        let ref_vec = array![0.0, 0.1, 0.2, 0.3, 0.4];
+        let test_vec = array![0.0, 0.1, 0.2, 0.3, 0.4];
+
+        let (d, p, status) = detector
+            .evaluate(ref_vec.view(), test_vec.view())
+            .await
+            .unwrap();
+
+        assert!(d < 0.01);
+        assert!(p > 0.95);
+        assert!(matches!(status, DriftStatus::Stable));
+    }
+
+    #[tokio::test]
+    async fn test_engine_integration() {
+        let detector = Arc::new(KSDriftDetector::new(KSConfig::default()));
+        let observers: Vec<Arc<dyn DriftObserver>> = vec![Arc::new(LoggingObserver::new())];
+        let engine = MonitoringEngine::new(detector, observers);
+
+        let ref_data: Array1<f32> = (0..50).map(|i| i as f32 / 50.0).collect();
+        let mut rng = StdRng::seed_from_u64(42);
+        let test_data: Array1<f32> = ref_data
+            .iter()
+            .map(|v| v + rng.gen_range(-0.02..0.02))
+            .collect();
+
+        let batch = SampleBatch {
+            model_version: "v1.2.3".into(),
+            reference: ref_data,
+            test: test_data,
+            meta: None,
+        };
+
+        let res = engine.evaluate(&batch).await.unwrap();
+        assert!(matches!(res.status, DriftStatus::Stable | DriftStatus::Warning));
+    }
+}
+```

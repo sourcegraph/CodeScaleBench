@@ -1,0 +1,373 @@
+```rust
+//! LedgerLink Nexus – Response Caching Middleware
+//!
+//! This module provides an Actix-Web compatible middleware that transparently
+//! caches successful GET / HEAD responses in Redis.  The middleware
+//! understands the multi-tenant nature of the platform (every key is
+//! automatically prefixed with the tenant id) and cooperates with the
+//! pagination layer by using the full query string in the cache key.
+//!
+//! Recommended usage (inside `main.rs` or the app factory):
+//! ```no_run
+//! use ledgerlink_nexus::middleware::{response_cache, response_cache::ResponseCache};
+//!
+//! fn app(redis: deadpool_redis::Pool) -> App {
+//!     App::new()
+//!         .wrap(ResponseCache::new(redis, response_cache::Config::default()))
+//!         // … more middleware & routes
+//! }
+//! ```
+//! The middleware is production-ready and follows the Repository / Service
+//! architecture mandated by LedgerLink Nexus. All error variants are mapped
+//! to structured problem details envelopes before being returned to the
+//! caller.
+
+#![deny(clippy::all)]
+#![deny(clippy::pedantic)]
+#![allow(clippy::module_name_repetitions)] // middlware naming is explicit
+
+use std::{cell::RefCell, rc::Rc, time::Duration};
+
+use actix_service::{Service, Transform};
+use actix_web::{
+    body::{BoxBody, MessageBody},
+    dev::{ServiceRequest, ServiceResponse},
+    error::ResponseError,
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    HttpMessage, HttpResponse,
+};
+use async_trait::async_trait;
+use deadpool_redis::{redis::AsyncCommands, Connection as RedisConnection, Pool as RedisPool};
+use pin_project_lite::pin_project;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::Mutex;
+use tracing::{debug, error, instrument};
+
+/// Public re-exports so callers only need to `use ledgerlink_nexus::middleware::response_cache::*;`
+pub use Config;
+pub use ResponseCache;
+
+const DEFAULT_TTL_SECS: u64 = 30;
+
+/// Middleware configuration
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// How long a cached response should live (in seconds).
+    pub ttl: Duration,
+    /// Maximum payload size that will be cached. Prevents accidentally placing
+    /// gigantic PDF blobs into Redis.
+    pub max_payload_size_bytes: usize,
+    /// Whether to include HTTP headers in the cached representation.
+    pub with_headers: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            ttl: Duration::from_secs(DEFAULT_TTL_SECS),
+            max_payload_size_bytes: 1024 * 32, // 32 KiB
+            with_headers: true,
+        }
+    }
+}
+
+/// Error variants emitted by the middleware
+#[derive(Debug, Error)]
+pub enum CacheError {
+    #[error("Redis error: {0}")]
+    Redis(#[from] deadpool_redis::redis::RedisError),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl ResponseError for CacheError {
+    fn status_code(&self) -> StatusCode {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+
+    fn error_response(&self) -> HttpResponse<BoxBody> {
+        HttpResponse::build(self.status_code())
+            .insert_header((header::CONTENT_TYPE, "application/problem+json"))
+            .json(serde_json::json!({
+                "type":   "about:blank",
+                "title":  "Cache subsystem error",
+                "status": self.status_code().as_u16(),
+                "detail": self.to_string(),
+            }))
+    }
+}
+
+/// Serialize-able envelope that lives in Redis
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedEnvelope {
+    status: u16,
+    #[serde(with = "serde_bytes")]
+    body: Vec<u8>,
+    // Optional; only present if `with_headers` enabled
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headers: Option<Vec<(String, String)>>,
+}
+
+/// Actix-Web middleware that implements transparent response caching.
+pub struct ResponseCache {
+    pool: RedisPool,
+    config: Config,
+}
+
+impl ResponseCache {
+    pub fn new(pool: RedisPool, config: Config) -> Self {
+        Self { pool, config }
+    }
+}
+
+impl<S, B> Transform<S, ServiceRequest> for ResponseCache
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = actix_web::Error> + 'static,
+    S::Future: 'static,
+    B: MessageBody + 'static,
+{
+    type Response = ServiceResponse<BoxBody>;
+    type Error = actix_web::Error;
+    type InitError = ();
+    type Transform = ResponseCacheMiddleware<S>;
+    type Future = futures_util::future::Ready<Result<Self::Transform, Self::InitError>>;
+
+    fn new_transform(&self, service: S) -> Self::Future {
+        futures_util::future::ok(ResponseCacheMiddleware {
+            inner: Rc::new(service),
+            pool: self.pool.clone(),
+            config: self.config.clone(),
+        })
+    }
+}
+
+pin_project! {
+    pub struct ResponseCacheMiddleware<S> {
+        inner: Rc<S>,
+        pool: RedisPool,
+        config: Config,
+    }
+}
+
+#[async_trait(?Send)]
+impl<S, B> Service<ServiceRequest> for ResponseCacheMiddleware<S>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = actix_web::Error>,
+    S::Future: 'static,
+    B: MessageBody + 'static,
+{
+    type Response = ServiceResponse<BoxBody>;
+    type Error = actix_web::Error;
+    type Future = Box<dyn futures_util::Future<Output = Result<Self::Response, Self::Error>>>;
+
+    #[instrument(skip(self, req), fields(method = %req.method(), path = %req.path()))]
+    fn call(&self, req: ServiceRequest) -> Self::Future {
+        // Only cache GET / HEAD requests
+        if req.method() != Method::GET && req.method() != Method::HEAD {
+            // fast path; delegate immediately
+            return Box::new(self.inner.call(req).map(|res| res.map_into_boxed_body()));
+        }
+
+        // Clone what we need
+        let svc = Rc::clone(&self.inner);
+        let pool = self.pool.clone();
+        let cfg = self.config.clone();
+
+        // Extract tenant id (mandatory in header, validated upstream)
+        // Fallback to "anonymous"
+        let tenant_id = req
+            .headers()
+            .get("x-tenant-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("anonymous");
+
+        // Compute cache key
+        let cache_key = create_cache_key(tenant_id, &req);
+
+        Box::new(async move {
+            // Step 1: Try Redis
+            let mut conn = match pool.get().await {
+                Ok(c) => c,
+                Err(err) => {
+                    error!(error = %err, "unable to obtain redis connection, continuing without cache");
+                    return fetch_and_maybe_store(&cache_key, svc, req, None, cfg).await;
+                }
+            };
+
+            match try_get_cached(&cache_key, &mut conn).await {
+                Ok(Some(cached)) => {
+                    debug!(key = %cache_key, "cache hit");
+                    Ok(rehydrate_response(cached, &cache_key)?)
+                }
+                Ok(None) => {
+                    debug!(key = %cache_key, "cache miss");
+                    fetch_and_maybe_store(&cache_key, svc, req, Some(conn), cfg).await
+                }
+                Err(err) => {
+                    error!(error = %err, "redis failure, bypassing cache");
+                    fetch_and_maybe_store(&cache_key, svc, req, None, cfg).await
+                }
+            }
+        })
+    }
+}
+
+/// Generates a canonical cache key using tenant, path + query string.
+fn create_cache_key(tenant_id: &str, req: &ServiceRequest) -> String {
+    // Example: tenant:ledgerlink|/api/v1/invoices?cursor=abc
+    let mut key = String::with_capacity(64);
+    key.push_str("tenant:");
+    key.push_str(tenant_id);
+    key.push('|');
+    key.push_str(req.path());
+    if let Some(qs) = req.query_string().strip_prefix('?') {
+        key.push('?');
+        key.push_str(qs);
+    } else if !req.query_string().is_empty() {
+        key.push('?');
+        key.push_str(req.query_string());
+    }
+    key
+}
+
+/// Try reading from Redis
+async fn try_get_cached(
+    key: &str,
+    conn: &mut RedisConnection,
+) -> Result<Option<CachedEnvelope>, CacheError> {
+    let bytes: Option<Vec<u8>> = conn.get(key).await?;
+    if let Some(raw) = bytes {
+        let envelope: CachedEnvelope = bincode::deserialize(&raw)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(Some(envelope))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Execute inner service and maybe store in cache
+async fn fetch_and_maybe_store<S, B>(
+    cache_key: &str,
+    svc: Rc<S>,
+    req: ServiceRequest,
+    mut conn: Option<RedisConnection>,
+    cfg: Config,
+) -> Result<ServiceResponse<BoxBody>, actix_web::Error>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = actix_web::Error>,
+    B: MessageBody + 'static,
+{
+    let fut = svc.call(req);
+    let mut res: ServiceResponse<B> = fut.await?;
+
+    // Only cache 200 OK + < 32KiB (configurable) + GET/HEAD
+    if res.status() == StatusCode::OK {
+        // Collect full body – not ideal for streaming, but LedgerLink endpoints are JSON and usually < 32KiB
+        let body_bytes = body_to_bytes(res.take_body(), cfg.max_payload_size_bytes).await?;
+
+        // Store into Redis if we have a connection
+        if let Some(conn) = conn.as_mut() {
+            let headers_snapshot = if cfg.with_headers {
+                Some(headers_to_vec(res.headers()))
+            } else {
+                None
+            };
+
+            let envelope = CachedEnvelope {
+                status: res.status().as_u16(),
+                body: body_bytes.clone(),
+                headers: headers_snapshot,
+            };
+
+            if let Err(err) = persist(conn, cache_key, envelope, cfg.ttl).await {
+                error!(error = %err, "failed to persist response in cache");
+            }
+        }
+
+        // Rebuild HttpResponse from buffered body
+        let mut builder = HttpResponse::build(res.status());
+        for (h, v) in res.headers().iter() {
+            builder.insert_header((h.clone(), v.clone()));
+        }
+        let response = builder.body(body_bytes);
+        Ok(res.map_body(|_, _| response.into_body()).map_into_boxed_body())
+    } else {
+        Ok(res.map_into_boxed_body())
+    }
+}
+
+/// Stream body into memory (bounded)
+#[instrument(level = "debug", skip(body))]
+async fn body_to_bytes<B>(
+    mut body: B,
+    max: usize,
+) -> Result<Vec<u8>, actix_web::Error>
+where
+    B: MessageBody + Unpin + 'static,
+{
+    use futures_util::StreamExt;
+
+    let mut collected = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let c = chunk?;
+        if collected.len() + c.len() > max {
+            return Err(actix_web::error::ErrorPayloadTooLarge(
+                "payload exceeds cache limit",
+            ));
+        }
+        collected.extend_from_slice(&c);
+    }
+    Ok(collected)
+}
+
+/// Persist to Redis
+async fn persist(
+    conn: &mut RedisConnection,
+    key: &str,
+    envelope: CachedEnvelope,
+    ttl: Duration,
+) -> Result<(), CacheError> {
+    let payload = bincode::serialize(&envelope)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    conn.set_ex::<&str, Vec<u8>, ()>(key, payload, ttl.as_secs() as usize)
+        .await?;
+    Ok(())
+}
+
+/// Rebuild a service response from cached envelope
+fn rehydrate_response(
+    cached: CachedEnvelope,
+    key: &str,
+) -> Result<ServiceResponse<BoxBody>, actix_web::Error> {
+    let mut builder =
+        HttpResponse::build(StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK));
+
+    if let Some(hdrs) = cached.headers {
+        for (k, v) in hdrs {
+            builder.insert_header((k, v));
+        }
+    }
+
+    // Add hint for observability
+    builder.insert_header(("x-cache", "HIT"));
+    builder.insert_header(("x-cache-key", key));
+
+    Ok(ServiceResponse::new(
+        actix_web::HttpRequest::default(),
+        builder.body(cached.body).map_into_boxed_body(),
+    ))
+}
+
+/// Helper to snapshot headers into Vec<(String, String)>
+fn headers_to_vec(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(k, v)| {
+            Some((k.to_string(), v.to_str().ok()?.to_string()))
+        })
+        .collect()
+}
+
+use futures_util::future::FutureExt; // Needed for .map()
+```

@@ -1,0 +1,415 @@
+```rust
+//! Adaptive Hyper-parameter Tuning and Automated Re-training
+//!
+//! This module demonstrates how VisuTility Orchestrator performs on-the-fly
+//! hyper-parameter tuning and automated re-training while respecting the
+//! Strategy and Observer patterns.
+//
+//  ┌───────────────────────────┐
+//  │ MetricMonitor (Subject)   │
+//  └────────────┬──────────────┘
+//               │ notifies
+//  ┌────────────▼──────────────┐
+//  │ RetrainTrigger (Observer) │──────────────┐
+//  └────────────┬──────────────┘              │ calls
+//               │                             │
+//  ┌────────────▼──────────────┐              │
+//  │  HyperparameterTuner      │              │
+//  │  (Strategy ‑ pluggable)   │              │
+//  └────────────┬──────────────┘              │
+//               │ recommends                  │
+//  ┌────────────▼──────────────┐              │
+//  │     ModelOps facade       │◄─────────────┘
+//  └───────────────────────────┘
+//
+//  The code is self-contained except for a few external crates that are very
+//  common in the Rust ecosystem (crossbeam-channel, serde, anyhow, log).
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+use crossbeam_channel::{bounded, Receiver, Sender};
+use log::{debug, error, info};
+use rand::seq::SliceRandom;
+use rand::thread_rng;
+use serde::{Deserialize, Serialize};
+
+/// Re-export commonly used types in a prelude so that downstream modules
+/// can `use module_2::prelude::*` and stay ergonomic.
+pub mod prelude {
+    pub use super::{
+        GridSearchTuner, HyperParamSpace, HyperParameterTuner, HyperParameters, MetricMonitor,
+        ModelMetrics, ModelOps, RetrainTrigger,
+    };
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                Domain Types                                */
+/* -------------------------------------------------------------------------- */
+
+/// Generic representation of a model’s hyper-parameters.
+///
+/// Internally we store a `serde_json::Value` for flexibility, but typed
+/// accessor helpers are provided for ergonomics in business-logic code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HyperParameters {
+    inner: serde_json::Value,
+}
+
+impl HyperParameters {
+    pub fn new(inner: serde_json::Value) -> Self {
+        Self { inner }
+    }
+
+    /// Convenience helper to get a numeric parameter.
+    pub fn get_f64(&self, key: &str) -> Option<f64> {
+        self.inner
+            .get(key)
+            .and_then(|v| v.as_f64())
+    }
+
+    /// Convenience helper to set/update a parameter.
+    pub fn set<K: Into<String>, T: Serialize>(&mut self, key: K, value: T) -> Result<()> {
+        let mut map = self
+            .inner
+            .as_object()
+            .cloned()
+            .unwrap_or_else(|| serde_json::Map::new());
+        map.insert(
+            key.into(),
+            serde_json::to_value(value).context("serializing parameter")?,
+        );
+        self.inner = serde_json::Value::Object(map);
+        Ok(())
+    }
+}
+
+/// Metrics reported by a running model.
+///
+/// For brevity we only capture a handful of metrics. In production, metrics
+/// would be routed from Prometheus/OpenTelemetry exporters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelMetrics {
+    pub model_id: String,
+    pub accuracy: f64,
+    pub precision: f64,
+    pub recall: f64,
+    pub throughput_fps: f64,
+}
+
+/// Abstract capabilities that the Model-Ops layer must expose so that
+/// hyper-parameter tuning and re-training can be orchestrated independently
+/// of the underlying ML framework (e.g. TensorFlow, PyTorch, ONNX-Runtime).
+pub trait ModelOps: Send + Sync {
+    /// Kick off an asynchronous re-training job for `model_id` using the
+    /// supplied hyper-parameters. The implementation is responsible for
+    /// returning immediately (non-blocking) and for emitting its own events
+    /// (status, success, failure) through the system’s event bus.
+    fn retrain(&self, model_id: &str, params: HyperParameters) -> Result<()>;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                          Strategy: Hyper-parameter Tuner                   */
+/* -------------------------------------------------------------------------- */
+
+/// Search space descriptor for naïve grid-search.
+///
+/// More advanced tuners (e.g. Bayesian) would define their own descriptor.
+#[derive(Debug, Clone)]
+pub struct HyperParamSpace {
+    pub lr: Vec<f64>,
+    pub batch_size: Vec<u32>,
+    pub dropout: Vec<f64>,
+}
+
+/// Strategy interface for selecting the next candidate hyper-parameters.
+pub trait HyperParameterTuner: Send + Sync {
+    /// Returns a new set of hyper-parameters based on the latest model metrics.
+    fn suggest(&mut self, metrics: &ModelMetrics) -> Option<HyperParameters>;
+}
+
+/// Reference strategy: exhaustive grid-search with random walk.
+///
+/// In production we would enumerate deterministically; here we randomise to
+/// avoid massive search space exploration in the example code.
+pub struct GridSearchTuner {
+    /// Search grid catalogued in a naive way. For large search spaces, a
+    /// smarter iterator would be required.
+    grid: Vec<HyperParameters>,
+    /// Keep track of which configurations have been tried.
+    tried: HashMap<String, ()>,
+}
+
+impl GridSearchTuner {
+    pub fn new(space: HyperParamSpace) -> Self {
+        let mut grid = Vec::new();
+        for lr in space.lr {
+            for batch in &space.batch_size {
+                for dropout in &space.dropout {
+                    let params = serde_json::json!({
+                        "learning_rate": lr,
+                        "batch_size": batch,
+                        "dropout": dropout,
+                    });
+                    grid.push(HyperParameters::new(params));
+                }
+            }
+        }
+        Self {
+            grid,
+            tried: HashMap::new(),
+        }
+    }
+}
+
+impl HyperParameterTuner for GridSearchTuner {
+    fn suggest(&mut self, metrics: &ModelMetrics) -> Option<HyperParameters> {
+        // If the model performs well enough, no need to tune.
+        if metrics.accuracy >= 0.97 {
+            info!(
+                "Model [{}] already meets accuracy target ({}). Skipping suggestion.",
+                metrics.model_id, metrics.accuracy
+            );
+            return None;
+        }
+
+        // Otherwise, randomly take an unseen configuration from the grid.
+        let mut rng = thread_rng();
+        self.grid.shuffle(&mut rng);
+
+        for params in &self.grid {
+            let fingerprint = serde_json::to_string(&params).ok()?;
+            if !self.tried.contains_key(&fingerprint) {
+                info!(
+                    "Suggesting new hyper-parameters for model [{}]: {}",
+                    metrics.model_id, fingerprint
+                );
+                self.tried.insert(fingerprint, ());
+                return Some(params.clone());
+            }
+        }
+
+        info!(
+            "Grid exhausted for model [{}]; no more hyper-parameters to try.",
+            metrics.model_id
+        );
+        None
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                       Observer: Metric-driven Re-trainer                   */
+/* -------------------------------------------------------------------------- */
+
+/// A generic observer that reacts to model metrics.
+///
+/// In a real-world system this trait would likely come from a common
+/// crate so that multiple modules can subscribe to events uniformly.
+pub trait MetricsObserver: Send + Sync {
+    fn on_metrics(&self, metrics: ModelMetrics);
+}
+
+/// Central hub that receives incoming metrics and dispatches them to
+/// registered observers. This plays the *Subject* role in the Observer pattern.
+pub struct MetricMonitor {
+    observers: Arc<Mutex<Vec<Arc<dyn MetricsObserver>>>>,
+    sender: Sender<ModelMetrics>,
+    _worker_handle: thread::JoinHandle<()>,
+}
+
+impl MetricMonitor {
+    /// Creates a new monitor with a background worker thread that forwards
+    /// metrics to observers. The channel is bounded to apply back-pressure in
+    /// pathological cases.
+    pub fn new(buffer: usize) -> Self {
+        let observers = Arc::new(Mutex::new(Vec::new()));
+        let (sender, receiver) = bounded::<ModelMetrics>(buffer);
+        let observers_clone = observers.clone();
+
+        let handle = thread::spawn(move || Self::run(receiver, observers_clone));
+
+        Self {
+            observers,
+            sender,
+            _worker_handle: handle,
+        }
+    }
+
+    /// Internal worker loop.
+    fn run(receiver: Receiver<ModelMetrics>, observers: Arc<Mutex<Vec<Arc<dyn MetricsObserver>>>>) {
+        for metrics in receiver.iter() {
+            debug!("MetricMonitor received metrics: {:?}", metrics);
+            let snapshot = {
+                // Take a snapshot to minimise lock contention duration.
+                observers.lock().unwrap().clone()
+            };
+            for obs in snapshot {
+                obs.on_metrics(metrics.clone());
+            }
+        }
+        info!("MetricMonitor worker terminating");
+    }
+
+    /// Register a new observer.
+    pub fn subscribe<O: MetricsObserver + 'static>(&self, observer: O) {
+        self.observers.lock().unwrap().push(Arc::new(observer));
+    }
+
+    /// Feed metrics into the monitor. Called by the system’s telemetry layer.
+    pub fn ingest(&self, metrics: ModelMetrics) {
+        if let Err(e) = self.sender.send(metrics) {
+            // Inbound side; losing metrics is severe – always log an error.
+            error!("Failed to dispatch metrics: {}", e);
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                  Observer Implementation: Retrain Trigger                  */
+/* -------------------------------------------------------------------------- */
+
+/// Observer that decides when to trigger re-training based on metrics and
+/// delegates hyper-parameter suggestion to an injected tuner (Strategy).
+pub struct RetrainTrigger<T: HyperParameterTuner> {
+    tuner: Mutex<T>,
+    model_ops: Arc<dyn ModelOps>,
+    /// Minimal gap (in seconds) between consecutive retraining events for the
+    /// same model. Prevents runaway retraining loops.
+    cooldown_secs: u64,
+    /// Track last retrain timestamp per model.
+    last_retrain: Mutex<HashMap<String, std::time::Instant>>,
+}
+
+impl<T> RetrainTrigger<T>
+where
+    T: HyperParameterTuner + 'static,
+{
+    pub fn new(tuner: T, model_ops: Arc<dyn ModelOps>, cooldown_secs: u64) -> Self {
+        Self {
+            tuner: Mutex::new(tuner),
+            model_ops,
+            cooldown_secs,
+            last_retrain: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<T> MetricsObserver for RetrainTrigger<T>
+where
+    T: HyperParameterTuner + 'static,
+{
+    fn on_metrics(&self, metrics: ModelMetrics) {
+        let now = std::time::Instant::now();
+
+        // Respect cooldown.
+        {
+            let mut map = self.last_retrain.lock().unwrap();
+            if let Some(last) = map.get(&metrics.model_id) {
+                if now.duration_since(*last).as_secs() < self.cooldown_secs {
+                    debug!(
+                        "Cooldown active for model [{}], skipping retrain",
+                        metrics.model_id
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Ask the strategy for new hyper-parameters.
+        let maybe_params = {
+            let mut tuner = self.tuner.lock().unwrap();
+            tuner.suggest(&metrics)
+        };
+
+        if let Some(params) = maybe_params {
+            info!(
+                "Triggering re-training for model [{}] with new parameters",
+                metrics.model_id
+            );
+            match self.model_ops.retrain(&metrics.model_id, params) {
+                Ok(_) => {
+                    self.last_retrain
+                        .lock()
+                        .unwrap()
+                        .insert(metrics.model_id.clone(), now);
+                    info!("Re-training job submitted successfully");
+                }
+                Err(e) => {
+                    error!("Failed to submit re-training job: {:?}", e);
+                }
+            }
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                       Minimal Mock Implementations                         */
+/* -------------------------------------------------------------------------- */
+
+/// A stub implementation that simulates a long-running re-training job.
+/// Useful for smoke-testing the observer without touching external systems.
+pub struct MockModelOps;
+
+impl ModelOps for MockModelOps {
+    fn retrain(&self, model_id: &str, params: HyperParameters) -> Result<()> {
+        let fingerprint = serde_json::to_string(&params)?;
+        // Spawn a detached thread so we don’t block the caller.
+        let id = model_id.to_owned();
+        thread::spawn(move || {
+            info!(
+                "Retraining [{}] in background with params: {}",
+                id, fingerprint
+            );
+            thread::sleep(Duration::from_secs(3));
+            info!("Retraining [{}] finished", id);
+        });
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                 Unit Tests                                 */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn basic_end_to_end_flow() {
+        let monitor = MetricMonitor::new(8);
+        let space = HyperParamSpace {
+            lr: vec![0.01, 0.001],
+            batch_size: vec![8, 16],
+            dropout: vec![0.1, 0.2],
+        };
+        let tuner = GridSearchTuner::new(space);
+        let model_ops = Arc::new(MockModelOps);
+
+        let trigger = RetrainTrigger::new(tuner, model_ops, 1);
+        monitor.subscribe(trigger);
+
+        let metrics = ModelMetrics {
+            model_id: "model-123".into(),
+            accuracy: 0.80,
+            precision: 0.75,
+            recall: 0.78,
+            throughput_fps: 35.0,
+        };
+
+        let start = Instant::now();
+        monitor.ingest(metrics);
+
+        // Allow background job to complete.
+        while start.elapsed().as_secs() < 5 {
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+```

@@ -1,0 +1,355 @@
+```rust
+//! Module 41 – Adaptive Retraining & Monitoring
+//!
+//! This module glues together an Observer that listens for online‐evaluation
+//! metrics and a Strategy that decides *when* a model should be retrained.  
+//! Once the decision is made, an asynchronous job is dispatched to the
+//! pipeline orchestrator to kick off a full retraining cycle.
+//
+//  Architectural touch-points
+//  --------------------------
+//  • Strategy Pattern  – `RetrainingStrategy` trait allows pluggable policies.
+//  • Observer Pattern  – `ModelMetricObserver` subscribes to an event bus.
+//  • Pipeline Pattern  – Retraining jobs are emitted to an async channel and
+//                        picked up by the higher-level orchestration layer.
+//  • Model Registry    – The retrainer fetches & registers new versions.
+//
+
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
+use std::{fmt, sync::Arc};
+
+use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, RwLock};
+use tokio::time;
+
+/// Constants describing default channel backlog & job retry behaviour.
+const METRIC_CHANNEL_CAPACITY: usize = 1_024;
+const RETRAIN_JOB_RETRIES: usize = 3;
+const RETRAIN_JOB_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// Unique identifier for a model instance.
+///
+/// Conforms to the internal Model Registry’s `<project>:<name>:<semver>`
+/// naming convention. Examples:
+///   * `cv:anomaly_detector:1.2.0`
+///   * `vision:lane_detector:0.9.3`
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ModelId(String);
+
+impl fmt::Display for ModelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Enumeration of supported real-time metrics.
+///
+/// NOTE: The enum is non-exhaustive to allow introducing new metrics without
+/// breaking downstream code (important for semver compatibility).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum MetricKind {
+    Accuracy,
+    Precision,
+    Recall,
+    F1Score,
+    Latency, // inference end-to-end latency in milliseconds
+}
+
+/// Domain event emitted by the Serving Ops layer each time an online metric
+/// is computed.  This is what our Observer listens to.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MetricEvent {
+    pub model_id: ModelId,
+    pub kind: MetricKind,
+    pub value: f64,
+    pub observed_at: DateTime<Utc>,
+}
+
+/// Job descriptor pushed to the Orchestrator once a retraining decision is
+/// made.
+///
+/// In a production implementation the job would include additional metadata
+/// (e.g. data snapshot URIs), but we keep it minimal here.
+#[derive(Clone, Debug)]
+pub struct RetrainJob {
+    pub model_id: ModelId,
+    pub triggered_at: DateTime<Utc>,
+}
+
+/// Trait that encapsulates a policy for turning a stream of `MetricEvent`s
+/// into a boolean retraining decision.
+#[async_trait::async_trait]
+pub trait RetrainingStrategy: Send + Sync {
+    /// Consumes a metric event and returns `true` if a retrain should happen.
+    async fn should_retrain(&self, evt: &MetricEvent) -> Result<bool>;
+}
+
+/// A simple adaptive threshold strategy:
+///
+///   • Keeps running statistics (EWMA) per metric kind.
+///   • If the EWMA drops below the configured threshold for *any* metric,
+///     a retraining event is fired.
+///   • Thresholds and smoothing alpha can be configured at runtime.
+pub struct AdaptiveThresholdStrategy {
+    thresholds: HashMap<MetricKind, f64>,
+    ewma_alpha: f64,
+    state: RwLock<HashMap<(ModelId, MetricKind), f64>>,
+}
+
+impl AdaptiveThresholdStrategy {
+    pub fn new(thresholds: HashMap<MetricKind, f64>, ewma_alpha: f64) -> Self {
+        assert!(
+            (0.0..=1.0).contains(&ewma_alpha),
+            "ewma_alpha must be within [0, 1]"
+        );
+
+        Self {
+            thresholds,
+            ewma_alpha,
+            state: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Exposes current EWMA for inspection/debugging.
+    pub async fn ewma(&self, model: &ModelId, kind: MetricKind) -> Option<f64> {
+        self.state
+            .read()
+            .await
+            .get(&(model.clone(), kind))
+            .copied()
+    }
+}
+
+#[async_trait::async_trait]
+impl RetrainingStrategy for AdaptiveThresholdStrategy {
+    async fn should_retrain(&self, evt: &MetricEvent) -> Result<bool> {
+        let key = (evt.model_id.clone(), evt.kind);
+        let mut state = self.state.write().await;
+
+        // Update EWMA
+        let ewma = state.entry(key).or_insert(evt.value);
+        *ewma = self.ewma_alpha * evt.value + (1.0 - self.ewma_alpha) * *ewma;
+
+        // Retrieve threshold; if none configured, never trigger retrain
+        let threshold = match self.thresholds.get(&evt.kind) {
+            Some(t) => *t,
+            None => return Ok(false),
+        };
+
+        tracing::debug!(
+            model=%evt.model_id,
+            metric=?evt.kind,
+            value=evt.value,
+            ewma=*ewma,
+            threshold,
+            "Processed metric event"
+        );
+
+        Ok(*ewma < threshold)
+    }
+}
+
+/// Observer implementation that subscribes to the metric bus and delegates
+/// the decision logic to a `RetrainingStrategy`.
+pub struct ModelMetricObserver {
+    strategy: Arc<dyn RetrainingStrategy>,
+    rx: mpsc::Receiver<MetricEvent>,
+    job_tx: mpsc::Sender<RetrainJob>,
+}
+
+impl ModelMetricObserver {
+    pub fn new(
+        strategy: Arc<dyn RetrainingStrategy>,
+        rx: mpsc::Receiver<MetricEvent>,
+        job_tx: mpsc::Sender<RetrainJob>,
+    ) -> Self {
+        Self {
+            strategy,
+            rx,
+            job_tx,
+        }
+    }
+
+    /// Main event loop – should be spawned inside a Tokio task.
+    pub async fn run(mut self) -> Result<()> {
+        while let Some(evt) = self.rx.recv().await {
+            if self.strategy.should_retrain(&evt).await? {
+                let job = RetrainJob {
+                    model_id: evt.model_id.clone(),
+                    triggered_at: Utc::now(),
+                };
+                if let Err(e) = self.job_tx.send(job).await {
+                    // Channel closed – escalate; this is a critical failure.
+                    return Err(anyhow!(
+                        "Retraining job channel closed: {:?}",
+                        e
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Background worker that actually *performs* retraining jobs.
+///
+/// In production this would spin up a Kubernetes Job, Ray cluster, or run a
+/// local pipeline; here we only simulate the time cost & register a new
+/// model version.
+pub struct RetrainingWorker {
+    mut_rx: mpsc::Receiver<RetrainJob>,
+    registry: Arc<dyn ModelRegistry>,
+}
+
+impl RetrainingWorker {
+    pub fn new(mut_rx: mpsc::Receiver<RetrainJob>, registry: Arc<dyn ModelRegistry>) -> Self {
+        Self { mut_rx, registry }
+    }
+
+    pub async fn run(mut self) -> Result<()> {
+        while let Some(job) = self.mut_rx.recv().await {
+            tracing::info!(model=%job.model_id, "Received retrain job");
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                match self.perform_retrain(&job).await {
+                    Ok(new_version) => {
+                        tracing::info!(
+                            model=%job.model_id,
+                            ?new_version,
+                            "Retraining succeeded"
+                        );
+                        break;
+                    }
+                    Err(e) if attempts < RETRAIN_JOB_RETRIES => {
+                        tracing::warn!(
+                            model=%job.model_id,
+                            attempt=attempts,
+                            "Retraining failed, retrying – {e:?}"
+                        );
+                        time::sleep(RETRAIN_JOB_RETRY_DELAY).await;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            model=%job.model_id,
+                            attempts,
+                            "Retraining ultimately failed – {e:?}"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn perform_retrain(&self, job: &RetrainJob) -> Result<String> {
+        // Simulated training time
+        let start = SystemTime::now();
+        time::sleep(Duration::from_secs(5)).await; // pretend work…
+        let elapsed = start.elapsed().unwrap_or_default();
+        tracing::debug!(
+            model=%job.model_id,
+            ms=?elapsed.as_millis(),
+            "Finished dummy training"
+        );
+
+        // Register the new model version in the registry
+        let new_version = self
+            .registry
+            .register_new_version(&job.model_id)
+            .await
+            .context("failed to register new model version")?;
+
+        Ok(new_version)
+    }
+}
+
+/// Minimal interface for the internal Model Registry.
+///
+/// The real implementation might live in a dedicated crate that talks to a
+/// Postgres DB or Consul KV store.
+#[async_trait::async_trait]
+pub trait ModelRegistry: Send + Sync {
+    /// Registers a new model version and returns `<semver>` of the new build.
+    async fn register_new_version(&self, model: &ModelId) -> Result<String>;
+}
+
+/// In-memory registry for unit tests & local demo runs.
+pub struct InMemoryRegistry {
+    store: RwLock<HashMap<ModelId, semver::Version>>,
+}
+
+impl InMemoryRegistry {
+    pub fn new() -> Self {
+        Self {
+            store: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelRegistry for InMemoryRegistry {
+    async fn register_new_version(&self, model: &ModelId) -> Result<String> {
+        let mut store = self.store.write().await;
+        let v = store
+            .entry(model.clone())
+            .or_insert_with(|| semver::Version::new(0, 0, 0));
+        v.patch += 1;
+        Ok(v.to_string())
+    }
+}
+
+/// Convenience helper that wires all pieces together and returns a *running*
+/// retraining subsystem.
+///
+/// Example:
+/// ```ignore
+/// let (metric_tx, metric_rx) = mpsc::channel(METRIC_CHANNEL_CAPACITY);
+/// let subsystem = RetrainingSubsystem::launch(metric_rx).await?;
+/// ```
+pub struct RetrainingSubsystem {
+    /// Handle to push new metric events into the system.
+    pub metric_tx: mpsc::Sender<MetricEvent>,
+    /// Join handles to spawned tasks; use `.await` on each to perform a
+    /// graceful shutdown.
+    pub join_handles: Vec<tokio::task::JoinHandle<Result<()>>>,
+}
+
+impl RetrainingSubsystem {
+    pub async fn launch(metric_rx: mpsc::Receiver<MetricEvent>) -> Result<Self> {
+        // 1. Strategy Setup
+        let mut thresholds = HashMap::new();
+        thresholds.insert(MetricKind::Accuracy, 0.92);
+        thresholds.insert(MetricKind::F1Score, 0.90);
+        let strategy = Arc::new(AdaptiveThresholdStrategy::new(thresholds, 0.2));
+
+        // 2. Channels
+        let (job_tx, job_rx) = mpsc::channel::<RetrainJob>(64);
+
+        // 3. Observer Task
+        let observer = ModelMetricObserver::new(strategy, metric_rx, job_tx);
+        let observer_handle = tokio::spawn(async move { observer.run().await });
+
+        // 4. Worker Task
+        let registry = Arc::new(InMemoryRegistry::new());
+        let worker = RetrainingWorker::new(job_rx, registry);
+        let worker_handle = tokio::spawn(async move { worker.run().await });
+
+        // 5. Expose subsystem
+        let metric_tx = observer_handle
+            .task()
+            .await
+            .map_err(|_| anyhow!("observer task join error"))?; // Should never error
+
+        Ok(Self {
+            metric_tx,
+            join_handles: vec![observer_handle, worker_handle],
+        })
+    }
+}
+```

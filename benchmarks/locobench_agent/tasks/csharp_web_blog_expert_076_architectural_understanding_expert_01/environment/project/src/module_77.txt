@@ -1,0 +1,302 @@
+```csharp
+// --------------------------------------------------------------------------------------------------------------------
+// TempoScribe Pro – Hexagonal Productivity Blog Suite
+// Module 77: Editorial Analytics Aggregator
+//
+// Location : src/module_77.txt  (kept as .txt so that domain-agnostic core can be loaded
+//                               even by lightweight scripting tools during CI analysis)
+//
+// This adapter/service builds time-boxed analytics reports that help editors understand
+// how well their publishing pipeline is performing.  The implementation demonstrates:
+//
+//  • Strict adherence to Hexagonal Architecture – depends only on ports, never on other
+//    concrete adapters.
+//
+//  • Caching via IDistributedCache (Redis, Mem-cached, in-memory) to avoid re-aggregating
+//    frequently requested ranges.
+//
+//  • Resilience via Polly for transient SQL and cache faults.
+//
+//  • Cancellation-aware async APIs to keep UI snappy on Blazor clients.
+//
+//  • Logging with structured message templates for first-class observability.
+//
+// ---------------------------------------------------------------------------------------------------------------
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Logging;
+using Polly;
+using Polly.Retry;
+
+namespace TempoScribePro.Domain.Analytics
+{
+    #region ==== Ports (Interfaces exposed to the domain) ===============================================
+
+    /// <summary>
+    /// Provides read-only access to post materialized views / projections optimised for analytics.
+    /// This port lives in the domain and is implemented by an infrastructure adapter (e.g., Dapper/EF).
+    /// </summary>
+    public interface IPostAnalyticsRepository
+    {
+        Task<IReadOnlyList<PostAnalyticsDto>> GetPostsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default);
+    }
+
+    /// <summary>
+    /// High-level domain service that produces aggregated analytics reports for the editorial team.
+    /// </summary>
+    public interface IEditorialAnalyticsService
+    {
+        /// <summary>
+        /// Builds a report summarizing editorial health for a given time window.
+        /// </summary>
+        Task<EditorialAnalyticsReport> BuildAsync(
+            DateTime fromUtc,
+            DateTime toUtc,
+            AnalyticsGranularity granularity,
+            CancellationToken ct = default);
+    }
+
+    #endregion
+
+    #region ==== Value Objects & DTOs ====================================================================
+
+    /// <summary>
+    /// Granularity with which metrics are bucketed inside the report.
+    /// </summary>
+    public enum AnalyticsGranularity
+    {
+        Daily,
+        Weekly,
+        Monthly
+    }
+
+    /// <summary>
+    /// Result model returned to callers (Blazor dashboards, API controllers, etc.).
+    /// Lives in the domain layer so that front-end adapters remain technology-agnostic.
+    /// </summary>
+    public record EditorialAnalyticsReport(
+        IReadOnlyList<TimeSlice> Slices,
+        string GeneratedBy,
+        DateTime GeneratedAtUtc);
+
+    /// <summary>
+    /// Aggregated metrics for a single time slice.
+    /// </summary>
+    public record TimeSlice(
+        DateTime PeriodStartUtc,
+        int PostsPublished,
+        int WordsAuthored,
+        double AvgReadTimeSeconds,
+        IReadOnlyList<TagMetric> TopTags);
+
+    /// <summary>
+    /// Tag-level popularity metric used by dashboards (tag cloud, etc.).
+    /// </summary>
+    public record TagMetric(string Tag, int PostCount);
+
+    /// <summary>
+    /// Flat projection of a post stored inside the analytics DB.
+    /// Keeps only the columns required for the calculations below.
+    /// </summary>
+    public sealed record PostAnalyticsDto(
+        Guid Id,
+        DateTime PublishedAtUtc,
+        int WordCount,
+        double EstimatedReadTimeSeconds,
+        IReadOnlyCollection<string> Tags);
+
+    #endregion
+
+    #region ==== Domain Service Implementation (Adapter) ================================================
+
+    /// <summary>
+    /// Hexagonal adapter that builds <see cref="EditorialAnalyticsReport"/> instances
+    /// from the underlying analytics database and caches them for future calls.
+    /// </summary>
+    public sealed class EditorialAnalyticsService : IEditorialAnalyticsService
+    {
+        private const string CacheKeyTemplate = "analytics:{0:yyyyMMddHHmm}:{1:yyyyMMddHHmm}:{2}";
+        private static readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
+
+        private readonly IPostAnalyticsRepository _repository;
+        private readonly IDistributedCache _cache;
+        private readonly ILogger<EditorialAnalyticsService> _logger;
+        private readonly AsyncRetryPolicy _retryPolicy;
+
+        public EditorialAnalyticsService(
+            IPostAnalyticsRepository repository,
+            IDistributedCache cache,
+            ILogger<EditorialAnalyticsService> logger)
+        {
+            _repository = repository ?? throw new ArgumentNullException(nameof(repository));
+            _cache = cache ?? throw new ArgumentNullException(nameof(cache));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+            // Simple Polly retry for transient faults (SQL, Redis, etc.)
+            _retryPolicy = Policy
+                .Handle<Exception>(ex => IsTransient(ex))
+                .WaitAndRetryAsync(
+                    retryCount: 3,
+                    sleepDurationProvider: attempt => TimeSpan.FromMilliseconds(100 * attempt),
+                    onRetry: (ex, span, attempt, ctx) =>
+                    {
+                        _logger.LogWarning(ex,
+                            "Transient failure when computing editorial analytics. Retrying {Attempt}/3 after {Delay}ms",
+                            attempt,
+                            span.TotalMilliseconds);
+                    });
+        }
+
+        public async Task<EditorialAnalyticsReport> BuildAsync(
+            DateTime fromUtc,
+            DateTime toUtc,
+            AnalyticsGranularity granularity,
+            CancellationToken ct = default)
+        {
+            if (fromUtc >= toUtc)
+                throw new ArgumentException("'fromUtc' must be earlier than 'toUtc'.");
+
+            string cacheKey = GetCacheKey(fromUtc, toUtc, granularity);
+            _logger.LogDebug("Attempting to retrieve analytics report from cache using key {CacheKey}", cacheKey);
+
+            // Try cache first – read-as-fast-as-possible, never fail the request if cache is unavailable.
+            EditorialAnalyticsReport? cachedReport = await TryReadFromCacheAsync(cacheKey, ct);
+            if (cachedReport is not null)
+            {
+                _logger.LogInformation("Analytics report served from cache ({CacheKey})", cacheKey);
+                return cachedReport;
+            }
+
+            _logger.LogInformation("Cache miss for analytics report ({CacheKey}). Building from repository…", cacheKey);
+
+            // Build with retry resilience.
+            EditorialAnalyticsReport report = await _retryPolicy.ExecuteAsync(
+                async token => await BuildInternalAsync(fromUtc, toUtc, granularity, token),
+                ct);
+
+            // Fire-and-forget cache set (do not await to avoid delaying response).
+            _ = CacheReportAsync(cacheKey, report, ct);
+
+            return report;
+        }
+
+        #region === Internals ===========================================================================
+
+        private static bool IsTransient(Exception ex)
+        {
+            // In a real code base, inspect SqlException numbers, RedisConnectionException, etc.
+            // Here, treat all exceptions as transient for demo purposes.
+            return true;
+        }
+
+        private static string GetCacheKey(DateTime fromUtc, DateTime toUtc, AnalyticsGranularity granularity)
+            => string.Format(CacheKeyTemplate, fromUtc, toUtc, granularity.ToString().ToLowerInvariant());
+
+        private async Task<EditorialAnalyticsReport?> TryReadFromCacheAsync(string cacheKey, CancellationToken ct)
+        {
+            try
+            {
+                byte[]? bytes = await _cache.GetAsync(cacheKey, ct);
+                if (bytes is null)
+                    return null;
+
+                var report = JsonSerializer.Deserialize<EditorialAnalyticsReport>(bytes, _jsonOptions);
+                return report;
+            }
+            catch (Exception ex) when (IsTransient(ex))
+            {
+                _logger.LogWarning(ex, "Failed to read analytics report from cache. Skipping.");
+                return null;
+            }
+        }
+
+        private async Task CacheReportAsync(string cacheKey, EditorialAnalyticsReport report, CancellationToken ct)
+        {
+            try
+            {
+                byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(report, _jsonOptions);
+
+                var options = new DistributedCacheEntryOptions
+                {
+                    AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(30),
+                    SlidingExpiration = TimeSpan.FromMinutes(10)
+                };
+
+                await _cache.SetAsync(cacheKey, bytes, options, ct);
+                _logger.LogDebug("Analytics report cached under key {CacheKey}", cacheKey);
+            }
+            catch (Exception ex) when (IsTransient(ex))
+            {
+                _logger.LogWarning(ex, "Failed to store analytics report in cache.");
+            }
+        }
+
+        private async Task<EditorialAnalyticsReport> BuildInternalAsync(
+            DateTime fromUtc,
+            DateTime toUtc,
+            AnalyticsGranularity granularity,
+            CancellationToken ct)
+        {
+            IReadOnlyList<PostAnalyticsDto> posts =
+                await _repository.GetPostsAsync(fromUtc, toUtc, ct);
+
+            _logger.LogDebug("Fetched {Count} posts from analytics repository", posts.Count);
+
+            // Bucket posts by chosen granularity.
+            var grouped = posts
+                .GroupBy(p => GetBucketKey(p.PublishedAtUtc, granularity))
+                .OrderBy(g => g.Key);
+
+            List<TimeSlice> slices = new();
+
+            foreach (IGrouping<DateTime, PostAnalyticsDto> bucket in grouped)
+            {
+                int postsPublished = bucket.Count();
+                int words = bucket.Sum(p => p.WordCount);
+                double avgReadTime = bucket.Any() ? bucket.Average(p => p.EstimatedReadTimeSeconds) : 0.0;
+
+                // Flatten tags for popularity metric.
+                var topTags = bucket
+                    .SelectMany(p => p.Tags)
+                    .GroupBy(t => t.ToLowerInvariant())
+                    .Select(g => new TagMetric(g.Key, g.Count()))
+                    .OrderByDescending(t => t.PostCount)
+                    .ThenBy(t => t.Tag)
+                    .Take(5)
+                    .ToList();
+
+                slices.Add(new TimeSlice(
+                    PeriodStartUtc: bucket.Key,
+                    PostsPublished: postsPublished,
+                    WordsAuthored: words,
+                    AvgReadTimeSeconds: Math.Round(avgReadTime, 2),
+                    TopTags: topTags));
+            }
+
+            return new EditorialAnalyticsReport(
+                Slices: slices,
+                GeneratedBy: Environment.MachineName,
+                GeneratedAtUtc: DateTime.UtcNow);
+        }
+
+        private static DateTime GetBucketKey(DateTime timestampUtc, AnalyticsGranularity granularity) =>
+            granularity switch
+            {
+                AnalyticsGranularity.Daily   => timestampUtc.Date,
+                AnalyticsGranularity.Weekly  => ISOWeek.ToDateTime(ISOWeek.GetYear(timestampUtc),
+                                                                   ISOWeek.GetWeekOfYear(timestampUtc), DayOfWeek.Monday),
+                AnalyticsGranularity.Monthly => new DateTime(timestampUtc.Year, timestampUtc.Month, 1, 0, 0, 0, DateTimeKind.Utc),
+                _ => throw new ArgumentOutOfRangeException(nameof(granularity), granularity, null)
+            };
+        #endregion
+    }
+
+    #endregion
+}
+```

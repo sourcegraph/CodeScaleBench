@@ -1,0 +1,403 @@
+```rust
+// src/module_49.rs
+//
+// This module wires together several critical capabilities for the
+// EduPulse-Live back-end:
+//
+//  1. Session management backed by Redis (TLS-protected connection)
+//  2. Lightweight JWT authentication middleware
+//  3. A Learning-Pulse service that writes to Postgres and emits domain
+//     events through Redis Pub/Sub (decoupling downstream processors)
+//  4. REST handlers (Actix-Web) that expose an API surface for clients
+//
+// The code is intentionally self-contained so it can live in a single
+// source file, yet it demonstrates real-world structure, error handling,
+// and idiomatic Rust practices.
+//
+// Build flags you might need in Cargo.toml:
+//
+// [dependencies]
+// actix-web       = { version = "4", features = ["rustls"] }
+// actix-session   = "0.7"
+// actix-rt        = "2"
+// redis           = { version = "0.23", features = ["tokio-comp"] }
+// sqlx            = { version = "0.7", features = ["postgres", "chrono", "runtime-tokio-rustls"] }
+// serde           = { version = "1", features = ["derive"] }
+// serde_json      = "1"
+// chrono          = { version = "0.4", features = ["serde"] }
+// jsonwebtoken    = "9"
+// thiserror       = "1"
+// uuid            = { version = "1", features = ["v4", "serde"] }
+// tracing         = "0.1"
+// tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+#![allow(clippy::unused_async)] // Noise reduction for this single-file example.
+
+use actix_session::{storage::RedisSessionStore, Session, SessionMiddleware};
+use actix_web::{
+    dev::ServiceRequest, get, http::header, middleware::Logger, post, web, App, Error,
+    FromRequest, HttpMessage, HttpResponse, HttpServer, Responder,
+};
+use chrono::{DateTime, Utc};
+use jsonwebtoken as jwt;
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use std::future::{ready, Ready};
+use std::sync::Arc;
+use thiserror::Error;
+use tracing::{error, info};
+use uuid::Uuid;
+
+// ======================================================================
+//                         Domain Event & Bus
+// ======================================================================
+
+/// A simplified set of domain events published by EduPulse Live.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum DomainEvent {
+    PulseResponseSubmitted {
+        response_id: Uuid,
+        pulse_id: Uuid,
+        author_id: Uuid,
+        ts: DateTime<Utc>,
+    },
+    SessionTerminated {
+        user_id: Uuid,
+        session_id: String,
+        ts: DateTime<Utc>,
+    },
+}
+
+/// Abstraction over an async, fire-and-forget event publisher.
+#[async_trait::async_trait]
+trait EventPublisher: Send + Sync {
+    async fn publish(&self, evt: &DomainEvent) -> Result<(), EventBusError>;
+}
+
+#[derive(Debug, Error)]
+enum EventBusError {
+    #[error("redis error: {0}")]
+    Redis(#[from] redis::RedisError),
+}
+
+/// Redis-backed pub/sub event publisher.
+struct RedisPublisher {
+    client: redis::Client,
+    channel: String,
+}
+
+impl RedisPublisher {
+    fn new(client: redis::Client) -> Self {
+        Self {
+            client,
+            channel: "edupulse:events".into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl EventPublisher for RedisPublisher {
+    async fn publish(&self, evt: &DomainEvent) -> Result<(), EventBusError> {
+        // Serialize the event to JSON to keep schema flexible.
+        let payload = serde_json::to_string(evt)
+            .map_err(|e| redis::RedisError::from((redis::ErrorKind::TypeError, e.to_string())))?;
+        let mut conn = self.client.get_async_connection().await?;
+        conn.publish::<&str, String, ()>(&self.channel, payload).await?;
+        Ok(())
+    }
+}
+
+// ======================================================================
+//                         Service-Layer Error
+// ======================================================================
+
+#[derive(Debug, Error)]
+enum ServiceError {
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+    #[error("event bus error: {0}")]
+    Event(#[from] EventBusError),
+    #[error("unauthorized")]
+    Unauthorized,
+    #[error("invalid input: {0}")]
+    InvalidInput(&'static str),
+}
+
+// ======================================================================
+//                        LearningPulse Service
+// ======================================================================
+
+#[derive(Clone)]
+struct LearningPulseService {
+    db: PgPool,
+    publisher: Arc<dyn EventPublisher>,
+}
+
+impl LearningPulseService {
+    pub fn new(db: PgPool, publisher: Arc<dyn EventPublisher>) -> Self {
+        Self { db, publisher }
+    }
+
+    /// Persist a response and emit a domain event. Heavy post-processing
+    /// (plagiarism, rubric scoring, etc.) is off-loaded to async workers
+    /// listening on Redis.
+    pub async fn submit_response(
+        &self,
+        author_id: Uuid,
+        pulse_id: Uuid,
+        body: String,
+    ) -> Result<Uuid, ServiceError> {
+        if body.trim().is_empty() {
+            return Err(ServiceError::InvalidInput("response body cannot be empty"));
+        }
+
+        let response_id = Uuid::new_v4();
+        let ts = Utc::now();
+
+        sqlx::query!(
+            r#"
+            INSERT INTO pulse_responses (id, pulse_id, author_id, body, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            response_id,
+            pulse_id,
+            author_id,
+            body,
+            ts
+        )
+        .execute(&self.db)
+        .await?;
+
+        // Fire-and-forget event emission.
+        let evt = DomainEvent::PulseResponseSubmitted {
+            response_id,
+            pulse_id,
+            author_id,
+            ts,
+        };
+        self.publisher.publish(&evt).await?;
+
+        Ok(response_id)
+    }
+}
+
+// ======================================================================
+//                                JWT
+// ======================================================================
+
+const JWT_ALGO: jwt::Algorithm = jwt::Algorithm::HS256;
+
+/// Basic JWT claims (for demo purposes only)
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    sub: Uuid,
+    exp: usize,
+    iat: usize,
+}
+
+/// Extractor used in handlers to pull out the authenticated user.
+struct AuthenticatedUser(Uuid);
+
+impl From<AuthenticatedUser> for Uuid {
+    fn from(au: AuthenticatedUser) -> Self {
+        au.0
+    }
+}
+
+impl std::ops::Deref for AuthenticatedUser {
+    type Target = Uuid;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AuthenticatedUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AuthenticatedUser({})", self.0)
+    }
+}
+
+impl FromRequest for AuthenticatedUser {
+    type Error = Error;
+    type Future = Ready<Result<Self, Self::Error>>;
+
+    fn from_request(req: &ServiceRequest, _payload: &mut actix_http::Payload) -> Self::Future {
+        // Read `Authorization: Bearer ...` header and verify JWT. In a
+        // production system you would cache decoding keys and handle
+        // algorithm negotiation.
+        let auth_hdr = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default();
+
+        if !auth_hdr.starts_with("Bearer ") {
+            error!("Missing bearer token");
+            return ready(Err(ServiceError::Unauthorized.into()));
+        }
+
+        let token = &auth_hdr[7..];
+        let key = jwt::DecodingKey::from_secret(b"super-secret-change-me"); // TODO: rotate
+        let validation = jwt::Validation::new(JWT_ALGO);
+
+        match jwt::decode::<Claims>(token, &key, &validation) {
+            Ok(data) => ready(Ok(AuthenticatedUser(data.claims.sub))),
+            Err(err) => {
+                error!("JWT validation error: {:?}", err);
+                ready(Err(ServiceError::Unauthorized.into()))
+            }
+        }
+    }
+}
+
+// ======================================================================
+//                       HTTP Request / Response DTOs
+// ======================================================================
+
+#[derive(Debug, Deserialize)]
+struct SubmitResponseReq {
+    pulse_id: Uuid,
+    body: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitResponseRes {
+    response_id: Uuid,
+}
+
+// ======================================================================
+//                        REST HTTP Handlers
+// ======================================================================
+
+#[post("/pulse/response")]
+async fn submit_pulse_response(
+    service: web::Data<LearningPulseService>,
+    user: AuthenticatedUser,
+    req: web::Json<SubmitResponseReq>,
+) -> Result<impl Responder, Error> {
+    let SubmitResponseReq { pulse_id, body } = req.into_inner();
+    let response_id = service
+        .submit_response(*user, pulse_id, body)
+        .await
+        .map_err(|e| {
+            error!("Submit response failed: {:?}", e);
+            actix_web::error::ErrorInternalServerError("could not submit response")
+        })?;
+
+    Ok(HttpResponse::Ok().json(SubmitResponseRes { response_id }))
+}
+
+#[get("/health")]
+async fn health() -> impl Responder {
+    HttpResponse::Ok().body("OK")
+}
+
+// ======================================================================
+//                           Server Bootstrap
+// ======================================================================
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    // Initialize structured logging.
+    tracing_subscriber::fmt()
+        .with_env_filter("info,web_social=debug,sqlx=warn")
+        .init();
+
+    // ------------------------------------------------------------------
+    // Load configuration (for brevity, hard-coded here)
+    // ------------------------------------------------------------------
+    let pg_url = std::env::var("PG_URL").unwrap_or_else(|_| {
+        "postgres://edupulse:edupulse@localhost:5432/edupulse".to_string()
+    });
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379/".into());
+    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8443".into());
+    let session_key = std::env::var("SESSION_KEY")
+        .map(|v| v.into_bytes())
+        .unwrap_or_else(|_| vec![0; 64]);
+
+    // ------------------------------------------------------------------
+    // Shared infrastructure
+    // ------------------------------------------------------------------
+    let pg_pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&pg_url)
+        .await
+        .expect("failed to establish postgres connection pool");
+
+    let redis_client =
+        redis::Client::open(redis_url.clone()).expect("failed to create redis client");
+
+    let publisher = Arc::new(RedisPublisher::new(redis_client.clone())) as Arc<dyn EventPublisher>;
+
+    let learning_pulse_service = LearningPulseService::new(pg_pool.clone(), publisher);
+
+    // Redis session store supports TLS; use `rediss://` scheme when
+    // binding to a TLS-enabled endpoint.
+    let session_store =
+        RedisSessionStore::new(redis_url)
+            .await
+            .expect("failed to create redis session store");
+
+    info!("Starting HTTPS server at {}", bind_addr);
+
+    // ------------------------------------------------------------------
+    // Build and run HTTP server (Rustls)
+    // ------------------------------------------------------------------
+    HttpServer::new(move || {
+        App::new()
+            .wrap(Logger::default())
+            .wrap(SessionMiddleware::new(
+                session_store.clone(),
+                // Key used to sign/encrypt session cookies
+                actix_web::cookie::Key::from(&session_key),
+            ))
+            .app_data(web::Data::new(learning_pulse_service.clone()))
+            .service(health)
+            .service(submit_pulse_response)
+    })
+    // Minimal TLS with self-signed certs for demo purposes; swap with ACM
+    // or Let's Encrypt in production.
+    .bind_rustls(bind_addr, load_local_rustls_config())?
+    .run()
+    .await
+}
+
+// ----------------------------------------------------------------------
+//                          TLS Utilities
+// ----------------------------------------------------------------------
+
+fn load_local_rustls_config() -> rustls::ServerConfig {
+    use rustls::{Certificate, PrivateKey, ServerConfig};
+    use rustls_pemfile::{certs, pkcs8_private_keys};
+    use std::{fs::File, io::BufReader, path::Path};
+
+    let cert_path = Path::new("certs/server.crt");
+    let key_path = Path::new("certs/server.key");
+    let cert_file =
+        &mut BufReader::new(File::open(cert_path).expect("cannot open certificate file"));
+    let key_file =
+        &mut BufReader::new(File::open(key_path).expect("cannot open private key file"));
+    let cert_chain: Vec<Certificate> = certs(cert_file)
+        .expect("failed to read certificate")
+        .into_iter()
+        .map(Certificate)
+        .collect();
+    let mut keys: Vec<PrivateKey> = pkcs8_private_keys(key_file)
+        .expect("failed to read private key")
+        .into_iter()
+        .map(PrivateKey)
+        .collect();
+    assert!(
+        !keys.is_empty(),
+        "private key file should contain at least one key"
+    );
+    ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, keys.remove(0))
+        .expect("failed to build rustls config")
+}
+```

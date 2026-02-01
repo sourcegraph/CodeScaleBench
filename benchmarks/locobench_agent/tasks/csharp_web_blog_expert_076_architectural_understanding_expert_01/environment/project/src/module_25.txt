@@ -1,0 +1,359 @@
+```csharp
+using System;
+using System.Globalization;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using StackExchange.Redis;
+
+namespace TempoScribePro.Infrastructure.Caching
+{
+    #region Options & Models
+
+    /// <summary>
+    /// Options object used to configure the Redis-based content-preview cache.
+    /// These values are typically supplied from the application’s configuration
+    /// system and injected with IOptions.
+    /// </summary>
+    public sealed class RedisContentPreviewCacheOptions
+    {
+        /// <summary>Comma-delimited list of endpoints (“host:port”).</summary>
+        public string Endpoints { get; init; } = "localhost:6379";
+
+        /// <summary>
+        /// User-defined key prefix (e.g. “tenant-a|env-prod”) to keep keys
+        /// logically separated across tenants and environments.
+        /// </summary>
+        public string KeyPrefix { get; init; } = "temposcribe";
+
+        /// <summary>The Redis database number where previews are kept.</summary>
+        public int DatabaseId { get; init; } = 2;
+
+        /// <summary>Absolute expiration in minutes for preview payloads.</summary>
+        public int PreviewExpirationMinutes { get; init; } = 30;
+
+        /// <summary>
+        /// When Redis connectivity is lost, a local, in-process fallback cache
+        /// keeps the UI working. This is the per-preview expiration (minutes).
+        /// </summary>
+        public int LocalFallbackExpirationMinutes { get; init; } = 5;
+
+        /// <summary>
+        /// Amount of time (ms) allowed for distributed locks (SETNX) to be
+        /// acquired. If the lock cannot be acquired in this time window, the
+        /// operation is abandoned to keep latency low.
+        /// </summary>
+        public int LockWaitTimeoutMilliseconds { get; init; } = 200;
+    }
+
+    /// <summary>
+    /// Domain-centric wrapped exception describing issues accessing or
+    /// manipulating preview cache entries.
+    /// </summary>
+    public sealed class ContentPreviewCacheException : Exception
+    {
+        public ContentPreviewCacheException(string message, Exception? inner = null)
+            : base(message, inner) { }
+    }
+
+    #endregion
+
+    #region Ports / Hexagonal Interfaces
+
+    /// <summary>
+    /// Hexagonal port that allows domain services to store and retrieve live
+    /// preview snapshots of post drafts. Implementations may send calls to
+    /// Redis, Memcached, or any other storage.
+    /// </summary>
+    public interface IContentPreviewCache
+    {
+        /// <summary>Gets the latest preview snapshot HTML for a post, or null.</summary>
+        Task<string?> GetDraftPreviewAsync(Guid postId, CancellationToken ct = default);
+
+        /// <summary>Saves/updates the preview snapshot HTML for a post.</summary>
+        Task SaveDraftPreviewAsync(Guid postId, string html, CancellationToken ct = default);
+
+        /// <summary>Invalidates (removes) the cached preview for a post.</summary>
+        Task InvalidatePreviewAsync(Guid postId, CancellationToken ct = default);
+    }
+
+    /// <summary>
+    /// Port responsible for generating human-readable differences between two
+    /// HTML strings. The output is Html-formatted diff markup ready for the
+    /// web front-end.
+    /// </summary>
+    public interface IPreviewDiffService
+    {
+        string ComputeDiff(string oldHtml, string newHtml);
+    }
+
+    #endregion
+
+    #region Redis Adapter Implementation
+
+    /// <summary>
+    /// Production-ready adapter that stores draft preview HTML in Redis with an
+    /// automatic local fallback in case of connectivity issues. The adapter
+    /// attempts to be lock-safe by leveraging SETNX semantics to prevent lost
+    /// updates.
+    /// </summary>
+    public sealed class RedisContentPreviewCacheAdapter : IContentPreviewCache, IDisposable
+    {
+        private readonly RedisContentPreviewCacheOptions _options;
+        private readonly ILogger<RedisContentPreviewCacheAdapter> _logger;
+        private readonly IMemoryCache _fallbackCache;
+        private readonly ConnectionMultiplexer _connection;
+        private readonly IDatabase _database;
+
+        private static readonly string LockSuffix = ":lock";
+        private static readonly string PreviewSuffix = ":preview";
+
+        public RedisContentPreviewCacheAdapter(
+            IOptions<RedisContentPreviewCacheOptions> options,
+            ILogger<RedisContentPreviewCacheAdapter> logger,
+            IMemoryCache? memoryCache = null)
+        {
+            _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+            // Initialize a lightweight in-memory fallback cache.
+            _fallbackCache = memoryCache ?? new MemoryCache(new MemoryCacheOptions
+            {
+                SizeLimit = 128
+            });
+
+            try
+            {
+                var configuration = ConfigurationOptions.Parse(_options.Endpoints);
+                configuration.AbortOnConnectFail = false;
+                _connection = ConnectionMultiplexer.Connect(configuration);
+                _database = _connection.GetDatabase(_options.DatabaseId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Unable to establish initial Redis connection. System will rely " +
+                    "on in-process fallback cache until connectivity is restored.");
+                // Connection mut be set but may not be connected yet.
+                _connection = ConnectionMultiplexer.Connect("localhost"); // Dummy for dispose pattern
+                _database = _connection.GetDatabase(_options.DatabaseId);
+            }
+        }
+
+        public async Task<string?> GetDraftPreviewAsync(Guid postId, CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var key = BuildCacheKey(postId);
+            try
+            {
+                string? cached = await _database.StringGetAsync(key);
+                if (cached != null)
+                {
+                    _logger.LogDebug("Preview retrieved for PostId={PostId} (Redis)", postId);
+                    _fallbackCache.Set(key, cached,
+                        TimeSpan.FromMinutes(_options.LocalFallbackExpirationMinutes));
+                    return cached;
+                }
+
+                if (_fallbackCache.TryGetValue<string>(key, out var fallback))
+                {
+                    _logger.LogDebug("Preview retrieved for PostId={PostId} (MemoryFallback)", postId);
+                    return fallback;
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Redis unavailable. Falling back to in-memory cache.");
+                if (_fallbackCache.TryGetValue<string>(key, out var fallback))
+                    return fallback;
+
+                throw new ContentPreviewCacheException(
+                    "Failed to retrieve preview from Redis and fallback cache.", ex);
+            }
+        }
+
+        public async Task SaveDraftPreviewAsync(Guid postId, string html, CancellationToken ct = default)
+        {
+            if (html is null) throw new ArgumentNullException(nameof(html));
+            ct.ThrowIfCancellationRequested();
+
+            var key = BuildCacheKey(postId);
+            var lockKey = key + LockSuffix;
+            var lockValue = Environment.MachineName + ":" + Guid.NewGuid().ToString("N");
+
+            try
+            {
+                // Basic distributed lock using SET NX PX pattern
+                bool acquired = await _database.StringSetAsync(
+                    lockKey, lockValue,
+                    TimeSpan.FromMilliseconds(_options.LockWaitTimeoutMilliseconds),
+                    When.NotExists);
+
+                if (!acquired)
+                {
+                    _logger.LogDebug("Lock acquisition timed out for PostId={PostId}", postId);
+                    return; // Another write in progress; skip to avoid thrashing
+                }
+
+                await _database.StringSetAsync(
+                    key,
+                    html,
+                    TimeSpan.FromMinutes(_options.PreviewExpirationMinutes));
+
+                _logger.LogDebug("Preview saved for PostId={PostId}", postId);
+
+                _fallbackCache.Set(key, html,
+                    TimeSpan.FromMinutes(_options.LocalFallbackExpirationMinutes));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Unable to save preview to Redis. Storing to fallback cache.");
+                _fallbackCache.Set(key, html,
+                    TimeSpan.FromMinutes(_options.LocalFallbackExpirationMinutes));
+                throw new ContentPreviewCacheException("Failed to save preview to Redis.", ex);
+            }
+            finally
+            {
+                // Best-effort lock release
+                try
+                {
+                    var currentValue = await _database.StringGetAsync(lockKey);
+                    if (currentValue == lockValue)
+                        await _database.KeyDeleteAsync(lockKey);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Error while releasing Redis lock for PostId={PostId}", postId);
+                }
+            }
+        }
+
+        public async Task InvalidatePreviewAsync(Guid postId, CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var key = BuildCacheKey(postId);
+            try
+            {
+                await _database.KeyDeleteAsync(key);
+                _fallbackCache.Remove(key);
+                _logger.LogDebug("Preview invalidated for PostId={PostId}", postId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Unable to invalidate preview for PostId={PostId} in Redis.", postId);
+                _fallbackCache.Remove(key); // Even if Redis fails, ensure local is cleared
+                throw new ContentPreviewCacheException("Failed to invalidate preview.", ex);
+            }
+        }
+
+        private string BuildCacheKey(Guid postId)
+            => $"{_options.KeyPrefix}{PreviewSuffix}|{postId.ToString("N", CultureInfo.InvariantCulture)}";
+
+        #region Dispose Pattern
+
+        private bool _disposed;
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+
+            _fallbackCache?.Dispose();
+            _connection?.Dispose();
+
+            _disposed = true;
+            GC.SuppressFinalize(this);
+        }
+
+        #endregion
+    }
+
+    #endregion
+
+    #region Diff Service Implementation
+
+    /// <summary>
+    /// Lightweight diffing implementation designed for HTML previews. The goal
+    /// is not a pixel-perfect diff, but a performant, readable markup (<ins>,
+    /// <del>) that editors can consume immediately in the live preview panel.
+    /// This implementation is intentionally simple to keep the dependency
+    /// footprint small; however, it can be transparently swapped for a more
+    /// advanced algorithm via the IPreviewDiffService port.
+    /// </summary>
+    public sealed class HtmlPreviewDiffService : IPreviewDiffService
+    {
+        private readonly ILogger<HtmlPreviewDiffService> _logger;
+
+        public HtmlPreviewDiffService(ILogger<HtmlPreviewDiffService> logger)
+        {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        public string ComputeDiff(string oldHtml, string newHtml)
+        {
+            if (oldHtml == null) throw new ArgumentNullException(nameof(oldHtml));
+            if (newHtml == null) throw new ArgumentNullException(nameof(newHtml));
+
+            if (oldHtml.Equals(newHtml, StringComparison.Ordinal))
+                return newHtml; // No changes; return as-is to save cycles
+
+            try
+            {
+                var sb = new StringBuilder(EstimateCapacity(oldHtml, newHtml));
+
+                int i = 0, j = 0;
+                while (i < oldHtml.Length && j < newHtml.Length)
+                {
+                    if (oldHtml[i] == newHtml[j])
+                    {
+                        sb.Append(oldHtml[i]);
+                        i++; j++;
+                    }
+                    else
+                    {
+                        // Naive diff: mark deletions then insertions
+                        int startOld = i;
+                        int startNew = j;
+                        while (i < oldHtml.Length && (j >= newHtml.Length || oldHtml[i] != newHtml[j]))
+                            i++;
+
+                        while (j < newHtml.Length && (i >= oldHtml.Length || oldHtml[i] != newHtml[j]))
+                            j++;
+
+                        var deleted = oldHtml.Substring(startOld, i - startOld);
+                        var inserted = newHtml.Substring(startNew, j - startNew);
+
+                        if (deleted.Length > 0)
+                            sb.Append($"<del>{System.Net.WebUtility.HtmlEncode(deleted)}</del>");
+                        if (inserted.Length > 0)
+                            sb.Append($"<ins>{System.Net.WebUtility.HtmlEncode(inserted)}</ins>");
+                    }
+                }
+
+                if (i < oldHtml.Length)
+                    sb.Append($"<del>{System.Net.WebUtility.HtmlEncode(oldHtml.Substring(i))}</del>");
+                if (j < newHtml.Length)
+                    sb.Append($"<ins>{System.Net.WebUtility.HtmlEncode(newHtml.Substring(j))}</ins>");
+
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Diff generation failed. Falling back to newHtml.");
+                return newHtml;
+            }
+        }
+
+        private static int EstimateCapacity(string s1, string s2)
+            => (s1.Length + s2.Length) * 2; // Rough estimate for StringBuilder size
+    }
+
+    #endregion
+}
+```

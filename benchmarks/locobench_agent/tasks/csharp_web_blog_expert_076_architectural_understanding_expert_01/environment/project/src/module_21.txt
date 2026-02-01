@@ -1,0 +1,298 @@
+```csharp
+// -----------------------------------------------------------------------------
+// File:        src/module_21.txt   (yes, .txt on disk; compiled via *.csproj glob)
+// Project:     TempoScribe Pro – Hexagonal Productivity Blog Suite (web_blog)
+// Purpose:     Implements the core PublicationAutomationService responsible for
+//              (1) scheduling posts for future publication
+//              (2) executing due publications atomically
+//              (3) emitting domain events / notifications
+// -----------------------------------------------------------------------------
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using TempoScribePro.Domain.Common;
+using TempoScribePro.Domain.Monetization;
+using TempoScribePro.Domain.Publishing.Events;
+using TempoScribePro.Domain.Repositories;
+using TempoScribePro.Domain.SharedKernel;
+using TempoScribePro.Domain.Workflows;
+using TempoScribePro.SharedKernel.Diagnostics;
+using TempoScribePro.SharedKernel.Results;
+
+namespace TempoScribePro.Domain.Publishing
+{
+    /// <summary>
+    /// Core application-service (port) responsible for both queuing and executing
+    /// scheduled publications. Intentionally technology-agnostic:  infrastructure
+    /// implementations (SQL/NoSQL, message-bus, etc.) live in adapters.
+    /// </summary>
+    public interface IPublicationAutomationService
+    {
+        /// <summary>
+        /// Queues a post for future publication. If <paramref name="scheduledUtc"/>
+        /// is in the past, it will be published immediately.
+        /// </summary>
+        Task<Result> ScheduleAsync(
+            PostId postId,
+            DateTimeOffset scheduledUtc,
+            CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Executes all posts whose scheduled time is ≤ <paramref name="nowUtc"/>.
+        /// Ensures idempotency (a post cannot be published twice).
+        /// </summary>
+        Task<Result<int /*publishedCount*/>> ExecuteDuePublicationsAsync(
+            DateTimeOffset nowUtc,
+            CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Production-grade implementation. Respects transactional consistency via
+    /// repository-level UnitOfWork and keeps the core side-effect-free by bubbling
+    /// out notifications & events through ports.
+    /// </summary>
+    internal sealed class PublicationAutomationService : IPublicationAutomationService
+    {
+        private readonly IPostRepository           _posts;
+        private readonly IUnitOfWork               _uow;
+        private readonly IClock                    _clock;
+        private readonly IMonetizationRuleService  _monetizationRules;
+        private readonly IEventBus                 _events;
+        private readonly INotificationPort         _notifications;
+        private readonly ILogger                   _logger;
+
+        public PublicationAutomationService(
+            IPostRepository posts,
+            IUnitOfWork uow,
+            IClock clock,
+            IMonetizationRuleService monetizationRules,
+            IEventBus events,
+            INotificationPort notifications,
+            ILogger logger)
+        {
+            _posts             = posts          ?? throw new ArgumentNullException(nameof(posts));
+            _uow               = uow            ?? throw new ArgumentNullException(nameof(uow));
+            _clock             = clock          ?? throw new ArgumentNullException(nameof(clock));
+            _monetizationRules = monetizationRules ?? throw new ArgumentNullException(nameof(monetizationRules));
+            _events            = events         ?? throw new ArgumentNullException(nameof(events));
+            _notifications     = notifications  ?? throw new ArgumentNullException(nameof(notifications));
+            _logger            = logger         ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        #region IPublicationAutomationService
+
+        public async Task<Result> ScheduleAsync(
+            PostId postId,
+            DateTimeOffset scheduledUtc,
+            CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                var post = await _posts.GetAsync(postId, cancellationToken)
+                                       .ConfigureAwait(false);
+
+                if (post == null)
+                    return Result.Fail($"Post {postId} does not exist.");
+
+                if (post.Status == PostStatus.Published)
+                    return Result.Fail("Post already published.");
+
+                post.ScheduledAtUtc = scheduledUtc;
+                await _uow.CommitAsync(cancellationToken).ConfigureAwait(false);
+
+                _logger.Info($"Post {postId} scheduled for {scheduledUtc:u}.");
+                return Result.Ok();
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(ex, "Failed to schedule post {PostId}.", postId);
+                return Result.Fail("Unexpected error while scheduling post.");
+            }
+        }
+
+        public async Task<Result<int>> ExecuteDuePublicationsAsync(
+            DateTimeOffset nowUtc,
+            CancellationToken cancellationToken = default)
+        {
+            var publishedCount = 0;
+
+            try
+            {
+                // Fetch due posts (status = Draft or Scheduled, time ≤ now)
+                IReadOnlyList<Post> duePosts = await _posts
+                    .FindScheduledBeforeAsync(nowUtc, cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (!duePosts.Any())
+                    return Result.Ok(publishedCount);
+
+                foreach (var post in duePosts)
+                {
+                    if (post.Status == PostStatus.Published)
+                        continue; // idempotent guard, should not happen but safe
+
+                    // Validate monetization logic
+                    var monetizationResult = await _monetizationRules
+                        .ValidatePublishAsync(post, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    if (monetizationResult.IsFailed)
+                    {
+                        _logger.Warn("Monetization validation failed for post {PostId}: {Reason}",
+                                     post.Id, monetizationResult.Error);
+                        await _notifications.EnqueueAsync(
+                            new Notification(
+                                post.AuthorId,
+                                $"Post \"{post.Title}\" failed monetization checks and was not published: {monetizationResult.Error}"),
+                            cancellationToken);
+
+                        continue; // skip publishing this post
+                    }
+
+                    // Perform domain-state transition
+                    post.Publish(nowUtc);
+
+                    publishedCount++;
+
+                    // Raise domain event
+                    _events.Publish(new PostPublishedEvent(post));
+                }
+
+                await _uow.CommitAsync(cancellationToken).ConfigureAwait(false);
+                _logger.Info("{Count} post(s) published at {Now}.", publishedCount, nowUtc);
+
+                return Result.Ok(publishedCount);
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(ex, "Error during ExecuteDuePublicationsAsync()");
+                return Result.Fail<int>("Unexpected error while executing publications.");
+            }
+        }
+
+        #endregion
+    }
+
+    // -------------------------------------------------------------------------
+    // Domain primitive wrappers & supporting abstractions
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Value-object wrapper to avoid primitive obsession and accidental mixups.
+    /// </summary>
+    public readonly record struct PostId(Guid Value)
+    {
+        public static PostId New() => new(Guid.NewGuid());
+        public override string ToString() => Value.ToString();
+        public static implicit operator Guid(PostId id) => id.Value;
+    }
+
+    public enum PostStatus
+    {
+        Draft       = 0,
+        Scheduled   = 1,
+        Published   = 2,
+    }
+
+    /// <summary>
+    /// Simplified aggregate root representing a blog post. Real implementation
+    /// lives elsewhere; truncated here for self-containment.
+    /// </summary>
+    public sealed class Post
+    {
+        public PostId            Id              { get; private set; }
+        public string            Title           { get; private set; } = default!;
+        public string            Content         { get; private set; } = default!;
+        public UserId            AuthorId        { get; private set; }
+        public bool              IsPremium       { get; private set; }
+        public PostStatus        Status          { get; private set; }
+        public DateTimeOffset?   ScheduledAtUtc  { get; internal set; }
+        public DateTimeOffset?   PublishedAtUtc  { get; internal set; }
+
+        // Domain invariants enforced in ctor/factory (omitted for brevity)
+
+        public void Publish(DateTimeOffset nowUtc)
+        {
+            if (Status == PostStatus.Published)
+                throw new DomainException("Cannot publish post that is already published.");
+
+            Status         = PostStatus.Published;
+            PublishedAtUtc = nowUtc;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Ports (interfaces) used by the service. Adapters implement these.
+    // -------------------------------------------------------------------------
+    public interface IPostRepository
+    {
+        Task<Post?> GetAsync(PostId id, CancellationToken ct = default);
+        Task<IReadOnlyList<Post>> FindScheduledBeforeAsync(DateTimeOffset utc, CancellationToken ct = default);
+    }
+
+    public interface IUnitOfWork
+    {
+        Task CommitAsync(CancellationToken ct = default);
+    }
+
+    public interface IClock
+    {
+        DateTimeOffset UtcNow { get; }
+    }
+
+    public interface IEventBus
+    {
+        void Publish<TEvent>(TEvent @event) where TEvent : IDomainEvent;
+    }
+
+    public interface INotificationPort
+    {
+        Task EnqueueAsync(Notification notification, CancellationToken ct = default);
+    }
+
+    public interface IMonetizationRuleService
+    {
+        /// <summary>
+        /// Validates whether the post can be published given its monetization
+        /// configuration (premium-only content, gating, etc.).
+        /// </summary>
+        Task<Result> ValidatePublishAsync(Post post, CancellationToken ct = default);
+    }
+
+    // -------------------------------------------------------------------------
+    // Supporting types
+    // -------------------------------------------------------------------------
+
+    public readonly record struct UserId(Guid Value)
+    {
+        public static implicit operator Guid(UserId id) => id.Value;
+    }
+
+    public sealed class Notification
+    {
+        public Notification(UserId recipient, string message)
+        {
+            Recipient = recipient;
+            Message   = message ?? throw new ArgumentNullException(nameof(message));
+            CreatedAtUtc = DateTimeOffset.UtcNow;
+        }
+
+        public UserId          Recipient      { get; }
+        public string          Message        { get; }
+        public DateTimeOffset  CreatedAtUtc   { get; }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// NOTES:
+//  • Uses Result<T> monad from TempoScribePro.SharedKernel.Results for explicit
+//    success/failure flow without relying on throwing exceptions.
+//  • All dependencies are expressed as ports (interfaces) to maintain Hexagonal
+//    architecture. Infrastructure concerns (SQL EF Core repo, Redis-based
+//    notification queue, etc.) are plugged in via adapters referencing this file.
+//  • Extensive logging safeguards production troubleshooting.
+// -----------------------------------------------------------------------------
+```

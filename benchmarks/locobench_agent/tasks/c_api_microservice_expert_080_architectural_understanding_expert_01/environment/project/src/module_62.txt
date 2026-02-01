@@ -1,0 +1,457 @@
+/*
+ * File: src/module_62.c     (logical name: mm_response_cache.c)
+ * Project: MercuryMonolith Commerce Hub (api_microservice)
+ *
+ * Description:
+ *   Thread–safe, in-memory response cache with LRU eviction.  Designed to
+ *   accelerate idempotent REST/GraphQL calls by short-circuiting the service
+ *   pipeline when a fresh representation is already available.  Integrated
+ *   with the internal event-bus so that writes to mutable resources trigger
+ *   automatic cache-invalidation, guaranteeing strong consistency semantics
+ *   while preserving performance for read-heavy traffic.
+ *
+ *   Highlights:
+ *     • Lock-striped (single global mutex is OK for <50k QPS, upgrade later).
+ *     • TTL-aware entries + proactive stale sweep on write contention.
+ *     • Uses uthash (https://troydhanson.github.io/uthash/) for O(1) lookups.
+ *     • Portable: C11, POSIX.1-2008.
+ *
+ * Copyright:
+ *   © 2024 MercuryMonolith Contributors.  All rights reserved.
+ */
+
+#include <ctype.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "uthash.h"            /* Header-only hash-table                     */
+#include "mm_eventbus.h"       /* Event bus API (publish/subscribe)          */
+#include "mm_logger.h"         /* Structured logging                         */
+#include "mm_metrics.h"        /* Prometheus counter helpers                 */
+#include "mm_response_cache.h" /* Public header for this implementation      */
+
+/*---------------------------------------------------------------------------
+ *  Compile-time Tunables
+ *---------------------------------------------------------------------------*/
+#ifndef MM_CACHE_DEFAULT_TTL_SEC
+#   define MM_CACHE_DEFAULT_TTL_SEC  30U    /* 30 seconds default TTL       */
+#endif
+
+#ifndef MM_CACHE_MAX_SIZE_BYTES
+#   define MM_CACHE_MAX_SIZE_BYTES   (128 * 1024 * 1024ULL) /* 128 MiB      */
+#endif
+
+#ifndef MM_CACHE_SWEEP_THRESHOLD
+#   define MM_CACHE_SWEEP_THRESHOLD  64     /* Sweep stale entries every N  */
+#endif
+
+/*---------------------------------------------------------------------------
+ *  Data Structures
+ *---------------------------------------------------------------------------*/
+typedef struct cache_entry_t {
+    /* ---- Hash Key ---- */
+    char             *key;          /* Normalized cache key                  */
+    UT_hash_handle    hh;           /* uthash handle                         */
+
+    /* ---- Payload ----  */
+    uint8_t          *blob;         /* Serialized HTTP/GraphQL response      */
+    size_t            size;         /* Payload length                        */
+    time_t            expires_at;   /* Absolute unix epoch                   */
+
+    /* ---- LRU List ---- */
+    struct cache_entry_t *prev;
+    struct cache_entry_t *next;
+} cache_entry_t;
+
+typedef struct mm_cache_ctx_t {
+    cache_entry_t *table;           /* Hash table root                       */
+    cache_entry_t *lru_head;        /* Most recently used                    */
+    cache_entry_t *lru_tail;        /* Least recently used                   */
+
+    size_t          bytes_in_use;   /* Total memory footprint                */
+    size_t          max_bytes;      /* Evict when > max_bytes                */
+
+    pthread_mutex_t mtx;            /* Global lock                           */
+
+    uint64_t        op_counter;     /* Incremented each GET/PUT → sweep      */
+} mm_cache_ctx_t;
+
+/* Singleton instance (init during mm_cache_init) */
+static mm_cache_ctx_t g_ctx = {
+    .table        = NULL,
+    .lru_head     = NULL,
+    .lru_tail     = NULL,
+    .bytes_in_use = 0,
+    .max_bytes    = MM_CACHE_MAX_SIZE_BYTES,
+    .mtx          = PTHREAD_MUTEX_INITIALIZER,
+    .op_counter   = 0
+};
+
+/*---------------------------------------------------------------------------
+ *  Forward Declarations
+ *---------------------------------------------------------------------------*/
+static void  mm_cache_evict_until_fit(size_t bytes_needed);
+static void  mm_cache_link_mru(cache_entry_t *entry);
+static void  mm_cache_unlink(cache_entry_t *entry);
+static void  mm_cache_dispose_entry(cache_entry_t *entry);
+static void* mm_cache_event_listener(const mm_event_t *ev, void *udata);
+
+/*---------------------------------------------------------------------------
+ *  Helper: Normalize cache key
+ *
+ * The cache key is constructed as:
+ *   <METHOD> ':' <URI_PATH> '?' <SORTED_QUERY> '|' <ACCEPT>
+ *
+ * This avoids duplicates due to param ordering or case differences.
+ *---------------------------------------------------------------------------*/
+static char *build_cache_key(const char *method,
+                             const char *uri,
+                             const char *accept)
+{
+    if (!method || !uri || !accept) { return NULL; }
+
+    /* -- Case-fold HTTP method (GET, HEAD, etc.) -- */
+    char method_up[16] = {0};
+    size_t i = 0;
+    for (; i < sizeof method_up - 1 && method[i]; ++i) {
+        method_up[i] = (char)toupper((unsigned char)method[i]);
+    }
+    method_up[i] = '\0';
+
+    /* TODO: canonicalize query-string ordering (requires parser) */
+    /* For simplicity in this module, we assume caller provides sorted URI. */
+
+    size_t key_len = strlen(method_up) + 1        /* ':' */
+                   + strlen(uri) + 1              /* '|' */
+                   + strlen(accept) + 1;          /* NUL */
+
+    char *key = malloc(key_len);
+    if (!key) { return NULL; }
+
+    snprintf(key, key_len, "%s:%s|%s", method_up, uri, accept);
+    return key;
+}
+
+/*---------------------------------------------------------------------------
+ *  API: mm_cache_init
+ *---------------------------------------------------------------------------*/
+int mm_cache_init(size_t max_size_bytes)
+{
+    pthread_mutex_lock(&g_ctx.mtx);
+    if (max_size_bytes > 0) {
+        g_ctx.max_bytes = max_size_bytes;
+    }
+    /* Subscribe to event-bus for invalidation notifications */
+    if (mm_eventbus_subscribe("resource.updated", mm_cache_event_listener, NULL) != 0 ||
+        mm_eventbus_subscribe("resource.deleted", mm_cache_event_listener, NULL) != 0) {
+        pthread_mutex_unlock(&g_ctx.mtx);
+        return -1;
+    }
+
+    pthread_mutex_unlock(&g_ctx.mtx);
+    LOG_INFO("response_cache: initialized (capacity=%zu bytes)", g_ctx.max_bytes);
+    return 0;
+}
+
+/*---------------------------------------------------------------------------
+ *  API: mm_cache_shutdown
+ *---------------------------------------------------------------------------*/
+void mm_cache_shutdown(void)
+{
+    pthread_mutex_lock(&g_ctx.mtx);
+
+    cache_entry_t *entry, *tmp;
+    HASH_ITER(hh, g_ctx.table, entry, tmp) {
+        HASH_DEL(g_ctx.table, entry);
+        mm_cache_dispose_entry(entry);
+    }
+    g_ctx.lru_head = g_ctx.lru_tail = NULL;
+    g_ctx.bytes_in_use = 0;
+
+    pthread_mutex_unlock(&g_ctx.mtx);
+
+    mm_eventbus_unsubscribe("resource.updated", mm_cache_event_listener);
+    mm_eventbus_unsubscribe("resource.deleted", mm_cache_event_listener);
+}
+
+/*---------------------------------------------------------------------------
+ *  API: mm_cache_get
+ *---------------------------------------------------------------------------*/
+int mm_cache_get(const char *method,
+                 const char *uri,
+                 const char *accept,
+                 uint8_t   **out_blob,
+                 size_t     *out_size)
+{
+    if (!out_blob || !out_size) { return -EINVAL; }
+    *out_blob = NULL;
+    *out_size = 0;
+
+    char *key = build_cache_key(method, uri, accept);
+    if (!key) { return -ENOMEM; }
+
+    int rc = -ENOENT;
+
+    pthread_mutex_lock(&g_ctx.mtx);
+    cache_entry_t *entry = NULL;
+    HASH_FIND_STR(g_ctx.table, key, entry);
+    if (entry) {
+        if (entry->expires_at < time(NULL)) {
+            /* Stale — evict */
+            LOG_DEBUG("response_cache: stale hit '%s' (removing)", key);
+            mm_cache_unlink(entry);
+            HASH_DEL(g_ctx.table, entry);
+            g_ctx.bytes_in_use -= entry->size;
+            mm_cache_dispose_entry(entry);
+            rc = -EAGAIN; /* treat as miss */
+        } else {
+            /* Cache hit */
+            *out_size = entry->size;
+            *out_blob = malloc(entry->size);
+            if (*out_blob) {
+                memcpy(*out_blob, entry->blob, entry->size);
+                mm_metrics_inc("response_cache_hits_total");
+                rc = 0;
+            } else {
+                rc = -ENOMEM;
+            }
+
+            /* Move entry to MRU position */
+            mm_cache_unlink(entry);
+            mm_cache_link_mru(entry);
+        }
+    } else {
+        mm_metrics_inc("response_cache_misses_total");
+    }
+
+    g_ctx.op_counter++;
+    if (g_ctx.op_counter % MM_CACHE_SWEEP_THRESHOLD == 0) {
+        mm_cache_evict_until_fit(0); /* Sweep stale entries opportunistically */
+    }
+
+    pthread_mutex_unlock(&g_ctx.mtx);
+    free(key);
+    return rc;
+}
+
+/*---------------------------------------------------------------------------
+ *  API: mm_cache_put
+ *---------------------------------------------------------------------------*/
+int mm_cache_put(const char *method,
+                 const char *uri,
+                 const char *accept,
+                 const uint8_t *blob,
+                 size_t blob_size,
+                 unsigned ttl_sec)
+{
+    if (!method || !uri || !accept || !blob || blob_size == 0) {
+        return -EINVAL;
+    }
+
+    char *key = build_cache_key(method, uri, accept);
+    if (!key) { return -ENOMEM; }
+
+    pthread_mutex_lock(&g_ctx.mtx);
+
+    /* If entry exists, overwrite */
+    cache_entry_t *entry = NULL;
+    HASH_FIND_STR(g_ctx.table, key, entry);
+    if (entry) {
+        mm_cache_unlink(entry);
+        g_ctx.bytes_in_use -= entry->size;
+        free(entry->blob);
+        entry->blob = NULL;
+    } else {
+        entry = calloc(1, sizeof *entry);
+        if (!entry) {
+            pthread_mutex_unlock(&g_ctx.mtx);
+            free(key);
+            return -ENOMEM;
+        }
+        entry->key = key; /* Take ownership */
+    }
+
+    /* Copy payload */
+    entry->blob = malloc(blob_size);
+    if (!entry->blob) {
+        pthread_mutex_unlock(&g_ctx.mtx);
+        free(entry->key);
+        free(entry);
+        free(key);
+        return -ENOMEM;
+    }
+    memcpy(entry->blob, blob, blob_size);
+    entry->size        = blob_size;
+    entry->expires_at  = time(NULL) + (ttl_sec ? ttl_sec : MM_CACHE_DEFAULT_TTL_SEC);
+
+    /* Insert/Update hash table */
+    HASH_REPLACE(hh, g_ctx.table, key, strlen(key), entry);
+
+    /* Insert into LRU at MRU position */
+    mm_cache_link_mru(entry);
+
+    g_ctx.bytes_in_use += blob_size;
+    mm_metrics_inc("response_cache_puts_total");
+
+    /* Evict if needed */
+    mm_cache_evict_until_fit(0);
+
+    g_ctx.op_counter++;
+    pthread_mutex_unlock(&g_ctx.mtx);
+
+    if (entry != NULL) {
+        LOG_DEBUG("response_cache: stored '%s' (size=%zu, ttl=%u)", key, blob_size, ttl_sec);
+    }
+    return 0;
+}
+
+/*---------------------------------------------------------------------------
+ *  API: mm_cache_invalidate
+ *
+ *  Invalidate by exact resource URI (all methods & accept headers).
+ *---------------------------------------------------------------------------*/
+int mm_cache_invalidate(const char *uri_prefix)
+{
+    if (!uri_prefix) { return -EINVAL; }
+
+    pthread_mutex_lock(&g_ctx.mtx);
+    cache_entry_t *entry, *tmp;
+    HASH_ITER(hh, g_ctx.table, entry, tmp) {
+        if (strstr(entry->key, uri_prefix)) {
+            LOG_DEBUG("response_cache: invalidating '%s' (prefix='%s')",
+                      entry->key, uri_prefix);
+            mm_cache_unlink(entry);
+            HASH_DEL(g_ctx.table, entry);
+            g_ctx.bytes_in_use -= entry->size;
+            mm_cache_dispose_entry(entry);
+        }
+    }
+    pthread_mutex_unlock(&g_ctx.mtx);
+    return 0;
+}
+
+/*---------------------------------------------------------------------------
+ *  Internal: Evict LRU until we have room for bytes_needed or within limit
+ *---------------------------------------------------------------------------*/
+static void mm_cache_evict_until_fit(size_t bytes_needed)
+{
+    time_t now = time(NULL);
+    while ((g_ctx.bytes_in_use + bytes_needed) > g_ctx.max_bytes &&
+            g_ctx.lru_tail != NULL) {
+        cache_entry_t *victim = g_ctx.lru_tail;
+
+        /* Remove */
+        mm_cache_unlink(victim);
+        HASH_DEL(g_ctx.table, victim);
+        g_ctx.bytes_in_use -= victim->size;
+
+        LOG_TRACE("response_cache: evict LRU '%s' (size=%zu, age=%lds)",
+                  victim->key, victim->size, (long)(now - victim->expires_at));
+
+        mm_cache_dispose_entry(victim);
+        mm_metrics_inc("response_cache_evictions_total");
+    }
+
+    /* Also drop stale items regardless of size */
+    cache_entry_t *entry, *tmp;
+    HASH_ITER(hh, g_ctx.table, entry, tmp) {
+        if (entry->expires_at < now) {
+            mm_cache_unlink(entry);
+            HASH_DEL(g_ctx.table, entry);
+            g_ctx.bytes_in_use -= entry->size;
+            mm_cache_dispose_entry(entry);
+            mm_metrics_inc("response_cache_evictions_total");
+        }
+    }
+}
+
+/*---------------------------------------------------------------------------
+ *  Internal: Insert entry at MRU head
+ *---------------------------------------------------------------------------*/
+static void mm_cache_link_mru(cache_entry_t *entry)
+{
+    entry->prev = NULL;
+    entry->next = g_ctx.lru_head;
+    if (g_ctx.lru_head) {
+        g_ctx.lru_head->prev = entry;
+    }
+    g_ctx.lru_head = entry;
+    if (!g_ctx.lru_tail) {
+        g_ctx.lru_tail = entry;
+    }
+}
+
+/*---------------------------------------------------------------------------
+ *  Internal: Remove entry from LRU list
+ *---------------------------------------------------------------------------*/
+static void mm_cache_unlink(cache_entry_t *entry)
+{
+    if (entry->prev) {
+        entry->prev->next = entry->next;
+    } else {
+        g_ctx.lru_head = entry->next;
+    }
+
+    if (entry->next) {
+        entry->next->prev = entry->prev;
+    } else {
+        g_ctx.lru_tail = entry->prev;
+    }
+
+    entry->prev = entry->next = NULL;
+}
+
+/*---------------------------------------------------------------------------
+ *  Internal: Destroy entry and its resources
+ *---------------------------------------------------------------------------*/
+static void mm_cache_dispose_entry(cache_entry_t *entry)
+{
+    if (!entry) return;
+    free(entry->key);
+    free(entry->blob);
+    free(entry);
+}
+
+/*---------------------------------------------------------------------------
+ *  Internal: Event-bus listener → Invalidate on writes
+ *---------------------------------------------------------------------------*/
+static void* mm_cache_event_listener(const mm_event_t *ev, void *udata)
+{
+    (void)udata;
+    if (!ev || !ev->topic || !ev->payload) { return NULL; }
+
+    const char *resource_uri = (const char *)ev->payload;
+    LOG_DEBUG("response_cache: received '%s' event (uri=%s)",
+              ev->topic, resource_uri);
+
+    mm_cache_invalidate(resource_uri);
+    return NULL;
+}
+
+/*---------------------------------------------------------------------------
+ *  Debug/Diagnostics: Dump cache stats (optional)
+ *---------------------------------------------------------------------------*/
+void mm_cache_dump_stats(FILE *out)
+{
+    if (!out) { out = stderr; }
+
+    pthread_mutex_lock(&g_ctx.mtx);
+    fprintf(out,
+            "=== Response Cache Stats ===\n"
+            " entries:      %u\n"
+            " bytes_in_use: %zu\n"
+            " capacity:     %zu\n",
+            HASH_COUNT(g_ctx.table),
+            g_ctx.bytes_in_use,
+            g_ctx.max_bytes);
+    pthread_mutex_unlock(&g_ctx.mtx);
+}
+
+/*==========================================================================*/

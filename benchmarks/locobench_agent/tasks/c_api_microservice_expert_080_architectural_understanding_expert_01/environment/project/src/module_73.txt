@@ -1,0 +1,450 @@
+```c
+/**
+ * module_73.c
+ *
+ * MercuryMonolith Commerce Hub
+ * ---------------------------------
+ * Response-cache middleware & in-memory LRU cache implementation.
+ *
+ * This module provides:
+ *   1. Thread-safe, bounded, TTL-aware LRU cache
+ *   2. Middleware helper that transparently serves/stores REST responses
+ *   3. Observability hooks (Prometheus-compatible counters/gauges)
+ *
+ * NOTE: This file purposefully has zero knowledge of the HTTP layer’s
+ *       internals; it relies on small public structs defined elsewhere
+ *       (mmc_http.h) to remain decoupled.
+ *
+ * Author: MercuryMonolith Core Team
+ * License: MIT (see LICENSE file distributed with project)
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <time.h>
+#include <stdint.h>
+#include <errno.h>
+
+#include "mmc_logging.h"      /* project logging helpers */
+#include "mmc_monitoring.h"   /* project metrics facade  */
+#include "mmc_http.h"         /* struct mmc_request / mmc_response */
+
+/* --------------------------------------------------------------------------
+ * Private macros & defaults
+ * --------------------------------------------------------------------------*/
+
+#define MMC_CACHE_METRIC_HIT     "cache_hit_total"
+#define MMC_CACHE_METRIC_MISS    "cache_miss_total"
+#define MMC_CACHE_METRIC_SIZE    "cache_current_entries"
+#define MMC_CACHE_METRIC_EVICT   "cache_eviction_total"
+
+#ifndef MMC_CACHE_DEFAULT_MAX_ENTRIES
+#define MMC_CACHE_DEFAULT_MAX_ENTRIES    2048u
+#endif
+
+#ifndef MMC_CACHE_DEFAULT_TTL_SEC
+#define MMC_CACHE_DEFAULT_TTL_SEC        30u
+#endif
+
+#define MMC_CACHE_KEY_SEPARATOR        "::"   /* path + '?' + query_string + "::" + accept_header */
+
+/* --------------------------------------------------------------------------
+ * uthash single-file inclusion (public domain, https://github.com/troydhanson/uthash)
+ * --------------------------------------------------------------------------*/
+#define uthash_malloc(sz)        mmc_xmalloc(sz)
+#define uthash_free(ptr,sz)      free(ptr)
+#include "uthash.h"
+
+/* --------------------------------------------------------------------------
+ * Memory helpers
+ * --------------------------------------------------------------------------*/
+
+static void *mmc_xmalloc(size_t sz)
+{
+    void *p = malloc(sz);
+    if (!p) {
+        mmc_log_fatal("OOM: failed to allocate %zu bytes", sz);
+        abort();
+    }
+    return p;
+}
+
+/* --------------------------------------------------------------------------
+ * Cache internals
+ * --------------------------------------------------------------------------*/
+
+typedef struct cache_entry_s
+{
+    char           *key;           /* heap allocated */
+    uint8_t        *payload;       /* opaque response body */
+    size_t          payload_len;
+    uint16_t        status_code;
+    char           *content_type;  /* e.g., "application/json" */
+    time_t          expires_at;
+
+    /* LRU bookkeeping */
+    struct cache_entry_s *prev, *next;
+
+    UT_hash_handle hh;
+} cache_entry_t;
+
+typedef struct mmc_cache_s
+{
+    cache_entry_t *entries;        /* uthash key -> entry */
+    cache_entry_t *lru_head;       /* MRU at head, LRU at tail */
+    cache_entry_t *lru_tail;
+
+    size_t         max_entries;
+    unsigned       default_ttl;
+
+    pthread_mutex_t lock;
+} mmc_cache_t;
+
+/* Global singleton (kept internal to translation unit) */
+static mmc_cache_t g_cache = {0};
+
+/* --------------------------------------------------------------------------
+ * Forward decls
+ * --------------------------------------------------------------------------*/
+static void   cache_lru_move_to_head(cache_entry_t *ce);
+static void   cache_lru_append_head(cache_entry_t *ce);
+static void   cache_lru_remove(cache_entry_t *ce);
+static void   cache_evict_if_needed_unlocked(void);
+static void   cache_entry_free(cache_entry_t *ce);
+
+/* --------------------------------------------------------------------------
+ * Public API
+ * --------------------------------------------------------------------------*/
+
+/**
+ * mmc_cache_init
+ *
+ * Initialize global cache singleton. Safe to call multiple times; the first
+ * invocation wins.
+ */
+void mmc_cache_init(size_t max_entries, unsigned default_ttl_sec)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+
+    void init_once(void)
+    {
+        memset(&g_cache, 0, sizeof(g_cache));
+        g_cache.max_entries  = (max_entries  == 0) ? MMC_CACHE_DEFAULT_MAX_ENTRIES : max_entries;
+        g_cache.default_ttl  = (default_ttl_sec == 0) ? MMC_CACHE_DEFAULT_TTL_SEC   : default_ttl_sec;
+
+        if (pthread_mutex_init(&g_cache.lock, NULL) != 0) {
+            mmc_log_fatal("Failed to create cache mutex");
+            abort();
+        }
+
+        /* register gauges/counters with monitoring layer */
+        mmc_metric_gauge_register(MMC_CACHE_METRIC_SIZE, "Current cache size");
+        mmc_metric_counter_register(MMC_CACHE_METRIC_HIT,  "Cache hit count");
+        mmc_metric_counter_register(MMC_CACHE_METRIC_MISS, "Cache miss count");
+        mmc_metric_counter_register(MMC_CACHE_METRIC_EVICT,"Cache eviction count");
+
+        mmc_log_info("Response cache initialized (max=%zu, ttl=%us)", g_cache.max_entries, g_cache.default_ttl);
+    }
+
+    pthread_once(&once, init_once);
+}
+
+/**
+ * mmc_cache_shutdown
+ *
+ * Free all allocated memory. To be called at process exit.
+ */
+void mmc_cache_shutdown(void)
+{
+    pthread_mutex_lock(&g_cache.lock);
+
+    cache_entry_t *ce, *tmp;
+    HASH_ITER(hh, g_cache.entries, ce, tmp) {
+        HASH_DEL(g_cache.entries, ce);
+        cache_entry_free(ce);
+    }
+
+    g_cache.lru_head = g_cache.lru_tail = NULL;
+    mmc_metric_gauge_set(MMC_CACHE_METRIC_SIZE, 0);
+
+    pthread_mutex_unlock(&g_cache.lock);
+    pthread_mutex_destroy(&g_cache.lock);
+}
+
+/**
+ * mmc_cache_get
+ *
+ * Attempt to retrieve a cached response matching request.
+ * Returns 1 on hit (populates out_response), 0 on miss.
+ */
+int mmc_cache_get(const struct mmc_request *req, struct mmc_response *out_response)
+{
+    char key_buf[1024];
+
+    /* Build composite key */
+    snprintf(key_buf, sizeof(key_buf), "%s%s%s%s%s",
+             req->path,
+             req->query_string[0] ? "?" : "",
+             req->query_string,
+             MMC_CACHE_KEY_SEPARATOR,
+             req->accept);
+
+    pthread_mutex_lock(&g_cache.lock);
+
+    cache_entry_t *ce = NULL;
+    HASH_FIND_STR(g_cache.entries, key_buf, ce);
+    if (!ce) {
+        pthread_mutex_unlock(&g_cache.lock);
+        mmc_metric_counter_inc(MMC_CACHE_METRIC_MISS);
+        return 0;
+    }
+
+    /* Verify TTL */
+    if (ce->expires_at < time(NULL)) {
+        /* stale */
+        HASH_DEL(g_cache.entries, ce);
+        cache_lru_remove(ce);
+        cache_entry_free(ce);
+        mmc_metric_counter_inc(MMC_CACHE_METRIC_MISS);
+        pthread_mutex_unlock(&g_cache.lock);
+        return 0;
+    }
+
+    /* hit */
+    cache_lru_move_to_head(ce);
+
+    out_response->status_code  = ce->status_code;
+    out_response->body         = mmc_xmalloc(ce->payload_len);
+    memcpy(out_response->body, ce->payload, ce->payload_len);
+    out_response->body_len     = ce->payload_len;
+    strncpy(out_response->content_type, ce->content_type, sizeof(out_response->content_type)-1);
+
+    mmc_metric_counter_inc(MMC_CACHE_METRIC_HIT);
+    pthread_mutex_unlock(&g_cache.lock);
+    return 1;
+}
+
+/**
+ * mmc_cache_put
+ *
+ * Store successful (2xx) responses.
+ */
+void mmc_cache_put(const struct mmc_request *req,
+                   const struct mmc_response *resp,
+                   unsigned ttl_override_sec)
+{
+    if (resp->status_code >= 300 || resp->body_len == 0)
+        return;
+
+    time_t now = time(NULL);
+    const unsigned ttl = ttl_override_sec ? ttl_override_sec : g_cache.default_ttl;
+    const time_t expires_at = now + ttl;
+
+    char key_buf[1024];
+    snprintf(key_buf, sizeof(key_buf), "%s%s%s%s%s",
+             req->path,
+             req->query_string[0] ? "?" : "",
+             req->query_string,
+             MMC_CACHE_KEY_SEPARATOR,
+             req->accept);
+
+    pthread_mutex_lock(&g_cache.lock);
+
+    /* Dedup if already present */
+    cache_entry_t *ce;
+    HASH_FIND_STR(g_cache.entries, key_buf, ce);
+    if (ce) {
+        cache_lru_remove(ce);
+        HASH_DEL(g_cache.entries, ce);
+        cache_entry_free(ce);
+    }
+
+    ce = mmc_xmalloc(sizeof(*ce));
+    ce->key           = strdup(key_buf);
+    ce->payload       = mmc_xmalloc(resp->body_len);
+    memcpy(ce->payload, resp->body, resp->body_len);
+    ce->payload_len   = resp->body_len;
+    ce->status_code   = resp->status_code;
+    ce->content_type  = strdup(resp->content_type);
+    ce->expires_at    = expires_at;
+    ce->prev = ce->next = NULL;
+
+    HASH_ADD_KEYPTR(hh, g_cache.entries, ce->key, strlen(ce->key), ce);
+    cache_lru_append_head(ce);
+    mmc_metric_gauge_set(MMC_CACHE_METRIC_SIZE, HASH_CNT(hh, g_cache.entries));
+
+    cache_evict_if_needed_unlocked(); /* may unlock internally */
+
+    pthread_mutex_unlock(&g_cache.lock);
+}
+
+/**
+ * mmc_cache_invalidate_path
+ *
+ * Invalidate every entry whose key path prefix matches supplied path
+ * (e.g., "/api/v1/products").
+ */
+void mmc_cache_invalidate_path(const char *path_prefix)
+{
+    const size_t prefix_len = strlen(path_prefix);
+
+    pthread_mutex_lock(&g_cache.lock);
+    cache_entry_t *ce, *tmp;
+    HASH_ITER(hh, g_cache.entries, ce, tmp) {
+        if (strncmp(ce->key, path_prefix, prefix_len) == 0) {
+            HASH_DEL(g_cache.entries, ce);
+            cache_lru_remove(ce);
+            cache_entry_free(ce);
+            mmc_metric_gauge_dec(MMC_CACHE_METRIC_SIZE);
+        }
+    }
+    pthread_mutex_unlock(&g_cache.lock);
+}
+
+/* --------------------------------------------------------------------------
+ * Middleware helper
+ * --------------------------------------------------------------------------*/
+
+/**
+ * mmc_cache_middleware
+ *
+ * Wrap downstream handler with cache lookup/store.
+ *
+ * Parameters:
+ *   handler  - next handler in chain
+ *   req      - inbound request
+ *   resp_out - caller-allocated response struct
+ *
+ * Returns:
+ *   0 on success; an HTTP status code on error.
+ */
+typedef int (*mmc_handler_fn)(const struct mmc_request *, struct mmc_response *);
+
+int mmc_cache_middleware(mmc_handler_fn handler,
+                         const struct mmc_request *req,
+                         struct mmc_response *resp_out)
+{
+    if (mmc_cache_get(req, resp_out))
+        return 0; /* served from cache */
+
+    int rc = handler(req, resp_out);
+
+    if (rc == 0)
+        mmc_cache_put(req, resp_out, 0 /* default ttl */);
+
+    return rc;
+}
+
+/* --------------------------------------------------------------------------
+ * Internal helpers
+ * --------------------------------------------------------------------------*/
+
+static void cache_entry_free(cache_entry_t *ce)
+{
+    if (!ce) return;
+    free(ce->key);
+    free(ce->payload);
+    free(ce->content_type);
+    free(ce);
+}
+
+static void cache_lru_append_head(cache_entry_t *ce)
+{
+    ce->next = g_cache.lru_head;
+    ce->prev = NULL;
+
+    if (g_cache.lru_head)
+        g_cache.lru_head->prev = ce;
+    g_cache.lru_head = ce;
+
+    if (!g_cache.lru_tail)
+        g_cache.lru_tail = ce;
+}
+
+static void cache_lru_move_to_head(cache_entry_t *ce)
+{
+    if (g_cache.lru_head == ce)
+        return;
+
+    cache_lru_remove(ce);
+    cache_lru_append_head(ce);
+}
+
+static void cache_lru_remove(cache_entry_t *ce)
+{
+    if (ce->prev)
+        ce->prev->next = ce->next;
+    if (ce->next)
+        ce->next->prev = ce->prev;
+
+    if (g_cache.lru_head == ce)
+        g_cache.lru_head = ce->next;
+    if (g_cache.lru_tail == ce)
+        g_cache.lru_tail = ce->prev;
+
+    ce->prev = ce->next = NULL;
+}
+
+static void cache_evict_if_needed_unlocked(void)
+{
+    while (HASH_CNT(hh, g_cache.entries) > g_cache.max_entries) {
+        cache_entry_t *victim = g_cache.lru_tail;
+        if (!victim) break;
+
+        HASH_DEL(g_cache.entries, victim);
+        cache_lru_remove(victim);
+        cache_entry_free(victim);
+
+        mmc_metric_counter_inc(MMC_CACHE_METRIC_EVICT);
+        mmc_metric_gauge_set(MMC_CACHE_METRIC_SIZE, HASH_CNT(hh, g_cache.entries));
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Simple unit test (compile with -DMMC_CACHE_TEST)
+ * --------------------------------------------------------------------------*/
+#ifdef MMC_CACHE_TEST
+#include <assert.h>
+
+static int dummy_handler(const struct mmc_request *req, struct mmc_response *resp)
+{
+    static const char *HELLO = "{\"msg\":\"hello\"}";
+    resp->status_code = 200;
+    strncpy(resp->content_type, "application/json", sizeof(resp->content_type)-1);
+    resp->body_len = strlen(HELLO);
+    resp->body = mmc_xmalloc(resp->body_len);
+    memcpy(resp->body, HELLO, resp->body_len);
+    return 0;
+}
+
+int main(void)
+{
+    struct mmc_request req = {
+        .path = "/api/v1/hello",
+        .query_string = "",
+        .accept = "application/json"
+    };
+    struct mmc_response resp = {0};
+
+    mmc_cache_init(8, 10);
+
+    /* first call => miss + store */
+    assert(mmc_cache_middleware(dummy_handler, &req, &resp) == 0);
+    assert(resp.body_len > 0);
+    free(resp.body);
+    memset(&resp, 0, sizeof(resp));
+
+    /* second call => hit */
+    assert(mmc_cache_middleware(dummy_handler, &req, &resp) == 0);
+    assert(resp.body_len > 0);
+    printf("payload=%.*s\n",(int)resp.body_len,resp.body);
+    free(resp.body);
+
+    mmc_cache_shutdown();
+    puts("cache self-test ok");
+    return 0;
+}
+#endif
+```

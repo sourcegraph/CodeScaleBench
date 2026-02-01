@@ -1,0 +1,304 @@
+```rust
+//! module_5 – run-time strategy management for sentiment analyzers
+//!
+//! This module demonstrates how ChirpPulse can hot-swap sentiment analysis
+//! algorithms in production with zero downtime.  A watch thread observes a
+//! config-file on disk; whenever the file changes, the active strategy is
+//! replaced in a lock-free, wait-free fashion for all subsequent requests.
+//!
+//! Real-world systems would pull the configuration from ZooKeeper / etcd or
+//! ship pre-compiled dynamic libraries.  For brevity we restrict ourselves to
+//! two in-process strategies and a YAML config file.
+
+use anyhow::{anyhow, Context, Result};
+use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use rand::Rng;
+use serde::Deserialize;
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::{Arc, RwLock},
+    thread,
+    time::Duration,
+};
+
+/// A single, typed sentiment label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sentiment {
+    Positive,
+    Neutral,
+    Negative,
+}
+
+/// Inference output from a [`SentimentStrategy`].
+#[derive(Debug, Clone)]
+pub struct Score {
+    pub sentiment: Sentiment,
+    /// Confidence in the range `[0.0, 1.0]`.
+    pub confidence: f32,
+}
+
+impl Score {
+    pub fn new(sentiment: Sentiment, confidence: f32) -> Self {
+        Self {
+            sentiment,
+            confidence: confidence.clamp(0.0, 1.0),
+        }
+    }
+}
+
+/// Types implementing this trait can be plugged into the real-time pipeline
+/// without recompilation.
+pub trait SentimentStrategy: Send + Sync + 'static {
+    /// Name of the strategy (for metrics / tracing).
+    fn name(&self) -> &str;
+
+    /// Analyze free-form text and return a [`Score`].
+    fn analyze(&self, text: &str) -> Result<Score>;
+}
+
+/// A super-lightweight lexicon-based sentiment classifier.
+struct LexiconStrategy {
+    positives: HashSet<&'static str>,
+    negatives: HashSet<&'static str>,
+}
+
+impl LexiconStrategy {
+    fn new() -> Self {
+        Self {
+            positives: HashSet::from([
+                "good", "great", "happy", "love", "excellent", "fantastic", "positive",
+            ]),
+            negatives: HashSet::from([
+                "bad", "terrible", "sad", "hate", "awful", "horrible", "negative",
+            ]),
+        }
+    }
+}
+
+impl SentimentStrategy for LexiconStrategy {
+    fn name(&self) -> &str {
+        "lexicon_v1"
+    }
+
+    fn analyze(&self, text: &str) -> Result<Score> {
+        let mut score = 0i32;
+        for token in text.split(|c: char| !c.is_alphanumeric()) {
+            let token_lower = token.to_ascii_lowercase();
+            if self.positives.contains(token_lower.as_str()) {
+                score += 1;
+            } else if self.negatives.contains(token_lower.as_str()) {
+                score -= 1;
+            }
+        }
+
+        let (sentiment, confidence) = if score > 0 {
+            (Sentiment::Positive, (score as f32 / 5.0).min(1.0))
+        } else if score < 0 {
+            (Sentiment::Negative, (-score as f32 / 5.0).min(1.0))
+        } else {
+            (Sentiment::Neutral, 0.5)
+        };
+
+        Ok(Score::new(sentiment, confidence))
+    }
+}
+
+/// A mock “Transformer” model that pretends to run a deep-learning network.
+///
+/// NOTE: In production this would call an ONNX/TensorRT/Accelerate runtime or a
+/// co-located micro-service.  Here we demo hot-swap semantics, not ML accuracy.
+struct TransformerStrategy;
+
+impl SentimentStrategy for TransformerStrategy {
+    fn name(&self) -> &str {
+        "transformer_mock"
+    }
+
+    fn analyze(&self, text: &str) -> Result<Score> {
+        let hash = seahash::hash(text.as_bytes());
+        let bucket = (hash % 3) as u8;
+        let (sentiment, confidence) = match bucket {
+            0 => (Sentiment::Positive, 0.9),
+            1 => (Sentiment::Negative, 0.9),
+            _ => (Sentiment::Neutral, 0.6),
+        };
+        Ok(Score::new(sentiment, confidence))
+    }
+}
+
+/// Thread-safe façade that delegates to the *currently active* strategy.
+/// Cloneable and cheap to pass around:
+#[derive(Clone)]
+pub struct StrategyManager {
+    strategy: Arc<RwLock<Box<dyn SentimentStrategy>>>,
+}
+
+impl StrategyManager {
+    /// Create a new manager with the provided default strategy.
+    pub fn new(initial: Box<dyn SentimentStrategy>) -> Self {
+        Self {
+            strategy: Arc::new(RwLock::new(initial)),
+        }
+    }
+
+    /// Run analysis using the current implementation.
+    pub fn analyze(&self, text: &str) -> Result<Score> {
+        // Fast path: only a shared read lock.
+        let guard = self
+            .strategy
+            .read()
+            .map_err(|_| anyhow!("poisoned sentiment strategy lock"))?;
+        guard.analyze(text)
+    }
+
+    /// Switch to a completely new implementation.
+    ///
+    /// Existing readers are *not* blocked while this takes place; they keep a
+    /// read-lock on the previous `Box`.  New readers will see the update.
+    pub fn hot_swap(&self, new_strategy: Box<dyn SentimentStrategy>) -> Result<()> {
+        let mut guard = self
+            .strategy
+            .write()
+            .map_err(|_| anyhow!("poisoned sentiment strategy lock"))?;
+        tracing::info!(
+            old = guard.name(),
+            new = new_strategy.name(),
+            "hot-swapping sentiment strategy"
+        );
+        *guard = new_strategy;
+        Ok(())
+    }
+}
+
+/// Deserialize-friendly view of a YAML config file.
+#[derive(Debug, Deserialize)]
+struct StrategyConfig {
+    /// Either `lexicon` or `transformer`.
+    strategy: String,
+}
+
+impl StrategyConfig {
+    fn resolve(&self) -> Result<Box<dyn SentimentStrategy>> {
+        match self.strategy.to_ascii_lowercase().as_str() {
+            "lexicon" | "lexicon_v1" => Ok(Box::new(LexiconStrategy::new())),
+            "transformer" | "transformer_mock" => Ok(Box::new(TransformerStrategy)),
+            other => Err(anyhow!("unknown strategy `{other}`")),
+        }
+    }
+}
+
+impl FromStr for StrategyConfig {
+    type Err = anyhow::Error;
+
+    fn from_str(contents: &str) -> Result<Self, Self::Err> {
+        serde_yaml::from_str(contents).context("invalid YAML in strategy config")
+    }
+}
+
+/// Spawn a watcher thread that reloads the strategy whenever the config file
+/// changes.
+///
+/// The function returns immediately; the background thread lives as long as
+/// `manager` is alive.
+pub fn spawn_hot_swap_watcher(config_path: impl Into<PathBuf>, manager: StrategyManager) -> Result<()> {
+    let path: PathBuf = config_path.into();
+    let initial = load_strategy_from_file(&path)?;
+    manager.hot_swap(initial)?;
+
+    // Detach a new thread: keeps a clone of the manager.
+    let manager_clone = manager.clone();
+    thread::Builder::new()
+        .name("strategy-hot-swapper".into())
+        .spawn(move || {
+            if let Err(e) = watch_loop(path, manager_clone) {
+                tracing::error!(error = ?e, "strategy watch loop crashed");
+            }
+        })?;
+
+    Ok(())
+}
+
+/// (Re)load a boxed [`SentimentStrategy`] from a YAML config file.
+fn load_strategy_from_file(path: &Path) -> Result<Box<dyn SentimentStrategy>> {
+    let contents = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+    let config = StrategyConfig::from_str(&contents)?;
+    config.resolve()
+}
+
+/// Blocking watch loop.  The implementation is isolated to its own thread.
+fn watch_loop(path: PathBuf, manager: StrategyManager) -> Result<()> {
+    // Channel used by the notify crate.
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let mut watcher: RecommendedWatcher =
+        Watcher::new(tx, NotifyConfig::default()).context("failed to init file watcher")?;
+    watcher
+        .watch(&path, RecursiveMode::NonRecursive)
+        .with_context(|| format!("failed to watch {:?}", path))?;
+
+    tracing::info!(path = ?path, "strategy watcher started");
+
+    loop {
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(event) => handle_fs_event(event, &path, &manager)?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // heartbeat: ensure thread isn’t dead
+            }
+            Err(e) => return Err(anyhow!("watcher channel closed: {e}")),
+        }
+    }
+}
+
+/// React to an inotify / fsevents payload.
+fn handle_fs_event(event: Event, config_path: &Path, manager: &StrategyManager) -> Result<()> {
+    // Only act on Modify/CloseWrite events to avoid double reload.
+    if !matches!(
+        event.kind,
+        notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+    ) {
+        return Ok(());
+    }
+
+    tracing::debug!(?event, "config file changed, reloading strategy");
+
+    match load_strategy_from_file(config_path) {
+        Ok(new_strategy) => manager.hot_swap(new_strategy)?,
+        Err(e) => tracing::warn!(error = ?e, "failed to reload strategy; keeping old one"),
+    };
+
+    Ok(())
+}
+
+/* ------------------------------------------------------------------------- */
+/* Example integration test (cargo test -- --nocapture)                      */
+/* ------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoke_test_manager() -> Result<()> {
+        let manager = StrategyManager::new(Box::new(LexiconStrategy::new()));
+
+        let positive = manager.analyze("I love this fantastic movie!")?;
+        assert_eq!(positive.sentiment, Sentiment::Positive);
+
+        let negative = manager.analyze("That was an awful game. I hate it.")?;
+        assert_eq!(negative.sentiment, Sentiment::Negative);
+
+        // hot swap at runtime
+        manager.hot_swap(Box::new(TransformerStrategy))?;
+        let neutralish = manager.analyze("The sky is blue.")?;
+        assert!(matches!(
+            neutralish.sentiment,
+            Sentiment::Positive | Sentiment::Negative | Sentiment::Neutral
+        ));
+
+        Ok(())
+    }
+}
+```

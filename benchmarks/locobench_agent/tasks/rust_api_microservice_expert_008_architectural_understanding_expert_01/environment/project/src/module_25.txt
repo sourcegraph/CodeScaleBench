@@ -1,0 +1,232 @@
+```rust
+//! src/module_25.rs
+//!
+//! High-volume Ledger Entry listing service with
+//!  • pagination
+//!  • request validation
+//!  • Redis response caching
+//!  • structured logging via `tracing`
+//!
+//! This is an isolated module—wiring (router, DI container, etc.) is handled
+//! elsewhere in the LedgerLink Nexus code-base.
+
+use std::time::Duration;
+
+use anyhow::Context as _;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use redis::aio::ConnectionManager;
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgRow, PgPool, Row};
+use thiserror::Error;
+use tracing::{debug, instrument};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+/// ========= Domain Model =========
+#[derive(Debug, Clone)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub account_id: Uuid,
+    pub amount: rust_decimal::Decimal,
+    pub currency: String,
+    pub entry_date: DateTime<Utc>,
+    pub description: Option<String>,
+}
+
+/// ========= View / DTO =========
+#[derive(Debug, Serialize)]
+pub struct LedgerEntryView {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub amount: String,
+    pub currency: String,
+    pub entry_date: DateTime<Utc>,
+    pub description: Option<String>,
+}
+
+impl From<LedgerEntry> for LedgerEntryView {
+    fn from(m: LedgerEntry) -> Self {
+        Self {
+            id: m.id,
+            account_id: m.account_id,
+            amount: m.amount.normalize().to_string(), // String for JSON precision
+            currency: m.currency,
+            entry_date: m.entry_date,
+            description: m.description,
+        }
+    }
+}
+
+/// ========= Pagination =========
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Validate)]
+pub struct PageRequest {
+    #[validate(range(min = 1, message = "page must be >= 1"))]
+    pub page: u32,
+
+    #[validate(custom = "validate_per_page")]
+    pub per_page: u32,
+}
+
+fn validate_per_page(pp: u32) -> Result<(), ValidationError> {
+    if (1..=100).contains(&pp) {
+        Ok(())
+    } else {
+        Err(ValidationError::new("per_page_out_of_bounds"))
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub has_more: bool,
+}
+
+/// ========= Errors =========
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation error: {0}")]
+    Validation(#[from] validator::ValidationErrors),
+
+    #[error("database error")]
+    Db(#[from] sqlx::Error),
+
+    #[error("cache error")]
+    Cache(#[from] redis::RedisError),
+
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// ========= Service Trait =========
+#[async_trait]
+pub trait LedgerEntryQueryService: Send + Sync + 'static {
+    async fn list_entries(
+        &self,
+        tenant_id: Uuid,
+        req: PageRequest,
+    ) -> Result<Page<LedgerEntryView>, ServiceError>;
+}
+
+/// ========= Concrete Implementation =========
+pub struct LedgerEntryService {
+    pg: PgPool,
+    redis: ConnectionManager,
+    cache_ttl: Duration,
+}
+
+impl LedgerEntryService {
+    pub fn new(pg: PgPool, redis: ConnectionManager, cache_ttl: Duration) -> Self {
+        Self {
+            pg,
+            redis,
+            cache_ttl,
+        }
+    }
+
+    fn cache_key(tenant_id: Uuid, req: PageRequest) -> String {
+        format!("ledger_entries:{}:{}_{}", tenant_id, req.page, req.per_page)
+    }
+
+    async fn fetch_from_pg(
+        &self,
+        tenant_id: Uuid,
+        req: PageRequest,
+    ) -> Result<Page<LedgerEntryView>, sqlx::Error> {
+        let offset = ((req.page - 1) * req.per_page) as i64;
+        let limit = req.per_page as i64;
+
+        // Fetch one extra row to know if there's more data
+        let rows: Vec<PgRow> = sqlx::query(
+            r#"
+            SELECT id, tenant_id, account_id, amount, currency, entry_date, description
+            FROM ledger_entries
+            WHERE tenant_id = $1
+            ORDER BY entry_date DESC, id DESC
+            OFFSET $2 LIMIT $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(offset)
+        .bind(limit + 1) // +1 to check has_more
+        .fetch_all(&self.pg)
+        .await?;
+
+        let has_more = rows.len() as u32 > req.per_page;
+        let items: Vec<LedgerEntryView> = rows
+            .into_iter()
+            .take(req.per_page as usize)
+            .map(|row| LedgerEntry {
+                id: row.get("id"),
+                tenant_id: row.get("tenant_id"),
+                account_id: row.get("account_id"),
+                amount: row.get::<rust_decimal::Decimal, _>("amount"),
+                currency: row.get("currency"),
+                entry_date: row.get("entry_date"),
+                description: row.get("description"),
+            })
+            .map(LedgerEntryView::from)
+            .collect();
+
+        Ok(Page { items, has_more })
+    }
+}
+
+#[async_trait]
+impl LedgerEntryQueryService for LedgerEntryService {
+    #[instrument(name = "list_entries", skip_all, fields(tenant=%tenant_id))]
+    async fn list_entries(
+        &self,
+        tenant_id: Uuid,
+        req: PageRequest,
+    ) -> Result<Page<LedgerEntryView>, ServiceError> {
+        req.validate()?;
+
+        let cache_key = Self::cache_key(tenant_id, req);
+        let mut conn = self.redis.clone();
+
+        // ===== Try cache first =====
+        if let Ok(Some(cached_json)) = conn.get::<_, Option<String>>(&cache_key).await {
+            debug!("cache hit");
+            let page: Page<LedgerEntryView> =
+                serde_json::from_str(&cached_json).context("deserialize cached page")?;
+            return Ok(page);
+        }
+
+        debug!("cache miss; querying Postgres");
+        let page = self.fetch_from_pg(tenant_id, req).await?;
+
+        // Fire-and-forget cache set
+        let cache_value = serde_json::to_string(&page)?;
+        let ttl_sec = self.cache_ttl.as_secs() as usize;
+        tokio::spawn(async move {
+            let _: redis::RedisResult<()> = conn.set_ex(cache_key, cache_value, ttl_sec).await;
+        });
+
+        Ok(page)
+    }
+}
+
+/// ========= Tests (requires `cargo test --features=integration-tests`) =========
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    fn pg_pool() -> PgPool {
+        let url = env::var("TEST_DATABASE_URL")
+            .expect("set TEST_DATABASE_URL to run integration tests");
+        PgPool::connect_lazy(&url).unwrap()
+    }
+
+    #[tokio::test]
+    async fn per_page_validation() {
+        let res = PageRequest { page: 1, per_page: 200 }.validate();
+        assert!(res.is_err());
+    }
+
+    // Other tests would spin up a redis + pg test harness, omitted for brevity.
+}
+```

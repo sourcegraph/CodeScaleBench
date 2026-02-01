@@ -1,0 +1,336 @@
+```csharp
+// -----------------------------------------------------------------------------
+//  Project  : PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//  File     : TransformationEngine.cs        (module_31.txt)
+//  Language : C#
+//
+//  Description:
+//  ----------------
+//  A pluggable transformation engine that sits in-between raw data ingestion
+//  and materialized KPI tables.  The implementation follows the classic
+//  Strategy Pattern to enable hot-swapping business logic without shipping a
+//  new artifact.  The engine is designed to be consumed by both real-time
+//  Lambda stream processors (Kinesis / SQS) as well as Glue backfill jobs.
+//
+//  Key Features
+//  -------------
+//  • In-memory strategy registry with defensive loading validation.
+//  • OpenTelemetry tracing and structured logging baked-in.
+//  • AWS XRay support auto-enabled in Lambda environments.
+//  • Cancellation-token aware, async/await throughout.
+//  • Explicit, typed error model for upstream DLQ routing.
+// -----------------------------------------------------------------------------
+
+using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Diagnostics;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformation
+{
+    #region Contracts & Models
+
+    /// <summary>
+    /// Describes an atomic business-logic transformation step.
+    /// </summary>
+    public interface ITransformationStrategy
+    {
+        /// <summary>
+        /// Human-readable name—unique within the strategy registry.
+        /// </summary>
+        string StrategyName { get; }
+
+        /// <summary>
+        /// Main entry-point for business logic.  Implementations must be
+        /// side-effect-free—no external IO other than the provided <paramref name="context"/>,
+        /// and must be idempotent.
+        /// </summary>
+        /// <param name="context">The transformation context.</param>
+        /// <param name="ct">Cancellation token.</param>
+        /// <returns>A completed <see cref="TransformationResult"/>.</returns>
+        Task<TransformationResult> TransformAsync(
+            TransformationContext context,
+            CancellationToken ct = default);
+    }
+
+    /// <summary>
+    /// Context bag passed to strategies, encapsulating the payload,
+    /// correlation metadata, and helper services.
+    /// </summary>
+    public sealed record TransformationContext(
+        string CorrelationId,
+        JsonElement Payload,
+        DateTimeOffset IngestionTimestamp,
+        IReadOnlyDictionary<string, string> Parameters);
+
+    /// <summary>
+    /// Standardized result contract returned by transformation strategies.
+    /// </summary>
+    public sealed record TransformationResult(
+        JsonElement TransformedPayload,
+        bool IsNoOp,
+        IReadOnlyDictionary<string, string>? OutboundTags);
+
+    /// <summary>
+    /// Domain-specific exception bubbled when a strategy fails in an expected
+    /// business scenario (e.g., validation error).  The engine will capture
+    /// this and ship to DLQ without treating it as an infra failure.
+    /// </summary>
+    public sealed class TransformationException : Exception
+    {
+        public string Strategy { get; }
+        public string CorrelationId { get; }
+
+        public TransformationException(
+            string strategy,
+            string correlationId,
+            string message,
+            Exception? inner = null)
+            : base(message, inner)
+        {
+            Strategy = strategy;
+            CorrelationId = correlationId;
+        }
+    }
+
+    #endregion // Contracts & Models
+
+    #region Engine
+
+    /// <summary>
+    /// Central orchestrator that resolves and invokes transformation strategies.
+    /// </summary>
+    public sealed class TransformationEngine
+    {
+        private static readonly ActivitySource ActivitySource =
+            new("PulseOps.Warehouse.TransformationEngine");
+
+        private readonly ImmutableDictionary<string, ITransformationStrategy> _registry;
+        private readonly ILogger<TransformationEngine> _logger;
+
+        /// <summary>
+        /// Constructs the engine and validates uniqueness of strategy names.
+        /// </summary>
+        /// <param name="strategies">Enumerated set loaded by the DI container.</param>
+        /// <param name="logger">Structured logger.</param>
+        /// <exception cref="ArgumentException">Thrown when a duplicate strategy name is found.</exception>
+        public TransformationEngine(
+            IEnumerable<ITransformationStrategy> strategies,
+            ILogger<TransformationEngine> logger)
+        {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+            var duplicate = strategies
+               .GroupBy(s => s.StrategyName, StringComparer.OrdinalIgnoreCase)
+               .FirstOrDefault(g => g.Count() > 1);
+
+            if (duplicate != null)
+            {
+                throw new ArgumentException(
+                    $"Duplicate strategy name '{duplicate.Key}' detected in DI container.");
+            }
+
+            _registry = strategies.ToImmutableDictionary(
+                s => s.StrategyName,
+                s => s,
+                StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Executes a registered strategy by name.
+        /// </summary>
+        /// <param name="strategyName">Name of the strategy, case-insensitive.</param>
+        /// <param name="context">Transformation context.</param>
+        /// <param name="ct">Cancellation token.</param>
+        /// <returns>The transformation result.</returns>
+        /// <exception cref="KeyNotFoundException">
+        /// When the requested strategy is not found in the registry.
+        /// </exception>
+        /// <exception cref="TransformationException">
+        /// When the strategy throws an expected domain error.
+        /// </exception>
+        public async Task<TransformationResult> ExecuteAsync(
+            string strategyName,
+            TransformationContext context,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(strategyName))
+                throw new ArgumentException("Strategy name must be supplied.", nameof(strategyName));
+
+            if (!_registry.TryGetValue(strategyName, out var strategy))
+                throw new KeyNotFoundException(
+                    $"No transformation strategy registered for '{strategyName}'.");
+
+            using var activity = ActivitySource.StartActivity(
+                $"{strategyName}.Transform",
+                ActivityKind.Internal);
+
+            activity?.SetTag("correlation_id", context.CorrelationId);
+            activity?.SetTag("strategy", strategyName);
+
+            _logger.LogDebug(
+                "Invoking transformation strategy '{Strategy}' for correlation '{CorrelationId}'.",
+                strategyName,
+                context.CorrelationId);
+
+            try
+            {
+                var result = await strategy.TransformAsync(context, ct)
+                                           .ConfigureAwait(false);
+
+                _logger.LogInformation(
+                    "Transformation strategy '{Strategy}' completed for correlation '{CorrelationId}'. " +
+                    "NoOp: {IsNoOp}.",
+                    strategyName,
+                    context.CorrelationId,
+                    result.IsNoOp);
+
+                return result;
+            }
+            catch (TransformationException) // Domain error already wrapped
+            {
+                throw;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                _logger.LogWarning(
+                    "Transformation for strategy '{Strategy}' cancelled (Correlation: {CorrelationId}).",
+                    strategyName,
+                    context.CorrelationId);
+
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Unhandled exception during transformation. Strategy: '{Strategy}', Correlation: '{CorrelationId}'.",
+                    strategyName,
+                    context.CorrelationId);
+
+                throw new TransformationException(
+                    strategyName,
+                    context.CorrelationId,
+                    "Unhandled exception during transformation phase.",
+                    ex);
+            }
+        }
+
+        /// <summary>
+        /// Helper method primarily used by unit and integration tests.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public IReadOnlyCollection<string> ListRegisteredStrategies() => _registry.Keys;
+    }
+
+    #endregion // Engine
+
+    #region Sample Strategy Implementation
+
+    /// <summary>
+    /// Example transformation that computes focus-time ratio KPI for a calendar
+    /// event JSON payload.  Demonstrates realistic business logic, validation,
+    /// and output contract usage.
+    /// </summary>
+    public sealed class FocusTimeRatioStrategy : ITransformationStrategy
+    {
+        private readonly ILogger<FocusTimeRatioStrategy> _logger;
+
+        public FocusTimeRatioStrategy(ILogger<FocusTimeRatioStrategy> logger)
+        {
+            _logger = logger;
+        }
+
+        public string StrategyName => "focus-time-ratio";
+
+        public async Task<TransformationResult> TransformAsync(
+            TransformationContext context,
+            CancellationToken ct = default)
+        {
+            // Simulate async IO (e.g., fetch user preferences)
+            await Task.Delay(TimeSpan.FromMilliseconds(5), ct);
+
+            if (!context.Payload.TryGetProperty("events", out var eventsNode) ||
+                eventsNode.ValueKind != JsonValueKind.Array)
+            {
+                throw new TransformationException(
+                    StrategyName,
+                    context.CorrelationId,
+                    "Payload must contain an 'events' array.");
+            }
+
+            var totalMinutes = 0.0;
+            var focusMinutes = 0.0;
+
+            foreach (var evt in eventsNode.EnumerateArray())
+            {
+                if (!evt.TryGetProperty("duration_minutes", out var durNode) ||
+                    !durNode.TryGetDouble(out var duration))
+                {
+                    _logger.LogWarning(
+                        "Event missing 'duration_minutes'—Correlation: {CorrelationId}. Skipping.",
+                        context.CorrelationId);
+                    continue;
+                }
+
+                totalMinutes += duration;
+
+                var isFocus = evt.TryGetProperty("meeting_type", out var typeNode) &&
+                              typeNode.GetString()?.Equals("focus", StringComparison.OrdinalIgnoreCase) == true;
+
+                if (isFocus)
+                    focusMinutes += duration;
+            }
+
+            if (totalMinutes == 0)
+            {
+                _logger.LogInformation(
+                    "No events with duration found for correlation '{CorrelationId}'. Returning NoOp.",
+                    context.CorrelationId);
+
+                return new TransformationResult(
+                    TransformedPayload: context.Payload, // Passthrough
+                    IsNoOp: true,
+                    OutboundTags: new Dictionary<string, string>
+                    {
+                        ["kpi.focus_minutes"] = "0",
+                        ["kpi.total_minutes"] = "0"
+                    });
+            }
+
+            var ratio = focusMinutes / totalMinutes;
+
+            using var jsonDoc = JsonDocument.Parse("{ }");
+            var root = jsonDoc.RootElement;
+
+            // For brevity we build a minimal JsonElement; production code
+            // might use System.Text.Json.Utf8JsonWriter for efficiency.
+            var transformed = JsonSerializer.SerializeToElement(new
+            {
+                correlation_id = context.CorrelationId,
+                focus_minutes = focusMinutes,
+                total_minutes = totalMinutes,
+                focus_ratio = Math.Round(ratio, 4),
+                timestamp = DateTimeOffset.UtcNow
+            });
+
+            return new TransformationResult(
+                TransformedPayload: transformed,
+                IsNoOp: false,
+                OutboundTags: new Dictionary<string, string>
+                {
+                    ["kpi.focus_ratio"] = ratio.ToString("0.####"),
+                    ["correlation_id"] = context.CorrelationId
+                });
+        }
+    }
+
+    #endregion // Sample Strategy Implementation
+}
+```

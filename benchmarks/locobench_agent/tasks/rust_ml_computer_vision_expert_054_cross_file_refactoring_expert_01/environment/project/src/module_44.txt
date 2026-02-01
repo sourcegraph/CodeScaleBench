@@ -1,0 +1,484 @@
+```rust
+//! src/module_44.rs
+//!
+//! Model-monitoring utilities for VisuTility Orchestrator.
+//! -----------------------------------------------------------------------------
+//! This module implements an asynchronous, event–driven monitoring layer that
+//! observes training / inference events produced by the Model-Ops layer and
+//! reports actionable metrics (latency, drift, failure rate, etc.) to external
+//! sinks such as Prometheus, OpenTelemetry or a proprietary dashboard.
+//!
+//! Design highlights
+//! -----------------
+//! • Observer Pattern: `Monitor` trait + concrete implementations (latency /
+//!   drift monitors) subscribe to a central `EventBus`.
+//! • Tokio broadcast: Lowest-friction fan-out of immutable `ModelEvent`s to
+//!   many listeners, without back-pressure on the producer side.
+//! • Strategy Pattern: At runtime, the `MonitorFactory` builds monitors from a
+//!   YAML / JSON config so that new monitors can be plugged in without code
+//!   changes.
+//! • Error handling: Rich, typed errors via `thiserror` that bubble up through
+//!   async tasks; monitored tasks never panic in production.
+//!
+//! NOTE: This file is intentionally self-contained to reduce compilation
+//! dependencies in downstream crates; optionally enable the `prometheus`
+//! feature for metrics export.
+
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
+use tokio::{select, signal, time};
+use tracing::{debug, error, info, warn};
+
+#[cfg(feature = "prometheus")]
+use prometheus::{register_histogram_vec, HistogramVec};
+
+use thiserror::Error;
+
+/// Default channel capacity for the event bus.
+const DEFAULT_CHANNEL_CAPACITY: usize = 1 << 8; // 256
+
+/* -------------------------------------------------------------------------- */
+/*                               Domain Events                                */
+/* -------------------------------------------------------------------------- */
+
+/// An event emitted from the Model-Ops subsystem.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelEvent {
+    /// A single inference call finished.
+    InferenceCompleted {
+        model_id: String,
+        latency_ms: f64,
+        timestamp: DateTime<Utc>,
+    },
+    /// Continuous monitoring detected feature / concept drift.
+    DriftDetected {
+        model_id: String,
+        drift_score: f64,
+        p_value: f64,
+        timestamp: DateTime<Utc>,
+    },
+    /// A training job completed successfully.
+    TrainingCompleted {
+        model_id: String,
+        version: String,
+        samples_seen: usize,
+        duration_ms: u64,
+        timestamp: DateTime<Utc>,
+    },
+    /// A failure occurred during inference or training.
+    Failure {
+        model_id: String,
+        message: String,
+        timestamp: DateTime<Utc>,
+    },
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                 Observer                                   */
+/* -------------------------------------------------------------------------- */
+
+/// Error returned from any monitor implementation.
+#[derive(Debug, Error)]
+pub enum MonitorError {
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("prometheus error: {0}")]
+    #[cfg(feature = "prometheus")]
+    Prometheus(#[from] prometheus::Error),
+
+    #[error("custom error: {0}")]
+    Custom(String),
+}
+
+/// Observer trait — implemented by all monitors.
+#[async_trait::async_trait]
+pub trait Monitor: Send + Sync + 'static {
+    /// Returns a human-readable name.
+    fn name(&self) -> &str;
+
+    /// Receives new events from the bus.
+    async fn on_event(&self, event: &ModelEvent) -> Result<(), MonitorError>;
+
+    /// Called periodically; monitors may flush aggregates or push metrics.
+    async fn on_tick(&self) -> Result<(), MonitorError> {
+        let _ = event;
+        Ok(())
+    }
+
+    /// Shutdown hook for graceful termination.
+    async fn shutdown(&self) -> Result<(), MonitorError> {
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                Event Bus                                   */
+/* -------------------------------------------------------------------------- */
+
+/// Central broadcast bus forwarding events to all registered monitors.
+pub struct EventBus {
+    sender: broadcast::Sender<ModelEvent>,
+    monitors: RwLock<Vec<Arc<dyn Monitor>>>,
+    join_handles: RwLock<Vec<JoinHandle<()>>>,
+}
+
+impl Default for EventBus {
+    fn default() -> Self {
+        Self::new(DEFAULT_CHANNEL_CAPACITY)
+    }
+}
+
+impl EventBus {
+    pub fn new(capacity: usize) -> Self {
+        let (sender, _) = broadcast::channel(capacity);
+        Self {
+            sender,
+            monitors: RwLock::new(Vec::new()),
+            join_handles: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Registers a new monitor and spins up its dedicated async task.
+    pub fn register<M>(&self, monitor: M)
+    where
+        M: Monitor,
+    {
+        let monitor = Arc::new(monitor);
+        let name = monitor.name().to_string();
+        let rx = self.sender.subscribe();
+
+        self.monitors.write().push(monitor.clone());
+
+        // Spawn dedicated task.
+        let handle = tokio::spawn(async move {
+            info!(monitor = %name, "monitor task started");
+            let mut rx = rx;
+            let tick = time::interval(Duration::from_secs(5));
+
+            tokio::pin!(tick);
+
+            loop {
+                select! {
+                    biased;
+                    // shutdown when Ctrl-C
+                    _ = signal::ctrl_c() => {
+                        if let Err(e) = monitor.shutdown().await {
+                            error!(monitor = %name, "shutdown error: {e}");
+                        }
+                        break;
+                    }
+
+                    Ok(event) = rx.recv() => {
+                        if let Err(e) = monitor.on_event(&event).await {
+                            error!(monitor = %name, "on_event error: {e}");
+                        }
+                    }
+
+                    _ = tick.tick() => {
+                        if let Err(e) = monitor.on_tick().await {
+                            error!(monitor = %name, "on_tick error: {e}");
+                        }
+                    }
+                }
+            }
+
+            info!(monitor = %name, "monitor task terminated");
+        });
+
+        self.join_handles.write().push(handle);
+    }
+
+    /// Broadcasts a new event to all listeners.
+    pub fn publish(&self, event: ModelEvent) {
+        if let Err(e) = self.sender.send(event) {
+            warn!("event bus send failed: {e:?}");
+        }
+    }
+
+    /// Await all monitor tasks (usually on app shutdown).
+    pub async fn join(self) {
+        let handles = self.join_handles.into_inner();
+        for h in handles {
+            let _ = h.await;
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            Monitor Implementations                         */
+/* -------------------------------------------------------------------------- */
+
+/// A running Exponential Moving Average.
+#[derive(Debug, Default)]
+struct ExponentialMovingAverage {
+    /// Smoothing factor (0‒1).
+    alpha: f64,
+    /// Last value; `None` until first sample.
+    value: Option<f64>,
+}
+
+impl ExponentialMovingAverage {
+    fn new(alpha: f64) -> Self {
+        Self { alpha, value: None }
+    }
+
+    fn update(&mut self, sample: f64) -> f64 {
+        match self.value {
+            Some(prev) => {
+                let next = self.alpha * sample + (1.0 - self.alpha) * prev;
+                self.value = Some(next);
+                next
+            }
+            None => {
+                self.value = Some(sample);
+                sample
+            }
+        }
+    }
+
+    fn get(&self) -> Option<f64> {
+        self.value
+    }
+}
+
+/// Monitor average inference latency per model.
+pub struct LatencyMonitor {
+    ema_alpha: f64,
+    state: RwLock<HashMap<String, ExponentialMovingAverage>>,
+
+    #[cfg(feature = "prometheus")]
+    histogram: HistogramVec,
+}
+
+impl LatencyMonitor {
+    pub fn new(ema_alpha: f64) -> Self {
+        #[cfg(feature = "prometheus")]
+        let histogram = register_histogram_vec!(
+            "visutility_inference_latency_ms",
+            "Inference latency per model (ms)",
+            &["model_id"],
+            vec![10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0]
+        )
+        .expect("failed to register histogram");
+
+        Self {
+            ema_alpha,
+            state: RwLock::new(HashMap::new()),
+            #[cfg(feature = "prometheus")]
+            histogram,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Monitor for LatencyMonitor {
+    fn name(&self) -> &str {
+        "latency_monitor"
+    }
+
+    async fn on_event(&self, event: &ModelEvent) -> Result<(), MonitorError> {
+        if let ModelEvent::InferenceCompleted {
+            model_id,
+            latency_ms,
+            ..
+        } = event
+        {
+            let mut map = self.state.write();
+            let entry = map
+                .entry(model_id.clone())
+                .or_insert_with(|| ExponentialMovingAverage::new(self.ema_alpha));
+
+            let avg = entry.update(*latency_ms);
+
+            debug!(
+                model_id = %model_id,
+                latency_ms = *latency_ms,
+                ema_latency_ms = avg,
+                "updated latency monitor"
+            );
+
+            #[cfg(feature = "prometheus")]
+            {
+                self.histogram
+                    .with_label_values(&[model_id])
+                    .observe(*latency_ms);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn on_tick(&self) -> Result<(), MonitorError> {
+        let map = self.state.read();
+        for (model_id, ema) in map.iter() {
+            if let Some(avg) = ema.get() {
+                info!(
+                    model_id = %model_id,
+                    ema_latency_ms = avg,
+                    "latency monitor tick"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Drift detection via simple p-value thresholding (placeholder
+/// implementation: real detector would compute PSI, KL-divergence, etc.).
+pub struct DriftMonitor {
+    threshold: f64,
+    p_values: RwLock<HashMap<String, f64>>,
+}
+
+impl DriftMonitor {
+    pub fn new(threshold: f64) -> Self {
+        Self {
+            threshold,
+            p_values: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Monitor for DriftMonitor {
+    fn name(&self) -> &str {
+        "drift_monitor"
+    }
+
+    async fn on_event(&self, event: &ModelEvent) -> Result<(), MonitorError> {
+        if let ModelEvent::DriftDetected {
+            model_id,
+            p_value,
+            drift_score,
+            ..
+        } = event
+        {
+            self.p_values.write().insert(model_id.clone(), *p_value);
+
+            warn!(
+                model_id = %model_id,
+                p_value = *p_value,
+                drift_score = *drift_score,
+                "concept / feature drift detected"
+            );
+
+            // TODO: Push alert to incident-management system.
+        }
+
+        Ok(())
+    }
+
+    async fn on_tick(&self) -> Result<(), MonitorError> {
+        let map = self.p_values.read();
+        for (model_id, p_val) in map.iter() {
+            debug!(
+                model_id = %model_id,
+                last_p_value = *p_val,
+                "drift monitor tick"
+            );
+        }
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              Factory Pattern                               */
+/* -------------------------------------------------------------------------- */
+
+/// JSON/YAML structure describing a monitor.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MonitorConfig {
+    Latency {
+        ema_alpha: Option<f64>,
+    },
+    Drift {
+        threshold: Option<f64>,
+    },
+}
+
+impl MonitorConfig {
+    pub fn build(&self) -> Arc<dyn Monitor> {
+        match self {
+            MonitorConfig::Latency { ema_alpha } => {
+                Arc::new(LatencyMonitor::new(ema_alpha.unwrap_or(0.1)))
+            }
+            MonitorConfig::Drift { threshold } => {
+                Arc::new(DriftMonitor::new(threshold.unwrap_or(0.05)))
+            }
+        }
+    }
+}
+
+/// Factory responsible for constructing monitors from config files.
+pub struct MonitorFactory;
+
+impl MonitorFactory {
+    /// Reads monitors from raw YAML/JSON bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Vec<Arc<dyn Monitor>>, MonitorError> {
+        let cfgs: Vec<MonitorConfig> = serde_yaml::from_slice(bytes)?;
+        Ok(cfgs.into_iter().map(|c| c.build()).collect())
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                   Tests                                    */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn smoke_test_event_bus_and_monitors() {
+        let bus = EventBus::default();
+        bus.register(LatencyMonitor::new(0.2));
+        bus.register(DriftMonitor::new(0.05));
+
+        // Publish some events.
+        for i in 0..10 {
+            bus.publish(ModelEvent::InferenceCompleted {
+                model_id: "model_a".into(),
+                latency_ms: 50.0 + i as f64,
+                timestamp: Utc::now(),
+            });
+        }
+
+        bus.publish(ModelEvent::DriftDetected {
+            model_id: "model_a".into(),
+            drift_score: 0.25,
+            p_value: 0.01,
+            timestamp: Utc::now(),
+        });
+
+        // Give monitors time to process events.
+        time::sleep(Duration::from_millis(200)).await;
+    }
+
+    #[test]
+    fn factory_creates_monitors() {
+        let yaml = r#"
+            - kind: latency
+              ema_alpha: 0.3
+            - kind: drift
+              threshold: 0.1
+        "#;
+
+        let monitors = MonitorFactory::from_bytes(yaml.as_bytes()).unwrap();
+        assert_eq!(monitors.len(), 2);
+        assert_eq!(monitors[0].name(), "latency_monitor");
+        assert_eq!(monitors[1].name(), "drift_monitor");
+    }
+}
+```

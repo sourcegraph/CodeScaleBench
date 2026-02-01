@@ -1,0 +1,432 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * =========================================
+ * Module: Response Cache (in-memory LRU)
+ *
+ * This module provides an in-process, thread-safe LRU cache that is used by the
+ * API gateway layer to cache REST/GraphQL responses.  The cache is completely
+ * self contained and requires no external runtime dependencies other than the
+ * C standard library and pthreads.  The public interface is intentionally
+ * minimal to make the module easy to embed inside high-performance request
+ * paths without leaking implementation details.
+ *
+ * Compile:
+ *   cc -std=c11 -O2 -pthread -DUSE_UTHASH -c response_cache.c
+ *
+ * Author: MercuryMonolith Core Team
+ * License: MIT
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <string.h>
+#include <time.h>
+#include <errno.h>
+#include <pthread.h>
+
+#ifdef USE_UTHASH
+    /*  uthash is distributed under the Revised BSD License.
+     *  https://troydhanson.github.io/uthash/
+     */
+    #include "uthash.h"
+#else
+    #error "This file requires uthash. Define USE_UTHASH and ensure uthash.h is in your include path."
+#endif
+
+/*---------------------------------------------------------------------------*/
+/*  Logging helpers                                                          */
+/*---------------------------------------------------------------------------*/
+
+#ifndef MM_LOG
+    #define MM_LOG(fmt, ...) fprintf(stderr, "[%s:%d] " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__)
+#endif
+
+/*---------------------------------------------------------------------------*/
+/*  Type declarations                                                        */
+/*---------------------------------------------------------------------------*/
+
+typedef struct cache_entry_t {
+    /* Hash key (path + query + relevant headers). */
+    char                    *key;           /* Null-terminated.                */
+    uint8_t                 *payload;       /* Owned copy of serialized resp.  */
+    size_t                   payload_len;   /* Number of bytes in payload.     */
+    time_t                   expires_at;    /* Epoch seconds.                  */
+
+    /* Intrusive LRU doubly-linked list. */
+    struct cache_entry_t    *prev;
+    struct cache_entry_t    *next;
+
+    /* uthash handle for O(1) lookups. */
+    UT_hash_handle           hh;
+} cache_entry_t;
+
+/* The cache object. */
+typedef struct response_cache_t {
+    cache_entry_t           *table;         /* Hash table root.                */
+    cache_entry_t           *lru_head;      /* MRU end.                        */
+    cache_entry_t           *lru_tail;      /* LRU end.                        */
+    size_t                   capacity;      /* Max number of items.            */
+    size_t                   count;         /* Current number of items.        */
+
+    /* Metrics (must be atomic for lock-free collection). */
+    atomic_uint_fast64_t     hits;
+    atomic_uint_fast64_t     misses;
+    atomic_uint_fast64_t     evictions;
+
+    /* Readers–writers lock for concurrency control. */
+    pthread_rwlock_t         rwlock;
+} response_cache_t;
+
+/*---------------------------------------------------------------------------*/
+/*  Internal helpers                                                         */
+/*---------------------------------------------------------------------------*/
+
+/* Move `entry` to the MRU position (head of list). */
+static inline void
+rcache_move_to_front(response_cache_t *cache, cache_entry_t *entry)
+{
+    if (cache->lru_head == entry) return;   /* Already at front. */
+
+    /* Detach from current position. */
+    if (entry->prev) entry->prev->next = entry->next;
+    if (entry->next) entry->next->prev = entry->prev;
+    if (cache->lru_tail == entry) cache->lru_tail = entry->prev;
+
+    /* Insert at head. */
+    entry->prev = NULL;
+    entry->next = cache->lru_head;
+    if (cache->lru_head) cache->lru_head->prev = entry;
+    cache->lru_head = entry;
+
+    if (!cache->lru_tail) cache->lru_tail = entry; /* First element case. */
+}
+
+/* Remove the least-recently-used element (tail). */
+static void
+rcache_evict_lru(response_cache_t *cache)
+{
+    if (!cache->lru_tail) return;
+
+    cache_entry_t *victim = cache->lru_tail;
+
+    /* Unlink from LRU list. */
+    if (victim->prev)
+        victim->prev->next = NULL;
+    cache->lru_tail = victim->prev;
+
+    if (cache->lru_head == victim)
+        cache->lru_head = NULL;
+
+    /* Remove from hash table. */
+    HASH_DEL(cache->table, victim);
+
+    /* Free resources. */
+    free(victim->key);
+    free(victim->payload);
+    free(victim);
+
+    cache->count--;
+    atomic_fetch_add_explicit(&cache->evictions, 1, memory_order_relaxed);
+}
+
+/* Check if a cache entry is expired w.r.t. the current time. */
+static inline bool
+rcache_is_expired(const cache_entry_t *e, time_t now)
+{
+    return e->expires_at != 0 && e->expires_at <= now;
+}
+
+/*---------------------------------------------------------------------------*/
+/*  Public API                                                               */
+/*---------------------------------------------------------------------------*/
+
+/*
+ * Initialize a response cache with `capacity` items.  Returns 0 on success or
+ * an errno value on failure.
+ */
+int
+rcache_init(response_cache_t *cache, size_t capacity)
+{
+    if (!cache || capacity == 0) return EINVAL;
+
+    memset(cache, 0, sizeof(*cache));
+    cache->capacity = capacity;
+
+    if (pthread_rwlock_init(&cache->rwlock, NULL) != 0) {
+        MM_LOG("pthread_rwlock_init failed");
+        return errno;
+    }
+
+    return 0;
+}
+
+/*
+ * Free all resources associated with the cache.
+ */
+void
+rcache_destroy(response_cache_t *cache)
+{
+    if (!cache) return;
+
+    /* Acquire exclusive lock to safely iterate/free. */
+    pthread_rwlock_wrlock(&cache->rwlock);
+
+    cache_entry_t *curr, *tmp;
+    HASH_ITER(hh, cache->table, curr, tmp) {
+        HASH_DEL(cache->table, curr);
+        free(curr->key);
+        free(curr->payload);
+        free(curr);
+    }
+
+    pthread_rwlock_unlock(&cache->rwlock);
+    pthread_rwlock_destroy(&cache->rwlock);
+}
+
+/*
+ * Insert or update an entry.  If the cache is full, the LRU entry is evicted.
+ * A TTL of 0 means "no expiration".
+ *
+ * Returns 0 on success or ENOMEM.
+ */
+int
+rcache_put(response_cache_t  *cache,
+           const char        *key,
+           const void        *payload,
+           size_t             payload_len,
+           uint32_t           ttl_seconds)
+{
+    if (!cache || !key || !payload || payload_len == 0)
+        return EINVAL;
+
+    time_t now = time(NULL);
+    time_t expires = ttl_seconds ? now + ttl_seconds : 0;
+
+    /* Allocate copies outside write lock to reduce critical-section time. */
+    char *key_copy = strdup(key);
+    if (!key_copy) return ENOMEM;
+
+    uint8_t *payload_copy = malloc(payload_len);
+    if (!payload_copy) { free(key_copy); return ENOMEM; }
+    memcpy(payload_copy, payload, payload_len);
+
+    pthread_rwlock_wrlock(&cache->rwlock);
+
+    /* Check if the key already exists. */
+    cache_entry_t *entry;
+    HASH_FIND_STR(cache->table, key, entry);
+
+    if (entry) {
+        /* Update existing entry. */
+        free(entry->payload);
+        entry->payload     = payload_copy;
+        entry->payload_len = payload_len;
+        entry->expires_at  = expires;
+
+        free(key_copy); /* Key string unchanged. */
+
+        rcache_move_to_front(cache, entry);
+    } else {
+        /* Insert new entry. */
+        entry = calloc(1, sizeof(*entry));
+        if (!entry) {
+            pthread_rwlock_unlock(&cache->rwlock);
+            free(key_copy);
+            free(payload_copy);
+            return ENOMEM;
+        }
+
+        entry->key         = key_copy;
+        entry->payload     = payload_copy;
+        entry->payload_len = payload_len;
+        entry->expires_at  = expires;
+
+        /* Add to hash table. */
+        HASH_ADD_KEYPTR(hh, cache->table, entry->key, strlen(entry->key), entry);
+
+        /* Insert at MRU position. */
+        entry->next = cache->lru_head;
+        if (cache->lru_head) cache->lru_head->prev = entry;
+        cache->lru_head = entry;
+        if (!cache->lru_tail) cache->lru_tail = entry;
+
+        cache->count++;
+
+        /* Evict if over capacity. */
+        if (cache->count > cache->capacity) {
+            rcache_evict_lru(cache);
+        }
+    }
+
+    pthread_rwlock_unlock(&cache->rwlock);
+    return 0;
+}
+
+/*
+ * Retrieve a cached item.  The caller receives an allocated buffer that must
+ * be freed with `free()`.  *payload_len_out is set to the size in bytes.
+ *
+ * Returns 0 on HIT, ENOENT on MISS, or other errno for error.
+ */
+int
+rcache_get(response_cache_t  *cache,
+           const char        *key,
+           uint8_t          **payload_out,
+           size_t            *payload_len_out)
+{
+    if (!cache || !key || !payload_out || !payload_len_out)
+        return EINVAL;
+
+    time_t now = time(NULL);
+
+    pthread_rwlock_rdlock(&cache->rwlock);
+
+    cache_entry_t *entry;
+    HASH_FIND_STR(cache->table, key, entry);
+
+    if (!entry || rcache_is_expired(entry, now)) {
+        /* Miss or expired. */
+        pthread_rwlock_unlock(&cache->rwlock);
+
+        if (entry && rcache_is_expired(entry, now)) {
+            /* Upgrade to writer to remove expired entry. */
+            pthread_rwlock_wrlock(&cache->rwlock);
+            HASH_DEL(cache->table, entry);
+            if (entry->prev) entry->prev->next = entry->next;
+            if (entry->next) entry->next->prev = entry->prev;
+            if (cache->lru_head == entry) cache->lru_head = entry->next;
+            if (cache->lru_tail == entry) cache->lru_tail = entry->prev;
+            cache->count--;
+            pthread_rwlock_unlock(&cache->rwlock);
+
+            free(entry->key);
+            free(entry->payload);
+            free(entry);
+        }
+
+        atomic_fetch_add_explicit(&cache->misses, 1, memory_order_relaxed);
+        return ENOENT;
+    }
+
+    /* Cache HIT: make a copy for the caller. */
+    uint8_t *buf = malloc(entry->payload_len);
+    if (!buf) {
+        pthread_rwlock_unlock(&cache->rwlock);
+        return ENOMEM;
+    }
+    memcpy(buf, entry->payload, entry->payload_len);
+    *payload_out     = buf;
+    *payload_len_out = entry->payload_len;
+
+    /* Promote to MRU position. */
+    rcache_move_to_front(cache, entry);
+
+    pthread_rwlock_unlock(&cache->rwlock);
+    atomic_fetch_add_explicit(&cache->hits, 1, memory_order_relaxed);
+    return 0;
+}
+
+/*
+ * Remove a single entry (if present).
+ */
+void
+rcache_invalidate(response_cache_t *cache, const char *key)
+{
+    if (!cache || !key) return;
+
+    pthread_rwlock_wrlock(&cache->rwlock);
+
+    cache_entry_t *entry;
+    HASH_FIND_STR(cache->table, key, entry);
+    if (entry) {
+        HASH_DEL(cache->table, entry);
+
+        /* Unlink from LRU list. */
+        if (entry->prev) entry->prev->next = entry->next;
+        if (entry->next) entry->next->prev = entry->prev;
+        if (cache->lru_head == entry) cache->lru_head = entry->next;
+        if (cache->lru_tail == entry) cache->lru_tail = entry->prev;
+
+        cache->count--;
+    }
+
+    pthread_rwlock_unlock(&cache->rwlock);
+
+    if (entry) {
+        free(entry->key);
+        free(entry->payload);
+        free(entry);
+    }
+}
+
+/*
+ * Render Prometheus style metrics into `buf`.  Returns the number of bytes
+ * written (excluding trailing NUL) or a negative errno.
+ */
+ssize_t
+rcache_format_metrics(response_cache_t *cache, char *buf, size_t buf_len)
+{
+    if (!cache || !buf || buf_len == 0) return -EINVAL;
+
+    uint64_t hits     = atomic_load_explicit(&cache->hits, memory_order_relaxed);
+    uint64_t misses   = atomic_load_explicit(&cache->misses, memory_order_relaxed);
+    uint64_t evicts   = atomic_load_explicit(&cache->evictions, memory_order_relaxed);
+
+    int n = snprintf(buf, buf_len,
+        "# HELP rcache_hits_total Total number of cache hits\n"
+        "# TYPE rcache_hits_total counter\n"
+        "rcache_hits_total %" PRIu64 "\n"
+        "# HELP rcache_misses_total Total number of cache misses\n"
+        "# TYPE rcache_misses_total counter\n"
+        "rcache_misses_total %" PRIu64 "\n"
+        "# HELP rcache_evictions_total Total number of evicted entries\n"
+        "# TYPE rcache_evictions_total counter\n"
+        "rcache_evictions_total %" PRIu64 "\n"
+        "# HELP rcache_entries Current number of cache entries\n"
+        "# TYPE rcache_entries gauge\n"
+        "rcache_entries %zu\n",
+        hits, misses, evicts, cache->count);
+
+    if (n < 0 || (size_t)n >= buf_len) return -ENOSPC;
+    return n;
+}
+
+/*---------------------------------------------------------------------------*/
+/*  Basic self-test (can be disabled in production)                          */
+/*---------------------------------------------------------------------------*/
+#ifdef RCACHE_SELFTEST
+
+#include <assert.h>
+
+static void
+run_selftest(void)
+{
+    response_cache_t cache;
+    assert(rcache_init(&cache, 4) == 0);
+
+    const char *key = "/v1/hello";
+    const char *body = "{\"msg\":\"world\"}";
+    assert(rcache_put(&cache, key, body, strlen(body), 1) == 0);
+
+    uint8_t *out = NULL;
+    size_t len = 0;
+    assert(rcache_get(&cache, key, &out, &len) == 0);
+    assert(len == strlen(body));
+    assert(memcmp(out, body, len) == 0);
+    free(out);
+
+    /* Wait for expiration. */
+    sleep(2);
+    assert(rcache_get(&cache, key, &out, &len) == ENOENT);
+
+    rcache_destroy(&cache);
+    MM_LOG("Self-test passed");
+}
+
+int main(void) { run_selftest(); }
+
+#endif /* RCACHE_SELFTEST */

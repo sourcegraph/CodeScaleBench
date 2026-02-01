@@ -1,0 +1,374 @@
+```rust
+//! module_23 – Sentiment enrichment service (strategy-pattern based)
+//!
+//! Ingests raw social messages from Kafka, enriches them with a pluggable
+//! sentiment algorithm, and republishes the enriched payload to the next topic.
+//! Strategies can be swapped at runtime without restarting the service.
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use futures::StreamExt;
+use once_cell::sync::Lazy;
+use prometheus::{opts, CounterVec, Encoder, IntGauge, Registry, TextEncoder};
+use rdkafka::{
+    consumer::{CommitMode, Consumer, StreamConsumer},
+    message::{OwnedHeaders, ToBytes},
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Message,
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::{select, signal, task};
+use tracing::{debug, error, info, instrument};
+
+/// Topic constants (could be loaded from config as well)
+const INPUT_TOPIC: &str = "chirppulse.raw.social";
+const OUTPUT_TOPIC: &str = "chirppulse.enriched.sentiment";
+
+/// Central metrics registry
+static METRICS: Lazy<Registry> = Lazy::new(Registry::new);
+
+static SENTIMENT_COUNTER: Lazy<CounterVec> = Lazy::new(|| {
+    let c = CounterVec::new(
+        opts!("sentiment_total", "Number of processed messages by sentiment class"),
+        &["class"],
+    )
+    .expect("valid counter");
+    METRICS
+        .register(Box::new(c.clone()))
+        .expect("metrics registry");
+    c
+});
+
+static BACKLOG_GAUGE: Lazy<IntGauge> = Lazy::new(|| {
+    let g = IntGauge::new("kafka_backlog", "Kafka partition backlog").expect("valid gauge");
+    METRICS
+        .register(Box::new(g.clone()))
+        .expect("metrics registry");
+    g
+});
+
+/// Public JSON schema for incoming / outgoing data
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SocialMessage {
+    pub id: String,
+    pub user_id: String,
+    pub created_at: i64,
+    pub text: String,
+    #[serde(default)]
+    pub sentiment: Option<SentimentScore>,
+}
+
+/// A simple sentiment score struct; could be more complex in production.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SentimentScore {
+    pub polarity: f32, // -1.0 .. 1.0
+    pub magnitude: f32,
+}
+
+/// Strategy trait
+#[async_trait]
+pub trait SentimentStrategy: Send + Sync {
+    async fn score(&self, text: &str) -> Result<SentimentScore>;
+    fn name(&self) -> &'static str;
+}
+
+/// An embarrassingly simple rule-based strategy (placeholder for VADER).
+pub struct VaderStrategy;
+
+#[async_trait]
+impl SentimentStrategy for VaderStrategy {
+    #[instrument(level = "trace", skip(self, text))]
+    async fn score(&self, text: &str) -> Result<SentimentScore> {
+        let polarity = if text.contains("love") {
+            0.8
+        } else if text.contains("hate") {
+            -0.8
+        } else {
+            0.0
+        };
+        Ok(SentimentScore {
+            polarity,
+            magnitude: polarity.abs(),
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "vader"
+    }
+}
+
+/// A DL-based strategy that simulates call to an async transformer model.
+pub struct TransformerStrategy;
+
+#[async_trait]
+impl SentimentStrategy for TransformerStrategy {
+    #[instrument(level = "trace", skip(self, text))]
+    async fn score(&self, text: &str) -> Result<SentimentScore> {
+        // A real implementation would call an embedding server or ONNX runtime.
+        let start = Instant::now();
+        // Simulate latency
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let polarity = (text.len() as f32 % 200.0 - 100.0) / 100.0;
+        debug!("transformer inference took {:?}", start.elapsed());
+        Ok(SentimentScore {
+            polarity,
+            magnitude: polarity.abs(),
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "transformer"
+    }
+}
+
+/// Configuration loaded from env or config file (serde is supported)
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServiceConfig {
+    pub kafka_brokers: String,
+    #[serde(default = "default_group")]
+    pub group_id: String,
+    #[serde(default = "default_strategy")]
+    pub strategy: String,
+    #[serde(default)]
+    pub metrics_port: u16,
+}
+
+fn default_group() -> String {
+    "chirppulse.sentiment".into()
+}
+fn default_strategy() -> String {
+    "vader".into()
+}
+
+/// Factory to map strategy names to trait objects.
+/// In production this could be replaced with a dynamic loader (e.g., dylib + ABI).
+pub fn build_strategy(name: &str) -> Result<Arc<dyn SentimentStrategy>> {
+    let strat: Arc<dyn SentimentStrategy> = match name {
+        "vader" => Arc::new(VaderStrategy),
+        "transformer" => Arc::new(TransformerStrategy),
+        _ => anyhow::bail!("unknown strategy: {name}"),
+    };
+    Ok(strat)
+}
+
+/// Main processor encapsulating Kafka consumer / producer loop
+pub struct SentimentProcessor {
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+    strategy: Arc<dyn SentimentStrategy>,
+}
+
+impl SentimentProcessor {
+    pub fn new(cfg: &ServiceConfig) -> Result<Self> {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.kafka_brokers)
+            .set("group.id", &cfg.group_id)
+            .set("enable.partition.eof", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()
+            .context("create consumer")?;
+
+        consumer
+            .subscribe(&[INPUT_TOPIC])
+            .context("subscribe to topic")?;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.kafka_brokers)
+            .set("message.timeout.ms", "5000")
+            .create()
+            .context("create producer")?;
+
+        let strategy = build_strategy(&cfg.strategy)?;
+
+        info!(
+            "SentimentProcessor initialized with strategy={}",
+            strategy.name()
+        );
+
+        Ok(Self {
+            consumer,
+            producer,
+            strategy,
+        })
+    }
+
+    /// The main async loop – graceful shutdown on SIGINT / SIGTERM.
+    pub async fn run(mut self) -> Result<()> {
+        // Spawn metrics HTTP endpoint
+        if let Err(e) = spawn_metrics_server().await {
+            // Non-fatal
+            error!(?e, "failed to start metrics endpoint");
+        }
+
+        let mut msg_stream = self.consumer.stream();
+
+        loop {
+            select! {
+                biased;
+
+                _ = signal::ctrl_c() => {
+                    info!("shutdown signal received");
+                    break;
+                }
+
+                msg = msg_stream.next() => {
+                    match msg {
+                        Some(Ok(m)) => {
+                            let payload = match m.payload_view::<str>() {
+                                None | Some(Err(_)) => {
+                                    error!("invalid utf8 payload, skipping");
+                                    self.consumer.commit_message(&m, CommitMode::Async)?;
+                                    continue;
+                                }
+                                Some(Ok(s)) => s,
+                            };
+
+                            let key = m.key().map(|b| String::from_utf8_lossy(b).to_string());
+                            let partition = m.partition();
+                            let offset = m.offset();
+
+                            BACKLOG_GAUGE.set(
+                                m.topic_partition_offset()
+                                    .map(|tpo| tpo.offset().to_raw() as i64)
+                                    .unwrap_or_default(),
+                            );
+
+                            debug!(?partition, ?offset, "consumed message");
+
+                            // Deserialize JSON
+                            let mut message: SocialMessage = match serde_json::from_str(payload) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    error!(error=?e, "failed to parse json");
+                                    self.consumer.commit_message(&m, CommitMode::Async)?;
+                                    continue;
+                                }
+                            };
+
+                            // Enrichment
+                            let score = match self.strategy.score(&message.text).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    error!(error=?e, "sentiment scoring failed");
+                                    // Do not propagate bad message
+                                    self.consumer.commit_message(&m, CommitMode::Async)?;
+                                    continue;
+                                }
+                            };
+
+                            // Metrics
+                            if score.polarity > 0.05 {
+                                SENTIMENT_COUNTER.with_label_values(&["positive"]).inc();
+                            } else if score.polarity < -0.05 {
+                                SENTIMENT_COUNTER.with_label_values(&["negative"]).inc();
+                            } else {
+                                SENTIMENT_COUNTER.with_label_values(&["neutral"]).inc();
+                            }
+
+                            message.sentiment = Some(score);
+
+                            // Serialize back to JSON
+                            let out_payload = match serde_json::to_vec(&message) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    error!(error=?e, "json serialization failed");
+                                    self.consumer.commit_message(&m, CommitMode::Async)?;
+                                    continue;
+                                }
+                            };
+
+                            // Produce
+                            let record = FutureRecord::to(OUTPUT_TOPIC)
+                                .payload(&out_payload)
+                                .key(key.as_deref().unwrap_or_default())
+                                .headers(
+                                    OwnedHeaders::new()
+                                        .add("processed-by", self.strategy.name()),
+                                );
+
+                            // Fire and forget
+                            let _ = self.producer.send(record, Duration::from_secs(0)).await;
+
+                            // Commit offset
+                            self.consumer.commit_message(&m, CommitMode::Async)?;
+                        }
+                        Some(Err(e)) => {
+                            error!(error=?e, "kafka error");
+                        }
+                        None => {
+                            // Stream ended – unlikely
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        info!("processor loop exited");
+        Ok(())
+    }
+}
+
+/// Spawns a small HTTP server exporting Prometheus metrics
+async fn spawn_metrics_server() -> Result<()> {
+    use hyper::{
+        service::{make_service_fn, service_fn},
+        Body, Request, Response, Server,
+    };
+
+    let addr = ([0, 0, 0, 0], 9900).into();
+
+    let make_svc = make_service_fn(|_conn| async {
+        Ok::<_, hyper::Error>(service_fn(|_req: Request<Body>| async move {
+            let encoder = TextEncoder::new();
+            let mf = METRICS.gather();
+            let mut buffer = vec![];
+            encoder.encode(&mf, &mut buffer).unwrap_or_default();
+            Ok::<_, hyper::Error>(Response::new(Body::from(buffer)))
+        }))
+    });
+
+    task::spawn(async move {
+        if let Err(e) = Server::bind(&addr).serve(make_svc).await {
+            error!(error=?e,"metrics server exited");
+        }
+    });
+
+    info!("metrics exported on http://{addr}/metrics");
+    Ok(())
+}
+
+// ----- Entrypoint (only compiled for binary target) -------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_vader_positive() {
+        let s = VaderStrategy;
+        let res = s.score("I love Rust!").await.unwrap();
+        assert!(res.polarity > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_transformer_any() {
+        let s = TransformerStrategy;
+        let res = s.score("some text").await.unwrap();
+        assert!((-1.0..=1.0).contains(&res.polarity));
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
+    // For brevity, load config from env
+    let cfg = envy::from_env::<ServiceConfig>().context("while parsing env")?;
+    let processor = SentimentProcessor::new(&cfg)?;
+    processor.run().await
+}
+```

@@ -1,0 +1,383 @@
+```rust
+//! src/module_22.rs
+//!
+//! Query handler and supporting types for listing ledger entries with:
+//!   • Multi–tenant authentication context
+//!   • Request-level validation
+//!   • Pagination helpers
+//!   • Redis response-caching
+//!   • Structured logging (`tracing`)
+//!
+//! NOTE: In a real code base this file would be split into several smaller
+//! modules, but for demonstration purposes everything is kept in one file.
+
+use std::time::Duration;
+use std::{fmt, sync::Arc};
+
+use chrono::{DateTime, Utc};
+use deadpool_redis::{
+    redis::{AsyncCommands, FromRedisValue, RedisError, ToRedisArgs},
+    Pool as RedisPool,
+};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgRow, FromRow, PgPool, Row};
+use thiserror::Error;
+use tracing::{debug, error, info, instrument};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Domain layer
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Ledger entry domain model (stored in PostgreSQL).
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct LedgerEntry {
+    pub id:          Uuid,
+    pub tenant_id:   Uuid,
+    pub account_id:  Uuid,
+    pub amount:      i64, // stored in cents per accounting guidelines
+    pub currency:    String,
+    pub entry_date:  DateTime<Utc>,
+    pub description: String,
+}
+
+/// Repository trait for the domain model.
+///
+/// A command/query service layer depends on this trait instead of concrete DB
+/// technology, facilitating unit tests and future migrations.
+#[async_trait::async_trait]
+pub trait LedgerEntryRepository: Send + Sync + 'static {
+    async fn list_entries(
+        &self,
+        tenant_id: Uuid,
+        pagination: Pagination,
+    ) -> Result<Vec<LedgerEntry>, LedgerError>;
+}
+
+/// PostgreSQL implementation of `LedgerEntryRepository`.
+pub struct PgLedgerEntryRepository {
+    pool: PgPool,
+}
+
+impl PgLedgerEntryRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl LedgerEntryRepository for PgLedgerEntryRepository {
+    #[instrument(name = "repository.list_entries", skip(self))]
+    async fn list_entries(
+        &self,
+        tenant_id: Uuid,
+        pagination: Pagination,
+    ) -> Result<Vec<LedgerEntry>, LedgerError> {
+        let rows = sqlx::query_as::<_, LedgerEntry>(
+            r#"
+            SELECT *
+            FROM ledger_entries
+            WHERE tenant_id = $1
+            ORDER BY entry_date DESC, id       -- deterministic ordering
+            OFFSET $2
+            LIMIT  $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(pagination.offset())
+        .bind(pagination.limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// View-Models and validation
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Raw query parameters coming from the transport layer (e.g. REST or GraphQL)
+/// before validation.
+#[derive(Debug, Deserialize, Validate)]
+pub struct ListLedgerEntriesParams {
+    /// 1-based page number (default 1).
+    #[validate(range(min = 1, max = 10_000))]
+    pub page: Option<u32>,
+
+    /// Page size (default 50, max 500).
+    #[validate(range(min = 1, max = 500))]
+    pub per_page: Option<u32>,
+}
+
+/// Paginated response wrapper following Nexus guidelines.
+#[derive(Debug, Serialize)]
+pub struct Page<T> {
+    pub data:       Vec<T>,
+    pub pagination: PaginationMeta,
+}
+
+/// Additional pagination metadata consumers rely on for UI rendering.
+#[derive(Debug, Serialize)]
+pub struct PaginationMeta {
+    pub page:        u32,
+    pub per_page:    u32,
+    pub next_page:   Option<u32>,
+    pub has_more:    bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Pagination {
+    pub page:     u32,
+    pub per_page: u32,
+}
+
+impl Pagination {
+    pub const DEFAULT_PAGE: u32     = 1;
+    pub const DEFAULT_PER_PAGE: u32 = 50;
+
+    pub fn from_params(params: &ListLedgerEntriesParams) -> Self {
+        Self {
+            page:     params.page.unwrap_or(Self::DEFAULT_PAGE),
+            per_page: params.per_page.unwrap_or(Self::DEFAULT_PER_PAGE),
+        }
+    }
+
+    /// SQL offset = (page-1) * per_page
+    pub fn offset(&self) -> i64 {
+        ((self.page.saturating_sub(1)) * self.per_page) as i64
+    }
+
+    /// to expose externally
+    pub fn limit(&self) -> i64 {
+        self.per_page as i64
+    }
+}
+
+/// Public view DTO. Keeps our HTTP contract stable even if domain‐model
+/// internals change.
+#[derive(Debug, Serialize)]
+pub struct LedgerEntryDto {
+    pub id:          Uuid,
+    pub account_id:  Uuid,
+    pub amount:      i64,
+    pub currency:    String,
+    pub entry_date:  DateTime<Utc>,
+    pub description: String,
+}
+
+impl From<LedgerEntry> for LedgerEntryDto {
+    fn from(e: LedgerEntry) -> Self {
+        Self {
+            id: e.id,
+            account_id: e.account_id,
+            amount: e.amount,
+            currency: e.currency,
+            entry_date: e.entry_date,
+            description: e.description,
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Service layer (CQRS)
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Encapsulates the dependencies for the query handler.
+pub struct LedgerService<R: LedgerEntryRepository> {
+    repo:      Arc<R>,
+    redis:     RedisPool,
+    cache_ttl: Duration,
+}
+
+impl<R: LedgerEntryRepository> LedgerService<R> {
+    pub fn new(repo: Arc<R>, redis: RedisPool, cache_ttl: Duration) -> Self {
+        Self { repo, redis, cache_ttl }
+    }
+
+    /// List ledger entries for current tenant with cache & pagination.
+    #[instrument(name = "service.list_ledger_entries", skip(self, ctx))]
+    pub async fn list_ledger_entries(
+        &self,
+        ctx: &TenantContext,
+        params: ListLedgerEntriesParams,
+    ) -> Result<Page<LedgerEntryDto>, LedgerError> {
+        params.validate()?;
+
+        let pagination = Pagination::from_params(&params);
+        let cache_key  = CacheKey::new(ctx.tenant_id, pagination);
+
+        // 1/3  – optimistic cache short-circuit
+        if let Some(cached) = self.get_cache::<Page<LedgerEntryDto>>(&cache_key).await? {
+            debug!(?cache_key, "hit redis cache");
+            return Ok(cached);
+        }
+        debug!(?cache_key, "redis miss – querying database");
+
+        // 2/3  – fallback to repository
+        let entries   = self.repo.list_entries(ctx.tenant_id, pagination).await?;
+        let has_more  = entries.len() as u32 == pagination.per_page;
+        let next_page = if has_more { Some(pagination.page + 1) } else { None };
+        let page      = Page {
+            data: entries.into_iter().map(LedgerEntryDto::from).collect(),
+            pagination: PaginationMeta {
+                page: pagination.page,
+                per_page: pagination.per_page,
+                next_page,
+                has_more,
+            },
+        };
+
+        // 3/3 – best-effort cache store (error ignored but logged)
+        if let Err(e) = self.set_cache(&cache_key, &page).await {
+            error!(?e, "unable to store page in redis");
+        }
+        Ok(page)
+    }
+
+    // Redis helpers ------------------------------------------------------------------------------
+
+    async fn get_cache<T>(&self, key: &CacheKey) -> Result<Option<T>, LedgerError>
+    where
+        for<'de> T: Deserialize<'de> + Send,
+    {
+        let mut conn = self.redis.get().await?;
+        let buf: Option<Vec<u8>> = conn.get(key.to_redis_key()).await?;
+        match buf {
+            Some(raw) => {
+                let value = bincode::deserialize::<T>(&raw)?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn set_cache<T>(&self, key: &CacheKey, value: &T) -> Result<(), LedgerError>
+    where
+        T: Serialize + ?Sized,
+    {
+        let mut conn = self.redis.get().await?;
+        let bytes    = bincode::serialize(value)?;
+        conn
+            .set_ex(key.to_redis_key(), bytes, self.cache_ttl.as_secs() as usize)
+            .await?;
+        Ok(())
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Authentication / Context
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Lightweight tenant context extracted by the API gateway auth middleware.
+#[derive(Debug, Clone)]
+pub struct TenantContext {
+    pub user_id:   Uuid,
+    pub tenant_id: Uuid,
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Cache keys
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Strongly-typed, structured cache key so we don’t accidentally clash
+/// different serialized types in Redis.
+#[derive(Debug)]
+struct CacheKey {
+    tenant_id: Uuid,
+    page:      u32,
+    per_page:  u32,
+}
+
+impl CacheKey {
+    pub fn new(tenant_id: Uuid, pagination: Pagination) -> Self {
+        Self {
+            tenant_id,
+            page: pagination.page,
+            per_page: pagination.per_page,
+        }
+    }
+
+    pub fn to_redis_key(&self) -> String {
+        // redis key pattern: ledger_entries:{tenant}:{page}:{per_page}
+        format!(
+            "ledger_entries:{}:{}:{}",
+            self.tenant_id, self.page, self.per_page
+        )
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Error handling
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Error)]
+pub enum LedgerError {
+    #[error("input validation failed: {0}")]
+    Validation(#[from] validator::ValidationErrors),
+
+    #[error("database query failed: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("redis error: {0}")]
+    Redis(#[from] RedisError),
+
+    #[error("serialization error: {0}")]
+    Serialization(#[from] bincode::Error),
+}
+
+impl actix_web::ResponseError for LedgerError {
+    fn error_response(&self) -> actix_web::HttpResponse {
+        use actix_web::http::StatusCode;
+        use actix_web::HttpResponse;
+
+        let code = match self {
+            LedgerError::Validation(_) => StatusCode::BAD_REQUEST,
+            LedgerError::Database(_)   => StatusCode::INTERNAL_SERVER_ERROR,
+            LedgerError::Redis(_)      => StatusCode::BAD_GATEWAY,
+            LedgerError::Serialization(_)=> StatusCode::INTERNAL_SERVER_ERROR,
+        };
+
+        let body = serde_json::json!({
+            "error": {
+                "type":   self.name(),
+                "message": self.to_string(),
+            }
+        });
+
+        HttpResponse::build(code).json(body)
+    }
+}
+
+impl LedgerError {
+    /// Shorthand error discriminator used by envelope.
+    fn name(&self) -> &'static str {
+        match self {
+            LedgerError::Validation(_)     => "ValidationError",
+            LedgerError::Database(_)       => "DatabaseError",
+            LedgerError::Redis(_)          => "RedisError",
+            LedgerError::Serialization(_)  => "SerializationError",
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Integration tests (requires `--features test`)
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deadpool_redis::Runtime;
+    use std::env;
+
+    #[actix_rt::test]
+    async fn test_pagination_offset() {
+        let p = Pagination { page: 3, per_page: 25 };
+        assert_eq!(p.offset(), 50);
+    }
+
+    // Additional tests would mock repository + redis using `mockall` or similar.
+}
+```

@@ -1,0 +1,453 @@
+```rust
+//! LedgerLink Nexus – Ledger Entry Query Module
+//!
+//! This source file is intentionally named `module_62.txt` so it can be dropped
+//! into the `src/` folder of the workspace while still compiling as a normal
+//! Rust module (Cargo treats any `*.rs` file inside `src/` as a root module,
+//! but we can `include!` or `mod`-rename this file from `lib.rs`/`main.rs`).
+//!
+//! The module implements a high-volume, read-optimised query service for ledger
+//! entries.  It demonstrates the following cross-cutting concerns requested in
+//! the project brief:
+//!
+//! * Pagination + typed DTOs
+//! * Centralised validation
+//! * Response-level caching (ETag / max-age)
+//! * Decoupled repository pattern
+//! * Structured error envelopes
+//! * Extensive logging with tracing
+//!
+//! # Usage
+//!
+//! ```rust,ignore
+//! use crate::ledger_entry_query::LedgerEntryQueryService;
+//!
+//! async fn handler<S, R>(svc: &LedgerEntryQueryService<S, R>) -> HttpResponse
+//! where
+//!     S: ClockSource + Send + Sync,
+//!     R: LedgerEntryRepository + Send + Sync,
+//! {
+//!     let req = LedgerEntryListRequestView::new(Some("ACC-1"), None, 1, 50)?;
+//!     let res = svc.list(req).await?;
+//!     Ok(HttpResponse::Ok().json(res))
+//! }
+//! ```
+//!
+//! Note: All `Result` aliases point to `LedgerQueryError` for ergonomic usage.
+
+#![allow(clippy::module_inception)] // because of the .txt name
+#![allow(dead_code)]
+
+use async_trait::async_trait;
+use chrono::{DateTime, Duration, Utc};
+use lru::LruCache;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::hash_map::DefaultHasher;
+use std::fmt::{self, Display, Formatter};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::sync::Mutex;
+use tracing::{error, info, instrument, warn};
+use uuid::Uuid;
+use validator::{Validate, ValidationErrors};
+
+/// A UTC timestamp alias used across the domain.
+pub type Timestamp = DateTime<Utc>;
+
+/// -------------- DOMAIN MODEL ------------------------------------------------
+
+/// Immutable domain model representing a ledger entry.
+///
+/// NOTE: In a real-world system this would live in the `domain` crate; we
+/// duplicate here to make the example self-contained.
+#[derive(Clone, Debug, Serialize)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub account_id: String,
+    pub amount_minor: i64, // Stored in minor units (e.g. cents)
+    pub currency: String,
+    pub posted_at: Timestamp,
+    pub narrative: Option<String>,
+}
+
+/// Domain error used by repository/service layers.
+#[derive(Debug, Error)]
+pub enum LedgerQueryError {
+    #[error("validation error: {0}")]
+    Validation(#[from] ValidationErrors),
+    #[error("repository error: {0}")]
+    Repository(#[from] RepositoryError),
+    #[error("internal service error: {0}")]
+    Internal(String),
+}
+
+/// -------------- DATA TRANSFER OBJECTS (DTOs) --------------------------------
+
+/// Pagination request. Page numbers start at 1 in the external contract.
+#[derive(Clone, Debug, Serialize, Deserialize, Validate)]
+pub struct PaginationRequest {
+    #[validate(range(min = 1, max = 10000))]
+    pub page: u32,
+    #[validate(range(min = 1, max = 500))]
+    pub per_page: u32,
+}
+
+impl PaginationRequest {
+    pub fn offset_limit(&self) -> (u32, u32) {
+        let offset = (self.page - 1) * self.per_page;
+        (offset, self.per_page)
+    }
+}
+
+/// Filterable list request DTO.
+#[derive(Clone, Debug, Serialize, Deserialize, Validate)]
+pub struct LedgerEntryListRequestView {
+    /// Filter by Account ID (optional).
+    #[validate(length(min = 1, max = 64))]
+    pub account_id: Option<String>,
+
+    /// Filter by Currency (optional ISO-4217 code).
+    #[validate(length(equal = 3))]
+    pub currency: Option<String>,
+
+    /// Pagination settings.
+    #[validate]
+    pub pagination: PaginationRequest,
+}
+
+impl LedgerEntryListRequestView {
+    pub fn new(
+        account_id: Option<impl Into<String>>,
+        currency: Option<impl Into<String>>,
+        page: u32,
+        per_page: u32,
+    ) -> Result<Self, LedgerQueryError> {
+        let dto = Self {
+            account_id: account_id.map(Into::into),
+            currency: currency.map(Into::into),
+            pagination: PaginationRequest { page, per_page },
+        };
+
+        dto.validate()?;
+        Ok(dto)
+    }
+}
+
+/// LedgerEntry DTO exposed by the API.
+///
+/// We convert minor units to decimal strings here (e.g. "123.45").
+#[derive(Clone, Debug, Serialize)]
+pub struct LedgerEntryView {
+    pub id: Uuid,
+    pub account_id: String,
+    pub amount: String,
+    pub currency: String,
+    pub posted_at: Timestamp,
+    pub narrative: Option<String>,
+}
+
+impl From<LedgerEntry> for LedgerEntryView {
+    fn from(e: LedgerEntry) -> Self {
+        Self {
+            id: e.id,
+            account_id: e.account_id,
+            amount: minor_to_decimal(e.amount_minor),
+            currency: e.currency,
+            posted_at: e.posted_at,
+            narrative: e.narrative,
+        }
+    }
+}
+
+/// Final paginated response envelope with caching hints.
+#[derive(Clone, Debug, Serialize)]
+pub struct LedgerEntryListResponse {
+    pub data: Vec<LedgerEntryView>,
+    pub page: u32,
+    pub per_page: u32,
+    pub total: u64,
+    pub etag: String,
+    pub cache_max_age: u64,
+}
+
+/// -------------- REPOSITORY TRAIT -------------------------------------------
+
+/// Repository-level error.
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("database connection issue")]
+    Connection,
+
+    #[error("query execution failed: {0}")]
+    Query(String),
+
+    #[error("timeout")]
+    Timeout,
+}
+
+/// Strongly-typed filter that matches the DTO.
+#[derive(Clone, Debug)]
+pub struct LedgerEntryFilter {
+    pub account_id: Option<String>,
+    pub currency: Option<String>,
+}
+
+/// Normalised pagination back-channel for repository.
+#[derive(Clone, Debug)]
+pub struct Pagination {
+    pub offset: u32,
+    pub limit: u32,
+}
+
+/// Result returned from repository layer with total count for client-side
+/// pagination.
+#[derive(Clone, Debug)]
+pub struct Paginated<T> {
+    pub rows: Vec<T>,
+    pub total: u64,
+}
+
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync + 'static {
+    async fn fetch(
+        &self,
+        filter: LedgerEntryFilter,
+        pagination: Pagination,
+    ) -> Result<Paginated<LedgerEntry>, RepositoryError>;
+}
+
+/// -------------- CLOCK SOURCE (TESTABLE TIME) -------------------------------
+
+/// The service doesn’t use `Utc::now()` directly; instead we accept a `Clock`
+/// abstraction for better testability & determinism.
+#[async_trait]
+pub trait ClockSource: Send + Sync + 'static {
+    async fn now(&self) -> Timestamp;
+}
+
+#[derive(Default)]
+pub struct SystemClock;
+
+#[async_trait]
+impl ClockSource for SystemClock {
+    async fn now(&self) -> Timestamp {
+        Utc::now()
+    }
+}
+
+/// -------------- IN-MEM CACHE ------------------------------------------------
+
+type CacheKey = u64;
+type CacheValue = Arc<LedgerEntryListResponse>;
+
+/// Thread-safe LRU cache wrapper. Using `tokio::sync::Mutex` allows async code
+/// to await without blocking other tasks on the same executor.
+pub struct ResponseCache {
+    inner: Mutex<LruCache<CacheKey, CacheValue>>,
+}
+
+impl ResponseCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(LruCache::new(capacity)),
+        }
+    }
+
+    /// Returns cached item if available.
+    pub async fn get(&self, key: CacheKey) -> Option<CacheValue> {
+        self.inner.lock().await.get(&key).cloned()
+    }
+
+    /// Stores a new item in cache.
+    pub async fn put(&self, key: CacheKey, value: CacheValue) {
+        self.inner.lock().await.put(key, value);
+    }
+}
+
+/// Hash function to generate stable cache keys based on request DTO.
+fn calculate_cache_key(request: &LedgerEntryListRequestView) -> CacheKey {
+    let mut hasher = DefaultHasher::new();
+    request.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Generate an ETag using SHA-256 of the concatenated row IDs & timestamps.
+///
+/// This is deterministic and inexpensive enough for demo purposes.
+fn calculate_etag(entries: &[LedgerEntry]) -> String {
+    let mut sha = Sha256::new();
+    for e in entries {
+        sha.update(e.id.as_bytes());
+        sha.update(e.posted_at.timestamp_millis().to_le_bytes());
+    }
+    format!("{:x}", sha.finalize())
+}
+
+/// -------------- SERVICE IMPLEMENTATION -------------------------------------
+
+/// Public service that wires together repository, clock and response cache.
+///
+/// We keep dependencies generic so the service can be unit-tested with an
+/// in-memory repository and deterministic clock.
+pub struct LedgerEntryQueryService<C, R>
+where
+    C: ClockSource,
+    R: LedgerEntryRepository,
+{
+    clock: Arc<C>,
+    repo: Arc<R>,
+    cache: Arc<ResponseCache>,
+    cache_ttl: Duration,
+}
+
+impl<C, R> LedgerEntryQueryService<C, R>
+where
+    C: ClockSource,
+    R: LedgerEntryRepository,
+{
+    /// Construct a new service instance.
+    ///
+    /// * `cache_ttl` – Duration that a response may live inside the in-memory
+    ///   LRU cache.  NOTE: This is separate from the client-facing `max_age`;
+    ///   you may want to shorten in-process caching to free memory sooner.
+    pub fn new(clock: Arc<C>, repo: Arc<R>, cache_capacity: usize, cache_ttl: Duration) -> Self {
+        Self {
+            clock,
+            repo,
+            cache: Arc::new(ResponseCache::new(cache_capacity)),
+            cache_ttl,
+        }
+    }
+
+    /// High-level orchestrator function for `GET /ledger_entries`.
+    ///
+    /// Returns a paginated response DTO with ETag and `max_age` hints.  Performs
+    /// request validation, caching and repository calls.
+    #[instrument(name = "ledger_entry_query_service.list", skip(self))]
+    pub async fn list(
+        &self,
+        request: LedgerEntryListRequestView,
+    ) -> Result<LedgerEntryListResponse, LedgerQueryError> {
+        // Step 1: Validate (already done by DTO's `new()`, but keep for safety).
+        request.validate()?;
+
+        // Step 2: Check cache.
+        let cache_key = calculate_cache_key(&request);
+        if let Some(cached) = self.cache.get(cache_key).await {
+            info!("cache hit for key={cache_key}");
+            return Ok((*cached).clone());
+        }
+        info!("cache miss for key={cache_key}");
+
+        // Step 3: Repository call.
+        let (offset, limit) = request.pagination.offset_limit();
+        let filter = LedgerEntryFilter {
+            account_id: request.account_id.clone(),
+            currency: request.currency.clone(),
+        };
+
+        let PaginationRequest { page, per_page } = request.pagination;
+        let pagination = Pagination { offset, limit };
+
+        let Paginated { rows, total } = self.repo.fetch(filter, pagination).await?;
+
+        // Step 4: Map domain -> view.
+        let data: Vec<LedgerEntryView> = rows.clone().into_iter().map(Into::into).collect();
+
+        // Step 5: Cache metadata.
+        let etag = calculate_etag(&rows);
+        let cache_max_age = self.cache_ttl.num_seconds() as u64;
+
+        let response = LedgerEntryListResponse {
+            data,
+            page,
+            per_page,
+            total,
+            etag,
+            cache_max_age,
+        };
+
+        // Step 6: Insert into cache.
+        self.cache
+            .put(cache_key, Arc::new(response.clone()))
+            .await;
+
+        Ok(response)
+    }
+}
+
+/// -------------- HELPER FUNCTIONS -------------------------------------------
+
+/// Convert minor units (i64) to decimal string (e.g. 12345 -> "123.45").
+fn minor_to_decimal(minor: i64) -> String {
+    let sign = if minor < 0 { "-" } else { "" };
+    let abs = minor.abs();
+    let units = abs / 100;
+    let cents = abs % 100;
+    format!("{sign}{units}.{cents:02}")
+}
+
+/// -------------- UNIT TESTS --------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// In-memory stub repository that increments an internal counter so we can
+    /// assert cache hits vs. DB hits easily.
+    struct StubRepo {
+        rows: Vec<LedgerEntry>,
+        calls: AtomicU64,
+    }
+
+    #[async_trait]
+    impl LedgerEntryRepository for StubRepo {
+        async fn fetch(
+            &self,
+            _filter: LedgerEntryFilter,
+            pagination: Pagination,
+        ) -> Result<Paginated<LedgerEntry>, RepositoryError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let slice = &self.rows
+                [pagination.offset as usize..(pagination.offset + pagination.limit) as usize];
+            Ok(Paginated {
+                rows: slice.to_vec(),
+                total: self.rows.len() as u64,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_hit() -> Result<(), LedgerQueryError> {
+        let entries = (0..10)
+            .map(|i| LedgerEntry {
+                id: Uuid::new_v4(),
+                account_id: "ACC-1".into(),
+                amount_minor: i * 10,
+                currency: "USD".into(),
+                posted_at: Utc::now(),
+                narrative: None,
+            })
+            .collect::<Vec<_>>();
+
+        let repo = Arc::new(StubRepo {
+            rows: entries,
+            calls: AtomicU64::new(0),
+        });
+
+        let clock = Arc::new(SystemClock);
+        let service = LedgerEntryQueryService::new(clock, repo.clone(), 16, Duration::seconds(5));
+
+        let req = LedgerEntryListRequestView::new(Some("ACC-1"), None, 1, 5)?;
+
+        let _ = service.list(req.clone()).await?;
+        let _ = service.list(req.clone()).await?; // second call should hit cache.
+
+        assert_eq!(repo.calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+}
+```

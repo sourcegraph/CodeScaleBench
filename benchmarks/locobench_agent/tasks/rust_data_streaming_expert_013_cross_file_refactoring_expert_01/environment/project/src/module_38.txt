@@ -1,0 +1,287 @@
+```rust
+//! src/module_38.rs
+//!
+//! Hot-swappable sentiment-analysis strategy registry for ChirpPulse.
+//!
+//! This module demonstrates a production-grade implementation of the
+//! Strategy Pattern that allows data-scientists to switch the active
+//! sentiment-analysis algorithm *at runtime* without interrupting the
+//! streaming jobs.  
+//!
+//! Highlights
+//! ----------
+//! • Thread-safe, lock-free reads of the active strategy (ArcSwap).  
+//! • Zero-downtime hot-swap triggered by file-system events (`notify`).  
+//! • Declarative configuration via TOML.  
+//! • Observability ready: structured logging (`tracing`) & metrics (`metrics`).  
+//! • Fall-back to last-known-good strategy on load failure.  
+//!
+//! ```toml
+//! # sentiment.toml
+//! active = "naive_bayes"   # or "rule_based"
+//! ```
+
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use ahash::AHashMap;
+use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
+use metrics::{counter, gauge};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use once_cell::sync::Lazy;
+use serde::Deserialize;
+use thiserror::Error;
+use tokio::{
+    sync::mpsc::{self, UnboundedReceiver},
+    task,
+};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Score returned by any [`SentimentAnalyzer`].
+#[derive(Debug, Clone, Copy)]
+pub struct SentimentScore {
+    /// Polarity in range [-1.0, 1.0].
+    pub polarity: f32,
+    /// Intensity in range [0.0, 1.0].
+    pub magnitude: f32,
+}
+
+impl SentimentScore {
+    pub const NEUTRAL: SentimentScore = SentimentScore {
+        polarity: 0.0,
+        magnitude: 0.0,
+    };
+}
+
+/// Strategy trait implemented by all algorithms.
+pub trait SentimentAnalyzer: Send + Sync + 'static {
+    /// Human-readable name (unique).
+    fn name(&self) -> &'static str;
+
+    /// Analyze raw text and return a [`SentimentScore`].
+    fn analyze(&self, text: &str) -> SentimentScore;
+}
+
+/// Naïve Bayes demo implementation.
+#[derive(Default)]
+pub struct NaiveBayesAnalyzer;
+
+impl SentimentAnalyzer for NaiveBayesAnalyzer {
+    fn name(&self) -> &'static str {
+        "naive_bayes"
+    }
+
+    fn analyze(&self, text: &str) -> SentimentScore {
+        // ⚠️  Fake logic for demonstration purposes.
+        let polarity = if text.contains("good") { 0.7 } else { -0.3 };
+        SentimentScore {
+            polarity,
+            magnitude: polarity.abs(),
+        }
+    }
+}
+
+/// Rule-based demo implementation.
+#[derive(Default)]
+pub struct RuleBasedAnalyzer;
+
+impl SentimentAnalyzer for RuleBasedAnalyzer {
+    fn name(&self) -> &'static str {
+        "rule_based"
+    }
+
+    fn analyze(&self, text: &str) -> SentimentScore {
+        let lowered = text.to_ascii_lowercase();
+        let polarity = match () {
+            _ if lowered.contains("love") => 1.0,
+            _ if lowered.contains("hate") => -1.0,
+            _ => 0.0,
+        };
+        SentimentScore {
+            polarity,
+            magnitude: polarity.abs(),
+        }
+    }
+}
+
+/// Holder for active strategy using lock-free reads.
+static ACTIVE_ANALYZER: Lazy<ArcSwap<dyn SentimentAnalyzer>> =
+    Lazy::new(|| ArcSwap::from_pointee(NaiveBayesAnalyzer::default()));
+
+/// Name → constructor map used during hot-swap.
+static ANALYZER_FACTORY: Lazy<AHashMap<&'static str, fn() -> Arc<dyn SentimentAnalyzer>>> =
+    Lazy::new(|| {
+        let mut map: AHashMap<_, _> = AHashMap::new();
+        map.insert("naive_bayes", || Arc::new(NaiveBayesAnalyzer::default()));
+        map.insert("rule_based", || Arc::new(RuleBasedAnalyzer::default()));
+        map
+    });
+
+/// Errors that can occur while handling configuration.
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("Unsupported analyzer \"{0}\"")]
+    UnsupportedAnalyzer(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    TomlDe(#[from] toml::de::Error),
+}
+
+/// Parsed TOML model.
+#[derive(Debug, Deserialize)]
+struct AnalyzerConfig {
+    active: String,
+}
+
+/// Public API: analyze text using current strategy.
+#[inline]
+pub fn analyze(text: &str) -> SentimentScore {
+    // lock-free deref
+    ACTIVE_ANALYZER.load().analyze(text)
+}
+
+/// Replace active analyzer; gauges + logs.
+fn swap_strategy(new_analyzer: Arc<dyn SentimentAnalyzer>) {
+    let prev = ACTIVE_ANALYZER.swap(new_analyzer);
+    info!(
+        old = prev.name(),
+        new = ACTIVE_ANALYZER.load().name(),
+        "Sentiment strategy swapped"
+    );
+    gauge!("chirp_pulse.sentiment.strategy", 1.0, "name" => ACTIVE_ANALYZER.load().name());
+}
+
+/// Load strategy from a TOML file and hot-swap.
+///
+/// Returns Ok(true) if a swap occurred.
+#[instrument(skip(path))]
+fn load_and_apply<P: AsRef<Path>>(path: P) -> Result<bool, ConfigError> {
+    let raw = fs::read_to_string(&path)?;
+    let cfg: AnalyzerConfig = toml::from_str(&raw)?;
+    let desired = cfg.active.trim();
+
+    if desired == ACTIVE_ANALYZER.load().name() {
+        debug!("Strategy unchanged: {}", desired);
+        return Ok(false);
+    }
+
+    let ctor = ANALYZER_FACTORY
+        .get(desired)
+        .ok_or_else(|| ConfigError::UnsupportedAnalyzer(desired.into()))?;
+
+    let new_instance = ctor();
+    swap_strategy(new_instance);
+    Ok(true)
+}
+
+/// Spawn async watcher that monitors a config file
+/// and triggers hot-swap on change.
+///
+/// Executes an initial load before watching.
+///
+/// # Panics
+/// Panics if the watcher thread cannot be spawned.
+pub fn spawn_hot_swapper<P: Into<PathBuf>>(config_path: P) {
+    let path = config_path.into();
+
+    // Channel for file events.
+    let (tx, rx) = mpsc::unbounded_channel::<notify::Result<notify::Event>>();
+
+    // Set up blocking watcher in its own std thread
+    std::thread::spawn({
+        let path = path.clone();
+        move || {
+            // notify requires a synchronous watcher on this thread
+            let mut watcher: RecommendedWatcher =
+                Watcher::new(tx, Duration::from_secs(2)).expect("failed to create watcher");
+            watcher
+                .watch(&path, RecursiveMode::NonRecursive)
+                .expect("failed to watch file");
+            // Block forever
+            std::thread::park();
+        }
+    });
+
+    // Spawn async task to receive events
+    task::spawn(async move {
+        // Do initial load
+        if let Err(e) = load_and_apply(&path) {
+            error!(error = ?e, "Initial strategy load failed; using default");
+        }
+
+        process_events(rx, path).await;
+    });
+}
+
+/// Event loop that coalesces file-events to avoid double reload.
+async fn process_events(mut rx: UnboundedReceiver<notify::Result<notify::Event>>, path: PathBuf) {
+    use tokio::time::{sleep, Instant};
+
+    const DEBOUNCE_MS: u64 = 300;
+    let mut last_event = Instant::now();
+
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            Ok(_event) => {
+                let now = Instant::now();
+                if now.duration_since(last_event).as_millis() < DEBOUNCE_MS as u128 {
+                    continue; // ignore burst
+                }
+                last_event = now;
+
+                match load_and_apply(&path) {
+                    Ok(swapped) => {
+                        if swapped {
+                            counter!("chirp_pulse.sentiment.strategy_swaps", 1);
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = ?e, "Failed to reload sentiment strategy; keeping previous");
+                        counter!("chirp_pulse.sentiment.strategy_errors", 1);
+                    }
+                }
+            }
+            Err(e) => warn!(error = ?e, "File watch error"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn naive_bayes_has_expected_name() {
+        let algo = NaiveBayesAnalyzer::default();
+        assert_eq!(algo.name(), "naive_bayes");
+    }
+
+    #[test]
+    fn rule_based_detects_love() {
+        let algo = RuleBasedAnalyzer::default();
+        let score = algo.analyze("I love Rust!");
+        assert!(score.polarity > 0.0);
+    }
+
+    #[test]
+    fn hot_swap_changes_behavior() {
+        // Ensure swap affects analyze()
+        let base = Arc::new(NaiveBayesAnalyzer::default());
+        ACTIVE_ANALYZER.store(base);
+        let before = analyze("I love it");
+        assert!(before.polarity > 0.0);
+
+        let alt = Arc::new(RuleBasedAnalyzer::default());
+        swap_strategy(alt);
+        let after = analyze("I love it");
+        assert_eq!(after.polarity, 1.0);
+    }
+}
+```

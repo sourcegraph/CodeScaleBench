@@ -1,0 +1,437 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * Module: response_caching
+ * File:    src/module_48.txt      (compiled as C source)
+ *
+ * Description:
+ *     Thread-safe, in-memory LRU cache with TTL semantics used by the HTTP/GraphQL
+ *     layer to accelerate frequently requested resources.  Cache metrics are
+ *     exported to the internal Prometheus-compatible monitoring subsystem.
+ *
+ *     The implementation relies on a doubly-linked list to track access order
+ *     (most-recently-used at the head) combined with a fast hash table
+ *     (uthash) for O(1) lookups, insertions and deletions.
+ *
+ * Public API (see cache.h):
+ *     int  cache_init(size_t max_entries);
+ *     int  cache_put(const char *key,
+ *                    const void *blob,
+ *                    size_t len,
+ *                    uint32_t ttl_sec);
+ *     int  cache_get(const char *key,
+ *                    void **out_blob,
+ *                    size_t *out_len);
+ *     int  cache_invalidate(const char *key);
+ *     void cache_stats(struct cache_stats *out);
+ *     void cache_shutdown(void);
+ *
+ * Thread Safety:
+ *     All exported functions are fully thread-safe.
+ *
+ * Copyright:
+ *     (c) 2024 Mercury Software Group – All rights reserved.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <time.h>
+#include <pthread.h>
+
+/* 3rd-party single-header hash table (BSD license) */
+#include "uthash.h"
+
+/* Project internal headers */
+#include "logger.h"      /* log_debug(), log_info(), log_warn(), log_error() */
+#include "monitoring.h"  /* metric_*() helpers                            */
+#include "cache.h"       /* public prototypes & struct cache_stats        */
+
+/* -------------------------------------------------------------------------- */
+/*                          Private data structures                           */
+/* -------------------------------------------------------------------------- */
+
+typedef struct cache_entry {
+    char                *key;         /* NULL-terminated key string          */
+    uint8_t             *payload;     /* raw response buffer                 */
+    size_t               len;         /* bytes in payload                    */
+    time_t               expiry;      /* epoch seconds when entry expires    */
+
+    /* Doubly-linked list (LRU) */
+    struct cache_entry  *prev;
+    struct cache_entry  *next;
+
+    /* Hash handle for uthash */
+    UT_hash_handle       hh;
+} cache_entry_t;
+
+/* Global (singleton) cache object */
+typedef struct cache_ctx {
+    size_t          max_entries;
+    size_t          cur_entries;
+
+    cache_entry_t  *hash_tbl;     /* uthash root                          */
+    cache_entry_t  *lru_head;     /* MRU                                  */
+    cache_entry_t  *lru_tail;     /* LRU                                  */
+
+    pthread_mutex_t mtx;          /* protects entire structure            */
+
+    /* Monitoring handles (registered at init) */
+    metric_counter_t *hits;
+    metric_counter_t *misses;
+    metric_counter_t *evictions;
+    metric_gauge_t   *items;
+} cache_ctx_t;
+
+/* The single instance */
+static cache_ctx_t g_cache = {
+    .max_entries  = 0,
+    .cur_entries  = 0,
+    .hash_tbl     = NULL,
+    .lru_head     = NULL,
+    .lru_tail     = NULL,
+};
+
+/* -------------------------------------------------------------------------- */
+/*                         Internal helper prototypes                         */
+/* -------------------------------------------------------------------------- */
+
+static void   lru_move_to_head(cache_entry_t *e);
+static void   lru_remove(cache_entry_t *e);
+static void   lru_insert_head(cache_entry_t *e);
+static void   evict_if_needed_unlocked(void);
+static void   purge_expired_unlocked(void);
+static time_t now_sec(void);
+
+/* -------------------------------------------------------------------------- */
+/*                            Public API implementation                       */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * cache_init
+ *     Bootstraps the cache and registers Prometheus metrics.
+ *
+ * Returns:
+ *     0 on success, or -1 on error (errno set).
+ */
+int cache_init(size_t max_entries)
+{
+    if (max_entries == 0) {
+        log_error("cache_init: max_entries must be >0");
+        return -1;
+    }
+
+    memset(&g_cache, 0, sizeof(g_cache));
+    g_cache.max_entries = max_entries;
+
+    if (pthread_mutex_init(&g_cache.mtx, NULL) != 0) {
+        log_error("cache_init: mutex init failed");
+        return -1;
+    }
+
+    /* Register metrics */
+    g_cache.hits      = metric_counter_register("cache_hits_total",
+                                               "Total cache hits");
+    g_cache.misses    = metric_counter_register("cache_misses_total",
+                                               "Total cache misses");
+    g_cache.evictions = metric_counter_register("cache_evictions_total",
+                                               "Total LRU evictions");
+    g_cache.items     = metric_gauge_register("cache_items",
+                                              "Currently resident cache items");
+
+    if (!g_cache.hits || !g_cache.misses ||
+        !g_cache.evictions || !g_cache.items) {
+        log_warn("cache_init: metric registration incomplete");
+    }
+
+    log_info("response cache initialized (capacity=%zu entries)", max_entries);
+    return 0;
+}
+
+/*
+ * cache_put
+ *     Inserts or updates a cache entry.
+ *     The payload is deep-copied and becomes owned by the cache.
+ *
+ * Returns:
+ *     0 on success, -1 on failure (ENOMEM, etc.)
+ */
+int cache_put(const char *key, const void *blob, size_t len, uint32_t ttl_sec)
+{
+    if (!key || !blob || len == 0 || ttl_sec == 0) {
+        log_warn("cache_put: invalid arguments");
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_cache.mtx);
+
+    cache_entry_t *e = NULL;
+    HASH_FIND_STR(g_cache.hash_tbl, key, e);
+
+    /* If the key exists, update its payload + metadata */
+    if (e) {
+        uint8_t *dup = (uint8_t *)malloc(len);
+        if (!dup) {
+            pthread_mutex_unlock(&g_cache.mtx);
+            return -1;
+        }
+        memcpy(dup, blob, len);
+        free(e->payload);
+        e->payload = dup;
+        e->len     = len;
+        e->expiry  = now_sec() + ttl_sec;
+
+        lru_move_to_head(e);
+        pthread_mutex_unlock(&g_cache.mtx);
+        return 0;
+    }
+
+    /* New entry */
+    e = (cache_entry_t *)calloc(1, sizeof(cache_entry_t));
+    if (!e) {
+        pthread_mutex_unlock(&g_cache.mtx);
+        return -1;
+    }
+    e->key = strdup(key);
+    if (!e->key) {
+        free(e);
+        pthread_mutex_unlock(&g_cache.mtx);
+        return -1;
+    }
+    e->payload = (uint8_t *)malloc(len);
+    if (!e->payload) {
+        free(e->key);
+        free(e);
+        pthread_mutex_unlock(&g_cache.mtx);
+        return -1;
+    }
+    memcpy(e->payload, blob, len);
+    e->len    = len;
+    e->expiry = now_sec() + ttl_sec;
+
+    /* Insert into hash table and LRU list */
+    HASH_ADD_STR(g_cache.hash_tbl, key, e);
+    lru_insert_head(e);
+    g_cache.cur_entries++;
+    metric_gauge_set(g_cache.items, (double)g_cache.cur_entries);
+
+    evict_if_needed_unlocked();
+    pthread_mutex_unlock(&g_cache.mtx);
+    return 0;
+}
+
+/*
+ * cache_get
+ *     Lookup a key and return a deep copy of the payload into out_blob.
+ *
+ * Ownership:
+ *     Caller must free(*out_blob) when done.
+ *
+ * Returns:
+ *     0 on hit, 1 on miss (ENOENT), -1 on fatal error.
+ */
+int cache_get(const char *key, void **out_blob, size_t *out_len)
+{
+    if (!key || !out_blob || !out_len) {
+        return -1;
+    }
+
+    *out_blob = NULL;
+    *out_len  = 0;
+
+    pthread_mutex_lock(&g_cache.mtx);
+
+    purge_expired_unlocked();
+
+    cache_entry_t *e = NULL;
+    HASH_FIND_STR(g_cache.hash_tbl, key, e);
+    if (!e) {
+        metric_counter_inc(g_cache.misses);
+        pthread_mutex_unlock(&g_cache.mtx);
+        return 1; /* miss */
+    }
+
+    /* Hit */
+    lru_move_to_head(e);
+    metric_counter_inc(g_cache.hits);
+
+    void *dup = malloc(e->len);
+    if (!dup) {
+        pthread_mutex_unlock(&g_cache.mtx);
+        return -1;
+    }
+    memcpy(dup, e->payload, e->len);
+
+    *out_blob = dup;
+    *out_len  = e->len;
+
+    pthread_mutex_unlock(&g_cache.mtx);
+    return 0; /* hit */
+}
+
+/*
+ * cache_invalidate
+ *     Removes a single entry (if present) from the cache.
+ *
+ * Returns:
+ *     0 on success, 1 if key was absent, -1 on error.
+ */
+int cache_invalidate(const char *key)
+{
+    if (!key) return -1;
+
+    pthread_mutex_lock(&g_cache.mtx);
+
+    cache_entry_t *e = NULL;
+    HASH_FIND_STR(g_cache.hash_tbl, key, e);
+    if (!e) {
+        pthread_mutex_unlock(&g_cache.mtx);
+        return 1;
+    }
+
+    HASH_DEL(g_cache.hash_tbl, e);
+    lru_remove(e);
+
+    free(e->key);
+    free(e->payload);
+    free(e);
+
+    g_cache.cur_entries--;
+    metric_gauge_set(g_cache.items, (double)g_cache.cur_entries);
+
+    pthread_mutex_unlock(&g_cache.mtx);
+    return 0;
+}
+
+/*
+ * cache_stats
+ *     Fills caller-provided struct with current statistics.
+ */
+void cache_stats(struct cache_stats *out)
+{
+    if (!out) return;
+
+    pthread_mutex_lock(&g_cache.mtx);
+    out->max_entries = g_cache.max_entries;
+    out->cur_entries = g_cache.cur_entries;
+    out->hits        = metric_counter_value(g_cache.hits);
+    out->misses      = metric_counter_value(g_cache.misses);
+    out->evictions   = metric_counter_value(g_cache.evictions);
+    pthread_mutex_unlock(&g_cache.mtx);
+}
+
+/*
+ * cache_shutdown
+ *     Frees all resources.  Must be called during process teardown.
+ */
+void cache_shutdown(void)
+{
+    pthread_mutex_lock(&g_cache.mtx);
+
+    cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, g_cache.hash_tbl, cur, tmp) {
+        HASH_DEL(g_cache.hash_tbl, cur);
+        free(cur->key);
+        free(cur->payload);
+        free(cur);
+    }
+    g_cache.hash_tbl = NULL;
+    g_cache.lru_head = g_cache.lru_tail = NULL;
+    g_cache.cur_entries = 0;
+
+    pthread_mutex_unlock(&g_cache.mtx);
+    pthread_mutex_destroy(&g_cache.mtx);
+
+    log_info("response cache shut down");
+}
+
+/* -------------------------------------------------------------------------- */
+/*                         Internal helper functions                          */
+/* -------------------------------------------------------------------------- */
+
+/* Return current epoch seconds (monotonic enough for TTL) */
+static inline time_t now_sec(void)
+{
+    return (time_t)time(NULL);
+}
+
+/* Move existing entry to head (MRU) */
+static void lru_move_to_head(cache_entry_t *e)
+{
+    if (e == g_cache.lru_head) return;
+
+    lru_remove(e);
+    lru_insert_head(e);
+}
+
+/* Remove node from LRU list (does not touch hash table) */
+static void lru_remove(cache_entry_t *e)
+{
+    if (!e) return;
+
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+
+    if (g_cache.lru_head == e) g_cache.lru_head = e->next;
+    if (g_cache.lru_tail == e) g_cache.lru_tail = e->prev;
+
+    e->prev = e->next = NULL;
+}
+
+/* Insert node at head (MRU) */
+static void lru_insert_head(cache_entry_t *e)
+{
+    e->prev = NULL;
+    e->next = g_cache.lru_head;
+    if (g_cache.lru_head) g_cache.lru_head->prev = e;
+    g_cache.lru_head = e;
+    if (!g_cache.lru_tail) g_cache.lru_tail = e;
+}
+
+/* Evict LRU entries until size constraint satisfied */
+static void evict_if_needed_unlocked(void)
+{
+    while (g_cache.cur_entries > g_cache.max_entries && g_cache.lru_tail) {
+        cache_entry_t *victim = g_cache.lru_tail;
+        log_debug("cache: evicting key='%s'", victim->key);
+
+        lru_remove(victim);
+        HASH_DEL(g_cache.hash_tbl, victim);
+
+        free(victim->key);
+        free(victim->payload);
+        free(victim);
+
+        g_cache.cur_entries--;
+        metric_counter_inc(g_cache.evictions);
+        metric_gauge_set(g_cache.items, (double)g_cache.cur_entries);
+    }
+}
+
+/* Purge all expired items (called opportunistically) */
+static void purge_expired_unlocked(void)
+{
+    cache_entry_t *cur = g_cache.lru_tail; /* iterate from coldest */
+    time_t now        = now_sec();
+
+    while (cur) {
+        /* Since list is in LRU order, once we find unexpired, we may break */
+        if (cur->expiry > now) break;
+
+        cache_entry_t *prev = cur->prev;
+        log_debug("cache: TTL expired for key='%s'", cur->key);
+
+        lru_remove(cur);
+        HASH_DEL(g_cache.hash_tbl, cur);
+
+        free(cur->key);
+        free(cur->payload);
+        free(cur);
+
+        g_cache.cur_entries--;
+        metric_gauge_set(g_cache.items, (double)g_cache.cur_entries);
+
+        cur = prev;
+    }
+}

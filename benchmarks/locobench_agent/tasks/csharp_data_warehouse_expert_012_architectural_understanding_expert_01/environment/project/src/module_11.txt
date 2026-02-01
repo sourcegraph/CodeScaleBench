@@ -1,0 +1,282 @@
+```csharp
+// File: src/module_11.txt
+// Project: PulseOps Warehouse — Serverless Productivity Intelligence Fabric (data_warehouse)
+// Language: C#
+// -----------------------------------------------------------------------------
+// This module provides a dynamic, plug-in–aware strategy registry responsible
+// for discovering, instantiating, and caching transformation strategies at
+// runtime. It enables teams to hot-swap business logic without redeployment by
+// merely dropping an assembly into the strategy plug-in folder.
+// -----------------------------------------------------------------------------
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.Loader;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformations
+{
+    /// <summary>
+    /// Represents the canonical contract every transformation strategy must fulfill.
+    /// </summary>
+    public interface ITransformationStrategy : IAsyncDisposable
+    {
+        /// <summary>
+        /// Human-readable, unique identifier that maps to this strategy.
+        /// </summary>
+        string Name { get; }
+
+        /// <summary>
+        /// Executes the transformation.
+        /// </summary>
+        /// <param name="context">Input context with raw data + envelopes.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <returns>A task containing <see cref="TransformationResult"/></returns>
+        Task<TransformationResult> ExecuteAsync(
+            TransformationContext context,
+            CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Input envelope passed to a transformation strategy.
+    /// Holds raw payload, entity metadata, and correlation identifiers.
+    /// </summary>
+    public sealed class TransformationContext
+    {
+        public TransformationContext(
+            ReadOnlyMemory<byte> payload,
+            string tenantId,
+            string streamName,
+            IDictionary<string, string> requestHeaders,
+            Guid correlationId)
+        {
+            Payload          = payload;
+            TenantId         = tenantId;
+            StreamName       = streamName;
+            RequestHeaders   = requestHeaders;
+            CorrelationId    = correlationId;
+            CreatedUtc       = DateTime.UtcNow;
+        }
+
+        public ReadOnlyMemory<byte> Payload { get; }
+        public string TenantId { get; }
+        public string StreamName { get; }
+        public IDictionary<string, string> RequestHeaders { get; }
+        public Guid CorrelationId { get; }
+        public DateTime CreatedUtc { get; }
+    }
+
+    /// <summary>
+    /// Result emitted by a transformation strategy.
+    /// </summary>
+    public sealed class TransformationResult
+    {
+        public TransformationResult(
+            string outputPartitionKey,
+            ReadOnlyMemory<byte> transformedPayload,
+            IDictionary<string, string> metadata)
+        {
+            OutputPartitionKey = outputPartitionKey;
+            TransformedPayload = transformedPayload;
+            Metadata           = metadata;
+        }
+
+        public string OutputPartitionKey { get; }
+        public ReadOnlyMemory<byte> TransformedPayload { get; }
+        public IDictionary<string, string> Metadata { get; }
+    }
+
+    /// <summary>
+    /// Factory/registry that discovers and caches transformation strategies on-demand.
+    /// Implements lazy loading & thread-safe caching for high-throughput streams.
+    /// </summary>
+    public sealed class TransformationStrategyRegistry : IAsyncDisposable
+    {
+        private readonly ILogger<TransformationStrategyRegistry> _logger;
+        private readonly ConcurrentDictionary<string, Lazy<Task<ITransformationStrategy>>> _strategyCache;
+        private readonly string _pluginFolder;
+
+        public TransformationStrategyRegistry(
+            ILogger<TransformationStrategyRegistry> logger,
+            string? pluginFolder = null)
+        {
+            _logger        = logger ?? throw new ArgumentNullException(nameof(logger));
+            _strategyCache = new ConcurrentDictionary<string, Lazy<Task<ITransformationStrategy>>>(StringComparer.OrdinalIgnoreCase);
+
+            // If not provided, fall back to a convention-based path inside /opt/plugins (Lambda Layer container path) or local bin folder.
+            _pluginFolder = pluginFolder ??
+                            (Directory.Exists("/opt/plugins")
+                                    ? "/opt/plugins"
+                                    : Path.Combine(AppContext.BaseDirectory, "plugins"));
+
+            _logger.LogInformation("TransformationStrategyRegistry initialized. Plugin folder: {PluginFolder}", _pluginFolder);
+        }
+
+        /// <summary>
+        /// Asynchronously resolves a transformation strategy, loading it if required.
+        /// Strategies are cached in memory for subsequent calls.
+        /// </summary>
+        /// <param name="strategyName">Case-insensitive unique name of the strategy.</param>
+        /// <returns>A task containing the strategy instance.</returns>
+        /// <exception cref="KeyNotFoundException">Thrown if the strategy cannot be found.</exception>
+        public Task<ITransformationStrategy> ResolveAsync(string strategyName)
+        {
+            if (string.IsNullOrWhiteSpace(strategyName))
+                throw new ArgumentException("Strategy name cannot be empty.", nameof(strategyName));
+
+            var lazyStrategy = _strategyCache.GetOrAdd(strategyName, name => new Lazy<Task<ITransformationStrategy>>(
+                () => LoadStrategyAsync(name), LazyThreadSafetyMode.ExecutionAndPublication));
+
+            return lazyStrategy.Value;
+        }
+
+        /// <summary>
+        /// Lists all strategies currently loaded in memory (does not scan disk).
+        /// </summary>
+        public IEnumerable<string> LoadedStrategies => _strategyCache.Keys;
+
+        /// <summary>
+        /// Releases all cached strategies and their managed/unmanaged resources.
+        /// </summary>
+        public async ValueTask DisposeAsync()
+        {
+            // Safely dispose every strategy.
+            foreach (var pair in _strategyCache)
+            {
+                if (pair.Value.IsValueCreated && pair.Value.Value.IsCompletedSuccessfully)
+                {
+                    var strategy = await pair.Value.Value.ConfigureAwait(false);
+                    await strategy.DisposeAsync().ConfigureAwait(false);
+                }
+            }
+
+            _strategyCache.Clear();
+            GC.SuppressFinalize(this);
+        }
+
+        // ---------------------------------------------------------------------
+        // Implementation details
+        // ---------------------------------------------------------------------
+
+        private async Task<ITransformationStrategy> LoadStrategyAsync(string strategyName)
+        {
+            _logger.LogInformation("Loading transformation strategy '{StrategyName}'.", strategyName);
+
+            // Look for the plug-in DLL that contains a type implementing ITransformationStrategy with matching Name property.
+            var strategyType = await FindStrategyTypeOnDiskAsync(strategyName).ConfigureAwait(false);
+
+            if (strategyType == null)
+            {
+                _logger.LogError("Strategy '{StrategyName}' not found on disk.", strategyName);
+                throw new KeyNotFoundException($"Strategy '{strategyName}' not found.");
+            }
+
+            // Instantiate via Activator (DI container could be integrated via ServiceProvider if needed).
+            if (Activator.CreateInstance(strategyType) is not ITransformationStrategy strategyInstance)
+            {
+                _logger.LogError(
+                    "Failed to instantiate strategy '{StrategyName}'. Type loaded: {StrategyType}.",
+                    strategyName, strategyType.FullName);
+
+                throw new InvalidOperationException(
+                    $"Strategy '{strategyName}' failed to instantiate. Verify default constructor.");
+            }
+
+            _logger.LogInformation("Strategy '{StrategyName}' successfully loaded & cached.", strategyName);
+            return strategyInstance;
+        }
+
+        private async Task<Type?> FindStrategyTypeOnDiskAsync(string strategyName)
+        {
+            // Non-blocking I/O to enumerate potential assemblies.
+            return await Task.Run(() =>
+            {
+                if (!Directory.Exists(_pluginFolder))
+                {
+                    _logger.LogWarning("Plugin folder '{PluginFolder}' does not exist.", _pluginFolder);
+                    return null;
+                }
+
+                foreach (var dllPath in Directory.EnumerateFiles(_pluginFolder, "*.dll", SearchOption.AllDirectories))
+                {
+                    try
+                    {
+                        // Load into a custom AssemblyLoadContext for hot-unload support.
+                        var alc    = new PluginLoadContext(dllPath);
+                        var asm    = alc.LoadFromAssemblyPath(dllPath);
+                        var types  = asm.GetTypes()
+                                        .Where(t => typeof(ITransformationStrategy).IsAssignableFrom(t) && !t.IsAbstract && !t.IsInterface);
+
+                        foreach (var type in types)
+                        {
+                            // Instantiate temporarily to check Name property.
+#if NET6_0_OR_GREATER
+                            if (Activator.CreateInstance(type) is ITransformationStrategy tmp)
+                            {
+                                if (string.Equals(tmp.Name, strategyName, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    // Important: store the ALC reference to prevent GC & keep assembly alive.
+                                    _ = _strategyCache.GetOrAdd(strategyName, _ => new Lazy<Task<ITransformationStrategy>>(
+                                        () => Task.FromResult<ITransformationStrategy>(tmp), LazyThreadSafetyMode.ExecutionAndPublication));
+
+                                    return type;
+                                }
+
+                                tmp.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                            }
+#else
+                            var instance = Activator.CreateInstance(type) as ITransformationStrategy;
+                            if (instance != null)
+                            {
+                                if (string.Equals(instance.Name, strategyName, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    _ = _strategyCache.GetOrAdd(strategyName, _ => new Lazy<Task<ITransformationStrategy>>(
+                                        () => Task.FromResult<ITransformationStrategy>(instance), LazyThreadSafetyMode.ExecutionAndPublication));
+
+                                    return type;
+                                }
+
+                                instance.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                            }
+#endif
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Continue scanning; log and swallow since other assemblies might still contain the strategy.
+                        _logger.LogWarning(ex, "Error while scanning assembly '{DllPath}' for strategy '{StrategyName}'.", dllPath, strategyName);
+                    }
+                }
+
+                return null;
+            }).ConfigureAwait(false);
+        }
+
+        // ---------------------------------------------------------------------
+        // Nested helper: AssemblyLoadContext that supports unloading.
+        // ---------------------------------------------------------------------
+        private sealed class PluginLoadContext : AssemblyLoadContext
+        {
+            private readonly AssemblyDependencyResolver _resolver;
+
+            public PluginLoadContext(string pluginPath)
+                : base(isCollectible: true)
+            {
+                _resolver = new AssemblyDependencyResolver(pluginPath);
+            }
+
+            protected override Assembly? Load(AssemblyName assemblyName)
+            {
+                var assemblyPath = _resolver.ResolveAssemblyToPath(assemblyName);
+                return assemblyPath != null ? LoadFromAssemblyPath(assemblyPath) : null;
+            }
+        }
+    }
+}
+```

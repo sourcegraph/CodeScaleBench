@@ -1,0 +1,406 @@
+```rust
+//! src/module_75.rs
+//! Event bus, store, and sample handlers for EduPulse Live  🚀
+//!
+//! This module provides a minimal yet production-grade, in-process event-bus
+//! accompanied by a Postgres-backed event store.  The bus is used by multiple
+//! back-end micro-services (search indexing, achievements, notifications, …)
+//! that react on published domain events such as `LessonPublished` or
+//! `QuizSubmitted`.
+//!
+//! The implementation focuses on correctness, observability, and graceful
+//! shutdown while staying fully async (Tokio runtime).
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc, oneshot, RwLock},
+    task::JoinHandle,
+};
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
+
+/// --------------------------------------------------------------------------------------------------------------------
+/// Domain events
+/// --------------------------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DomainEvent {
+    LessonPublished {
+        lesson_id: Uuid,
+        author_id: Uuid,
+        title: String,
+    },
+    QuizSubmitted {
+        quiz_id: Uuid,
+        student_id: Uuid,
+        score: u16,
+    },
+    PeerFeedbackGiven {
+        feedback_id: Uuid,
+        from_user_id: Uuid,
+        to_user_id: Uuid,
+        rating: u8,
+    },
+    BadgeAwarded {
+        badge_id: Uuid,
+        to_user_id: Uuid,
+        reason: String,
+    },
+}
+
+/// Envelope adds metadata required by infrastructure concerns such as ordering,
+/// idempotence, auditing, etc.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub payload: DomainEvent,
+}
+
+impl EventEnvelope {
+    pub fn new(event: DomainEvent) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            payload: event,
+        }
+    }
+}
+
+/// --------------------------------------------------------------------------------------------------------------------
+/// Event store (Postgres) – append-only
+/// --------------------------------------------------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct PgEventStore {
+    pool: sqlx::Pool<sqlx::Postgres>,
+}
+
+impl PgEventStore {
+    pub async fn new(database_url: &str, max_connections: u32) -> Result<Self> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(database_url)
+            .await
+            .context("Failed to establish Postgres connection pool for PgEventStore")?;
+
+        // Ensure the table exists. In production, use migrations.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS domain_events (
+                id          UUID PRIMARY KEY,
+                created_at  TIMESTAMPTZ NOT NULL,
+                event_type  TEXT        NOT NULL,
+                payload     JSONB       NOT NULL
+            )
+        "#,
+        )
+        .execute(&pool)
+        .await
+        .context("Failed to ensure domain_events table")?;
+
+        Ok(Self { pool })
+    }
+
+    /// Append an event in a durable, transactional way.
+    pub async fn append(&self, evt: &EventEnvelope) -> Result<()> {
+        let event_type = match &evt.payload {
+            DomainEvent::LessonPublished { .. } => "lesson_published",
+            DomainEvent::QuizSubmitted { .. } => "quiz_submitted",
+            DomainEvent::PeerFeedbackGiven { .. } => "peer_feedback_given",
+            DomainEvent::BadgeAwarded { .. } => "badge_awarded",
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO domain_events (id, created_at, event_type, payload)
+            VALUES ($1, $2, $3, $4)
+        "#,
+        )
+        .bind(evt.id)
+        .bind(evt.created_at)
+        .bind(event_type)
+        .bind(sqlx::types::Json(evt))
+        .execute(&self.pool)
+        .await
+        .context("Failed to persist domain event")?;
+
+        Ok(())
+    }
+}
+
+/// --------------------------------------------------------------------------------------------------------------------
+/// Event bus – fan-out (Tokio broadcast + mpsc)
+/// --------------------------------------------------------------------------------------------------------------------
+
+#[async_trait]
+pub trait EventHandler: Send + Sync + 'static {
+    /// Handle an incoming event.
+    async fn handle(&self, event: EventEnvelope) -> Result<()>;
+}
+
+/// How handlers communicate their lifecycle termination back to the bus.
+struct HandlerControl {
+    /// Ask the handler to gracefully shutdown.
+    stop_tx: oneshot::Sender<()>,
+    /// `JoinHandle` that finishes when the handler exits.
+    join: JoinHandle<()>,
+}
+
+/// An in-memory event bus that allows dynamic registration of handlers. Each
+/// handler runs on its own task and receives events through a dedicated
+/// `mpsc::Receiver`.
+pub struct EventBus {
+    sender: broadcast::Sender<EventEnvelope>,
+    handlers: Arc<RwLock<HashMap<String, HandlerControl>>>,
+    store: PgEventStore,
+}
+
+impl EventBus {
+    pub fn new(store: PgEventStore, channel_capacity: usize) -> Self {
+        let (sender, _) = broadcast::channel(channel_capacity);
+        Self {
+            sender,
+            handlers: Arc::new(RwLock::new(HashMap::new())),
+            store,
+        }
+    }
+
+    /// Publish an event: persist it first, then fan-out to handlers. If a
+    /// handler is lagging behind, the broadcast channel drops the event; we log
+    /// a warning so operations can react (in practice, use Kafka / NATS).
+    #[instrument(skip(self))]
+    pub async fn publish(&self, evt: DomainEvent) -> Result<()> {
+        let envelope = EventEnvelope::new(evt);
+
+        self.store
+            .append(&envelope)
+            .await
+            .context("Persisting event")?;
+
+        match self.sender.send(envelope.clone()) {
+            Ok(cnt) => {
+                debug!("Event published to {cnt} handlers");
+            }
+            Err(err) => {
+                warn!(?err, "No active handlers – event not delivered");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Register a new handler, returning an error when a duplicate key is
+    /// supplied. The handler’s `key` serves as idempotent registration id.
+    #[instrument(skip(self, handler))]
+    pub async fn register_handler<H>(&self, key: &str, handler: H) -> Result<()>
+    where
+        H: EventHandler,
+    {
+        let mut guard = self.handlers.write().await;
+
+        if guard.contains_key(key) {
+            return Err(EventBusError::DuplicateHandler(key.to_owned()).into());
+        }
+
+        let mut rx = self.sender.subscribe();
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+
+        let join: JoinHandle<()> = tokio::spawn(async move {
+            info!("Event handler `{key}` started");
+
+            // Buffer to avoid blocking broadcast when handler takes a while
+            let (evt_tx, mut evt_rx) = mpsc::channel::<EventEnvelope>(1024);
+
+            // Fan-out from broadcast subscription to the internal buffer
+            let forwarder = tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(evt) => {
+                            if evt_tx.send(evt).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!("Handler `{key}` skipped {skipped} messages");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+
+            // Main handling loop
+            select! {
+                _ = async {
+                    while let Some(evt) = evt_rx.recv().await {
+                        if let Err(err) = handler.handle(evt).await {
+                            error!(?err, "Handler `{key}` failed");
+                        }
+                    }
+                } => {},
+                _ = stop_rx => {
+                    debug!("Handler `{key}` received shutdown signal");
+                }
+            }
+
+            forwarder.abort();
+            info!("Event handler `{key}` stopped");
+        });
+
+        guard.insert(
+            key.to_owned(),
+            HandlerControl {
+                stop_tx,
+                join,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Ask all handlers to stop and wait for them to finish (within timeout).
+    pub async fn shutdown(&self, timeout: Duration) {
+        let mut guard = self.handlers.write().await;
+
+        for (key, ctl) in guard.drain() {
+            if ctl.stop_tx.send(()).is_err() {
+                warn!("Handler `{key}` already terminated");
+            }
+
+            let key_clone = key.clone();
+            match tokio::time::timeout(timeout, ctl.join).await {
+                Ok(_) => info!("Handler `{key_clone}` gracefully terminated"),
+                Err(_) => warn!("Handler `{key_clone}` did not terminate in time"),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum EventBusError {
+    #[error("Handler with key `{0}` is already registered")]
+    DuplicateHandler(String),
+}
+
+/// --------------------------------------------------------------------------------------------------------------------
+/// Sample handlers
+/// --------------------------------------------------------------------------------------------------------------------
+
+/// Simulate search index updates (e.g., Elasticsearch/OpenSearch)
+pub struct SearchIndexer;
+
+#[async_trait]
+impl EventHandler for SearchIndexer {
+    #[instrument(skip(self))]
+    async fn handle(&self, event: EventEnvelope) -> Result<()> {
+        match &event.payload {
+            DomainEvent::LessonPublished { lesson_id, title, .. } => {
+                info!(%lesson_id, %title, "Indexing lesson");
+                // simulate latency
+                tokio::time::sleep(Duration::from_millis(75)).await;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// Simulate achievement calculation service
+pub struct AchievementService;
+
+#[async_trait]
+impl EventHandler for AchievementService {
+    #[instrument(skip(self))]
+    async fn handle(&self, event: EventEnvelope) -> Result<()> {
+        match &event.payload {
+            DomainEvent::QuizSubmitted {
+                student_id,
+                score,
+                quiz_id,
+            } => {
+                info!(%student_id, %quiz_id, %score, "Calculating achievements");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// Simulate email / push notifications
+pub struct NotificationService;
+
+#[async_trait]
+impl EventHandler for NotificationService {
+    #[instrument(skip(self))]
+    async fn handle(&self, event: EventEnvelope) -> Result<()> {
+        info!("Sending notifications for event {:?}", event.payload);
+        Ok(())
+    }
+}
+
+/// --------------------------------------------------------------------------------------------------------------------
+/// Demonstration entry point (can be removed in production binaries)
+/// --------------------------------------------------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // -----------------------------------------------------------------------------------------
+    // Initialise observability & infrastructure
+    // -----------------------------------------------------------------------------------------
+    dotenvy::dotenv().ok();
+    tracing_subscriber::fmt::init();
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/edupulse".into());
+
+    let store = PgEventStore::new(&db_url, 5).await?;
+    let bus = Arc::new(EventBus::new(store, 512));
+
+    // -----------------------------------------------------------------------------------------
+    // Register handlers
+    // -----------------------------------------------------------------------------------------
+    bus.register_handler("search_indexer", SearchIndexer).await?;
+    bus.register_handler("achievement_service", AchievementService)
+        .await?;
+    bus.register_handler("notification_service", NotificationService)
+        .await?;
+
+    // -----------------------------------------------------------------------------------------
+    // Simulate business flow
+    // -----------------------------------------------------------------------------------------
+    let t0 = Instant::now();
+
+    bus.publish(DomainEvent::LessonPublished {
+        lesson_id: Uuid::new_v4(),
+        author_id: Uuid::new_v4(),
+        title: "Traits in Rust 🦀".into(),
+    })
+    .await?;
+
+    bus.publish(DomainEvent::QuizSubmitted {
+        quiz_id: Uuid::new_v4(),
+        student_id: Uuid::new_v4(),
+        score: 87,
+    })
+    .await?;
+
+    // Give handlers time to process before shutdown
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    bus.shutdown(Duration::from_secs(3)).await;
+
+    info!("Demo finished in {:?}", t0.elapsed());
+    Ok(())
+}
+```

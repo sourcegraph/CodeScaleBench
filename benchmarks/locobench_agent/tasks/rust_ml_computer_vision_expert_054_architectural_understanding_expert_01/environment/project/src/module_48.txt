@@ -1,0 +1,395 @@
+```rust
+//! Hyper-parameter Tuning Engine
+//!
+//! This module implements a Strategy-Pattern–based hyper-parameter tuning
+//! engine that can be plugged into any stage of the VisuTility Orchestrator
+//! pipeline. The engine provides:
+//!   • A generic [`Tuner`] façade that coordinates trial execution
+//!   • Pluggable tuning strategies (e.g. Grid, Random, Bayesian)
+//!   • Observer hooks for experiment tracking & early-stopping
+//!
+//! The code purposefully avoids project-specific dependencies so it can be
+//! re-used by other crates within the workspace. All heavy lifting (model
+//! compilation, dataset loading, etc.) is delegated to an [`Objective`]
+//! implementation supplied by the caller.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use rand::distributions::{Distribution, Uniform};
+use rand::{rngs::StdRng, SeedableRng};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Generic error type for the tuning engine.
+#[derive(Debug, Error)]
+pub enum TuningError {
+    #[error("objective function failed: {0}")]
+    ObjectiveFailed(String),
+
+    #[error("invalid parameter space definition: {0}")]
+    InvalidParameter(String),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+/// Domain of a single hyper-parameter.
+///
+/// The enum is intentionally limited to float & discrete types to keep the
+/// sample code concise. In production you may want Boolean, Categorical, etc.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ParameterDomain {
+    Continuous { low: f64, high: f64 },
+    Discrete(Vec<f64>),
+}
+
+impl ParameterDomain {
+    /// Sample a value from the domain.
+    fn sample<R: rand::Rng>(&self, rng: &mut R) -> f64 {
+        match self {
+            ParameterDomain::Continuous { low, high } => {
+                let distr = Uniform::new(*low, *high);
+                distr.sample(rng)
+            }
+            ParameterDomain::Discrete(values) => {
+                let idx = rng.gen_range(0..values.len());
+                values[idx]
+            }
+        }
+    }
+
+    /// Iterate over all discrete points when applicable.
+    fn iter(&self) -> Option<impl Iterator<Item = f64> + '_> {
+        match self {
+            ParameterDomain::Discrete(values) => Some(values.iter().copied()),
+            _ => None,
+        }
+    }
+}
+
+/// Collection of named domains.
+pub type ParameterSpace = HashMap<String, ParameterDomain>;
+
+/// Concrete set of hyper-parameters for a single trial.
+pub type HyperParams = HashMap<String, f64>;
+
+/// Result produced by a single trial.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrialResult {
+    pub params: HyperParams,
+    pub score: f64,
+    pub duration: Duration,
+}
+
+/// Contract for objective evaluation.
+///
+/// Implementors should train a model (or a down-scaled proxy) and return the
+/// metric that the tuning process must optimize (higher is better).
+pub trait Objective: Send + Sync + 'static {
+    fn evaluate(&self, params: &HyperParams) -> Result<f64, TuningError>;
+}
+
+/// Observer pattern for side-effects such as logging, experiment tracking,
+/// early stopping, etc.
+pub trait TuningObserver: Send + Sync {
+    fn on_trial_completed(&self, result: &TrialResult);
+}
+
+/// Strategy pattern for search algorithms.
+pub trait TuningStrategy: Send + Sync {
+    fn next_parameters(&mut self) -> Option<HyperParams>;
+    fn register_result(&mut self, _result: &TrialResult) {}
+}
+
+/// Grid Search implementation.
+///
+/// Explores the cartesian product of every discrete domain, *ignoring*
+/// continuous ones. If the user provides only continuous spaces, the grid is
+/// empty and `next_parameters` will always return `None`.
+pub struct GridSearch {
+    grid: Vec<HyperParams>,
+    cursor: usize,
+}
+
+impl GridSearch {
+    pub fn new(space: &ParameterSpace) -> Self {
+        let mut grid: Vec<HyperParams> = vec![HyperParams::new()];
+        for (name, domain) in space {
+            if let Some(iter) = domain.iter() {
+                let mut next_grid = Vec::with_capacity(grid.len() * 4);
+                for existing in &grid {
+                    for value in iter.clone() {
+                        let mut params = existing.clone();
+                        params.insert(name.clone(), value);
+                        next_grid.push(params);
+                    }
+                }
+                grid = next_grid;
+            }
+        }
+        Self { grid, cursor: 0 }
+    }
+}
+
+impl TuningStrategy for GridSearch {
+    fn next_parameters(&mut self) -> Option<HyperParams> {
+        if self.cursor < self.grid.len() {
+            let params = self.grid[self.cursor].clone();
+            self.cursor += 1;
+            Some(params)
+        } else {
+            None
+        }
+    }
+}
+
+/// Random Search implementation using a seeded PRNG.
+pub struct RandomSearch {
+    space: ParameterSpace,
+    rng: StdRng,
+    max_trials: usize,
+    generated: usize,
+}
+
+impl RandomSearch {
+    pub fn new(space: ParameterSpace, max_trials: usize, seed: u64) -> Self {
+        Self {
+            space,
+            rng: StdRng::seed_from_u64(seed),
+            max_trials,
+            generated: 0,
+        }
+    }
+}
+
+impl TuningStrategy for RandomSearch {
+    fn next_parameters(&mut self) -> Option<HyperParams> {
+        if self.generated >= self.max_trials {
+            return None;
+        }
+        let mut params = HyperParams::with_capacity(self.space.len());
+        for (name, domain) in &self.space {
+            params.insert(name.clone(), domain.sample(&mut self.rng));
+        }
+        self.generated += 1;
+        Some(params)
+    }
+}
+
+/// Thread-safe experiment tracker that writes each trial to a JSON Lines file.
+/// The implementation is intentionally simple and can be replaced by something
+/// like MLflow, Weights & Biases, or a SQL database.
+pub struct JsonlTracker {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl JsonlTracker {
+    pub fn new(path: impl AsRef<std::path::Path>) -> Result<Self, TuningError> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        Ok(Self {
+            file: Arc::new(Mutex::new(file)),
+        })
+    }
+}
+
+impl TuningObserver for JsonlTracker {
+    fn on_trial_completed(&self, result: &TrialResult) {
+        if let Ok(serialized) = serde_json::to_string(result) {
+            if let Ok(mut file) = self.file.lock() {
+                // Ignore I/O errors so tuning can proceed.
+                let _ = writeln!(file, "{}", serialized);
+            }
+        }
+    }
+}
+
+/// Central façade that orchestrates strategy, observers and objective.
+pub struct Tuner<S: TuningStrategy> {
+    strategy: S,
+    objective: Arc<dyn Objective>,
+    observers: Vec<Arc<dyn TuningObserver>>,
+    tx: Sender<TrialResult>,
+    rx: Receiver<TrialResult>,
+}
+
+impl<S: TuningStrategy> Tuner<S> {
+    pub fn builder(strategy: S, objective: Arc<dyn Objective>) -> TunerBuilder<S> {
+        TunerBuilder::new(strategy, objective)
+    }
+
+    fn new(strategy: S, objective: Arc<dyn Objective>, observers: Vec<Arc<dyn TuningObserver>>) -> Self {
+        let (tx, rx) = unbounded();
+        Self {
+            strategy,
+            objective,
+            observers,
+            tx,
+            rx,
+        }
+    }
+
+    /// Drives the tuning loop until the strategy is exhausted or an error
+    /// occurs. Returns the best trial encountered.
+    pub fn run(&mut self) -> Result<TrialResult, TuningError> {
+        let mut best: Option<TrialResult> = None;
+
+        // Spawn a simple worker thread pool (1 thread / logical core).
+        let n_workers = num_cpus::get();
+        let mut handles = Vec::with_capacity(n_workers);
+        for _ in 0..n_workers {
+            let tx = self.tx.clone();
+            let objective = self.objective.clone();
+            let mut local_strategy = &mut self.strategy as *mut S; // raw ptr to share across threads
+            handles.push(std::thread::spawn(move || loop {
+                // SAFETY: Exclusive access is guaranteed by the global lock below.
+                let params = {
+                    // Strategy access is synchronized via a global mutex.
+                    static STRATEGY_LOCK: once_cell::sync::Lazy<Mutex<()>> =
+                        once_cell::sync::Lazy::new(|| Mutex::new(()));
+                    let _guard = STRATEGY_LOCK.lock().unwrap();
+                    // Mutable borrow of the strategy behind the raw pointer.
+                    unsafe { &mut *local_strategy }.next_parameters()
+                };
+
+                let params = match params {
+                    Some(p) => p,
+                    None => break, // no more work
+                };
+
+                let time_start = Instant::now();
+                let score = match objective.evaluate(&params) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tx.send(TrialResult {
+                            params,
+                            score: f64::NAN,
+                            duration: time_start.elapsed(),
+                        });
+                        eprintln!("Objective failed: {e}");
+                        continue;
+                    }
+                };
+
+                let result = TrialResult {
+                    params,
+                    score,
+                    duration: time_start.elapsed(),
+                };
+                let _ = tx.send(result);
+            }));
+        }
+
+        drop(self.tx); // Close senders when workers finish.
+
+        // Collect results & notify observers.
+        for trial in &self.rx {
+            self.strategy.register_result(&trial);
+            for obs in &self.observers {
+                obs.on_trial_completed(&trial);
+            }
+            if best.as_ref().map_or(true, |b| trial.score > b.score) {
+                best = Some(trial);
+            }
+        }
+
+        // Wait for threads to finish.
+        for h in handles {
+            let _ = h.join();
+        }
+
+        best.ok_or_else(|| TuningError::InvalidParameter("No trials executed".into()))
+    }
+}
+
+/// Builder for [`Tuner`] allowing ergonomic configuration.
+pub struct TunerBuilder<S: TuningStrategy> {
+    strategy: S,
+    objective: Arc<dyn Objective>,
+    observers: Vec<Arc<dyn TuningObserver>>,
+}
+
+impl<S: TuningStrategy> TunerBuilder<S> {
+    fn new(strategy: S, objective: Arc<dyn Objective>) -> Self {
+        Self {
+            strategy,
+            objective,
+            observers: Vec::new(),
+        }
+    }
+
+    pub fn with_observer(mut self, observer: Arc<dyn TuningObserver>) -> Self {
+        self.observers.push(observer);
+        self
+    }
+
+    pub fn build(self) -> Tuner<S> {
+        Tuner::new(self.strategy, self.objective, self.observers)
+    }
+}
+
+/// Example objective for demonstration purposes only.
+///
+/// The objective is a noisy parabola whose global maximum is
+/// near x=0.42, y=0.69. This allows the tuner to finish quickly.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyObjective;
+
+    impl Objective for DummyObjective {
+        fn evaluate(&self, params: &HyperParams) -> Result<f64, TuningError> {
+            let x = params.get("x").copied().unwrap_or(0.0);
+            let y = params.get("y").copied().unwrap_or(0.0);
+            // simple 2-D inverted paraboloid + random noise
+            let value = -(x - 0.42).powi(2) - (y - 0.69).powi(2) + 1.0
+                + rand::random::<f64>() * 0.01;
+            Ok(value)
+        }
+    }
+
+    #[test]
+    fn random_search_converges() -> Result<(), TuningError> {
+        let mut space = ParameterSpace::new();
+        space.insert("x".into(), ParameterDomain::Continuous { low: 0.0, high: 1.0 });
+        space.insert("y".into(), ParameterDomain::Continuous { low: 0.0, high: 1.0 });
+
+        let strategy = RandomSearch::new(space, 1_000, 42);
+        let objective = Arc::new(DummyObjective);
+        let tracker = Arc::new(JsonlTracker::new(std::env::temp_dir().join("trials.jsonl"))?);
+
+        let mut tuner = Tuner::builder(strategy, objective)
+            .with_observer(tracker)
+            .build();
+
+        let best = tuner.run()?;
+        assert!(best.score > 0.95, "best score too low: {}", best.score);
+        Ok(())
+    }
+
+    #[test]
+    fn grid_search_enumerates_discrete() -> Result<(), TuningError> {
+        let mut space = ParameterSpace::new();
+        space.insert("x".into(), ParameterDomain::Discrete(vec![0.0, 0.5, 1.0]));
+        space.insert("y".into(), ParameterDomain::Discrete(vec![0.0, 1.0]));
+
+        let strategy = GridSearch::new(&space);
+        let objective = Arc::new(DummyObjective);
+
+        let mut tuner = Tuner::builder(strategy, objective).build();
+        let best = tuner.run()?;
+        assert!(best.score > 0.9);
+        Ok(())
+    }
+}
+```

@@ -1,0 +1,435 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * Module 14  – Response Cache
+ *
+ * This file implements an in-memory, thread-safe, LRU response cache that is
+ * used by the HTTP/GraphQL gateway layer to short-circuit upstream processing
+ * for frequently requested resources.
+ *
+ * Features
+ * --------
+ *  • O(1) inserts, lookups, and evictions via uthash + intrusive LRU list
+ *  • Per-entry TTL (time-to-live) with lazy expiration
+ *  • Bounded memory footprint (max_entries) with automatic eviction
+ *  • Prometheus-style metrics export (hit, miss, eviction counters)
+ *  • POSIX-threads safety using a single global mutex
+ *
+ * The cache is intentionally conservative in scope—it holds fully rendered
+ * response payloads (headers + body) keyed by a stable cache-key that the
+ * gateway derives from the request (method, URL, auth-scope, etc.).
+ *
+ * Copyright (c) 2024 MercuryMonolith.
+ */
+
+#include <assert.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "uthash.h" /* https://troydhanson.github.io/uthash/ */
+
+/* ------------------------------------------------------------------------- */
+/* Public API                                                                */
+/* ------------------------------------------------------------------------- */
+
+typedef struct mm_cache_stats {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    uint64_t insertions;
+} mm_cache_stats_t;
+
+/* Initializes global cache singleton. Returns 0 on success. */
+int  mm_cache_init(size_t max_entries, uint32_t default_ttl_sec);
+/* Shuts down cache and frees all resources. */
+void mm_cache_shutdown(void);
+
+/*
+ * Inserts a response into the cache.
+ *   key            : cache key (must be a stable, unique, null-terminated string)
+ *   response_bytes : raw response payload. Caller relinquishes ownership.
+ *   len            : length of response_bytes
+ *   content_type   : Null-terminated HTTP content-type header. Copied internally.
+ *   ttl_sec        : Time-to-live in seconds. 0 => use default_ttl_sec.
+ *
+ * Return 0 on success, or an error code.
+ */
+int  mm_cache_put(const char *key,
+                  const uint8_t *response_bytes,
+                  size_t len,
+                  const char *content_type,
+                  uint32_t ttl_sec);
+
+/*
+ * Looks up a response. On cache hit, out_* pointers are populated with INTERNAL
+ * pointers – caller must NOT free() them.
+ *
+ * Returns true on hit, false on miss/expired. On miss, outputs remain untouched.
+ */
+bool mm_cache_get(const char *key,
+                  const uint8_t **out_bytes,
+                  size_t      *out_len,
+                  const char  **out_content_type);
+
+/* Explicitly invalidates a cache entry. Returns true if removed. */
+bool mm_cache_invalidate(const char *key);
+
+/* Returns snapshot of cache stats. Thread-safe. */
+mm_cache_stats_t mm_cache_get_stats(void);
+
+/* ------------------------------------------------------------------------- */
+/* Implementation                                                            */
+/* ------------------------------------------------------------------------- */
+
+typedef struct cache_entry {
+    char            *key;            /* hash key                           */
+    uint8_t         *payload;        /* response bytes                     */
+    size_t           len;            /* byte length                        */
+    char            *content_type;   /* e.g. "application/json"            */
+    time_t           expires_at;     /* epoch seconds                      */
+
+    /* LRU intrusive doubly linked list */
+    struct cache_entry *prev;
+    struct cache_entry *next;
+
+    UT_hash_handle hh;               /* makes this struct hashable         */
+} cache_entry_t;
+
+static struct {
+    cache_entry_t   *map;            /* uthash hash table root             */
+    cache_entry_t   *lru_head;       /* most recently used                 */
+    cache_entry_t   *lru_tail;       /* least recently used                */
+    size_t           max_entries;
+    uint32_t         default_ttl;
+    mm_cache_stats_t stats;
+    pthread_mutex_t  mtx;
+    bool             initialized;
+} g_cache = {0};
+
+/* Internal helpers -------------------------------------------------------- */
+
+static void lru_move_to_front(cache_entry_t *node)
+{
+    if (g_cache.lru_head == node) {
+        return; /* already front */
+    }
+
+    /* Detach */
+    if (node->prev) node->prev->next = node->next;
+    if (node->next) node->next->prev = node->prev;
+
+    if (g_cache.lru_tail == node)
+        g_cache.lru_tail = node->prev;
+
+    /* Insert at head */
+    node->prev = NULL;
+    node->next = g_cache.lru_head;
+
+    if (g_cache.lru_head)
+        g_cache.lru_head->prev = node;
+
+    g_cache.lru_head = node;
+
+    if (g_cache.lru_tail == NULL)
+        g_cache.lru_tail = node;
+}
+
+static void lru_append_front(cache_entry_t *node)
+{
+    node->prev = NULL;
+    node->next = g_cache.lru_head;
+
+    if (g_cache.lru_head)
+        g_cache.lru_head->prev = node;
+
+    g_cache.lru_head = node;
+
+    if (g_cache.lru_tail == NULL)
+        g_cache.lru_tail = node;
+}
+
+static void lru_remove_tail(void)
+{
+    if (!g_cache.lru_tail) {
+        return;
+    }
+
+    cache_entry_t *victim = g_cache.lru_tail;
+
+    /* Detach from list */
+    if (victim->prev)
+        victim->prev->next = NULL;
+    g_cache.lru_tail = victim->prev;
+
+    if (g_cache.lru_head == victim)
+        g_cache.lru_head = NULL;
+
+    /* Remove from hash */
+    HASH_DEL(g_cache.map, victim);
+
+    /* Update stats */
+    g_cache.stats.evictions++;
+
+    /* Free memory */
+    free(victim->payload);
+    free(victim->content_type);
+    free(victim->key);
+    free(victim);
+}
+
+static bool is_expired(const cache_entry_t *entry, time_t now)
+{
+    return entry->expires_at <= now;
+}
+
+/* Public API -------------------------------------------------------------- */
+
+int mm_cache_init(size_t max_entries, uint32_t default_ttl_sec)
+{
+    if (g_cache.initialized)
+        return 0;
+
+    if (max_entries == 0 || default_ttl_sec == 0)
+        return EINVAL;
+
+    g_cache.max_entries  = max_entries;
+    g_cache.default_ttl  = default_ttl_sec;
+    g_cache.stats        = (mm_cache_stats_t){0};
+
+    if (pthread_mutex_init(&g_cache.mtx, NULL) != 0)
+        return errno;
+
+    g_cache.initialized = true;
+    return 0;
+}
+
+void mm_cache_shutdown(void)
+{
+    if (!g_cache.initialized)
+        return;
+
+    pthread_mutex_lock(&g_cache.mtx);
+
+    cache_entry_t *current, *tmp;
+    HASH_ITER(hh, g_cache.map, current, tmp)
+    {
+        HASH_DEL(g_cache.map, current);
+        free(current->payload);
+        free(current->content_type);
+        free(current->key);
+        free(current);
+    }
+
+    g_cache.lru_head = g_cache.lru_tail = NULL;
+    pthread_mutex_unlock(&g_cache.mtx);
+
+    pthread_mutex_destroy(&g_cache.mtx);
+    g_cache.initialized = false;
+}
+
+int mm_cache_put(const char *key,
+                 const uint8_t *response_bytes,
+                 size_t len,
+                 const char *content_type,
+                 uint32_t ttl_sec)
+{
+    if (!g_cache.initialized || !key || !response_bytes || len == 0)
+        return EINVAL;
+
+    /* allocate new structures up-front to simplify error path */
+    char *key_copy          = strdup(key);
+    if (!key_copy) return ENOMEM;
+
+    uint8_t *payload_copy   = malloc(len);
+    if (!payload_copy) {
+        free(key_copy);
+        return ENOMEM;
+    }
+    memcpy(payload_copy, response_bytes, len);
+
+    char *ct_copy           = strdup(content_type ? content_type : "application/octet-stream");
+    if (!ct_copy) {
+        free(key_copy); free(payload_copy);
+        return ENOMEM;
+    }
+
+    cache_entry_t *entry = calloc(1, sizeof(cache_entry_t));
+    if (!entry) {
+        free(key_copy); free(payload_copy); free(ct_copy);
+        return ENOMEM;
+    }
+
+    entry->key          = key_copy;
+    entry->payload      = payload_copy;
+    entry->len          = len;
+    entry->content_type = ct_copy;
+    entry->expires_at   = time(NULL) + (ttl_sec ? ttl_sec : g_cache.default_ttl);
+
+    pthread_mutex_lock(&g_cache.mtx);
+
+    /* If key exists, replace it in-place */
+    cache_entry_t *existing = NULL;
+    HASH_FIND_STR(g_cache.map, key, existing);
+    if (existing) {
+        /* detach from LRU list */
+        if (existing->prev) existing->prev->next = existing->next;
+        if (existing->next) existing->next->prev = existing->prev;
+        if (g_cache.lru_head == existing) g_cache.lru_head = existing->next;
+        if (g_cache.lru_tail == existing) g_cache.lru_tail = existing->prev;
+
+        HASH_DEL(g_cache.map, existing);
+
+        free(existing->payload);
+        free(existing->content_type);
+        free(existing->key);
+        free(existing);
+    }
+
+    HASH_ADD_KEYPTR(hh, g_cache.map, entry->key, strlen(entry->key), entry);
+    lru_append_front(entry);
+
+    g_cache.stats.insertions++;
+
+    /* Evict if over capacity */
+    while (HASH_COUNT(g_cache.map) > g_cache.max_entries) {
+        lru_remove_tail();
+    }
+
+    pthread_mutex_unlock(&g_cache.mtx);
+    return 0;
+}
+
+bool mm_cache_get(const char *key,
+                  const uint8_t **out_bytes,
+                  size_t *out_len,
+                  const char **out_content_type)
+{
+    if (!g_cache.initialized || !key)
+        return false;
+
+    bool hit = false;
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&g_cache.mtx);
+
+    cache_entry_t *entry = NULL;
+    HASH_FIND_STR(g_cache.map, key, entry);
+    if (entry && !is_expired(entry, now)) {
+        /* Hit */
+        lru_move_to_front(entry);
+
+        if (out_bytes)         *out_bytes        = entry->payload;
+        if (out_len)           *out_len          = entry->len;
+        if (out_content_type)  *out_content_type = entry->content_type;
+
+        g_cache.stats.hits++;
+        hit = true;
+    } else if (entry) {
+        /* Expired – purge */
+        HASH_DEL(g_cache.map, entry);
+        if (entry->prev) entry->prev->next = entry->next;
+        if (entry->next) entry->next->prev = entry->prev;
+        if (g_cache.lru_head == entry) g_cache.lru_head = entry->next;
+        if (g_cache.lru_tail == entry) g_cache.lru_tail = entry->prev;
+
+        free(entry->payload);
+        free(entry->content_type);
+        free(entry->key);
+        free(entry);
+
+        g_cache.stats.misses++;
+    } else {
+        /* Miss */
+        g_cache.stats.misses++;
+    }
+
+    pthread_mutex_unlock(&g_cache.mtx);
+    return hit;
+}
+
+bool mm_cache_invalidate(const char *key)
+{
+    if (!g_cache.initialized || !key)
+        return false;
+
+    pthread_mutex_lock(&g_cache.mtx);
+
+    cache_entry_t *entry = NULL;
+    HASH_FIND_STR(g_cache.map, key, entry);
+    if (!entry) {
+        pthread_mutex_unlock(&g_cache.mtx);
+        return false;
+    }
+
+    /* Remove from LRU list */
+    if (entry->prev) entry->prev->next = entry->next;
+    if (entry->next) entry->next->prev = entry->prev;
+    if (g_cache.lru_head == entry) g_cache.lru_head = entry->next;
+    if (g_cache.lru_tail == entry) g_cache.lru_tail = entry->prev;
+
+    HASH_DEL(g_cache.map, entry);
+
+    free(entry->payload);
+    free(entry->content_type);
+    free(entry->key);
+    free(entry);
+
+    g_cache.stats.evictions++;
+
+    pthread_mutex_unlock(&g_cache.mtx);
+    return true;
+}
+
+mm_cache_stats_t mm_cache_get_stats(void)
+{
+    mm_cache_stats_t snapshot = {0};
+    if (!g_cache.initialized)
+        return snapshot;
+
+    pthread_mutex_lock(&g_cache.mtx);
+    snapshot = g_cache.stats;
+    pthread_mutex_unlock(&g_cache.mtx);
+    return snapshot;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Example (unit-test style) – compile with `-DMM_CACHE_TEST`               */
+/* ------------------------------------------------------------------------- */
+#ifdef MM_CACHE_TEST
+#include <unistd.h>
+
+static void test_basic(void)
+{
+    assert(mm_cache_init(3, 2) == 0);
+
+    const char *key = "GET /hello";
+    const char *body = "world";
+    assert(mm_cache_put(key, (const uint8_t *)body, strlen(body), "text/plain", 0) == 0);
+
+    const uint8_t *out;
+    size_t len;
+    const char *ctype;
+    assert(mm_cache_get(key, &out, &len, &ctype) == true);
+    assert(len == strlen(body));
+    assert(strncmp((const char *)out, body, len) == 0);
+    assert(strcmp(ctype, "text/plain") == 0);
+
+    sleep(3); /* let TTL expire */
+    assert(mm_cache_get(key, &out, &len, &ctype) == false);
+
+    mm_cache_shutdown();
+}
+
+int main(void)
+{
+    test_basic();
+    printf("mm_cache tests passed.\n");
+    return 0;
+}
+#endif /* MM_CACHE_TEST */

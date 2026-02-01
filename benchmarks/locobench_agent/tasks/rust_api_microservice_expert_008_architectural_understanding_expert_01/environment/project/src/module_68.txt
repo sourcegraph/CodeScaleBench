@@ -1,0 +1,352 @@
+```rust
+//! Pagination utilities and DTOs used across LedgerLink Nexus
+//!
+//! This module centralises everything that is required to perform cursor based
+//! pagination for both REST and GraphQL front-ends, while remaining decoupled
+//! from concrete transport frameworks (e.g. actix-web, axum, async-graphql).
+//!
+//! The code deliberately lives in its own compilation unit so that it can be
+//! re-used by other micro-services without dragging in heavy HTTP dependencies.
+
+use std::marker::PhantomData;
+use std::str::FromStr;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use base64::{engine::general_purpose, Engine as _};
+use chrono::{DateTime, Utc};
+use derive_more::{Display, Error};
+use serde::{Deserialize, Serialize};
+use validator::Validate;
+
+/// Maximum page size the public API allows.
+pub const HARD_PAGE_SIZE_LIMIT: u32 = 250;
+
+/// TTL for pagination results that can be cached safely without violating
+/// customer SLA requirements (15s is short enough to avoid stale balances,
+/// yet long enough for GraphQL clients performing waterfall queries).
+pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(15);
+
+/// Standardised pagination request accepted by all *list* endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct PageRequest {
+    /// Amount of records requested (`limit` in most REST dialects).
+    #[validate(range(min = 1, max = "HARD_PAGE_SIZE_LIMIT"))]
+    pub first: u32,
+
+    /// Opaque cursor marking the last seen record (exclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<Cursor>,
+}
+
+impl PageRequest {
+    /// Returns a *safe* limit that is guaranteed to be within our hard cap,
+    /// even if the caller skipped validation.
+    pub fn safe_limit(&self) -> u32 {
+        self.first.min(HARD_PAGE_SIZE_LIMIT)
+    }
+
+    /// Generates a new request that will fetch the next page given the last
+    /// known cursor.
+    pub fn next(&self, cursor: Cursor) -> Self {
+        Self {
+            first: self.first,
+            after: Some(cursor),
+        }
+    }
+}
+
+/// Cursor is a compact, opaque reference to a logical row in an ordered set.
+///
+/// Internally the cursor encodes the primary key as well as the *order by*
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Cursor(String);
+
+impl Cursor {
+    /// Create a cursor from its raw components. The token will be varnished via
+    /// base64 to prevent clients from making assumptions about its structure.
+    pub fn new(pk: i64, ts: DateTime<Utc>) -> Self {
+        let raw = format!("{pk}:{ts}");
+        Self(general_purpose::URL_SAFE_NO_PAD.encode(raw))
+    }
+
+    /// Attempts to decode the cursor into its raw (pk, ts) components.
+    pub fn decode(&self) -> Result<(i64, DateTime<Utc>), CursorError> {
+        let decoded = general_purpose::URL_SAFE_NO_PAD
+            .decode(&self.0)
+            .map_err(|_| CursorError::InvalidEncoding)?;
+
+        let decoded = String::from_utf8(decoded).map_err(|_| CursorError::InvalidEncoding)?;
+        let mut parts = decoded.splitn(2, ':');
+        let pk = parts
+            .next()
+            .ok_or(CursorError::Malformed)?
+            .parse::<i64>()
+            .map_err(|_| CursorError::Malformed)?;
+        let ts_str = parts.next().ok_or(CursorError::Malformed)?;
+        let ts = DateTime::<Utc>::from_str(ts_str).map_err(|_| CursorError::Malformed)?;
+
+        Ok((pk, ts))
+    }
+
+    /// Raw base64 representation to be consumed by external callers.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl From<String> for Cursor {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for Cursor {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+#[derive(Debug, Display, Error)]
+pub enum CursorError {
+    #[display(fmt = "invalid cursor encoding")]
+    InvalidEncoding,
+    #[display(fmt = "malformed cursor")]
+    Malformed,
+}
+
+/// Generic container returned by list APIs.
+///
+/// `T` is the domain DTO and SHOULD NOT expose internal domain objects directly
+/// (obey the service's MVVM separation).
+#[derive(Debug, Clone, Serialize)]
+pub struct Page<T> {
+    /// Actual business entities.
+    pub edges: Vec<T>,
+    /// True if the server can guarantee that there are no items after *this*
+    /// page (i.e. it fetched one additional row behind the scenes).
+    pub has_next_page: bool,
+    /// Cursor pointing to the last element in `edges`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_cursor: Option<Cursor>,
+    /// `max_age` hint for gateway caches and CDN edges.
+    ///
+    /// NOTE: This is *advisory*—gateways perform additional checks (auth,
+    /// per-tenant cache keys, invalidation via message bus, ...).
+    pub cache_ttl: Duration,
+}
+
+impl<T> Page<T> {
+    pub fn empty() -> Self {
+        Self {
+            edges: Vec::new(),
+            has_next_page: false,
+            end_cursor: None,
+            cache_ttl: Duration::default(),
+        }
+    }
+}
+
+/// Domain-specific error envelope used by repository implementations.
+#[derive(Debug, Display, Error)]
+pub enum PaginationError {
+    #[display(fmt = "database error: {}", _0)]
+    Db(#[error(not(source))] String), // Using String to avoid coupling to sqlx::Error
+    #[display(fmt = "cursor error: {}", _0)]
+    Cursor(#[error(not(source))] CursorError),
+    #[display(fmt = "validation failed: {}", _0)]
+    Validation(#[error(not(source))] String),
+    #[display(fmt = "unknown pagination error")]
+    Unknown,
+}
+
+impl From<CursorError> for PaginationError {
+    fn from(err: CursorError) -> Self {
+        Self::Cursor(err)
+    }
+}
+
+/// Abstraction to be implemented by repositories wishing to expose paginated
+/// results.
+///
+/// The trait is intentionally defined with an associated output (`Row`) to
+/// allow the same repository to serve multiple DTO shapes by simply mapping
+/// `Row` into `T` at the service layer.
+#[async_trait]
+pub trait PageableRepository {
+    type Row: Send + Sync;
+
+    /// Executes a cursor based request. Implementations are expected to:
+    /// 1. Convert the logical cursor into DB predicates
+    /// 2. Fetch `limit + 1` rows (to compute `has_next_page`)
+    /// 3. Map the DB struct (`Row`) into DTO `T`
+    async fn fetch_page<T>(
+        &self,
+        req: &PageRequest,
+    ) -> Result<Page<T>, PaginationError>
+    where
+        T: From<Self::Row> + Send + 'static;
+}
+
+/// Helper around [`sqlx`] so that concrete Postgres implementations can share
+/// the common boilerplate. As this micro-service also ships with a GraphQL
+/// engine, we keep database-centric modules behind compile flags.
+#[cfg(feature = "postgres")]
+pub mod postgres_impl {
+    use super::*;
+    use sqlx::{postgres::PgRow, PgPool, Row};
+
+    /// Default implementation that assumes `{table}.id` is the **stable**
+    /// ordering column, with a secondary ordering on `created_at`.
+    pub struct SqlxCursorPaginator<'a> {
+        pool: &'a PgPool,
+        table: &'a str,
+    }
+
+    impl<'a> SqlxCursorPaginator<'a> {
+        pub fn new(pool: &'a PgPool, table: &'a str) -> Self {
+            Self { pool, table }
+        }
+    }
+
+    #[async_trait]
+    impl<'a> PageableRepository for SqlxCursorPaginator<'a> {
+        type Row = PgRow;
+
+        async fn fetch_page<T>(
+            &self,
+            req: &PageRequest,
+        ) -> Result<Page<T>, PaginationError>
+        where
+            T: From<Self::Row> + Send + 'static,
+        {
+            // Validate upfront; converting failures into our unified error.
+            if let Err(e) = req.validate() {
+                return Err(PaginationError::Validation(e.to_string()));
+            }
+
+            let limit = req.safe_limit() + 1; // Fetch one extra row.
+            let mut query = format!(
+                "SELECT * FROM {} WHERE 1=1 ",
+                self.table
+            );
+
+            if let Some(ref cursor) = req.after {
+                let (pk, ts) = cursor.decode()?;
+                query.push_str("AND (created_at, id) > ($1, $2) ");
+                query.push_str("ORDER BY created_at, id ");
+                query.push_str("LIMIT $3");
+                tracing::debug!(%query, "Executing paginated query");
+
+                let rows = sqlx::query(&query)
+                    .bind(ts)
+                    .bind(pk)
+                    .bind(limit as i64)
+                    .fetch_all(self.pool)
+                    .await
+                    .map_err(|e| PaginationError::Db(e.to_string()))?;
+
+                build_page(rows, req).map_err(Into::into)
+            } else {
+                query.push_str("ORDER BY created_at, id ");
+                query.push_str("LIMIT $1");
+                tracing::debug!(%query, "Executing paginated query");
+
+                let rows = sqlx::query(&query)
+                    .bind(limit as i64)
+                    .fetch_all(self.pool)
+                    .await
+                    .map_err(|e| PaginationError::Db(e.to_string()))?;
+
+                build_page(rows, req).map_err(Into::into)
+            }
+        }
+    }
+
+    fn build_page<T>(rows: Vec<PgRow>, req: &PageRequest) -> Result<Page<T>, CursorError>
+    where
+        T: From<PgRow>,
+    {
+        let mut has_next_page = false;
+        let mut rows = rows;
+
+        if rows.len() as u32 > req.safe_limit() {
+            has_next_page = true;
+            rows.pop(); // Remove lookahead row
+        }
+
+        let end_cursor = rows
+            .last()
+            .map(|row| {
+                let pk: i64 = row.get("id");
+                let ts: DateTime<Utc> = row.get("created_at");
+                Cursor::new(pk, ts)
+            });
+
+        Ok(Page {
+            edges: rows.into_iter().map(T::from).collect(),
+            has_next_page,
+            end_cursor,
+            cache_ttl: super::DEFAULT_CACHE_TTL,
+        })
+    }
+}
+
+/// Integration helpers for Actix-web. Opt-in via the `actix` feature flag so
+/// that core business logic remains detached from HTTP concerns.
+#[cfg(feature = "actix")]
+pub mod actix {
+    use super::*;
+    use actix_web::{error::ErrorBadRequest, FromRequest, HttpRequest};
+    use futures_util::future::{ready, Ready};
+
+    impl FromRequest for PageRequest {
+        type Error = actix_web::Error;
+        type Future = Ready<Result<Self, Self::Error>>;
+
+        fn from_request(req: &HttpRequest, _: &mut actix_http::Payload) -> Self::Future {
+            let query = req.query_string();
+            let pr: Result<Self, _> = serde_qs::from_str(query);
+            match pr {
+                Ok(pr) => match pr.validate() {
+                    Ok(_) => ready(Ok(pr)),
+                    Err(e) => ready(Err(ErrorBadRequest(e.to_string()))),
+                },
+                Err(e) => ready(Err(ErrorBadRequest(e))),
+            }
+        }
+    }
+}
+
+/// Tiny compile-time check to ensure we do not accidentally expose gigantic
+/// type parameters when this module is linked as a library.
+#[allow(clippy::assertions_on_constants)]
+const _: () = {
+    assert!(HARD_PAGE_SIZE_LIMIT <= 500, "Page size cap is suspiciously high");
+};
+
+/// Tests rely on the *default* features only.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn cursor_roundtrip() {
+        let ts = Utc.ymd(2023, 03, 10).and_hms_milli(10, 0, 12, 250);
+        let cursor = Cursor::new(42, ts);
+        let (pk, ts_decoded) = cursor.decode().expect("cursor decoding failed");
+        assert_eq!(pk, 42);
+        assert_eq!(ts_decoded, ts);
+    }
+
+    #[test]
+    fn page_request_validation() {
+        let req = PageRequest {
+            first: 300,
+            after: None,
+        };
+        assert!(req.validate().is_err(), "should fail due to hard cap");
+    }
+}
+```

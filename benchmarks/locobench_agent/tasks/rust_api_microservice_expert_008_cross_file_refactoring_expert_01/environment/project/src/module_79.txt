@@ -1,0 +1,387 @@
+```rust
+//! src/module_79.rs
+//! ---------------------------------------------------------
+//! LedgerLink Nexus – Ledger Entry Query Module
+//!
+//! Responsibilities
+//! 1. DTOs & validation for the “list ledger entries” endpoint
+//! 2. Repository interface (Command/Query separation)
+//! 3. Service-layer orchestration with read-through caching
+//! 4. Observability hooks (structured logging + metrics)
+//!
+//! The code below is self-contained but showcases realistic,
+//! production-grade patterns used across the wider codebase.
+//!
+//! ---------------------------------------------------------
+
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
+use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
+use tokio::time::timeout;
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
+use validator::Validate;
+
+/// -------------------------
+/// Error envelope
+/// -------------------------
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation failed: {0:?}")]
+    Validation(#[from] validator::ValidationErrors),
+
+    #[error("repository failure: {0}")]
+    Repository(String),
+
+    #[error("cache backend error: {0}")]
+    CacheBackend(String),
+
+    #[error("timeout ({0}ms)")]
+    Timeout(u64),
+
+    #[error("unexpected: {0}")]
+    Unexpected(String),
+}
+
+impl ServiceError {
+    fn repository<E: std::fmt::Display>(e: E) -> Self {
+        ServiceError::Repository(e.to_string())
+    }
+    fn cache<E: std::fmt::Display>(e: E) -> Self {
+        ServiceError::CacheBackend(e.to_string())
+    }
+}
+
+/// -------------------------
+/// Pagination helpers
+/// -------------------------
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Cursor(pub i64);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaginationMeta {
+    pub next: Option<Cursor>,
+    pub prev: Option<Cursor>,
+    pub total: Option<u64>,
+}
+
+/// -------------------------
+/// View-Models (DTOs)
+/// -------------------------
+
+/// Request DTO coming from the API Gateway / Controller layer.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct ListLedgerEntriesRequest {
+    /// Tenant-scoped account identifier
+    #[validate(length(min = 1))]
+    pub account_id: String,
+
+    /// Optional date filter (inclusive)
+    #[validate]
+    pub from: Option<NaiveDate>,
+
+    /// Optional date filter (inclusive)
+    #[validate]
+    pub to: Option<NaiveDate>,
+
+    /// Pagination cursor
+    pub cursor: Option<Cursor>,
+
+    /// Page size — bounded to avoid “SELECT *”
+    #[validate(range(min = 1, max = 500))]
+    pub per_page: Option<u16>,
+}
+
+/// Response DTO returned to the View layer.
+/// Keeps external clients decoupled from the domain entity.
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerEntryView {
+    pub id: Uuid,
+    pub account_id: String,
+    pub amount: i64,
+    pub currency: String,
+    pub booking_date: NaiveDate,
+    pub created_at: DateTime<Utc>,
+    pub modified_at: DateTime<Utc>,
+    // … possible expansion fields (fx_rate, source_system, etc.)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListLedgerEntriesResponse {
+    pub items: Vec<LedgerEntryView>,
+    pub pagination: PaginationMeta,
+    pub cache_hit: bool,
+}
+
+/// -------------------------
+/// Repository (domain layer)
+/// -------------------------
+
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync + 'static {
+    /// Fetch ledger entries for an account, ordered by booking_date DESC, id ASC
+    async fn fetch_entries(
+        &self,
+        account_id: &str,
+        from: Option<NaiveDate>,
+        to: Option<NaiveDate>,
+        cursor: Option<Cursor>,
+        limit: u16,
+    ) -> Result<(Vec<LedgerEntryView>, PaginationMeta), anyhow::Error>;
+}
+
+/// -------------------------
+/// Cache abstraction
+/// -------------------------
+
+#[async_trait]
+pub trait Cache: Send + Sync + 'static {
+    async fn get<T>(&self, key: &str) -> Result<Option<T>, anyhow::Error>
+    where
+        T: for<'de> Deserialize<'de> + Send;
+
+    async fn set<T>(&self, key: &str, value: &T, ttl: Duration) -> Result<(), anyhow::Error>
+    where
+        T: Serialize + Send;
+}
+
+/// -------------------------
+/// Service implementation
+/// -------------------------
+
+pub struct LedgerEntryQueryService<R: LedgerEntryRepository, C: Cache> {
+    repo: Arc<R>,
+    cache: Arc<C>,
+    default_page_size: u16,
+    default_ttl: Duration,
+}
+
+impl<R: LedgerEntryRepository, C: Cache> LedgerEntryQueryService<R, C> {
+    pub fn new(repo: Arc<R>, cache: Arc<C>) -> Self {
+        Self {
+            repo,
+            cache,
+            default_page_size: 100,
+            default_ttl: Duration::from_secs(30),
+        }
+    }
+
+    /// Map the request DTO to a stable cache key.
+    fn build_cache_key(req: &ListLedgerEntriesRequest) -> String {
+        let mut fragments = vec![
+            req.account_id.clone(),
+            req.cursor.map(|c| c.0.to_string()).unwrap_or_default(),
+            req.from.map(|d| d.to_string()).unwrap_or_default(),
+            req.to.map(|d| d.to_string()).unwrap_or_default(),
+        ];
+        if let Some(size) = req.per_page {
+            fragments.push(size.to_string())
+        }
+        fragments.join("|")
+    }
+
+    #[instrument(
+        name = "service.list_ledger_entries",
+        skip(self, req),
+        fields(
+            account_id = %req.account_id,
+            cursor = ?req.cursor,
+            per_page = ?req.per_page
+        )
+    )]
+    pub async fn list_entries(
+        &self,
+        req: ListLedgerEntriesRequest,
+    ) -> Result<ListLedgerEntriesResponse, ServiceError> {
+        // 1. Validate
+        req.validate()?;
+
+        // 2. Cache lookup
+        let cache_key = Self::build_cache_key(&req);
+        if let Some(resp) = self.cache.get::<ListLedgerEntriesResponse>(&cache_key).await.map_err(ServiceError::cache)? {
+            debug!("cache hit: {}", cache_key);
+            return Ok(ListLedgerEntriesResponse { cache_hit: true, ..resp });
+        }
+        debug!("cache miss: {}", cache_key);
+
+        // 3. Repository query with timeout protection
+        let limit = req.per_page.unwrap_or(self.default_page_size);
+        let repo_fut = self.repo.fetch_entries(
+            &req.account_id,
+            req.from,
+            req.to,
+            req.cursor,
+            limit,
+        );
+        let (items, pagination) = timeout(Duration::from_secs(3), repo_fut)
+            .await
+            .map_err(|_| ServiceError::Timeout(3_000))?
+            .map_err(ServiceError::repository)?;
+
+        let resp = ListLedgerEntriesResponse {
+            items,
+            pagination,
+            cache_hit: false,
+        };
+
+        // 4. Fire-and-forget cache population
+        let cache = Arc::clone(&self.cache);
+        let ttl = self.default_ttl;
+        let resp_clone = resp.clone();
+        tokio::spawn(async move {
+            if let Err(e) = cache.set(&cache_key, &resp_clone, ttl).await {
+                warn!("failed to backfill cache ({}): {}", cache_key, e);
+            }
+        });
+
+        Ok(resp)
+    }
+}
+
+/// -------------------------
+/// Mock implementations
+/// (Used in unit tests & local dev)
+//  These mocks compile out in production via feature flags.
+/// -------------------------
+#[cfg(any(test, feature = "mock"))]
+mod mocks {
+    use super::*;
+    use once_cell::sync::Lazy;
+    use parking_lot::RwLock;
+
+    /// In-memory ledger entry store for tests
+    pub struct MockLedgerRepo {
+        /// account_id -> Vec<LedgerEntryView>
+        data: RwLock<HashMap<String, Vec<LedgerEntryView>>>,
+    }
+
+    #[async_trait]
+    impl LedgerEntryRepository for MockLedgerRepo {
+        async fn fetch_entries(
+            &self,
+            account_id: &str,
+            _from: Option<NaiveDate>,
+            _to: Option<NaiveDate>,
+            _cursor: Option<Cursor>,
+            limit: u16,
+        ) -> Result<(Vec<LedgerEntryView>, PaginationMeta), anyhow::Error> {
+            let store = self.data.read();
+            let full = store.get(account_id).cloned().unwrap_or_default();
+            let slice = full.into_iter().take(limit as usize).collect::<Vec<_>>();
+            Ok((
+                slice,
+                PaginationMeta {
+                    next: None,
+                    prev: None,
+                    total: Some(slice.len() as u64),
+                },
+            ))
+        }
+    }
+
+    /// Very thin, non-evicting local cache
+    pub struct MockCache {
+        inner: RwLock<HashMap<String, Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl Cache for MockCache {
+        async fn get<T>(&self, key: &str) -> Result<Option<T>, anyhow::Error>
+        where
+            T: for<'de> Deserialize<'de> + Send,
+        {
+            let map = self.inner.read();
+            match map.get(key) {
+                Some(raw) => Ok(Some(serde_json::from_slice(raw)?)),
+                None => Ok(None),
+            }
+        }
+
+        async fn set<T>(&self, key: &str, value: &T, _ttl: Duration) -> Result<(), anyhow::Error>
+        where
+            T: Serialize + Send,
+        {
+            let mut map = self.inner.write();
+            map.insert(key.to_owned(), serde_json::to_vec(value)?);
+            Ok(())
+        }
+    }
+
+    // Static fixtures
+    pub static MOCK_REPO: Lazy<Arc<MockLedgerRepo>> = Lazy::new(|| {
+        let mut map: HashMap<String, Vec<LedgerEntryView>> = HashMap::new();
+        map.insert(
+            "acc-1".to_string(),
+            (0..3)
+                .map(|i| LedgerEntryView {
+                    id: Uuid::new_v4(),
+                    account_id: "acc-1".to_string(),
+                    amount: 1000 + i * 10,
+                    currency: "USD".into(),
+                    booking_date: NaiveDate::from_ymd_opt(2024, 3, 14 + i).unwrap(),
+                    created_at: Utc::now(),
+                    modified_at: Utc::now(),
+                })
+                .collect(),
+        );
+        Arc::new(MockLedgerRepo {
+            data: RwLock::new(map),
+        })
+    });
+
+    pub static MOCK_CACHE: Lazy<Arc<MockCache>> = Lazy::new(|| {
+        Arc::new(MockCache {
+            inner: RwLock::new(HashMap::new()),
+        })
+    });
+}
+
+/// -------------------------
+/// Unit tests
+/// -------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::module_79::mocks::{MOCK_CACHE, MOCK_REPO};
+
+    #[tokio::test]
+    async fn happy_path() {
+        let svc = LedgerEntryQueryService::new(MOCK_REPO.clone(), MOCK_CACHE.clone());
+
+        let req = ListLedgerEntriesRequest {
+            account_id: "acc-1".to_string(),
+            from: None,
+            to: None,
+            cursor: None,
+            per_page: Some(2),
+        };
+
+        let resp = svc.list_entries(req).await.unwrap();
+        assert_eq!(resp.items.len(), 2);
+        assert!(!resp.cache_hit);
+
+        // Second call should be cached
+        let resp2 = svc
+            .list_entries(ListLedgerEntriesRequest {
+                per_page: Some(2),
+                ..resp_request()
+            })
+            .await
+            .unwrap();
+        assert!(resp2.cache_hit);
+    }
+
+    fn resp_request() -> ListLedgerEntriesRequest {
+        ListLedgerEntriesRequest {
+            account_id: "acc-1".to_string(),
+            from: None,
+            to: None,
+            cursor: None,
+            per_page: Some(2),
+        }
+    }
+}
+```

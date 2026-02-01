@@ -1,0 +1,469 @@
+/*
+ * SynestheticCanvas API Suite - License Verification Module
+ *
+ * File:    SynestheticCanvas/LICENSE
+ * Purpose: Secure, runtime license-file validation for individual micro-services.
+ * Language: C (C11)
+ *
+ * Synopsis
+ * --------
+ *      #include "license.h"
+ *
+ *      sc_license_t lic;
+ *      if (sc_license_load("license.json", &lic) != 0) {
+ *          fprintf(stderr, "License invalid: %s\n", lic.error);
+ *          exit(EXIT_FAILURE);
+ *      }
+ *
+ *      if (!sc_license_feature_enabled(&lic, "dynamic_texture_synthesis")) {
+ *          fprintf(stderr, "Feature disabled by license.\n");
+ *      }
+ *
+ *      sc_license_free(&lic);
+ *
+ * Design Notes
+ * ------------
+ *  • License file is JSON     (see spec below) and carries a detached
+ *    Base64-encoded signature covering the canonicalized JSON.
+ *  • OpenSSL is used for RSA-PKCS#1 v1.5/SHA-256 verification.
+ *  • Graceful degradation: If OpenSSL is not present or key mismatch occurs,
+ *    the service will deny startup.
+ *  • Thread safety: no global mutable state, the caller owns the struct.
+ *
+ * License File Spec (license.json)
+ * --------------------------------
+ *  {
+ *    "product"      : "SynestheticCanvas",
+ *    "company"      : "Acme Gallery",
+ *    "issued_at"    : "2024-02-18T00:00:00Z",
+ *    "expires_at"   : "2025-02-18T00:00:00Z",
+ *    "features"     : ["palette_management", "dynamic_texture_synthesis"],
+ *    "signature"    : "BASE64_RSA_SIG"
+ *  }
+ */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <ctype.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/sha.h>
+
+#include "license.h"
+
+/* --------------------------------------------------------------------------
+ * Constants & Internal Structures
+ * -------------------------------------------------------------------------- */
+
+#define SC_LICENSE_MAX_FEATURES    64
+#define SC_LICENSE_SIG_FIELD       "signature"
+#define SC_LICENSE_MASTER_PUBKEY_PEM                                            \
+"-----BEGIN PUBLIC KEY-----\n"                                                  \
+"MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs5iYFsFv46bR1gTadPpa\n"          \
+"ux+S9LsYLuESW+CvTCUMCYi1C0yPt3CgZzgUagFtjiDuMLdzY2nxrdKB4RJfOAf7\n"          \
+"lzsKmkY3ie7YFeQQiYVdkqSN8REQhJ+3PjxVaNkLojm8fQWYpAf9y2V0pct6qXcx\n"          \
+"ibX6/HSj4whJRtH7edYKqt6uLcp1ASY5ilkrfPx4gc3sxg7ZRey+DRb7m/ASf82b\n"          \
+"iQUyFskzn8oDpCkY5xYiQkOnAk1ZfsEbfjOPwG3zn5pptWmCvjIcKIfrPf3jgzmw\n"          \
+"eOrwicT7OvqoQRxOMEBrUzKjcl/Xra53MXcfo6m9hGmycmuRmdSf0XD3w17uBo8J\n"          \
+"OwIDAQAB\n"                                                                    \
+"-----END PUBLIC KEY-----\n"
+
+typedef struct {
+    char        *product;
+    char        *company;
+    time_t       issued_at;
+    time_t       expires_at;
+    char        *features[SC_LICENSE_MAX_FEATURES];
+    size_t       feature_count;
+    unsigned char *signature;     /* raw bytes */
+    size_t          sig_len;
+    char        *raw_json;        /* canonical json string w/out signature field */
+} sc_license_raw_t;
+
+/* --------------------------------------------------------------------------
+ * Helper Functions - Memory utilities and JSON parsing
+ * -------------------------------------------------------------------------- */
+
+/* Trim leading/trailing whitespace in-place. */
+static char *strtrim(char *s)
+{
+    if (!s) return s;
+    char *end = s + strlen(s);
+    while (end > s && isspace((unsigned char)*(end - 1))) --end;
+    *end = '\0';
+    while (*s && isspace((unsigned char)*s)) ++s;
+    return s;
+}
+
+/* Read entire file into NUL-terminated buffer.  Caller frees. */
+static int slurp_file(const char *path, char **out_buf, size_t *out_len, char *err, size_t errcap)
+{
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        snprintf(err, errcap, "Unable to open '%s': %s", path, strerror(errno));
+        return -1;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        snprintf(err, errcap, "fseek: %s", strerror(errno));
+        fclose(fp);
+        return -1;
+    }
+    long sz = ftell(fp);
+    if (sz < 0) {
+        snprintf(err, errcap, "ftell: %s", strerror(errno));
+        fclose(fp);
+        return -1;
+    }
+    rewind(fp);
+
+    *out_buf = malloc((size_t)sz + 1);
+    if (!*out_buf) {
+        snprintf(err, errcap, "malloc failed");
+        fclose(fp);
+        return -1;
+    }
+    size_t nread = fread(*out_buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    if (nread != (size_t)sz) {
+        snprintf(err, errcap, "Short read");
+        free(*out_buf);
+        *out_buf = NULL;
+        return -1;
+    }
+    (*out_buf)[sz] = '\0';
+    if (out_len) *out_len = (size_t)sz;
+    return 0;
+}
+
+/* Simple ISO-8601 parser (UTC only). */
+static int parse_iso8601_utc(const char *str, time_t *out, char *err, size_t errcap)
+{
+    struct tm tm = {0};
+    if (strptime(str, "%Y-%m-%dT%H:%M:%SZ", &tm) == NULL) {
+        snprintf(err, errcap, "Invalid ISO-8601 timestamp: %s", str);
+        return -1;
+    }
+    tm.tm_isdst = 0;
+    *out = timegm(&tm);
+    return 0;
+}
+
+/* Base64-decode helper using OpenSSL.  Caller frees. */
+static int base64_decode(const char *b64, unsigned char **out, size_t *out_len, char *err, size_t errcap)
+{
+    BIO *bmem = BIO_new_mem_buf((void *)b64, -1);
+    BIO *b64bio = BIO_new(BIO_f_base64());
+    if (!bmem || !b64bio) {
+        snprintf(err, errcap, "BIO_new failed");
+        BIO_free_all(bmem);
+        return -1;
+    }
+    BIO_set_flags(b64bio, BIO_FLAGS_BASE64_NO_NL);
+    bmem = BIO_push(b64bio, bmem);
+
+    size_t est_len = strlen(b64) * 3 / 4;
+    unsigned char *buf = malloc(est_len + 1);
+    if (!buf) {
+        snprintf(err, errcap, "malloc failed");
+        BIO_free_all(bmem);
+        return -1;
+    }
+    int n = BIO_read(bmem, buf, (int)est_len);
+    BIO_free_all(bmem);
+    if (n <= 0) {
+        snprintf(err, errcap, "BIO_read failed");
+        free(buf);
+        return -1;
+    }
+    buf[n] = '\0';
+    *out = buf;
+    *out_len = (size_t)n;
+    return 0;
+}
+
+/* Very small, non-compliant JSON field extractor.
+ * Assumptions:
+ *   – No nested objects (except 'features' array).
+ *   – Double-quoted strings only.
+ *   – Keys and values do not contain escaped quotes (simplified).
+ *
+ * The implementation is intentionally minimal to avoid adding heavy deps.
+ * Replace with cJSON or JSMN in production builds that need full JSON.
+ */
+static char *json_get_string(const char *json, const char *key)
+{
+    size_t klen = strlen(key);
+    const char *p = json;
+    while ((p = strstr(p, key))) {
+        /* ensure it's a standalone key in quotes: "key" */
+        if (p > json && *(p - 1) != '"') { p += klen; continue; }
+        const char *colon = strchr(p + klen + 1, ':');    /* skip '"' */
+        if (!colon) break;
+        const char *q = strchr(colon, '"');
+        if (!q) break;
+        const char *r = strchr(q + 1, '"');
+        if (!r) break;
+        size_t len = (size_t)(r - q - 1);
+        char *out = malloc(len + 1);
+        strncpy(out, q + 1, len);
+        out[len] = '\0';
+        return strtrim(out);
+    }
+    return NULL;
+}
+
+static int json_get_string_array(const char *json, const char *key, char **arr, size_t *arr_len)
+{
+    const char *p = strstr(json, key);
+    if (!p) return 0;
+    const char *lbracket = strchr(p, '[');
+    if (!lbracket) return 0;
+    const char *rbracket = strchr(lbracket, ']');
+    if (!rbracket) return 0;
+
+    char *dup = strndup(lbracket + 1, (size_t)(rbracket - lbracket - 1));
+    if (!dup) return -1;
+
+    size_t count = 0;
+    char *tok = strtok(dup, ",");
+    while (tok && count < SC_LICENSE_MAX_FEATURES) {
+        tok = strtrim(tok);
+        if (*tok == '"') tok++;
+        char *end = tok + strlen(tok);
+        if (end > tok && *(end - 1) == '"') *(end - 1) = '\0';
+        arr[count++] = strdup(tok);
+        tok = strtok(NULL, ",");
+    }
+    free(dup);
+    *arr_len = count;
+    return 0;
+}
+
+/* Remove the "signature" field (and its comma) to produce canonical JSON for hashing. */
+static char *json_remove_signature_field(const char *json)
+{
+    const char *p = strstr(json, "\"" SC_LICENSE_SIG_FIELD "\"");
+    if (!p) return strdup(json);
+
+    /* Locate preceding comma (if any) and following comma/newline to keep JSON valid. */
+    const char *start = p;
+    while (start > json && *(start - 1) != ',') --start;
+    const char *end = strchr(p, '\n');
+    if (!end) end = strchr(p, '}');
+    if (!end) end = p + strlen(p);
+    if (*end == ',') ++end;
+
+    size_t prefix_len = (size_t)(start - json);
+    size_t suffix_len = strlen(end);
+    char *out = malloc(prefix_len + suffix_len + 1);
+    memcpy(out, json, prefix_len);
+    memcpy(out + prefix_len, end, suffix_len);
+    out[prefix_len + suffix_len] = '\0';
+    return out;
+}
+
+/* --------------------------------------------------------------------------
+ * Cryptographic Verification
+ * -------------------------------------------------------------------------- */
+
+static int verify_signature(const unsigned char *data, size_t data_len,
+                            const unsigned char *sig, size_t sig_len,
+                            char *err, size_t errcap)
+{
+    int rc = -1;
+    EVP_PKEY *pkey = NULL;
+    EVP_MD_CTX *ctx = NULL;
+
+    BIO *bio = BIO_new_mem_buf((void *)SC_LICENSE_MASTER_PUBKEY_PEM, -1);
+    if (!bio) {
+        snprintf(err, errcap, "BIO_new_mem_buf failed");
+        goto cleanup;
+    }
+    pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    if (!pkey) {
+        snprintf(err, errcap, "PEM_read_bio_PUBKEY failed");
+        goto cleanup;
+    }
+
+    ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        snprintf(err, errcap, "EVP_MD_CTX_new failed");
+        goto cleanup;
+    }
+
+    if (EVP_DigestVerifyInit(ctx, NULL, EVP_sha256(), NULL, pkey) != 1 ||
+        EVP_DigestVerifyUpdate(ctx, data, data_len) != 1) {
+        snprintf(err, errcap, "DigestVerifyInit/Update failed");
+        goto cleanup;
+    }
+    if (EVP_DigestVerifyFinal(ctx, sig, sig_len) != 1) {
+        snprintf(err, errcap, "RSA signature verification failed");
+        goto cleanup;
+    }
+
+    rc = 0;  /* success */
+
+cleanup:
+    if (ctx) EVP_MD_CTX_free(ctx);
+    if (pkey) EVP_PKEY_free(pkey);
+    return rc;
+}
+
+/* --------------------------------------------------------------------------
+ * Public API
+ * -------------------------------------------------------------------------- */
+
+static void sc_license_raw_free(sc_license_raw_t *raw)
+{
+    if (!raw) return;
+    free(raw->product);
+    free(raw->company);
+    for (size_t i = 0; i < raw->feature_count; ++i)
+        free(raw->features[i]);
+    free(raw->signature);
+    free(raw->raw_json);
+}
+
+static int sc_license_parse(const char *json, sc_license_t *lic)
+{
+    sc_license_raw_t raw = {0};
+    char errbuf[256] = {0};
+    int rc = -1;
+
+    raw.product  = json_get_string(json, "product");
+    raw.company  = json_get_string(json, "company");
+    char *issued = json_get_string(json, "issued_at");
+    char *expire = json_get_string(json, "expires_at");
+    char *sig_b64 = json_get_string(json, SC_LICENSE_SIG_FIELD);
+
+    if (!raw.product || !raw.company || !issued || !expire || !sig_b64) {
+        snprintf(lic->error, sizeof lic->error, "Missing required field(s)");
+        goto cleanup;
+    }
+    if (parse_iso8601_utc(issued, &raw.issued_at, errbuf, sizeof errbuf) != 0 ||
+        parse_iso8601_utc(expire, &raw.expires_at, errbuf, sizeof errbuf) != 0) {
+        snprintf(lic->error, sizeof lic->error, "%s", errbuf);
+        goto cleanup;
+    }
+    if (base64_decode(sig_b64, &raw.signature, &raw.sig_len, errbuf, sizeof errbuf) != 0) {
+        snprintf(lic->error, sizeof lic->error, "%s", errbuf);
+        goto cleanup;
+    }
+    if (json_get_string_array(json, "features", raw.features, &raw.feature_count) != 0) {
+        snprintf(lic->error, sizeof lic->error, "JSON parse error (features)");
+        goto cleanup;
+    }
+
+    raw.raw_json = json_remove_signature_field(json);
+
+    /* Cryptographic verification */
+    if (verify_signature((unsigned char *)raw.raw_json, strlen(raw.raw_json),
+                         raw.signature, raw.sig_len, errbuf, sizeof errbuf) != 0) {
+        snprintf(lic->error, sizeof lic->error, "%s", errbuf);
+        goto cleanup;
+    }
+
+    /* Expiry check */
+    time_t now = time(NULL);
+    if (now > raw.expires_at) {
+        snprintf(lic->error, sizeof lic->error, "License expired");
+        goto cleanup;
+    }
+
+    /* All good -> populate public struct  */
+    lic->product      = raw.product;    raw.product = NULL;
+    lic->company      = raw.company;    raw.company = NULL;
+    lic->issued_at    = raw.issued_at;
+    lic->expires_at   = raw.expires_at;
+    lic->feature_count= raw.feature_count;
+    for (size_t i = 0; i < raw.feature_count; ++i) {
+        lic->features[i] = raw.features[i];
+        raw.features[i]  = NULL;
+    }
+    lic->valid = true;
+    rc = 0;
+
+cleanup:
+    sc_license_raw_free(&raw);
+    free(issued);
+    free(expire);
+    free(sig_b64);
+    return rc;
+}
+
+
+/* Public function definitions ------------------------------------------------ */
+
+int sc_license_load(const char *path, sc_license_t *lic)
+{
+    memset(lic, 0, sizeof *lic);
+
+    char *json = NULL;
+    char errbuf[256] = {0};
+    if (slurp_file(path, &json, NULL, errbuf, sizeof errbuf) != 0) {
+        snprintf(lic->error, sizeof lic->error, "%s", errbuf);
+        return -1;
+    }
+
+    int rc = sc_license_parse(json, lic);
+    free(json);
+    return rc;
+}
+
+bool sc_license_feature_enabled(const sc_license_t *lic, const char *feature)
+{
+    if (!lic || !lic->valid) return false;
+    for (size_t i = 0; i < lic->feature_count; ++i) {
+        if (strcmp(lic->features[i], feature) == 0) return true;
+    }
+    return false;
+}
+
+void sc_license_free(sc_license_t *lic)
+{
+    if (!lic) return;
+    free(lic->product);
+    free(lic->company);
+    for (size_t i = 0; i < lic->feature_count; ++i)
+        free(lic->features[i]);
+    memset(lic, 0, sizeof *lic);
+}
+
+/* --------------------------------------------------------------------------
+ * Self-test (enabled with -DLICENSE_SELFTEST)
+ * -------------------------------------------------------------------------- */
+#ifdef LICENSE_SELFTEST
+
+static const char *sample_license =
+"{\n"
+"  \"product\": \"SynestheticCanvas\",\n"
+"  \"company\": \"Example Co\",\n"
+"  \"issued_at\": \"2023-12-01T00:00:00Z\",\n"
+"  \"expires_at\": \"2099-12-01T00:00:00Z\",\n"
+"  \"features\": [\"palette_management\", \"dynamic_texture_synthesis\"],\n"
+"  \"signature\": \"<REPLACE_WITH_REAL_SIG>\"\n"
+"}\n";
+
+int main(void)
+{
+    sc_license_t lic;
+    if (sc_license_parse(sample_license, &lic) == 0) {
+        printf("License OK. Features:\n");
+        for (size_t i = 0; i < lic.feature_count; ++i)
+            printf("  - %s\n", lic.features[i]);
+    } else {
+        printf("License invalid: %s\n", lic.error);
+    }
+    sc_license_free(&lic);
+    return 0;
+}
+#endif /* LICENSE_SELFTEST */

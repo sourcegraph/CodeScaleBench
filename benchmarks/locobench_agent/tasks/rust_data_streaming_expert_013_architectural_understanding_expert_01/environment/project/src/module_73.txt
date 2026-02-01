@@ -1,0 +1,369 @@
+```rust
+//! src/module_73.rs
+//!
+//! Enrichment Processor (EP)
+//! -------------------------
+//! A hot-swappable, strategy-based enrichment micro-service that consumes raw
+//! social-network events from Kafka, enriches them with a configurable chain of
+//! algorithms (language detection, toxicity scoring, sentiment analysis,
+//! influencer graph extraction, …) and republishes the enriched payload to the
+//! lake house topic.
+//!
+//! This module is self-contained to ease review and on-call debugging; all
+//! external contracts are expressed through traits so that unit tests can rely
+//! on in-memory fakes rather than a running Kafka cluster.
+//!
+//! Compile with:
+//! `cargo build --package chirp_pulse --features enrichment_processor`
+//!
+//! ─────────────────────────────────────────────────────────────────────────────
+
+#![allow(clippy::large_enum_variant)]
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use async_trait::async_trait;
+use metrics::{counter, histogram};
+use rdkafka::{
+    consumer::{CommitMode, Consumer, StreamConsumer},
+    message::{BorrowedMessage, OwnedHeaders},
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Message,
+};
+use serde::{Deserialize, Serialize};
+use tokio::{select, sync::RwLock, task, time};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Logical name of the Kafka topic we ingest from.
+pub const RAW_TOPIC: &str = "chirppulse.raw";
+
+/// Logical name of the Kafka topic we push enriched records to.
+pub const ENRICHED_TOPIC: &str = "chirppulse.enriched";
+
+/// How long we allow an individual enrichment chain to run before we give up.
+const ENRICHMENT_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Wrapper around the raw payload (e.g., tweet, reddit comment, …).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawEvent {
+    pub id: String,
+    pub user_id: String,
+    pub created_at_epoch_ms: i64,
+    pub network: String,
+    pub body: String,
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Enriched event that will be published further down-stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichedEvent {
+    pub raw: RawEvent,
+    /// Arbitrary enrichment results keyed by algorithm name.
+    pub enrichment: HashMap<String, serde_json::Value>,
+}
+
+/// High-level error type for the processor.
+#[derive(thiserror::Error, Debug)]
+pub enum ProcessorError {
+    #[error("Kafka error: {0}")]
+    Kafka(#[from] rdkafka::error::KafkaError),
+
+    #[error("Enrichment error: {0}")]
+    Enrichment(#[from] anyhow::Error),
+
+    #[error("Serde json error: {0}")]
+    SerdeJson(#[from] serde_json::Error),
+}
+
+/// Trait implemented by all enrichment algorithms.
+#[async_trait]
+pub trait Enricher: Send + Sync + 'static {
+    /// Immutable name used as key in the enrichment map.
+    fn name(&self) -> &'static str;
+
+    /// Performs in-place enrichment. Implementors may mutate the map, but must
+    /// never remove entries added by other Enrichers.
+    async fn enrich(
+        &self,
+        evt: &RawEvent,
+        out: &mut HashMap<String, serde_json::Value>,
+    ) -> Result<(), anyhow::Error>;
+}
+
+/// Factory that returns active `Enricher` chains at runtime. Allows live
+/// reconfiguration without restarting the service.
+#[async_trait]
+pub trait EnricherRegistry: Send + Sync + 'static {
+    async fn current_chain(&self) -> Arc<Vec<Arc<dyn Enricher>>>;
+}
+
+/// The simplest registry: a static, immutable chain of enrichers.
+#[derive(Clone)]
+pub struct StaticRegistry {
+    chain: Arc<Vec<Arc<dyn Enricher>>>,
+}
+
+impl StaticRegistry {
+    pub fn new<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = Arc<dyn Enricher>>,
+    {
+        Self {
+            chain: Arc::new(iter.into_iter().collect()),
+        }
+    }
+}
+
+#[async_trait]
+impl EnricherRegistry for StaticRegistry {
+    async fn current_chain(&self) -> Arc<Vec<Arc<dyn Enricher>>> {
+        self.chain.clone()
+    }
+}
+
+/// Tokio task that owns Kafka consumer & producer and orchestrates enrichment.
+pub struct EnrichmentProcessor<R: EnricherRegistry> {
+    registry: R,
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+}
+
+impl<R: EnricherRegistry> EnrichmentProcessor<R> {
+    pub fn new(registry: R, consumer: StreamConsumer, producer: FutureProducer) -> Self {
+        Self {
+            registry,
+            consumer,
+            producer,
+        }
+    }
+
+    /// Spawns the main processing loop. Returns a handle to the background task.
+    pub fn spawn(mut self) -> task::JoinHandle<()> {
+        task::spawn(async move {
+            if let Err(e) = self.run().await {
+                error!(error = %e, "enrichment processor terminated with error");
+            }
+        })
+    }
+
+    #[instrument(skip(self))]
+    async fn run(&mut self) -> Result<(), ProcessorError> {
+        info!("starting enrichment processor");
+
+        self.consumer.subscribe(&[RAW_TOPIC])?;
+
+        loop {
+            select! {
+                res = self.consumer.recv() => {
+                    match res {
+                        Err(e) => {
+                            error!(error = %e, "Kafka receive error");
+                            counter!("chirppulse.ingest_errors", 1, "reason" => "kafka_receive");
+                            time::sleep(Duration::from_millis(250)).await;
+                        }
+                        Ok(msg) => {
+                            if let Err(e) = self.handle_message(msg).await {
+                                error!(error = %e, "failed to handle message");
+                                counter!("chirppulse.ingest_errors", 1, "reason" => "handle_message");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[instrument(skip(self, msg), fields(offset = msg.offset()))]
+    async fn handle_message(&self, msg: BorrowedMessage<'_>) -> Result<(), ProcessorError> {
+        let payload = msg.payload().ok_or_else(|| {
+            error!("received message without payload, skipping");
+            counter!("chirppulse.ingest_errors", 1, "reason" => "empty_payload");
+            rdkafka::error::KafkaError::NoMessageReceived
+        })?;
+
+        // 1. Deserialize ------------------------------------------------------
+        let raw_event: RawEvent = match serde_json::from_slice(payload) {
+            Ok(evt) => evt,
+            Err(e) => {
+                warn!(error = %e, "invalid JSON, discarding");
+                // For bad input we just commit offset and continue.
+                self.consumer.commit_message(&msg, CommitMode::Async)?;
+                return Ok(());
+            }
+        };
+
+        // 2. Enrichment -------------------------------------------------------
+        let chain = self.registry.current_chain().await;
+        let mut enrichment: HashMap<String, serde_json::Value> = HashMap::with_capacity(chain.len());
+
+        let start = Instant::now();
+        for enricher in chain.iter() {
+            // Deadline enforcement
+            let deadline = ENRICHMENT_DEADLINE.checked_sub(start.elapsed()).unwrap_or_default();
+            if deadline.is_zero() {
+                warn!("enrichment deadline exceeded, aborting chain");
+                counter!("chirppulse.enrichment_aborted", 1);
+                break;
+            }
+
+            let name = enricher.name();
+            let fut = enricher.enrich(&raw_event, &mut enrichment);
+
+            // timeout per step
+            match time::timeout(deadline, fut).await {
+                Err(_) => {
+                    warn!(alg = name, "enrichment step timed out");
+                    counter!("chirppulse.enrichment_timeout", 1, "alg" => name);
+                }
+                Ok(Err(err)) => {
+                    warn!(alg = name, error = %err, "enrichment step errored");
+                    counter!("chirppulse.enrichment_fail", 1, "alg" => name);
+                }
+                Ok(Ok(())) => {
+                    debug!(alg = name, "enrichment step completed");
+                    counter!("chirppulse.enrichment_ok", 1, "alg" => name);
+                }
+            }
+        }
+        histogram!("chirppulse.enrichment_duration_ms", start.elapsed().as_millis() as f64);
+
+        // 3. Serialize & publish ---------------------------------------------
+        let enriched = EnrichedEvent { raw: raw_event, enrichment };
+        let bytes = serde_json::to_vec(&enriched)?;
+
+        let headers = OwnedHeaders::new().add("version", "1");
+        let record = FutureRecord::<[u8], _>::to(ENRICHED_TOPIC)
+            .payload(&bytes)
+            .key(&enriched.raw.id)
+            .headers(headers);
+
+        let produce_res = self.producer.send(record, Duration::from_secs(0));
+        // We don't want to block the hot path; we spawn and detach.
+        task::spawn(async move {
+            if let Err((e, _msg)) = produce_res.await {
+                error!(error = %e, "failed to publish enriched event");
+                counter!("chirppulse.publish_fail", 1);
+            } else {
+                counter!("chirppulse.publish_ok", 1);
+            }
+        });
+
+        // 4. Commit offset ----------------------------------------------------
+        self.consumer.commit_message(&msg, CommitMode::Async)?;
+
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reference Enricher Implementations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Fake language detection using Unicode heuristics.
+pub struct LangDetect;
+
+#[async_trait]
+impl Enricher for LangDetect {
+    fn name(&self) -> &'static str {
+        "lang_detect"
+    }
+
+    async fn enrich(
+        &self,
+        evt: &RawEvent,
+        out: &mut HashMap<String, serde_json::Value>,
+    ) -> Result<(), anyhow::Error> {
+        let lang = guess_language(&evt.body);
+        out.insert(
+            "lang".into(),
+            serde_json::Value::String(lang.to_owned()),
+        );
+        Ok(())
+    }
+}
+
+/// Naïve toxicity scorer based on regex, as a placeholder for an ML model.
+pub struct ToxicityScorer;
+
+#[async_trait]
+impl Enricher for ToxicityScorer {
+    fn name(&self) -> &'static str {
+        "toxicity"
+    }
+
+    async fn enrich(
+        &self,
+        evt: &RawEvent,
+        out: &mut HashMap<String, serde_json::Value>,
+    ) -> Result<(), anyhow::Error> {
+        let score = if evt.body.contains("idiot") { 0.9 } else { 0.1 };
+        out.insert("toxicity".into(), serde_json::json!({ "score": score }));
+        Ok(())
+    }
+}
+
+/// Very quick & dirty language guesser.
+fn guess_language(txt: &str) -> &'static str {
+    if txt.is_empty() {
+        return "und";
+    }
+    if txt.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+        return "zh";
+    }
+    if txt.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c)) {
+        return "ru";
+    }
+    "en"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bootstrap helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Creates a tuned Kafka consumer for low-latency workloads.
+pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer, rdkafka::error::KafkaError> {
+    ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", group_id)
+        .set("enable.auto.commit", "false")
+        .set("session.timeout.ms", "6000")
+        .set("enable.partition.eof", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()
+}
+
+/// Creates a high-throughput Kafka producer.
+pub fn build_producer(brokers: &str) -> Result<FutureProducer, rdkafka::error::KafkaError> {
+    ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("message.timeout.ms", "5000")
+        .set("compression.type", "lz4")
+        .set("queue.buffering.max.messages", "1000000")
+        .create()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Service Entrypoint
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "bin")]
+#[tokio::main]
+async fn main() -> Result<(), ProcessorError> {
+    tracing_subscriber::fmt::init();
+
+    let consumer = build_consumer("localhost:9092", "chirppulse-enrichment")?;
+    let producer = build_producer("localhost:9092")?;
+
+    let registry = StaticRegistry::new(vec![
+        Arc::new(LangDetect),
+        Arc::new(ToxicityScorer),
+    ]);
+
+    EnrichmentProcessor::new(registry, consumer, producer).spawn().await?;
+    Ok(())
+}
+```

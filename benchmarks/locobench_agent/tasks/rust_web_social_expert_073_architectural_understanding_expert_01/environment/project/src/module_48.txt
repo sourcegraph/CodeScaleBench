@@ -1,0 +1,509 @@
+```rust
+//! src/module_48.rs
+//!
+//! Event-Driven Infrastructure for EduPulse Live
+//! ============================================
+//! This module encapsulates the **Outbox → Broker** integration used across the
+//! platform.  Each bounded context persists `DomainEvent`s to its local
+//! PostgreSQL **outbox** table as part of the same transaction that mutates
+//! aggregates.  A dedicated background task (see [`EventDispatcher`]) then
+//! reliably publishes those events to the message broker (NATS) and marks them
+//! as dispatched, guaranteeing at-least-once delivery while preserving
+//! transactional integrity.
+//!
+//! The implementation follows DDD, Repository, and Service Layer patterns and
+//! demonstrates:
+//!   • Database integration with `sqlx`
+//!   • Async, streaming message publication with `nats`
+//!   • Robust error handling and observability (`thiserror`, `tracing`)
+//!   • Support for GDPR erase requests through an explicit `UserEraseRequested`
+//!     event visible to downstream services.
+//!
+//! # Public API
+//! * [`DomainEvent`]: Trait implemented by every event emitted by the domain.
+//! * [`EventEnvelope`]: Serializable wrapper containing metadata & payload.
+//! * [`EventOutboxRepository`]: Abstract persistence port.
+//! * [`PgOutboxRepository`]: Postgres-backed implementation.
+//! * [`NatsPublisher`]: Message broker adapter.
+//! * [`EventDispatcher`]: Orchestrates fetch → publish → acknowledge loop.
+
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::{stream, StreamExt};
+use nats::asynk::{self, Connection};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
+use thiserror::Error;
+use tokio::{select, task::JoinHandle, time::sleep};
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
+
+/* ------------------------------------------------------------------------- */
+/*                          Domain Event Abstractions                        */
+/* ------------------------------------------------------------------------- */
+
+/// Marker trait implemented by *all* domain events.
+///
+/// Implementations **must** be serializable (`Serialize + DeserializeOwned`) and
+/// versioned via the `EVENT_VERSION` constant to facilitate schema evolution.
+#[async_trait]
+pub trait DomainEvent:
+    Send + Sync + Serialize + DeserializeOwned + 'static + std::fmt::Debug
+{
+    /// Logical type discriminator, e.g. `"lesson.published.v1"`.
+    const EVENT_TYPE: &'static str;
+
+    /// Semantic version of the event's JSON schema.
+    const EVENT_VERSION: u8 = 1;
+
+    /// Globally unique identifier used for idempotency by consumers.
+    fn event_id(&self) -> Uuid;
+
+    /// Aggregate root identifier the event originated from.
+    fn aggregate_id(&self) -> Uuid;
+
+    /// Timestamp (UTC) at which the event occurred.
+    fn occurred_at(&self) -> DateTime<Utc>;
+}
+
+/// Example event emitted when a lesson is published.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LessonPublished {
+    pub event_id: Uuid,
+    pub lesson_id: Uuid,
+    pub teacher_id: Uuid,
+    pub title: String,
+    pub occurred_at: DateTime<Utc>,
+}
+
+#[async_trait]
+impl DomainEvent for LessonPublished {
+    const EVENT_TYPE: &'static str = "lesson.published.v1";
+
+    fn event_id(&self) -> Uuid {
+        self.event_id
+    }
+
+    fn aggregate_id(&self) -> Uuid {
+        self.lesson_id
+    }
+
+    fn occurred_at(&self) -> DateTime<Utc> {
+        self.occurred_at
+    }
+}
+
+/// Event raised when a user requests GDPR account erasure.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserEraseRequested {
+    pub event_id: Uuid,
+    pub user_id: Uuid,
+    pub requested_at: DateTime<Utc>,
+}
+
+#[async_trait]
+impl DomainEvent for UserEraseRequested {
+    const EVENT_TYPE: &'static str = "user.erase_requested.v1";
+
+    fn event_id(&self) -> Uuid {
+        self.event_id
+    }
+
+    fn aggregate_id(&self) -> Uuid {
+        self.user_id
+    }
+
+    fn occurred_at(&self) -> DateTime<Utc> {
+        self.requested_at
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/*                         Event Envelope & Serialization                    */
+/* ------------------------------------------------------------------------- */
+
+/// Wrapper persisted to the outbox and exchanged via NATS.
+///
+/// We store payload as raw JSON (`payload_json`) to avoid polymorphism issues
+/// in the DB layer while still enabling typed deserialization by consumers.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub id: Uuid,
+    pub aggregate_id: Uuid,
+    pub event_type: String,
+    pub event_version: u8,
+    pub occurred_at: DateTime<Utc>,
+
+    /// Raw JSON representation of the event.
+    pub payload_json: serde_json::Value,
+}
+
+impl EventEnvelope {
+    /// Create a new envelope from a concrete [`DomainEvent`] implementation.
+    pub fn from_event<E: DomainEvent>(event: &E) -> serde_json::Result<Self> {
+        Ok(Self {
+            id: event.event_id(),
+            aggregate_id: event.aggregate_id(),
+            event_type: E::EVENT_TYPE.to_string(),
+            event_version: E::EVENT_VERSION,
+            occurred_at: event.occurred_at(),
+            payload_json: serde_json::to_value(event)?,
+        })
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/*                          Repository: Outbox Storage                       */
+/* ------------------------------------------------------------------------- */
+
+#[derive(Debug, Error)]
+pub enum OutboxError {
+    #[error("Database error: {0}")]
+    Db(#[from] sqlx::Error),
+    #[error("Serde error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+#[async_trait]
+pub trait EventOutboxRepository: Send + Sync {
+    /// Persist a new domain event within an existing DB transaction.
+    async fn add_event<E: DomainEvent + Send + Sync>(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        event: &E,
+    ) -> Result<(), OutboxError>;
+
+    /// Fetch a *batch* of events that have not yet been dispatched.
+    async fn fetch_pending(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<EventEnvelope>, OutboxError>;
+
+    /// Mark the given event IDs as dispatched.
+    async fn mark_dispatched(&self, ids: &[Uuid]) -> Result<(), OutboxError>;
+}
+
+/// PostgreSQL implementation of [`EventOutboxRepository`].
+pub struct PgOutboxRepository {
+    pool: PgPool,
+}
+
+impl PgOutboxRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl EventOutboxRepository for PgOutboxRepository {
+    #[instrument(skip(self, tx, event))]
+    async fn add_event<E: DomainEvent + Send + Sync>(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        event: &E,
+    ) -> Result<(), OutboxError> {
+        let env = EventEnvelope::from_event(event)?;
+        sqlx::query!(
+            r#"
+            INSERT INTO outbox_events (
+                id,
+                aggregate_id,
+                event_type,
+                event_version,
+                occurred_at,
+                payload_json
+            )
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+            env.id,
+            env.aggregate_id,
+            env.event_type,
+            env.event_version as i16,
+            env.occurred_at,
+            env.payload_json,
+        )
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn fetch_pending(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<EventEnvelope>, OutboxError> {
+        let raw = sqlx::query!(
+            r#"
+            SELECT id,
+                   aggregate_id,
+                   event_type,
+                   event_version,
+                   occurred_at,
+                   payload_json
+            FROM outbox_events
+            WHERE dispatched_at IS NULL
+            ORDER BY occurred_at
+            LIMIT $1
+            "#,
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut events = Vec::with_capacity(raw.len());
+        for row in raw {
+            events.push(EventEnvelope {
+                id: row.id,
+                aggregate_id: row.aggregate_id,
+                event_type: row.event_type,
+                event_version: row.event_version as u8,
+                occurred_at: row.occurred_at,
+                payload_json: row.payload_json,
+            });
+        }
+        Ok(events)
+    }
+
+    #[instrument(skip(self, ids))]
+    async fn mark_dispatched(&self, ids: &[Uuid]) -> Result<(), OutboxError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+            "UPDATE outbox_events SET dispatched_at = NOW() WHERE id IN (",
+        );
+        let mut separated = qb.separated(", ");
+        for id in ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+
+        qb.build().execute(&self.pool).await?;
+        Ok(())
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/*                         Message Broker Integration                        */
+/* ------------------------------------------------------------------------- */
+
+#[derive(Debug, Error)]
+pub enum PublishError {
+    #[error("NATS error: {0}")]
+    Nats(#[from] nats::Error),
+    #[error("Serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, event: &EventEnvelope) -> Result<(), PublishError>;
+}
+
+pub struct NatsPublisher {
+    conn: Connection,
+    subject_prefix: String,
+}
+
+impl NatsPublisher {
+    pub async fn connect(
+        nats_url: &str,
+        jwt: Option<String>,
+        prefix: impl Into<String>,
+    ) -> Result<Self, PublishError> {
+        let conn = if let Some(token) = jwt {
+            asynk::Options::with_jwt(token, |nonce| async move {
+                // TODO: Provide signature callback for NATS auth if required.
+                Ok(vec![])
+            })
+            .connect(nats_url)
+            .await?
+        } else {
+            asynk::connect(nats_url).await?
+        };
+
+        Ok(Self {
+            conn,
+            subject_prefix: prefix.into(),
+        })
+    }
+
+    fn subject_for(&self, event_type: &str) -> String {
+        format!("{}.{}", self.subject_prefix, event_type)
+    }
+}
+
+#[async_trait]
+impl EventPublisher for NatsPublisher {
+    #[instrument(skip(self, event))]
+    async fn publish(&self, event: &EventEnvelope) -> Result<(), PublishError> {
+        let subject = self.subject_for(&event.event_type);
+        let data = serde_json::to_vec(event)?;
+        self.conn.publish(subject, data).await?;
+        Ok(())
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/*                             Event Dispatcher                              */
+/* ------------------------------------------------------------------------- */
+
+#[derive(Debug, Error)]
+pub enum DispatchError {
+    #[error(transparent)]
+    Outbox(#[from] OutboxError),
+    #[error(transparent)]
+    Publish(#[from] PublishError),
+}
+
+/// Repeatedly polls the outbox and hands events to the broker.
+///
+/// Spawn via [`tokio::spawn`]; it terminates when the passed `shutdown`
+/// [`tokio::sync::broadcast::Receiver`] is signalled.
+pub struct EventDispatcher<R: EventOutboxRepository, P: EventPublisher> {
+    repo: Arc<R>,
+    publisher: Arc<P>,
+    batch_size: i64,
+    poll_interval: Duration,
+}
+
+impl<R, P> EventDispatcher<R, P>
+where
+    R: EventOutboxRepository + 'static,
+    P: EventPublisher + 'static,
+{
+    pub fn new(
+        repo: Arc<R>,
+        publisher: Arc<P>,
+        batch_size: i64,
+        poll_interval: Duration,
+    ) -> Self {
+        Self {
+            repo,
+            publisher,
+            batch_size,
+            poll_interval,
+        }
+    }
+
+    #[instrument(skip(self, shutdown_rx), name = "event_dispatch_loop")]
+    pub fn start(
+        self,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                select! {
+                    _ = shutdown_rx.recv() => {
+                        info!("EventDispatcher received shutdown signal");
+                        break;
+                    }
+                    _ = self.tick() => {}
+                }
+            }
+        })
+    }
+
+    /// Single poll → publish → ack iteration.
+    async fn tick(&self) {
+        match self
+            .repo
+            .fetch_pending(self.batch_size)
+            .await
+        {
+            Ok(events) if events.is_empty() => {
+                sleep(self.poll_interval).await;
+            }
+            Ok(events) => {
+                let ids: Vec<Uuid> = events.iter().map(|e| e.id).collect();
+                debug!(count = events.len(), "Publishing events");
+
+                // Publish concurrently but limit concurrency to avoid backpressure.
+                let results = stream::iter(events)
+                    .map(|e| async {
+                        if let Err(err) = self.publisher.publish(&e).await {
+                            error!(error = %err, "Failed to publish event");
+                            Err(err)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .buffer_unordered(8)
+                    .collect::<Vec<_>>()
+                    .await;
+
+                if results.iter().all(Result::is_ok) {
+                    if let Err(err) = self.repo.mark_dispatched(&ids).await {
+                        error!(%err, "Failed to mark events as dispatched");
+                    }
+                } else {
+                    warn!("Some events failed to publish; will retry later");
+                }
+            }
+            Err(err) => {
+                error!(%err, "Failed to fetch pending events");
+                sleep(self.poll_interval).await;
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/*                         Module Initialization Helper                      */
+/* ------------------------------------------------------------------------- */
+
+/// Build all dependencies and start dispatcher.
+///
+/// Example usage (in `main.rs`):
+///
+/// ```rust,no_run
+/// #[tokio::main]
+/// async fn main() -> anyhow::Result<()> {
+///     tracing_subscriber::fmt::init();
+///
+///     let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+///     let handle = module_48::init_and_spawn("postgres://...", "nats://localhost", None, shutdown_rx).await?;
+///
+///     // ...
+///
+///     // On ctrl-c
+///     _shutdown_tx.send(())?;
+///     handle.await?;
+///     Ok(())
+/// }
+/// ```
+pub async fn init_and_spawn(
+    pg_dsn: &str,
+    nats_url: &str,
+    nats_jwt: Option<String>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) -> Result<JoinHandle<()>, anyhow::Error> {
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(pg_dsn)
+        .await?;
+
+    let repo = Arc::new(PgOutboxRepository::new(pool));
+
+    let publisher = Arc::new(
+        NatsPublisher::connect(nats_url, nats_jwt, "edupulse")
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?,
+    );
+
+    let dispatcher = EventDispatcher::new(
+        repo,
+        publisher,
+        100,
+        Duration::from_secs(2),
+    );
+
+    Ok(dispatcher.start(shutdown_rx))
+}
+```

@@ -1,0 +1,361 @@
+```c
+/*-----------------------------------------------------------------------------
+ * MercuryMonolith Commerce Hub – Rate-Limiter module
+ *
+ * File   : src/module_67.c   (original request: src/module_67.txt)
+ * Author : MercuryMonolith Core Team
+ *
+ * Synopsis
+ *   Thread-safe, token-bucket based rate-limiter intended to be used by both the
+ *   REST and GraphQL gateways.  Each caller (identified by an arbitrary
+ *   user-supplied “key”, e.g. API key, user id, IP, or tenant id) receives its
+ *   own bucket, allowing for fine-grained control without global contention.
+ *
+ *   Highlights:
+ *     · Lock-striped hash-table (1024 shards) for scalable concurrent access
+ *     · Automatic bucket cleanup performed by background janitor thread
+ *     · Minimal malloc churn – buckets are recycled when possible
+ *     · Fully self-contained, no third-party dependencies
+ *
+ * Usage
+ *   RateLimiter *rl = rl_create(100 /* capacity */, 10 /* refill/s */, 900);
+ *   if (rl_allow(rl, user_key)) {
+ *       // proceed with request …
+ *   } else {
+ *       // reject with HTTP 429
+ *   }
+ *   …
+ *   rl_destroy(rl);
+ *---------------------------------------------------------------------------*/
+
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/*------------------------------------*
+ * Tunables / compile-time parameters *
+ *------------------------------------*/
+#define RL_SHARD_COUNT      1024     /* # of hash buckets / shards           */
+#define RL_KEY_MAX_LEN      64       /* max length of caller key (incl NUL)  */
+#define RL_PURGE_INTERVAL_S 60       /* janitor wakes up every N seconds     */
+
+/*------------------------------------*
+ * Utility: FNV-1a 64-bit hash        *
+ *------------------------------------*/
+static inline uint64_t
+fnv1a_hash(const char *data)
+{
+    uint64_t h = 14695981039346656037ULL;
+    for (const unsigned char *p = (const unsigned char *)data; *p; ++p) {
+        h ^= (uint64_t)(*p);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/*------------------------------------*
+ * Internal structures                *
+ *------------------------------------*/
+typedef struct RateBucket {
+    char           key[RL_KEY_MAX_LEN];
+    double         tokens;          /* current balance                      */
+    double         capacity;        /* max tokens that can be held          */
+    double         refill_rate;     /* tokens / second                      */
+    struct timespec last_refill;    /* last time we refilled the bucket     */
+    struct timespec last_seen;      /* last request – used for TTL purging  */
+    struct RateBucket *next;        /* chaining in hash table               */
+} RateBucket;
+
+typedef struct RateLimiter {
+    RateBucket     *table[RL_SHARD_COUNT];
+    pthread_mutex_t locks[RL_SHARD_COUNT];
+    double          def_capacity;
+    double          def_refill_rate;
+    uint32_t        bucket_ttl;     /* seconds without traffic before purge */
+    volatile int    stop_purge;     /* shutdown flag for janitor            */
+    pthread_t       purge_thread;
+} RateLimiter;
+
+/*------------------------------------*
+ * Time helpers                       *
+ *------------------------------------*/
+static inline void
+timespec_now(struct timespec *ts)
+{
+    clock_gettime(CLOCK_MONOTONIC, ts);
+}
+
+static inline double
+timespec_diff_sec(const struct timespec *a, const struct timespec *b)
+{
+    return (double)(a->tv_sec - b->tv_sec)
+         + (double)(a->tv_nsec - b->tv_nsec) / 1e9;
+}
+
+/*------------------------------------*
+ * Bucket algorithm helpers           *
+ *------------------------------------*/
+static void
+bucket_refill(RateBucket *b, const struct timespec *now)
+{
+    double elapsed = timespec_diff_sec(now, &b->last_refill);
+    if (elapsed <= 0.0)
+        return;
+
+    double tokens_to_add = elapsed * b->refill_rate;
+    b->tokens = (b->tokens + tokens_to_add > b->capacity)
+                    ? b->capacity
+                    : b->tokens + tokens_to_add;
+
+    b->last_refill = *now;
+}
+
+/* Acquire shard lock, must already know idx */
+static inline void
+lock_shard(RateLimiter *rl, size_t idx)
+{
+    pthread_mutex_lock(&rl->locks[idx]);
+}
+static inline void
+unlock_shard(RateLimiter *rl, size_t idx)
+{
+    pthread_mutex_unlock(&rl->locks[idx]);
+}
+
+/*------------------------------------*
+ * Find or create bucket              *
+ *------------------------------------*/
+static RateBucket *
+find_or_create_bucket(RateLimiter *rl, const char *key,
+                      size_t shard_idx, const struct timespec *now)
+{
+    RateBucket *prev = NULL;
+    RateBucket *cur  = rl->table[shard_idx];
+
+    while (cur) {
+        if (strncmp(cur->key, key, RL_KEY_MAX_LEN) == 0)
+            break;
+        prev = cur;
+        cur  = cur->next;
+    }
+
+    if (cur) {
+        /* move-to-front heuristic */
+        if (prev) {
+            prev->next = cur->next;
+            cur->next  = rl->table[shard_idx];
+            rl->table[shard_idx] = cur;
+        }
+        return cur;
+    }
+
+    /* Not found – create new */
+    cur = calloc(1, sizeof(*cur));
+    if (!cur)
+        return NULL;
+
+    strncpy(cur->key, key, RL_KEY_MAX_LEN - 1);
+    cur->capacity    = rl->def_capacity;
+    cur->refill_rate = rl->def_refill_rate;
+    cur->tokens      = rl->def_capacity;  /* start full */
+    cur->last_refill = *now;
+    cur->last_seen   = *now;
+
+    /* insert at head */
+    cur->next = rl->table[shard_idx];
+    rl->table[shard_idx] = cur;
+
+    return cur;
+}
+
+/*------------------------------------*
+ * Public API                         *
+ *------------------------------------*/
+
+/*
+ * rl_create – instantiate a new rate limiter
+ *
+ * def_capacity     maximum tokens per bucket
+ * def_refill_rate  tokens restored each second
+ * bucket_ttl       seconds of inactivity after which bucket is purged
+ *
+ * Returns newly allocated RateLimiter* on success, NULL on failure.
+ */
+RateLimiter *
+rl_create(double def_capacity, double def_refill_rate, uint32_t bucket_ttl)
+{
+    RateLimiter *rl = calloc(1, sizeof(*rl));
+    if (!rl)
+        return NULL;
+
+    rl->def_capacity    = def_capacity;
+    rl->def_refill_rate = def_refill_rate;
+    rl->bucket_ttl      = bucket_ttl;
+
+    for (size_t i = 0; i < RL_SHARD_COUNT; ++i) {
+        if (pthread_mutex_init(&rl->locks[i], NULL) != 0) {
+            /* best-effort cleanup */
+            for (size_t j = 0; j < i; ++j)
+                pthread_mutex_destroy(&rl->locks[j]);
+            free(rl);
+            return NULL;
+        }
+    }
+
+    /* Launch janitor thread */
+    if (pthread_create(&rl->purge_thread, NULL,
+                       (void *(*)(void *)) /* cast to avoid warnings */
+                       (void *) (void *) (void *(*)(void *)) &rl_purge_loop,
+                       rl) != 0) {
+        for (size_t i = 0; i < RL_SHARD_COUNT; ++i)
+            pthread_mutex_destroy(&rl->locks[i]);
+        free(rl);
+        return NULL;
+    }
+
+    return rl;
+}
+
+/*
+ * rl_allow – attempt to consume 1 token for given key.
+ *
+ * Return value: 1 => allowed, 0 => rate-limited, -1 => internal error.
+ */
+int
+rl_allow(RateLimiter *rl, const char *key)
+{
+    if (!rl || !key || *key == '\0')
+        return -1;
+
+    uint64_t hash     = fnv1a_hash(key);
+    size_t   shard_idx = hash % RL_SHARD_COUNT;
+
+    struct timespec now;
+    timespec_now(&now);
+
+    lock_shard(rl, shard_idx);
+    RateBucket *bucket = find_or_create_bucket(rl, key, shard_idx, &now);
+    if (!bucket) {
+        unlock_shard(rl, shard_idx);
+        return -1;
+    }
+
+    bucket_refill(bucket, &now);
+
+    int allowed = 0;
+    if (bucket->tokens >= 1.0) {
+        bucket->tokens -= 1.0;
+        allowed = 1;
+    }
+
+    bucket->last_seen = now;
+    unlock_shard(rl, shard_idx);
+    return allowed;
+}
+
+/*
+ * rl_destroy – free all resources.  Safe to call with NULL.
+ */
+void
+rl_destroy(RateLimiter *rl)
+{
+    if (!rl)
+        return;
+
+    /* stop janitor */
+    rl->stop_purge = 1;
+    pthread_join(rl->purge_thread, NULL);
+
+    /* free buckets */
+    for (size_t i = 0; i < RL_SHARD_COUNT; ++i) {
+        lock_shard(rl, i);
+        RateBucket *cur = rl->table[i];
+        while (cur) {
+            RateBucket *next = cur->next;
+            free(cur);
+            cur = next;
+        }
+        unlock_shard(rl, i);
+        pthread_mutex_destroy(&rl->locks[i]);
+    }
+
+    free(rl);
+}
+
+/*------------------------------------*
+ * Background janitor                 *
+ *------------------------------------*/
+static void *
+rl_purge_loop(void *arg)
+{
+    RateLimiter *rl = arg;
+
+    while (!rl->stop_purge) {
+        struct timespec now;
+        timespec_now(&now);
+
+        for (size_t shard_idx = 0; shard_idx < RL_SHARD_COUNT; ++shard_idx) {
+            lock_shard(rl, shard_idx);
+
+            RateBucket **pp = &rl->table[shard_idx];
+            while (*pp) {
+                RateBucket *cur = *pp;
+                double idle_sec = timespec_diff_sec(&now, &cur->last_seen);
+                if (idle_sec > rl->bucket_ttl) {
+                    *pp = cur->next;
+                    free(cur);
+                } else {
+                    pp = &(*pp)->next;
+                }
+            }
+
+            unlock_shard(rl, shard_idx);
+        }
+
+        /* sleep */
+        struct timespec req = { RL_PURGE_INTERVAL_S, 0 };
+        nanosleep(&req, NULL);
+    }
+
+    return NULL;
+}
+
+/*------------------------------------*
+ * Test stub (compile with -DRL_TEST) *
+ *------------------------------------*/
+#ifdef RL_TEST
+#include <assert.h>
+#include <unistd.h>
+
+int main(void)
+{
+    RateLimiter *rl = rl_create(5, 1 /* token/s */, 10 /* ttl */);
+    assert(rl);
+
+    const char *key = "userA";
+
+    /* Consume initial capacity */
+    for (int i = 0; i < 5; ++i)
+        assert(rl_allow(rl, key) == 1);
+
+    /* Should be rate limited now */
+    assert(rl_allow(rl, key) == 0);
+
+    /* Wait for 2 seconds to restore 2 tokens */
+    sleep(2);
+    assert(rl_allow(rl, key) == 1);
+    assert(rl_allow(rl, key) == 1);
+    assert(rl_allow(rl, key) == 0);
+
+    rl_destroy(rl);
+    puts("RateLimiter self-test OK");
+    return 0;
+}
+#endif
+```

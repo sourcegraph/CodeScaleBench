@@ -1,0 +1,358 @@
+```rust
+//! src/module_43.rs
+//! --------------------------------------------------------------
+//! Model-Monitoring & Automated-Retraining Orchestrator
+//! --------------------------------------------------------------
+//! This module wires together the Observer & Strategy patterns used by the
+//! VisuTility Orchestrator to
+//!   1. observe live model-serving metrics,
+//!   2. detect statistical drift or performance regressions, and
+//!   3. trigger an automated retraining job through the internal MLOps
+//!      pipeline when necessary.
+//!
+//! It is fully self-contained and agnostic of the concrete metric backend,
+//! storage layer, or experiment-tracking implementation.  All of those
+//! concerns are injected via trait objects, keeping the module easily
+//! testable and reusable across binaries and workspaces.
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use log::{debug, error, info, warn};
+use thiserror::Error;
+
+/// A normalized metric payload emitted by the Serving-Ops layer.
+///
+/// Requirements:
+///   • `value` MUST be normalized so that higher is always better.  
+///   • `timestamp` must be captured close to the model to guarantee
+///     time-series fidelity even in presence of network jitter.
+#[derive(Debug, Clone)]
+pub struct MetricSample {
+    pub metric_name: String,
+    pub value: f64,
+    pub timestamp: Instant,
+}
+
+/// Errors surfaced by the Model Monitor and its collaborators.
+#[derive(Debug, Error)]
+pub enum MonitorError {
+    #[error("observer failed: {0}")]
+    ObserverFailure(String),
+    #[error("strategy evaluation failed: {0}")]
+    StrategyFailure(String),
+}
+
+/// Trait implemented by components interested in real-time metric updates
+/// (dashboards, alarm systems, audit logs, …).
+pub trait MetricObserver: Send + Sync + 'static {
+    fn on_metric(&self, sample: &MetricSample) -> Result<(), MonitorError>;
+}
+
+/// Decision returned by a retraining strategy after evaluating a metric window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RetrainingDecision {
+    NoAction,
+    ShouldRetrain,
+}
+
+/// Strategy that evaluates a sliding window of metrics and decides whether
+/// automated retraining should be triggered.
+///
+/// Implementations MUST be thread-safe and cheap to clone: they are wrapped
+/// in `Arc` internally.
+pub trait RetrainingStrategy: Send + Sync + 'static {
+    fn evaluate(
+        &self,
+        metric_name: &str,
+        window: &[MetricSample],
+    ) -> Result<RetrainingDecision, MonitorError>;
+}
+
+/// A statistically-driven strategy that triggers retraining when the average
+/// of the last `window_size` samples drops below `min_acceptable_score`.
+///
+/// Example:
+///   For an F1-score in [0,1] you may want to trigger retraining once the
+///   average score of the last 10 samples falls under 0.80.
+pub struct StatisticalAverageStrategy {
+    min_acceptable_score: f64,
+    window_size: usize,
+}
+
+impl StatisticalAverageStrategy {
+    pub fn new(min_acceptable_score: f64, window_size: usize) -> Self {
+        assert!(
+            (0.0..=1.0).contains(&min_acceptable_score),
+            "min_acceptable_score must be in [0,1]"
+        );
+        assert!(window_size > 1, "window_size must be > 1");
+
+        Self {
+            min_acceptable_score,
+            window_size,
+        }
+    }
+}
+
+impl RetrainingStrategy for StatisticalAverageStrategy {
+    fn evaluate(
+        &self,
+        _metric_name: &str,
+        window: &[MetricSample],
+    ) -> Result<RetrainingDecision, MonitorError> {
+        if window.len() < self.window_size {
+            return Ok(RetrainingDecision::NoAction);
+        }
+        let avg: f64 = window
+            .iter()
+            .rev()
+            .take(self.window_size)
+            .map(|s| s.value)
+            .sum::<f64>()
+            / self.window_size as f64;
+
+        debug!(
+            "[Strategy::StatisticalAverage] avg={:.4} threshold={:.4}",
+            avg, self.min_acceptable_score
+        );
+
+        if avg < self.min_acceptable_score {
+            Ok(RetrainingDecision::ShouldRetrain)
+        } else {
+            Ok(RetrainingDecision::NoAction)
+        }
+    }
+}
+
+/// Central coordinator that
+///   • accumulates metric samples in a ring buffer,
+///   • notifies observers,
+///   • delegates to strategies for retraining decisions.
+///
+#[derive(Clone)]
+pub struct ModelMonitor {
+    inner: Arc<Mutex<Inner>>,
+}
+
+struct Inner {
+    window: VecDeque<MetricSample>,
+    max_window: usize,
+    observers: Vec<Arc<dyn MetricObserver>>,
+    strategies: Vec<Arc<dyn RetrainingStrategy>>,
+    cooldown: Duration,
+    last_retrain_at: Option<Instant>,
+}
+
+impl ModelMonitor {
+    /// Create a new monitor.
+    ///
+    /// `max_window`  – maximum number of samples kept per metric  
+    /// `cooldown`    – minimum delay between two retraining triggers
+    pub fn new(max_window: usize, cooldown: Duration) -> Self {
+        assert!(max_window > 1, "max_window must be > 1");
+
+        Self {
+            inner: Arc::new(Mutex::new(Inner {
+                window: VecDeque::with_capacity(max_window),
+                max_window,
+                observers: Vec::new(),
+                strategies: Vec::new(),
+                cooldown,
+                last_retrain_at: None,
+            })),
+        }
+    }
+
+    /// Register a new observer.  Failures in an observer do not abort the
+    /// ingest flow; they are logged and swallowed.
+    pub fn register_observer<O>(&self, observer: O)
+    where
+        O: MetricObserver,
+    {
+        self.inner.lock().unwrap().observers.push(Arc::new(observer));
+    }
+
+    /// Register a new retraining strategy.  The first strategy voting for
+    /// `ShouldRetrain` short-circuits evaluation of further strategies.
+    pub fn register_strategy<S>(&self, strategy: S)
+    where
+        S: RetrainingStrategy,
+    {
+        self.inner.lock().unwrap().strategies.push(Arc::new(strategy));
+    }
+
+    /// Ingest a single metric sample into the monitor.
+    ///
+    /// Return `Ok(true)`  if a retraining event was emitted.  
+    /// Return `Ok(false)` if no action was taken.  
+    /// Return `Err(_)`    if a strategy returned an unrecoverable error.
+    pub fn ingest_metric(&self, sample: MetricSample) -> Result<bool, MonitorError> {
+        let mut inner = self.inner.lock().unwrap();
+
+        // 1) add sample to ring buffer
+        if inner.window.len() == inner.max_window {
+            inner.window.pop_front();
+        }
+        inner.window.push_back(sample.clone());
+
+        // 2) notify observers
+        for obs in &inner.observers {
+            if let Err(e) = obs.on_metric(&sample) {
+                error!("observer failed: {}", e);
+            }
+        }
+
+        // 3) consult each strategy
+        for strategy in &inner.strategies {
+            match strategy.evaluate(&sample.metric_name, &inner.window) {
+                Ok(RetrainingDecision::ShouldRetrain) => {
+                    let now = Instant::now();
+                    if inner
+                        .last_retrain_at
+                        .map_or(true, |t| now.duration_since(t) >= inner.cooldown)
+                    {
+                        inner.last_retrain_at = Some(now);
+                        info!(
+                            "Retraining triggered for metric '{}' (cooldown = {:?})",
+                            sample.metric_name, inner.cooldown
+                        );
+                        return Ok(true);
+                    } else {
+                        warn!("Retraining skipped due to cooldown.");
+                        return Ok(false);
+                    }
+                }
+                Ok(RetrainingDecision::NoAction) => {
+                    // continue with next strategy
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(false)
+    }
+}
+
+/// A trivial console observer handy for local debugging.
+pub struct ConsoleObserver;
+
+impl MetricObserver for ConsoleObserver {
+    fn on_metric(&self, sample: &MetricSample) -> Result<(), MonitorError> {
+        debug!(
+            "[ConsoleObserver] metric={} value={:.4} ts={:?}",
+            sample.metric_name, sample.value, sample.timestamp
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use std::time::Duration;
+
+    struct CountingObserver {
+        counter: Arc<Mutex<u64>>,
+    }
+
+    impl CountingObserver {
+        fn new(counter: Arc<Mutex<u64>>) -> Self {
+            Self { counter }
+        }
+    }
+
+    impl MetricObserver for CountingObserver {
+        fn on_metric(&self, _sample: &MetricSample) -> Result<(), MonitorError> {
+            *self.counter.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn retraining_is_triggered_when_average_drops() {
+        let monitor = ModelMonitor::new(10, Duration::from_secs(1));
+        monitor.register_strategy(StatisticalAverageStrategy::new(0.8, 5));
+
+        // push 5 good samples
+        for _ in 0..5 {
+            assert!(!monitor
+                .ingest_metric(MetricSample {
+                    metric_name: "f1".into(),
+                    value: 0.9,
+                    timestamp: Instant::now(),
+                })
+                .unwrap());
+        }
+
+        // push 5 degraded samples -> avg below threshold -> retrain
+        let mut triggered = false;
+        for _ in 0..5 {
+            triggered = monitor
+                .ingest_metric(MetricSample {
+                    metric_name: "f1".into(),
+                    value: 0.5,
+                    timestamp: Instant::now(),
+                })
+                .unwrap();
+        }
+        assert!(triggered);
+    }
+
+    #[test]
+    fn observer_is_called_for_each_sample() {
+        let monitor = ModelMonitor::new(5, Duration::from_secs(60));
+        let counter = Arc::new(Mutex::new(0));
+        monitor.register_observer(CountingObserver::new(counter.clone()));
+
+        for _ in 0..3 {
+            monitor
+                .ingest_metric(MetricSample {
+                    metric_name: "latency_ms".into(),
+                    value: 15.0,
+                    timestamp: Instant::now(),
+                })
+                .unwrap();
+        }
+
+        assert_eq!(*counter.lock().unwrap(), 3);
+    }
+
+    #[test]
+    fn cooldown_is_enforced_between_triggers() {
+        let monitor = ModelMonitor::new(10, Duration::from_millis(300));
+        monitor.register_strategy(StatisticalAverageStrategy::new(0.8, 1));
+
+        // first trigger should fire
+        assert!(monitor
+            .ingest_metric(MetricSample {
+                metric_name: "accuracy".into(),
+                value: 0.0,
+                timestamp: Instant::now(),
+            })
+            .unwrap());
+
+        // second trigger should be blocked by cooldown
+        assert!(!monitor
+            .ingest_metric(MetricSample {
+                metric_name: "accuracy".into(),
+                value: 0.0,
+                timestamp: Instant::now(),
+            })
+            .unwrap());
+
+        thread::sleep(Duration::from_millis(400));
+
+        // after cooldown passes, trigger should fire again
+        assert!(monitor
+            .ingest_metric(MetricSample {
+                metric_name: "accuracy".into(),
+                value: 0.0,
+                timestamp: Instant::now(),
+            })
+            .unwrap());
+    }
+}
+```

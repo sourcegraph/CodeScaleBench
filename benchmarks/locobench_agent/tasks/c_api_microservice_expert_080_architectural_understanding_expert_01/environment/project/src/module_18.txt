@@ -1,0 +1,426 @@
+```c
+/**
+ * src/module_18.txt
+ *
+ * MercuryMonolith Commerce Hub
+ * Metrics & Monitoring Sub-system (Prometheus-compatible exposition)
+ *
+ * This compilation unit implements a lightweight, in-process metrics registry
+ * that supports COUNTER, GAUGE, and HISTOGRAM metric families.  All operations
+ * are thread-safe and lock-free for the hot path (metric updates) by leveraging
+ * C11 atomics.  Read-side aggregation (scraping) uses a global RW-lock to take
+ * a consistent, low-latency snapshot without blocking writers for more than a
+ * few micro-seconds.
+ *
+ * NOTE: The surrounding project offers an embedded HTTP stack built on
+ *       libmicrohttpd.  The `mm_metrics_http_handler()` function plugs into
+ *       that router, returning Prometheus-formatted metrics.
+ */
+
+#define _POSIX_C_SOURCE 200809L
+#include <assert.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "mm_logging.h"      /* Project-wide structured logging facade       */
+#include "mm_memory.h"       /* Custom malloc wrappers with OOM handling     */
+#include "mm_http_router.h"  /* Router glue (struct mm_http_request/response)*/
+
+/*------------------------------------------------------------*
+ *                      Public Interface                      *
+ *------------------------------------------------------------*/
+
+typedef enum {
+    MM_METRIC_COUNTER,
+    MM_METRIC_GAUGE,
+    MM_METRIC_HISTOGRAM
+} mm_metric_type_t;
+
+typedef struct mm_metric                   mm_metric_t;
+typedef struct mm_metric_histogram_bucket  mm_metric_histogram_bucket_t;
+
+/**
+ * Registers a new metric in the global registry.  The returned pointer is
+ * stable for the lifetime of the application and can be cached by callers.
+ *
+ * The function is idempotent per <name, type> combination.  If the metric
+ * already exists, the existing instance is returned.
+ *
+ * For histogram metrics, the `buckets` array must be sorted in ascending
+ * order.  `bucket_cnt` denotes the number of entries.
+ */
+mm_metric_t *
+mm_register_counter(const char *name, const char *help);
+mm_metric_t *
+mm_register_gauge  (const char *name, const char *help);
+mm_metric_t *
+mm_register_histogram(const char *name, const char *help,
+                      const double *buckets, size_t bucket_cnt);
+
+/* Fast-path update helpers */
+void mm_counter_inc   (mm_metric_t *m, uint64_t delta);
+void mm_gauge_set     (mm_metric_t *m, double value);
+void mm_histogram_observe(mm_metric_t *m, double observation);
+
+/* Output helpers */
+char *mm_metrics_serialize(size_t *len_out); /* malloc'd buffer            */
+void  mm_metrics_free(char *buffer);
+
+void mm_metrics_init  (void);
+void mm_metrics_close (void);
+
+/* HTTP glue for the project's router */
+int  mm_metrics_http_handler(struct mm_http_request  *req,
+                             struct mm_http_response *res);
+
+/*------------------------------------------------------------*
+ *                 Internal Data Structures                   *
+ *------------------------------------------------------------*/
+
+struct mm_metric_histogram_bucket {
+    double             upper_bound;  /* e.g. 0.5, 1, 2.5, ... */
+    _Atomic uint64_t   count;
+};
+
+typedef struct {
+    size_t                          bucket_cnt;
+    mm_metric_histogram_bucket_t   *buckets;
+    _Atomic uint64_t                sum;         /* floating-point encoded
+                                                    as IEEE-754 bits        */
+} mm_histogram_t;
+
+struct mm_metric {
+    mm_metric_type_t         type;
+    char                    *name;
+    char                    *help;
+
+    union {
+        _Atomic uint64_t     counter;   /* Counter/gauge share same layout */
+        _Atomic uint64_t     gauge_bits;
+        mm_histogram_t       histogram;
+    } payload;
+
+    mm_metric_t             *next;      /* Singly-linked list for registry */
+};
+
+/*------------------------------------------------------------*
+ *                  Global Registry & Synchronization         *
+ *------------------------------------------------------------*/
+
+static mm_metric_t       *g_registry_head = NULL;
+
+/* Hot-path (write) is lock-free; reads take a shared lock. */
+static pthread_rwlock_t   g_registry_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+/*------------------------------------------------------------*
+ *                     Utility Functions                      *
+ *------------------------------------------------------------*/
+
+static inline uint64_t
+double_to_bits(double v)
+{
+    uint64_t u;
+    memcpy(&u, &v, sizeof(u));
+    return u;
+}
+
+static inline double
+bits_to_double(uint64_t b)
+{
+    double d;
+    memcpy(&d, &b, sizeof(d));
+    return d;
+}
+
+static mm_metric_t *
+mm_metric_create(mm_metric_type_t type,
+                 const char      *name,
+                 const char      *help)
+{
+    mm_metric_t *m = mm_calloc(1, sizeof(*m));
+    m->type = type;
+    m->name = mm_strdup(name);
+    m->help = mm_strdup(help ? help : "");
+    return m;
+}
+
+static mm_metric_t *
+mm_registry_find_locked(const char *name, mm_metric_type_t type)
+{
+    for (mm_metric_t *cur = g_registry_head; cur; cur = cur->next) {
+        if (cur->type == type && strcmp(cur->name, name) == 0)
+            return cur;
+    }
+    return NULL;
+}
+
+static mm_metric_t *
+mm_registry_get_or_create(mm_metric_type_t type,
+                          const char *name,
+                          const char *help,
+                          const double *buckets,
+                          size_t bucket_cnt)
+{
+    /* First check without lock (RCU like), optimistic path */
+    mm_metric_t *m = mm_registry_find_locked(name, type);
+    if (m) return m;
+
+    pthread_rwlock_wrlock(&g_registry_lock);
+
+    /* Re-check to avoid TOCTOU */
+    m = mm_registry_find_locked(name, type);
+    if (m) {
+        pthread_rwlock_unlock(&g_registry_lock);
+        return m;
+    }
+
+    /* Create new metric */
+    m = mm_metric_create(type, name, help);
+
+    if (type == MM_METRIC_HISTOGRAM) {
+        mm_histogram_t *h = &m->payload.histogram;
+        h->bucket_cnt = bucket_cnt;
+        h->buckets    = mm_calloc(bucket_cnt, sizeof(mm_metric_histogram_bucket_t));
+        for (size_t i = 0; i < bucket_cnt; ++i) {
+            h->buckets[i].upper_bound = buckets[i];
+            atomic_init(&h->buckets[i].count, 0);
+        }
+        atomic_init(&h->sum, 0);
+    } else {
+        atomic_init(&m->payload.counter, 0);
+    }
+
+    /* Insert at head */
+    m->next = g_registry_head;
+    g_registry_head = m;
+
+    pthread_rwlock_unlock(&g_registry_lock);
+    return m;
+}
+
+/*------------------------------------------------------------*
+ *                 Public Registration API                    *
+ *------------------------------------------------------------*/
+
+mm_metric_t *
+mm_register_counter(const char *name, const char *help)
+{
+    return mm_registry_get_or_create(MM_METRIC_COUNTER, name, help, NULL, 0);
+}
+
+mm_metric_t *
+mm_register_gauge(const char *name, const char *help)
+{
+    return mm_registry_get_or_create(MM_METRIC_GAUGE, name, help, NULL, 0);
+}
+
+mm_metric_t *
+mm_register_histogram(const char *name, const char *help,
+                      const double *buckets, size_t bucket_cnt)
+{
+    if (!buckets || bucket_cnt == 0) {
+        mm_log(MM_LOG_ERR, "histogram '%s' must have at least one bucket", name);
+        errno = EINVAL;
+        return NULL;
+    }
+    return mm_registry_get_or_create(MM_METRIC_HISTOGRAM,
+                                     name, help, buckets, bucket_cnt);
+}
+
+/*------------------------------------------------------------*
+ *               Fast-Path Increment/Observation              *
+ *------------------------------------------------------------*/
+
+void mm_counter_inc(mm_metric_t *m, uint64_t delta)
+{
+    assert(m && m->type == MM_METRIC_COUNTER);
+    atomic_fetch_add_explicit(&m->payload.counter, delta, memory_order_relaxed);
+}
+
+void mm_gauge_set(mm_metric_t *m, double value)
+{
+    assert(m && m->type == MM_METRIC_GAUGE);
+    uint64_t bits = double_to_bits(value);
+    atomic_store_explicit(&m->payload.gauge_bits, bits, memory_order_relaxed);
+}
+
+void mm_histogram_observe(mm_metric_t *m, double observation)
+{
+    assert(m && m->type == MM_METRIC_HISTOGRAM);
+    mm_histogram_t *h = &m->payload.histogram;
+
+    /* Update buckets */
+    for (size_t i = 0; i < h->bucket_cnt; ++i) {
+        if (observation <= h->buckets[i].upper_bound) {
+            atomic_fetch_add_explicit(&h->buckets[i].count, 1, memory_order_relaxed);
+            break;
+        }
+    }
+    /* Update +Inf bucket (always last) */
+    atomic_fetch_add_explicit(&h->buckets[h->bucket_cnt - 1].count, 1,
+                              memory_order_relaxed);
+
+    /* Update sum (atomic on bits) */
+    uint64_t obs_bits = double_to_bits(observation);
+    atomic_fetch_add_explicit(&h->sum, obs_bits, memory_order_relaxed);
+}
+
+/*------------------------------------------------------------*
+ *               Prometheus Exposition Encoding               *
+ *------------------------------------------------------------*/
+
+static void
+sb_append(char **buf, size_t *len, size_t *cap, const char *fmt, ...)
+{
+    va_list ap;
+    while (1) {
+        va_start(ap, fmt);
+        int needed = vsnprintf(*buf + *len, *cap - *len, fmt, ap);
+        va_end(ap);
+
+        if (needed < 0) {
+            /* Encoding error: give up */
+            return;
+        }
+
+        if ((size_t)needed < *cap - *len) {
+            /* Successfully written */
+            *len += needed;
+            return;
+        }
+
+        /* Grow buffer and retry */
+        *cap = (*cap == 0 ? 1024 : *cap * 2) + (size_t)needed;
+        *buf = mm_realloc(*buf, *cap);
+    }
+}
+
+char *mm_metrics_serialize(size_t *len_out)
+{
+    char   *buf = NULL;
+    size_t  len = 0, cap = 0;
+
+    pthread_rwlock_rdlock(&g_registry_lock);
+
+    for (mm_metric_t *m = g_registry_head; m; m = m->next) {
+        sb_append(&buf, &len, &cap, "# HELP %s %s\n", m->name, m->help);
+        sb_append(&buf, &len, &cap, "# TYPE %s %s\n", m->name,
+                  m->type == MM_METRIC_COUNTER   ? "counter"   :
+                  m->type == MM_METRIC_GAUGE     ? "gauge"     :
+                                                    "histogram");
+
+        switch (m->type) {
+        case MM_METRIC_COUNTER: {
+            uint64_t val = atomic_load_explicit(&m->payload.counter,
+                                                memory_order_relaxed);
+            sb_append(&buf, &len, &cap, "%s %" PRIu64 "\n", m->name, val);
+            break;
+        }
+
+        case MM_METRIC_GAUGE: {
+            uint64_t bits = atomic_load_explicit(&m->payload.gauge_bits,
+                                                 memory_order_relaxed);
+            sb_append(&buf, &len, &cap, "%s %lf\n", m->name, bits_to_double(bits));
+            break;
+        }
+
+        case MM_METRIC_HISTOGRAM: {
+            mm_histogram_t *h = &m->payload.histogram;
+            uint64_t running = 0;
+            for (size_t i = 0; i < h->bucket_cnt; ++i) {
+                uint64_t c = atomic_load_explicit(&h->buckets[i].count,
+                                                  memory_order_relaxed);
+                running += c;
+                sb_append(&buf, &len, &cap,
+                          "%s_bucket{le=\"%.17g\"} %" PRIu64 "\n",
+                          m->name, h->buckets[i].upper_bound, running);
+            }
+            sb_append(&buf, &len, &cap,
+                      "%s_sum %lf\n%s_count %" PRIu64 "\n",
+                      m->name,
+                      bits_to_double(atomic_load_explicit(&h->sum,
+                                                          memory_order_relaxed)),
+                      m->name,
+                      running);
+            break;
+        }
+        }
+    }
+
+    pthread_rwlock_unlock(&g_registry_lock);
+
+    if (len_out) *len_out = len;
+    return buf ? buf : mm_strdup("");
+}
+
+void mm_metrics_free(char *buffer)
+{
+    mm_free(buffer);
+}
+
+/*------------------------------------------------------------*
+ *                 HTTP Handler Integration                   *
+ *------------------------------------------------------------*/
+
+int mm_metrics_http_handler(struct mm_http_request *req,
+                            struct mm_http_response *res)
+{
+    (void)req; /* Unused for now */
+
+    size_t len;
+    char *payload = mm_metrics_serialize(&len);
+    if (!payload) {
+        mm_http_response_send_error(res, 500, "internal error");
+        return 0;
+    }
+
+    mm_http_response_set_status(res, 200);
+    mm_http_response_set_header(res, "Content-Type",
+                                "text/plain; version=0.0.4; charset=utf-8");
+    mm_http_response_set_body(res, payload, len);
+
+    /* The router will take ownership and free later */
+    return 0;
+}
+
+/*------------------------------------------------------------*
+ *               Initialization / Finalization                *
+ *------------------------------------------------------------*/
+
+void mm_metrics_init(void)
+{
+    pthread_rwlock_init(&g_registry_lock, NULL);
+    mm_log(MM_LOG_INFO, "metrics subsystem initialized");
+}
+
+void mm_metrics_close(void)
+{
+    pthread_rwlock_wrlock(&g_registry_lock);
+
+    mm_metric_t *cur = g_registry_head;
+    while (cur) {
+        mm_metric_t *next = cur->next;
+        if (cur->type == MM_METRIC_HISTOGRAM) {
+            mm_histogram_t *h = &cur->payload.histogram;
+            mm_free(h->buckets);
+        }
+        mm_free(cur->name);
+        mm_free(cur->help);
+        mm_free(cur);
+        cur = next;
+    }
+    g_registry_head = NULL;
+
+    pthread_rwlock_unlock(&g_registry_lock);
+    pthread_rwlock_destroy(&g_registry_lock);
+    mm_log(MM_LOG_INFO, "metrics subsystem shutdown");
+}
+```

@@ -1,0 +1,248 @@
+```rust
+//! src/module_83.rs
+//!
+//! LedgerLink Nexus – Ledger Entry Query Module
+//! -------------------------------------------
+//! This module provides a paginated query service for ledger entries, including
+//! transparent Redis response-caching, structured error handling and automatic
+//! request validation.  It is designed to be consumed by the API layer (REST or
+//! GraphQL) and therefore purposefully avoids any web-framework specifics.
+//!
+//! # Highlights
+//! * Clean separation between View (external payload) and View-Model (DTO).
+//! * Repository-backed query with Postgres (`sqlx`) and opt-in Redis caching.
+//! * Built-in pagination helpers & validation via the `validator` crate.
+//! * Rich, structured error enumeration using `thiserror`.
+//!
+//! NOTE: Replace the `ledger_entries` table / column names as required by your
+//! schema migration tooling.
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::NaiveDate;
+use redis::AsyncCommands;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgRow, PgPool, Row};
+use thiserror::Error;
+use tracing::{debug, instrument, warn};
+use uuid::Uuid;
+use validator::Validate;
+
+// region: ---------- View / DTO ----------
+
+/// Public representation of a single ledger entry returned to API consumers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LedgerEntryView {
+    pub id:           Uuid,
+    pub tenant_id:    Uuid,
+    pub txn_date:     NaiveDate,
+    pub description:  String,
+    pub amount:       Decimal,
+    pub currency:     String,
+    pub account_id:   Uuid,
+}
+
+/// Pagination metadata envelope returned together with every paginated list.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PageMeta {
+    pub page:        u32,
+    pub per_page:    u32,
+    pub total:       u64,
+    pub total_pages: u32,
+}
+
+/// Generic paginated list wrapper.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PaginatedList<T> {
+    pub data: Vec<T>,
+    pub meta: PageMeta,
+}
+
+// endregion: ---------- View / DTO ----------
+
+// region: ---------- Validation ----------
+
+/// Incoming pagination parameters (usually deserialized from the request).
+#[derive(Clone, Debug, Deserialize, Validate)]
+pub struct PaginationParams {
+    #[validate(range(min = 1, max = 10_000))]
+    pub page:     u32,
+
+    /// Maximum 100 records per page to keep memory footprint reasonable.
+    #[validate(range(min = 1, max = 100))]
+    pub per_page: u32,
+
+    /// Force re-loading from the database instead of using Redis.
+    #[serde(default)]
+    pub refresh:  bool,
+}
+
+// endregion: ---------- Validation ----------
+
+// region: ---------- Service Traits & Errors ----------
+
+/// Query layer contract for fetching paginated ledger entries.
+#[async_trait]
+pub trait LedgerEntryQueryService: Send + Sync {
+    async fn list_entries(
+        &self,
+        tenant_id: Uuid,
+        params: PaginationParams,
+    ) -> Result<PaginatedList<LedgerEntryView>, QueryError>;
+}
+
+/// All errors that can bubble up from the query service.
+#[derive(Debug, Error)]
+pub enum QueryError {
+    #[error("validation failed: {0}")]
+    Validation(String),
+
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("cache error: {0}")]
+    Cache(#[from] redis::RedisError),
+
+    #[error("internal serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+}
+
+// endregion: ---------- Service Traits & Errors ----------
+
+// region: ---------- Service Implementation ----------
+
+/// Concrete implementation that uses Postgres + Redis for storage/caching.
+#[derive(Clone)]
+pub struct LedgerEntryQueryServiceImpl {
+    db_pool:        PgPool,
+    redis_client:   redis::Client,
+    cache_ttl:      Duration,
+}
+
+impl LedgerEntryQueryServiceImpl {
+    /// Create a new query service.
+    pub fn new(db_pool: PgPool, redis_client: redis::Client) -> Self {
+        Self {
+            db_pool,
+            redis_client,
+            cache_ttl: Duration::from_secs(60),
+        }
+    }
+
+    fn cache_key(tenant_id: Uuid, page: u32, per_page: u32) -> String {
+        format!("cache:ledger_entries:{tenant_id}:{page}:{per_page}")
+    }
+}
+
+#[async_trait]
+impl LedgerEntryQueryService for LedgerEntryQueryServiceImpl {
+    #[instrument(skip(self))]
+    async fn list_entries(
+        &self,
+        tenant_id: Uuid,
+        params: PaginationParams,
+    ) -> Result<PaginatedList<LedgerEntryView>, QueryError> {
+        // 1. Validate request first.
+        params
+            .validate()
+            .map_err(|e| QueryError::Validation(e.to_string()))?;
+
+        let key = Self::cache_key(tenant_id, params.page, params.per_page);
+
+        // 2. Attempt to read from Redis if not explicitly refreshed.
+        if !params.refresh {
+            if let Ok(mut conn) = self.redis_client.get_async_connection().await {
+                if let Ok(cached_str): Result<String, _> = conn.get(&key).await {
+                    debug!("Redis cache hit: `{key}`");
+                    let cached: PaginatedList<LedgerEntryView> = serde_json::from_str(&cached_str)?;
+                    return Ok(cached);
+                }
+            }
+        }
+
+        // 3. Fallback to Postgres query.
+        debug!("Cache miss (or refresh requested) for `{key}` – hitting postgres");
+        let offset: i64    = ((params.page - 1) * params.per_page) as i64;
+        let limit: i64     = params.per_page as i64;
+
+        // The `count(*) OVER ()` window function returns total rows for pagination.
+        let rows: Vec<PgRow> = sqlx::query(
+            r#"
+            SELECT
+                id,
+                tenant_id,
+                txn_date,
+                description,
+                amount,
+                currency,
+                account_id,
+                COUNT(*) OVER() AS total_count
+            FROM ledger_entries
+            WHERE tenant_id = $1
+            ORDER BY txn_date DESC, id DESC
+            OFFSET $2
+            LIMIT  $3
+            "#
+        )
+        .bind(tenant_id)
+        .bind(offset)
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        let total: u64 = rows
+            .get(0)
+            .map(|r| r.get::<i64, _>("total_count") as u64)
+            .unwrap_or(0);
+
+        let data: Vec<LedgerEntryView> = rows.into_iter().map(row_to_view).collect();
+
+        let total_pages =
+            if total == 0 { 0 } else { ((total as f64) / params.per_page as f64).ceil() as u32 };
+
+        let paginated = PaginatedList {
+            data,
+            meta: PageMeta {
+                page: params.page,
+                per_page: params.per_page,
+                total,
+                total_pages,
+            },
+        };
+
+        // 4. Store in Redis for next request.
+        if let Ok(json) = serde_json::to_string(&paginated) {
+            match self.redis_client.get_async_connection().await {
+                Ok(mut conn) => {
+                    let _: () = conn
+                        .set_ex(&key, json, self.cache_ttl.as_secs() as usize)
+                        .await?;
+                }
+                Err(e) => warn!("Failed to cache ledger entries: {e:?}"),
+            }
+        }
+
+        Ok(paginated)
+    }
+}
+
+// endregion: ---------- Service Implementation ----------
+
+// region: ---------- Helper Conversions ----------
+
+fn row_to_view(row: PgRow) -> LedgerEntryView {
+    LedgerEntryView {
+        id:          row.get("id"),
+        tenant_id:   row.get("tenant_id"),
+        txn_date:    row.get("txn_date"),
+        description: row.get::<&str, _>("description").to_owned(),
+        amount:      row.get("amount"),
+        currency:    row.get::<&str, _>("currency").to_owned(),
+        account_id:  row.get("account_id"),
+    }
+}
+
+// endregion: ---------- Helper Conversions ----------
+```

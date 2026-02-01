@@ -1,0 +1,481 @@
+```csharp
+// ---------------------------------------------------------------------------------------------------------------------
+//  Project : PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//  File    : module_10.txt   (implementation only; filename is controlled by build pipeline)
+//  License : MIT
+// ---------------------------------------------------------------------------------------------------------------------
+//  Description
+//  ------------
+//  Transformation module that materialises productivity-oriented KPIs from a heterogenous event feed.
+//  Implements the Strategy-Pattern so that additional KPIs can be plugged in without redeploying the
+//  compute units.  The module is designed to execute inside an AWS Lambda but is consciously decoupled
+//  from the hosting environment (no direct dependency on Amazon.Lambda.* packages) so it can also be
+//  reused by Glue, Fargate, or on-prem batch jobs.
+// ---------------------------------------------------------------------------------------------------------------------
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+using Amazon.S3;
+using Amazon.S3.Model;
+
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformations
+{
+    #region Public DTOs / Contracts -----------------------------------------------------------------
+
+    /// <summary>
+    /// Thin wrapper around any raw event that enters the warehouse.
+    /// Envelopes allow us to standardise metadata required for transformation,
+    /// without rewriting every single ingestion lambda when an attribute is added later on.
+    /// </summary>
+    /// <remarks>
+    /// The schema mirrors the one emitted by the <c>EventIngressProcessor</c> lambda.
+    /// </remarks>
+    public sealed record EventEnvelope
+    {
+        public required string EventId          { get; init; }
+        public required string EventType        { get; init; }
+        public required DateTimeOffset Created  { get; init; }
+        public required IReadOnlyDictionary<string, string?> Metadata { get; init; }
+        public required string PayloadJson      { get; init; }   // Raw JSON blob – don’t parse unless strictly needed.
+    }
+
+    /// <summary>
+    /// Normalised, strongly-typed KPI result produced by one of the strategy implementations.
+    /// </summary>
+    public sealed record KpiCalculationResult
+    {
+        public required string              KpiName         { get; init; }
+        public required DateTimeOffset      WindowStartUtc  { get; init; }
+        public required DateTimeOffset      WindowEndUtc    { get; init; }
+        public required decimal             Value           { get; init; }
+        public required IReadOnlyDictionary<string, string> Dimensions      { get; init; }
+        public          IReadOnlyDictionary<string, string>? AdditionalMeta { get; init; }
+    }
+
+    /// <summary>
+    /// Contract for a pluggable KPI strategy.
+    /// </summary>
+    public interface IKpiCalculationStrategy
+    {
+        /// <summary>Name of the KPI – MUST be unique.</summary>
+        string KpiName { get; }
+
+        /// <summary>Returns <c>true</c> if the strategy can handle the given event.</summary>
+        bool CanHandle(EventEnvelope envelope);
+
+        /// <summary>
+        /// Performs calculation and yields one or more KPI rows.  Strategies may buffer events
+        /// internally if the KPI spans a sliding window (e.g., Deployment Lead-Time).
+        /// </summary>
+        ValueTask<IEnumerable<KpiCalculationResult>> ProcessAsync(
+            EventEnvelope envelope,
+            CancellationToken                        ct = default);
+    }
+
+    #endregion
+
+    #region Transformation Engine -------------------------------------------------------------------
+
+    /// <summary>
+    /// Coordinates incoming event stream and dispatches to registered KPI strategies.
+    /// Takes care of parallelism, back-pressure, exception isolation, and durability (S3 write).
+    /// </summary>
+    public sealed class KpiTransformationEngine : IAsyncDisposable
+    {
+        private readonly IReadOnlyList<IKpiCalculationStrategy> _strategies;
+        private readonly IS3KpiWriter                           _writer;
+        private readonly ILogger<KpiTransformationEngine>       _logger;
+        private readonly SemaphoreSlim                          _parallelism;
+
+        public KpiTransformationEngine(
+            IEnumerable<IKpiCalculationStrategy> strategies,
+            IS3KpiWriter                           writer,
+            ILogger<KpiTransformationEngine>       logger,
+            int                                    maxDegreeOfParallelism = 8)
+        {
+            _strategies   = strategies?.ToList() ?? throw new ArgumentNullException(nameof(strategies));
+            _writer       = writer     ?? throw new ArgumentNullException(nameof(writer));
+            _logger       = logger     ?? throw new ArgumentNullException(nameof(logger));
+            if (!_strategies.Any())
+                throw new ArgumentException("At least one KPI strategy must be provided.", nameof(strategies));
+
+            _parallelism  = new SemaphoreSlim(maxDegreeOfParallelism, maxDegreeOfParallelism);
+        }
+
+        /// <summary>
+        /// Orchestrates transformation for a batch of events.
+        /// </summary>
+        public async ValueTask ExecuteAsync(
+            IEnumerable<EventEnvelope> events,
+            CancellationToken         ct = default)
+        {
+            ArgumentNullException.ThrowIfNull(events);
+
+            var tasks = new List<Task>();
+
+            foreach (var envelope in events)
+            {
+                await _parallelism.WaitAsync(ct).ConfigureAwait(false);
+
+                // Fire-and-forget – safe because we await all tasks in the list below
+                tasks.Add(Task.Run(async () =>
+                {
+                    try
+                    {
+                        await DispatchToStrategiesAsync(envelope, ct).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex,
+                            "Uncaught exception while processing event {EventId}. " +
+                            "The event will be re-queued to the DLQ by the Lambda runtime.",
+                            envelope.EventId);
+                        // Bubble up to trigger Lambda DLQ – do NOT swallow
+                        throw;
+                    }
+                    finally
+                    {
+                        _parallelism.Release();
+                    }
+                }, ct));
+            }
+
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+
+        private async Task DispatchToStrategiesAsync(EventEnvelope envelope, CancellationToken ct)
+        {
+            var sw = Stopwatch.StartNew();
+
+            var interestedStrategies = _strategies.Where(s => s.CanHandle(envelope)).ToArray();
+            if (interestedStrategies.Length == 0)
+            {
+                _logger.LogDebug("No KPI strategy registered for event {EventType}.", envelope.EventType);
+                return;
+            }
+
+            var kpiRows = new ConcurrentBag<KpiCalculationResult>();
+
+            // Parallel but limited to #strategies so trivial overhead
+            var strategyTasks = interestedStrategies.Select(async strategy =>
+            {
+                try
+                {
+                    var rows = await strategy.ProcessAsync(envelope, ct).ConfigureAwait(false);
+                    foreach (var row in rows) kpiRows.Add(row);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "Strategy {KpiStrategy} failed while processing EventId={EventId}. Skipping strategy.",
+                        strategy.KpiName, envelope.EventId);
+                }
+            });
+
+            await Task.WhenAll(strategyTasks).ConfigureAwait(false);
+
+            // Commit results to the Data Lake (S3, parquet files partitioned by YYYY/MM/DD)
+            if (kpiRows.Count > 0)
+            {
+                await _writer.WriteAsync(kpiRows, ct).ConfigureAwait(false);
+            }
+
+            _logger.LogInformation(
+                "Processed EventId={EventId} in {ElapsedMs:n0} ms with {RowCount} KPI rows.",
+                envelope.EventId, sw.ElapsedMilliseconds, kpiRows.Count);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _parallelism?.Dispose();
+            if (_writer is IAsyncDisposable asyncDisposable)
+                await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    #endregion
+
+    #region Strategy Implementations ----------------------------------------------------------------
+
+    /// <summary>
+    /// Calculates the ratio between focus time and total working hours on a per-user, per-day basis.
+    /// Source events:
+    ///   - CalendarEventCreated / Updated
+    ///   - WorkSessionStarted / Ended (emitted by IDE plugins, CLI wrappers, browser extensions, …)
+    /// </summary>
+    internal sealed class FocusTimeRatioStrategy : IKpiCalculationStrategy
+    {
+        private const string CalendarEventType = "CalendarEvent";
+        private const string WorkSessionType   = "WorkSession";
+
+        public string KpiName => "focus_time_ratio";
+
+        public bool CanHandle(EventEnvelope envelope)
+            => envelope.EventType is CalendarEventType or WorkSessionType;
+
+        public async ValueTask<IEnumerable<KpiCalculationResult>> ProcessAsync(
+            EventEnvelope   envelope,
+            CancellationToken ct = default)
+        {
+            // NOTE: In a real-world scenario, we would use a distributed cache (e.g., DAX or Redis)
+            //       to store partial aggregates.  For brevity, this implementation simply returns
+            //       an immediate KPI row when sufficient information is present on the event itself.
+
+            if (envelope.EventType == WorkSessionType &&
+                envelope.Metadata.TryGetValue("DurationMinutes", out var durationStr) &&
+                int.TryParse(durationStr, out var durationMinutes))
+            {
+                var userId = envelope.Metadata["UserId"]!;
+                var date   = envelope.Created.UtcDateTime.Date;
+
+                var result = new KpiCalculationResult
+                {
+                    KpiName        = KpiName,
+                    WindowStartUtc = date,
+                    WindowEndUtc   = date.AddDays(1),
+                    Value          = durationMinutes, // later aggregated to obtain total focus time
+                    Dimensions = new Dictionary<string, string>
+                    {
+                        ["user_id"] = userId,
+                        ["metric"]  = "focus_minutes"
+                    }
+                };
+
+                return new[] { result };
+            }
+
+            if (envelope.EventType == CalendarEventType &&
+                envelope.Metadata.TryGetValue("DurationMinutes", out var calendarDurationStr) &&
+                int.TryParse(calendarDurationStr, out var meetingMinutes))
+            {
+                var userId = envelope.Metadata["OrganizerId"]!;
+                var date   = envelope.Created.UtcDateTime.Date;
+
+                var result = new KpiCalculationResult
+                {
+                    KpiName        = KpiName,
+                    WindowStartUtc = date,
+                    WindowEndUtc   = date.AddDays(1),
+                    Value          = meetingMinutes,
+                    Dimensions = new Dictionary<string, string>
+                    {
+                        ["user_id"] = userId,
+                        ["metric"]  = "meeting_minutes"
+                    }
+                };
+
+                return new[] { result };
+            }
+
+            return Array.Empty<KpiCalculationResult>();
+        }
+    }
+
+    /// <summary>
+    /// Computes deployment lead-time (commit → production) on a per-repo basis.
+    /// Maintains a small in-memory buffer which is flushed every <see cref="FlushInterval"/>.
+    /// </summary>
+    internal sealed class DeploymentLeadTimeStrategy : IKpiCalculationStrategy, IDisposable
+    {
+        private const string CommitEventType     = "CodeCommitPushed";
+        private const string ProdDeployEventType = "CdPipelineDeployed";
+
+        private readonly TimeSpan                               FlushInterval     = TimeSpan.FromMinutes(5);
+        private readonly ConcurrentDictionary<string, DateTime> _commitTimestamps = new(StringComparer.Ordinal);
+        private readonly Timer                                  _flushTimer;
+        private readonly ILogger                                _logger;
+
+        public string KpiName => "deployment_lead_time";
+
+        public DeploymentLeadTimeStrategy(ILogger<DeploymentLeadTimeStrategy> logger)
+        {
+            _logger      = logger;
+            _flushTimer  = new Timer(_ => FlushExpired(), null, FlushInterval, FlushInterval);
+        }
+
+        public bool CanHandle(EventEnvelope envelope)
+            => envelope.EventType is CommitEventType or ProdDeployEventType;
+
+        public async ValueTask<IEnumerable<KpiCalculationResult>> ProcessAsync(
+            EventEnvelope envelope,
+            CancellationToken ct = default)
+        {
+            switch (envelope.EventType)
+            {
+                case CommitEventType:
+                    {
+                        var commitSha  = envelope.Metadata["CommitSha"]!;
+                        _commitTimestamps[commitSha] = envelope.Created.UtcDateTime;
+                        break;
+                    }
+
+                case ProdDeployEventType:
+                    {
+                        var commitSha = envelope.Metadata["CommitSha"]!;
+                        if (_commitTimestamps.TryRemove(commitSha, out var commitTime))
+                        {
+                            var leadTimeMinutes = (envelope.Created.UtcDateTime - commitTime).TotalMinutes;
+                            var repo            = envelope.Metadata["Repository"]!;
+
+                            var kpiRow = new KpiCalculationResult
+                            {
+                                KpiName        = KpiName,
+                                WindowStartUtc = commitTime,
+                                WindowEndUtc   = envelope.Created.UtcDateTime,
+                                Value          = (decimal)leadTimeMinutes,
+                                Dimensions = new Dictionary<string, string>
+                                {
+                                    ["repository"] = repo
+                                }
+                            };
+                            return new[] { kpiRow };
+                        }
+                        break;
+                    }
+            }
+
+            return Array.Empty<KpiCalculationResult>();
+        }
+
+        private void FlushExpired()
+        {
+            var threshold = DateTime.UtcNow.AddHours(-24); // assume deploy happens within 24 h
+            foreach (var kvp in _commitTimestamps)
+            {
+                if (kvp.Value < threshold && _commitTimestamps.TryRemove(kvp.Key, out _))
+                {
+                    _logger.LogDebug(
+                        "Dropped stale commit {CommitSha} for deployment lead-time KPI (older than 24h).",
+                        kvp.Key);
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            _flushTimer.Dispose();
+        }
+    }
+
+    #endregion
+
+    #region Persistence Layer -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Simple abstraction that serialises KPI rows as ND-JSON and stores them in S3.
+    /// Real-world implementation could write Apache Parquet or Iceberg; ND-JSON keeps demo lightweight.
+    /// </summary>
+    public interface IS3KpiWriter : IAsyncDisposable
+    {
+        ValueTask WriteAsync(
+            IEnumerable<KpiCalculationResult> rows,
+            CancellationToken                 ct = default);
+    }
+
+    /// <summary>
+    /// Production-ready S3 writer implementation with retry/back-off and partitioned key structure.
+    /// </summary>
+    internal sealed class S3KpiWriter : IS3KpiWriter
+    {
+        private readonly IAmazonS3                 _s3;
+        private readonly string                    _bucket;
+        private readonly ILogger<S3KpiWriter>      _logger;
+
+        private static readonly AmazonS3RetryPolicy RetryPolicy = new();
+
+        public S3KpiWriter(IAmazonS3 s3, string bucket, ILogger<S3KpiWriter> logger)
+        {
+            _s3     = s3     ?? throw new ArgumentNullException(nameof(s3));
+            _bucket = bucket ?? throw new ArgumentNullException(nameof(bucket));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        public async ValueTask WriteAsync(
+            IEnumerable<KpiCalculationResult> rows,
+            CancellationToken                 ct = default)
+        {
+            ArgumentNullException.ThrowIfNull(rows);
+
+            var nowUtc     = DateTime.UtcNow;
+            var partition  = $"{nowUtc:yyyy/MM/dd}";
+            var objectKey  = $"kpi/partition_date={partition}/{Guid.NewGuid():N}.jsonl";
+
+            // Serialise as ND-JSON
+            var jsonLines  = string.Join('\n', rows.Select(row => System.Text.Json.JsonSerializer.Serialize(row)));
+
+            var request = new PutObjectRequest
+            {
+                BucketName  = _bucket,
+                Key         = objectKey,
+                ContentBody = jsonLines,
+                ContentType = "application/json"
+            };
+
+            await RetryPolicy.ExecuteAsync(
+                async () => await _s3.PutObjectAsync(request, ct).ConfigureAwait(false),
+                ct).ConfigureAwait(false);
+
+            _logger.LogDebug("Wrote {RowCount} KPI rows to s3://{Bucket}/{Key}.", rows.Count(), _bucket, objectKey);
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// Declarative, exponential back-off retry wrapper for S3 operations.
+    /// </summary>
+    internal sealed class AmazonS3RetryPolicy
+    {
+        private static readonly TimeSpan[] BackOffSchedule =
+        {
+            TimeSpan.FromMilliseconds(100),
+            TimeSpan.FromMilliseconds(250),
+            TimeSpan.FromMilliseconds(500),
+            TimeSpan.FromSeconds(1),
+            TimeSpan.FromSeconds(2)
+        };
+
+        public async Task ExecuteAsync(Func<Task> operation, CancellationToken ct)
+        {
+            var attempt = 0;
+            Exception? lastError = null;
+
+            foreach (var delay in BackOffSchedule.Append(TimeSpan.Zero))
+            {
+                try
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await operation().ConfigureAwait(false);
+                    return; // success
+                }
+                catch (Exception ex) when (IsTransient(ex))
+                {
+                    lastError = ex;
+                    attempt++;
+                    if (delay > TimeSpan.Zero)
+                        await Task.Delay(delay, ct).ConfigureAwait(false);
+                }
+            }
+
+            throw new InvalidOperationException(
+                $"S3 operation failed after {attempt} retries.", lastError);
+        }
+
+        private static bool IsTransient(Exception ex)
+        {
+            // TODO: Add richer fault-analysis; for now assume all AmazonS3Exception with 5xx are transient.
+            return ex is AmazonS3Exception s3Ex && (int)s3Ex.StatusCode >= 500;
+        }
+    }
+
+    #endregion
+}
+```

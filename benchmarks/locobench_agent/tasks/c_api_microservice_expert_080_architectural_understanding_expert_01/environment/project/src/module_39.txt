@@ -1,0 +1,458 @@
+```c
+/*
+ * MercuryMonolith Commerce Hub
+ * Module 39  –  Response Cache (in-memory, sharded LRU with TTL)
+ *
+ * This component provides a thread-safe, in-process response cache that can be
+ * shared by every service layer within the monolith (orders, billing, etc.).
+ * The cache is purposely simple (malloc-backed, not mmap) to keep operational
+ * footprint low while still delivering predictable latency for hot resources.
+ *
+ * Features
+ *   • Sharded hash table (16 shards) for reduced contention
+ *   • O(1) look-ups and O(1) LRU eviction per shard
+ *   • Per-entry TTL and max-byte eviction policy
+ *   • Prometheus-style metrics export
+ *   • Hook points for the central structured logger
+ *
+ * NOTE: The cache is *not* persistent and will be wiped on process restart.
+ *
+ * Author: MercuryMonolith Core Team
+ * SPDX-License-Identifier: MIT
+ */
+
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* ---------------------------------------------------------------------------
+ * Project-local headers
+ * ------------------------------------------------------------------------- */
+#include "logger.h"     /* Central structured logging facade               */
+#include "metrics.h"    /* Prometheus helper (registry, serialization etc) */
+#include "murmur3.h"    /* 64-bit Murmur3 hash used across the monolith    */
+
+/*
+ * If uthash is already included elsewhere in the monolith, that's fine.
+ * Otherwise we fall back to the embedded single-file version below.
+ */
+#ifndef UTHASH_H
+#define UTHASH_FNV
+#include "uthash.h"
+#endif
+
+/* ---------------------------------------------------------------------------
+ * Module configuration
+ * ------------------------------------------------------------------------- */
+#define CACHE_SHARD_COUNT 16          /* Power-of-two for cheap modulo mask   */
+#define CACHE_KEY_MAX_LEN 256         /* Fails fast if abused                 */
+#define CACHE_DEFAULT_TTL_SEC 300     /* 5 minutes                            */
+
+#ifndef CACHE_MAX_CAP_BYTES
+#define CACHE_MAX_CAP_BYTES (64 * 1024 * 1024) /* 64 MiB process default    */
+#endif
+
+/* ---------------------------------------------------------------------------
+ * Data structures
+ * ------------------------------------------------------------------------- */
+typedef struct CacheEntry {
+    char          key[CACHE_KEY_MAX_LEN]; /* zero-terminated                */
+    unsigned char *payload;               /* opaque serialized response     */
+    size_t        size;                   /* payload length in bytes        */
+    time_t        expire_at;              /* absolute epoch sec             */
+
+    /* Doubly-linked list for LRU ordering within a shard                  */
+    struct CacheEntry *prev;
+    struct CacheEntry *next;
+
+    UT_hash_handle hh;                    /* uthash linkage                 */
+} CacheEntry;
+
+typedef struct CacheShard {
+    pthread_mutex_t lock;                 /* protects every field below     */
+    CacheEntry     *map;                  /* uthash hash table              */
+    CacheEntry     *lru_head;             /* Most recently used             */
+    CacheEntry     *lru_tail;             /* Least recently used            */
+    size_t          bytes_used;           /* Current memory footprint       */
+    uint64_t        hit;                  /* metrics – hits per shard       */
+    uint64_t        miss;                 /* metrics – misses per shard     */
+    uint64_t        evict;                /* metrics – evictions per shard  */
+} CacheShard;
+
+/* ---------------------------------------------------------------------------
+ * Global state
+ * ------------------------------------------------------------------------- */
+static struct {
+    CacheShard shards[CACHE_SHARD_COUNT];
+    size_t     cap_bytes;
+    int        default_ttl;
+    int        online;                    /* 0 = shut down, 1 = ready       */
+} g_cache;
+
+/* ---------------------------------------------------------------------------
+ * Forward declarations
+ * ------------------------------------------------------------------------- */
+static inline uint32_t shard_index_from_key(const char *key);
+static void            lru_move_to_front(CacheShard *shard, CacheEntry *entry);
+static void            evict_until_fit(CacheShard *shard, size_t bytes_needed);
+static void            purge_expired_locked(CacheShard *shard, time_t now);
+
+/* ---------------------------------------------------------------------------
+ * Public API
+ * ------------------------------------------------------------------------- */
+int
+response_cache_init(size_t max_bytes, int default_ttl_sec)
+{
+    if (g_cache.online) {
+        LOG_WARN("cache", "Already initialized – ignoring second init.");
+        return 0;
+    }
+
+    g_cache.cap_bytes   = max_bytes > 0 ? max_bytes : CACHE_MAX_CAP_BYTES;
+    g_cache.default_ttl = default_ttl_sec > 0 ? default_ttl_sec
+                                              : CACHE_DEFAULT_TTL_SEC;
+
+    for (size_t i = 0; i < CACHE_SHARD_COUNT; ++i) {
+        CacheShard *shard = &g_cache.shards[i];
+        memset(shard, 0, sizeof(*shard));
+
+        if (pthread_mutex_init(&shard->lock, NULL) != 0) {
+            LOG_ERROR("cache", "Failed to init mutex for shard=%zu", i);
+            return -1;
+        }
+    }
+
+    g_cache.online = 1;
+    LOG_INFO("cache",
+             "Response cache ready – cap=%zu MiB, default_ttl=%ds, shards=%d",
+             g_cache.cap_bytes / (1024 * 1024), g_cache.default_ttl,
+             CACHE_SHARD_COUNT);
+    return 0;
+}
+
+void
+response_cache_shutdown(void)
+{
+    if (!g_cache.online) return;
+
+    for (size_t i = 0; i < CACHE_SHARD_COUNT; ++i) {
+        CacheShard *shard = &g_cache.shards[i];
+        pthread_mutex_lock(&shard->lock);
+
+        CacheEntry *cur, *tmp;
+        HASH_ITER(hh, shard->map, cur, tmp)
+        {
+            HASH_DEL(shard->map, cur);
+            free(cur->payload);
+            free(cur);
+        }
+        shard->map       = NULL;
+        shard->lru_head  = shard->lru_tail = NULL;
+        shard->bytes_used = shard->hit = shard->miss = shard->evict = 0;
+
+        pthread_mutex_unlock(&shard->lock);
+        pthread_mutex_destroy(&shard->lock);
+    }
+
+    g_cache.online = 0;
+    LOG_INFO("cache", "Response cache shut down");
+}
+
+int
+response_cache_get(const char *key,
+                   unsigned char **out_payload,
+                   size_t *out_size)
+{
+    assert(key && out_payload && out_size);
+
+    if (!g_cache.online) return -2; /* Not initialized */
+
+    uint32_t idx   = shard_index_from_key(key);
+    CacheShard *sh = &g_cache.shards[idx];
+
+    pthread_mutex_lock(&sh->lock);
+
+    CacheEntry *entry = NULL;
+    HASH_FIND_STR(sh->map, key, entry);
+
+    const time_t now = time(NULL);
+
+    if (!entry) {
+        /* Miss */
+        sh->miss++;
+        pthread_mutex_unlock(&sh->lock);
+        return -1;
+    }
+
+    if (entry->expire_at <= now) {
+        /* Expired – remove and count as miss */
+        HASH_DEL(sh->map, entry);
+        if (entry->prev) entry->prev->next = entry->next;
+        if (entry->next) entry->next->prev = entry->prev;
+        if (sh->lru_head == entry) sh->lru_head = entry->next;
+        if (sh->lru_tail == entry) sh->lru_tail = entry->prev;
+        sh->bytes_used -= entry->size;
+        free(entry->payload);
+        free(entry);
+        sh->miss++;
+        pthread_mutex_unlock(&sh->lock);
+        return -1;
+    }
+
+    /* Hit */
+    lru_move_to_front(sh, entry);
+    sh->hit++;
+
+    /* Deep-copy payload to caller – they must free() */
+    *out_payload = malloc(entry->size);
+    if (!*out_payload) {
+        pthread_mutex_unlock(&sh->lock);
+        return -ENOMEM;
+    }
+    memcpy(*out_payload, entry->payload, entry->size);
+    *out_size = entry->size;
+
+    pthread_mutex_unlock(&sh->lock);
+    return 0;
+}
+
+int
+response_cache_put(const char *key,
+                   const unsigned char *payload,
+                   size_t size,
+                   int ttl_sec)
+{
+    assert(key && payload);
+
+    if (!g_cache.online) return -2; /* Not initialized */
+    if (strlen(key) >= CACHE_KEY_MAX_LEN) return -EINVAL;
+    if (size == 0) return -EINVAL;
+    if (size > g_cache.cap_bytes) {
+        /* Not worth caching big responses that can never fit */
+        LOG_DEBUG("cache", "Payload > cache cap (%zu bytes) – skip key='%s'",
+                  size, key);
+        return -EOVERFLOW;
+    }
+
+    uint32_t idx   = shard_index_from_key(key);
+    CacheShard *sh = &g_cache.shards[idx];
+
+    pthread_mutex_lock(&sh->lock);
+
+    /* Replace if existing */
+    CacheEntry *entry = NULL;
+    HASH_FIND_STR(sh->map, key, entry);
+    if (entry) {
+        /* Adjust accounting */
+        sh->bytes_used -= entry->size;
+
+        free(entry->payload);
+        entry->payload = NULL;
+        entry->size    = 0;
+    } else {
+        /* New entry */
+        entry = calloc(1, sizeof(*entry));
+        if (!entry) {
+            pthread_mutex_unlock(&sh->lock);
+            return -ENOMEM;
+        }
+        strncpy(entry->key, key, CACHE_KEY_MAX_LEN - 1);
+        HASH_ADD_STR(sh->map, key, entry);
+    }
+
+    /* Allocate and copy payload */
+    entry->payload = malloc(size);
+    if (!entry->payload) {
+        /* Rollback */
+        HASH_DEL(sh->map, entry);
+        free(entry);
+        pthread_mutex_unlock(&sh->lock);
+        return -ENOMEM;
+    }
+    memcpy(entry->payload, payload, size);
+    entry->size      = size;
+    entry->expire_at = time(NULL) + (ttl_sec > 0 ? ttl_sec
+                                                 : g_cache.default_ttl);
+
+    /* LRU ‑ move to front */
+    lru_move_to_front(sh, entry);
+    sh->bytes_used += size;
+
+    /* Evict until within cap for this shard */
+    evict_until_fit(sh, 0);
+
+    pthread_mutex_unlock(&sh->lock);
+    return 0;
+}
+
+void
+response_cache_metrics_snapshot(cache_metrics_t *dst)
+{
+    memset(dst, 0, sizeof(*dst));
+
+    for (size_t i = 0; i < CACHE_SHARD_COUNT; ++i) {
+        CacheShard *sh = &g_cache.shards[i];
+        pthread_mutex_lock(&sh->lock);
+
+        dst->bytes_used += sh->bytes_used;
+        dst->hit        += sh->hit;
+        dst->miss       += sh->miss;
+        dst->evict      += sh->evict;
+
+        pthread_mutex_unlock(&sh->lock);
+    }
+    dst->bytes_cap = g_cache.cap_bytes;
+}
+
+int
+response_cache_prometheus(char *buf, size_t buf_len)
+{
+    cache_metrics_t m;
+    response_cache_metrics_snapshot(&m);
+
+    int n = snprintf(buf, buf_len,
+                     "# HELP cache_bytes_used In-memory bytes currently "
+                     "used by the response cache.\n"
+                     "# TYPE cache_bytes_used gauge\n"
+                     "cache_bytes_used %zu\n"
+                     "# HELP cache_bytes_cap Max bytes configured for the "
+                     "response cache.\n"
+                     "# TYPE cache_bytes_cap gauge\n"
+                     "cache_bytes_cap %zu\n"
+                     "# HELP cache_hit_total Total number of cache hits.\n"
+                     "# TYPE cache_hit_total counter\n"
+                     "cache_hit_total %llu\n"
+                     "# HELP cache_miss_total Total number of cache misses.\n"
+                     "# TYPE cache_miss_total counter\n"
+                     "cache_miss_total %llu\n"
+                     "# HELP cache_eviction_total Total number of cache "
+                     "evictions.\n"
+                     "# TYPE cache_eviction_total counter\n"
+                     "cache_eviction_total %llu\n",
+                     m.bytes_used, m.bytes_cap,
+                     (unsigned long long)m.hit,
+                     (unsigned long long)m.miss,
+                     (unsigned long long)m.evict);
+
+    if (n < 0 || (size_t)n >= buf_len) {
+        return -ENOMEM;
+    }
+    return n; /* bytes written */
+}
+
+/* ---------------------------------------------------------------------------
+ * Internal helpers
+ * ------------------------------------------------------------------------- */
+static inline uint32_t
+shard_index_from_key(const char *key)
+{
+    uint64_t h = murmur3_64(key, strlen(key), 0xDEADBEEF);
+    return (uint32_t)(h & (CACHE_SHARD_COUNT - 1));
+}
+
+static void
+lru_move_to_front(CacheShard *shard, CacheEntry *entry)
+{
+    if (entry == shard->lru_head) return;
+
+    /* Detach */
+    if (entry->prev) entry->prev->next = entry->next;
+    if (entry->next) entry->next->prev = entry->prev;
+    if (shard->lru_tail == entry) shard->lru_tail = entry->prev;
+
+    /* Insert front */
+    entry->prev      = NULL;
+    entry->next      = shard->lru_head;
+    if (shard->lru_head) shard->lru_head->prev = entry;
+    shard->lru_head = entry;
+    if (!shard->lru_tail) shard->lru_tail = entry;
+}
+
+static void
+evict_one(CacheShard *shard)
+{
+    CacheEntry *victim = shard->lru_tail;
+    if (!victim) return;
+
+    HASH_DEL(shard->map, victim);
+
+    if (victim->prev) victim->prev->next = NULL;
+    shard->lru_tail = victim->prev;
+    if (!shard->lru_tail) shard->lru_head = NULL;
+
+    shard->bytes_used -= victim->size;
+    shard->evict++;
+
+    free(victim->payload);
+    free(victim);
+}
+
+static void
+evict_until_fit(CacheShard *shard, size_t bytes_needed)
+{
+    /* Ensure we have room for bytes_needed within global cap / shard */
+    const size_t shard_cap = g_cache.cap_bytes / CACHE_SHARD_COUNT;
+
+    while (shard->bytes_used + bytes_needed > shard_cap) {
+        if (!shard->lru_tail) break;
+        evict_one(shard);
+    }
+}
+
+static void
+purge_expired_locked(CacheShard *shard, time_t now)
+{
+    CacheEntry *cur = shard->lru_tail; /* Start from oldest */
+    while (cur) {
+        if (cur->expire_at > now) break;
+
+        CacheEntry *prev = cur->prev;
+        HASH_DEL(shard->map, cur);
+
+        if (cur->prev) cur->prev->next = cur->next;
+        if (cur->next) cur->next->prev = cur->prev;
+        if (shard->lru_head == cur) shard->lru_head = cur->next;
+        if (shard->lru_tail == cur) shard->lru_tail = cur->prev;
+
+        shard->bytes_used -= cur->size;
+        free(cur->payload);
+        free(cur);
+
+        cur = prev;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Unit test stub (compile with -DRESPONSE_CACHE_TEST)
+ * ------------------------------------------------------------------------- */
+#ifdef RESPONSE_CACHE_TEST
+#include <assert.h>
+
+int main(void)
+{
+    assert(response_cache_init(4 * 1024 * 1024, 1) == 0);
+
+    char key[] = "GET:/health";
+    unsigned char payload[] = "OK";
+    assert(response_cache_put(key, payload, sizeof(payload), 1) == 0);
+
+    unsigned char *out;
+    size_t out_sz;
+    assert(response_cache_get(key, &out, &out_sz) == 0);
+    assert(out_sz == sizeof(payload));
+    assert(memcmp(out, payload, out_sz) == 0);
+    free(out);
+
+    sleep(2); /* TTL expires */
+    assert(response_cache_get(key, &out, &out_sz) == -1);
+
+    response_cache_shutdown();
+    return 0;
+}
+#endif /* RESPONSE_CACHE_TEST */
+```

@@ -1,0 +1,325 @@
+```rust
+//! src/module_20.rs
+//!
+//! LedgerLink Nexus – Ledger Entry Query Module (with Pagination & Redis Caching)
+//!
+//! This module lives in the “View-Model / Service” layer of the micro-service. It is responsible
+//! for fetching paginated ledger entries for a given tenant, while transparently leveraging a
+//! Redis cache to reduce pressure on Postgres for hot queries.
+//!
+//! Architectural notes
+//! -------------------
+//! • View <- ViewModel (DTO + metadata) <- Service <- Repository  (MVVM inspired)
+//! • Command/Query separation is respected; this module is *read-only* (query).
+//! • Error envelopes are unified and converted higher up in the middleware-stack.
+//!
+//! Crate features used
+//! -------------------
+//! async-trait, serde, thiserror, chrono, uuid, rust_decimal, redis (aio), tokio
+//! ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use redis::aio::ConnectionManager;
+use redis::AsyncCommands;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::Mutex;
+use uuid::Uuid;
+
+// ---------- Domain model ----------------------------------------------------
+
+/// Simplified immutable domain model representing a single ledger entry.
+/// In production this would live in a dedicated `domain` crate.
+#[derive(Debug, Clone)]
+pub struct LedgerEntry {
+    pub id:        Uuid,
+    pub tenant_id: Uuid,
+    pub account_id: String,
+    pub amount:    Decimal,
+    pub currency:  String,
+    pub posted_at: DateTime<Utc>,
+}
+
+// ---------- Pagination helpers ---------------------------------------------
+
+/// Request side: limit + opaque cursor (classic keyset pagination).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageRequest {
+    pub limit:  u32,
+    pub cursor: Option<Uuid>,
+}
+
+impl Default for PageRequest {
+    fn default() -> Self {
+        Self {
+            limit: 50,
+            cursor: None,
+        }
+    }
+}
+
+/// Response side: additional metadata returned to the consumer.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PageInfo {
+    pub has_more:    bool,
+    pub next_cursor: Option<Uuid>,
+}
+
+// ---------- Data-Transfer-Objects (DTO / ViewModel) -------------------------
+
+/// Narrowed JSON friendly representation sent to API clients.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LedgerEntryDTO {
+    pub id:         Uuid,
+    pub account_id: String,
+    pub amount:     String,
+    pub currency:   String,
+    pub posted_at:  DateTime<Utc>,
+}
+
+impl From<LedgerEntry> for LedgerEntryDTO {
+    fn from(e: LedgerEntry) -> Self {
+        Self {
+            id: e.id,
+            account_id: e.account_id,
+            amount: e.amount.to_string(),
+            currency: e.currency,
+            posted_at: e.posted_at,
+        }
+    }
+}
+
+/// High-level ViewModel returned by the query service (what controllers serialize).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PaginatedLedgerEntriesVM {
+    pub data:      Vec<LedgerEntryDTO>,
+    pub page:      PageInfo,
+    pub cache_hit: bool,
+}
+
+// ---------- Repository abstraction -----------------------------------------
+
+#[derive(Debug, Error)]
+pub enum RepoError {
+    #[error("database unavailable")]
+    Unavailable,
+    #[error("unknown repository error: {0}")]
+    Other(#[from] anyhow::Error),
+}
+
+/// Query-side repository interface (DDD “Port”).
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    async fn list_by_tenant(
+        &self,
+        tenant_id: Uuid,
+        page: PageRequest,
+    ) -> Result<(Vec<LedgerEntry>, PageInfo), RepoError>;
+}
+
+// ---------- Simple Redis cache facade --------------------------------------
+
+#[derive(Debug, Error)]
+pub enum CacheError {
+    #[error("redis connectivity issue")]
+    Connection(#[from] redis::RedisError),
+    #[error("serialization: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("unexpected: {0}")]
+    Other(String),
+}
+
+#[async_trait]
+pub trait SimpleCache: Send + Sync {
+    async fn get(&self, key: &str) -> Result<Option<String>, CacheError>;
+    async fn set_ex(&self, key: &str, val: &str, ttl: Duration) -> Result<(), CacheError>;
+}
+
+/// Redis-backed implementation using a connection pool (manager).
+pub struct RedisCache {
+    /// Mutex to comply with `AsyncCommands` mutability requirements.
+    inner: Mutex<ConnectionManager>,
+}
+
+impl RedisCache {
+    pub fn new(conn: ConnectionManager) -> Self {
+        Self {
+            inner: Mutex::new(conn),
+        }
+    }
+}
+
+#[async_trait]
+impl SimpleCache for RedisCache {
+    async fn get(&self, key: &str) -> Result<Option<String>, CacheError> {
+        let mut conn = self.inner.lock().await;
+        let res: Option<String> = conn.get(key).await?;
+        Ok(res)
+    }
+
+    async fn set_ex(&self, key: &str, val: &str, ttl: Duration) -> Result<(), CacheError> {
+        let mut conn = self.inner.lock().await;
+        let _: () = conn.set_ex(key, val, ttl.as_secs() as usize).await?;
+        Ok(())
+    }
+}
+
+// ---------- Service layer ---------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error(transparent)]
+    Repo(#[from] RepoError),
+    #[error(transparent)]
+    Cache(#[from] CacheError),
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+pub struct LedgerEntryQueryService<R: LedgerEntryRepository, C: SimpleCache> {
+    repo: Arc<R>,
+    cache: Arc<C>,
+    ttl: Duration,
+}
+
+impl<R: LedgerEntryRepository, C: SimpleCache> LedgerEntryQueryService<R, C> {
+    pub fn new(repo: Arc<R>, cache: Arc<C>, ttl: Duration) -> Self {
+        Self { repo, cache, ttl }
+    }
+
+    /// Fetch paginated ledger entries for a tenant with auto-caching.
+    pub async fn get_paginated_entries(
+        &self,
+        tenant_id: Uuid,
+        page_req: PageRequest,
+    ) -> Result<PaginatedLedgerEntriesVM, ServiceError> {
+        // Deterministic cache-key: tenant + page params
+        let cache_key = format!(
+            "ledger_entries:{}:limit:{}:cursor:{}",
+            tenant_id,
+            page_req.limit,
+            page_req
+                .cursor
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "none".into())
+        );
+
+        // Fast-path: attempt Redis
+        if let Some(raw) = self.cache.get(&cache_key).await? {
+            let mut vm: PaginatedLedgerEntriesVM = serde_json::from_str(&raw)?;
+            vm.cache_hit = true;
+            return Ok(vm);
+        }
+
+        // Fallback: Repository (Postgres)
+        let (entries, page_info) = self.repo.list_by_tenant(tenant_id, page_req).await?;
+
+        let data: Vec<LedgerEntryDTO> = entries.into_iter().map(Into::into).collect();
+        let vm = PaginatedLedgerEntriesVM {
+            data: data.clone(),
+            page: page_info.clone(),
+            cache_hit: false,
+        };
+
+        // Serialize & fire-and-forget set into Redis; no need to block main path on errors
+        let cache = Arc::clone(&self.cache);
+        let ttl = self.ttl;
+        let cache_key_clone = cache_key.clone();
+        let serialized = serde_json::to_string(&vm)?;
+        tokio::spawn(async move {
+            // Intentionally ignore errors – metrics will report if needed.
+            let _ = cache.set_ex(&cache_key_clone, &serialized, ttl).await;
+        });
+
+        Ok(vm)
+    }
+}
+
+// ---------- Mock repository for unit tests ----------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    struct InMemoryRepo {
+        data: VecDeque<LedgerEntry>,
+    }
+
+    #[async_trait]
+    impl LedgerEntryRepository for InMemoryRepo {
+        async fn list_by_tenant(
+            &self,
+            _tenant_id: Uuid,
+            page: PageRequest,
+        ) -> Result<(Vec<LedgerEntry>, PageInfo), RepoError> {
+            let mut vec = self.data.clone().into_iter().collect::<Vec<_>>();
+
+            if let Some(cursor) = page.cursor {
+                // naive seek
+                if let Some(pos) = vec.iter().position(|e| e.id == cursor) {
+                    vec = vec.into_iter().skip(pos + 1).collect();
+                }
+            }
+
+            let has_more = vec.len() as u32 > page.limit;
+            let sliced = vec.into_iter().take(page.limit as usize).collect::<Vec<_>>();
+            let next_cursor = sliced.last().map(|e| e.id);
+
+            Ok((
+                sliced,
+                PageInfo {
+                    has_more,
+                    next_cursor,
+                },
+            ))
+        }
+    }
+
+    /// Dummy cache that never hits to test non-cache path deterministically.
+    struct NoopCache;
+
+    #[async_trait]
+    impl SimpleCache for NoopCache {
+        async fn get(&self, _key: &str) -> Result<Option<String>, CacheError> {
+            Ok(None)
+        }
+        async fn set_ex(&self, _key: &str, _val: &str, _ttl: Duration) -> Result<(), CacheError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_paginated_entries() {
+        let tenant_id = Uuid::new_v4();
+
+        let entries = (0..10)
+            .map(|i| LedgerEntry {
+                id: Uuid::new_v4(),
+                tenant_id,
+                account_id: format!("acc_{i}"),
+                amount: Decimal::new(1000 + i as i64, 2),
+                currency: "USD".into(),
+                posted_at: Utc::now(),
+            })
+            .collect::<VecDeque<_>>();
+
+        let repo = Arc::new(InMemoryRepo { data: entries });
+        let cache = Arc::new(NoopCache);
+        let service = LedgerEntryQueryService::new(repo, cache, Duration::from_secs(60));
+
+        let vm = service
+            .get_paginated_entries(tenant_id, PageRequest::default())
+            .await
+            .unwrap();
+
+        assert_eq!(vm.data.len(), 50.min(10));
+        assert_eq!(vm.cache_hit, false);
+    }
+}
+```

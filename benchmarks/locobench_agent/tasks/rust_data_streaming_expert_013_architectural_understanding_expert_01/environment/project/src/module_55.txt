@@ -1,0 +1,358 @@
+```rust
+//! ChirpPulse – Quality-Control & Enrichment Stage
+//! ----------------------------------------------
+//! This module owns the *Quality-Control* micro–service responsible for
+//! validating, enriching, and re-publishing raw social-media events in real
+//! time.  It runs as a long-lived Kafka consumer group and publishes the
+//! outcome to a downstream topic while exporting rich Prometheus/OTel
+//! telemetry for observability.
+//
+//! ┌───────────────────────────┐
+//! │  social-raw.<partition>   │  (avro/json as bytes)
+//! └────────────▲──────────────┘
+//!              │ Kafka
+//!              ▼
+//! ┌───────────────────────────┐
+//! │ QualityControlStage       │  (this file)
+//! └────────────▲──────────────┘
+//!              │ Kafka
+//!              ▼
+//! ┌───────────────────────────┐
+//! │  social-enriched.<part>   │
+//! └───────────────────────────┘
+//
+//! Responsibilities
+//! ----------------
+//! 1. Schema validation / evolution guard
+//! 2. Language detection (fastText) & toxicity scoring (Perspective API)
+//! 3. Field-level redaction (PII)
+//! 4. QoS feedback via DLQ & metrics
+//!
+//! NOTE:  The *real* production build links to compiled C models for language
+//! detection.  For brevity, those calls are replaced with stubs in this single
+//! file example.
+//
+
+#![allow(clippy::module_name_repetitions)]
+#![allow(dead_code)]
+
+use async_trait::async_trait;
+use futures::{stream, StreamExt, TryFutureExt};
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    error::KafkaError,
+    message::{BorrowedMessage, OwnedHeaders},
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Message,
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use thiserror::Error;
+use tokio::{
+    select,
+    signal::ctrl_c,
+    sync::{mpsc, Semaphore},
+    task::JoinSet,
+};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Kafka topics in use by this microservice.
+#[derive(Debug, Clone)]
+pub struct TopicConfig {
+    pub in_topic: String,
+    pub out_topic: String,
+    pub dlq_topic: String,
+}
+
+/// Runtime tuning knobs read from environment or config file.
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub kafka_brokers: String,
+    pub group_id: String,
+    pub max_in_flight: usize,
+    pub poll_timeout_ms: u64,
+    pub flush_timeout: Duration,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            kafka_brokers: "localhost:9092".into(),
+            group_id: "chirppulse-quality-control".into(),
+            max_in_flight: 64,
+            poll_timeout_ms: 250,
+            flush_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+/// High-level domain model for incoming social event.
+#[derive(Debug, Deserialize)]
+pub struct SocialEvent {
+    pub id: String,
+    pub user_id: String,
+    pub body: String,
+    pub timestamp: i64,
+    #[serde(flatten)]
+    pub ext: HashMap<String, serde_json::Value>,
+}
+
+/// Augmented model after QC stage.
+#[derive(Debug, Serialize)]
+pub struct EnrichedEvent {
+    #[serde(flatten)]
+    pub base: SocialEvent,
+    pub language: String,
+    pub toxicity_score: f32,
+    pub qc_processed_at: i64,
+}
+
+/// Errors that can occur within the QC pipeline.
+#[derive(Debug, Error)]
+pub enum QcError {
+    #[error("JSON deserialization failed: {0}")]
+    Deser(#[from] serde_json::Error),
+    #[error("Kafka error: {0}")]
+    Kafka(#[from] KafkaError),
+    #[error("Language detection error: {0}")]
+    LangDetect(String),
+    #[error("Toxicity scoring error: {0}")]
+    Toxicity(String),
+    #[error("Validation failed: {0}")]
+    Validation(String),
+    #[error("Unknown error: {0}")]
+    Other(String),
+}
+
+/// Trait representing a streaming pipeline stage.
+#[async_trait]
+pub trait PipelineStage {
+    /// Consumes a raw Kafka message, returning a serializable record or an error.
+    async fn process(&self, msg: &BorrowedMessage<'_>) -> Result<EnrichedEvent, QcError>;
+}
+
+/// Concrete implementation of the QC stage.
+#[derive(Debug)]
+pub struct QualityControlStage {
+    semaphore: Arc<Semaphore>,
+}
+
+impl QualityControlStage {
+    pub fn new(max_concurrency: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrency)),
+        }
+    }
+
+    /// Checks minimal schema requirements to prevent noise downstream.
+    fn validate(&self, event: &SocialEvent) -> Result<(), QcError> {
+        if event.body.trim().is_empty() {
+            return Err(QcError::Validation("body empty".into()));
+        }
+        Ok(())
+    }
+
+    /// Language detection stub; replace with fastText inference.
+    fn detect_language(&self, text: &str) -> Result<String, QcError> {
+        // naive heuristic for demonstration purposes
+        if text.is_ascii() {
+            Ok("en".into())
+        } else {
+            Ok("unknown".into())
+        }
+    }
+
+    /// Toxicity scoring stub; replace with Perspective API.
+    fn score_toxicity(&self, _text: &str) -> Result<f32, QcError> {
+        Ok(0.05) // assume mostly non-toxic
+    }
+}
+
+#[async_trait]
+impl PipelineStage for QualityControlStage {
+    #[instrument(skip_all, fields(msg.key = ?msg.key()))]
+    async fn process(&self, msg: &BorrowedMessage<'_>) -> Result<EnrichedEvent, QcError> {
+        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
+
+        let payload = msg
+            .payload_view::<str>()
+            .ok_or_else(|| QcError::Deser(serde_json::Error::custom("missing payload")))??;
+
+        let event: SocialEvent = serde_json::from_str(payload)?;
+
+        self.validate(&event)?;
+
+        let language = self.detect_language(&event.body)?;
+        let toxicity = self.score_toxicity(&event.body)?;
+
+        let enriched = EnrichedEvent {
+            base: event,
+            language,
+            toxicity_score: toxicity,
+            qc_processed_at: chrono::Utc::now().timestamp_millis(),
+        };
+
+        Ok(enriched)
+    }
+}
+
+/// Spawns the QC microservice.  Returns a `JoinHandle` that resolves when
+/// either an unrecoverable error occurs or shutdown signal received.
+pub async fn spawn_qc_worker(
+    cfg: RuntimeConfig,
+    topics: TopicConfig,
+) -> Result<(), QcError> {
+    tracing_subscriber::fmt::init();
+
+    info!("booting ChirpPulse QC stage");
+    debug!(?cfg, ?topics, "configuration loaded");
+
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &cfg.kafka_brokers)
+        .set("group.id", &cfg.group_id)
+        .set("enable.partition.eof", "false")
+        .set("session.timeout.ms", "6000")
+        .set("enable.auto.commit", "false")
+        .create()?;
+
+    consumer.subscribe(&[&topics.in_topic])?;
+
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &cfg.kafka_brokers)
+        .set("message.timeout.ms", "5000")
+        .create()?;
+
+    let stage = Arc::new(QualityControlStage::new(cfg.max_in_flight));
+    let (dlq_tx, mut dlq_rx) = mpsc::channel::<(BorrowedMessage<'static>, QcError)>(1024);
+
+    // ,---- Spawn DLQ forwarder
+    // `--------------------------------------------------------------
+    let dlq_handle = {
+        let producer = producer.clone();
+        let dlq_topic = topics.dlq_topic.clone();
+        tokio::spawn(async move {
+            while let Some((msg, err)) = dlq_rx.recv().await {
+                warn!(error = %err, "routing message to DLQ");
+
+                let _ = producer
+                    .send(
+                        FutureRecord::to(&dlq_topic)
+                            .payload(msg.payload().unwrap_or_default())
+                            .key(msg.key().unwrap_or_default())
+                            .headers(
+                                OwnedHeaders::new()
+                                    .add("dlq_reason", &err.to_string())
+                                    .add("original_topic", msg.topic()),
+                            ),
+                        cfg.flush_timeout,
+                    )
+                    .await;
+            }
+        })
+    };
+
+    // ,---- Worker main stream
+    // `--------------------------------------------------------------
+    let mut messages = consumer.stream();
+    let mut tasks = JoinSet::new();
+    let shutdown = ctrl_c();
+
+    tokio::pin!(shutdown);
+
+    loop {
+        select! {
+            maybe_msg = messages.next() => {
+                match maybe_msg {
+                    Some(Ok(msg)) => {
+                        let stage = stage.clone();
+                        let producer = producer.clone();
+                        let out_topic = topics.out_topic.clone();
+                        let dlq = dlq_tx.clone();
+                        tasks.spawn(async move {
+                            match stage.process(&msg).await {
+                                Ok(enriched) => {
+                                    let payload = serde_json::to_vec(&enriched)
+                                        .expect("serialization cannot fail");
+                                    let result = producer
+                                        .send(
+                                            FutureRecord::to(&out_topic)
+                                                .payload(&payload)
+                                                .key(msg.key().unwrap_or_default()),
+                                            cfg.flush_timeout,
+                                        )
+                                        .await;
+
+                                    if let Err((err, _)) = result {
+                                        error!(?err, "producer send failed");
+                                    }
+                                }
+                                Err(err) => {
+                                    let owned = msg.detach();
+                                    if dlq.send((owned, err)).await.is_err() {
+                                        error!("DLQ channel closed; dropping message");
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Some(Err(e)) => {
+                        error!(error = %e, "Kafka consumer error");
+                        // simple backoff to avoid hot loop
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    None => break, // stream ended
+                }
+            }
+            _ = &mut shutdown => {
+                info!("shutdown signal received, draining");
+                break;
+            }
+        }
+    }
+
+    // Wait for in-flight tasks to complete
+    let start_wait = Instant::now();
+    tasks.shutdown_join_all().await;
+    info!(secs = ?start_wait.elapsed().as_secs_f32(), "all tasks drained");
+
+    // flush producer
+    producer.flush(cfg.flush_timeout);
+
+    dlq_handle.abort();
+    if let Err(err) = dlq_handle.await {
+        debug!(?err, "DLQ task terminated");
+    }
+
+    info!("QC worker exited gracefully");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_validation_passes() {
+        let stage = QualityControlStage::new(1);
+        let event = SocialEvent {
+            id: "123".into(),
+            user_id: "u".into(),
+            body: "hello world".into(),
+            timestamp: 0,
+            ext: HashMap::default(),
+        };
+        assert!(stage.validate(&event).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_language_detection_ascii() {
+        let stage = QualityControlStage::new(1);
+        let lang = stage.detect_language("hello world").unwrap();
+        assert_eq!(lang, "en");
+    }
+}
+```

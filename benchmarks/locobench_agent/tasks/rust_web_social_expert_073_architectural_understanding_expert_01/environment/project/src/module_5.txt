@@ -1,0 +1,364 @@
+```rust
+//! src/module_5.rs
+//!
+//! Event-driven domain integration for “Learning Pulses”.
+//!
+//! This module defines strongly-typed domain events, an event envelope,
+//! trait abstractions for publishers/consumers, and a RabbitMQ publisher
+//! implementation using the `lapin` crate.  It demonstrates how the core
+//! service layer can remain broker-agnostic while individual adapters
+//! implement the I/O details behind the trait objects.
+//!
+//! The code purposefully favours composition over inheritance and
+//! separates business-level concerns from transport-level concerns,
+//! adhering to the Dependency-Inversion Principle.
+//!
+//! # Dependencies
+//!
+//! Add the following to `Cargo.toml` (omitting unrelated project deps):
+//!
+//! ```toml
+//! [dependencies]
+//! anyhow      = "1.0"
+//! async-trait = "0.1"
+//! chrono      = { version = "0.4", features = ["serde"] }
+//! futures     = "0.3"
+//! lapin       = { version = "2.3", default-features = false, features = ["rustls", "serde_json"] }
+//! log         = "0.4"
+//! serde       = { version = "1.0", features = ["derive"] }
+//! tokio       = { version = "1", features = ["rt-multi-thread", "macros"] }
+//! uuid        = { version = "1", features = ["serde", "v4"] }
+//! ```
+//!
+//! # Usage
+//!
+//! ```rust,no_run
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     use module_5::*;
+//!
+//!     // Initialise broker connection.
+//!     let amqp_uri = std::env::var("AMQP_URI")
+//!         .unwrap_or_else(|_| "amqps://guest:guest@localhost:5672/edupulse".to_owned());
+//!     let publisher = RabbitPublisher::connect(&amqp_uri, "edupulse.events").await?;
+//!
+//!     // Build a domain event
+//!     let event = EventEnvelope::new(
+//!         Event::LearningPulseCreated(LearningPulseCreated {
+//!             pulse_id: uuid::Uuid::new_v4(),
+//!             author_id: uuid::Uuid::new_v4(),
+//!             title: "20-minute Refactoring Challenge".into(),
+//!         }),
+//!     );
+//!
+//!     // Publish asynchronously
+//!     publisher.publish(&event).await?;
+//!
+//!     Ok(())
+//! }
+//! ```
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::FutureExt;
+use lapin::{
+    options::{BasicPublishOptions, ConfirmSelectOptions},
+    publisher_confirm::Confirmation,
+    BasicProperties, Channel, Connection, ConnectionProperties,
+};
+use log::{debug, error, info};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// An opaque message identifier; unique across the distributed system.
+pub type MessageId = Uuid;
+
+/// All domain-level events emitted by the “Learning Pulse” bounded context.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type", content = "data")]
+pub enum Event {
+    /// A teacher created a new learning pulse.
+    LearningPulseCreated(LearningPulseCreated),
+
+    /// A student submitted an artefact (file, code snippet, etc.).
+    SubmissionReceived(SubmissionReceived),
+
+    /// The plagiarism analysis finished for a submission.
+    PlagiarismCheckCompleted(PlagiarismCheckCompleted),
+
+    /// Points/badge were awarded to a user.
+    RewardGranted(RewardGranted),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LearningPulseCreated {
+    pub pulse_id: Uuid,
+    pub author_id: Uuid,
+    pub title: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SubmissionReceived {
+    pub submission_id: Uuid,
+    pub pulse_id: Uuid,
+    pub student_id: Uuid,
+    pub file_name: String,
+    pub mime: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PlagiarismCheckCompleted {
+    pub submission_id: Uuid,
+    pub is_plagiarised: bool,
+    pub similarity_score: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RewardGranted {
+    pub reward_id: Uuid,
+    pub user_id: Uuid,
+    pub points: i32,
+}
+
+/// Envelope that wraps every event with metadata required for processing.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EventEnvelope {
+    /// Unique event identifier.
+    pub id: MessageId,
+
+    /// ISO-8601 timestamp when the event was emitted.
+    pub timestamp: DateTime<Utc>,
+
+    /// The domain event payload.
+    pub payload: Event,
+}
+
+impl EventEnvelope {
+    /// Build a new `EventEnvelope` with default metadata.
+    pub fn new(event: Event) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            payload: event,
+        }
+    }
+
+    /// Return a topic name suitable for the broker, derived from payload variant.
+    pub fn topic(&self) -> &'static str {
+        match &self.payload {
+            Event::LearningPulseCreated(_) => "edupulse.learning_pulse.created",
+            Event::SubmissionReceived(_) => "edupulse.submission.received",
+            Event::PlagiarismCheckCompleted(_) => "edupulse.plagiarism.completed",
+            Event::RewardGranted(_) => "edupulse.reward.granted",
+        }
+    }
+}
+
+/// Trait representing an asynchronous event publisher.
+///
+/// Implementations may target RabbitMQ, Kafka, Redis Streams, etc.
+/// The trait remains agnostic of the transport layer.
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    /// Asynchronously publish a single event.
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<()>;
+}
+
+/// RabbitMQ implementation of `EventPublisher`.
+///
+/// It relies on:
+///  - AMQP 0-9-1 protocol with publisher confirmations
+///  - JSON-serialised payloads
+pub struct RabbitPublisher {
+    channel: Channel,
+    exchange: String,
+}
+
+impl RabbitPublisher {
+    /// Establish the underlying AMQP connection and create a `RabbitPublisher`.
+    pub async fn connect(uri: &str, exchange: &str) -> Result<Arc<Self>> {
+        info!("Connecting to RabbitMQ at {uri}");
+        let conn_props = ConnectionProperties::default().with_default_executor(8);
+        let conn = Connection::connect(uri, conn_props)
+            .await
+            .with_context(|| "Failed to connect to RabbitMQ")?;
+
+        let channel = conn
+            .create_channel()
+            .await
+            .with_context(|| "Opening channel")?;
+
+        channel
+            .confirm_select(ConfirmSelectOptions { nowait: false })
+            .await
+            .with_context(|| "Enabling publisher confirms")?;
+
+        Ok(Arc::new(Self {
+            channel,
+            exchange: exchange.to_owned(),
+        }))
+    }
+}
+
+#[async_trait]
+impl EventPublisher for RabbitPublisher {
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<()> {
+        let routing_key = envelope.topic();
+        let payload = serde_json::to_vec(envelope).context("Serialising event to JSON")?;
+
+        debug!(
+            "Publishing event {} to `{}` ({} bytes)",
+            envelope.id, routing_key, payload.len()
+        );
+
+        let confirm: Confirmation = self
+            .channel
+            .basic_publish(
+                &self.exchange,
+                routing_key,
+                BasicPublishOptions::default(),
+                &payload,
+                BasicProperties::default()
+                    .with_content_type("application/json".into())
+                    .with_message_id(envelope.id.to_string().into()),
+            )
+            .await?
+            .await
+            .context("Awaiting broker confirmation")?;
+
+        if confirm.is_nack() {
+            error!("Broker negatively acknowledged message {}", envelope.id);
+            anyhow::bail!("Broker NACK");
+        }
+
+        Ok(())
+    }
+}
+
+/// Business-level façade exposing convenient helpers.
+///
+/// Consumers of the service layer can remain transport-agnostic and
+/// inject any `EventPublisher` implementation.
+pub struct PulseService<P: EventPublisher> {
+    publisher: Arc<P>,
+}
+
+impl<P: EventPublisher> PulseService<P> {
+    pub fn new(publisher: Arc<P>) -> Self {
+        Self { publisher }
+    }
+
+    /// Persist a new submission and emit `SubmissionReceived`.
+    ///
+    /// In a real application the insertion would happen against a database
+    /// repository inside the same transaction that produces the event,
+    /// guaranteeing atomicity via an outbox or similar pattern.
+    pub async fn receive_submission(
+        &self,
+        pulse_id: Uuid,
+        student_id: Uuid,
+        file_name: &str,
+        mime: &str,
+    ) -> Result<Uuid> {
+        let submission_id = Uuid::new_v4();
+
+        // Simulate DB insertion...
+        info!(
+            "Persisted submission {submission_id} for pulse {pulse_id} by student {student_id}"
+        );
+
+        let event = EventEnvelope::new(Event::SubmissionReceived(SubmissionReceived {
+            submission_id,
+            pulse_id,
+            student_id,
+            file_name: file_name.into(),
+            mime: mime.into(),
+        }));
+
+        self.publisher.publish(&event).await?;
+
+        Ok(submission_id)
+    }
+
+    /// Handle plagiarism result and trigger downstream events.
+    pub async fn complete_plagiarism_check(
+        &self,
+        submission_id: Uuid,
+        is_plagiarised: bool,
+        similarity_score: f32,
+    ) -> Result<()> {
+        let event = EventEnvelope::new(Event::PlagiarismCheckCompleted(
+            PlagiarismCheckCompleted {
+                submission_id,
+                is_plagiarised,
+                similarity_score,
+            },
+        ));
+
+        self.publisher.publish(&event).await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// In-memory publisher for fast unit tests.
+    struct StubPublisher {
+        /// Collected events (protected by a mutex for mutation in async tests)
+        events: Mutex<Vec<EventEnvelope>>,
+    }
+
+    impl StubPublisher {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                events: Mutex::new(vec![]),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl EventPublisher for StubPublisher {
+        async fn publish(&self, envelope: &EventEnvelope) -> Result<()> {
+            self.events.lock().unwrap().push(envelope.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submission_flow() -> Result<()> {
+        let publisher = StubPublisher::new();
+        let service = PulseService::new(publisher.clone());
+
+        let pulse_id = Uuid::new_v4();
+        let student_id = Uuid::new_v4();
+
+        let submission_id = service
+            .receive_submission(pulse_id, student_id, "main.rs", "text/rust")
+            .await?;
+
+        assert_eq!(
+            publisher.events.lock().unwrap().len(),
+            1,
+            "Exactly one event should be published"
+        );
+
+        // Validate event contents
+        let env = &publisher.events.lock().unwrap()[0];
+        if let Event::SubmissionReceived(s) = &env.payload {
+            assert_eq!(s.submission_id, submission_id);
+            assert_eq!(s.pulse_id, pulse_id);
+            assert_eq!(s.student_id, student_id);
+        } else {
+            panic!("Unexpected event variant");
+        }
+
+        Ok(())
+    }
+}
+```

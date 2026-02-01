@@ -1,0 +1,374 @@
+```rust
+// src/module_74.rs
+//
+// VisuTility Orchestrator (ml_computer_vision)
+// -------------------------------------------
+// Automated Retraining Orchestrator
+//
+// This module implements an Observer-based automated-retraining subsystem
+// which listens to runtime model-quality metrics, applies a pluggable
+// `RetrainingStrategy`, and (asynchronously) launches a full retraining
+// pipeline when the strategy decides it is necessary.  Although the real
+// training logic is handled elsewhere in the project, this orchestrator
+// stitches together model monitoring, strategy evaluation, model registry
+// interactions, and robust error handling.
+//
+// The code uses:
+//   • Strategy Pattern      — `RetrainingStrategy` trait + concrete impls
+//   • Observer Pattern       — `MetricsPublisher` ⇢ `MetricsSubscriber`
+//   • Factory Pattern        — `StrategyFactory` for dynamic strategy choice
+//   • Tokio                  — for non-blocking execution of heavy tasks
+//
+// The module is self-contained, depending only on widely-used crates.  All
+// external interfaces are abstracted by traits so that other layers of the
+// system can replace them with concrete implementations as needed.
+
+#![allow(clippy::missing_errors_doc)] // allow omitted error docs for brevity
+
+use chrono::{DateTime, Duration, Utc};
+use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::{sync::broadcast, task, time};
+
+/// Domain-level error type for the retraining orchestrator.
+#[derive(Debug, Error)]
+pub enum RetrainingError {
+    #[error("Model registry error: {0}")]
+    Registry(#[from] RegistryError),
+
+    #[error("Training job failed: {0}")]
+    TrainingJob(String),
+
+    #[error("Metrics channel error: {0}")]
+    MetricsChannel(#[from] broadcast::error::RecvError),
+
+    #[error("Unknown error: {0}")]
+    Unknown(String),
+}
+
+/// Extremely trimmed-down error type for the registry stub.
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct RegistryError(String);
+
+/// Simple performance metrics emitted by running models.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PerformanceMetric {
+    /// e.g. mean-average-precision for object detection
+    Map(f32),
+    /// e.g. IoU
+    IoU(f32),
+    /// e.g. classification accuracy
+    Accuracy(f32),
+    /// Generic float metric identified by tag
+    Custom { tag: String, value: f32 },
+}
+
+/// Envelope that includes metadata so the strategy can reason over time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricEvent {
+    pub model_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub metric: PerformanceMetric,
+}
+
+/// Observer interface — anything that wants to consume metrics implements this.
+pub trait MetricsSubscriber: Send + Sync + 'static {
+    fn on_metric(&self, event: MetricEvent) -> Result<(), RetrainingError>;
+}
+
+/// Subject/publisher side of the Observer pattern.
+#[derive(Debug)]
+pub struct MetricsPublisher {
+    sender: broadcast::Sender<MetricEvent>,
+}
+
+impl MetricsPublisher {
+    pub fn new(buffer: usize) -> Self {
+        let (sender, _) = broadcast::channel(buffer);
+        Self { sender }
+    }
+
+    /// Send a metric update to all listeners; best-effort only.
+    pub fn publish(&self, event: MetricEvent) {
+        // Ignore lagged-subscriber errors; they can re-sync later.
+        let _ = self.sender.send(event);
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<MetricEvent> {
+        self.sender.subscribe()
+    }
+}
+
+/// Strategy Pattern: decide when retraining is needed, and with what params.
+pub trait RetrainingStrategy: Send + Sync {
+    /// Observe a new metric. Return `true` if retraining should be triggered.
+    fn should_retrain(&self, model_id: &str, metric: &MetricEvent) -> bool;
+}
+
+/// Strategy that triggers retraining if mAP has degraded beyond a threshold
+/// compared with the model's best-ever score (kept in memory for demo).
+pub struct PerformanceDegradationStrategy {
+    /// Degradation ratio (e.g. 0.1 -> 10% worse than best)
+    tolerance: f32,
+    /// Per-model historical bests
+    best_scores: DashMap<String, f32>,
+}
+
+impl PerformanceDegradationStrategy {
+    pub fn new(tolerance: f32) -> Self {
+        Self {
+            tolerance,
+            best_scores: DashMap::new(),
+        }
+    }
+}
+
+impl RetrainingStrategy for PerformanceDegradationStrategy {
+    fn should_retrain(&self, model_id: &str, metric: &MetricEvent) -> bool {
+        use PerformanceMetric::*;
+        // Only supports Map and Accuracy for demonstration purposes.
+        let score = match &metric.metric {
+            Map(v) | Accuracy(v) => *v,
+            _ => return false,
+        };
+
+        let mut should_retrain = false;
+        self.best_scores
+            .entry(model_id.to_owned())
+            .and_modify(|best| {
+                if score > *best {
+                    *best = score; // new best
+                } else if (best - score) / *best >= self.tolerance {
+                    should_retrain = true;
+                }
+            })
+            .or_insert_with(|| score);
+
+        should_retrain
+    }
+}
+
+/// Strategy that triggers retraining on a fixed wall-clock interval.
+pub struct TimeBasedStrategy {
+    interval: Duration,
+    last_retrain: DashMap<String, DateTime<Utc>>,
+}
+
+impl TimeBasedStrategy {
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last_retrain: DashMap::new(),
+        }
+    }
+}
+
+impl RetrainingStrategy for TimeBasedStrategy {
+    fn should_retrain(&self, model_id: &str, _metric: &MetricEvent) -> bool {
+        let now = Utc::now();
+        let mut should_retrain = false;
+        self.last_retrain
+            .entry(model_id.to_owned())
+            .and_modify(|last| {
+                if now.signed_duration_since(*last) >= self.interval {
+                    should_retrain = true;
+                    *last = now;
+                }
+            })
+            .or_insert_with(|| {
+                // first time we see this model, set timestamp but don't retrain
+                now
+            });
+        should_retrain
+    }
+}
+
+/// Simple factory that chooses a strategy at runtime, e.g. based on config.
+pub enum StrategyKind {
+    Performance { tolerance: f32 },
+    TimeBased { minutes: i64 },
+}
+
+pub struct StrategyFactory;
+
+impl StrategyFactory {
+    pub fn build(kind: StrategyKind) -> Arc<dyn RetrainingStrategy> {
+        match kind {
+            StrategyKind::Performance { tolerance } => {
+                Arc::new(PerformanceDegradationStrategy::new(tolerance))
+            }
+            StrategyKind::TimeBased { minutes } => {
+                Arc::new(TimeBasedStrategy::new(Duration::minutes(minutes)))
+            }
+        }
+    }
+}
+
+/// A minimal interface for the internal model registry.
+pub trait ModelRegistry: Send + Sync {
+    fn current_version(&self, model_id: &str) -> Result<String, RegistryError>;
+    fn register_new_version(
+        &self,
+        model_id: &str,
+        artifact_uri: &str,
+    ) -> Result<String, RegistryError>;
+}
+
+/// A stub in-memory registry (useful for unit tests).
+pub struct InMemoryRegistry {
+    versions: DashMap<String, String>,
+}
+
+impl Default for InMemoryRegistry {
+    fn default() -> Self {
+        Self {
+            versions: DashMap::new(),
+        }
+    }
+}
+
+impl ModelRegistry for InMemoryRegistry {
+    fn current_version(&self, model_id: &str) -> Result<String, RegistryError> {
+        self.versions
+            .get(model_id)
+            .map(|v| v.value().clone())
+            .ok_or_else(|| RegistryError(format!("Model {model_id} not found")))
+    }
+
+    fn register_new_version(
+        &self,
+        model_id: &str,
+        artifact_uri: &str,
+    ) -> Result<String, RegistryError> {
+        self.versions
+            .insert(model_id.to_owned(), artifact_uri.to_owned());
+        Ok(artifact_uri.to_owned())
+    }
+}
+
+/// High-level orchestrator that listens to metrics and calls training routines.
+pub struct RetrainingOrchestrator<R: ModelRegistry> {
+    pub registry: Arc<R>,
+    strategy: Arc<dyn RetrainingStrategy>,
+}
+
+impl<R: ModelRegistry> RetrainingOrchestrator<R> {
+    pub fn new(registry: Arc<R>, strategy: Arc<dyn RetrainingStrategy>) -> Self {
+        Self { registry, strategy }
+    }
+
+    /// Spawns an async task that listens for metrics and applies the strategy.
+    ///
+    /// # Errors
+    /// Propagates lower-level errors from the metrics channel or training jobs.
+    pub fn start(
+        self: Arc<Self>,
+        mut metrics_rx: broadcast::Receiver<MetricEvent>,
+    ) -> task::JoinHandle<Result<(), RetrainingError>> {
+        task::spawn(async move {
+            while let Ok(event) = metrics_rx.recv().await {
+                if self.strategy.should_retrain(&event.model_id, &event) {
+                    println!(
+                        "[Orchestrator] Retraining triggered for model {}",
+                        event.model_id
+                    );
+                    let orchestrator = Arc::clone(&self);
+                    // Fire-and-forget; if you need back-pressure wrap in semaphore.
+                    task::spawn(async move {
+                        if let Err(e) = orchestrator.run_retraining(event).await {
+                            eprintln!("[Orchestrator] Retraining error: {e}");
+                        }
+                    });
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Executes the retraining pipeline for a single model.
+    async fn run_retraining(&self, trigger_event: MetricEvent) -> Result<(), RetrainingError> {
+        let model_id = &trigger_event.model_id;
+        let current_version = self.registry.current_version(model_id)?;
+        println!(
+            "[Orchestrator] Current version for model {model_id}: {current_version}"
+        );
+
+        // Simulate a heavy training job via Tokio sleep.
+        println!("[Orchestrator] Starting training job...");
+        time::sleep(time::Duration::from_secs(3)).await;
+
+        // In production this would call the real training service / pipeline.
+        let new_version_uri = format!(
+            "s3://model-artifacts/{model_id}/versions/{}",
+            Utc::now().timestamp()
+        );
+
+        // Simulate success probability
+        let success = rand::random::<f32>() > 0.1;
+        if !success {
+            return Err(RetrainingError::TrainingJob(
+                "training loss diverged".into(),
+            ));
+        }
+
+        self.registry
+            .register_new_version(model_id, &new_version_uri)?;
+
+        println!(
+            "[Orchestrator] Registered new model version: {new_version_uri}"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::timeout;
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn perf_degradation_strategy_triggers_retrain() {
+        let registry = Arc::new(InMemoryRegistry::default());
+        registry
+            .register_new_version("cam-model-1", "v0")
+            .unwrap();
+        let strategy =
+            StrategyFactory::build(StrategyKind::Performance { tolerance: 0.05 });
+        let orchestrator = Arc::new(RetrainingOrchestrator::new(
+            Arc::clone(&registry),
+            strategy,
+        ));
+
+        let publisher = MetricsPublisher::new(16);
+        let handle = orchestrator.start(publisher.subscribe());
+
+        // Publish baseline good metric
+        publisher.publish(MetricEvent {
+            model_id: "cam-model-1".into(),
+            timestamp: Utc::now(),
+            metric: PerformanceMetric::Map(0.9),
+        });
+        // Slight degradation — should NOT trigger (0.9→0.86 <5%)
+        publisher.publish(MetricEvent {
+            model_id: "cam-model-1".into(),
+            timestamp: Utc::now(),
+            metric: PerformanceMetric::Map(0.86),
+        });
+        // Big degradation — SHOULD trigger (0.9→0.7 ~22%)
+        publisher.publish(MetricEvent {
+            model_id: "cam-model-1".into(),
+            timestamp: Utc::now(),
+            metric: PerformanceMetric::Map(0.7),
+        });
+
+        // Allow orchestrator to consume messages
+        let _ = timeout(time::Duration::from_secs(10), handle).await.unwrap().unwrap();
+        // Ensure registry updated
+        let new_version = registry.current_version("cam-model-1").unwrap();
+        assert_ne!(new_version, "v0");
+    }
+}
+```

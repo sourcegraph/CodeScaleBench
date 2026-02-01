@@ -1,0 +1,401 @@
+```rust
+//! src/module_78.rs
+//!
+//! LedgerEntry query‐side service implementation (read model).
+//!
+//! This module demonstrates the “Query” half of CQS, including validation,
+//! pagination helpers, response caching, tenant scoping and structured logging.
+//!
+//! NOTE: database & cache back-ends are expressed via traits so that higher
+//! levels of the application can supply concrete adapters (e.g. Diesel / SQLx
+//! + redis-rs).  This keeps the module fully unit-testable and in line with the
+//! Repository pattern embraced throughout LedgerLink Nexus.
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use log::{debug, error, info, trace};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use thiserror::Error;
+use uuid::Uuid;
+
+/// Constants
+const MAX_PAGE_SIZE: i64 = 500;
+const DEFAULT_PAGE_SIZE: i64 = 50;
+const LEDGER_CACHE_TTL_SECS: usize = 45; // Short-lived cache; numbers frequently change.
+
+/// Public error envelope.
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation failed: {0}")]
+    Validation(String),
+
+    #[error("authentication failed")]
+    Unauthenticated,
+
+    #[error("authorization failed")]
+    Unauthorized,
+
+    #[error("persistence error: {0}")]
+    Storage(#[from] Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("internal error")]
+    Internal,
+}
+
+/// Lightweight Auth-context supplied by the upstream gateway.
+#[derive(Debug, Clone)]
+pub struct AuthContext {
+    pub tenant_id: Uuid,
+    pub user_id:  Uuid,
+    pub roles:    Vec<String>,
+}
+
+/// Pagination helpers.
+#[derive(Debug, Clone, Serialize)]
+pub struct PageMeta {
+    pub page:       i64,
+    pub per_page:   i64,
+    pub total_rows: i64,
+    pub total_pages: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Page<T> {
+    pub data: Vec<T>,
+    pub meta: PageMeta,
+}
+
+/// Domain model (denormalised, read-optimised)
+#[derive(Debug, Clone)]
+pub struct LedgerEntry {
+    pub id:          Uuid,
+    pub account_id:  Uuid,
+    pub tenant_id:   Uuid,
+    pub posted_at:   DateTime<Utc>,
+    pub amount:      rust_decimal::Decimal,
+    pub currency:    String,
+    pub description: String,
+}
+
+/// DTO/View returned to API consumers.
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerEntryView {
+    pub id:          Uuid,
+    pub account_id:  Uuid,
+    pub posted_at:   DateTime<Utc>,
+    pub amount:      rust_decimal::Decimal,
+    pub currency:    String,
+    pub description: String,
+}
+
+impl From<LedgerEntry> for LedgerEntryView {
+    fn from(e: LedgerEntry) -> Self {
+        Self {
+            id: e.id,
+            account_id: e.account_id,
+            posted_at: e.posted_at,
+            amount: e.amount,
+            currency: e.currency,
+            description: e.description,
+        }
+    }
+}
+
+/// Query parameters accepted via REST / GraphQL endpoint.
+#[derive(Debug, Deserialize)]
+pub struct LedgerEntryQueryParams {
+    #[serde(default)]
+    pub account_id: Option<Uuid>,
+
+    #[serde(default = "default_page")]
+    pub page: i64,
+
+    #[serde(default = "default_per_page")]
+    pub per_page: i64,
+}
+
+fn default_page() -> i64 { 1 }
+fn default_per_page() -> i64 { DEFAULT_PAGE_SIZE }
+
+impl LedgerEntryQueryParams {
+    /// Guard clauses for basic validation.
+    pub fn validate(&self) -> Result<(), ServiceError> {
+        if self.page < 1 {
+            return Err(ServiceError::Validation(
+                "`page` must be greater than zero".to_string(),
+            ));
+        }
+        if self.per_page < 1 || self.per_page > MAX_PAGE_SIZE {
+            return Err(ServiceError::Validation(format!(
+                "`per_page` must be within 1..={MAX_PAGE_SIZE}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn offset_limit(&self) -> (i64, i64) {
+        let limit  = self.per_page;
+        let offset = (self.page - 1) * self.per_page;
+        (offset, limit)
+    }
+}
+
+/// Repository contract (read-only).
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    async fn count_by_tenant(
+        &self,
+        tenant_id: Uuid,
+        account_id_filter: Option<Uuid>,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>>;
+
+    async fn find_by_tenant_paginated(
+        &self,
+        tenant_id: Uuid,
+        account_id_filter: Option<Uuid>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<LedgerEntry>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Simple cache abstraction.
+#[async_trait]
+pub trait CacheProvider: Send + Sync {
+    async fn get<T>(&self, key: &str) -> Result<Option<T>, ServiceError>
+    where
+        T: for<'de> Deserialize<'de> + Send;
+
+    async fn set<T>(&self, key: &str, value: &T, ttl_secs: usize) -> Result<(), ServiceError>
+    where
+        T: Serialize + Send;
+}
+
+/// Concrete query service.
+#[derive(Clone)]
+pub struct LedgerEntryQueryService<R: LedgerEntryRepository, C: CacheProvider> {
+    repo:  Arc<R>,
+    cache: Arc<C>,
+}
+
+impl<R: LedgerEntryRepository, C: CacheProvider> LedgerEntryQueryService<R, C> {
+    pub fn new(repo: Arc<R>, cache: Arc<C>) -> Self {
+        Self { repo, cache }
+    }
+
+    /// List ledger entries for the current tenant/user.
+    pub async fn list_ledger_entries(
+        &self,
+        params: LedgerEntryQueryParams,
+        auth:   Option<AuthContext>,
+    ) -> Result<Page<LedgerEntryView>, ServiceError> {
+        // ---- Security -----------------------------------------------------
+        let auth = auth.ok_or(ServiceError::Unauthenticated)?;
+        if !auth.roles.iter().any(|r| r == "viewer" || r == "admin") {
+            return Err(ServiceError::Unauthorized);
+        }
+
+        // ---- Validation ---------------------------------------------------
+        params.validate()?;
+
+        // ---- Cache key ----------------------------------------------------
+        let cache_key = format!(
+            "tenant:{}:ledger:list:{}:{}:{}",
+            auth.tenant_id, params.page, params.per_page,
+            params.account_id.map(|id| id.to_string()).unwrap_or_else(|| "all".into())
+        );
+
+        // ---- Fast-path: cached -------------------------------------------
+        if let Some(cached) = self.cache.get::<Page<LedgerEntryView>>(&cache_key).await? {
+            trace!("ledger_entries cache hit, tenant={}", auth.tenant_id);
+            return Ok(cached);
+        }
+        trace!("ledger_entries cache miss, tenant={}", auth.tenant_id);
+
+        // ---- Repository operations ---------------------------------------
+        let (offset, limit) = params.offset_limit();
+        let total_rows = self
+            .repo
+            .count_by_tenant(auth.tenant_id, params.account_id)
+            .await
+            .map_err(|e| ServiceError::Storage(e))?;
+
+        let entities = self
+            .repo
+            .find_by_tenant_paginated(auth.tenant_id, params.account_id, offset, limit)
+            .await
+            .map_err(|e| ServiceError::Storage(e))?;
+
+        // ---- Mapping ------------------------------------------------------
+        let views: Vec<LedgerEntryView> =
+            entities.into_iter().map(LedgerEntryView::from).collect();
+
+        // ---- Pagination meta ---------------------------------------------
+        let total_pages = (total_rows as f64 / params.per_page as f64).ceil() as i64;
+        let page = Page {
+            meta: PageMeta {
+                page: params.page,
+                per_page: params.per_page,
+                total_rows,
+                total_pages,
+            },
+            data: views,
+        };
+
+        // ---- Cache store --------------------------------------------------
+        // We swallow cache errors as non-fatal to avoid cascading failures.
+        if let Err(e) = self.cache.set(&cache_key, &page, LEDGER_CACHE_TTL_SECS).await {
+            error!("failed to set cache for ledger_entries: {:?}", e);
+        }
+
+        info!(
+            target: "ledger_entry_query",
+            "returned {} rows (tenant={}, page={})",
+            page.data.len(),
+            auth.tenant_id,
+            params.page
+        );
+
+        Ok(page)
+    }
+}
+
+/* -------------------------------------------------------------------------
+   ===== TESTS =============================================================
+   The repository & cache traits are mocked below to illustrate synchronous
+   unit testing without external systems.  In real production code we would
+   provide an in-memory test harness or compile-time feature toggles.
+   ---------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    struct MockRepo {
+        data: Vec<LedgerEntry>,
+    }
+
+    #[async_trait]
+    impl LedgerEntryRepository for MockRepo {
+        async fn count_by_tenant(
+            &self,
+            tenant_id: Uuid,
+            account_id_filter: Option<Uuid>,
+        ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self
+                .data
+                .iter()
+                .filter(|e| {
+                    e.tenant_id == tenant_id
+                        && account_id_filter.map_or(true, |id| e.account_id == id)
+                })
+                .count() as i64)
+        }
+
+        async fn find_by_tenant_paginated(
+            &self,
+            tenant_id: Uuid,
+            account_id_filter: Option<Uuid>,
+            offset: i64,
+            limit: i64,
+        ) -> Result<Vec<LedgerEntry>, Box<dyn std::error::Error + Send + Sync>> {
+            let mut filtered: Vec<_> = self
+                .data
+                .iter()
+                .cloned()
+                .filter(|e| {
+                    e.tenant_id == tenant_id
+                        && account_id_filter.map_or(true, |id| e.account_id == id)
+                })
+                .collect();
+            filtered.sort_by_key(|e| e.posted_at);
+            Ok(filtered
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect())
+        }
+    }
+
+    struct InMemoryCache {
+        inner: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl InMemoryCache {
+        pub fn new() -> Self {
+            Self {
+                inner: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CacheProvider for InMemoryCache {
+        async fn get<T>(&self, key: &str) -> Result<Option<T>, ServiceError>
+        where
+            T: for<'de> Deserialize<'de> + Send,
+        {
+            let guard = self.inner.lock().await;
+            Ok(guard
+                .get(key)
+                .and_then(|v| bincode::deserialize::<T>(v).ok()))
+        }
+
+        async fn set<T>(&self, key: &str, value: &T, _ttl_secs: usize) -> Result<(), ServiceError>
+        where
+            T: Serialize + Send,
+        {
+            let mut guard = self.inner.lock().await;
+            guard.insert(key.to_string(), bincode::serialize(value).map_err(|_| ServiceError::Internal)?);
+            Ok(())
+        }
+    }
+
+    fn sample_entry(tenant: Uuid, account: Uuid, amount: i32) -> LedgerEntry {
+        LedgerEntry {
+            id: Uuid::new_v4(),
+            tenant_id: tenant,
+            account_id: account,
+            posted_at: Utc::now(),
+            amount: rust_decimal::Decimal::new(amount as i64, 2),
+            currency: "USD".into(),
+            description: "sample".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pagination_and_cache_work() {
+        let tenant = Uuid::new_v4();
+        let account = Uuid::new_v4();
+        let data: Vec<_> = (0..120).map(|i| sample_entry(tenant, account, i)).collect();
+
+        let service = LedgerEntryQueryService::new(
+            Arc::new(MockRepo { data }),
+            Arc::new(InMemoryCache::new()),
+        );
+
+        let auth = Some(AuthContext {
+            tenant_id: tenant,
+            user_id: Uuid::new_v4(),
+            roles: vec!["viewer".into()],
+        });
+
+        let params = LedgerEntryQueryParams {
+            account_id: None,
+            page: 2,
+            per_page: 40,
+        };
+
+        // First call → miss cache.
+        let page1 = service.list_ledger_entries(params.clone(), auth.clone()).await.unwrap();
+        assert_eq!(page1.meta.page, 2);
+        assert_eq!(page1.data.len(), 40);
+
+        // Second call → should hit cache.
+        let page2 = service.list_ledger_entries(params, auth).await.unwrap();
+        assert_eq!(page2.data.len(), 40);
+    }
+}
+```

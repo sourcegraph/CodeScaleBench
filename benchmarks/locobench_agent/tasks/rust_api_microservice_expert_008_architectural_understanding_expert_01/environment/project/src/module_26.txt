@@ -1,0 +1,430 @@
+```rust
+//! src/module_26.rs
+//! -------------------------------------------------------------
+//! LedgerLink Nexus – Ledger Entry Query Endpoint (Module 26)
+//!
+//! This source file wires‐up an ultra-reliable, paginated,
+//! response-cached, authenticated query endpoint for ledger
+//! entries.  It demonstrates the project’s MVVM-inspired layering:
+//!
+//! View  (Web / JSON payload)  ⟶  View-Model (DTO + validation)
+//!            ⟶  Command / Query Service  ⟶  Repository
+//!
+//! The module purposefully focuses on the *query* (read) side of the
+//! pipeline and highlights logging, request validation, caching and
+//! graceful error handling.
+//!
+//! Dependencies (Cargo.toml excerpt):
+//! ----------------------------------
+//! [dependencies]
+//! actix-web       = "4"
+//! actix-web-httpauth = "0.7"
+//! serde           = { version = "1", features = ["derive"] }
+//! serde_json      = "1"
+//! validator       = "0.16"
+//! uuid            = { version = "1", features = ["v4", "serde", "macro-diagnostics"] }
+//! chrono          = { version = "0.4", features = ["serde"] }
+//! redis           = { version = "0.23", features = ["tokio-comp"] }
+//! async-trait     = "0.1"
+//! tracing         = "0.1"
+//! thiserror       = "1"
+//! futures         = "0.3"
+//! parking_lot     = "0.12"
+//!
+//! -------------------------------------------------------------
+//! NOTE: For brevity the underlying repository implementation
+//!       and JWT authentication middleware are mocked, yet the
+//!       public interface remains production-grade.
+
+#![allow(clippy::unused_async, clippy::missing_errors_doc)]
+
+use std::sync::Arc;
+
+use actix_web::{
+    get,
+    http::StatusCode,
+    web::{self, Data, Json, Query},
+    HttpRequest, HttpResponse, ResponseError,
+};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info, instrument};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+/// --------------------------------------------------------------------------------------------
+/// View-Model (DTO) – Validated query parameters sent by the client
+/// --------------------------------------------------------------------------------------------
+#[derive(Debug, Deserialize, Validate)]
+pub struct LedgerEntryQueryDto {
+    #[validate(range(min = 1, max = 1000))]
+    #[serde(default = "default_page")]
+    pub page: usize,
+
+    #[validate(range(min = 1, max = 100))]
+    #[serde(default = "default_per_page")]
+    pub per_page: usize,
+
+    /// Optional filter: return entries for a single account
+    pub account_id: Option<Uuid>,
+
+    /// Optional filter: return entries starting from this date (inclusive)
+    pub from_date: Option<DateTime<Utc>>,
+
+    /// Optional filter: return entries up to this date (inclusive)
+    pub to_date: Option<DateTime<Utc>>,
+
+    /// Optional sorting hint – "asc"|"desc"  (default: "desc")
+    #[serde(default = "default_sort")]
+    #[validate(custom = "validate_sort")]
+    pub sort: String,
+}
+
+fn default_page() -> usize {
+    1
+}
+fn default_per_page() -> usize {
+    50
+}
+fn default_sort() -> String {
+    "desc".to_owned()
+}
+
+/// Custom validator for the sort parameter
+fn validate_sort(sort: &str) -> Result<(), ValidationError> {
+    match sort {
+        "asc" | "desc" => Ok(()),
+        _ => Err(ValidationError::new("invalid_sort")),
+    }
+}
+
+/// --------------------------------------------------------------------------------------------
+/// Domain Model (read-side projection, a subset of the full LedgerEntry aggregate)
+/// --------------------------------------------------------------------------------------------
+#[derive(Debug, Serialize, Clone)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub booked_at: DateTime<Utc>,
+    pub narrative: String,
+}
+
+/// --------------------------------------------------------------------------------------------
+/// Pagination envelope returned to clients
+/// --------------------------------------------------------------------------------------------
+#[derive(Debug, Serialize)]
+pub struct Paginated<T> {
+    pub data: Vec<T>,
+    pub page: usize,
+    pub per_page: usize,
+    pub total: usize,
+}
+
+/// --------------------------------------------------------------------------------------------
+/// Cache key utilities
+/// --------------------------------------------------------------------------------------------
+fn make_cache_key(user_tenant: &str, dto: &LedgerEntryQueryDto) -> String {
+    // A simple but effective composite cache key
+    format!(
+        "ledger_entries:v1:{}:{}:{}:{}:{}:{}:{}",
+        user_tenant,
+        dto.page,
+        dto.per_page,
+        dto.account_id
+            .map(Uuid::to_string)
+            .unwrap_or_else(|| "all".into()),
+        dto.from_date
+            .map(|d| d.timestamp_millis().to_string())
+            .unwrap_or_else(|| "min".into()),
+        dto.to_date
+            .map(|d| d.timestamp_millis().to_string())
+            .unwrap_or_else(|| "max".into()),
+        dto.sort
+    )
+}
+
+/// --------------------------------------------------------------------------------------------
+/// Error handling
+/// --------------------------------------------------------------------------------------------
+#[derive(thiserror::Error, Debug)]
+pub enum ApiError {
+    #[error("validation failed: {0}")]
+    Validation(String),
+
+    #[error("unauthorized")]
+    Unauthorized,
+
+    #[error("internal server error")]
+    Internal(#[from] anyhow::Error),
+}
+
+impl ResponseError for ApiError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            ApiError::Validation(_) => StatusCode::BAD_REQUEST,
+            ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    fn error_response(&self) -> HttpResponse {
+        // Structured error envelope
+        #[derive(Serialize)]
+        struct ErrorBody<'a> {
+            error: &'a str,
+            message: String,
+        }
+
+        let body = match self {
+            ApiError::Validation(msg) => ErrorBody {
+                error: "validation_error",
+                message: msg.clone(),
+            },
+            ApiError::Unauthorized => ErrorBody {
+                error: "unauthorized",
+                message: "Authentication required".to_owned(),
+            },
+            ApiError::Internal(e) => {
+                // Hide internal details from the caller
+                error!(error = ?e, "internal server error");
+                ErrorBody {
+                    error: "internal_error",
+                    message: "An unexpected error occurred".to_owned(),
+                }
+            }
+        };
+
+        HttpResponse::build(self.status_code()).json(body)
+    }
+}
+
+/// --------------------------------------------------------------------------------------------
+/// Service Layer – Query service abstraction + concrete implementation
+/// --------------------------------------------------------------------------------------------
+#[derive(Debug, Clone)]
+pub struct Pagination {
+    pub page: usize,
+    pub per_page: usize,
+    pub sort_desc: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct LedgerEntryFilter {
+    pub account_id: Option<Uuid>,
+    pub from_date: Option<DateTime<Utc>>,
+    pub to_date: Option<DateTime<Utc>>,
+}
+
+#[async_trait]
+pub trait LedgerEntryQueryService: Send + Sync {
+    async fn query_entries(
+        &self,
+        filter: LedgerEntryFilter,
+        pagination: Pagination,
+    ) -> Result<Paginated<LedgerEntry>, anyhow::Error>;
+}
+
+/// Mocked repository + service implementation.
+/// In real life, this would call a Postgres/TimescaleDB read-optimized view
+/// or an ElasticSearch index.
+pub struct LedgerEntryQueryServiceImpl;
+
+#[async_trait]
+impl LedgerEntryQueryService for LedgerEntryQueryServiceImpl {
+    #[instrument(skip_all, fields(page = pagination.page, per_page = pagination.per_page))]
+    async fn query_entries(
+        &self,
+        filter: LedgerEntryFilter,
+        pagination: Pagination,
+    ) -> Result<Paginated<LedgerEntry>, anyhow::Error> {
+        // Mocked data-fetch: generate fake entries
+        let total = 250; // pretend we ran COUNT(*)
+        let data: Vec<LedgerEntry> = (0..pagination.per_page)
+            .map(|i| LedgerEntry {
+                id: Uuid::new_v4(),
+                account_id: filter
+                    .account_id
+                    .unwrap_or_else(|| Uuid::parse_str("00000000-0000-0000-0000-000000000001")?),
+                amount_minor: 50_00 + i as i64,
+                currency: "USD".into(),
+                booked_at: Utc::now(),
+                narrative: "Mocked ledger entry".into(),
+            })
+            .collect();
+
+        Ok(Paginated {
+            data,
+            page: pagination.page,
+            per_page: pagination.per_page,
+            total,
+        })
+    }
+}
+
+/// --------------------------------------------------------------------------------------------
+/// State container injected into Actix extractors
+/// --------------------------------------------------------------------------------------------
+#[derive(Clone)]
+pub struct AppState {
+    pub query_service: Arc<dyn LedgerEntryQueryService>,
+    pub redis: redis::Client,
+}
+
+/// --------------------------------------------------------------------------------------------
+/// Authentication extractor (mocked) – resolves current tenant ID
+/// --------------------------------------------------------------------------------------------
+#[derive(Debug)]
+pub struct AuthContext {
+    pub tenant_id: String,
+    pub user_id: String,
+}
+
+impl std::ops::Deref for AuthContext {
+    type Target = String;
+    fn deref(&self) -> &Self::Target {
+        &self.tenant_id
+    }
+}
+
+/// Dummy extractor;  replace by JWT middleware in production
+impl actix_web::FromRequest for AuthContext {
+    type Error = ApiError;
+    type Future = futures::future::Ready<Result<Self, Self::Error>>;
+    type Config = ();
+
+    fn from_request(req: &HttpRequest, _payload: &mut actix_web::dev::Payload) -> Self::Future {
+        use futures::future::ready;
+        if let Some(token) = req.headers().get("x-test-auth") {
+            // parsing omitted
+            let tenant_id = token.to_str().unwrap_or_default().to_owned();
+            ready(Ok(AuthContext {
+                tenant_id,
+                user_id: "demo_user".into(),
+            }))
+        } else {
+            ready(Err(ApiError::Unauthorized))
+        }
+    }
+}
+
+/// --------------------------------------------------------------------------------------------
+/// Endpoint handler
+/// --------------------------------------------------------------------------------------------
+#[get("/api/v1/ledger/entries")]
+#[instrument(skip(dto, state, auth), fields(tenant = %auth.tenant_id))]
+pub async fn get_ledger_entries(
+    auth: AuthContext,
+    Query(dto): Query<LedgerEntryQueryDto>,
+    state: Data<AppState>,
+) -> Result<Json<Paginated<LedgerEntry>>, ApiError> {
+    // Validate incoming DTO
+    dto.validate()
+        .map_err(|e| ApiError::Validation(e.to_string()))?;
+
+    let cache_key = make_cache_key(&auth.tenant_id, &dto);
+    debug!(%cache_key, "generated cache key");
+
+    // Attempt cache hit
+    let mut redis_conn = state
+        .redis
+        .get_async_connection()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+    if let Ok(cached) = redis_conn.get::<_, Vec<u8>>(cache_key.clone()).await {
+        if !cached.is_empty() {
+            debug!("cache hit");
+            let value: Paginated<LedgerEntry> =
+                serde_json::from_slice(&cached).map_err(|e| ApiError::Internal(e.into()))?;
+            return Ok(Json(value));
+        }
+    }
+
+    debug!("cache miss – fetching from service layer");
+
+    // Build domain filter/pagination structs
+    let filter = LedgerEntryFilter {
+        account_id: dto.account_id,
+        from_date: dto.from_date,
+        to_date: dto.to_date,
+    };
+    let pagination = Pagination {
+        page: dto.page,
+        per_page: dto.per_page,
+        sort_desc: dto.sort == "desc",
+    };
+
+    // Execute query
+    let result = state
+        .query_service
+        .query_entries(filter, pagination)
+        .await
+        .map_err(ApiError::Internal)?;
+
+    // Store in cache – set TTL 60s
+    let ttl_seconds = 60;
+    if let Ok(serialized) = serde_json::to_vec(&result) {
+        let _: () = redis_conn
+            .set_ex(cache_key, serialized, ttl_seconds)
+            .await
+            .unwrap_or_default();
+        debug!(ttl = ttl_seconds, "cached result");
+    }
+
+    info!(
+        page = result.page,
+        per_page = result.per_page,
+        total = result.total,
+        "ledger entries served"
+    );
+
+    Ok(Json(result))
+}
+
+/// --------------------------------------------------------------------------------------------
+/// Configure actix-web app
+/// --------------------------------------------------------------------------------------------
+pub fn configure(cfg: &mut web::ServiceConfig) {
+    cfg.service(get_ledger_entries);
+}
+
+/// --------------------------------------------------------------------------------------------
+/// Unit tests (lightweight – verifies validation + cache path)
+/// --------------------------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{body::to_bytes, test};
+
+    #[actix_web::test]
+    async fn test_validation_rejects_invalid_sort() {
+        let req = test::TestRequest::with_uri("/api/v1/ledger/entries?sort=foobar").to_http_request();
+        let dto: Result<Query<LedgerEntryQueryDto>, _> = Query::extract(&req).await;
+        assert!(dto.is_ok());
+        let dto = dto.unwrap();
+        assert!(dto.validate().is_err());
+    }
+
+    #[actix_web::test]
+    async fn test_cache_key_determinism() {
+        let dto = LedgerEntryQueryDto {
+            page: 1,
+            per_page: 50,
+            account_id: Some(Uuid::nil()),
+            from_date: None,
+            to_date: None,
+            sort: "desc".into(),
+        };
+        let k1 = make_cache_key("tenant_a", &dto);
+        let k2 = make_cache_key("tenant_a", &dto);
+        assert_eq!(k1, k2);
+    }
+
+    // Additional unit/integration tests would spin up a Redis docker image
+    // and an in-memory service stub.
+}
+```

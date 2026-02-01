@@ -1,0 +1,355 @@
+```rust
+//! src/module_26.rs
+//!
+//! Event-bus façade that glues together in-process handlers and the
+//! distributed message broker (NATS) used across micro-services inside
+//! the EduPulse Live platform.
+//!
+//! The module is intentionally self-contained so it can be compiled
+//! stand-alone in unit tests while still being reusable by the wider
+//! code base (API, background workers, etc.).
+
+use std::{
+    any::TypeId,
+    collections::HashMap,
+    sync::Arc,
+};
+
+use async_nats::{Client as NatsClient, ConnectOptions};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::Value;
+use thiserror::Error;
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
+/// A well-known subject prefix for all domain events sent through NATS.
+const SUBJECT_PREFIX: &str = "edu_pulse.events";
+
+/// Wrapper around a JSON encoded domain event together with routing
+/// information and correlation data used for observability.
+///
+/// The payload is stored in raw JSON so the envelope can be forwarded
+/// across process-boundaries **without** having access to the compiled
+/// event definitions on the other side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub id:           Uuid,
+    pub occurred_at:  DateTime<Utc>,
+    pub correlation:  Option<Uuid>,
+    pub event_type:   String,
+    pub payload:      Value,
+}
+
+/// Marker trait that every domain event must implement.
+///
+/// Keeping the trait lean: every event must be serializable and have a
+/// static routing key that allows the broker and the in-process event
+/// bus to find handlers without relying on `TypeId`.
+pub trait DomainEvent: Serialize + Send + Sync + 'static {
+    /// Fully-qualified logical name (e.g. `lesson.published`).
+    const EVENT_TYPE: &'static str;
+}
+
+/// Syntactic sugar for creating envelopes.
+pub fn envelope<E: DomainEvent>(event: &E, correlation: Option<Uuid>) -> Result<EventEnvelope, EventError> {
+    let payload = serde_json::to_value(event)?;
+    Ok(EventEnvelope {
+        id: Uuid::new_v4(),
+        occurred_at: Utc::now(),
+        correlation,
+        event_type: E::EVENT_TYPE.to_string(),
+        payload,
+    })
+}
+
+/// Error hierarchy used throughout the event subsystem.
+#[derive(Debug, Error)]
+pub enum EventError {
+    #[error("failed to serialize or deserialize domain event: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("NATS I/O error: {0}")]
+    Nats(#[from] async_nats::Error),
+
+    #[error("handler error: {0}")]
+    Handler(String),
+}
+
+/// Trait all asynchronous event handlers have to implement.
+#[async_trait]
+pub trait EventHandler<E: DomainEvent>: Send + Sync {
+    async fn handle(&self, event: E, meta: &EventEnvelope) -> Result<(), EventError>;
+}
+
+/// Internal helper object used for dynamic dispatch without giving up
+/// on compile-time type safety for concrete events.
+#[async_trait]
+trait DynHandler: Send + Sync {
+    fn type_id(&self) -> TypeId;
+    fn event_type(&self) -> &'static str;
+
+    async fn call(&self, env: &EventEnvelope) -> Result<(), EventError>;
+}
+
+/// Generic new-type adapter that turns any strongly-typed
+/// `EventHandler<E>` into a trait object implementing `DynHandler`.
+struct HandlerAdapter<E, H>
+where
+    E: DomainEvent + DeserializeOwned,
+    H: EventHandler<E>,
+{
+    inner: H,
+    _marker: std::marker::PhantomData<E>,
+}
+
+impl<E, H> HandlerAdapter<E, H>
+where
+    E: DomainEvent + DeserializeOwned,
+    H: EventHandler<E>,
+{
+    fn new(inner: H) -> Self {
+        Self {
+            inner,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+#[async_trait]
+impl<E, H> DynHandler for HandlerAdapter<E, H>
+where
+    E: DomainEvent + DeserializeOwned,
+    H: EventHandler<E>,
+{
+    fn type_id(&self) -> TypeId {
+        TypeId::of::<E>()
+    }
+
+    fn event_type(&self) -> &'static str {
+        E::EVENT_TYPE
+    }
+
+    async fn call(&self, env: &EventEnvelope) -> Result<(), EventError> {
+        // Convert JSON back into strongly-typed event.
+        let evt: E = serde_json::from_value(env.payload.clone())?;
+        self.inner.handle(evt, env).await
+    }
+}
+
+/// Public façade object that user code interacts with.
+///
+/// Under the hood we keep two registries:
+///   * `handlers`: in-process subscription list
+///   * `broker`:   connection to NATS for cross-process communication
+///
+/// NOTE: `EventBus` can be cloned cheaply because we arc-wrap its
+/// inner state.
+#[derive(Clone)]
+pub struct EventBus {
+    inner: Arc<EventBusInner>,
+}
+
+struct EventBusInner {
+    broker: Arc<NatsClient>,
+    handlers: RwLock<HashMap<String, Vec<Arc<dyn DynHandler>>>>,
+}
+
+impl EventBus {
+    /// Connect to NATS and initialise the event bus.
+    ///
+    /// The NATS server address is resolved in the following order:
+    ///   1. Provided parameter
+    ///   2. `$NATS_URL` environment variable
+    ///   3. Default to `nats://127.0.0.1:4222`
+    pub async fn new(nats_url: Option<String>) -> Result<Self, EventError> {
+        let url = nats_url
+            .or_else(|| std::env::var("NATS_URL").ok())
+            .unwrap_or_else(|| "nats://127.0.0.1:4222".to_string());
+
+        let client = ConnectOptions::new()
+            .disconnect_callback(|| async {
+                tracing::warn!("disconnected from NATS");
+            })
+            .connect(url)
+            .await?;
+
+        Ok(Self {
+            inner: Arc::new(EventBusInner {
+                broker: Arc::new(client),
+                handlers: RwLock::new(HashMap::new()),
+            }),
+        })
+    }
+
+    /// Register an in-process handler for a concrete event type.
+    pub async fn register<E, H>(&self, handler: H)
+    where
+        E: DomainEvent + DeserializeOwned,
+        H: EventHandler<E> + 'static,
+    {
+        let mut map = self.inner.handlers.write().await;
+        let entry = map.entry(E::EVENT_TYPE.to_string()).or_default();
+        entry.push(Arc::new(HandlerAdapter::<E, H>::new(handler)));
+    }
+
+    /// Publish a *strongly typed* domain event.
+    ///
+    /// 1. Wrap event into an envelope
+    /// 2. Send envelope over NATS (fire-and-forget)
+    /// 3. Dispatch to local handlers (await all tasks)
+    pub async fn publish<E>(&self, event: E, correlation: Option<Uuid>) -> Result<(), EventError>
+    where
+        E: DomainEvent,
+    {
+        let env = envelope(&event, correlation)?;
+
+        // Step 1: send to NATS (no await on subscribers).
+        let subject = format!("{SUBJECT_PREFIX}.{}", env.event_type);
+        let data = serde_json::to_vec(&env)?;
+        self.inner.broker.publish(subject, data.into()).await?;
+
+        // Step 2: dispatch to in-process handlers concurrently.
+        let tasks = {
+            let map = self.inner.handlers.read().await;
+            map.get(&env.event_type)
+                .cloned() // clone vec
+                .unwrap_or_default()
+        };
+
+        // Early exit when no handlers are interested.
+        if tasks.is_empty() {
+            return Ok(());
+        }
+
+        // Spawn tasks; Fail-fast and bubble first error (if any).
+        let mut join_set = tokio::task::JoinSet::new();
+        for h in tasks {
+            let env = env.clone();
+            join_set.spawn(async move { h.call(&env).await });
+        }
+
+        while let Some(res) = join_set.join_next().await {
+            res??; // propagate potential handler errors
+        }
+
+        Ok(())
+    }
+
+    /// Subscribe to a **raw** event type coming from the broker and
+    /// invoke registered in-process handlers.  This method should be
+    /// spawned in a background task during service start-up.  Using a
+    /// single shared subscription reduces memory and latency overhead.
+    pub async fn run_dispatch_loop(self) -> Result<(), EventError> {
+        let subject = format!("{SUBJECT_PREFIX}.*");
+        let mut sub = self.inner.broker.subscribe(subject).await?;
+
+        tracing::info!("event-bus started; waiting for messages…");
+
+        while let Some(msg) = sub.next().await {
+            let env: EventEnvelope = match serde_json::from_slice(&msg.payload) {
+                Ok(e) => e,
+                Err(err) => {
+                    tracing::error!(error = %err, "unable to decode incoming event");
+                    continue; // Skip invalid message but keep subscription alive.
+                }
+            };
+
+            let handlers = {
+                let map = self.inner.handlers.read().await;
+                map.get(&env.event_type).cloned().unwrap_or_default()
+            };
+
+            // Spawn and forget—errors are logged but do not stop the loop.
+            for h in handlers {
+                let env = env.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = h.call(&env).await {
+                        tracing::warn!(error = %err, event = %env.event_type, "handler failure");
+                    }
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------
+   -- Example Domain Events & Handlers --------------------------------------
+   ------------------------------------------------------------------------- */
+
+/// Example event emitted when a teacher publishes a new lesson.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LessonPublished {
+    pub lesson_id:  Uuid,
+    pub teacher_id: Uuid,
+    pub title:      String,
+    pub published_at: DateTime<Utc>,
+}
+
+impl DomainEvent for LessonPublished {
+    const EVENT_TYPE: &'static str = "lesson.published";
+}
+
+/// Sample handler that indexes the lesson into an external search
+/// engine (Elasticsearch, Opensearch …).  In production this would
+/// live in its own crate/service, but the minimal example shows how to
+/// plug into the event stream.
+pub struct SearchIndexer;
+
+#[async_trait]
+impl EventHandler<LessonPublished> for SearchIndexer {
+    async fn handle(&self, event: LessonPublished, meta: &EventEnvelope) -> Result<(), EventError> {
+        tracing::info!(
+            lesson_id = %event.lesson_id,
+            correlation = ?meta.correlation,
+            "indexing lesson in search service"
+        );
+        // TODO: perform indexing using an http client — omitted here.
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------
+   -- Compile-time Smoke Tests ---------------------------------------------
+   ------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{sleep, Duration};
+
+    static LOGGER: Lazy<()> = Lazy::new(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("debug")
+            .try_init();
+    });
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_process_handler_invoked() -> Result<(), Box<dyn std::error::Error>> {
+        Lazy::force(&LOGGER); // initialise test logger
+
+        // Use an in-memory NATS server (`nats-server -DV`) in real tests.
+        // For CI we skip broker assertions and only test in-process dispatch.
+        let bus = EventBus::new(Some("no://broker".into())).await?;
+        bus.register::<LessonPublished, _>(SearchIndexer).await;
+
+        let evt = LessonPublished {
+            lesson_id:    Uuid::new_v4(),
+            teacher_id:   Uuid::new_v4(),
+            title:        "Introduction to Rust".into(),
+            published_at: Utc::now(),
+        };
+
+        bus.publish(evt, None).await?;
+
+        // Give the async handler some time (it runs on separate task).
+        sleep(Duration::from_millis(50)).await;
+
+        Ok(())
+    }
+}
+```

@@ -1,0 +1,311 @@
+```rust
+//! src/module_11.rs
+//!
+//! Event Dispatcher & Outbox processor for EduPulse Live.
+//!
+//! This module encapsulates everything required to reliably publish domain
+//! events to an external broker while guaranteeing atomic persistence of the
+//! associated business transaction (Transactional Outbox pattern).
+//!
+//! A high-level overview of the workflow:
+//!
+//! 1.  Business service saves its state changes inside a SQL transaction.
+//! 2.  The same transaction stores an `OutboxEvent` row
+//!     inside `event_outbox` (JSONB payload).
+//! 3.  The [`OutboxProcessor`] picks up un-published events in batches,
+//!     publishes them to NATS, and marks them as dispatched.
+//!
+//! The implementation is `async`/`await` based and leverages
+//! industry-grade crates such as `sqlx`, `async-nats`, and `tracing`.
+
+use std::{fmt, time::Duration};
+
+use async_nats::{jetstream, Client as NatsClient, ConnectOptions};
+use chrono::{DateTime, Utc};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sqlx::{PgPool, Postgres, Transaction};
+use thiserror::Error;
+use tokio::time::sleep;
+use tracing::{debug, error, info, instrument};
+
+/// The global NATS subject for EduPulse Live domain events.
+///
+/// Each microservice subscribes using its own durable consumer
+/// and optionally leverages JetStream for at-least-once delivery guarantees.
+pub static NATS_SUBJECT: &str = "edupulse.domain.events";
+
+/// ------------------------------------------------------------------------------------------------
+/// Domain Event abstraction
+/// ------------------------------------------------------------------------------------------------
+
+/// Every domain event must implement this marker trait.
+///
+/// The trait bounds guarantee that all events are serialisable and debuggable,
+/// which enables structured logging & telemetry.
+pub trait DomainEvent: Serialize + DeserializeOwned + fmt::Debug + Send + Sync {
+    /// A stable string identifier (e.g. `learning_pulse.created`).
+    fn event_type(&self) -> &'static str;
+    /// SemVer style event versioning (`"1.0"` by convention).
+    fn version(&self) -> &'static str;
+}
+
+/// Envelope for all outbound events.
+///
+/// It contains generic metadata required by consumers to perform
+/// deserialisation and correlation.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventEnvelope<E: DomainEvent> {
+    pub event_id: uuid::Uuid,
+    pub event_type: &'static str,
+    pub version: &'static str,
+    pub occurred_at: DateTime<Utc>,
+    pub aggregate_id: uuid::Uuid,
+    pub payload: E,
+}
+
+/// Helper to wrap a concrete event instance.
+pub fn wrap_event<E: DomainEvent>(
+    aggregate_id: uuid::Uuid,
+    payload: E,
+) -> EventEnvelope<E> {
+    EventEnvelope {
+        event_id: uuid::Uuid::new_v4(),
+        event_type: payload.event_type(),
+        version: payload.version(),
+        occurred_at: Utc::now(),
+        aggregate_id,
+        payload,
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Outbox persistence
+/// ------------------------------------------------------------------------------------------------
+
+/// Row inside `event_outbox` table.
+///
+/// Inserted within the same DB transaction as the originating command.
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+pub struct OutboxEvent {
+    pub id: i64,
+    pub aggregate_id: uuid::Uuid,
+    pub event_type: String,
+    pub version: String,
+    pub payload: serde_json::Value,
+    pub occurred_at: DateTime<Utc>,
+    pub published_at: Option<DateTime<Utc>>,
+}
+
+/// Persist a new domain event in the outbox table.
+///
+/// Must be invoked within the caller's SQL transaction.
+#[instrument(skip(tx, envelope))]
+pub async fn persist_event<E>(
+    tx: &mut Transaction<'_, Postgres>,
+    envelope: &EventEnvelope<E>,
+) -> Result<(), OutboxError>
+where
+    E: DomainEvent,
+{
+    let payload_json = serde_json::to_value(&envelope.payload)?;
+    sqlx::query!(
+        r#"
+        INSERT INTO event_outbox 
+            (aggregate_id, event_type, version, payload, occurred_at)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+        envelope.aggregate_id,
+        envelope.event_type,
+        envelope.version,
+        payload_json,
+        envelope.occurred_at,
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    Ok(())
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Outbox processor implementation
+/// ------------------------------------------------------------------------------------------------
+
+/// Number of events we fetch per batch to reduce DB contention.
+const BATCH_SIZE: i64 = 250;
+
+/// Processor error surface.
+#[derive(Debug, Error)]
+pub enum OutboxError {
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("NATS error: {0}")]
+    Nats(#[from] async_nats::Error),
+}
+
+/// Background worker which iteratively drains the `event_outbox` table
+/// and forwards the events to NATS JetStream.
+pub struct OutboxProcessor {
+    pg_pool: PgPool,
+    nats: jetstream::Context,
+}
+
+impl OutboxProcessor {
+    /// Constructs a new [`OutboxProcessor`].
+    pub async fn new(pg_pool: PgPool, nats_url: &str) -> Result<Self, OutboxError> {
+        let nats_client = NatsClient::connect_with_options(
+            nats_url,
+            ConnectOptions::with_name("edupulse-outbox"),
+        )
+        .await?;
+        let jetstream = jetstream::new(nats_client);
+
+        Ok(Self {
+            pg_pool,
+            nats: jetstream,
+        })
+    }
+
+    /// Starts the infinite polling loop until `shutdown` future resolves.
+    ///
+    /// Caller decides the sleep interval between attempts.
+    #[instrument(skip(self, shutdown), name = "outbox.run")]
+    pub async fn run_until_stopped(
+        &self,
+        poll_interval: Duration,
+        mut shutdown: tokio::sync::watch::Receiver<()>,
+    ) {
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    info!("Outbox processor received shutdown signal – finishing current batch");
+                    break;
+                }
+                _ = self.tick() => {}
+            }
+
+            sleep(poll_interval).await;
+        }
+
+        info!("Outbox processor terminated gracefully");
+    }
+
+    /// Execute a single polling cycle.
+    #[instrument(skip(self))]
+    pub async fn tick(&self) {
+        match self.process_batch().await {
+            Ok(count) => {
+                if count > 0 {
+                    info!(count, "outbox events dispatched");
+                } else {
+                    debug!("no events to dispatch");
+                }
+            }
+            Err(err) => {
+                error!(?err, "failed to process outbox batch");
+            }
+        }
+    }
+
+    /// Fetch a batch of pending events, publish, and mark as dispatched.
+    #[instrument(skip(self), err)]
+    async fn process_batch(&self) -> Result<u64, OutboxError> {
+        let mut tx = self.pg_pool.begin().await?;
+
+        // Step 1: select for update – prevents concurrent processors
+        let events: Vec<OutboxEvent> = sqlx::query_as!(
+            OutboxEvent,
+            r#"
+            SELECT * FROM event_outbox
+            WHERE published_at IS NULL
+            ORDER BY id
+            FOR UPDATE SKIP LOCKED
+            LIMIT $1
+            "#,
+            BATCH_SIZE
+        )
+        .fetch_all(&mut tx)
+        .await?;
+
+        if events.is_empty() {
+            tx.rollback().await?;
+            return Ok(0);
+        }
+
+        // Step 2: publish each event to NATS
+        for evt in &events {
+            let payload_bytes = serde_json::to_vec(&evt)?;
+            self.nats
+                .publish(NATS_SUBJECT, payload_bytes.into())
+                .await?;
+        }
+
+        // Step 3: update published stamp
+        sqlx::query!(
+            r#"
+            UPDATE event_outbox
+            SET published_at = NOW()
+            WHERE id = ANY($1)
+            "#,
+            &events.iter().map(|e| e.id).collect::<Vec<_>>()
+        )
+        .execute(&mut tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(events.len() as u64)
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Example domain event
+/// ------------------------------------------------------------------------------------------------
+
+/// Fired when a new learning pulse (challenge) is created by a teacher.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LearningPulseCreated {
+    pub pulse_id: uuid::Uuid,
+    pub author_id: uuid::Uuid,
+    pub title: String,
+    pub summary: String,
+}
+
+impl DomainEvent for LearningPulseCreated {
+    fn event_type(&self) -> &'static str {
+        "learning_pulse.created"
+    }
+
+    fn version(&self) -> &'static str {
+        "1.0"
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Convenience API for application services
+/// ------------------------------------------------------------------------------------------------
+
+/// Publish a newly generated domain event inside an existing SQL transaction.
+///
+/// Typical usage in a service command handler:
+///
+/// ```ignore
+/// let mut tx = pool.begin().await?;
+/// let envelope = wrap_event(aggregate_id, LearningPulseCreated { … });
+/// persist_event(&mut tx, &envelope).await?;
+/// tx.commit().await?;
+/// ```
+pub async fn publish_domain_event<E>(
+    tx: &mut Transaction<'_, Postgres>,
+    aggregate_id: uuid::Uuid,
+    event: E,
+) -> Result<(), OutboxError>
+where
+    E: DomainEvent,
+{
+    let envelope = wrap_event(aggregate_id, event);
+    persist_event(tx, &envelope).await
+}
+```

@@ -1,0 +1,249 @@
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Globalization;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Analytics
+{
+    /// <summary>
+    /// Strongly typed record describing a raw telemetry event ingested from the Data-Lake.
+    /// </summary>
+    public sealed record EventRecord(
+        Guid Id,
+        string SourceSystem,                // e.g. "GoogleCalendar", "GitHub", "Slack"
+        EventCategory Category,             // Normalised high-level category
+        DateTimeOffset StartUtc,
+        DateTimeOffset EndUtc,
+        ImmutableDictionary<string, string> Attributes);
+
+    /// <summary>
+    /// Coarse-grained categories that map heterogeneous event sources
+    /// onto a common ontology we can reason about.
+    /// </summary>
+    public enum EventCategory
+    {
+        Unknown = 0,
+        Focus,          // Heads-down work — coding, writing, designing
+        Meeting,
+        Communication,  // Chats, e-mails
+        Administrative, // Approvals, expense reports, etc.
+        Idle
+    }
+
+    /// <summary>
+    /// Lightweight DTO returned by KPI strategies.
+    /// </summary>
+    public sealed record KpiResult(
+        string Name,
+        string TimeWindowIso,   // ISO-8601 duration or explicit period label, e.g. "2023-W15"
+        double Value,
+        string Unit,
+        ImmutableDictionary<string, string> Dimensions);
+
+    /// <summary>
+    /// Contract for plug-in KPI computation strategies.
+    /// </summary>
+    public interface IKpiComputationStrategy
+    {
+        /// <summary>The unique, machine-friendly KPI identifier.</summary>
+        string KpiName { get; }
+
+        /// <summary>
+        /// Computes one or more KPI values over the supplied event stream.
+        /// </summary>
+        /// <remarks>
+        /// Strategies are expected to be side-effect free (pure functions) and
+        /// therefore trivially cacheable.  They may, however, perform internal
+        /// buffering when required, but must honour <paramref name="cancellationToken"/>.
+        /// </remarks>
+        /// <param name="events">Chronologically ordered, de-duplicated stream.</param>
+        /// <param name="timeWindow">Human readable label representing the covered period.</param>
+        /// <param name="logger">Structured logger for diagnostics.</param>
+        /// <param name="cancellationToken">Cooperative cancellation token.</param>
+        Task<KpiResult> ComputeAsync(
+            IAsyncEnumerable<EventRecord> events,
+            string timeWindow,
+            ILogger logger,
+            CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Calculates the ratio between focus time and overall active time
+    /// during a specified window, e.g. one week.
+    ///
+    ///     focus-ratio = Σ(focus minutes) / Σ(active minutes)
+    ///
+    /// “Active” excludes <see cref="EventCategory.Idle"/>.
+    /// </summary>
+    public sealed class FocusTimeRatioStrategy : IKpiComputationStrategy
+    {
+        public const string UnitName = "ratio";
+
+        public string KpiName => "focus_time_ratio";
+
+        public async Task<KpiResult> ComputeAsync(
+            IAsyncEnumerable<EventRecord> events,
+            string timeWindow,
+            ILogger logger,
+            CancellationToken cancellationToken = default)
+        {
+            if (events is null) throw new ArgumentNullException(nameof(events));
+            if (logger is null) throw new ArgumentNullException(nameof(logger));
+
+            double focusMinutes = 0;
+            double activeMinutes = 0;
+
+            await foreach (EventRecord ev in events.WithCancellation(cancellationToken)
+                                                   .ConfigureAwait(false))
+            {
+                ValidateEvent(ev);
+
+                double minutes = (ev.EndUtc - ev.StartUtc).TotalMinutes;
+
+                // Defensive: filter out nonsensical negative durations early.
+                if (minutes <= 0)
+                {
+                    logger.LogDebug("Discarding event {EventId} due to non-positive duration {Minutes}.", ev.Id,
+                        minutes);
+                    continue;
+                }
+
+                switch (ev.Category)
+                {
+                    case EventCategory.Focus:
+                        focusMinutes += minutes;
+                        activeMinutes += minutes;
+                        break;
+
+                    case EventCategory.Meeting:
+                    case EventCategory.Communication:
+                    case EventCategory.Administrative:
+                        activeMinutes += minutes;
+                        break;
+
+                    case EventCategory.Idle:
+                        // Intentionally ignored for active summation.
+                        break;
+
+                    default:
+                        logger.LogWarning("Unknown EventCategory {Category} on event {EventId}. Treating as inactive.",
+                            ev.Category, ev.Id);
+                        break;
+                }
+            }
+
+            double ratio = activeMinutes.Equals(0d)
+                ? 0d
+                : Math.Round(focusMinutes / activeMinutes, 4, MidpointRounding.AwayFromZero);
+
+            logger.LogInformation(
+                "Computed Focus-Time Ratio: Focus={Focus:F2}m, Active={Active:F2}m, Ratio={Ratio:P2} for window {Window}.",
+                focusMinutes, activeMinutes, ratio, timeWindow);
+
+            return new KpiResult(
+                KpiName,
+                timeWindow,
+                ratio,
+                UnitName,
+                new Dictionary<string, string>
+                {
+                    { "focus_minutes", focusMinutes.ToString("F1", CultureInfo.InvariantCulture) },
+                    { "active_minutes", activeMinutes.ToString("F1", CultureInfo.InvariantCulture) }
+                }.ToImmutableDictionary());
+        }
+
+        #region ◾️ Internal helpers
+
+        private static void ValidateEvent(EventRecord ev)
+        {
+            if (ev.StartUtc > ev.EndUtc)
+            {
+                throw new InvalidOperationException(
+                    $"Event {ev.Id} has StartUtc later than EndUtc ({ev.StartUtc:o} > {ev.EndUtc:o}).");
+            }
+        }
+
+        #endregion
+    }
+
+    /// <summary>
+    /// Orchestrates KPI strategy execution.  Designed for dependency-injection
+    /// friendly composition inside Lambda handlers / Step-Functions activities.
+    /// </summary>
+    public sealed class KpiEngine
+    {
+        private readonly IDictionary<string, IKpiComputationStrategy> _strategies;
+        private readonly ILogger _logger;
+
+        public KpiEngine(IEnumerable<IKpiComputationStrategy> strategies, ILogger<KpiEngine> logger)
+        {
+            if (strategies is null) throw new ArgumentNullException(nameof(strategies));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+            // Safe to perform case-insensitive dictionary since KPI names are snake-case ASCII.
+            _strategies = strategies.ToDictionary(s => s.KpiName, StringComparer.OrdinalIgnoreCase);
+        }
+
+        public async Task<KpiResult> ExecuteAsync(
+            string kpiName,
+            IAsyncEnumerable<EventRecord> events,
+            string timeWindow,
+            CancellationToken cancellationToken = default)
+        {
+            if (!_strategies.TryGetValue(kpiName, out IKpiComputationStrategy? strategy))
+            {
+                throw new ArgumentException($"Unsupported KPI '{kpiName}'.", nameof(kpiName));
+            }
+
+            _logger.LogDebug("Invoking strategy {Strategy} for KPI {KpiName}.", strategy.GetType().Name, kpiName);
+            return await strategy.ComputeAsync(events, timeWindow, _logger, cancellationToken)
+                                 .ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Convenience extensions used throughout analytics code.
+    /// </summary>
+    internal static class AsyncEnumerableExtensions
+    {
+        /// <summary>
+        /// Materialises the <see cref="IAsyncEnumerable{T}"/> into a cached list
+        /// to enable multi-pass aggregate computations.
+        /// </summary>
+        public static async Task<IReadOnlyList<T>> ToListAsync<T>(
+            this IAsyncEnumerable<T> source,
+            CancellationToken cancellationToken = default)
+        {
+            if (source is null) throw new ArgumentNullException(nameof(source));
+
+            var results = new List<T>();
+            await foreach (T item in source.WithCancellation(cancellationToken).ConfigureAwait(false))
+            {
+                results.Add(item);
+            }
+
+            return results;
+        }
+
+        /// <summary>
+        /// Allows piping of an async enumerable through an arbitrary transformation.
+        /// </summary>
+        public static async IAsyncEnumerable<TOut> SelectAwait<TIn, TOut>(
+            this IAsyncEnumerable<TIn> source,
+            Func<TIn, ValueTask<TOut>> transform,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await foreach (TIn item in source.WithCancellation(cancellationToken).ConfigureAwait(false))
+            {
+                yield return await transform(item).ConfigureAwait(false);
+            }
+        }
+    }
+}
+```

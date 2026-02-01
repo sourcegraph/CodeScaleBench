@@ -1,0 +1,566 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * ------------------------------------------------------------
+ * Module 12: In-Memory Response Cache  (LRU + TTL)
+ *
+ * This module exposes a small, thread-safe, LRU cache used by the
+ * REST/GraphQL gateway layer for idempotent GET endpoints.  It can
+ * safely be compiled as a standalone translation unit or linked
+ * statically inside the monolith.  The implementation keeps the
+ * memory footprint predictable (O(capacity)) and integrates with
+ * the project-wide structured logging / monitoring facilities.
+ *
+ * Author:  Mercury Engineering Team
+ * License: MIT
+ */
+
+#define _GNU_SOURCE     /* clock_gettime, pthread_rwlock */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <pthread.h>
+#include <time.h>
+#include <errno.h>
+#include <inttypes.h>
+#include "mm_logger.h"      /* project-wide logger              */
+#include "mm_metrics.h"     /* Prometheus style counters        */
+
+/*----------------------------------------------------------------------
+ * Public API
+ *--------------------------------------------------------------------*/
+#ifndef MM_CACHE_H
+#define MM_CACHE_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct mm_cache      mm_cache_t;
+
+mm_cache_t *mm_cache_create(size_t capacity,
+                            uint64_t default_ttl_ms);
+void        mm_cache_destroy(mm_cache_t *c);
+
+int         mm_cache_put    (mm_cache_t *c,
+                             const char *key,
+                             const void *value,
+                             size_t      value_len,
+                             uint64_t    ttl_ms /* 0 = default */);
+
+int         mm_cache_get    (mm_cache_t *c,
+                             const char *key,
+                             void      **out_value,
+                             size_t     *out_value_len);
+
+void        mm_cache_invalidate(mm_cache_t *c,
+                                const char *key);
+
+void        mm_cache_clear     (mm_cache_t *c);
+
+void        mm_cache_dump_metrics(mm_cache_t *c,
+                                  FILE *out);   /* human readable */
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* MM_CACHE_H */
+
+/*----------------------------------------------------------------------
+ * Configuration constants
+ *--------------------------------------------------------------------*/
+#define MM_CACHE_KEY_MAX          256   /* bytes (UTF-8)      */
+#define MM_CACHE_VALUE_MAX      65536   /* bytes (64 KiB)     */
+#define MM_CACHE_DEFAULT_CAP      1024  /* entries            */
+#define MM_CACHE_HASH_SEED   14695981039346656037ULL  /* FNV-1a */
+
+/*----------------------------------------------------------------------
+ * Internal structures
+ *--------------------------------------------------------------------*/
+typedef struct mm_cache_entry mm_cache_entry_t;
+struct mm_cache_entry {
+    char                 key[MM_CACHE_KEY_MAX];
+    uint64_t             key_hash;
+    void                *value;
+    size_t               value_len;
+    struct timespec      expires_at;
+    mm_cache_entry_t    *prev;
+    mm_cache_entry_t    *next;
+    mm_cache_entry_t    *hnext;   /* collision chain */
+};
+
+struct mm_cache {
+    size_t            capacity;
+    uint64_t          default_ttl_ms;
+    size_t            size;          /* current # of entries */
+    mm_cache_entry_t **buckets;      /* hash table */
+    size_t            bucket_mask;
+    mm_cache_entry_t  *head;         /* MRU */
+    mm_cache_entry_t  *tail;         /* LRU */
+    pthread_rwlock_t   lock;
+    /* metrics */
+    uint64_t           hits;
+    uint64_t           misses;
+    uint64_t           evictions;
+};
+
+/*----------------------------------------------------------------------
+ * Utility helpers
+ *--------------------------------------------------------------------*/
+static inline uint64_t
+mm_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
+
+static inline struct timespec
+mm_future_ms(uint64_t delta_ms)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    uint64_t ns = ts.tv_nsec + (delta_ms % 1000ULL) * 1000000ULL;
+    ts.tv_sec  += delta_ms / 1000ULL + ns / 1000000000ULL;
+    ts.tv_nsec  = ns % 1000000000ULL;
+    return ts;
+}
+
+static uint64_t
+mm_hash_fnv1a(const char *key)
+{
+    uint64_t hash = MM_CACHE_HASH_SEED;
+    while (*key) {
+        hash ^= (unsigned char)(*key++);
+        hash *= 0x100000001b3ULL;
+    }
+    return hash;
+}
+
+static int
+mm_timespec_cmp(const struct timespec *a, const struct timespec *b)
+{
+    if (a->tv_sec == b->tv_sec) {
+        return (a->tv_nsec > b->tv_nsec) - (a->tv_nsec < b->tv_nsec);
+    }
+    return (a->tv_sec > b->tv_sec) - (a->tv_sec < b->tv_sec);
+}
+
+/*----------------------------------------------------------------------
+ * LRU helpers
+ *--------------------------------------------------------------------*/
+static void
+mm_lru_move_front(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    if (c->head == e) return;
+
+    /* detach */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->tail == e) c->tail = e->prev;
+
+    /* prepend */
+    e->prev = NULL;
+    e->next = c->head;
+    if (c->head) c->head->prev = e;
+    c->head = e;
+    if (!c->tail) c->tail = e;
+}
+
+static void
+mm_lru_append_front(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    e->prev = NULL;
+    e->next = c->head;
+    if (c->head) c->head->prev = e;
+    c->head = e;
+    if (!c->tail) c->tail = e;
+}
+
+static void
+mm_lru_remove(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->head == e) c->head = e->next;
+    if (c->tail == e) c->tail = e->prev;
+
+    e->prev = e->next = NULL;
+}
+
+/*----------------------------------------------------------------------
+ * Hash table helpers
+ *--------------------------------------------------------------------*/
+static inline size_t
+mm_bucket_index(mm_cache_t *c, uint64_t hash)
+{
+    return hash & c->bucket_mask;
+}
+
+static mm_cache_entry_t *
+mm_hash_find(mm_cache_t *c, const char *key, uint64_t hash)
+{
+    size_t idx = mm_bucket_index(c, hash);
+    for (mm_cache_entry_t *e = c->buckets[idx]; e; e = e->hnext) {
+        if (e->key_hash == hash && strcmp(e->key, key) == 0) {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static void
+mm_hash_insert(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    size_t idx = mm_bucket_index(c, e->key_hash);
+    e->hnext = c->buckets[idx];
+    c->buckets[idx] = e;
+}
+
+static void
+mm_hash_remove(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    size_t idx = mm_bucket_index(c, e->key_hash);
+    mm_cache_entry_t **prev = &c->buckets[idx];
+    while (*prev && *prev != e) prev = &(*prev)->hnext;
+    if (*prev == e) *prev = e->hnext;
+}
+
+/*----------------------------------------------------------------------
+ * Memory helpers
+ *--------------------------------------------------------------------*/
+static mm_cache_entry_t *
+mm_entry_alloc(const char *key, uint64_t hash,
+               const void *value, size_t value_len,
+               uint64_t ttl_ms, uint64_t default_ttl_ms)
+{
+    if (value_len > MM_CACHE_VALUE_MAX) return NULL;
+
+    mm_cache_entry_t *e = calloc(1, sizeof(*e));
+    if (!e) return NULL;
+
+    strncpy(e->key, key, MM_CACHE_KEY_MAX - 1);
+    e->key[MM_CACHE_KEY_MAX - 1] = '\0';
+    e->key_hash = hash;
+
+    e->value = malloc(value_len);
+    if (!e->value) {
+        free(e);
+        return NULL;
+    }
+    memcpy(e->value, value, value_len);
+    e->value_len = value_len;
+
+    uint64_t ttl = ttl_ms ? ttl_ms : default_ttl_ms;
+    e->expires_at = mm_future_ms(ttl);
+    return e;
+}
+
+static void
+mm_entry_free(mm_cache_entry_t *e)
+{
+    if (!e) return;
+    free(e->value);
+    free(e);
+}
+
+/*----------------------------------------------------------------------
+ * API implementation
+ *--------------------------------------------------------------------*/
+mm_cache_t *
+mm_cache_create(size_t capacity, uint64_t default_ttl_ms)
+{
+    if (capacity == 0) capacity = MM_CACHE_DEFAULT_CAP;
+    if (default_ttl_ms == 0) default_ttl_ms = 10 * 1000; /* 10s */
+
+    /* buckets power of two */
+    size_t buckets_pow2 = 1;
+    while (buckets_pow2 < capacity) buckets_pow2 <<= 1;
+
+    mm_cache_t *c = calloc(1, sizeof(*c));
+    if (!c) return NULL;
+
+    c->capacity         = capacity;
+    c->default_ttl_ms   = default_ttl_ms;
+    c->bucket_mask      = buckets_pow2 - 1;
+    c->buckets          = calloc(buckets_pow2, sizeof(mm_cache_entry_t *));
+    if (!c->buckets) {
+        free(c);
+        return NULL;
+    }
+    pthread_rwlock_init(&c->lock, NULL);
+
+    MM_LOG_INFO("mm_cache: created (cap=%zu, ttl=%"PRIu64"ms, buckets=%zu)",
+                capacity, default_ttl_ms, buckets_pow2);
+    return c;
+}
+
+void
+mm_cache_destroy(mm_cache_t *c)
+{
+    if (!c) return;
+    pthread_rwlock_wrlock(&c->lock);
+
+    for (size_t i = 0; i <= c->bucket_mask; ++i) {
+        mm_cache_entry_t *e = c->buckets[i];
+        while (e) {
+            mm_cache_entry_t *next = e->hnext;
+            mm_entry_free(e);
+            e = next;
+        }
+    }
+    free(c->buckets);
+    pthread_rwlock_unlock(&c->lock);
+    pthread_rwlock_destroy(&c->lock);
+    free(c);
+}
+
+static void
+mm_evict_lru(mm_cache_t *c)
+{
+    while (c->size > c->capacity) {
+        mm_cache_entry_t *victim = c->tail;
+        if (!victim) break;
+
+        MM_METRIC_INC("cache_evictions_total");
+        c->evictions++;
+
+        mm_lru_remove(c, victim);
+        mm_hash_remove(c, victim);
+        mm_entry_free(victim);
+        c->size--;
+    }
+}
+
+/* remove all expired entries in a single pass until none found */
+static void
+mm_purge_expired(mm_cache_t *c)
+{
+    uint64_t now_ms = mm_now_ms();
+    struct timespec now_ts = {
+        .tv_sec = now_ms / 1000ULL,
+        .tv_nsec = (now_ms % 1000ULL) * 1000000ULL
+    };
+
+    mm_cache_entry_t *e = c->tail;
+    while (e) {
+        mm_cache_entry_t *prev = e->prev;
+        if (mm_timespec_cmp(&e->expires_at, &now_ts) < 0) {
+            MM_METRIC_INC("cache_expired_total");
+            mm_lru_remove(c, e);
+            mm_hash_remove(c, e);
+            mm_entry_free(e);
+            c->size--;
+        } else {
+            /* stop because entries toward head are newer */
+            break;
+        }
+        e = prev;
+    }
+}
+
+int
+mm_cache_put(mm_cache_t *c,
+             const char *key,
+             const void *value,
+             size_t      value_len,
+             uint64_t    ttl_ms)
+{
+    if (!c || !key || !value) return EINVAL;
+    if (strlen(key) >= MM_CACHE_KEY_MAX) return ENAMETOOLONG;
+
+    uint64_t hash = mm_hash_fnv1a(key);
+
+    pthread_rwlock_wrlock(&c->lock);
+
+    mm_cache_entry_t *e = mm_hash_find(c, key, hash);
+    if (e) {
+        /* Update existing entry */
+        free(e->value);
+        e->value = malloc(value_len);
+        if (!e->value) {
+            pthread_rwlock_unlock(&c->lock);
+            return ENOMEM;
+        }
+        memcpy(e->value, value, value_len);
+        e->value_len = value_len;
+        e->expires_at = mm_future_ms(ttl_ms ? ttl_ms : c->default_ttl_ms);
+        mm_lru_move_front(c, e);
+        pthread_rwlock_unlock(&c->lock);
+        return 0;
+    }
+
+    /* Create new entry */
+    e = mm_entry_alloc(key, hash, value, value_len, ttl_ms, c->default_ttl_ms);
+    if (!e) {
+        pthread_rwlock_unlock(&c->lock);
+        return ENOMEM;
+    }
+    mm_hash_insert(c, e);
+    mm_lru_append_front(c, e);
+    c->size++;
+
+    mm_evict_lru(c);
+    pthread_rwlock_unlock(&c->lock);
+    return 0;
+}
+
+int
+mm_cache_get(mm_cache_t *c,
+             const char *key,
+             void      **out_value,
+             size_t     *out_value_len)
+{
+    if (!c || !key || !out_value || !out_value_len) return EINVAL;
+    if (strlen(key) >= MM_CACHE_KEY_MAX) return ENAMETOOLONG;
+
+    uint64_t hash = mm_hash_fnv1a(key);
+    int ret = ENOENT;
+
+    pthread_rwlock_wrlock(&c->lock); /* write lock: we might mutate LRU */
+
+    mm_cache_entry_t *e = mm_hash_find(c, key, hash);
+    if (!e) {
+        c->misses++;
+        MM_METRIC_INC("cache_miss_total");
+        ret = ENOENT;
+        goto done;
+    }
+
+    struct timespec now_ts;
+    clock_gettime(CLOCK_REALTIME, &now_ts);
+    if (mm_timespec_cmp(&e->expires_at, &now_ts) < 0) {
+        /* expired */
+        mm_lru_remove(c, e);
+        mm_hash_remove(c, e);
+        mm_entry_free(e);
+        c->size--;
+        c->misses++;
+        MM_METRIC_INC("cache_miss_expired_total");
+        ret = ENOENT;
+        goto done;
+    }
+
+    /* hit */
+    c->hits++;
+    MM_METRIC_INC("cache_hit_total");
+    mm_lru_move_front(c, e);
+
+    void *dup = malloc(e->value_len);
+    if (!dup) {
+        ret = ENOMEM;
+        goto done;
+    }
+    memcpy(dup, e->value, e->value_len);
+    *out_value = dup;
+    *out_value_len = e->value_len;
+    ret = 0;
+
+done:
+    /* opportunistic housekeeping */
+    mm_purge_expired(c);
+    pthread_rwlock_unlock(&c->lock);
+    return ret;
+}
+
+void
+mm_cache_invalidate(mm_cache_t *c, const char *key)
+{
+    if (!c || !key) return;
+    if (strlen(key) >= MM_CACHE_KEY_MAX) return;
+
+    uint64_t hash = mm_hash_fnv1a(key);
+
+    pthread_rwlock_wrlock(&c->lock);
+    mm_cache_entry_t *e = mm_hash_find(c, key, hash);
+    if (e) {
+        mm_lru_remove(c, e);
+        mm_hash_remove(c, e);
+        mm_entry_free(e);
+        c->size--;
+        MM_METRIC_INC("cache_invalidate_total");
+    }
+    pthread_rwlock_unlock(&c->lock);
+}
+
+void
+mm_cache_clear(mm_cache_t *c)
+{
+    if (!c) return;
+    pthread_rwlock_wrlock(&c->lock);
+
+    for (size_t i = 0; i <= c->bucket_mask; ++i) {
+        mm_cache_entry_t *e = c->buckets[i];
+        while (e) {
+            mm_cache_entry_t *next = e->hnext;
+            mm_entry_free(e);
+            e = next;
+        }
+        c->buckets[i] = NULL;
+    }
+    c->head = c->tail = NULL;
+    c->size = 0;
+    pthread_rwlock_unlock(&c->lock);
+}
+
+void
+mm_cache_dump_metrics(mm_cache_t *c, FILE *out)
+{
+    if (!c) return;
+    if (!out) out = stdout;
+
+    pthread_rwlock_rdlock(&c->lock);
+    fprintf(out,
+        "== MercuryMonolith Cache Metrics ==\n"
+        "capacity    : %zu\n"
+        "size        : %zu\n"
+        "hits        : %"PRIu64"\n"
+        "misses      : %"PRIu64"\n"
+        "evictions   : %"PRIu64"\n"
+        "hit_ratio   : %.2f%%\n",
+        c->capacity,
+        c->size,
+        c->hits,
+        c->misses,
+        c->evictions,
+        (c->hits + c->misses) ? (100.0 * c->hits / (c->hits + c->misses)) : 0.0
+    );
+    pthread_rwlock_unlock(&c->lock);
+}
+
+/*----------------------------------------------------------------------
+ * Self-test (compile with -DMM_CACHE_TEST to run)
+ *--------------------------------------------------------------------*/
+#ifdef MM_CACHE_TEST
+#include <assert.h>
+int main(void)
+{
+    mm_cache_t *cache = mm_cache_create(4, 1000);
+    assert(cache);
+
+    char key[32];
+    char val[32];
+
+    /* insert 5 items => 1 eviction */
+    for (int i = 0; i < 5; ++i) {
+        snprintf(key, sizeof(key), "k%d", i);
+        snprintf(val, sizeof(val), "v%d", i);
+        assert(!mm_cache_put(cache, key, val, strlen(val) + 1, 0));
+    }
+    assert(cache->size == 4);
+
+    void *out;
+    size_t len;
+
+    assert(!mm_cache_get(cache, "k4", &out, &len));
+    assert(strcmp(out, "v4") == 0);
+    free(out);
+
+    assert(mm_cache_get(cache, "k0", &out, &len) == ENOENT); /* evicted */
+
+    mm_cache_dump_metrics(cache, stdout);
+    mm_cache_destroy(cache);
+}
+#endif /* MM_CACHE_TEST */

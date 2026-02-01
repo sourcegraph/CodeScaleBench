@@ -1,0 +1,408 @@
+```rust
+//! module_39.rs
+//!
+//! LedgerLink Nexus – Ledger Entry Query Module
+//! ============================================
+//! This module wires together the HTTP handler, authentication extractor,
+//! pagination + validation helpers, response–caching layer (Redis),
+//! service layer and repository interface for fetching ledger entries.
+//!
+//! The implementation demonstrates idiomatic, production-ready Rust
+//! featuring:
+//!     • Actix-web 4 handler & middleware
+//!     • Validator-based request validation
+//!     • JWT authentication extractor
+//!     • Structured logging
+//!     • Deadpool-Redis cache with fall-through to repository
+//!
+//! In real deployment this module would live alongside other services.
+//! Here we provide an in-memory fallback repository so the code compiles
+//! stand-alone while still showcasing full behaviour.
+
+use actix_web::{
+    get,
+    http::header,
+    web::{self, Data, Json, Query},
+    Error as ActixError, FromRequest, HttpRequest, HttpResponse, Responder,
+};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use deadpool_redis::{redis::AsyncCommands, Config as RedisConfig, Pool as RedisPool};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
+use std::{
+    future::{ready, Ready},
+    sync::Arc,
+    time::Duration,
+};
+use thiserror::Error;
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+// ---------- Domain Model ----------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct LedgerEntry {
+    pub id:            Uuid,
+    pub account_id:    Uuid,
+    pub amount_cents:  i64,
+    pub currency:      String,
+    pub created_at:    DateTime<Utc>,
+    pub description:   String,
+}
+
+// ---------- DTO / View ------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerEntryView {
+    pub id:           Uuid,
+    pub account_id:   Uuid,
+    pub amount_cents: i64,
+    pub currency:     String,
+    pub created_at:   DateTime<Utc>,
+    pub description:  String,
+}
+
+impl From<LedgerEntry> for LedgerEntryView {
+    fn from(e: LedgerEntry) -> Self {
+        Self {
+            id: e.id,
+            account_id: e.account_id,
+            amount_cents: e.amount_cents,
+            currency: e.currency,
+            created_at: e.created_at,
+            description: e.description,
+        }
+    }
+}
+
+// ---------- Pagination Helper ----------------------------------------------
+
+/// Maximum page size allowed by the API. Anything larger will be clamped.
+const MAX_PAGE_SIZE: u32 = 500;
+
+#[derive(Debug, Deserialize, Validate)]
+pub struct PageParams {
+    #[validate(custom = "validate_page_size")]
+    pub limit: Option<u32>,
+
+    /// Optional opaque cursor returned from previous page
+    pub after: Option<String>,
+}
+
+fn validate_page_size(size: &u32) -> Result<(), ValidationError> {
+    if *size == 0 || *size > MAX_PAGE_SIZE {
+        return Err(ValidationError::new("invalid_page_size"));
+    }
+    Ok(())
+}
+
+impl Default for PageParams {
+    fn default() -> Self {
+        Self {
+            limit: Some(100),
+            after: None,
+        }
+    }
+}
+
+impl PageParams {
+    pub fn effective_limit(&self) -> u32 {
+        self.limit.unwrap_or(100).min(MAX_PAGE_SIZE)
+    }
+}
+
+// ---------- Error Envelope --------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation failure: {0}")]
+    Validation(String),
+
+    #[error("unauthorized")]
+    Unauthorized,
+
+    #[error("database error: {0}")]
+    Repository(String),
+
+    #[error("cache error: {0}")]
+    Cache(String),
+
+    #[error("internal error")]
+    Internal,
+}
+
+impl From<ServiceError> for ActixError {
+    fn from(err: ServiceError) -> Self {
+        let status = match err {
+            ServiceError::Validation(_) => actix_web::http::StatusCode::BAD_REQUEST,
+            ServiceError::Unauthorized => actix_web::http::StatusCode::UNAUTHORIZED,
+            ServiceError::Repository(_) | ServiceError::Cache(_) => {
+                actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+            }
+            ServiceError::Internal => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let body = serde_json::json!({ "error": err.to_string() });
+        HttpResponse::build(status).json(body).into()
+    }
+}
+
+// ---------- Authentication Extractor ---------------------------------------
+
+/// Simple JWT claims set for demonstration.
+#[derive(Debug, Deserialize)]
+struct Claims {
+    sub: String,
+    exp: usize,
+    tenant_id: Uuid,
+}
+
+const BEARER_PREFIX: &str = "Bearer ";
+
+pub struct AuthenticatedUser {
+    pub user_id: String,
+    pub tenant_id: Uuid,
+}
+
+impl FromRequest for AuthenticatedUser {
+    type Error = ActixError;
+    type Future = Ready<Result<Self, Self::Error>>;
+
+    fn from_request(req: &HttpRequest, _: &mut actix_web::dev::Payload) -> Self::Future {
+        let auth_header = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default();
+
+        if !auth_header.starts_with(BEARER_PREFIX) {
+            return ready(Err(ServiceError::Unauthorized.into()));
+        }
+
+        let token = &auth_header[BEARER_PREFIX.len()..];
+        let secret = std::env::var("LLN_JWT_SECRET").unwrap_or_else(|_| "dev_secret".into());
+
+        match decode::<Claims>(
+            token,
+            &DecodingKey::from_secret(secret.as_bytes()),
+            &Validation::new(Algorithm::HS256),
+        ) {
+            Ok(data) => {
+                debug!("Authenticated user {}", data.claims.sub);
+                ready(Ok(AuthenticatedUser {
+                    user_id: data.claims.sub,
+                    tenant_id: data.claims.tenant_id,
+                }))
+            }
+            Err(err) => {
+                warn!("JWT decode failed: {err}");
+                ready(Err(ServiceError::Unauthorized.into()))
+            }
+        }
+    }
+}
+
+// ---------- Repository Layer -----------------------------------------------
+
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    async fn fetch_for_account(
+        &self,
+        tenant_id: Uuid,
+        account_id: Uuid,
+        limit: u32,
+        after: Option<String>,
+    ) -> Result<Vec<LedgerEntry>, ServiceError>;
+}
+
+/// In-memory faux repository for demo / tests
+pub struct MemoryLedgerRepository {
+    data: Arc<Vec<LedgerEntry>>,
+}
+
+impl MemoryLedgerRepository {
+    pub fn new(seed: Vec<LedgerEntry>) -> Self {
+        Self {
+            data: Arc::new(seed),
+        }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for MemoryLedgerRepository {
+    async fn fetch_for_account(
+        &self,
+        _tenant_id: Uuid,
+        account_id: Uuid,
+        limit: u32,
+        after: Option<String>,
+    ) -> Result<Vec<LedgerEntry>, ServiceError> {
+        // Very naive filtering & cursor simulation
+        let mut rows: Vec<LedgerEntry> = self
+            .data
+            .iter()
+            .filter(|e| e.account_id == account_id)
+            .cloned()
+            .collect();
+
+        // sort descending by created_at
+        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        if let Some(cursor) = after {
+            if let Ok(ts) = DateTime::parse_from_rfc3339(&cursor) {
+                rows = rows
+                    .into_iter()
+                    .filter(|e| e.created_at < ts.with_timezone(&Utc))
+                    .collect();
+            }
+        }
+
+        Ok(rows.into_iter().take(limit as usize).collect())
+    }
+}
+
+// ---------- Service Layer ---------------------------------------------------
+
+/// Redis key namespace
+fn cache_key(tenant_id: Uuid, account_id: Uuid, limit: u32, after: &Option<String>) -> String {
+    format!(
+        "lln:v1:ledger:{}:{}:{}:{}",
+        tenant_id,
+        account_id,
+        limit,
+        after.clone().unwrap_or_default()
+    )
+}
+
+const CACHE_TTL_SECONDS: usize = 30; // keep query results for 30 seconds
+
+pub struct LedgerEntryService<R: LedgerEntryRepository> {
+    repo: Arc<R>,
+    redis: Option<RedisPool>,
+}
+
+impl<R: LedgerEntryRepository> LedgerEntryService<R> {
+    pub fn new(repo: R, redis: Option<RedisPool>) -> Self {
+        Self {
+            repo: Arc::new(repo),
+            redis,
+        }
+    }
+
+    pub async fn query_entries(
+        &self,
+        tenant_id: Uuid,
+        account_id: Uuid,
+        params: &PageParams,
+    ) -> Result<Vec<LedgerEntryView>, ServiceError> {
+        params.validate().map_err(|e| ServiceError::Validation(e.to_string()))?;
+
+        let limit = params.effective_limit();
+        let key = cache_key(tenant_id, account_id, limit, &params.after);
+
+        // 1. Attempt cache hit
+        if let Some(pool) = &self.redis {
+            if let Ok(mut conn) = pool.get().await.map_err(|e| ServiceError::Cache(e.to_string())) {
+                if let Ok(cached): Result<String, _> = conn.get(&key).await {
+                    debug!("Cache hit for key {key}");
+                    let views: Vec<LedgerEntryView> = serde_json::from_str(&cached)
+                        .map_err(|e| ServiceError::Internal)?;
+                    return Ok(views);
+                }
+            }
+        }
+
+        // 2. Fetch from repository
+        let raw = self
+            .repo
+            .fetch_for_account(tenant_id, account_id, limit, params.after.clone())
+            .await?;
+
+        let views: Vec<LedgerEntryView> = raw.into_iter().map(Into::into).collect();
+
+        // 3. Store into cache (fire-and-forget)
+        if let Some(pool) = &self.redis {
+            if let Ok(mut conn) = pool.get().await {
+                let _res: Result<(), _> = conn
+                    .set_ex(
+                        &key,
+                        serde_json::to_string(&views).unwrap_or_default(),
+                        CACHE_TTL_SECONDS,
+                    )
+                    .await;
+            }
+        }
+
+        Ok(views)
+    }
+}
+
+// ---------- HTTP Handler ----------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct PathParams {
+    account_id: Uuid,
+}
+
+/// GET /v1/accounts/{account_id}/ledger-entries
+#[get("/v1/accounts/{account_id}/ledger-entries")]
+async fn ledger_entries_handler<R: LedgerEntryRepository + 'static>(
+    user: AuthenticatedUser,
+    path: web::Path<PathParams>,
+    query: Query<PageParams>,
+    service: Data<LedgerEntryService<R>>,
+) -> Result<impl Responder, ActixError> {
+    let account_id = path.into_inner().account_id;
+    info!(
+        "User {} querying ledger for account {account_id}",
+        user.user_id
+    );
+
+    let data = service
+        .query_entries(user.tenant_id, account_id, &query)
+        .await?;
+
+    Ok(Json(data))
+}
+
+// ---------- Module Factory --------------------------------------------------
+
+/// Helper to build Actix app data for this module.
+///
+/// In production the repository + redis pool would be provided by the main
+/// application wiring. Here we create defaults for completeness.
+pub fn module_config(cfg: &mut web::ServiceConfig) {
+    // Seed some dummy ledger entries
+    let now = Utc::now();
+    let seed_data = (0..1000)
+        .map(|i| LedgerEntry {
+            id: Uuid::new_v4(),
+            account_id: Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap(),
+            amount_cents: (i as i64) * 100,
+            currency: "USD".to_owned(),
+            created_at: now - chrono::Duration::seconds(i * 60),
+            description: format!("Seed entry {i}"),
+        })
+        .collect();
+
+    let repo = MemoryLedgerRepository::new(seed_data);
+
+    // Optional redis pool (disabled if REDIS_URL missing)
+    let redis_pool = std::env::var("REDIS_URL")
+        .ok()
+        .and_then(|url| {
+            RedisConfig::from_url(url)
+                .map(|cfg| cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1)))
+                .transpose()
+                .ok()
+                .flatten()
+        });
+
+    let service = LedgerEntryService::new(repo, redis_pool);
+
+    cfg.app_data(Data::new(service));
+    cfg.service(ledger_entries_handler::<MemoryLedgerRepository>);
+}
+```

@@ -1,0 +1,406 @@
+```rust
+//! module_12
+//!
+//! “Pulse Engine”—the real-time, event-stream execution core.
+//!
+//! Responsibilities
+//!  • Subscribe to Kafka topics, deserialize social events, and run them through a pluggable
+//!    enrichment + analysis pipeline (Strategy Pattern).
+//!  • Perform synchronous data-quality checks before publishing enriched events downstream.
+//!  • Surface rich telemetry via `tracing` and expose Prometheus metrics.
+//!  • Run scheduled batch aggregations (e.g. influencer graph refresh) without blocking the
+//!    hot path.
+//!
+//! This file is intentionally self-contained so the crate can expose it as
+//! `chirp_pulse::pulse_engine` for both binary and library users.
+//
+// === External Crates =========================================================
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
+use rdkafka::{
+    consumer::{CommitMode, Consumer, StreamConsumer},
+    message::{BorrowedMessage, OwnedHeaders},
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Message,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{mpsc, oneshot, RwLock},
+    task::JoinHandle,
+    time,
+};
+use tracing::{debug, error, info, instrument, span, Level};
+
+// === Type Definitions ========================================================
+
+/// Raw event ingested from social network firehoses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialEvent {
+    pub id: String,
+    pub network: String,
+    pub author: String,
+    pub payload: String,
+    pub created_at: DateTime<Utc>,
+    pub metadata: HashMap<String, String>,
+}
+
+/// Result emitted by an `Analyzer` implementation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisResult {
+    pub event_id: String,
+    pub tags: Vec<String>,
+    pub sentiment_score: f32,
+    pub extra: HashMap<String, String>,
+    pub analyzed_at: DateTime<Utc>,
+}
+
+// === Error Handling ==========================================================
+
+#[derive(Error, Debug)]
+pub enum PulseError {
+    #[error("kafka error: {0}")]
+    Kafka(#[from] rdkafka::error::KafkaError),
+
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("analyzer `{0}` not found")]
+    AnalyzerNotFound(String),
+
+    #[error("data-quality violation: {0}")]
+    DataQuality(String),
+
+    #[error("channel closed")]
+    ChannelClosed,
+}
+
+// === Data-Quality Checks =====================================================
+
+/// Each check returns `Ok(())` on pass or a `PulseError::DataQuality` on fail.
+#[async_trait]
+pub trait DataQualityChecker: Send + Sync {
+    async fn check(&self, event: &SocialEvent) -> Result<(), PulseError>;
+}
+
+/// Built-in checker that ensures required metadata keys are present.
+pub struct MetadataPresenceChecker {
+    required_keys: Vec<&'static str>,
+}
+
+impl MetadataPresenceChecker {
+    pub fn new(required_keys: Vec<&'static str>) -> Self {
+        Self { required_keys }
+    }
+}
+
+#[async_trait]
+impl DataQualityChecker for MetadataPresenceChecker {
+    async fn check(&self, event: &SocialEvent) -> Result<(), PulseError> {
+        for &key in &self.required_keys {
+            if !event.metadata.contains_key(key) {
+                return Err(PulseError::DataQuality(format!(
+                    "missing metadata key: {key}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+// === Analyzer Strategy Pattern ==============================================
+
+#[async_trait]
+pub trait Analyzer: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    async fn analyze(&self, event: &SocialEvent) -> Result<AnalysisResult, PulseError>;
+}
+
+/// Simple rule-based sentiment analyzer (placeholder for ML model).
+pub struct RuleBasedSentiment;
+
+#[async_trait]
+impl Analyzer for RuleBasedSentiment {
+    fn name(&self) -> &'static str {
+        "rule_based_sentiment"
+    }
+
+    async fn analyze(&self, event: &SocialEvent) -> Result<AnalysisResult, PulseError> {
+        // Toy implementation: positive if “love”, negative if “hate”, neutral otherwise.
+        let mut score = 0.0;
+        let lowercase = event.payload.to_lowercase();
+        if lowercase.contains("love") {
+            score = 0.8;
+        } else if lowercase.contains("hate") {
+            score = -0.8;
+        }
+
+        Ok(AnalysisResult {
+            event_id: event.id.clone(),
+            tags: vec![],
+            sentiment_score: score,
+            extra: HashMap::new(),
+            analyzed_at: Utc::now(),
+        })
+    }
+}
+
+// === Plugin Registry =========================================================
+
+/// Registry is runtime-mutable to allow hot-swapping analyzers without downtime.
+#[derive(Default, Debug)]
+pub struct AnalyzerRegistry {
+    inner: DashMap<String, Arc<dyn Analyzer>>,
+}
+
+impl AnalyzerRegistry {
+    pub fn register(&self, analyzer: Arc<dyn Analyzer>) {
+        self.inner.insert(analyzer.name().into(), analyzer);
+    }
+
+    pub fn unregister<S: AsRef<str>>(&self, name: S) -> Option<Arc<dyn Analyzer>> {
+        self.inner.remove(name.as_ref()).map(|(_, v)| v)
+    }
+
+    pub fn get<S: AsRef<str>>(&self, name: S) -> Option<Arc<dyn Analyzer>> {
+        self.inner.get(name.as_ref()).map(|r| r.value().clone())
+    }
+}
+
+// === Scheduler (Batch Tasks) ================================================
+
+/// Message sent to the scheduler to register periodic jobs.
+struct ScheduleMsg {
+    interval: Duration,
+    task: Box<dyn Fn() -> JoinHandle<()> + Send + Sync>,
+}
+
+pub struct Scheduler {
+    tx: mpsc::UnboundedSender<ScheduleMsg>,
+}
+
+impl Scheduler {
+    pub fn start() -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ScheduleMsg>();
+        tokio::spawn(async move {
+            // Keep a list of running intervals.
+            let mut jobs = Vec::<JoinHandle<()>>::new();
+            while let Some(msg) = rx.recv().await {
+                let ScheduleMsg { interval, task } = msg;
+                let handle = tokio::spawn(async move {
+                    let mut ticker = time::interval(interval);
+                    loop {
+                        ticker.tick().await;
+                        task().await;
+                    }
+                });
+                jobs.push(handle);
+            }
+            // Channel closed ‑> stop all jobs
+            for h in jobs {
+                h.abort();
+            }
+        });
+
+        Self { tx }
+    }
+
+    /// Spawn a recurring task with the given interval.
+    pub fn schedule<F>(&self, interval: Duration, task: F) -> Result<(), PulseError>
+    where
+        F: Fn() -> JoinHandle<()> + Send + Sync + 'static,
+    {
+        self.tx
+            .send(ScheduleMsg {
+                interval,
+                task: Box::new(task),
+            })
+            .map_err(|_| PulseError::ChannelClosed)
+    }
+}
+
+// === Kafka Config Helpers ====================================================
+
+fn build_consumer(group_id: &str, brokers: &str, topic: &str) -> Result<StreamConsumer, PulseError> {
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("group.id", group_id)
+        .set("bootstrap.servers", brokers)
+        .set("enable.partition.eof", "false")
+        .set("enable.auto.commit", "false")
+        .create()?;
+    consumer.subscribe(&[topic])?;
+    Ok(consumer)
+}
+
+fn build_producer(brokers: &str) -> Result<FutureProducer, PulseError> {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()?;
+    Ok(producer)
+}
+
+// === Pulse Engine (Core Loop) ===============================================
+
+pub struct PulseEngine {
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+    analyzer_registry: AnalyzerRegistry,
+    dq_checkers: Vec<Arc<dyn DataQualityChecker>>,
+    shutdown_rx: oneshot::Receiver<()>,
+}
+
+impl PulseEngine {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new(
+        consumer_group: &str,
+        brokers: &str,
+        input_topic: &str,
+        analyzer_registry: AnalyzerRegistry,
+        dq_checkers: Vec<Arc<dyn DataQualityChecker>>,
+        shutdown_rx: oneshot::Receiver<()>,
+    ) -> Result<Self, PulseError> {
+        Ok(Self {
+            consumer: build_consumer(consumer_group, brokers, input_topic)?,
+            producer: build_producer(brokers)?,
+            analyzer_registry,
+            dq_checkers,
+            shutdown_rx,
+        })
+    }
+
+    /// Blocking loop—call from a dedicated task.
+    #[instrument(skip(self))]
+    pub async fn run(mut self) -> Result<(), PulseError> {
+        let mut message_stream = self.consumer.stream();
+        loop {
+            select! {
+                _ = &mut self.shutdown_rx => {
+                    info!("pulse engine shutting down (signal received)");
+                    break;
+                }
+                maybe_msg = message_stream.next() => {
+                    match maybe_msg {
+                        Some(Ok(msg)) => {
+                            let span = span!(Level::DEBUG, "process_event", offset = msg.offset());
+                            let _guard = span.enter();
+                            if let Err(e) = self.process_message(msg).await {
+                                error!(error = %e, "failed to process message");
+                            }
+                        }
+                        Some(Err(e)) => {
+                            error!(error = %e, "kafka error");
+                        }
+                        None => {
+                            debug!("kafka stream ended");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn process_message(&self, msg: BorrowedMessage<'_>) -> Result<(), PulseError> {
+        let payload = msg.payload().ok_or_else(|| {
+            PulseError::DataQuality("empty payload".to_string())
+        })?;
+        let event: SocialEvent = serde_json::from_slice(payload)?;
+
+        // 1) Data-quality checks
+        for checker in &self.dq_checkers {
+            checker.check(&event).await?;
+        }
+
+        // 2) Analyzer dispatch
+        let analyzer = self
+            .analyzer_registry
+            .get("rule_based_sentiment") // default analyzer; could be dynamic per event
+            .ok_or_else(|| PulseError::AnalyzerNotFound("rule_based_sentiment".into()))?;
+
+        let analysis = analyzer.analyze(&event).await?;
+
+        // 3) Publish downstream
+        let out_topic = "social.events.enriched";
+        let record = FutureRecord::to(out_topic)
+            .key(&analysis.event_id)
+            .payload(&serde_json::to_vec(&analysis)?)
+            .headers(OwnedHeaders::new().add("analyzer", analyzer.name()));
+
+        // Fire-and-forget with timeout
+        let produce_res = self.producer.send(record, Duration::from_secs(0)).await;
+        if let Err((e, _)) = produce_res {
+            error!(error = %e, "failed to produce enriched event");
+        }
+
+        // 4) Commit offset
+        self.consumer.commit_message(&msg, CommitMode::Async)?;
+
+        Ok(())
+    }
+}
+
+// === Demo Entrypoint (can be disabled in lib mode) ===========================
+
+#[cfg(any(feature = "standalone", test))]
+#[tokio::main]
+async fn main() -> Result<(), PulseError> {
+    // Initialize tracing subscriber for demo
+    tracing_subscriber::fmt::init();
+
+    // Graceful-shutdown channel
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    // Registry with a single analyzer
+    let registry = {
+        let reg = AnalyzerRegistry::default();
+        reg.register(Arc::new(RuleBasedSentiment));
+        reg
+    };
+
+    // Data-quality checkers
+    let dq_checkers: Vec<Arc<dyn DataQualityChecker>> = vec![
+        Arc::new(MetadataPresenceChecker::new(vec!["lang", "source"])),
+    ];
+
+    // Kick off scheduler for a dummy batch job
+    let scheduler = Scheduler::start();
+    scheduler.schedule(Duration::from_secs(60), || {
+        tokio::spawn(async {
+            info!("running scheduled influencer graph aggregation");
+            // ... real aggregation code here ...
+            time::sleep(Duration::from_secs(2)).await;
+            info!("aggregation finished");
+        })
+    })?;
+
+    // Spin up the engine
+    let engine = PulseEngine::new(
+        "pulse-engine",
+        "localhost:9092",
+        "social.raw",
+        registry,
+        dq_checkers,
+        shutdown_rx,
+    )
+    .await?;
+
+    // Run until Ctrl-C
+    let engine_handle = tokio::spawn(engine.run());
+    tokio::signal::ctrl_c().await.expect("failed to listen for ctrl-c");
+    shutdown_tx.send(()).ok();
+
+    engine_handle.await??;
+    Ok(())
+}
+```

@@ -1,0 +1,367 @@
+```rust
+//! src/module_18.rs
+//! ----------------------------------------------------------
+//! Adaptive retraining observer for VisuTility Orchestrator.
+//!
+//! This module listens to real-time model-quality metrics that are
+//! published by the Model-Monitoring layer (Subject) and triggers a
+//! re-training job through the Model-Ops layer whenever sustained
+//! degradation is detected.  It encapsulates an Observer pattern and
+//! is designed to run as a long-lived async task.
+//!
+//! High-level flow
+//! 1. `ModelMonitor` publishes `ModelMetricEvent`s on a multi-producer,
+//!    single-consumer channel.
+//! 2. `AdaptiveRetrainingObserver` consumes the events, updates a
+//!    rolling window per (model, metric) pair.
+//! 3. When a window shows statistically significant degradation
+//!    (e.g., average accuracy falls below `threshold` for at least
+//!    `min_consecutive_failures` windows), the observer triggers a
+//!    retraining job via the `RetrainService`.
+//!
+//! Error handling is performed with `thiserror` and retrials are
+//! governed by an exponential back-off to avoid thundering-herds.
+//!
+//! ----------------------------------------------------------
+
+#![allow(clippy::module_name_repetitions)]
+
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
+
+use chrono::{DateTime, Utc};
+use crossbeam_channel::{Receiver, RecvError};
+use governor::{
+    clock::DefaultClock,
+    state::{InMemoryState, NotKeyed},
+    Quota, RateLimiter,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    sync::Mutex,
+    task,
+    time::{sleep, Instant},
+};
+
+/// Type alias for model identifiers used throughout the platform.
+pub type ModelId = String;
+
+/// A single metric observation emitted by `ModelMonitor`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelMetricEvent {
+    pub model_id: ModelId,
+    pub metric_name: String,
+    pub value: f64,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Trait exposing the capability to launch a retraining job for a given model.
+#[async_trait::async_trait]
+pub trait RetrainService: Send + Sync {
+    /// Trigger a retraining job and return a retrain ticket / job-id.
+    async fn trigger_retraining(
+        &self,
+        model_id: &ModelId,
+        reason: &str,
+    ) -> Result<RetrainTicket, RetrainServiceError>;
+}
+
+/// Simple DTO returned when a retraining job is successfully queued.
+#[derive(Debug, Clone)]
+pub struct RetrainTicket {
+    pub job_id: String,
+    pub queued_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Error)]
+pub enum RetrainServiceError {
+    #[error("upstream service unavailable: {0}")]
+    Unavailable(String),
+    #[error("job submission failed: {0}")]
+    SubmissionFailed(String),
+    #[error("invalid parameters: {0}")]
+    InvalidInput(String),
+    #[error("unknown error: {0}")]
+    Unknown(String),
+}
+
+/// Configuration knobs for the adaptive-retraining logic.
+#[derive(Debug, Clone)]
+pub struct RetrainConfig {
+    /// Size of the rolling window per model/metric.
+    pub window_size: usize,
+    /// Minimum consecutive failing windows before retraining fires.
+    pub min_consecutive_failures: usize,
+    /// Threshold below which metric value is considered degraded.
+    pub threshold: f64,
+    /// Cool-down period between retraining jobs for the same model.
+    pub cooldown: Duration,
+    /// Maximum number of retraining jobs per model per hour.
+    pub max_per_hour: u32,
+}
+
+impl Default for RetrainConfig {
+    fn default() -> Self {
+        Self {
+            window_size: 30,
+            min_consecutive_failures: 3,
+            threshold: 0.80,
+            cooldown: Duration::from_secs(60 * 30), // 30 minutes
+            max_per_hour: 3,
+        }
+    }
+}
+
+/// Error type propagated by `AdaptiveRetrainingObserver`.
+#[derive(Debug, Error)]
+pub enum ObserverError {
+    #[error("channel receive error: {0}")]
+    ChannelReceive(#[from] RecvError),
+    #[error("retrain service error: {0}")]
+    RetrainService(#[from] RetrainServiceError),
+    #[error("internal mutex error: {0}")]
+    PoisonedLock(String),
+}
+
+/// Holds per-model monitoring state needed to decide when to retrain.
+#[derive(Debug)]
+struct ModelState {
+    /// Deque storing most recent metric values.
+    window: VecDeque<f64>,
+    /// Number of consecutive windows below threshold.
+    consecutive_failures: usize,
+    /// Last retrain time to enforce cool-down.
+    last_retrain: Option<Instant>,
+    /// Rate-limiter to cap retraining frequency.
+    limiter: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
+}
+
+impl ModelState {
+    fn new(cfg: &RetrainConfig) -> Self {
+        Self {
+            window: VecDeque::with_capacity(cfg.window_size),
+            consecutive_failures: 0,
+            last_retrain: None,
+            limiter: RateLimiter::direct(Quota::per_hour(cfg.max_per_hour.into())),
+        }
+    }
+}
+
+/// Observer responsible for handling `ModelMetricEvent`s.
+pub struct AdaptiveRetrainingObserver<S>
+where
+    S: RetrainService + 'static,
+{
+    receiver: Receiver<ModelMetricEvent>,
+    service: Arc<S>,
+    cfg: RetrainConfig,
+    /// A map storing per-model state protected by `Mutex` for interior mutability.
+    state: Arc<Mutex<HashMap<ModelId, ModelState>>>,
+}
+
+impl<S> AdaptiveRetrainingObserver<S>
+where
+    S: RetrainService + 'static,
+{
+    pub fn new(receiver: Receiver<ModelMetricEvent>, service: Arc<S>, cfg: RetrainConfig) -> Self {
+        Self {
+            receiver,
+            service,
+            cfg,
+            state: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Launch the observer loop as a background tokio task.
+    /// Returns a task handle that can be `await`ed or `abort`ed.
+    pub fn spawn(self) -> task::JoinHandle<()> {
+        task::spawn(async move {
+            if let Err(e) = self.run().await {
+                tracing::error!(error = %e, "AdaptiveRetrainingObserver terminated unexpectedly");
+            }
+        })
+    }
+
+    async fn run(self) -> Result<(), ObserverError> {
+        loop {
+            let event = self.receiver.recv()?; // Blocking receive (MPSC)
+            self.process_event(event).await?;
+        }
+    }
+
+    async fn process_event(&self, event: ModelMetricEvent) -> Result<(), ObserverError> {
+        if event.metric_name != "accuracy" {
+            // For brevity, only monitor accuracy; extend via config if needed.
+            return Ok(());
+        }
+
+        let mut state_guard = self
+            .state
+            .lock()
+            .await
+            .map_err(|e| ObserverError::PoisonedLock(e.to_string()))?;
+        let state_entry = state_guard
+            .entry(event.model_id.clone())
+            .or_insert_with(|| ModelState::new(&self.cfg));
+
+        // Update rolling window
+        if state_entry.window.len() == self.cfg.window_size {
+            state_entry.window.pop_front();
+        }
+        state_entry.window.push_back(event.value);
+
+        // Determine whether window is full
+        if state_entry.window.len() < self.cfg.window_size {
+            return Ok(()); // Insufficient data
+        }
+
+        let avg: f64 = state_entry.window.iter().copied().sum::<f64>()
+            / self.cfg.window_size as f64;
+
+        if avg < self.cfg.threshold {
+            state_entry.consecutive_failures += 1;
+            tracing::debug!(
+                model_id = %event.model_id,
+                consecutive_failures = state_entry.consecutive_failures,
+                "Average accuracy below threshold ({} < {})",
+                avg,
+                self.cfg.threshold
+            );
+        } else {
+            state_entry.consecutive_failures = 0;
+        }
+
+        // Should we trigger a retrain?
+        if state_entry.consecutive_failures >= self.cfg.min_consecutive_failures {
+            // Check cool-down
+            let now = Instant::now();
+            if let Some(last) = state_entry.last_retrain {
+                if now.duration_since(last) < self.cfg.cooldown {
+                    tracing::info!(
+                        model_id = %event.model_id,
+                        "Retrain suppressed due to cooldown window"
+                    );
+                    return Ok(());
+                }
+            }
+
+            // Check rate-limit
+            if state_entry.limiter.check().is_ok() {
+                // All good—trigger retrain
+                drop(state_guard); // Release lock before awaiting in async call
+                self.trigger_retrain(&event.model_id, avg).await?;
+                // Re-lock to mutate after retrain success
+                let mut state_guard = self
+                    .state
+                    .lock()
+                    .await
+                    .map_err(|e| ObserverError::PoisonedLock(e.to_string()))?;
+                let state_entry = state_guard.get_mut(&event.model_id).unwrap();
+                state_entry.last_retrain = Some(now);
+                state_entry.consecutive_failures = 0;
+            } else {
+                tracing::warn!(
+                    model_id = %event.model_id,
+                    "Retrain denied by rate-limiter"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn trigger_retrain(&self, model_id: &ModelId, avg_accuracy: f64) -> Result<(), ObserverError> {
+        let reason = format!(
+            "Average accuracy {} fell below threshold {}",
+            avg_accuracy, self.cfg.threshold
+        );
+        tracing::info!(model_id = %model_id, %reason, "Submitting retrain job");
+        let ticket = self
+            .service
+            .trigger_retraining(model_id, &reason)
+            .await
+            .map_err(ObserverError::RetrainService)?;
+
+        tracing::info!(
+            model_id = %model_id,
+            job_id = %ticket.job_id,
+            queued_at = %ticket.queued_at,
+            "Retrain job successfully queued"
+        );
+        Ok(())
+    }
+}
+
+// ----------------------------------------------------------
+// Dummy implementation for local testing / examples
+// ----------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DummyService {
+        counter: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RetrainService for DummyService {
+        async fn trigger_retraining(
+            &self,
+            _model_id: &ModelId,
+            _reason: &str,
+        ) -> Result<RetrainTicket, RetrainServiceError> {
+            let idx = self.counter.fetch_add(1, Ordering::SeqCst);
+            Ok(RetrainTicket {
+                job_id: format!("dummy-{idx}"),
+                queued_at: Utc::now(),
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observer_triggers_retrain_after_degradation() {
+        let (tx, rx) = bounded(100);
+        let service = Arc::new(DummyService {
+            counter: AtomicUsize::new(0),
+        });
+
+        let cfg = RetrainConfig {
+            window_size: 5,
+            min_consecutive_failures: 1,
+            threshold: 0.9,
+            cooldown: Duration::from_secs(0),
+            max_per_hour: 10,
+        };
+
+        let observer = AdaptiveRetrainingObserver::new(rx, service.clone(), cfg);
+        let handle = observer.spawn();
+
+        // Send 5 low-accuracy events to fill the window and trigger retrain
+        for _ in 0..5 {
+            tx.send(ModelMetricEvent {
+                model_id: "model-1".into(),
+                metric_name: "accuracy".into(),
+                value: 0.5,
+                timestamp: Utc::now(),
+            })
+            .unwrap();
+        }
+
+        // Wait a bit for async task to process
+        sleep(Duration::from_millis(300)).await;
+
+        // Validate retrain was triggered
+        assert_eq!(service.counter.load(Ordering::SeqCst), 1);
+
+        // Clean up
+        handle.abort();
+    }
+}
+```

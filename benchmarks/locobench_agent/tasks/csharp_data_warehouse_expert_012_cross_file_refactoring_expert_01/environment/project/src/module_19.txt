@@ -1,0 +1,309 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.Kinesis;
+using Amazon.Kinesis.Model;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformations
+{
+    #region Dispatcher
+
+    /// <summary>
+    /// Orchestrates run-time selection of <see cref="ITransformationStrategy"/> instances and executes
+    /// them in parallel against a batch of <see cref="EventEnvelope"/> messages.
+    /// </summary>
+    public sealed class TransformationDispatcher
+    {
+        private readonly IReadOnlyCollection<ITransformationStrategy> _strategies;
+        private readonly IDeadLetterSink _deadLetterSink;
+        private readonly ILogger<TransformationDispatcher> _logger;
+
+        public TransformationDispatcher(
+            IEnumerable<ITransformationStrategy> strategies,
+            IDeadLetterSink deadLetterSink,
+            ILogger<TransformationDispatcher> logger)
+        {
+            _strategies     = strategies?.ToArray() ?? throw new ArgumentNullException(nameof(strategies));
+            if (!_strategies.Any())
+            {
+                throw new ArgumentException("At least one transformation strategy must be registered.", nameof(strategies));
+            }
+
+            _deadLetterSink = deadLetterSink ?? throw new ArgumentNullException(nameof(deadLetterSink));
+            _logger         = logger          ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        /// <summary>
+        /// Applies the matching strategy to every event in <paramref name="batch"/>.  
+        /// Events that fail transformation are shunted to the configured DLQ sink.
+        /// </summary>
+        public async Task<IReadOnlyCollection<KpiRecord>> TransformBatchAsync(
+            IReadOnlyCollection<EventEnvelope> batch,
+            CancellationToken                    ct = default)
+        {
+            if (batch is null) throw new ArgumentNullException(nameof(batch));
+
+            var output = new List<KpiRecord>(batch.Count);
+            var gate   = new object();
+
+            await Parallel.ForEachAsync(batch, ct, async (envelope, token) =>
+            {
+                try
+                {
+                    var strategy = _strategies.FirstOrDefault(s => s.CanHandle(envelope))
+                                   ?? throw new UnsupportedEventException(envelope);
+
+                    var kpi = await strategy.TransformAsync(envelope, token).ConfigureAwait(false);
+
+                    if (kpi is not null)
+                    {
+                        lock (gate) { output.Add(kpi); }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to transform event {EventId}", envelope.Id);
+                    await _deadLetterSink.PublishAsync(envelope, ex, token).ConfigureAwait(false);
+                }
+            });
+
+            return output.AsReadOnly();
+        }
+    }
+
+    #endregion
+
+    #region Contracts & Records
+
+    /// <summary>Canonical wrapper for all inbound event messages.</summary>
+    public sealed record EventEnvelope(
+        string        Id,
+        string        EventType,
+        DateTimeOffset Timestamp,
+        JsonElement   Payload);
+
+    /// <summary>A normalized KPI record to be persisted to the warehouse.</summary>
+    public sealed record KpiRecord(
+        string                     Name,
+        double                     Value,
+        string                     Unit,
+        DateTimeOffset             Timestamp,
+        IReadOnlyDictionary<string,string> Dimensions);
+
+    /// <summary>Pluggable transformation contract.</summary>
+    public interface ITransformationStrategy
+    {
+        bool  CanHandle  (EventEnvelope envelope);
+        Task<KpiRecord?> TransformAsync(EventEnvelope envelope, CancellationToken ct);
+    }
+
+    /// <summary>Abstraction for writing failed events to a dead-letter queue.</summary>
+    public interface IDeadLetterSink
+    {
+        Task PublishAsync(EventEnvelope envelope, Exception ex, CancellationToken ct = default);
+    }
+
+    #endregion
+
+    #region DLQ Implementation
+
+    /// <summary>
+    /// Writes failed events to an Amazon Kinesis stream for replay or inspection.
+    /// </summary>
+    public sealed class KinesisDeadLetterSink : IDeadLetterSink
+    {
+        private const int MaxPayloadBytes = 1_000_000; // 1 MB Kinesis hard-limit (rounded down)
+
+        private readonly IAmazonKinesis               _kinesis;
+        private readonly string                       _streamName;
+        private readonly ILogger<KinesisDeadLetterSink> _logger;
+
+        public KinesisDeadLetterSink(
+            IAmazonKinesis               kinesis,
+            string                       streamName,
+            ILogger<KinesisDeadLetterSink> logger)
+        {
+            _kinesis    = kinesis                      ?? throw new ArgumentNullException(nameof(kinesis));
+            _streamName = string.IsNullOrWhiteSpace(streamName)
+                            ? throw new ArgumentException("Stream name must be supplied.", nameof(streamName))
+                            : streamName;
+            _logger     = logger                       ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        public async Task PublishAsync(EventEnvelope envelope, Exception ex, CancellationToken ct = default)
+        {
+            var dlqPayload = new
+            {
+                envelope.Id,
+                envelope.EventType,
+                envelope.Timestamp,
+                envelope.Payload,
+                Error       = ex.ToString(),
+                PublishedAt = DateTimeOffset.UtcNow
+            };
+
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(dlqPayload);
+
+            if (bytes.Length > MaxPayloadBytes)
+            {
+                _logger.LogWarning(
+                    "DLQ payload exceeds the 1 MB limit and will be discarded. EventId={EventId}",
+                    envelope.Id);
+                return;
+            }
+
+            var request = new PutRecordRequest
+            {
+                StreamName   = _streamName,
+                PartitionKey = envelope.Id,
+                Data         = new MemoryStream(bytes)
+            };
+
+            await _kinesis.PutRecordAsync(request, ct).ConfigureAwait(false);
+        }
+    }
+
+    #endregion
+
+    #region Strategy Implementations
+
+    /// <summary>
+    /// Computes the ratio of uninterrupted focus-time to total work-time
+    /// from raw calendar events.
+    /// </summary>
+    public sealed class FocusTimeStrategy : ITransformationStrategy
+    {
+        private readonly ILogger<FocusTimeStrategy> _logger;
+
+        public FocusTimeStrategy(ILogger<FocusTimeStrategy> logger) =>
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+        public bool CanHandle(EventEnvelope envelope) =>
+            string.Equals(envelope.EventType, "calendar.event", StringComparison.OrdinalIgnoreCase);
+
+        public Task<KpiRecord?> TransformAsync(EventEnvelope envelope, CancellationToken ct)
+        {
+            try
+            {
+                var payload = envelope.Payload;
+
+                if (!payload.TryGetProperty("meetingLengthMinutes", out var meetingProp) ||
+                    !payload.TryGetProperty("workdayLengthMinutes", out var workdayProp))
+                {
+                    throw new InvalidEventSchemaException(envelope.Id, "Missing meeting/workday duration.");
+                }
+
+                var meetingMinutes = meetingProp.GetInt32();
+                var workdayMinutes = workdayProp.GetInt32();
+
+                var ratio = (double)(workdayMinutes - meetingMinutes) / workdayMinutes;
+
+                return Task.FromResult<KpiRecord?>(new KpiRecord(
+                    Name       : "focus_time_ratio",
+                    Value      : Math.Round(ratio, 4),
+                    Unit       : "ratio",
+                    Timestamp  : envelope.Timestamp,
+                    Dimensions : new Dictionary<string, string>
+                    {
+                        ["event_id"] = envelope.Id
+                    }));
+            }
+            catch (Exception ex) when (ex is not InvalidEventSchemaException)
+            {
+                _logger.LogError(ex, "FocusTime transformation failed for EventId={EventId}", envelope.Id);
+                throw;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Calculates the monetary cost of meetings based on duration and attendee count.
+    /// </summary>
+    public sealed class MeetingCostStrategy : ITransformationStrategy
+    {
+        private readonly ILogger<MeetingCostStrategy> _logger;
+
+        // TODO: Inject via configuration / HR API lookup.
+        private const double AverageSalaryPerMinuteUsd = 1.00;
+
+        public MeetingCostStrategy(ILogger<MeetingCostStrategy> logger) =>
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+        public bool CanHandle(EventEnvelope envelope) =>
+            string.Equals(envelope.EventType, "meeting.analytics", StringComparison.OrdinalIgnoreCase);
+
+        public Task<KpiRecord?> TransformAsync(EventEnvelope envelope, CancellationToken ct)
+        {
+            try
+            {
+                var payload = envelope.Payload;
+
+                if (!payload.TryGetProperty("attendeeCount",   out var attendeeProp) ||
+                    !payload.TryGetProperty("durationMinutes", out var durationProp))
+                {
+                    throw new InvalidEventSchemaException(envelope.Id, "Missing attendee count/duration.");
+                }
+
+                var attendees       = attendeeProp.GetInt32();
+                var durationMinutes = durationProp.GetInt32();
+
+                var cost = attendees * durationMinutes * AverageSalaryPerMinuteUsd;
+
+                return Task.FromResult<KpiRecord?>(new KpiRecord(
+                    Name       : "meeting_cost_usd",
+                    Value      : cost,
+                    Unit       : "USD",
+                    Timestamp  : envelope.Timestamp,
+                    Dimensions : new Dictionary<string, string>
+                    {
+                        ["attendees"] = attendees.ToString(),
+                        ["event_id"]  = envelope.Id
+                    }));
+            }
+            catch (Exception ex) when (ex is not InvalidEventSchemaException)
+            {
+                _logger.LogError(ex, "MeetingCost transformation failed for EventId={EventId}", envelope.Id);
+                throw;
+            }
+        }
+    }
+
+    #endregion
+
+    #region Exceptions
+
+    /// <summary>
+    /// Thrown when no strategy claims responsibility for a given event.
+    /// </summary>
+    public sealed class UnsupportedEventException : Exception
+    {
+        public EventEnvelope Envelope { get; }
+
+        public UnsupportedEventException(EventEnvelope envelope)
+            : base($"No transformation strategy registered for eventType '{envelope.EventType}'.")
+        {
+            Envelope = envelope;
+        }
+    }
+
+    /// <summary>
+    /// Raised when an event payload violates its expected contract.
+    /// </summary>
+    public sealed class InvalidEventSchemaException : Exception
+    {
+        public string EventId { get; }
+
+        public InvalidEventSchemaException(string eventId, string details)
+            : base($"Event '{eventId}' has an invalid schema: {details}")
+        {
+            EventId = eventId;
+        }
+    }
+
+    #endregion
+}

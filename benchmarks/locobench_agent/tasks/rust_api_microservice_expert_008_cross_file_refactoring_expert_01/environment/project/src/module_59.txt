@@ -1,0 +1,418 @@
+```rust
+//! src/module_59.rs
+//!
+//! High-level, cache-aware query service for Ledger Entries.
+//!
+//! This module demonstrates how the service layer orchestrates:
+//!   • authentication context (multi-tenant, role aware)  
+//!   • request validation (pagination + filters)  
+//!   • repository access (PostgreSQL)  
+//!   • optional response-level caching (Redis)  
+//!   • structured logging and rich error envelopes  
+//!
+//! In production the `LedgerRepository` would live in a different crate (domain
+//! or infrastructure layer) and be wired via dependency-injection.  For the
+//! sake of a self-contained example, we define a minimal version here.
+
+#![allow(clippy::missing_async)]
+#![allow(clippy::unused_async)]
+#![allow(dead_code)]
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use log::{debug, error, trace};
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use thiserror::Error;
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+/// Tenant-scoped authentication context extracted by the API-Gateway.
+///
+/// Upstream middleware guarantees that requests hitting this service have
+/// already passed JWT validation, rate-limiting, etc.
+#[derive(Debug, Clone)]
+pub struct AuthContext {
+    /// Identifies the tenant within the multi-tenant environment
+    pub tenant_id: Uuid,
+    /// User id for auditing / row-level permissions
+    pub user_id: Uuid,
+    /// Granted scopes (e.g. `["ledgers:read", "ledgers:write"]`)
+    pub scopes: Vec<String>,
+}
+
+/// Compile-time constant for ledger read scope
+const SCOPE_LEDGER_READ: &str = "ledgers:read";
+
+/// Domain DTO returned to the outside world.
+/// View-Models in LedgerLink Nexus always end up serialized to JSON / GraphQL
+/// so we keep them `Serialize`.
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerEntryDto {
+    pub id: Uuid,
+    pub external_ref: String,
+    pub booking_date: DateTime<Utc>,
+    pub debit: f64,
+    pub credit: f64,
+}
+
+/// Pagination parameters validated by `validator` crate.
+#[derive(Debug, Deserialize, Validate, Clone)]
+pub struct PaginationParams {
+    #[validate(range(min = 1))]
+    pub page: u32,
+
+    #[validate(range(min = 10, max = 100))]
+    pub per_page: u32,
+
+    /// Optional sort field; validated separately.
+    pub sort_by: Option<String>,
+
+    /// ASC / DESC (case-insensitive)
+    #[validate(custom = "validate_sort_order")]
+    pub sort_order: Option<String>,
+}
+
+/// Custom validator to make `sort_order` more ergonomic.
+fn validate_sort_order(value: &str) -> Result<(), ValidationError> {
+    match value.to_ascii_uppercase().as_str() {
+        "ASC" | "DESC" => Ok(()),
+        _ => Err(ValidationError::new("invalid_sort_order")),
+    }
+}
+
+/// Paginated container returned by the service.
+#[derive(Debug, Serialize)]
+pub struct PagedResponse<T> {
+    pub items: Vec<T>,
+    pub page: u32,
+    pub per_page: u32,
+    pub total_count: u64,
+}
+
+/// Public error type exposed by this service.
+///
+/// In production this should wire into application-wide error envelopes that
+/// map to HTTP / GraphQL errors.
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("permission denied")]
+    PermissionDenied,
+    #[error("validation failed: {0}")]
+    Validation(String),
+    #[error("persistence failure: {0}")]
+    Repository(String),
+    #[error("cache error: {0}")]
+    Cache(String),
+}
+
+/// Trait hiding our persistence layer.
+///
+/// Real implementation would talk to `sqlx::PgPool`, run strongly-typed
+/// queries, apply row-level security, etc.
+#[async_trait]
+pub trait LedgerRepository: Send + Sync {
+    async fn fetch_entries(
+        &self,
+        tenant_id: Uuid,
+        page: u32,
+        per_page: u32,
+        sort_by: Option<&str>,
+        sort_order: Option<&str>,
+    ) -> Result<(Vec<LedgerEntryDto>, u64), anyhow::Error>;
+}
+
+/// Redis-based response cache.
+///
+/// String key, JSON value.  TTL is set at insertion time.
+#[derive(Clone)]
+pub struct ResponseCache {
+    client: redis::Client,
+    ttl_seconds: usize,
+}
+
+impl ResponseCache {
+    pub fn new(client: redis::Client, ttl_seconds: usize) -> Self {
+        Self {
+            client,
+            ttl_seconds,
+        }
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<String>, ServiceError> {
+        let mut conn = self
+            .client
+            .get_async_connection()
+            .await
+            .map_err(|e| ServiceError::Cache(e.to_string()))?;
+
+        let value: Option<String> = conn
+            .get(key)
+            .await
+            .map_err(|e| ServiceError::Cache(e.to_string()))?;
+
+        Ok(value)
+    }
+
+    async fn set(&self, key: &str, value: &str) -> Result<(), ServiceError> {
+        let mut conn = self
+            .client
+            .get_async_connection()
+            .await
+            .map_err(|e| ServiceError::Cache(e.to_string()))?;
+
+        conn.set_ex(key, value, self.ttl_seconds)
+            .await
+            .map_err(|e| ServiceError::Cache(e.to_string()))?;
+
+        Ok(())
+    }
+}
+
+/// High-level service struct that wires everything together.
+pub struct LedgerEntryQueryService<R: LedgerRepository> {
+    repository: Arc<R>,
+    cache: Option<ResponseCache>,
+}
+
+impl<R: LedgerRepository> LedgerEntryQueryService<R> {
+    pub fn new(repository: Arc<R>, cache: Option<ResponseCache>) -> Self {
+        Self { repository, cache }
+    }
+
+    /// Public façade called by presentation layer (REST/GraphQL).
+    ///
+    /// Steps:
+    ///  1.  Authentication / Scope enforcement
+    ///  2.  Request validation
+    ///  3.  Attempt Redis cache lookup
+    ///  4.  Fallback to repository
+    ///  5.  Serialize + store in cache
+    pub async fn list_entries(
+        &self,
+        auth_ctx: &AuthContext,
+        params: PaginationParams,
+    ) -> Result<PagedResponse<LedgerEntryDto>, ServiceError> {
+        trace!(
+            target: "service.ledger",
+            tenant = %auth_ctx.tenant_id,
+            user = %auth_ctx.user_id,
+            "LedgerEntryQueryService::list_entries invoked"
+        );
+
+        // Step 1 – Check permissions
+        if !auth_ctx.scopes.iter().any(|s| s == SCOPE_LEDGER_READ) {
+            error!(
+                target: "service.ledger",
+                "Permission denied for tenant={} user={}",
+                auth_ctx.tenant_id,
+                auth_ctx.user_id
+            );
+            return Err(ServiceError::PermissionDenied);
+        }
+
+        // Step 2 – Validate pagination params
+        if let Err(e) = params.validate() {
+            return Err(ServiceError::Validation(e.to_string()));
+        }
+
+        // Unique cache key: "tenant::<tenant_id>::ledger::<hash_of_params>"
+        let cache_key = if self.cache.is_some() {
+            let serialized_filter = serde_json::to_string(&params).unwrap_or_else(|_| "{}".into());
+            let digest = blake3::hash(serialized_filter.as_bytes());
+            Some(format!(
+                "tenant::{}::ledger::{}",
+                auth_ctx.tenant_id,
+                digest.to_hex()
+            ))
+        } else {
+            None
+        };
+
+        // Step 3 – Cache lookup
+        if let (Some(cache), Some(ref key)) = (self.cache.as_ref(), cache_key.as_ref()) {
+            if let Some(json) = cache.get(key).await? {
+                debug!(
+                    target: "service.ledger",
+                    "Cache hit for key={}",
+                    key
+                );
+                let cached: PagedResponse<LedgerEntryDto> =
+                    serde_json::from_str(&json).map_err(|e| ServiceError::Cache(e.to_string()))?;
+                return Ok(cached);
+            } else {
+                trace!(
+                    target: "service.ledger",
+                    "Cache miss for key={}",
+                    key
+                );
+            }
+        }
+
+        // Step 4 – Repository call
+        let (items, total_count) = self
+            .repository
+            .fetch_entries(
+                auth_ctx.tenant_id,
+                params.page,
+                params.per_page,
+                params.sort_by.as_deref(),
+                params.sort_order.as_deref(),
+            )
+            .await
+            .map_err(|e| ServiceError::Repository(e.to_string()))?;
+
+        let response = PagedResponse {
+            items,
+            page: params.page,
+            per_page: params.per_page,
+            total_count,
+        };
+
+        // Step 5 – Serialize & store in cache
+        if let (Some(cache), Some(ref key)) = (self.cache.as_ref(), cache_key.as_ref()) {
+            if let Ok(json) = serde_json::to_string(&response) {
+                let _ = cache.set(key, &json).await; // ignoring errors on purpose
+            }
+        }
+
+        Ok(response)
+    }
+}
+
+/* -------------------------------------------------------------------------
+ *  Dummy / mock implementation for repository so the module compiles.
+ * ---------------------------------------------------------------------- */
+
+/// Naïve in-memory repository used for unit tests or dev preview.
+pub struct InMemoryLedgerRepository {
+    data: Vec<LedgerEntryDto>,
+}
+
+impl InMemoryLedgerRepository {
+    pub fn seeded() -> Self {
+        let data = (0..250)
+            .map(|i| LedgerEntryDto {
+                id: Uuid::new_v4(),
+                external_ref: format!("INV-{i:05}"),
+                booking_date: Utc::now(),
+                debit: if i % 2 == 0 { 100.0 } else { 0.0 },
+                credit: if i % 2 == 1 { 100.0 } else { 0.0 },
+            })
+            .collect();
+        Self { data }
+    }
+}
+
+#[async_trait]
+impl LedgerRepository for InMemoryLedgerRepository {
+    async fn fetch_entries(
+        &self,
+        _tenant_id: Uuid,
+        page: u32,
+        per_page: u32,
+        sort_by: Option<&str>,
+        sort_order: Option<&str>,
+    ) -> Result<(Vec<LedgerEntryDto>, u64), anyhow::Error> {
+        // We ignore tenant segregation for demo purposes.
+        let mut entries = self.data.clone();
+
+        // Sorting (only by booking_date or external_ref)
+        if let Some(field) = sort_by {
+            match field {
+                "booking_date" => entries.sort_by_key(|e| e.booking_date),
+                "external_ref" => entries.sort_by(|a, b| a.external_ref.cmp(&b.external_ref)),
+                _ => {}
+            }
+            if let Some(order) = sort_order {
+                if order.eq_ignore_ascii_case("desc") {
+                    entries.reverse();
+                }
+            }
+        }
+
+        let total = entries.len() as u64;
+        let start = ((page - 1) * per_page) as usize;
+        let end = (start + per_page as usize).min(entries.len());
+
+        let slice = if start >= entries.len() {
+            Vec::new()
+        } else {
+            entries[start..end].to_vec()
+        };
+
+        Ok((slice, total))
+    }
+}
+
+/* -------------------------------------------------------------------------
+ *  Unit Test (can be run with `cargo test`)
+ * ---------------------------------------------------------------------- */
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use once_cell::sync::Lazy;
+    use tokio::runtime::Runtime;
+
+    static LOGGER: Lazy<()> = Lazy::new(|| {
+        let _ = env_logger::builder().is_test(true).try_init();
+    });
+
+    #[test]
+    fn pagination_happy_path() {
+        let _ = *LOGGER;
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let repo = Arc::new(InMemoryLedgerRepository::seeded());
+            let service: LedgerEntryQueryService<_> =
+                LedgerEntryQueryService::new(repo, None /* no cache for test */);
+
+            let auth = AuthContext {
+                tenant_id: Uuid::new_v4(),
+                user_id: Uuid::new_v4(),
+                scopes: vec![SCOPE_LEDGER_READ.to_string()],
+            };
+
+            let params = PaginationParams {
+                page: 1,
+                per_page: 25,
+                sort_by: Some("external_ref".into()),
+                sort_order: Some("ASC".into()),
+            };
+
+            let res = service.list_entries(&auth, params).await.unwrap();
+            assert_eq!(res.items.len(), 25);
+            assert_eq!(res.page, 1);
+            assert_eq!(res.total_count, 250);
+        });
+    }
+
+    #[test]
+    fn unauthorized_fails() {
+        let _ = *LOGGER;
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let repo = Arc::new(InMemoryLedgerRepository::seeded());
+            let service: LedgerEntryQueryService<_> =
+                LedgerEntryQueryService::new(repo, None);
+
+            let auth = AuthContext {
+                tenant_id: Uuid::new_v4(),
+                user_id: Uuid::new_v4(),
+                scopes: vec![], // empty
+            };
+
+            let params = PaginationParams {
+                page: 1,
+                per_page: 10,
+                sort_by: None,
+                sort_order: None,
+            };
+
+            let err = service.list_entries(&auth, params).await.unwrap_err();
+            matches!(err, ServiceError::PermissionDenied);
+        });
+    }
+}
+```

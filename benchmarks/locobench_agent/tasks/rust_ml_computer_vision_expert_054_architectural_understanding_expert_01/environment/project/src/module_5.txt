@@ -1,0 +1,329 @@
+```rust
+//! src/module_5.rs
+//! -----------------------------------------------------------------------------
+//! Model‐Monitoring sub-system (Serving Ops layer)
+//!
+//! Responsibilities
+//!  1. Ingest real-time model-performance metrics coming from the Serving layer.
+//!  2. Notify interested parties (e.g. automated-retraining scheduler, Grafana
+//!     dashboard, alerting web-hooks) via a classic Observer Pattern.
+//!  3. Execute pluggable strategies (Strategy Pattern) such as performance-
+//!     degradation detection, concept-drift detection, and canary-rollback.
+//!
+//! The implementation is intentionally self-contained but wired with async
+//! primitives so it can be integrated into Tokio-based orchestration runtimes
+//! that power the rest of the VisuTility Orchestrator code-base.
+//!
+//! -----------------------------------------------------------------------------
+
+// External ─────────────────────────────────────────────────────────────────────
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::sync::{broadcast, RwLock};
+use tracing::{debug, error, info, warn};
+
+// Crate-local ──────────────────────────────────────────────────────────────────
+// (Other internal modules would live in `crate::` but are elided for brevity.)
+
+// Errors ──────────────────────────────────────────────────────────────────────
+
+/// Domain-specific errors for the monitoring sub-system.
+#[derive(Debug, Error)]
+pub enum MonitoringError {
+    #[error("failed to send metric event: {0}")]
+    EventSendError(String),
+
+    #[error("observer execution failed: {0}")]
+    ObserverError(String),
+
+    #[error("broadcast channel closed unexpectedly")]
+    ChannelClosed,
+}
+
+// Core domain types ───────────────────────────────────────────────────────────
+
+/// Uniquely identifies a model instance deployed in production.
+///
+/// The `instance` field allows multiple replicas of the same version
+/// to be tracked independently (e.g. canary deployments, A/B testing).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ModelId {
+    pub name:     String,
+    pub version:  String,
+    pub instance: String,
+}
+
+/// Periodic snapshot of model-level performance metrics.
+///
+/// NOTE: The struct is intentionally serializable because metrics are often
+/// shipped over the network (e.g. gRPC, Web-hooks, Kafka topics).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsSnapshot {
+    pub timestamp: DateTime<Utc>,
+    pub accuracy:  f32,
+    pub precision: f32,
+    pub recall:    f32,
+    pub f1:        f32,
+    /// Any arbitrary KPI can be pushed via the dynamic key/value bag.
+    pub custom:    serde_json::Value,
+}
+
+impl MetricsSnapshot {
+    /// Quickly compute a “macro” score.  Real production code might
+    /// use a weighted sum or more sophisticated composite index.
+    pub fn macro_score(&self) -> f32 {
+        (self.accuracy + self.precision + self.recall + self.f1) / 4.0
+    }
+}
+
+/// Event propagated across the Observer hub.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricEvent {
+    pub model:    ModelId,
+    pub snapshot: MetricsSnapshot,
+}
+
+// Observer / Strategy traits ──────────────────────────────────────────────────
+
+/// Observer Pattern: anything interested in metric updates implements this.
+#[async_trait]
+pub trait MetricObserver: Send + Sync {
+    /// Handle an incoming `MetricEvent`.
+    async fn on_event(&self, event: MetricEvent) -> Result<(), MonitoringError>;
+}
+
+/// Strategy Pattern: decides whether a retraining should be triggered.
+#[async_trait]
+pub trait RetrainStrategy: Send + Sync {
+    /// Invoked every time a new metrics snapshot arrives.  Returns `true`
+    /// if conditions for retraining are met.
+    async fn should_retrain(&self, event: &MetricEvent) -> bool;
+}
+
+// Concrete Strategies ─────────────────────────────────────────────────────────
+
+/// A naive but effective strategy that triggers retraining when
+/// the macro score drops below a fixed threshold.
+pub struct SimpleThresholdStrategy {
+    threshold: f32,
+}
+
+impl SimpleThresholdStrategy {
+    pub fn new(threshold: f32) -> Self {
+        Self { threshold }
+    }
+}
+
+#[async_trait]
+impl RetrainStrategy for SimpleThresholdStrategy {
+    async fn should_retrain(&self, event: &MetricEvent) -> bool {
+        let score = event.snapshot.macro_score();
+        debug!(
+            model      = ?event.model,
+            snapshot   = ?event.snapshot,
+            threshold  = self.threshold,
+            "evaluating retrain strategy"
+        );
+        score < self.threshold
+    }
+}
+
+/// Observer that wires a `RetrainStrategy` into an async callback.
+pub struct RetrainObserver<S>
+where
+    S: RetrainStrategy,
+{
+    strategy: Arc<S>,
+    /// In real deployments this sender could feed a message bus or job queue.
+    retrain_tx: tokio::sync::mpsc::Sender<ModelId>,
+}
+
+impl<S> RetrainObserver<S>
+where
+    S: RetrainStrategy,
+{
+    pub fn new(strategy: Arc<S>, retrain_tx: tokio::sync::mpsc::Sender<ModelId>) -> Self {
+        Self { strategy, retrain_tx }
+    }
+}
+
+#[async_trait]
+impl<S> MetricObserver for RetrainObserver<S>
+where
+    S: RetrainStrategy,
+{
+    async fn on_event(&self, event: MetricEvent) -> Result<(), MonitoringError> {
+        if self.strategy.should_retrain(&event).await {
+            warn!(
+                model    = ?event.model,
+                snapshot = ?event.snapshot,
+                "retrain condition met – sending retrain job to scheduler"
+            );
+            self.retrain_tx
+                .send(event.model.clone())
+                .await
+                .map_err(|e| MonitoringError::ObserverError(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+// Monitoring Hub ──────────────────────────────────────────────────────────────
+
+/// Central hub that owns a broadcast channel and tracks dynamic observers.
+///
+/// The hub itself is cheap to clone and can be shared across async tasks.
+#[derive(Clone)]
+pub struct ModelMonitor {
+    inner: Arc<ModelMonitorInner>,
+}
+
+struct ModelMonitorInner {
+    tx:         broadcast::Sender<MetricEvent>,
+    observers:  RwLock<Vec<Arc<dyn MetricObserver>>>,
+}
+
+impl ModelMonitor {
+    /// Initialize the hub.  Capacity defines the size of the ring-buffer used
+    /// by the broadcast channel; large enough to accommodate normal bursts.
+    pub fn new(capacity: usize) -> Self {
+        let (tx, _rx) = broadcast::channel(capacity);
+        Self {
+            inner: Arc::new(ModelMonitorInner {
+                tx,
+                observers: RwLock::new(Vec::new()),
+            }),
+        }
+    }
+
+    /// Add a new observer at runtime.
+    pub async fn register_observer(&self, obs: Arc<dyn MetricObserver>) {
+        self.inner.observers.write().await.push(obs);
+    }
+
+    /// Remove all observers that satisfy the given predicate.
+    pub async fn unregister_observers<F>(&self, predicate: F)
+    where
+        F: Fn(&Arc<dyn MetricObserver>) -> bool,
+    {
+        self.inner
+            .observers
+            .write()
+            .await
+            .retain(|obs| !predicate(obs));
+    }
+
+    /// Entry-point used by the Serving layer to push fresh metrics.
+    pub fn ingest_snapshot(
+        &self,
+        model: ModelId,
+        snapshot: MetricsSnapshot,
+    ) -> Result<(), MonitoringError> {
+        let event = MetricEvent { model, snapshot };
+        self.inner
+            .tx
+            .send(event)
+            .map(|_| ())
+            .map_err(|e| MonitoringError::EventSendError(e.to_string()))
+    }
+
+    /// Spawn a background task that fans-out events to observers.
+    ///
+    /// MUST be called to activate the hub; multiple calls are idempotent,
+    /// each producing its own subscription loop (useful for horizontal
+    /// scaling).  Returns a join handle so callers can `await` for exit.
+    pub fn start_dispatch_loop(&self) -> tokio::task::JoinHandle<()> {
+        let rx = self.inner.tx.subscribe();
+        let hub = self.clone();
+
+        tokio::spawn(async move {
+            let mut rx = rx;
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        let observers = { hub.inner.observers.read().await.clone() };
+                        for obs in observers {
+                            // We spawn each observer separately to minimize
+                            // tail latency and isolate failures.
+                            let evt_clone = event.clone();
+                            let obs_clone = obs.clone();
+                            task::spawn(async move {
+                                if let Err(e) = obs_clone.on_event(evt_clone).await {
+                                    error!(error = %e, "observer failed");
+                                }
+                            });
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "monitoring hub lagged behind; some events lost");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        error!("monitoring hub channel closed unexpectedly");
+                        break;
+                    }
+                }
+            }
+        })
+    }
+}
+
+// Example usage (could live in unit / integration tests) ──────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{sleep, Duration};
+
+    #[tokio::test]
+    async fn test_retrain_trigger() {
+        // GIVEN
+        let monitor = ModelMonitor::new(16);
+        let _dispatch_handle = monitor.start_dispatch_loop();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ModelId>(4);
+        let strategy      = Arc::new(SimpleThresholdStrategy::new(0.80));
+        let observer      = Arc::new(RetrainObserver::new(strategy, tx));
+
+        monitor.register_observer(observer).await;
+
+        let model = ModelId {
+            name:     "product_defect_detector".into(),
+            version:  "v1.2.3".into(),
+            instance: "canary-0".into(),
+        };
+
+        let snapshot_ok = MetricsSnapshot {
+            timestamp: Utc::now(),
+            accuracy:  0.93,
+            precision: 0.92,
+            recall:    0.94,
+            f1:        0.93,
+            custom:    serde_json::json!({}),
+        };
+
+        let snapshot_bad = MetricsSnapshot {
+            timestamp: Utc::now(),
+            accuracy:  0.58,
+            precision: 0.60,
+            recall:    0.55,
+            f1:        0.57,
+            custom:    serde_json::json!({}),
+        };
+
+        // WHEN (healthy)
+        monitor.ingest_snapshot(model.clone(), snapshot_ok).unwrap();
+        sleep(Duration::from_millis(100)).await;
+        assert!(rx.try_recv().is_err(), "no retrain should be triggered");
+
+        // WHEN (degraded)
+        monitor.ingest_snapshot(model.clone(), snapshot_bad).unwrap();
+
+        // THEN
+        let triggered = rx.recv().await.expect("retrain should be triggered");
+        assert_eq!(triggered, model);
+    }
+}
+```

@@ -1,0 +1,430 @@
+```csharp
+// -----------------------------------------------------------------------------
+//  File:        src/module_72.txt   (Yes, .txt — we treat it as a C# compilation
+//                                    unit by SDK include globbing)
+//  Project:     PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+//  Purpose:     Stream-processing entry-point that ingests Kinesis records,
+//               validates envelopes, picks an on-the-fly transformation strategy
+//               (Strategy Pattern), and emits normalised payloads further down
+//               the ETL pipeline.
+//
+//  NOTE:        This Lambda is intentionally written as a self-contained,
+//               production-grade component.  It wires up its own DI container
+//               (in-Lambda) to stay fully autonomous and testable.
+// -----------------------------------------------------------------------------
+
+using System;
+using System.Buffers;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.Kinesis;
+using Amazon.Lambda.Core;
+using Amazon.Lambda.KinesisEvents;
+using Microsoft.Extensions.DependencyInjection;
+using Serilog;
+
+// Required by AWS Lambda to locate the serializer we want to use.
+[assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
+
+namespace PulseOps.Warehouse.StreamProcessing
+{
+    /// <summary>
+    /// Entry-point Lambda handler for processing Kinesis ingestion shards.
+    /// </summary>
+    public sealed class KinesisStreamProcessor
+    {
+        private readonly IServiceProvider _root;
+        private readonly ILogger _log;
+
+        public KinesisStreamProcessor()
+        {
+            _root = ConfigureServices();
+            _log = _root.GetRequiredService<ILogger>().ForContext<KinesisStreamProcessor>();
+
+            _log.Information("KinesisStreamProcessor cold-start completed — DI container initialised.");
+        }
+
+        // ---------------------------------------------------------------------
+        //  Lambda Handler
+        // ---------------------------------------------------------------------
+        /// <summary>
+        /// AWS Lambda runtime invokes this async handler for each micro-batch that
+        /// Kinesis pushes.  Batch size &amp; window are configured via Kinesis event
+        /// source mapping (IaC – see cdk/KinesisIngestionStack.cs).
+        /// </summary>
+        public async Task HandleAsync(KinesisEvent kinesisEvent, ILambdaContext context)
+        {
+            _log.ForContext("Records", kinesisEvent.Records.Count)
+                .Information("Received Kinesis micro-batch.");
+
+            var validator  = _root.GetRequiredService<IEventEnvelopeValidator>();
+            var selector   = _root.GetRequiredService<ITransformationStrategySelector>();
+            var dispatcher = _root.GetRequiredService<ITransformedEventDispatcher>();
+
+            // Process in parallel – concurrency governed by reserved Lambda memory.
+            await Parallel.ForEachAsync(
+                kinesisEvent.Records,
+                new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+                async (record, ct) =>
+                {
+                    try
+                    {
+                        var envelope = DeserializeEnvelope(record);
+                        validator.Validate(envelope);             // throws if invalid
+
+                        var strategy = selector.Resolve(envelope.EventType);
+                        var result   = await strategy.TransformAsync(envelope, ct);
+
+                        await dispatcher.DispatchAsync(result, ct);
+                    }
+                    catch (ValidationException vex)
+                    {
+                        _log.Warning(vex, "Validation failure.  Record sent to DLQ.");
+                        await dispatcher.DeadLetterAsync(record, vex, ct);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Error(ex, "Unhandled exception.  Record sent to DLQ.");
+                        await dispatcher.DeadLetterAsync(record, ex, ct);
+                    }
+                });
+        }
+
+        // ---------------------------------------------------------------------
+        //  Helpers
+        // ---------------------------------------------------------------------
+        private static EventEnvelope DeserializeEnvelope(KinesisEvent.KinesisEventRecord record)
+        {
+            // Kinesis enforces a Base64 encoded string.  We decode quickly using
+            // ArrayPool to avoid allocations on high throughput.
+            var dataSpan = record.Kinesis.Data.Span;
+            var rented   = ArrayPool<byte>.Shared.Rent(dataSpan.Length);
+            try
+            {
+                dataSpan.CopyTo(rented);
+                var json = Encoding.UTF8.GetString(rented, 0, dataSpan.Length);
+
+                return JsonSerializer.Deserialize<EventEnvelope>(json)!;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
+
+        private static IServiceProvider ConfigureServices()
+        {
+            var services = new ServiceCollection();
+
+            // --- Logging -----------------------------------------------------
+            Log.Logger = new LoggerConfiguration()
+                .Enrich.WithProperty("Component", "PulseOps.KinesisStreamProcessor")
+                .WriteTo.Console()
+                .CreateLogger();
+
+            services.AddSingleton<ILogger>(Log.Logger);
+
+            // --- Validators ---------------------------------------------------
+            services.AddSingleton<IEventEnvelopeValidator, DefaultEnvelopeValidator>();
+
+            // --- Transformation Strategies -----------------------------------
+            services.AddSingleton<CalendarEventTransformationStrategy>();
+            services.AddSingleton<CiCdLogTransformationStrategy>();
+            services.AddSingleton<EmailMetadataTransformationStrategy>();
+
+            services.AddSingleton<ITransformationStrategySelector>(sp =>
+            {
+                var strategies = new Dictionary<string, ITransformationStrategy>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["calendar_event"] = sp.GetRequiredService<CalendarEventTransformationStrategy>(),
+                    ["cicd_log"]       = sp.GetRequiredService<CiCdLogTransformationStrategy>(),
+                    ["email_metadata"] = sp.GetRequiredService<EmailMetadataTransformationStrategy>()
+                };
+                return new TransformationStrategySelector(strategies);
+            });
+
+            // --- Dispatchers --------------------------------------------------
+            services.AddSingleton<ITransformedEventDispatcher, FireAndForgetDispatcher>();
+
+            return services.BuildServiceProvider();
+        }
+    }
+
+    // =========================================================================
+    //  Domain Models
+    // =========================================================================
+    public record EventEnvelope(
+        string     EventType,
+        JsonElement Payload,
+        DateTime    TimestampUtc);
+
+    public record TransformedEvent(
+        string     NormalisedType,
+        JsonElement Payload,
+        DateTime    ObservedAtUtc,
+        IDictionary<string, string> Tags);
+
+    // =========================================================================
+    //  Validation
+    // =========================================================================
+    public interface IEventEnvelopeValidator
+    {
+        void Validate(EventEnvelope envelope);
+    }
+
+    public sealed class DefaultEnvelopeValidator : IEventEnvelopeValidator
+    {
+        private readonly ILogger _log;
+
+        public DefaultEnvelopeValidator(ILogger log) => _log = log;
+
+        public void Validate(EventEnvelope envelope)
+        {
+            if (string.IsNullOrWhiteSpace(envelope.EventType))
+            {
+                throw new ValidationException("EventType is required.");
+            }
+
+            if (envelope.TimestampUtc == default)
+            {
+                throw new ValidationException("TimestampUtc is required.");
+            }
+
+            if (envelope.Payload.ValueKind == JsonValueKind.Undefined ||
+                envelope.Payload.ValueKind == JsonValueKind.Null)
+            {
+                throw new ValidationException("Payload cannot be null or undefined.");
+            }
+
+            _log.Debug("Envelope validation passed for type {EventType}", envelope.EventType);
+        }
+    }
+
+    public sealed class ValidationException : Exception
+    {
+        public ValidationException(string message) : base(message) { }
+    }
+
+    // =========================================================================
+    //  Strategy Pattern — Transformations
+    // =========================================================================
+    public interface ITransformationStrategy
+    {
+        Task<TransformedEvent> TransformAsync(EventEnvelope envelope, CancellationToken ct);
+    }
+
+    public sealed class TransformationStrategySelector : ITransformationStrategySelector
+    {
+        private readonly IReadOnlyDictionary<string, ITransformationStrategy> _strategies;
+
+        public TransformationStrategySelector(IReadOnlyDictionary<string, ITransformationStrategy> strategies)
+            => _strategies = strategies;
+
+        public ITransformationStrategy Resolve(string eventType)
+        {
+            if (_strategies.TryGetValue(eventType, out var strategy))
+            {
+                return strategy;
+            }
+
+            throw new InvalidOperationException($"No transformation strategy registered for '{eventType}'.");
+        }
+    }
+
+    public interface ITransformationStrategySelector
+    {
+        ITransformationStrategy Resolve(string eventType);
+    }
+
+    // -------------------------------------------------------------------------
+    //  Concrete Strategies
+    // -------------------------------------------------------------------------
+    public sealed class CalendarEventTransformationStrategy : ITransformationStrategy
+    {
+        public Task<TransformedEvent> TransformAsync(EventEnvelope envelope, CancellationToken ct)
+        {
+            // Example: Enrich meeting duration & cost statistics
+            var source = envelope.Payload;
+
+            var attendees  = source.GetProperty("attendees").GetArrayLength();
+            var durationMs = source.GetProperty("duration_ms").GetInt64();
+            var hourlyRate = 65; // USD – in practice looked up from DB
+
+            var meetingCost = (durationMs / 1000 / 60.0 / 60.0) * attendees * hourlyRate;
+
+            var enriched = new
+            {
+                attendees,
+                duration_ms  = durationMs,
+                meeting_cost = meetingCost,
+                source_id    = source.GetProperty("id").GetString()
+            };
+
+            return Task.FromResult(
+                new TransformedEvent(
+                    NormalisedType : "meeting_metrics",
+                    Payload        : JsonSerializer.SerializeToElement(enriched),
+                    ObservedAtUtc  : envelope.TimestampUtc,
+                    Tags           : new Dictionary<string, string>
+                    {
+                        ["source"] = "calendar"
+                    }));
+        }
+    }
+
+    public sealed class CiCdLogTransformationStrategy : ITransformationStrategy
+    {
+        public Task<TransformedEvent> TransformAsync(EventEnvelope envelope, CancellationToken ct)
+        {
+            var payload        = envelope.Payload;
+            var started        = payload.GetProperty("job_started_at").GetDateTime();
+            var finished       = payload.GetProperty("job_finished_at").GetDateTime();
+            var leadTime       = (finished - started).TotalSeconds;
+            var pipelineStatus = payload.GetProperty("status").GetString();
+
+            var normalised = new
+            {
+                lead_time_seconds = leadTime,
+                status            = pipelineStatus,
+                commit_sha        = payload.GetProperty("commit_sha").GetString()
+            };
+
+            return Task.FromResult(
+                new TransformedEvent(
+                    NormalisedType : "deployment_lead_time",
+                    Payload        : JsonSerializer.SerializeToElement(normalised),
+                    ObservedAtUtc  : envelope.TimestampUtc,
+                    Tags           : new Dictionary<string, string>
+                    {
+                        ["source"] = "cicd"
+                    }));
+        }
+    }
+
+    public sealed class EmailMetadataTransformationStrategy : ITransformationStrategy
+    {
+        public Task<TransformedEvent> TransformAsync(EventEnvelope envelope, CancellationToken ct)
+        {
+            var p          = envelope.Payload;
+            var threadId   = p.GetProperty("thread_id").GetString();
+            var direction  = p.GetProperty("direction").GetString(); // inbound|outbound
+
+            var normalised = new
+            {
+                thread_id  = threadId,
+                is_reply   = p.GetProperty("is_reply").GetBoolean(),
+                direction,
+                size_bytes = p.GetProperty("size_bytes").GetInt64()
+            };
+
+            return Task.FromResult(
+                new TransformedEvent(
+                    NormalisedType : "email_activity",
+                    Payload        : JsonSerializer.SerializeToElement(normalised),
+                    ObservedAtUtc  : envelope.TimestampUtc,
+                    Tags           : new Dictionary<string, string>
+                    {
+                        ["source"] = "email",
+                        ["direction"] = direction
+                    }));
+        }
+    }
+
+    // =========================================================================
+    //  Dispatcher (Observer Pattern variant)
+    // =========================================================================
+    public interface ITransformedEventDispatcher
+    {
+        Task DispatchAsync(TransformedEvent evt, CancellationToken ct);
+        Task DeadLetterAsync(KinesisEvent.KinesisEventRecord rawRecord, Exception ex, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Fire-and-forget dispatcher that pushes transformed events onto a downstream
+    /// Kinesis stream.  If no stream is configured (e.g. local tests), we fall
+    /// back to logging.
+    /// </summary>
+    public sealed class FireAndForgetDispatcher : ITransformedEventDispatcher, IDisposable
+    {
+        private readonly ILogger _log;
+        private readonly IAmazonKinesis _kinesis;
+        private readonly string _targetStreamName;
+        private readonly ConcurrentQueue<Amazon.Kinesis.Model.PutRecordsRequestEntry> _buffer = new();
+
+        public FireAndForgetDispatcher(ILogger log)
+        {
+            _log              = log;
+            _kinesis          = new AmazonKinesisClient(); // region inferred from Lambda environment
+            _targetStreamName = Environment.GetEnvironmentVariable("TRANSFORMED_STREAM_NAME") 
+                                ?? "pulseops-transformed-events";
+        }
+
+        public Task DispatchAsync(TransformedEvent evt, CancellationToken ct)
+        {
+            var json   = JsonSerializer.Serialize(evt);
+            var record = new Amazon.Kinesis.Model.PutRecordsRequestEntry
+            {
+                PartitionKey = evt.Tags.TryGetValue("source", out var source) ? source : "unknown",
+                Data         = new MemoryStream(Encoding.UTF8.GetBytes(json))
+            };
+
+            _buffer.Enqueue(record);
+
+            // Flush in background if we crossed threshold (imperfect, but keeps demo short)
+            if (_buffer.Count >= 500)
+            {
+                _ = FlushAsync(CancellationToken.None);
+            }
+
+            return Task.CompletedTask;
+        }
+
+        public async Task DeadLetterAsync(KinesisEvent.KinesisEventRecord rawRecord, Exception ex, CancellationToken ct)
+        {
+            // Pipe to DLQ – in demo we just log.  In production it’s an SQS DLQ.
+            _log.Warning(ex, "Dead-lettering record {@PartitionKey}", rawRecord.Kinesis.PartitionKey);
+            await Task.CompletedTask;
+        }
+
+        private async Task FlushAsync(CancellationToken ct)
+        {
+            if (_buffer.IsEmpty) return;
+
+            var batch = new List<Amazon.Kinesis.Model.PutRecordsRequestEntry>();
+            while (batch.Count < 500 && _buffer.TryDequeue(out var entry))
+            {
+                batch.Add(entry);
+            }
+
+            if (batch.Count == 0) return;
+
+            var request = new Amazon.Kinesis.Model.PutRecordsRequest
+            {
+                StreamName = _targetStreamName,
+                Records    = batch
+            };
+
+            var response = await _kinesis.PutRecordsAsync(request, ct);
+
+            if (response.FailedRecordCount > 0)
+            {
+                _log.Error("Failed to write {Failed}/{Total} records to stream {Stream}",
+                           response.FailedRecordCount, batch.Count, _targetStreamName);
+            }
+            else
+            {
+                _log.Information("Flushed {Count} transformed events to stream {Stream}",
+                                 batch.Count, _targetStreamName);
+            }
+        }
+
+        public void Dispose() => _ = FlushAsync(CancellationToken.None);
+    }
+}
+```

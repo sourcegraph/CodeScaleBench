@@ -1,0 +1,282 @@
+```rust
+//! src/module_6.rs
+//!
+//! LedgerEntry *query* service with transparent Redis-backed response-caching and
+//! built-in pagination helpers.  
+//!
+//! This module exemplifies the Command/Query Separation (CQS) and Repository
+//! patterns used throughout LedgerLink Nexus.  It is **read-only**—all mutating
+//! commands live in a dedicated command service.
+//!
+//! Dependencies (add to Cargo.toml):
+//! ---------------------------------
+//! tracing             = "0.1"
+//! serde               = { version = "1", features = ["derive"] }
+//! serde_json          = "1"
+//! uuid                = { version = "1", features = ["v4"] }
+//! chrono              = { version = "0.4", features = ["serde"] }
+//! thiserror           = "1"
+//! validator           = { version = "0.17", features = ["derive"] }
+//! sqlx                = { version = "0.7", default-features = false, features = [
+//!     "runtime-tokio-rustls", "postgres", "uuid", "chrono", "macros"
+//! ] }
+//! deadpool-redis      = { version = "0.12", features = ["serde"] }
+
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{query_as, PgPool};
+use tracing::{debug, instrument};
+use uuid::Uuid;
+use validator::Validate;
+
+use deadpool_redis::{redis::AsyncCommands, Connection as RedisConn, Pool as RedisPool};
+
+/// TTL (seconds) for cached query results.
+///
+/// In a real system this would come from a hierarchical configuration source.
+const LEDGER_ENTRY_QUERY_CACHE_TTL: usize = 15;
+
+/// Domain model representing a row in `ledger_entries`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub amount: rust_decimal::Decimal,
+    pub currency: String,
+    pub posted_at: DateTime<Utc>,
+    pub description: Option<String>,
+}
+
+/// Wire-format-friendly DTO (View-Model).
+///
+/// Business invariants are checked via `validator`.
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct LedgerEntryDto {
+    pub id: Uuid,
+    pub amount: rust_decimal::Decimal,
+    #[validate(length(min = 3, max = 3))]
+    pub currency: String,
+    pub posted_at: DateTime<Utc>,
+    pub description: Option<String>,
+}
+
+impl From<LedgerEntry> for LedgerEntryDto {
+    fn from(model: LedgerEntry) -> Self {
+        Self {
+            id: model.id,
+            amount: model.amount,
+            currency: model.currency,
+            posted_at: model.posted_at,
+            description: model.description,
+        }
+    }
+}
+
+/// Request-level pagination helper.
+///
+/// Typical usage: derive from HTTP query params via `axum::extract::Query<Pagination>`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Validate)]
+pub struct Pagination {
+    #[validate(range(min = 1, max = 10_000))]
+    pub per_page: u32,
+    #[validate(range(min = 1))]
+    pub page: u32,
+}
+
+impl Pagination {
+    pub fn limit(&self) -> i64 {
+        self.per_page as i64
+    }
+
+    pub fn offset(&self) -> i64 {
+        ((self.page.saturating_sub(1) * self.per_page) as i64)
+    }
+}
+
+impl Default for Pagination {
+    fn default() -> Self {
+        Self { per_page: 50, page: 1 }
+    }
+}
+
+/// Generic envelope returned for any paginated endpoint.
+///
+/// Items are cached/re-serialized individually to reduce hot-path allocations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaginatedResponse<T> {
+    pub page: u32,
+    pub per_page: u32,
+    pub total_items: u64,
+    pub total_pages: u32,
+    pub items: Vec<T>,
+}
+
+/// All service-level errors get normalized into `ServiceError`.
+#[derive(thiserror::Error, Debug)]
+pub enum ServiceError {
+    #[error("validation error: {0}")]
+    Validation(#[from] validator::ValidationErrors),
+
+    #[error("database failure: {0}")]
+    Db(#[from] sqlx::Error),
+
+    #[error("redis failure: {0}")]
+    Cache(#[from] deadpool_redis::redis::RedisError),
+
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+/// Query service facade (read-only).
+///
+/// Logical dependencies are injected in the constructor.
+#[derive(Clone)]
+pub struct LedgerEntryQueryService {
+    pg_pool: PgPool,
+    redis_pool: RedisPool,
+}
+
+impl LedgerEntryQueryService {
+    /// Create a new query service instance.
+    pub fn new(pg_pool: PgPool, redis_pool: RedisPool) -> Self {
+        Self { pg_pool, redis_pool }
+    }
+
+    /// List ledger entries for a given account using *offset/limit* pagination.
+    ///
+    /// Results are cached in Redis based on (account_id, page, per_page).
+    ///
+    /// NOTE: [`instrument`] automatically injects tracing span metadata.
+    #[instrument(skip(self))]
+    pub async fn list_entries(
+        &self,
+        account_id: Uuid,
+        pagination: Pagination,
+    ) -> Result<PaginatedResponse<LedgerEntryDto>, ServiceError> {
+        pagination.validate()?; // Early validation — cheap.
+
+        let mut cache = self.redis_pool.get().await?;
+        let cache_key = cache_key(account_id, pagination);
+
+        // Short-circuit fast path.
+        if let Some(cached_json): Option<String> = cache.get(&cache_key).await? {
+            debug!(%cache_key, "cache hit");
+            let cached: PaginatedResponse<LedgerEntryDto> = serde_json::from_str(&cached_json)?;
+            return Ok(cached);
+        };
+        debug!(%cache_key, "cache miss – querying database");
+
+        // Fetch total row count for pagination metadata.
+        let total_items: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) FROM ledger_entries WHERE account_id = $1"#,
+            account_id
+        )
+        .fetch_one(&self.pg_pool)
+        .await?;
+
+        // Fetch page.
+        let rows: Vec<LedgerEntry> = query_as!(
+            LedgerEntry,
+            r#"
+            SELECT id, account_id, amount, currency, posted_at, description
+            FROM ledger_entries
+            WHERE account_id = $1
+            ORDER BY posted_at DESC
+            OFFSET $2 LIMIT $3
+            "#,
+            account_id,
+            pagination.offset(),
+            pagination.limit()
+        )
+        .fetch_all(&self.pg_pool)
+        .await?;
+
+        let total_pages = ((total_items as f32) / (pagination.per_page as f32)).ceil() as u32;
+
+        let items: Vec<LedgerEntryDto> = rows.into_iter().map(LedgerEntryDto::from).collect();
+
+        let response = PaginatedResponse {
+            page: pagination.page,
+            per_page: pagination.per_page,
+            total_items: total_items as u64,
+            total_pages: total_pages.max(1),
+            items,
+        };
+
+        // Store in Redis while ignoring serialization errors.
+        cache
+            .set_ex::<_, _, ()>(
+                cache_key,
+                serde_json::to_string(&response)?,
+                LEDGER_ENTRY_QUERY_CACHE_TTL,
+            )
+            .await?;
+
+        Ok(response)
+    }
+}
+
+/// Helper for namespacing cache keys.
+fn cache_key(account_id: Uuid, p: Pagination) -> String {
+    format!(
+        "ledger_entries:{}:page={}:per_page={}",
+        account_id, p.page, p.per_page
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deadpool_redis::Config as RedisCfg;
+    use sqlx::{postgres::PgPoolOptions, Executor};
+
+    // NOTE: These integration-style tests require a running Postgres & Redis.
+    // They are `ignored` by default; run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn roundtrip_cache_hit() -> anyhow::Result<()> {
+        let pg_pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect("postgres://postgres:postgres@localhost/ledgerlink_test")
+            .await?;
+
+        let redis_cfg = RedisCfg::from_url("redis://127.0.0.1/");
+        let redis_pool = redis_cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))?;
+
+        // Seed one ledger entry.
+        let account_id = Uuid::new_v4();
+        pg_pool
+            .execute(
+                sqlx::query!(
+                    r#"
+                    INSERT INTO ledger_entries
+                        (id, account_id, amount, currency, posted_at, description)
+                    VALUES ($1, $2, 10.00, 'USD', now(), 'seed')
+                    "#,
+                    Uuid::new_v4(),
+                    account_id
+                )
+                .into(),
+            )
+            .await?;
+
+        let service = LedgerEntryQueryService::new(pg_pool, redis_pool);
+
+        // first call ⇒ cache miss
+        let first = service
+            .list_entries(account_id, Pagination::default())
+            .await?;
+        assert_eq!(first.total_items, 1);
+
+        // second call ⇒ should be served from cache
+        let second = service
+            .list_entries(account_id, Pagination::default())
+            .await?;
+        assert_eq!(second.total_items, first.total_items);
+
+        Ok(())
+    }
+}
+```

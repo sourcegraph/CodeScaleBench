@@ -1,0 +1,529 @@
+```rust
+//! module_41 – Data-quality enforcement micro-service
+//!
+//! Part of: ChirpPulse – Real-Time Social Sentiment Lake
+//!
+//! Responsibility
+//! --------------
+//! Reads raw social events from Kafka, applies a configurable set of
+//! data-quality rules (missing language, invalid timestamps, etc.) and
+//! republishes the message to either
+//!   * `<stream>.qc.pass`  – when all rules succeed, or
+//!   * `<stream>.qc.fail`  – on the first rule failure.
+//!
+//! In addition, the service exposes Prometheus metrics for observability and
+//! gracefully handles re-balancing, back-pressure, and shutdown signals.
+//
+//  ──────────────────────────────────────────────────────────────────────────
+//  Production dependencies (in Cargo.toml)
+//  ======================================
+//  [dependencies]
+//  anyhow          = "1"
+//  chrono          = { version = "0.4", features = ["serde"] }
+//  futures         = "0.3"
+//  log             = "0.4"
+//  prometheus      = "0.14"
+//  rdkafka         = { version = "0.36", default-features = false, features = ["tokio"] }
+//  serde           = { version = "1.0", features = ["derive"] }
+//  serde_json      = "1"
+//  tokio           = { version = "1", features = ["full"] }
+//  tokio-stream    = "0.1"
+//  tracing         = "0.1"
+//  tracing-subscriber = "0.3"
+//  thiserror       = "1"
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use futures::StreamExt;
+use log::{error, info, warn};
+use prometheus::{Encoder, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder};
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::message::{BorrowedMessage, Headers, Message};
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::{ClientConfig, Offset, TopicPartitionList};
+use serde::{Deserialize, Serialize};
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::Notify;
+use tokio_stream::wrappers::SignalStream;
+use tracing::{span, Instrument, Level};
+
+//
+// ────────────────────────────────────────────────────────────── Data structures ─
+//
+
+/// Incoming raw social event
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SocialEvent {
+    pub id: String,
+    pub stream: String, // e.g. "twitter", "reddit"
+    pub language: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub sentiment: Option<f32>,
+    pub payload: HashMap<String, serde_json::Value>,
+}
+
+/// Enriched event tagged with QC metadata
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualifiedEvent {
+    pub original: SocialEvent,
+    pub qc_passed: bool,
+    pub failed_rule: Option<String>,
+}
+
+/// Data-quality validation failure
+#[derive(Debug, thiserror::Error)]
+pub enum QualityError {
+    #[error("missing field `{0}`")]
+    MissingField(&'static str),
+    #[error("timestamp is in the future")]
+    InvalidTimestamp,
+    #[error("sentiment score out of bounds: {0}")]
+    SentimentOutOfBounds(f32),
+}
+
+/// Strategy trait for data-quality rules
+pub trait DataQualityRule: Send + Sync {
+    /// Unique, stable name (used in metrics and failure payload)
+    fn name(&self) -> &'static str;
+
+    /// Returns `Ok(())` when the rule passes
+    fn check(&self, event: &SocialEvent) -> Result<(), QualityError>;
+}
+
+type DynRule = Box<dyn DataQualityRule>;
+
+/// Ensure the language code is present
+pub struct LanguagePresentRule;
+
+impl DataQualityRule for LanguagePresentRule {
+    fn name(&self) -> &'static str {
+        "language_present"
+    }
+
+    fn check(&self, event: &SocialEvent) -> Result<(), QualityError> {
+        if event.language.is_some() {
+            Ok(())
+        } else {
+            Err(QualityError::MissingField("language"))
+        }
+    }
+}
+
+/// Ensure `created_at` <= *now* (+ 5s tolerance)
+pub struct TimestampNotFutureRule;
+
+impl DataQualityRule for TimestampNotFutureRule {
+    fn name(&self) -> &'static str {
+        "timestamp_not_future"
+    }
+
+    fn check(&self, event: &SocialEvent) -> Result<(), QualityError> {
+        let now = Utc::now() + chrono::Duration::seconds(5);
+        if event.created_at <= now {
+            Ok(())
+        } else {
+            Err(QualityError::InvalidTimestamp)
+        }
+    }
+}
+
+/// Ensure sentiment ∈ [-1.0, 1.0] when present
+pub struct SentimentBoundsRule;
+
+impl DataQualityRule for SentimentBoundsRule {
+    fn name(&self) -> &'static str {
+        "sentiment_bounds"
+    }
+
+    fn check(&self, event: &SocialEvent) -> Result<(), QualityError> {
+        if let Some(s) = event.sentiment {
+            if s >= -1.0 && s <= 1.0 {
+                Ok(())
+            } else {
+                Err(QualityError::SentimentOutOfBounds(s))
+            }
+        } else {
+            Ok(()) // Absence is allowed here; another rule can enforce presence
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────── Configuration ─────
+
+/// Service configuration loaded from env-vars
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub brokers: String,
+    pub group_id: String,
+    pub input_topic: String,
+    pub output_pass_topic: String,
+    pub output_fail_topic: String,
+}
+
+impl Config {
+    pub fn from_env() -> Self {
+        Self {
+            brokers: std::env::var("CP_KAFKA_BROKERS")
+                .unwrap_or_else(|_| "localhost:9092".into()),
+            group_id: std::env::var("CP_QC_GROUP").unwrap_or_else(|_| "qc-validator".into()),
+            input_topic: std::env::var("CP_INPUT_TOPIC").unwrap_or_else(|_| "raw.social".into()),
+            output_pass_topic: std::env::var("CP_PASS_TOPIC")
+                .unwrap_or_else(|_| "social.qc.pass".into()),
+            output_fail_topic: std::env::var("CP_FAIL_TOPIC")
+                .unwrap_or_else(|_| "social.qc.fail".into()),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────── Metrics ───────────
+
+#[derive(Clone)]
+struct Metrics {
+    registry: Registry,
+    processed: IntCounterVec,
+    latency: HistogramVec,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        let registry = Registry::new();
+
+        let processed = IntCounterVec::new(
+            prometheus::Opts::new("events_processed", "Total processed events"),
+            &["result"],
+        )
+        .expect("metric can be created");
+        registry
+            .register(Box::new(processed.clone()))
+            .expect("metric can be registered");
+
+        let latency = HistogramVec::new(
+            HistogramOpts::new("qc_latency_seconds", "QC processing latency"),
+            &["result"],
+        )
+        .expect("metric can be created");
+
+        registry
+            .register(Box::new(latency.clone()))
+            .expect("metric can be registered");
+
+        Self {
+            registry,
+            processed,
+            latency,
+        }
+    }
+
+    async fn serve(self: Arc<Self>) -> Result<()> {
+        let addr = ([0, 0, 0, 0], 9888).into();
+        let make_svc = hyper::service::make_service_fn(move |_| {
+            let m = self.clone();
+            async move {
+                Ok::<_, hyper::Error>(hyper::service::service_fn(move |_req| {
+                    let m = m.clone();
+                    async move {
+                        let encoder = TextEncoder::new();
+                        let mf = m.registry.gather();
+                        let mut buf = Vec::new();
+                        encoder.encode(&mf, &mut buf).unwrap();
+                        Ok::<_, hyper::Error>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .header(hyper::header::CONTENT_TYPE, encoder.format_type())
+                                .body(hyper::Body::from(buf))
+                                .unwrap(),
+                        )
+                    }
+                }))
+            }
+        });
+        let server = hyper::Server::bind(&addr).serve(make_svc);
+        info!("Prometheus exporter listening on {}", addr);
+
+        server.await?;
+        Ok(())
+    }
+}
+
+// ───────────────────────────────────────────────────────────── QC Engine ────────
+
+/// Central controller running all QC rules
+pub struct QualityController {
+    rules: Vec<DynRule>,
+    metrics: Arc<Metrics>,
+    producer: FutureProducer,
+    cfg: Config,
+}
+
+impl QualityController {
+    pub fn new(cfg: Config, producer: FutureProducer, metrics: Arc<Metrics>) -> Self {
+        let rules: Vec<DynRule> = vec![
+            Box::new(LanguagePresentRule),
+            Box::new(TimestampNotFutureRule),
+            Box::new(SentimentBoundsRule),
+        ];
+        Self {
+            rules,
+            metrics,
+            producer,
+            cfg,
+        }
+    }
+
+    /// Apply all rules and emit results
+    async fn handle_message(&self, msg: BorrowedMessage<'_>) -> Result<()> {
+        let span = span!(Level::DEBUG, "handle_message");
+        async move {
+            let payload = match msg.payload_view::<str>() {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => {
+                    error!("Invalid UTF-8 payload: {e}");
+                    return Ok(());
+                }
+                None => {
+                    warn!("Received message with empty payload");
+                    return Ok(());
+                }
+            };
+
+            let event: SocialEvent = match serde_json::from_str(payload) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!("Failed to deserialize social event: {e}");
+                    return Ok(());
+                }
+            };
+
+            let timer = self
+                .metrics
+                .latency
+                .with_label_values(&["total"])
+                .start_timer();
+
+            // Iterate rules
+            for rule in &self.rules {
+                if let Err(err) = rule.check(&event) {
+                    self.metrics
+                        .processed
+                        .with_label_values(&["fail"])
+                        .inc();
+                    self.metrics
+                        .latency
+                        .with_label_values(&["fail"])
+                        .observe_duration(timer.stop_and_record());
+
+                    let qe = QualifiedEvent {
+                        original: event.clone(),
+                        qc_passed: false,
+                        failed_rule: Some(rule.name().to_string()),
+                    };
+                    self.publish(&qe, &self.cfg.output_fail_topic).await?;
+                    return Ok(());
+                }
+            }
+
+            // All rules passed
+            self.metrics
+                .processed
+                .with_label_values(&["pass"])
+                .inc();
+            self.metrics
+                .latency
+                .with_label_values(&["pass"])
+                .observe_duration(timer.stop_and_record());
+
+            let qe = QualifiedEvent {
+                original: event,
+                qc_passed: true,
+                failed_rule: None,
+            };
+            self.publish(&qe, &self.cfg.output_pass_topic).await?;
+            Ok(())
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn publish(&self, qe: &QualifiedEvent, topic: &str) -> Result<()> {
+        let payload =
+            serde_json::to_vec(qe).context("serializing QualifiedEvent for publishing")?;
+        // The round-trip future resolves once acked by Kafka
+        let record = FutureRecord::to(topic)
+            .payload(&payload)
+            .key(&qe.original.id);
+        let _ = self
+            .producer
+            .send(record, Duration::from_secs(0))
+            .await
+            .map_err(|(e, _)| e)
+            .context("sending message to Kafka")?;
+        Ok(())
+    }
+}
+
+// ───────────────────────────────────────────────────────────── Runner ───────────
+
+/// Build an async Kafka consumer committed on message success
+fn build_consumer(cfg: &Config) -> Result<StreamConsumer> {
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &cfg.brokers)
+        .set("group.id", &cfg.group_id)
+        .set("enable.partition.eof", "false")
+        .set("session.timeout.ms", "6000")
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()?;
+    consumer.subscribe(&[&cfg.input_topic])?;
+    Ok(consumer)
+}
+
+/// Build a high-throughput producer (idempotency on)
+fn build_producer(cfg: &Config) -> Result<FutureProducer> {
+    let prod: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &cfg.brokers)
+        .set("message.timeout.ms", "5000")
+        .set("enable.idempotence", "true")
+        .create()?;
+    Ok(prod)
+}
+
+/// Run QC service until Ctrl-C/TERM
+pub async fn run() -> Result<()> {
+    // --- Logging / tracing
+    tracing_subscriber::fmt::init();
+
+    let cfg = Config::from_env();
+    info!("Launching QC microservice with config: {:?}", cfg);
+
+    // Metrics
+    let metrics = Arc::new(Metrics::new());
+
+    // Kafka
+    let consumer = build_consumer(&cfg)?;
+    let producer = build_producer(&cfg)?;
+
+    // Quality controller
+    let qc = Arc::new(QualityController::new(cfg.clone(), producer, metrics.clone()));
+
+    // Graceful shutdown orchestration
+    let shutdown = Arc::new(Notify::new());
+    let shutdown_signal = shutdown.clone();
+
+    // Spawn Prometheus exporter
+    let metric_handle = {
+        let m = metrics.clone();
+        tokio::spawn(async move {
+            if let Err(e) = m.serve().await {
+                error!("Metrics exporter stopped: {e}");
+            }
+        })
+    };
+
+    // Spawn Kafka loop
+    let kafka_handle = tokio::spawn(async move {
+        let mut stream = consumer.stream();
+        while let Some(msg) = stream.next().await {
+            match msg {
+                Ok(borrowed) => {
+                    if let Err(e) = qc.handle_message(borrowed.clone()).await {
+                        error!("QC error: {e}");
+                    }
+                    // On success *or* failure, we commit offsets.
+                    if let Err(e) = consumer.store_offset_from_message(&borrowed) {
+                        error!("Failed to store offset: {e}");
+                    }
+                }
+                Err(e) => {
+                    error!("Kafka error: {e}");
+                }
+            }
+        }
+    });
+
+    // Listen for SIGINT / SIGTERM
+    tokio::spawn(async move {
+        let mut sig_int = signal(SignalKind::interrupt()).unwrap();
+        let mut sig_term = signal(SignalKind::terminate()).unwrap();
+        tokio::select! {
+            _ = sig_int.recv() => {
+                info!("Received SIGINT, shutting down");
+            }
+            _ = sig_term.recv() => {
+                info!("Received SIGTERM, shutting down");
+            }
+        }
+        shutdown_signal.notify_waiters();
+    });
+
+    // Wait until shutdown notified
+    shutdown.notified().await;
+    info!("Stopping QC microservice…");
+
+    // Give the consumer some time to commit last offsets
+    consumer.commit_consumer_state(CommitMode::Sync)?;
+    consumer.unsubscribe();
+
+    kafka_handle.abort();
+    metric_handle.abort();
+
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────── Integration test ─
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn language_rule_fails_when_language_missing() {
+        let evt = SocialEvent {
+            id: "1".into(),
+            stream: "twitter".into(),
+            language: None,
+            created_at: Utc::now(),
+            sentiment: None,
+            payload: HashMap::new(),
+        };
+        let rule = LanguagePresentRule;
+        assert!(rule.check(&evt).is_err());
+    }
+
+    #[test]
+    fn sentiment_rule_bounds_ok() {
+        let evt = SocialEvent {
+            id: "2".into(),
+            stream: "reddit".into(),
+            language: Some("en".into()),
+            created_at: Utc::now(),
+            sentiment: Some(0.2),
+            payload: HashMap::new(),
+        };
+        let rule = SentimentBoundsRule;
+        assert!(rule.check(&evt).is_ok());
+    }
+
+    #[test]
+    fn sentiment_rule_bounds_fail() {
+        let evt = SocialEvent {
+            id: "3".into(),
+            stream: "reddit".into(),
+            language: Some("en".into()),
+            created_at: Utc::now(),
+            sentiment: Some(2.0),
+            payload: HashMap::new(),
+        };
+        let rule = SentimentBoundsRule;
+        assert!(rule.check(&evt).is_err());
+    }
+}
+```

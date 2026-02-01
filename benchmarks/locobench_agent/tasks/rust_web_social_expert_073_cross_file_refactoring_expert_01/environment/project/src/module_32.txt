@@ -1,0 +1,347 @@
+```rust
+//! module_32.rs
+//!
+//! Event–driven “learning-pulse” reply processor.
+//!
+//! Responsibility
+//! --------------
+//! Listens to the message broker for `LearningPulseReplySubmitted` domain events
+//! and coordinates the asynchronous, side-effect-laden workflows that must
+//! follow a submission:
+//!
+//! • Dispatches the reply assets to the plagiarism-detection micro-service.  
+//! • Persists the plagiarism score into Postgres for audit & analytics.  
+//! • Updates an in-memory Redis cache used by the adaptive-recommendation
+//!   engine.  
+//! • Emits a follow-up domain event when processing is complete.
+//!
+//! The code purposefully demonstrates a realistic, production-grade blend of
+//! error handling, tracing, configuration, and dependency inversion while
+//! keeping I/O boundaries explicit.
+
+use std::{sync::Arc, time::Duration};
+
+use anyhow::Context;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use redis::AsyncCommands;
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{select, time};
+use tracing::{error, info, instrument, warn};
+
+/// External crate re-exports that the project prelude exposes.
+///
+/// Having an explicit `prelude` keeps the public surface small, but importing
+/// the bits we need here avoids a huge global glob-import.
+use crate::prelude::{
+    event_bus::{EventBus, EventConsumer, EventPublisher},
+    postgres::PgPool,
+    BrokerMessage,
+};
+
+/// Domain event that is published by the core API once a learner replies to a
+/// “learning pulse”.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningPulseReplySubmitted {
+    pub reply_id:      uuid::Uuid,
+    pub pulse_id:      uuid::Uuid,
+    pub author_id:     uuid::Uuid,
+    pub submitted_at:  DateTime<Utc>,
+    pub attachment_url: Option<String>,
+    /// Free-form text submitted by the learner.  
+    /// (Can be `None` e.g. for pure file uploads.)
+    pub content: Option<String>,
+}
+
+/// Event that can be published after all heavy workflows are done so other
+/// bounded contexts (e.g. notifications) can react without becoming
+/// synchronous.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningPulseReplyProcessed {
+    pub reply_id:      uuid::Uuid,
+    pub plagiarism_score: f32,
+    pub processed_at:  DateTime<Utc>,
+}
+
+/// Possible failures that can occur while processing a reply.
+///
+/// All variants implement `std::error::Error` through `thiserror::Error`.
+#[derive(Debug, Error)]
+pub enum ProcessingError {
+    #[error("plagiarism service returned non-success ({0})")]
+    PlagiarismNonSuccess(StatusCode),
+
+    #[error("failed to (de)serialize JSON: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("HTTP client error: {0}")]
+    Http(#[from] reqwest::Error),
+
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("redis error: {0}")]
+    Redis(#[from] redis::RedisError),
+
+    #[error("unknown processing error: {0}")]
+    Other(#[from] anyhow::Error),
+}
+
+/// Trait for a component that can evaluate plagiarism.
+///
+/// Keeping the interface small allows us to inject a stub during integration
+/// tests or switch out the underlying service without ripple effects.
+#[async_trait]
+pub trait PlagiarismClient: Send + Sync {
+    async fn evaluate(
+        &self,
+        submission: &LearningPulseReplySubmitted,
+    ) -> Result<f32, ProcessingError>;
+}
+
+/// Concrete HTTP implementation for `PlagiarismClient`.
+pub struct HttpPlagiarismClient {
+    http: reqwest::Client,
+    base_url: String,
+}
+
+impl HttpPlagiarismClient {
+    pub fn new(base_url: String) -> Self {
+        Self {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("building reqwest client"),
+            base_url,
+        }
+    }
+}
+
+#[async_trait]
+impl PlagiarismClient for HttpPlagiarismClient {
+    #[instrument(skip(self, submission))]
+    async fn evaluate(
+        &self,
+        submission: &LearningPulseReplySubmitted,
+    ) -> Result<f32, ProcessingError> {
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            reply_id: &'a uuid::Uuid,
+            content:  &'a Option<String>,
+            attachment_url: &'a Option<String>,
+        }
+
+        let url = format!("{}/plagiarism/evaluate", self.base_url);
+        let res = self
+            .http
+            .post(&url)
+            .json(&Payload {
+                reply_id: &submission.reply_id,
+                content: &submission.content,
+                attachment_url: &submission.attachment_url,
+            })
+            .send()
+            .await?;
+
+        if !res.status().is_success() {
+            return Err(ProcessingError::PlagiarismNonSuccess(res.status()));
+        }
+
+        #[derive(Deserialize)]
+        struct ResponseDto {
+            score: f32,
+        }
+
+        let body: ResponseDto = res.json().await?;
+        Ok(body.score)
+    }
+}
+
+/// Dependency bundle–struct used to construct the processor.
+///
+/// Cheap to clone thanks to `Arc`.
+#[derive(Clone)]
+pub struct ReplyProcessorDeps {
+    pub pg:           PgPool,
+    pub redis:        redis::Client,
+    pub plagiarism:   Arc<dyn PlagiarismClient>,
+    pub publisher:    Arc<dyn EventPublisher>,
+}
+
+/// Processor implementation that consumes `LearningPulseReplySubmitted`
+/// events, orchestrates workflows, and persists results.
+pub struct LearningPulseReplyProcessor {
+    deps: ReplyProcessorDeps,
+}
+
+impl LearningPulseReplyProcessor {
+    pub fn new(deps: ReplyProcessorDeps) -> Self {
+        Self { deps }
+    }
+
+    #[instrument(skip_all, fields(reply_id=%event.reply_id))]
+    async fn process(
+        &self,
+        event: LearningPulseReplySubmitted,
+    ) -> Result<(), ProcessingError> {
+        // 1) Call plagiarism service
+        let plagiarism_score = self.deps.plagiarism.evaluate(&event).await?;
+
+        // 2) Persist to Postgres (idempotent UPSERT)
+        sqlx::query!(
+            r#"
+            INSERT INTO reply_plagiarism (reply_id, score, processed_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (reply_id)
+            DO UPDATE SET score = EXCLUDED.score, processed_at = EXCLUDED.processed_at
+            "#,
+            event.reply_id,
+            plagiarism_score
+        )
+        .execute(&self.deps.pg)
+        .await?;
+
+        // 3) Warm Redis cache for adaptive engine
+        {
+            let mut conn = self.deps.redis.get_async_connection().await?;
+            let key = format!("reply:{}:plagiarism_score", event.reply_id);
+            conn.set_ex(key, plagiarism_score, 60 * 60 /* 1h */)
+                .await?;
+        }
+
+        // 4) Publish follow-up event
+        let processed = LearningPulseReplyProcessed {
+            reply_id: event.reply_id,
+            plagiarism_score,
+            processed_at: Utc::now(),
+        };
+
+        self.deps.publisher.publish(&processed).await?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl EventConsumer for LearningPulseReplyProcessor {
+    type Event = LearningPulseReplySubmitted;
+
+    /// Main event-handling entry-point used by the runtime.
+    async fn handle(&self, msg: BrokerMessage<Self::Event>) {
+        match self.process(msg.payload).await {
+            Ok(()) => info!(id=?msg.id, "processed reply successfully"),
+            Err(e) => {
+                error!(id=?msg.id, error=%e, "failed to process reply");
+                // TODO: depending on error class we may choose to re-queue
+                // the message, move to a dead-letter queue, or mark as acked.
+            }
+        }
+    }
+}
+
+/// Spin up a consumer loop.
+///
+/// The function is intentionally separate from `main.rs` so we can spawn it
+/// from integration tests as well.
+pub async fn run_processor(
+    deps: ReplyProcessorDeps,
+    bus: Arc<dyn EventBus>,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) -> anyhow::Result<()> {
+    let processor = Arc::new(LearningPulseReplyProcessor::new(deps));
+    let mut subscription = bus
+        .subscribe::<LearningPulseReplySubmitted>(processor.clone())
+        .await
+        .context("subscribe to learning-pulse replies")?;
+
+    info!("LearningPulseReplyProcessor up and running");
+
+    // Graceful shutdown loop
+    loop {
+        select! {
+            biased;
+
+            _ = shutdown.recv() => {
+                warn!("LearningPulseReplyProcessor shutting down");
+                subscription.close().await;
+                break;
+            }
+
+            res = subscription.next() => {
+                if let Err(e) = res {
+                    error!("subscription error: {e}");
+                    time::sleep(Duration::from_secs(1)).await; // back-off
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::*;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn plagiarism_failure_bubbles_up() {
+        // Arrange
+        let pg = test_pg_pool().await;
+        let redis = test_redis().await;
+        let plagiarism = Arc::new(MockPlagiarismClient { fail: true });
+        let publisher = Arc::new(MockPublisher::default());
+
+        let deps = ReplyProcessorDeps { pg, redis, plagiarism, publisher };
+        let processor = LearningPulseReplyProcessor::new(deps);
+
+        let evt = LearningPulseReplySubmitted {
+            reply_id: Uuid::new_v4(),
+            pulse_id: Uuid::new_v4(),
+            author_id: Uuid::new_v4(),
+            submitted_at: Utc::now(),
+            attachment_url: None,
+            content: Some("hello".into()),
+        };
+
+        // Act
+        let res = processor.process(evt).await;
+
+        // Assert
+        assert!(matches!(res, Err(ProcessingError::PlagiarismNonSuccess(_))));
+    }
+
+    // ─── TEST DOUBLES ──────────────────────────────────────────────────────────
+    #[derive(Default)]
+    struct MockPublisher;
+
+    #[async_trait::async_trait]
+    impl EventPublisher for MockPublisher {
+        async fn publish<E: Serialize + Send + Sync + 'static>(&self, _e: &E) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MockPlagiarismClient {
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl PlagiarismClient for MockPlagiarismClient {
+        async fn evaluate(
+            &self,
+            _submission: &LearningPulseReplySubmitted,
+        ) -> Result<f32, ProcessingError> {
+            if self.fail {
+                Err(ProcessingError::PlagiarismNonSuccess(StatusCode::BAD_REQUEST))
+            } else {
+                Ok(0.05)
+            }
+        }
+    }
+}
+```

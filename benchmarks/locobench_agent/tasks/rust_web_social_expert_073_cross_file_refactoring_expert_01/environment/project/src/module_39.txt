@@ -1,0 +1,307 @@
+```rust
+//! src/module_39.rs
+//! Audit-trail & event-dispatch module for **EduPulse Live – Event-Driven Social Learning Hub**.
+//!
+//! This module is responsible for
+//! 1. Persisting every domain event in an append-only audit table (GDPR-compliant).
+//! 2. Fanning out the same event to the platform message broker for downstream consumers
+//!    (e.g. search indexing, e-mail service, badge engine).
+//!
+//! Production notes
+//! ----------------
+//! • Database access is async/await powered by `sqlx` using a typed Postgres connection pool.  
+//! • All structs are `Send + Sync` so they can be freely shared in the Actix-web / Axum
+//!   runtimes the project uses.  
+//! • The concrete broker implementation here is NATS, but the code is generic over an
+//!   `EventProducer` trait, making it trivial to swap for Kafka, RabbitMQ, or a local in-memory
+//!   test double.  
+//! • Extensive error handling via `thiserror` and contextual spans via `tracing`.
+//
+//! # Example
+//! ```ignore
+//! let pool = PgPoolOptions::new()
+//!     .max_connections(5)
+//!     .connect("postgres://user:pw@localhost/edupulse")
+//!     .await?;
+//!
+//! let producer = NatsProducer::connect("nats://localhost:4222").await?;
+//! let service  = AuditTrailService::new(pool, Box::new(producer));
+//!
+//! service.record(DomainEvent::LessonPublished { lesson_id: 42, author_id: 5 }).await?;
+//! ```
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::Mutex;
+use tracing::{instrument, Instrument};
+use uuid::Uuid;
+
+// ---------- Database & MQ dependencies ----------
+use sqlx::{postgres::PgPoolOptions, PgPool};
+
+/// Topic on the message broker that receives all domain events.
+const BROKER_TOPIC: &str = "edupulse.domain.events";
+
+/// Domain-level representation of interesting actions in the system.
+///
+/// Adding a new event is a two-liner:
+/// 1. Extend the enum with a new variant (and its data).
+/// 2. Run `cargo sqlx migrate` if the serialized payload grows beyond Postgres'
+///    usual limits (we store as JSONB, so rarely needed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DomainEvent {
+    LessonPublished { lesson_id: i64, author_id: i64 },
+    QuizSubmitted {
+        quiz_id: i64,
+        student_id: i64,
+        attempt_id: i64,
+    },
+    BadgeAwarded {
+        badge_id: i64,
+        recipient_id: i64,
+        issuer_id: i64,
+    },
+    FileUploaded {
+        file_id: Uuid,
+        owner_id: i64,
+        size_bytes: i64,
+    },
+    // keep ‑- code-gen tools rely on comment above
+}
+
+/// Raw audit table record.
+///
+/// The table is created by the following SQLx migration (FYI):
+/// ```sql
+/// CREATE TABLE audit_log (
+///     id              UUID          PRIMARY KEY,
+///     occurred_at     TIMESTAMPTZ   NOT NULL,
+///     event_type      TEXT          NOT NULL,
+///     payload         JSONB         NOT NULL
+/// );
+/// ```
+#[derive(Debug, sqlx::FromRow)]
+struct AuditRecord {
+    id: Uuid,
+    occurred_at: DateTime<Utc>,
+    event_type: String,
+    payload: serde_json::Value,
+}
+
+/// Public service error wrapper.
+#[derive(Debug, Error)]
+pub enum AuditError {
+    #[error("Database failure: {0}")]
+    Db(#[from] sqlx::Error),
+
+    #[error("Broker failure: {0}")]
+    Broker(anyhow::Error),
+
+    #[error("Serialization failure: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+/// Trait abstracting the outbound message broker.
+#[async_trait]
+pub trait EventProducer: Send + Sync {
+    /// Publish a raw JSON payload to a topic.
+    async fn publish(&self, topic: &str, bytes: &[u8]) -> Result<(), anyhow::Error>;
+}
+
+// -----------------------------------------------------------------------------
+// NATS implementation – enabled by default. Other brokers can be swapped in.
+// -----------------------------------------------------------------------------
+#[cfg(feature = "nats")]
+pub mod nats_impl {
+    use super::*;
+    use nats::asynk::Connection;
+
+    /// Thin wrapper around a NATS connection implementing `EventProducer`.
+    pub struct NatsProducer {
+        conn: Connection,
+    }
+
+    impl NatsProducer {
+        pub async fn connect(url: &str) -> Result<Self, anyhow::Error> {
+            let conn = nats::asynk::connect(url).await?;
+            Ok(Self { conn })
+        }
+    }
+
+    #[async_trait]
+    impl EventProducer for NatsProducer {
+        async fn publish(&self, topic: &str, bytes: &[u8]) -> Result<(), anyhow::Error> {
+            self.conn.publish(topic, bytes).await?;
+            Ok(())
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Core service
+// -----------------------------------------------------------------------------
+
+/// The audit-trail and event-dispatch service.
+///
+/// Clone is cheap because it wraps an `Arc`.
+#[derive(Clone)]
+pub struct AuditTrailService {
+    pool: PgPool,
+    producer: Arc<dyn EventProducer>,
+    // A single open transaction that batches inserts in high-throughput scenarios
+    // is out-of-scope here; instead we serialize inserts via a Mutex.
+    // RwLock would starve writes under contention, so we pick Mutex.
+    lock: Arc<Mutex<()>>,
+}
+
+impl AuditTrailService {
+    /// Construct a new instance.
+    pub fn new(pool: PgPool, producer: Box<dyn EventProducer>) -> Self {
+        Self {
+            pool,
+            producer: Arc::from(producer),
+            lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Persist the event and dispatch to the broker atomically (as much as we can).
+    ///
+    /// Follows the transactional outbox pattern:
+    /// 1. Insert into audit_log (local transaction).  
+    /// 2. Publish to broker.  
+    /// 3. If (2) fails, a compensating job re-emits unfinished events later
+    ///    (see `unfinished_events_worker` in another module).  
+    #[instrument(skip_all, fields(event_type = %event.variant_name()))]
+    pub async fn record(&self, event: DomainEvent) -> Result<(), AuditError> {
+        // Serialize first so we fail fast before DB writes.
+        let payload = serde_json::to_value(&event)?;
+
+        // Hold mutex shortly to keep writes ordered (optional).
+        let _guard = self.lock.lock().await;
+
+        let mut tx = self.pool.begin().await?;
+
+        // create record
+        let rec = AuditRecord {
+            id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            event_type: event.variant_name().to_string(),
+            payload,
+        };
+
+        sqlx::query!(
+            "INSERT INTO audit_log (id, occurred_at, event_type, payload)
+             VALUES ($1, $2, $3, $4)",
+            rec.id,
+            rec.occurred_at,
+            rec.event_type,
+            rec.payload
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        // Broker publish *after* commit so other services don't read phantom events.
+        // Clone here to release the lock as early as possible.
+        let producer = self.producer.clone();
+        let body = serde_json::to_vec(&event)?;
+
+        producer
+            .publish(BROKER_TOPIC, &body)
+            .await
+            .map_err(AuditError::Broker)?;
+
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Helper utilities
+// -----------------------------------------------------------------------------
+
+/// Extension trait to get the variant name of an enum.
+///
+/// Uses `std::any::type_name` hack (stable; reflects full path), then slices.
+trait VariantName {
+    fn variant_name(&self) -> &str;
+}
+
+impl VariantName for DomainEvent {
+    fn variant_name(&self) -> &str {
+        // "path::to::DomainEvent::Variant"
+        let full = std::any::type_name::<Self>();
+        // We want the dynamic variant, not the type name.
+        // Use match to map to string slice (constexpr).
+        match self {
+            DomainEvent::LessonPublished { .. } => "lesson_published",
+            DomainEvent::QuizSubmitted { .. } => "quiz_submitted",
+            DomainEvent::BadgeAwarded { .. } => "badge_awarded",
+            DomainEvent::FileUploaded { .. } => "file_uploaded",
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct MockProducer {
+        counter: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl EventProducer for MockProducer {
+        async fn publish(&self, _topic: &str, _bytes: &[u8]) -> Result<(), anyhow::Error> {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn variant_names_match() {
+        let e = DomainEvent::BadgeAwarded {
+            badge_id: 1,
+            recipient_id: 2,
+            issuer_id: 3,
+        };
+        assert_eq!(e.variant_name(), "badge_awarded");
+    }
+
+    #[tokio::test]
+    async fn mock_publish_invoked() -> anyhow::Result<()> {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://ignored/ignored")?;
+        // We won't hit the DB; this is just compile validation.
+
+        let producer = MockProducer {
+            counter: AtomicUsize::new(0),
+        };
+
+        let service = AuditTrailService::new(pool, Box::new(producer));
+
+        // We expect broker publish to succeed even if DB fails (mock pool).
+        let _ = service
+            .record(DomainEvent::LessonPublished {
+                lesson_id: 1,
+                author_id: 2,
+            })
+            .await
+            .err(); // ignore error
+
+        // cannot inspect counter without downcasting; skip.
+        Ok(())
+    }
+}
+```

@@ -1,0 +1,398 @@
+```rust
+//! module_12 – Hyperparameter Tuning & Experiment Tracking
+//!
+//! This module lives in the “Model Ops” layer of VisuTility Orchestrator.
+//! It provides two core capabilities:
+//!  1. Strategy-based hyper-parameter tuning (currently Random Search,
+//!     but additional strategies can be plugged in at runtime).
+//!  2. Thread-safe, observer-friendly experiment tracking that can be
+//!     queried by other layers (e.g. Model Registry, Monitoring).
+//!
+//! Design patterns in play
+//! -----------------------
+//! • Strategy Pattern  – `HyperParamTuner` (trait) + concrete impls.  
+//! • Observer Pattern  – `TrainingEvent` + `TrainingObserver` for model
+//!                       monitoring / automated retraining triggers.
+//! • Factory Pattern   – The `TunerFactory` decides which strategy to
+//!                       instantiate based on runtime config.
+//!
+//! NOTE: This file does not touch any hardware-accelerated CV code;
+//! it focuses purely on orchestration concerns.
+
+// External crates -----------------------------------------------------------
+use rand::{distributions::Uniform, prelude::*};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+use thiserror::Error;
+use tokio::sync::{broadcast, RwLock};
+use uuid::Uuid;
+
+// Internal exports ----------------------------------------------------------
+pub use error::TunerError;
+pub use observer::{TrainingEvent, TrainingObserver};
+pub use tracker::{ExperimentRun, ExperimentTracker};
+pub use tuner::{HyperParamSpec, HyperParamTuner, RandomSearchTuner, TunerFactory};
+
+// ---------------------------------------------------------------------------
+mod error {
+    use super::*;
+
+    /// Domain-specific errors for hyper-parameter tuning & tracking.
+    #[derive(Debug, Error)]
+    pub enum TunerError {
+        #[error("Unknown tuner strategy: {0}")]
+        UnknownStrategy(String),
+        #[error("Experiment run not found: {0}")]
+        UnknownRun(Uuid),
+        #[error("Metric key already exists in this step: {0}")]
+        DuplicateMetricKey(String),
+        #[error("Serialization error: {0}")]
+        SerdeError(#[from] serde_json::Error),
+        #[error("Internal error: {0}")]
+        Internal(String),
+    }
+}
+
+// ---------------------------------------------------------------------------
+mod observer {
+    use super::*;
+
+    /// Observable events emitted by the training loop.
+    #[derive(Debug, Clone)]
+    pub enum TrainingEvent {
+        EpochEnd {
+            run_id: Uuid,
+            epoch: usize,
+            metrics: HashMap<String, f64>,
+            timestamp: SystemTime,
+        },
+        TrainingEnd {
+            run_id: Uuid,
+            final_metrics: HashMap<String, f64>,
+            duration: Duration,
+            timestamp: SystemTime,
+        },
+    }
+
+    /// Observer trait that other layers can implement to react to events.
+    pub trait TrainingObserver: Send + Sync {
+        fn on_event(&self, event: &TrainingEvent);
+    }
+}
+
+// ---------------------------------------------------------------------------
+mod tracker {
+    use super::*;
+
+    /// Metadata for one experiment run.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ExperimentRun {
+        pub run_id: Uuid,
+        pub params: HashMap<String, HyperParamValue>,
+        pub start_time: SystemTime,
+        pub end_time: Option<SystemTime>,
+        pub metrics: HashMap<String, f64>,
+        pub tags: Vec<String>,
+    }
+
+    /// Thread-safe experiment tracker that broadcasts events to observers.
+    #[derive(Clone)]
+    pub struct ExperimentTracker {
+        state: Arc<RwLock<HashMap<Uuid, ExperimentRun>>>,
+        broadcaster: broadcast::Sender<TrainingEvent>,
+    }
+
+    impl ExperimentTracker {
+        pub fn new() -> Self {
+            // 32 is an arbitrary channel size; adjust to throughput needs.
+            let (tx, _) = broadcast::channel(32);
+            Self {
+                state: Arc::new(RwLock::new(HashMap::new())),
+                broadcaster: tx,
+            }
+        }
+
+        /// Subscribe to training events.
+        pub fn subscribe(&self) -> broadcast::Receiver<TrainingEvent> {
+            self.broadcaster.subscribe()
+        }
+
+        /// Start a new run with given parameters. Returns run_id.
+        pub async fn start_run(
+            &self,
+            params: HashMap<String, HyperParamValue>,
+            tags: Vec<String>,
+        ) -> Uuid {
+            let run = ExperimentRun {
+                run_id: Uuid::new_v4(),
+                params,
+                start_time: SystemTime::now(),
+                end_time: None,
+                metrics: HashMap::new(),
+                tags,
+            };
+            let run_id = run.run_id;
+            self.state.write().await.insert(run_id, run);
+            run_id
+        }
+
+        /// Log metrics for a run & epoch, broadcasting an event.
+        pub async fn log_epoch_metrics(
+            &self,
+            run_id: Uuid,
+            epoch: usize,
+            metrics: HashMap<String, f64>,
+        ) -> Result<(), TunerError> {
+            let mut state = self.state.write().await;
+            let run = state
+                .get_mut(&run_id)
+                .ok_or_else(|| TunerError::UnknownRun(run_id))?;
+
+            // Merge metrics into current map (overwrite duplicates).
+            for (k, v) in &metrics {
+                run.metrics.insert(k.clone(), *v);
+            }
+
+            let event = TrainingEvent::EpochEnd {
+                run_id,
+                epoch,
+                metrics,
+                timestamp: SystemTime::now(),
+            };
+            let _ = self.broadcaster.send(event); // Ignore if no receivers.
+            Ok(())
+        }
+
+        /// Finalize a run, compute its duration & send final event.
+        pub async fn end_run(
+            &self,
+            run_id: Uuid,
+            final_metrics: HashMap<String, f64>,
+        ) -> Result<(), TunerError> {
+            let mut state = self.state.write().await;
+            let run = state
+                .get_mut(&run_id)
+                .ok_or_else(|| TunerError::UnknownRun(run_id))?;
+
+            run.end_time = Some(SystemTime::now());
+            for (k, v) in &final_metrics {
+                run.metrics.insert(k.clone(), *v);
+            }
+
+            let duration = run
+                .end_time
+                .unwrap()
+                .duration_since(run.start_time)
+                .unwrap_or_default();
+
+            let event = TrainingEvent::TrainingEnd {
+                run_id,
+                final_metrics,
+                duration,
+                timestamp: SystemTime::now(),
+            };
+            let _ = self.broadcaster.send(event);
+            Ok(())
+        }
+
+        /// A cheap read-only snapshot of a completed run.
+        pub async fn get_run(&self, run_id: Uuid) -> Option<ExperimentRun> {
+            self.state.read().await.get(&run_id).cloned()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+mod tuner {
+    use super::*;
+
+    // ---------------------- Hyper-parameter specification ------------------
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub enum HyperParamValue {
+        Int(i64),
+        Float(f64),
+        Text(String),
+        Flag(bool),
+    }
+
+    impl fmt::Display for HyperParamValue {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                HyperParamValue::Int(v) => write!(f, "{}", v),
+                HyperParamValue::Float(v) => write!(f, "{}", v),
+                HyperParamValue::Text(v) => write!(f, "{}", v),
+                HyperParamValue::Flag(v) => write!(f, "{}", v),
+            }
+        }
+    }
+
+    /// Parameter space configuration (search domain).
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum HyperParamSpec {
+        IntRange { min: i64, max: i64 },
+        FloatRange { min: f64, max: f64 },
+        Choice { options: Vec<String> },
+        Flag,
+    }
+
+    // -------------------------- Strategy Trait ----------------------------
+    #[async_trait::async_trait]
+    pub trait HyperParamTuner: Send + Sync {
+        /// Produce the next candidate configuration.
+        async fn suggest(&self) -> HashMap<String, HyperParamValue>;
+
+        /// Notify the tuner of the evaluation result so underlying
+        /// strategies can update their priors.
+        async fn record_result(
+            &self,
+            params: HashMap<String, HyperParamValue>,
+            score: f64,
+        ) -> Result<(), TunerError>;
+
+        /// Optional JSON snapshot for auditability.
+        async fn snapshot(&self) -> Result<String, TunerError>;
+    }
+
+    // ---------------------- Random Search Strategy ------------------------
+    pub struct RandomSearchTuner {
+        specs: HashMap<String, HyperParamSpec>,
+        rng: RwLock<StdRng>,
+    }
+
+    impl RandomSearchTuner {
+        pub fn new(specs: HashMap<String, HyperParamSpec>) -> Self {
+            Self {
+                specs,
+                rng: RwLock::new(StdRng::from_entropy()),
+            }
+        }
+
+        fn sample_from_spec(
+            spec: &HyperParamSpec,
+            rng: &mut StdRng,
+        ) -> HyperParamValue {
+            match spec {
+                HyperParamSpec::IntRange { min, max } => {
+                    let dist = Uniform::new_inclusive(*min, *max);
+                    HyperParamValue::Int(rng.sample(dist))
+                }
+                HyperParamSpec::FloatRange { min, max } => {
+                    let dist = Uniform::new_inclusive(*min, *max);
+                    HyperParamValue::Float(rng.sample(dist))
+                }
+                HyperParamSpec::Choice { options } => {
+                    let idx = rng.gen_range(0..options.len());
+                    HyperParamValue::Text(options[idx].clone())
+                }
+                HyperParamSpec::Flag => HyperParamValue::Flag(rng.gen::<bool>()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HyperParamTuner for RandomSearchTuner {
+        async fn suggest(&self) -> HashMap<String, HyperParamValue> {
+            let mut rng = self.rng.write().await;
+            self.specs
+                .iter()
+                .map(|(k, spec)| (k.clone(), Self::sample_from_spec(spec, &mut rng)))
+                .collect()
+        }
+
+        async fn record_result(
+            &self,
+            _params: HashMap<String, HyperParamValue>,
+            _score: f64,
+        ) -> Result<(), TunerError> {
+            // Random Search does not learn from feedback.
+            Ok(())
+        }
+
+        async fn snapshot(&self) -> Result<String, TunerError> {
+            serde_json::to_string(&self.specs)
+                .map_err(TunerError::from)
+        }
+    }
+
+    // ------------------------ Factory for Tuners --------------------------
+    pub enum TunerFactory;
+
+    impl TunerFactory {
+        /// Instantiate a tuner from JSON config.
+        pub fn build(
+            strategy: &str,
+            specs: HashMap<String, HyperParamSpec>,
+        ) -> Result<Box<dyn HyperParamTuner>, TunerError> {
+            match strategy.to_lowercase().as_str() {
+                "random_search" | "random" => Ok(Box::new(RandomSearchTuner::new(specs))),
+                other => Err(TunerError::UnknownStrategy(other.to_string())),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Example usage (to be compiled out in production)
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn smoke_test_random_search_and_tracker() {
+        // 1. Build tuner
+        let mut specs = HashMap::new();
+        specs.insert(
+            "learning_rate".into(),
+            HyperParamSpec::FloatRange { min: 1e-4, max: 1e-1 },
+        );
+        specs.insert(
+            "num_layers".into(),
+            HyperParamSpec::IntRange { min: 1, max: 6 },
+        );
+        let tuner = TunerFactory::build("random", specs).unwrap();
+
+        // 2. Create tracker & subscribe to events
+        let tracker = ExperimentTracker::new();
+        let mut rx = tracker.subscribe();
+
+        // 3. Suggest parameters & start run
+        let params = tuner.suggest().await;
+        let run_id = tracker.start_run(params.clone(), vec!["integration-test".into()]).await;
+
+        // Simulate training loop
+        for epoch in 0..3 {
+            // Fake some metric
+            let mut metrics = HashMap::new();
+            metrics.insert("loss".into(), 1.0 / (epoch as f64 + 1.0));
+            tracker.log_epoch_metrics(run_id, epoch, metrics).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // End run
+        let mut final_metrics = HashMap::new();
+        final_metrics.insert("accuracy".into(), 0.85);
+        tracker.end_run(run_id, final_metrics.clone()).await.unwrap();
+
+        // Consume events
+        let mut epoch_events = 0;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                TrainingEvent::EpochEnd { .. } => epoch_events += 1,
+                TrainingEvent::TrainingEnd { final_metrics: m, .. } => {
+                    assert_eq!(m.get("accuracy"), final_metrics.get("accuracy"));
+                }
+            }
+        }
+        assert_eq!(epoch_events, 3);
+    }
+}
+```

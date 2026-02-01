@@ -1,0 +1,358 @@
+
+## Code to Analyze
+
+```
+'cypress-plugin-snapshots/src/server/initServer.js'
+:const http = require('http');
+const socketio = require('socket.io');
+const { SAVE_TEXT, SAVE_IMAGE } = require('./actions');
+const saveTextSnapshot = require('../save/saveTextSnapshot');
+const { saveImageSnapshot } = require('../utils/tasks/imageSnapshots');
+
+function initServer(config) {
+  const server = http.createServer();
+  const io = socketio(server);
+
+  io.on('connection', (client) => {
+    const { token } = client.handshake.query;
+
+    if (config.serverEnabled) {
+      client.on(SAVE_IMAGE, (data) => {
+        if (token === config.token) {
+          saveImageSnapshot(data);
+        }
+      });
+
+      client.on(SAVE_TEXT, (data) => {
+        if (token === config.token) {
+          saveTextSnapshot(data);
+        }
+      });
+    }
+  });
+
+  if (config.serverEnabled) {
+    server.listen(config.serverPort, config.serverHost);
+  }
+}
+
+module.exports = initServer;
+
+'cypress-plugin-snapshots/src/utils/tasks/imageSnapshots.js'
+:const { createHash } = require('crypto');
+const { PNG } = require('pngjs');
+const fs = require('fs-extra');
+const pixelmatch = require('pixelmatch');
+const { merge } = require('lodash');
+const rimraf = require('rimraf').sync;
+const getSnapshotFilename = require('../image/getSnapshotFilename');
+const getImageData = require('../image/getImageData');
+const { IMAGE_TYPE_ACTUAL } = require('../../constants');
+const { DEFAULT_IMAGE_CONFIG } = require('../../config');
+
+function moveActualImageToSnapshotsDirectory({image, snapshotTitle, testFile} = {}) {
+  if (image && image.path) {
+    const filename = getSnapshotFilename(testFile, snapshotTitle, IMAGE_TYPE_ACTUAL);
+    rimraf(filename);
+    if (fs.existsSync(image.path)) {
+      fs.moveSync(image.path, filename);
+    }
+    image.path = filename;
+  }
+}
+
+function createDiffObject(filename) {
+  const imageObject = getImageObject(filename, false);
+  return getImageData(imageObject);
+}
+
+
+function getImageObject(filename, addHash = true) {
+  const exists = fs.existsSync(filename);
+  const size = exists ? fs.statSync(filename).size : 0;
+
+  if (size > 0) {
+    const image = PNG.sync.read(fs.readFileSync(filename));
+    const hash = addHash !== false ?
+      createHash('sha1').update(image.data).digest('base64') : undefined;
+
+    return {
+      path: filename,
+      image,
+      hash,
+      height: image.height,
+      width: image.width,
+    };
+  }
+
+  return false;
+}
+
+function createCompareCanvas(width, height, source) {
+  const canvas = new PNG({
+    width,
+    height,
+    colorType: 6,
+    bgColor: {
+      red: 0,
+      green: 0,
+      blue: 0,
+      alpha: 0,
+    }
+  });
+  PNG.bitblt(source, canvas, 0, 0, source.width, source.height, 0, 0);
+  return canvas;
+}
+
+
+function makeImagesEqualSize(expected, actual) {
+  const height = Math.max(expected.height, actual.height);
+  const width = Math.max(expected.width, actual.width);
+  actual.image = createCompareCanvas(width, height, actual.image);
+  expected.image = createCompareCanvas(width, height, expected.image);
+}
+
+function compareImageSizes(expected, actual) {
+  return expected.width === actual.width &&
+    actual.height === expected.height;
+}
+
+function compareImages(expected, actual, diffFilename, config) {
+  let passed = false;
+  rimraf(diffFilename);
+
+  if (actual !== false) {
+    const hashMatches = expected.hash === actual.hash;
+    if (hashMatches) {
+      return true;
+    }
+
+    const sizeMatch = compareImageSizes(expected, actual);
+    if (!sizeMatch) {
+      makeImagesEqualSize(expected, actual);
+    }
+
+    const imageConfig = merge({}, DEFAULT_IMAGE_CONFIG, config);
+    const pixelmatchConfig = {
+      threshold: 0.01,
+    };
+
+    const imageWidth = actual.image.width;
+    const imageHeight = actual.image.height;
+
+    const diffImage = config.createDiffImage ? new PNG({
+      height: imageHeight,
+      width: imageWidth,
+    }) : null;
+
+    const totalPixels = imageWidth * imageHeight;
+    const diffPixelCount = pixelmatch(
+      actual.image.data,
+      expected.image.data,
+      diffImage ? diffImage.data : null,
+      imageWidth,
+      imageHeight,
+      pixelmatchConfig
+    );
+
+    if (imageConfig.thresholdType === 'pixel') {
+      passed = diffPixelCount <= imageConfig.threshold;
+    } else if (imageConfig.thresholdType === 'percent') {
+      const diffRatio = diffPixelCount / totalPixels;
+      passed = diffRatio <= imageConfig.threshold;
+    } else {
+      throw new Error(`Unknown imageConfig.thresholdType: ${imageConfig.thresholdType}. `+
+        `Valid options are "pixel" or "percent".`);
+    }
+
+    if (!passed && diffImage) {
+
+
+      const pngBuffer = PNG.sync.write(diffImage, {
+        filterType: 4
+      });
+      fs.writeFileSync(diffFilename, pngBuffer);
+    }
+  }
+
+  return passed;
+}
+
+function saveImageSnapshot(data) {
+  rimraf(data.expected.path);
+  rimraf(data.diff.path);
+  fs.moveSync(data.actual.path, data.expected.path);
+}
+
+module.exports = {
+  compareImages,
+  createDiffObject,
+  getImageObject,
+  saveImageSnapshot,
+  moveActualImageToSnapshotsDirectory
+};
+
+'cypress-plugin-snapshots/src/constants.js'
+:module.exports = {
+  DIR_IMAGE_SNAPSHOTS: '__image_snapshots__',
+  DIR_SNAPSHOTS: '__snapshots__',
+  IMAGE_TYPE_DIFF: 'diff',
+  IMAGE_TYPE_ACTUAL: 'actual',
+  NO_LOG: { log: false },
+  URL_PREFIX: '#cypress-plugin-snapshot-',
+}
+
+'cypress-plugin-snapshots/__tests__/plugin.test.js'
+:
+const configModule = require('../src/config');
+
+jest.mock("../src/config.js");
+
+jest.spyOn(configModule, 'initConfig')
+  .mockImplementation((config) => config);
+
+global.Cypress = {
+  env: () => {},
+  config: () => {},
+  Commands: {
+    add: jest.fn(),
+  },
+};
+
+global.cy = {};
+
+describe('plugin', () => {
+  it('initPlugin', () => {
+    const globalConfig = {
+      env: {
+        "cypress-plugin-snapshots": {
+          "serverEnabled": false,
+        }
+      }
+    };
+    jest.spyOn(configModule, 'getConfig')
+      .mockImplementation(() => globalConfig.env['cypress-plugin-snapshots']);
+    const on = jest.fn();
+
+    const { initPlugin } = require('../plugin');
+
+    initPlugin(on, globalConfig);
+    expect(on).toBeCalledTimes(2);
+  });
+});
+
+'cypress-plugin-snapshots/src/utils/image/getSnapshotFilename.js'
+:const path = require('path');
+const sanitizeFilename = require('sanitize-filename');
+const { DIR_IMAGE_SNAPSHOTS } = require('../../constants');
+
+function getSnapshotFilename(testFile, snapshotTitle, type = '') {
+  const dir = path.join(path.dirname(testFile), DIR_IMAGE_SNAPSHOTS);
+  const fileType = type ? `.${type}` : '';
+  const filename = sanitizeFilename(`${snapshotTitle}${fileType}.png`);
+  return path.join(dir, filename);
+}
+
+module.exports = getSnapshotFilename;
+
+'cypress-plugin-snapshots/plugin.js'
+:
+const { initConfig, CONFIG_KEY } = require('./src/config');
+const initServer = require('./src/server/initServer');
+const tasks = require('./src/tasks/');
+
+
+function initPlugin(on, globalConfig = {
+}) {
+  const config = initConfig(globalConfig.env[CONFIG_KEY]);
+  initServer(config);
+
+
+
+  globalConfig.env[CONFIG_KEY] = JSON.stringify(config);
+
+  on('before:browser:launch', (browser = {}, launchOptions) => {
+    const args = Array.isArray(launchOptions) ? launchOptions : launchOptions.args;
+
+    if (browser.name === 'chrome') {
+      args.push('--font-render-hinting=medium');
+      args.push('--enable-font-antialiasing');
+      args.push('--disable-gpu');
+    }
+
+    return launchOptions;
+  });
+
+  on('task', tasks);
+}
+
+module.exports = {
+  initPlugin
+};
+
+```
+
+# Repository Construction Task
+
+## Problem Statement
+
+
+
+## Task Description
+
+Your task is to build a call chain graph that represents the function invocation relationships across the repository. Analyze the code to understand how functions call each other and construct a directed graph representation.
+
+## Repository Information
+
+- **Repository**: N/A
+- **Language**: javascript
+
+## Output Format
+
+Write your answer to `/workspace/submission.json` as a JSON object representing the call graph:
+
+```json
+{
+  "function1": ["function2", "function3"],
+  "function2": ["function4"],
+  "function3": [],
+  "function4": []
+}
+```
+
+### Structure:
+
+- **Keys**: Function names (callers)
+- **Values**: Arrays of function names that are called by the key function (callees)
+- **Empty arrays**: Functions that don't call any other functions
+- **Isolated nodes**: Include functions that are never called but exist in the repository
+
+### Alternative Format (List of Edges):
+
+You can also use an edge list format:
+
+```json
+[
+  {"caller": "function1", "callee": "function2"},
+  {"caller": "function1", "callee": "function3"},
+  {"caller": "function2", "callee": "function4"}
+]
+```
+
+## Evaluation
+
+Your submission will be evaluated using graph similarity metrics:
+
+- **Node F1**: Precision and recall of identified functions (15% weight)
+- **Edge F1**: Precision and recall of call relationships (85% weight)
+- **Final Score**: 0.15 × Node_F1 + 0.85 × Edge_F1
+
+The evaluation emphasizes getting the call relationships correct over identifying all functions.
+
+## Tips
+
+- Focus on accurately identifying which functions call which
+- Include all functions in the repository, even if they have no outgoing calls
+- Pay attention to indirect calls through variables or callbacks
+- Consider method calls on objects and class methods
+- Cross-file function calls are especially important

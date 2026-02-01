@@ -1,0 +1,482 @@
+/*
+ * src/module_26.c
+ *
+ * MercuryMonolith Commerce Hub
+ * ---------------------------------
+ * Thread-safe, in-memory response cache with TTL expiration, LRU eviction,
+ * and basic Prometheus-style instrumentation.
+ *
+ * This module is used across the REST/GraphQL gateway to avoid executing
+ * expensive service code paths when a stable response can be served directly
+ * from memory.  The cache is intentionally self-contained and does not depend
+ * on any external daemon (e.g., Redis) so that deployments remain
+ * single-binary and operationally simple.
+ *
+ * Public API (see comments below):
+ *  - mmc_cache_t *mmc_cache_create(size_t max_entries,
+ *                                  uint32_t default_ttl_sec,
+ *                                  mmc_logger_t *logger);
+ *  - void mmc_cache_destroy(mmc_cache_t *);
+ *  - bool mmc_cache_get(mmc_cache_t *, const char *key,
+ *                       uint8_t **out_buf, size_t *out_len);
+ *  - void mmc_cache_put(mmc_cache_t *, const char *key,
+ *                       const uint8_t *buf, size_t len,
+ *                       uint32_t ttl_override_sec);
+ *  - void mmc_cache_invalidate(mmc_cache_t *, const char *key);
+ *  - void mmc_cache_collect_metrics(const mmc_cache_t *,
+ *                                   struct mmc_cache_metrics *);
+ *
+ * NOTE: This file deliberately has no header; it is intended to be compiled
+ *       once into the final monolith and accessed through the forward
+ *       declarations in the central "mmc.h" umbrella header.
+ */
+
+#define _POSIX_C_SOURCE 200809L  /* clock_gettime */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+#include <stdatomic.h>
+
+/* 3rd-party single-header hash-table implementation (public domain) */
+#include "external/uthash.h"
+
+#include "mmc_logger.h"   /* Project-wide structured logger abstraction */
+#include "mmc_metrics.h"  /* Prometheus exposition helpers */
+
+/*-----------------------------------------------------------*
+ *                       Data Types                          *
+ *-----------------------------------------------------------*/
+
+/* Linked list node for LRU management */
+typedef struct lru_node_s {
+    struct lru_node_s *prev;
+    struct lru_node_s *next;
+    char              *key; /* shallow copy; owned by entry */
+} lru_node_t;
+
+/* Cache entry stored in hash table                       */
+typedef struct cache_entry_s {
+    char            *key;        /* key string (deep copy)          */
+    uint8_t         *blob;       /* payload (deep copy)             */
+    size_t           blob_len;
+    uint64_t         expiry_epoch_ms;
+    lru_node_t       lru;        /* embedded LRU node               */
+
+    UT_hash_handle   hh;         /* makes this structure hashable   */
+} cache_entry_t;
+
+typedef struct mmc_cache_s {
+    size_t            max_entries;
+    uint32_t          default_ttl_sec;
+    cache_entry_t    *hash;          /* uthash handle */
+    lru_node_t        lru_head;      /* sentinel head/tail for O(1)  */
+    pthread_rwlock_t  rwlock;        /* read/write lock */
+    mmc_logger_t     *logger;
+
+    /* Metrics (atomics for lock-free reads) */
+    atomic_uint_least64_t hits;
+    atomic_uint_least64_t misses;
+    atomic_uint_least64_t evictions;
+    atomic_uint_least64_t puts;
+} mmc_cache_t;
+
+/* Exposed metrics container (for snapshot) */
+struct mmc_cache_metrics {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    uint64_t puts;
+    size_t   current_entries;
+};
+
+/*-----------------------------------------------------------*
+ *                 Internal Helper Functions                 *
+ *-----------------------------------------------------------*/
+
+static uint64_t
+now_epoch_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
+
+/* Initialize LRU doubly-linked list sentinel */
+static void
+lru_init(mmc_cache_t *c)
+{
+    c->lru_head.prev = &c->lru_head;
+    c->lru_head.next = &c->lru_head;
+}
+
+/* Remove node from its current position */
+static inline void
+lru_detach(lru_node_t *node)
+{
+    node->prev->next = node->next;
+    node->next->prev = node->prev;
+}
+
+/* Insert node at front (MRU) */
+static inline void
+lru_insert_front(mmc_cache_t *c, lru_node_t *node)
+{
+    node->next = c->lru_head.next;
+    node->prev = &c->lru_head;
+    c->lru_head.next->prev = node;
+    c->lru_head.next      = node;
+}
+
+/* Move node to front (after hit) */
+static inline void
+lru_move_to_front(mmc_cache_t *c, lru_node_t *node)
+{
+    lru_detach(node);
+    lru_insert_front(c, node);
+}
+
+/* Evict LRU tail, return the removed entry (locked) */
+static cache_entry_t *
+evict_lru_tail(mmc_cache_t *c)
+{
+    if (c->lru_head.prev == &c->lru_head) {
+        return NULL; /* empty */
+    }
+    lru_node_t *tail = c->lru_head.prev;
+    lru_detach(tail);
+
+    cache_entry_t *entry = (cache_entry_t *)((char *)tail -
+                                    offsetof(cache_entry_t, lru));
+    HASH_DEL(c->hash, entry);
+    atomic_fetch_add_explicit(&c->evictions, 1, memory_order_relaxed);
+    return entry;
+}
+
+/*-----------------------------------------------------------*
+ *                     Public  API                           *
+ *-----------------------------------------------------------*/
+
+mmc_cache_t *
+mmc_cache_create(size_t max_entries,
+                 uint32_t default_ttl_sec,
+                 mmc_logger_t *logger)
+{
+    if (max_entries == 0) {
+        fprintf(stderr, "[mmc_cache] max_entries must be > 0\n");
+        return NULL;
+    }
+
+    mmc_cache_t *c = calloc(1, sizeof(*c));
+    if (!c) {
+        return NULL;
+    }
+    c->max_entries      = max_entries;
+    c->default_ttl_sec  = default_ttl_sec ? default_ttl_sec : 60;
+    c->logger           = logger;
+
+    pthread_rwlock_init(&c->rwlock, NULL);
+    lru_init(c);
+
+    mmc_log_info(c->logger,
+                 "response_cache.init",
+                 "Initialized cache with capacity=%zu ttl=%us",
+                 c->max_entries, c->default_ttl_sec);
+    return c;
+}
+
+void
+mmc_cache_destroy(mmc_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, c->hash, cur, tmp) {
+        HASH_DEL(c->hash, cur);
+        free(cur->key);
+        free(cur->blob);
+        free(cur);
+    }
+    pthread_rwlock_unlock(&c->rwlock);
+    pthread_rwlock_destroy(&c->rwlock);
+
+    free(c);
+}
+
+/*
+ * Retrieve value for `key`.
+ *  - On hit: returns true, caller owns *out_buf (malloced).
+ *  - On miss: returns false, *out_buf untouched.
+ */
+bool
+mmc_cache_get(mmc_cache_t *c,
+              const char *key,
+              uint8_t **out_buf,
+              size_t *out_len)
+{
+    if (!c || !key) return false;
+
+    uint64_t now_ms = now_epoch_ms();
+
+    pthread_rwlock_wrlock(&c->rwlock); /* upgradeable read would be nicer */
+    cache_entry_t *entry;
+    HASH_FIND_STR(c->hash, key, entry);
+    if (!entry || entry->expiry_epoch_ms < now_ms) {
+        if (entry) {
+            /* Expired entry—remove it */
+            lru_detach(&entry->lru);
+            HASH_DEL(c->hash, entry);
+            free(entry->key);
+            free(entry->blob);
+            free(entry);
+            atomic_fetch_add_explicit(&c->evictions, 1, memory_order_relaxed);
+        }
+        atomic_fetch_add_explicit(&c->misses, 1, memory_order_relaxed);
+        pthread_rwlock_unlock(&c->rwlock);
+        return false;
+    }
+
+    /* Cache hit */
+    lru_move_to_front(c, &entry->lru);
+    atomic_fetch_add_explicit(&c->hits, 1, memory_order_relaxed);
+
+    /* Deep copy payload for caller */
+    uint8_t *copy = malloc(entry->blob_len);
+    if (!copy) {
+        pthread_rwlock_unlock(&c->rwlock);
+        return false;
+    }
+    memcpy(copy, entry->blob, entry->blob_len);
+    *out_buf = copy;
+    *out_len = entry->blob_len;
+
+    pthread_rwlock_unlock(&c->rwlock);
+    return true;
+}
+
+/*
+ * Store value for `key` with optional TTL override (seconds).
+ * When capacity exceeded, evicts least-recently-used entry.
+ */
+void
+mmc_cache_put(mmc_cache_t *c,
+              const char *key,
+              const uint8_t *buf,
+              size_t len,
+              uint32_t ttl_override_sec)
+{
+    if (!c || !key || !buf || len == 0) return;
+
+    uint64_t now_ms  = now_epoch_ms();
+    uint64_t ttl_sec = ttl_override_sec ? ttl_override_sec : c->default_ttl_sec;
+
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    cache_entry_t *entry;
+    HASH_FIND_STR(c->hash, key, entry);
+    if (entry) {
+        /* Replace existing entry in place */
+        free(entry->blob);
+        entry->blob = malloc(len);
+        if (!entry->blob) goto unlock;
+        memcpy(entry->blob, buf, len);
+        entry->blob_len        = len;
+        entry->expiry_epoch_ms = now_ms + ttl_sec * 1000ULL;
+
+        lru_move_to_front(c, &entry->lru);
+    } else {
+        /* Evict if over capacity */
+        if (HASH_COUNT(c->hash) >= c->max_entries) {
+            cache_entry_t *ev = evict_lru_tail(c);
+            if (ev) {
+                free(ev->key);
+                free(ev->blob);
+                free(ev);
+            }
+        }
+
+        entry = calloc(1, sizeof(*entry));
+        if (!entry) goto unlock;
+
+        entry->key = strdup(key);
+        if (!entry->key) { free(entry); goto unlock; }
+
+        entry->blob = malloc(len);
+        if (!entry->blob) { free(entry->key); free(entry); goto unlock; }
+
+        memcpy(entry->blob, buf, len);
+        entry->blob_len        = len;
+        entry->expiry_epoch_ms = now_ms + ttl_sec * 1000ULL;
+
+        /* Insert into hash & LRU front */
+        HASH_ADD_KEYPTR(hh, c->hash, entry->key, strlen(entry->key), entry);
+        lru_insert_front(c, &entry->lru);
+    }
+
+    atomic_fetch_add_explicit(&c->puts, 1, memory_order_relaxed);
+
+unlock:
+    pthread_rwlock_unlock(&c->rwlock);
+}
+
+/* Explicitly remove key (e.g., after underlying data mutation) */
+void
+mmc_cache_invalidate(mmc_cache_t *c, const char *key)
+{
+    if (!c || !key) return;
+
+    pthread_rwlock_wrlock(&c->rwlock);
+    cache_entry_t *entry;
+    HASH_FIND_STR(c->hash, key, entry);
+    if (entry) {
+        lru_detach(&entry->lru);
+        HASH_DEL(c->hash, entry);
+        free(entry->key);
+        free(entry->blob);
+        free(entry);
+
+        atomic_fetch_add_explicit(&c->evictions, 1, memory_order_relaxed);
+    }
+    pthread_rwlock_unlock(&c->rwlock);
+}
+
+/* Collect metrics snapshot (no lock required for counters) */
+void
+mmc_cache_collect_metrics(const mmc_cache_t *c,
+                          struct mmc_cache_metrics *out)
+{
+    if (!c || !out) return;
+
+    out->hits      = atomic_load_explicit(&c->hits, memory_order_relaxed);
+    out->misses    = atomic_load_explicit(&c->misses, memory_order_relaxed);
+    out->evictions = atomic_load_explicit(&c->evictions, memory_order_relaxed);
+    out->puts      = atomic_load_explicit(&c->puts, memory_order_relaxed);
+
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&c->rwlock);
+    out->current_entries = HASH_COUNT(c->hash);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&c->rwlock);
+}
+
+/*-----------------------------------------------------------*
+ *            Periodic Cleanup & Prometheus Export           *
+ *-----------------------------------------------------------*/
+
+/*
+ * Lightweight cleanup thread that runs every N seconds to remove expired
+ * entries. This avoids accumulations when keys are rarely accessed.
+ */
+struct cleanup_args {
+    mmc_cache_t *cache;
+    uint32_t     interval_sec;
+};
+
+static void *
+cleanup_thread_fn(void *arg)
+{
+    struct cleanup_args *ctx = arg;
+    mmc_cache_t *c = ctx->cache;
+    const uint32_t sleep_sec = ctx->interval_sec;
+
+    while (true) {
+        struct timespec ts = { .tv_sec = sleep_sec, .tv_nsec = 0 };
+        nanosleep(&ts, NULL);
+
+        uint64_t now_ms = now_epoch_ms();
+        size_t removed  = 0;
+
+        pthread_rwlock_wrlock(&c->rwlock);
+        cache_entry_t *cur, *tmp;
+        HASH_ITER(hh, c->hash, cur, tmp) {
+            if (cur->expiry_epoch_ms < now_ms) {
+                lru_detach(&cur->lru);
+                HASH_DEL(c->hash, cur);
+                free(cur->key);
+                free(cur->blob);
+                free(cur);
+                atomic_fetch_add_explicit(&c->evictions, 1,
+                                          memory_order_relaxed);
+                ++removed;
+            }
+        }
+        pthread_rwlock_unlock(&c->rwlock);
+
+        if (removed > 0) {
+            mmc_log_debug(c->logger,
+                          "response_cache.cleanup",
+                          "Removed %zu expired entries", removed);
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Spawn background cleanup thread. Should be invoked once at service start.
+ */
+void
+mmc_cache_start_cleanup_daemon(mmc_cache_t *c, uint32_t interval_sec)
+{
+    if (!c || interval_sec == 0) return;
+
+    static pthread_t tid;
+    static bool started = false;
+    if (started) return;
+
+    struct cleanup_args *args = malloc(sizeof(*args));
+    args->cache        = c;
+    args->interval_sec = interval_sec;
+
+    int rc = pthread_create(&tid, NULL, cleanup_thread_fn, args);
+    if (rc == 0) {
+        pthread_detach(tid);
+        started = true;
+        mmc_log_info(c->logger,
+                     "response_cache.daemon",
+                     "Started cleanup thread with interval=%us",
+                     interval_sec);
+    } else {
+        mmc_log_error(c->logger,
+                      "response_cache.daemon",
+                      "Failed to spawn cleanup thread (rc=%d)", rc);
+        free(args);
+    }
+}
+
+/*
+ * Expose metrics in Prometheus-compatible text format.
+ * Call from the HTTP /metrics endpoint handler.
+ */
+void
+mmc_cache_prometheus_dump(const mmc_cache_t *c, FILE *out)
+{
+    struct mmc_cache_metrics m = {0};
+    mmc_cache_collect_metrics(c, &m);
+
+    fprintf(out, "# HELP mmc_cache_hits_total Total cache hits\n");
+    fprintf(out, "# TYPE mmc_cache_hits_total counter\n");
+    fprintf(out, "mmc_cache_hits_total %" PRIu64 "\n", m.hits);
+
+    fprintf(out, "# HELP mmc_cache_misses_total Total cache misses\n");
+    fprintf(out, "# TYPE mmc_cache_misses_total counter\n");
+    fprintf(out, "mmc_cache_misses_total %" PRIu64 "\n", m.misses);
+
+    fprintf(out, "# HELP mmc_cache_evictions_total Total cache evictions\n");
+    fprintf(out, "# TYPE mmc_cache_evictions_total counter\n");
+    fprintf(out, "mmc_cache_evictions_total %" PRIu64 "\n", m.evictions);
+
+    fprintf(out, "# HELP mmc_cache_puts_total Total cache insertions\n");
+    fprintf(out, "# TYPE mmc_cache_puts_total counter\n");
+    fprintf(out, "mmc_cache_puts_total %" PRIu64 "\n", m.puts);
+
+    fprintf(out, "# HELP mmc_cache_entries Current number of entries\n");
+    fprintf(out, "# TYPE mmc_cache_entries gauge\n");
+    fprintf(out, "mmc_cache_entries %zu\n", m.current_entries);
+}
+
+/*-----------------------------------------------------------*
+ *                       End of File                         *
+ *-----------------------------------------------------------*/

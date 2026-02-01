@@ -1,0 +1,369 @@
+```rust
+//! src/module_24.rs
+//!
+//! Dynamic sentiment–analysis orchestration (a.k.a “module 24”) for
+//! the ChirpPulse streaming stack.  At runtime, analysts can push a
+//! control‐plane event (e.g. via Kafka, gRPC or an HTTP call) to hot‐swap
+//! the algorithm that scores incoming social events.  The coordinator
+//! guarantees lock-free reads for the high-volume ingest path while
+//! atomically switching the active strategy in micro-seconds.
+//!
+//! Design goals
+//! ------------
+//! • zero-copy, lock-free fast-path (`arc-swap`)
+//! • pragmatic async with Tokio
+//! • clear separation of concerns (Strategy Pattern)
+//! • graceful error handling + observability (`thiserror`, `tracing`)
+//!
+//! This crate file is self-contained and ready to compile.  External
+//! dependencies are declared in the project’s `Cargo.toml`:
+//
+//! ```toml
+//! [dependencies]
+//! async-trait  = "0.1"
+//! arc-swap     = "1"
+//! chrono       = { version = "0.4", features = ["serde"] }
+//! serde        = { version = "1", features = ["derive"] }
+//! serde_json   = "1"
+//! thiserror    = "1"
+//! tokio        = { version = "1", features = ["rt-multi-thread", "macros"] }
+//! tracing      = "0.1"
+//! ```
+//!
+//! You may optionally enable the `kafka` feature to swap the stubbed
+//! stream source with a real `rdkafka` implementation.
+
+#![allow(clippy::missing_errors_doc)] // (docstrings focus on main flows)
+#![allow(dead_code)]                  // some helpers kept for future use
+
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc},
+    task,
+    time::sleep,
+};
+use tracing::{debug, error, info, warn};
+
+/// Unique identifier inside the lake.
+pub type EventId = u64;
+
+/// A raw social event as captured by the ingest engine.
+///
+/// In production the payload is Avro/Protobuf; here we simplify by using
+/// JSON for readability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialEvent {
+    pub id: EventId,
+    pub author_handle: String,
+    pub text: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Output produced by any [`SentimentAnalyzer`] implementation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentimentOutcome {
+    pub id: EventId,
+    pub score: f32,          // -1.0 … 1.0
+    pub algorithm: String,   // human-readable name
+    pub processed_at: DateTime<Utc>,
+}
+
+/// Domain errors emitted by module 24.
+#[derive(Debug, Error)]
+pub enum Module24Error {
+    #[error("stream source disconnected")]
+    SourceDisconnected,
+    #[error("control channel closed unexpectedly")]
+    ControlPlaneClosed,
+    #[error("invalid analyzer name `{0}`")]
+    UnknownAnalyzer(String),
+    #[error("internal processing error: {0}")]
+    Internal(String),
+}
+
+/// Abstraction over any real-time source (Kafka / Kinesis / WebSocket / etc.)
+#[async_trait]
+pub trait EventStreamSource: Send + Sync {
+    async fn next_event(&self) -> Result<SocialEvent, Module24Error>;
+}
+
+/// Quick in-memory generator used for CI / unit tests / playground.
+pub struct StubSource {
+    rx: mpsc::UnboundedReceiver<SocialEvent>,
+}
+
+impl StubSource {
+    pub fn new() -> (Self, mpsc::UnboundedSender<SocialEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self { rx }, tx)
+    }
+}
+
+#[async_trait]
+impl EventStreamSource for StubSource {
+    async fn next_event(&self) -> Result<SocialEvent, Module24Error> {
+        self.rx
+            .recv()
+            .await
+            .ok_or(Module24Error::SourceDisconnected)
+    }
+}
+
+/// Strategy pattern — any sentiment algorithm must comply.
+#[async_trait]
+pub trait SentimentAnalyzer: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn assess(&self, event: &SocialEvent) -> SentimentOutcome;
+}
+
+/// Extremely naive word-count-based analyzer used for fallback.
+pub struct LexiconAnalyzer;
+
+#[async_trait]
+impl SentimentAnalyzer for LexiconAnalyzer {
+    fn name(&self) -> &'static str {
+        "lexicon_v1"
+    }
+
+    async fn assess(&self, event: &SocialEvent) -> SentimentOutcome {
+        // A silly “algorithm”: positive if the text contains more happy emojis
+        // than sad ones; neutral otherwise.
+        let positives = ["😀", "😎", "🥳", "🎉", "❤️"];
+        let negatives = ["😢", "😠", "💔", "😭"];
+
+        let score = {
+            let mut s = 0f32;
+            for p in positives {
+                s += event.text.matches(p).count() as f32;
+            }
+            for n in negatives {
+                s -= event.text.matches(n).count() as f32;
+            }
+            (s / 5.0).clamp(-1.0, 1.0)
+        };
+
+        SentimentOutcome {
+            id: event.id,
+            score,
+            algorithm: Self::name(&self).into(),
+            processed_at: Utc::now(),
+        }
+    }
+}
+
+/// A mock “deep learning” model.  Here we just randomize for demo purposes.
+pub struct TransformerXLAnalyzer;
+
+#[async_trait]
+impl SentimentAnalyzer for TransformerXLAnalyzer {
+    fn name(&self) -> &'static str {
+        "transformer_xl_v2"
+    }
+
+    async fn assess(&self, event: &SocialEvent) -> SentimentOutcome {
+        // Pretend we invoke a real ML model here.
+        let hash = fxhash::hash64(event.text.as_bytes());
+        let norm = (hash % 200) as f32 / 100.0 - 1.0; // [-1,1] pseudo-random
+
+        SentimentOutcome {
+            id: event.id,
+            score: norm,
+            algorithm: Self::name(&self).into(),
+            processed_at: Utc::now(),
+        }
+    }
+}
+
+/// Lock-free holder that can be swapped atomically at runtime.
+#[derive(Clone)]
+pub struct AnalyzerManager {
+    /// Fast-path look-ups never need locking.
+    inner: Arc<ArcSwap<dyn SentimentAnalyzer>>,
+}
+
+impl AnalyzerManager {
+    /// Create a manager with the given default strategy.
+    pub fn new<S: SentimentAnalyzer + 'static>(default: S) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(default)),
+        }
+    }
+
+    /// Returns the current algorithm’s name (cheap, lock-free).
+    pub fn current_name(&self) -> &'static str {
+        self.inner.load().name()
+    }
+
+    /// Swap analyzer by human-readable name.  If unknown, returns an error.
+    pub fn swap_by_name(&self, name: &str) -> Result<(), Module24Error> {
+        let new_algo: Arc<dyn SentimentAnalyzer> = match name {
+            "lexicon_v1" => Arc::new(LexiconAnalyzer),
+            "transformer_xl_v2" => Arc::new(TransformerXLAnalyzer),
+            _ => return Err(Module24Error::UnknownAnalyzer(name.into())),
+        };
+        self.inner.store(new_algo);
+        Ok(())
+    }
+
+    /// Obtain a clone of the current implementation (Arc—cheap).
+    pub fn analyzer(&self) -> Arc<dyn SentimentAnalyzer> {
+        self.inner.load_full()
+    }
+}
+
+/// Control-plane message to switch algorithms (Kafka topic “control.sentiment”)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ControlPlaneCmd {
+    pub new_algorithm: String,
+}
+
+/// The core orchestrator task.
+pub struct SentimentCoordinator<S>
+where
+    S: EventStreamSource + 'static,
+{
+    source: Arc<S>,
+    manager: AnalyzerManager,
+    /// External observers can subscribe to results.
+    publisher: broadcast::Sender<SentimentOutcome>,
+    /// Control-plane commands (either gRPC or Kafka consumption).
+    control_rx: mpsc::UnboundedReceiver<ControlPlaneCmd>,
+}
+
+impl<S> SentimentCoordinator<S>
+where
+    S: EventStreamSource + 'static,
+{
+    pub fn new(
+        source: S,
+        control_rx: mpsc::UnboundedReceiver<ControlPlaneCmd>,
+    ) -> (Self, broadcast::Receiver<SentimentOutcome>) {
+        let (tx, rx) = broadcast::channel(128);
+        let manager = AnalyzerManager::new(LexiconAnalyzer);
+        (
+            Self {
+                source: Arc::new(source),
+                manager,
+                publisher: tx,
+                control_rx,
+            },
+            rx,
+        )
+    }
+
+    /// Spawn the async loop on the Tokio runtime.
+    pub fn spawn(self) -> task::JoinHandle<()> {
+        task::spawn(async move {
+            if let Err(e) = self.run().await {
+                error!(error = %e, "sentiment coordinator terminated");
+            }
+        })
+    }
+
+    async fn run(mut self) -> Result<(), Module24Error> {
+        info!(
+            algo = self.manager.current_name(),
+            "sentiment coordinator started"
+        );
+
+        loop {
+            select! {
+                // Fast data path — social events
+                biased;
+
+                res = self.source.next_event() => {
+                    let event = match res {
+                        Ok(ev) => ev,
+                        Err(e) => {
+                            error!(error = %e, "source failure");
+                            return Err(e);
+                        }
+                    };
+                    let analyzer = self.manager.analyzer();
+                    let outcome = analyzer.assess(&event).await;
+                    if let Err(e) = self.publisher.send(outcome) {
+                        warn!(error = %e, "no active subscribers");
+                    }
+                }
+
+                // Control path — algorithm updates
+                Some(cmd) = self.control_rx.recv() => {
+                    info!(%cmd.new_algorithm, "received analyzer switch request");
+                    match self.manager.swap_by_name(&cmd.new_algorithm) {
+                        Ok(()) => {
+                            info!(
+                                algo = self.manager.current_name(),
+                                "successfully switched analyzer"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "control-plane command failed");
+                        }
+                    }
+                }
+
+                // Idle maintenance to exhibit non-busy waiting.
+                _ = sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    }
+}
+
+/* ---------- Example binary for local testing ---------------------------------
+   Run with: `cargo run --example module24_demo`
+---------------------------------------------------------------------------------
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt::init();
+
+    let (stub_source, stub_tx) = StubSource::new();
+    let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
+
+    let (coordinator, mut sentiment_rx) = SentimentCoordinator::new(stub_source, ctrl_rx);
+    coordinator.spawn();
+
+    // Fire some test events.
+    for id in 0..5 {
+        let _ = stub_tx.send(SocialEvent {
+            id,
+            author_handle: format!("@user{}", id),
+            text: if id % 2 == 0 { "I love Rust 😀" } else { "I hate bugs 😠" }.into(),
+            created_at: Utc::now(),
+        });
+    }
+
+    // Switch algorithm on the fly.
+    let _ = ctrl_tx.send(ControlPlaneCmd {
+        new_algorithm: "transformer_xl_v2".into(),
+    });
+
+    // Ingest a few more events.
+    for id in 5..10 {
+        let _ = stub_tx.send(SocialEvent {
+            id,
+            author_handle: format!("@hacker{}", id),
+            text: "Streaming is fun 🎉".into(),
+            created_at: Utc::now(),
+        });
+    }
+
+    // Drain to show console output.
+    for _ in 0..10 {
+        if let Ok(outcome) = sentiment_rx.recv().await {
+            println!("{outcome:?}");
+        }
+    }
+}
+---------------------------------------------------------------------------------
+*/
+```

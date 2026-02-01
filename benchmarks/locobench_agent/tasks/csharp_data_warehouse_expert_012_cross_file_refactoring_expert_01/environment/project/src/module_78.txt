@@ -1,0 +1,340 @@
+```csharp
+// ---------------------------------------------------------------------------------------------------------------------
+// File:        src/module_78.txt   (yes, we keep the TXT extension to satisfy legacy build-ops)
+// Project:     PulseOps Warehouse — Serverless Productivity Intelligence Fabric
+// Description: Transformation engine + pluggable KPI strategies (Strategy Pattern).
+// ---------------------------------------------------------------------------------------------------------------------
+#nullable enable
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.Transformation
+{
+    /// <summary>
+    /// Raw event domain model as it comes off the lake.
+    /// </summary>
+    /// <param name="SourceSystem">The upstream system (Calendar, GitHub, Jira, etc.)</param>
+    /// <param name="Timestamp">UTC timestamp at source system.</param>
+    /// <param name="Payload">Opaque JSON payload.</param>
+    public sealed record RawEvent(string SourceSystem, DateTimeOffset Timestamp, JsonDocument Payload);
+
+    /// <summary>
+    /// Normalized KPI result produced by a transformation strategy.
+    /// </summary>
+    /// <param name="KpiName">Unique KPI identifier.</param>
+    /// <param name="NumericValue">A numeric representation (for visualizations / alerting engines).</param>
+    /// <param name="CalculatedAt">Timestamp when KPI was calculated.</param>
+    /// <param name="Metadata">Optional, strategy-specific JSON metadata.</param>
+    public sealed record KpiResult(
+        string KpiName,
+        double NumericValue,
+        DateTimeOffset CalculatedAt,
+        JsonDocument? Metadata = null);
+
+    /// <summary>
+    /// Strategy interface to calculate a KPI out of an arbitrary <see cref="IAsyncEnumerable{RawEvent}"/> stream.
+    /// </summary>
+    public interface ITransformationStrategy
+    {
+        /// <summary>
+        /// Human-friendly, unique name (used in configuration &amp; routing).
+        /// </summary>
+        string Name { get; }
+
+        /// <summary>
+        /// Executes the transformation.
+        /// </summary>
+        /// <exception cref="OperationCanceledException">Thrown if the caller cancels.</exception>
+        Task<KpiResult?> TransformAsync(IAsyncEnumerable<RawEvent> events, CancellationToken cancellationToken = default);
+    }
+
+    /// <summary>
+    /// Calculates the "Focus-Time Ratio" KPI.
+    ///
+    /// Assumptions:
+    ///   ‑ Only events from the "Calendar" source are inspected.
+    ///   ‑ Each payload contains { "EventType": "Meeting" | "Focus", "DurationMinutes": int }.
+    /// </summary>
+    public sealed class FocusTimeRatioStrategy : ITransformationStrategy
+    {
+        public const string KpiKey = "focus_time_ratio";
+        public string Name => KpiKey;
+
+        private readonly ILogger _logger;
+
+        public FocusTimeRatioStrategy(ILogger<FocusTimeRatioStrategy> logger) => _logger = logger;
+
+        public async Task<KpiResult?> TransformAsync(IAsyncEnumerable<RawEvent> events, CancellationToken cancellationToken = default)
+        {
+            double focusMinutes = 0;
+            double meetingMinutes = 0;
+
+            await foreach (var e in events.WithCancellation(cancellationToken))
+            {
+                if (!e.SourceSystem.Equals("Calendar", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (!e.Payload.RootElement.TryGetProperty("EventType", out var typeElement) ||
+                    !e.Payload.RootElement.TryGetProperty("DurationMinutes", out var durationElement))
+                {
+                    // Skip malformed.
+                    _logger.LogWarning("Calendar event missing required properties: {Payload}", e.Payload);
+                    continue;
+                }
+
+                var minutes = durationElement.GetDouble();
+                var eventType = typeElement.GetString();
+
+                switch (eventType)
+                {
+                    case "Focus":
+                        focusMinutes += minutes;
+                        break;
+
+                    case "Meeting":
+                        meetingMinutes += minutes;
+                        break;
+
+                    default:
+                        _logger.LogDebug("Ignoring Calendar event of type {EventType}", eventType);
+                        break;
+                }
+            }
+
+            var total = focusMinutes + meetingMinutes;
+            if (total <= 0)
+            {
+                _logger.LogInformation("No calendar entries detected. Focus-time ratio not computed.");
+                return null;
+            }
+
+            var ratio = focusMinutes / total;
+            _logger.LogInformation("Focus-Time Ratio computed: {Ratio:P2}", ratio);
+
+            var meta = JsonSerializer.SerializeToDocument(new
+            {
+                focusMinutes,
+                meetingMinutes,
+                ratio
+            });
+
+            return new KpiResult(KpiKey, ratio, DateTimeOffset.UtcNow, meta);
+        }
+    }
+
+    /// <summary>
+    /// Calculates "Deployment Lead-Time" KPI.
+    ///
+    /// Assumptions:
+    ///   ‑ Events originate either from the "Git" or "CI" systems.
+    ///   ‑ Git payload: { "CommitSha": string, "CommittedAt": DateTime }
+    ///   ‑ CI payload : { "CommitSha": string, "DeployedAt": DateTime }
+    ///   ‑ Lead-time := DeployedAt ‑ CommittedAt, averaged across unique shas.
+    /// </summary>
+    public sealed class DeploymentLeadTimeStrategy : ITransformationStrategy
+    {
+        public const string KpiKey = "deployment_lead_time_minutes";
+        public string Name => KpiKey;
+
+        private readonly ILogger _logger;
+
+        public DeploymentLeadTimeStrategy(ILogger<DeploymentLeadTimeStrategy> logger)
+            => _logger = logger;
+
+        public async Task<KpiResult?> TransformAsync(IAsyncEnumerable<RawEvent> events, CancellationToken cancellationToken = default)
+        {
+            var commitTimestamps = new ConcurrentDictionary<string, DateTimeOffset>(); // sha -> committedAt
+            var deployTimestamps = new ConcurrentDictionary<string, DateTimeOffset>(); // sha -> deployedAt
+
+            await foreach (var e in events.WithCancellation(cancellationToken))
+            {
+                // Defensive: drain the stream quickly and avoid blocking logging I/O on hot path.
+                _ = Task.Run(() => ParseEvent(e), cancellationToken);
+            }
+
+            void ParseEvent(RawEvent ev)
+            {
+                try
+                {
+                    switch (ev.SourceSystem)
+                    {
+                        case "Git":
+                            commitTimestamps.TryAdd(
+                                ev.Payload.RootElement.GetProperty("CommitSha").GetString()!,
+                                ev.Payload.RootElement.GetProperty("CommittedAt").GetDateTime().ToUniversalTime());
+                            break;
+
+                        case "CI":
+                            deployTimestamps.TryAdd(
+                                ev.Payload.RootElement.GetProperty("CommitSha").GetString()!,
+                                ev.Payload.RootElement.GetProperty("DeployedAt").GetDateTime().ToUniversalTime());
+                            break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Malformed {System} payload skipped: {Payload}", ev.SourceSystem, ev.Payload);
+                }
+            }
+
+            // Wait for all parsing tasks to drain (they're fire-and-forget but should finish by now).
+            await Task.Delay(100, cancellationToken);
+
+            var intersections = commitTimestamps.Keys.Intersect(deployTimestamps.Keys).ToList();
+            if (intersections.Count == 0)
+            {
+                _logger.LogInformation("No deployments matched to commits. Lead-time KPI not generated.");
+                return null;
+            }
+
+            var totalMinutes = intersections
+                .Select(sha => (deployTimestamps[sha] - commitTimestamps[sha]).TotalMinutes)
+                .Where(m => m >= 0 && m <= TimeSpan.FromDays(30).TotalMinutes) // ignore outliers
+                .ToList();
+
+            if (totalMinutes.Count == 0)
+            {
+                _logger.LogInformation("All candidate lead-times discarded as outliers.");
+                return null;
+            }
+
+            var avgMinutes = totalMinutes.Average();
+            _logger.LogInformation("Deployment Lead-Time calculated: {Minutes:F1} minutes", avgMinutes);
+
+            var meta = JsonSerializer.SerializeToDocument(new
+            {
+                observations = totalMinutes.Count,
+                averageMinutes = avgMinutes
+            });
+
+            return new KpiResult(KpiKey, avgMinutes, DateTimeOffset.UtcNow, meta);
+        }
+    }
+
+    /// <summary>
+    /// Simple DI-friendly registry for strategies. Acts as a façade for discovery, selection, and execution.
+    /// </summary>
+    public sealed class TransformationEngine
+    {
+        private readonly IReadOnlyDictionary<string, ITransformationStrategy> _strategies;
+        private readonly ILogger _logger;
+
+        public TransformationEngine(IEnumerable<ITransformationStrategy> strategies, ILogger<TransformationEngine> logger)
+        {
+            _strategies = strategies.ToDictionary(s => s.Name, StringComparer.OrdinalIgnoreCase);
+            _logger = logger;
+        }
+
+        /// <summary>
+        /// Executes a set of strategy names against the provided event stream.
+        /// </summary>
+        /// <returns>KPI name → result.</returns>
+        public async Task<IDictionary<string, KpiResult>> RunAsync(
+            IAsyncEnumerable<RawEvent> events,
+            IEnumerable<string> strategyNames,
+            CancellationToken cancellationToken = default)
+        {
+            var uniqueNames = strategyNames
+                .Select(s => s.Trim())
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var missing = uniqueNames.Where(n => !_strategies.ContainsKey(n)).ToList();
+            if (missing.Any())
+                throw new ArgumentException($"Unknown KPIs requested: {string.Join(", ", missing)}", nameof(strategyNames));
+
+            // Materialize the source stream once into memory-efficient list to fan-out to multiple strategies,
+            // because IAsyncEnumerable can be consumed only once.
+            var buffered = await events.ToListAsync(cancellationToken);
+
+            var tasks = uniqueNames
+                .Select(name => ExecuteStrategyAsync(name, buffered, cancellationToken))
+                .ToArray();
+
+            await Task.WhenAll(tasks);
+
+            return tasks
+                .Where(t => t.Result != null)
+                .ToDictionary(t => t.Result!.KpiName, t => t.Result!, StringComparer.OrdinalIgnoreCase);
+        }
+
+        private async Task<KpiResult?> ExecuteStrategyAsync(
+            string name,
+            IReadOnlyList<RawEvent> buffer,
+            CancellationToken ct)
+        {
+            if (!_strategies.TryGetValue(name, out var strategy))
+                return null; // Should never happen due to earlier check.
+
+            try
+            {
+                _logger.LogDebug("Starting KPI strategy {Name}.", name);
+                var sw = Stopwatch.StartNew();
+
+                // Copy the buffer into an async stream for each strategy.
+                async IAsyncEnumerable<RawEvent> Stream()
+                {
+                    foreach (var ev in buffer)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        yield return ev;
+                    }
+                }
+
+                var result = await strategy.TransformAsync(Stream(), ct);
+                _logger.LogDebug("KPI strategy {Name} completed in {ElapsedMs}ms.", name, sw.ElapsedMilliseconds);
+                return result;
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("KPI strategy {Name} canceled.", name);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "KPI strategy {Name} failed.", name);
+                return null; // Swallow to allow other strategies to continue.
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+    // Helper extensions
+    // -----------------------------------------------------------------------------------------------------------------
+    internal static class AsyncEnumerableExtensions
+    {
+        public static async Task<List<T>> ToListAsync<T>(this IAsyncEnumerable<T> source, CancellationToken ct = default)
+        {
+            var list = new List<T>();
+            await foreach (var item in source.WithCancellation(ct))
+            {
+                list.Add(item);
+            }
+
+            return list;
+        }
+    }
+
+    internal static class JsonSerializerExtensions
+    {
+        /// <summary>
+        /// Converts a POCO to an immutable <see cref="JsonDocument"/> in one shot.
+        /// </summary>
+        public static JsonDocument SerializeToDocument<T>(this JsonSerializer _, T data, JsonSerializerOptions? options = null)
+        {
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(data, options);
+            return JsonDocument.Parse(bytes);
+        }
+    }
+}
+```

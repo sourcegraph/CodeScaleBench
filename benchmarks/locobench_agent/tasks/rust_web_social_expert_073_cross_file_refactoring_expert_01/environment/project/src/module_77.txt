@@ -1,0 +1,442 @@
+```rust
+//! src/module_77.rs
+//!
+//! Outbox & Domain-Event infrastructure for EduPulse Live.
+//!
+//! This module demonstrates a pragmatic implementation of the
+//!  • domain‐event pattern,
+//!  • transactional outbox,
+//!  • asynchronous relay into a broker (e.g. NATS, Rabbit, Kafka),
+//! while keeping the core API synchronous and highly responsive.
+//
+//! The implementation follows EduPulse’s architecture guidelines: Service
+//! layer + Repository pattern, backed by a PostgreSQL database via `sqlx`.
+//!
+//! NOTE: In a real workspace this file would live under `src/infra/…`, but the
+//!       challenge requires the path `src/module_77.txt`.  The extension is left
+//!       unchanged for demonstration purposes, yet `cargo` happily compiles it
+//!       because Rust only considers the `mod` system, not the filename suffix.
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::{stream::FuturesUnordered, StreamExt};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sqlx::{postgres::PgRow, query, query_as, PgPool, Postgres, Row, Transaction};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::mpsc::{self, Receiver, Sender},
+    task::JoinHandle,
+    time,
+};
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
+
+const MAX_RETRY_COUNT: i16 = 5;
+const BATCH_SIZE: i64 = 100;
+
+/// High-level domain events used throughout EduPulse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum DomainEvent {
+    /// A new learning pulse was published by an instructor.
+    PulseCreated {
+        pulse_id: Uuid,
+        author_id: Uuid,
+        title: String,
+        published_at: DateTime<Utc>,
+    },
+
+    /// A learner submitted an answer to a pulse.
+    PulseAnswered {
+        pulse_id: Uuid,
+        answer_id: Uuid,
+        student_id: Uuid,
+        answered_at: DateTime<Utc>,
+    },
+
+    /// A badge has been awarded.
+    BadgeAwarded {
+        badge_id: Uuid,
+        user_id: Uuid,
+        reason: String,
+        awarded_at: DateTime<Utc>,
+    },
+}
+
+/// Envelope that wraps any [`DomainEvent`] together with outbox metadata.
+///
+/// This allows fault-tolerant, ordered replay while keeping the event payload
+/// opaque to the infrastructure layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub id: Uuid,
+    pub aggregate_id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub event: DomainEvent,
+}
+
+/// Database representation of an outbox message.
+///
+/// The table is expected to look like:
+///
+/// ```sql
+/// CREATE TABLE outbox (
+///     id              uuid      PRIMARY KEY,
+///     aggregate_id    uuid      NOT NULL,
+///     event_type      text      NOT NULL,
+///     payload         jsonb     NOT NULL,
+///     occurred_at     timestamptz NOT NULL,
+///     retries         smallint     NOT NULL DEFAULT 0,
+///     locked_until    timestamptz,
+///     delivered_at    timestamptz
+/// );
+/// CREATE INDEX idx_outbox_retries ON outbox (retries);
+/// CREATE INDEX idx_outbox_pending ON outbox (delivered_at) WHERE delivered_at IS NULL;
+/// ```
+#[derive(Debug, Clone)]
+struct OutboxRow {
+    id: Uuid,
+    aggregate_id: Uuid,
+    event_type: String,
+    payload: serde_json::Value,
+    occurred_at: DateTime<Utc>,
+    retries: i16,
+}
+
+impl OutboxRow {
+    #[instrument(level = "trace", skip_all)]
+    fn from_envelope(envelope: EventEnvelope) -> sqlx::Result<Self> {
+        let event_type = match &envelope.event {
+            DomainEvent::PulseCreated { .. } => "PulseCreated",
+            DomainEvent::PulseAnswered { .. } => "PulseAnswered",
+            DomainEvent::BadgeAwarded { .. } => "BadgeAwarded",
+        }
+        .to_string();
+
+        Ok(Self {
+            id: envelope.id,
+            aggregate_id: envelope.aggregate_id,
+            event_type,
+            payload: serde_json::to_value(&envelope.event)?,
+            occurred_at: envelope.occurred_at,
+            retries: 0,
+        })
+    }
+}
+
+/// Errors originating in the outbox layer.
+#[derive(Debug, Error)]
+pub enum OutboxError {
+    #[error("Persistence failure: {0}")]
+    Persistence(#[from] sqlx::Error),
+
+    #[error("Serialization failure: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("Channel closed")]
+    ChannelClosed,
+}
+
+/// Abstraction over anything that can store events in the outbox.
+#[async_trait]
+pub trait OutboxRepository {
+    async fn save(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        envelope: EventEnvelope,
+    ) -> Result<(), OutboxError>;
+}
+
+/// PostgreSQL implementation of the outbox repository.
+pub struct PgOutboxRepository {
+    pool: PgPool,
+}
+
+impl PgOutboxRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl OutboxRepository for PgOutboxRepository {
+    #[instrument(level = "debug", skip_all, fields(event_id=%envelope.id))]
+    async fn save(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        envelope: EventEnvelope,
+    ) -> Result<(), OutboxError> {
+        let row = OutboxRow::from_envelope(envelope)?;
+        query!(
+            r#"
+            INSERT INTO outbox (id, aggregate_id, event_type, payload, occurred_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            row.id,
+            row.aggregate_id,
+            row.event_type,
+            row.payload,
+            row.occurred_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        Ok(())
+    }
+}
+
+/// Contract for anything that can publish events from the outbox to an external
+/// broker (NATS, RabbitMQ, Kafka, …).
+#[async_trait]
+pub trait EventPublisher {
+    async fn publish(&self, envelope: EventEnvelope) -> Result<(), anyhow::Error>;
+}
+
+/// =============================================================================================
+/// Background task that continuously pulls pending messages, publishes them,
+/// and marks them as delivered (or retries with exponential back-off).
+/// =============================================================================================
+pub struct OutboxRelay<P> {
+    pool: PgPool,
+    publisher: P,
+    interval: Duration,
+    concurrency: usize,
+}
+
+impl<P> OutboxRelay<P>
+where
+    P: EventPublisher + Send + Sync + 'static,
+{
+    pub fn new(pool: PgPool, publisher: P) -> Self {
+        Self {
+            pool,
+            publisher,
+            interval: Duration::from_secs(5),
+            concurrency: 8,
+        }
+    }
+
+    pub fn with_interval(mut self, duration: Duration) -> Self {
+        self.interval = duration;
+        self
+    }
+
+    pub fn with_concurrency(mut self, n: usize) -> Self {
+        self.concurrency = n;
+        self
+    }
+
+    /// Spawns the relay as an independent Tokio task and returns the join handle.
+    pub fn spawn(self) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            self.run().await;
+        })
+    }
+
+    #[instrument(name = "outbox_relay", skip(self))]
+    pub async fn run(self) {
+        info!("OutboxRelay started; interval = {:?}", self.interval);
+
+        let (tx, rx) = mpsc::channel::<EventEnvelope>(self.concurrency * 2);
+
+        // Spawn worker tasks
+        let mut workers: FuturesUnordered<_> = (0..self.concurrency)
+            .map(|idx| {
+                let rx = rx.clone();
+                let publisher = &self.publisher;
+                tokio::spawn(worker_task(idx, rx, publisher))
+            })
+            .collect();
+
+        drop(rx); // allow graceful exit when all senders are dropped
+
+        let mut ticker = time::interval(self.interval);
+
+        loop {
+            select! {
+                _ = ticker.tick() => {
+                    match self.fetch_pending(&tx).await {
+                        Ok(count) => {
+                            debug!(%count, "Fetched pending events");
+                        }
+                        Err(e) => {
+                            error!(error = ?e, "Failed to fetch pending events");
+                        }
+                    }
+                }
+
+                // Drain finished workers to avoid memory leak of JoinHandles.
+                Some(res) = workers.next() => {
+                    if let Err(e) = res {
+                        error!(error = ?e, "Worker crashed");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fetches pending events and sends them to the worker channel.
+    #[instrument(skip_all, fields(batch_size = BATCH_SIZE))]
+    async fn fetch_pending(&self, tx_chan: &Sender<EventEnvelope>) -> Result<usize, OutboxError> {
+        let mut conn = self.pool.acquire().await?;
+
+        // Lock rows to prevent double delivery from multiple nodes.
+        let rows: Vec<PgRow> = query(
+            r#"
+            UPDATE outbox
+            SET locked_until = NOW() + INTERVAL '1 minute'
+            WHERE id IN (
+                SELECT id
+                FROM outbox
+                WHERE delivered_at IS NULL
+                  AND (locked_until IS NULL OR locked_until < NOW())
+                  AND retries < $1
+                ORDER BY occurred_at
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, aggregate_id, event_type, payload, occurred_at, retries
+            "#,
+        )
+        .bind(MAX_RETRY_COUNT)
+        .bind(BATCH_SIZE)
+        .fetch_all(&mut *conn)
+        .await?;
+
+        let count = rows.len();
+
+        for row in rows {
+            let envelope = EventEnvelope {
+                id: row.get("id"),
+                aggregate_id: row.get("aggregate_id"),
+                occurred_at: row.get("occurred_at"),
+                event: serde_json::from_value::<DomainEvent>(row.get("payload"))?,
+            };
+
+            tx_chan.send(envelope).await.map_err(|_| OutboxError::ChannelClosed)?;
+        }
+
+        Ok(count)
+    }
+}
+
+/// Background worker that receives envelopes and publishes them through the
+/// provided `EventPublisher`.
+#[instrument(skip(rx, publisher))]
+async fn worker_task<P>(idx: usize, mut rx: Receiver<EventEnvelope>, publisher: &P)
+where
+    P: EventPublisher + Send + Sync + 'static,
+{
+    while let Some(envelope) = rx.recv().await {
+        match publisher.publish(envelope.clone()).await {
+            Ok(()) => {
+                debug!(worker = idx, event_id = %envelope.id, "Published event");
+                // Mark as delivered
+                // We perform a fire-and-forget update; eventual consistency is enough here.
+                if let Err(e) = mark_delivered(envelope.id).await {
+                    warn!(error=?e, "Failed to mark outbox row as delivered");
+                }
+            }
+            Err(e) => {
+                error!(worker = idx, event_id = %envelope.id, error = ?e, "Failed to publish event");
+                if let Err(db_err) = increment_retries(envelope.id).await {
+                    error!(error = ?db_err, "Failed to increment retry counter");
+                }
+            }
+        }
+    }
+}
+
+/// Updates `delivered_at` timestamp.
+async fn mark_delivered(event_id: Uuid) -> sqlx::Result<()> {
+    // Acquire from a global PgPool. In a real project we’d inject it, but for
+    // this isolated file we rely on the `DATABASE_URL` environment variable and
+    // lazy connection init.
+    static POOL: once_cell::sync::Lazy<PgPool> = once_cell::sync::Lazy::new(|| {
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(async {
+            let url = std::env::var("DATABASE_URL")
+                .expect("DATABASE_URL must be set for outbox relay");
+            PgPool::connect(&url).await.expect("failed to connect")
+        })
+    });
+
+    query!(
+        "UPDATE outbox SET delivered_at = NOW() WHERE id = $1",
+        event_id
+    )
+    .execute(&*POOL)
+    .await?;
+    Ok(())
+}
+
+/// Increments retry counter for failed deliveries.
+async fn increment_retries(event_id: Uuid) -> sqlx::Result<()> {
+    static POOL: once_cell::sync::Lazy<PgPool> = once_cell::sync::Lazy::new(|| {
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(async {
+            let url = std::env::var("DATABASE_URL")
+                .expect("DATABASE_URL must be set for outbox relay");
+            PgPool::connect(&url).await.expect("failed to connect")
+        })
+    });
+
+    query!(
+        "UPDATE outbox SET retries = retries + 1 WHERE id = $1",
+        event_id
+    )
+    .execute(&*POOL)
+    .await?;
+    Ok(())
+}
+
+/// =============================================================================================
+/// Mock publisher for unit-testing – prints events to the console.
+/// =============================================================================================
+pub struct StdoutPublisher;
+
+#[async_trait]
+impl EventPublisher for StdoutPublisher {
+    #[instrument(level = "info", skip(self))]
+    async fn publish(&self, envelope: EventEnvelope) -> Result<(), anyhow::Error> {
+        println!("🔔 Publishing event: {envelope:#?}");
+        Ok(())
+    }
+}
+
+/// =============================================================================================
+/// Unit tests
+/// =============================================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[tokio::test]
+    async fn serde_roundtrip() {
+        let original = EventEnvelope {
+            id: Uuid::new_v4(),
+            aggregate_id: Uuid::new_v4(),
+            occurred_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            event: DomainEvent::PulseCreated {
+                pulse_id: Uuid::new_v4(),
+                author_id: Uuid::new_v4(),
+                title: "Intro to Topology".to_string(),
+                published_at: Utc::now(),
+            },
+        };
+
+        let json = serde_json::to_string_pretty(&original).expect("serialize");
+        let deserialized: EventEnvelope = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(original.id, deserialized.id);
+        match deserialized.event {
+            DomainEvent::PulseCreated { title, .. } => assert_eq!(title, "Intro to Topology"),
+            _ => unreachable!(),
+        }
+    }
+}
+```

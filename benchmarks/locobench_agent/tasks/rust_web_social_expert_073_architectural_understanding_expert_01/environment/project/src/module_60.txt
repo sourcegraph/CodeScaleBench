@@ -1,0 +1,406 @@
+```rust
+//! src/module_60.rs
+//!
+//! Core business-logic for creating “learning pulses” and handling student
+//! replies.  All write-operations emit strongly-typed domain events that are
+//! published to the async message broker (e.g. NATS, RabbitMQ or Kafka) so that
+//! downstream services—plagiarism checker, notification fan-out, analytics,
+//! etc.—can react without coupling.
+//!
+//! The module follows a classical Service/Repository split and is completely
+//! unit-testable thanks to its fully mockable trait interfaces.
+//!
+//! # Examples
+//! ```no_run
+//! use edupulse_live::pulse::service::{PulseService, ServiceConfig};
+//! use edupulse_live::pulse::repository::InMemoryPulseRepository;
+//! use edupulse_live::infra::broker::NatsPublisher;
+//! use std::sync::Arc;
+//! use uuid::Uuid;
+//!
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     let repo = Arc::new(InMemoryPulseRepository::default());
+//!     let publisher = Arc::new(NatsPublisher::connect("nats://localhost:4222").await?);
+//!
+//!     let svc = PulseService::new(ServiceConfig::default(), repo, publisher);
+//!
+//!     let teacher_id = Uuid::new_v4();
+//!     let pulse_id = svc
+//!         .create_pulse(teacher_id, "Explain async/await in Rust".into())
+//!         .await?;
+//!
+//!     let student_id = Uuid::new_v4();
+//!     svc.reply_to_pulse(pulse_id, student_id, "Here is my explanation…".into())
+//!         .await?;
+//!     Ok(())
+//! }
+//! ```
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::time::{sleep, Duration};
+use uuid::Uuid;
+
+/// Unique identifier wrappers make the type system work for us
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, derive_more::Display,
+)]
+pub struct UserId(Uuid);
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, derive_more::Display,
+)]
+pub struct PulseId(Uuid);
+
+impl From<Uuid> for UserId {
+    fn from(v: Uuid) -> Self {
+        Self(v)
+    }
+}
+impl From<Uuid> for PulseId {
+    fn from(v: Uuid) -> Self {
+        Self(v)
+    }
+}
+
+/// Domain-layer entity: a *Learning Pulse* authored by a teacher.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Pulse {
+    pub id: PulseId,
+    pub author_id: UserId,
+    pub prompt: String,
+    pub created_at: DateTime<Utc>,
+    pub replies: Vec<Reply>,
+}
+
+/// Student reply to a pulse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Reply {
+    pub id: Uuid,
+    pub pulse_id: PulseId,
+    pub student_id: UserId,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Strongly-typed domain events emitted by the service.
+///
+/// Downstream services subscribe to the `subject()` and deserialize payloads
+/// back into these exact structures (thanks to `serde`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PulseDomainEvent {
+    PulseCreated {
+        pulse_id: PulseId,
+        author_id: UserId,
+        prompt: String,
+        created_at: DateTime<Utc>,
+    },
+    PulseReplied {
+        pulse_id: PulseId,
+        reply_id: Uuid,
+        student_id: UserId,
+        created_at: DateTime<Utc>,
+    },
+}
+
+impl PulseDomainEvent {
+    pub fn subject(&self) -> &'static str {
+        match self {
+            PulseDomainEvent::PulseCreated { .. } => "pulse.created",
+            PulseDomainEvent::PulseReplied { .. } => "pulse.replied",
+        }
+    }
+}
+
+/* ---------- Repository Layer ---------- */
+
+#[async_trait]
+pub trait PulseRepository: Send + Sync {
+    async fn insert(&self, pulse: Pulse) -> Result<(), RepositoryError>;
+    async fn find(&self, id: PulseId) -> Result<Option<Pulse>, RepositoryError>;
+    async fn upsert(&self, pulse: Pulse) -> Result<(), RepositoryError>;
+}
+
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("database unavailable")]
+    Unavailable,
+    #[error("anyhow: {0}")]
+    Other(#[from] anyhow::Error),
+}
+
+/// A simple, thread-safe in-memory implementation useful for unit tests.
+/// Not optimized for production—replace with Postgres, MongoDB, etc.
+#[derive(Default)]
+pub struct InMemoryPulseRepository {
+    store: parking_lot::RwLock<std::collections::HashMap<PulseId, Pulse>>,
+}
+
+#[async_trait]
+impl PulseRepository for InMemoryPulseRepository {
+    async fn insert(&self, pulse: Pulse) -> Result<(), RepositoryError> {
+        let mut guard = self.store.write();
+        guard.insert(pulse.id, pulse);
+        Ok(())
+    }
+
+    async fn find(&self, id: PulseId) -> Result<Option<Pulse>, RepositoryError> {
+        let guard = self.store.read();
+        Ok(guard.get(&id).cloned())
+    }
+
+    async fn upsert(&self, pulse: Pulse) -> Result<(), RepositoryError> {
+        let mut guard = self.store.write();
+        guard.insert(pulse.id, pulse);
+        Ok(())
+    }
+}
+
+/* ---------- Message Broker Abstraction ---------- */
+
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish<E>(&self, subject: &str, event: &E) -> Result<(), PublishError>
+    where
+        E: Serialize + Send + Sync;
+}
+
+#[derive(Debug, Error)]
+pub enum PublishError {
+    #[error("connection lost")]
+    LostConnection,
+    #[error("serialization failed: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("anyhow: {0}")]
+    Other(#[from] anyhow::Error),
+}
+
+/* Example implementation using NATS -------------------------------------- */
+pub mod nats_impl {
+    use super::*;
+    use async_nats::{self, Client as NatsClient};
+
+    pub struct NatsPublisher {
+        client: NatsClient,
+    }
+
+    impl NatsPublisher {
+        pub async fn connect(url: &str) -> anyhow::Result<Self> {
+            let client = async_nats::connect(url).await?;
+            Ok(Self { client })
+        }
+    }
+
+    #[async_trait]
+    impl EventPublisher for NatsPublisher {
+        async fn publish<E>(&self, subject: &str, event: &E) -> Result<(), PublishError>
+        where
+            E: Serialize + Send + Sync,
+        {
+            let payload = serde_json::to_vec(event)?;
+            self.client
+                .publish(subject.into(), payload.into())
+                .await
+                .map_err(|_| PublishError::LostConnection)?;
+            Ok(())
+        }
+    }
+}
+/* ------------------------------------------------------------------------ */
+
+/* ---------- Service Layer ---------------------------------------------- */
+
+/// Configuration knobs for the `PulseService`. They come with sensible
+/// production defaults that can be tweaked at runtime.
+#[derive(Debug, Clone)]
+pub struct ServiceConfig {
+    /// Artificial write-latency useful during early load-testing; set to zero
+    /// in production.
+    pub simulated_db_latency: Duration,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            simulated_db_latency: Duration::from_millis(0),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("repository error: {0}")]
+    Repo(#[from] RepositoryError),
+    #[error("event publication failed: {0}")]
+    Publish(#[from] PublishError),
+    #[error("pulse not found")]
+    PulseNotFound,
+}
+
+/// The façade consumed by REST handlers, GraphQL resolvers, background jobs,
+/// etc.  All functions are `async` and return rich error types.
+///
+/// The struct is `Clone` because it only contains `Arc` handles.
+#[derive(Clone)]
+pub struct PulseService<R, P>
+where
+    R: PulseRepository,
+    P: EventPublisher,
+{
+    cfg: ServiceConfig,
+    repo: Arc<R>,
+    publisher: Arc<P>,
+}
+
+impl<R, P> PulseService<R, P>
+where
+    R: PulseRepository,
+    P: EventPublisher,
+{
+    pub fn new(cfg: ServiceConfig, repo: Arc<R>, publisher: Arc<P>) -> Self {
+        Self {
+            cfg,
+            repo,
+            publisher,
+        }
+    }
+
+    /// Teacher creates a new learning pulse.
+    pub async fn create_pulse(
+        &self,
+        author_id: Uuid,
+        prompt: String,
+    ) -> Result<PulseId, ServiceError> {
+        // Simulate DB latency if configured
+        if self.cfg.simulated_db_latency != Duration::ZERO {
+            sleep(self.cfg.simulated_db_latency).await;
+        }
+
+        let pulse = Pulse {
+            id: PulseId(Uuid::new_v4()),
+            author_id: UserId(author_id),
+            prompt: prompt.clone(),
+            created_at: Utc::now(),
+            replies: Vec::new(),
+        };
+
+        self.repo.insert(pulse.clone()).await?;
+
+        let event = PulseDomainEvent::PulseCreated {
+            pulse_id: pulse.id,
+            author_id: pulse.author_id,
+            prompt,
+            created_at: pulse.created_at,
+        };
+        self.publisher.publish(event.subject(), &event).await?;
+
+        Ok(pulse.id)
+    }
+
+    /// Student replies to existing pulse.
+    pub async fn reply_to_pulse(
+        &self,
+        pulse_id: PulseId,
+        student_id: Uuid,
+        content: String,
+    ) -> Result<Uuid, ServiceError> {
+        let mut pulse = self
+            .repo
+            .find(pulse_id)
+            .await?
+            .ok_or(ServiceError::PulseNotFound)?;
+
+        let reply = Reply {
+            id: Uuid::new_v4(),
+            pulse_id,
+            student_id: UserId(student_id),
+            content,
+            created_at: Utc::now(),
+        };
+        pulse.replies.push(reply.clone());
+        self.repo.upsert(pulse).await?;
+
+        let event = PulseDomainEvent::PulseReplied {
+            pulse_id,
+            reply_id: reply.id,
+            student_id: reply.student_id,
+            created_at: reply.created_at,
+        };
+        self.publisher.publish(event.subject(), &event).await?;
+
+        Ok(reply.id)
+    }
+}
+
+/* ---------- Tests ------------------------------------------------------- */
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /* A dummy publisher that counts messages */
+    struct CountingPublisher {
+        count: AtomicUsize,
+    }
+
+    impl Default for CountingPublisher {
+        fn default() -> Self {
+            Self {
+                count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EventPublisher for CountingPublisher {
+        async fn publish<E>(&self, _subject: &str, _event: &E) -> Result<(), PublishError>
+        where
+            E: Serialize + Send + Sync,
+        {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn pulse_creation_emits_event() {
+        let repo = Arc::new(InMemoryPulseRepository::default());
+        let publisher = Arc::new(CountingPublisher::default());
+        let service = PulseService::new(ServiceConfig::default(), repo, publisher.clone());
+
+        let author_id = Uuid::new_v4();
+        let _pulse_id = service
+            .create_pulse(author_id, "Describe lifetimes".into())
+            .await
+            .unwrap();
+
+        assert_eq!(publisher.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reply_emits_event() {
+        let repo = Arc::new(InMemoryPulseRepository::default());
+        let publisher = Arc::new(CountingPublisher::default());
+        let service = PulseService::new(ServiceConfig::default(), repo.clone(), publisher.clone());
+
+        let teacher_id = Uuid::new_v4();
+        let pulse_id = service
+            .create_pulse(teacher_id, "Explain traits".into())
+            .await
+            .unwrap();
+
+        let student_id = Uuid::new_v4();
+        service
+            .reply_to_pulse(pulse_id, student_id, "Traits are…".into())
+            .await
+            .unwrap();
+
+        assert_eq!(publisher.count.load(Ordering::SeqCst), 2);
+    }
+}
+```

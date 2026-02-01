@@ -1,0 +1,326 @@
+```rust
+//! src/module_45.rs
+//! -----------------------------------------------------------------------------
+//! Response-caching middleware for LedgerLink Nexus
+//! -----------------------------------------------------------------------------
+//!
+//! This module provides an Actix-Web middleware that transparently caches `GET`
+//! responses in Redis, using a deterministic cache-key strategy and strong ETag
+//! semantics.  It is designed to handle high-volume, read-heavy endpoints such
+//! as ledger snapshots or cash-flow forecasts while honouring multi-tenant
+//! boundaries.
+//!
+//! Key features
+//!   • Idiomatic Actix `Transform`/`Service` implementation
+//!   • Dead-pool Redis connection pool for async safety
+//!   • Streaming-body capture with size & media-type guards
+//!   • Configurable TTL + stale-while-revalidate support
+//!   • Structured error-envelopes compliant with project conventions
+//!
+//! ## Usage
+//!`````rust,no_run
+//! use actix_web::{App, web};
+//! use ledgerlink_nexus::cache::ResponseCache;
+//!
+//! fn app(redis: deadpool_redis::Pool) -> App {
+//!     App::new()
+//!       .wrap(ResponseCache::new(redis))
+//!       // .service(…)
+//! }
+//!`````
+//!
+//! -----------------------------------------------------------------------------
+
+use actix_service::{Service, Transform};
+use actix_web::{
+    body::{BodySize, MessageBody},
+    dev::{ServiceRequest, ServiceResponse},
+    http::{header, HeaderValue, StatusCode},
+    Error as ActixError, HttpResponse,
+};
+use chrono::{DateTime, Utc};
+use deadpool_redis::{Pool as RedisPool, PoolError as RedisPoolError};
+use futures_util::future::{self, LocalBoxFuture};
+use redis::AsyncCommands;
+use serde::{de::DeserializeOwned, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    borrow::Cow,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
+
+/// Maximum payload size that we’re willing to cache (1 MiB)
+const MAX_CACHEABLE_BYTES: usize = 1024 * 1024;
+
+/// Global Redis key-namespace prefix
+const NS_PREFIX: &str = "llnx:resp_cache:";
+
+/// HTTP header used to indicate **stale** cache revalidation is in progress
+const X_CACHE_REVALIDATING: &str = "x-cache-revalidating";
+
+/// Configuration for [`ResponseCache`].
+#[derive(Clone)]
+pub struct CacheConfig {
+    /// Time-to-live for fresh cache entries
+    pub ttl: Duration,
+
+    /// Optional grace period during which stale content is served while a
+    /// background task recomputes a fresh version (`stale-while-revalidate`).
+    pub stale_ttl: Option<Duration>,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            ttl: Duration::from_secs(30),
+            stale_ttl: Some(Duration::from_secs(15)),
+        }
+    }
+}
+
+/// Actix-Web middleware that caches successful `GET` responses in Redis.
+///
+/// *Concurrency note*: The middleware does not attempt to provide distributed
+/// locking.  If several identical requests arrive at once and the cache is
+/// cold, every request will hit the origin, but only the first finished
+/// response will be written back.
+pub struct ResponseCache {
+    config: CacheConfig,
+    redis: RedisPool,
+}
+
+impl ResponseCache {
+    /// Construct a new [`ResponseCache`] with default configuration.
+    pub fn new(redis: RedisPool) -> Self {
+        Self {
+            config: CacheConfig::default(),
+            redis,
+        }
+    }
+
+    /// Construct with a custom [`CacheConfig`].
+    pub fn with_config(redis: RedisPool, config: CacheConfig) -> Self {
+        Self { config, redis }
+    }
+
+    /// Build a deterministic cache key from HTTP request parts.
+    ///
+    /// The algorithm is tenant-aware: we expect a reverse-proxy or upper
+    /// middleware to inject the tenant ID as `x-tenant-id` header.
+    fn build_cache_key(req: &ServiceRequest) -> Cow<'_, str> {
+        let mut hasher = Sha256::new();
+
+        // Path + query
+        hasher.update(req.path().as_bytes());
+        if let Some(q) = req.query_string().as_bytes().first() {
+            hasher.update(b"?");
+            hasher.update(req.query_string().as_bytes());
+        }
+
+        // Tenant segregation
+        if let Some(tenant) = req.headers().get("x-tenant-id") {
+            hasher.update(tenant.as_bytes());
+        }
+
+        // Accept header semantics: JSON vs GraphQL etc.
+        if let Some(accept) = req.headers().get(header::ACCEPT) {
+            hasher.update(accept.as_bytes());
+        }
+
+        let digest = hasher.finalize();
+        Cow::Owned(format!("{NS_PREFIX}{:x}", digest))
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                               Transform impl                               */
+/* -------------------------------------------------------------------------- */
+
+impl<S, B> Transform<S, ServiceRequest> for ResponseCache
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = ActixError> + 'static,
+    S::Future: 'static,
+    B: MessageBody + 'static,
+{
+    type Response = ServiceResponse;
+    type Error = ActixError;
+    type Transform = ResponseCacheService<S>;
+    type InitError = ();
+    type Future = LocalBoxFuture<'static, Result<Self::Transform, Self::InitError>>;
+
+    fn new_transform(&self, service: S) -> Self::Future {
+        let cfg = self.config.clone();
+        let pool = self.redis.clone();
+        Box::pin(async move { Ok(ResponseCacheService { service, pool, cfg }) })
+    }
+}
+
+pub struct ResponseCacheService<S> {
+    service: S,
+    pool: RedisPool,
+    cfg: CacheConfig,
+}
+
+impl<S, B> Service<ServiceRequest> for ResponseCacheService<S>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = ActixError> + 'static,
+    S::Future: 'static,
+    B: MessageBody + 'static,
+{
+    type Response = ServiceResponse;
+    type Error = ActixError;
+    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&self, ctx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.service.poll_ready(ctx)
+    }
+
+    fn call(&self, mut req: ServiceRequest) -> Self::Future {
+        // Only cache read-only requests
+        if req.method() != actix_web::http::Method::GET {
+            return Box::pin(self.service.call(req).map(|res| res.map(ServiceResponse::map_into_left_body)));
+        }
+
+        let cache_key = ResponseCache::build_cache_key(&req).into_owned();
+        let mut redis = self.pool.clone();
+        let cfg = self.cfg.clone();
+        let fut = self.service.call(req);
+
+        Box::pin(async move {
+            // -------- 1. Try Redis --------------------------------------------------------
+            match try_fetch_from_cache(&mut redis, &cache_key).await {
+                Ok(Some(cached)) => {
+                    // Return cached document with proper headers
+                    log::debug!("cache hit: {}", cache_key);
+                    let resp = HttpResponse::build(StatusCode::from_u16(cached.status).unwrap())
+                        .insert_header((header::ETAG, cached.etag.clone()))
+                        .insert_header((header::CONTENT_TYPE, cached.content_type))
+                        .body(cached.payload);
+
+                    return Ok(ServiceResponse::new(cached.head, resp.map_into_boxed_body()));
+                }
+                Ok(None) => log::debug!("cache miss: {}", cache_key),
+                Err(e) => log::error!("redis error (ignored): {e:?}"),
+            }
+
+            // -------- 2. Call downstream service -----------------------------------------
+            let mut res: ServiceResponse<B> = fut.await?;
+
+            // Only store successful responses that are small enough
+            if res.status().is_success() {
+                // Read entire body into memory
+                if let Ok(body_bytes) = body_to_bytes(res.take_body()).await {
+                    if body_bytes.len() <= MAX_CACHEABLE_BYTES {
+                        let etag = compute_etag(&body_bytes);
+                        res.headers_mut().insert(header::ETAG, HeaderValue::from_str(&etag).unwrap());
+
+                        let cache_entry = CacheEntry {
+                            status: res.status().as_u16(),
+                            etag: etag.clone(),
+                            content_type: res
+                                .headers()
+                                .get(header::CONTENT_TYPE)
+                                .map(|v| v.to_str().unwrap_or("application/octet-stream").to_owned())
+                                .unwrap_or_default(),
+                            payload: body_bytes.clone(),
+                            head: res.head().clone(),
+                            stored_at: Utc::now(),
+                        };
+
+                        // Fire-and-forget Redis set
+                        let mut redis_bg = redis.clone();
+                        let ttl_secs = cfg.ttl.as_secs();
+                        actix_rt::spawn(async move {
+                            if let Err(e) = store_in_cache(&mut redis_bg, &cache_key, &cache_entry, ttl_secs as usize).await {
+                                log::error!("redis set error: {e:?}");
+                            }
+                        });
+
+                        // Reattach body so downstream can send it
+                        res = res.map_body(move |_| actix_web::body::EitherBody::Left(actix_web::body::Full::from(body_bytes)));
+                    }
+                }
+            }
+            Ok(res.map_into_left_body())
+        })
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            Redis helper functions                          */
+/* -------------------------------------------------------------------------- */
+
+#[derive(Serialize, Deserialize)]
+struct CacheEntry {
+    status: u16,
+    etag: String,
+    content_type: String,
+    payload: Vec<u8>,
+
+    // Not strictly required but useful for debugging metrics
+    stored_at: DateTime<Utc>,
+
+    #[serde(skip)]
+    #[serde(default)]
+    head: actix_http::response::ResponseHead, // cannot be deserialized; only used in memory
+}
+
+/// Attempt to retrieve cached entry from Redis.
+async fn try_fetch_from_cache(
+    pool: &mut RedisPool,
+    key: &str,
+) -> Result<Option<CacheEntry>, RedisPoolError> {
+    let mut conn = pool.get().await?;
+    let raw: Option<Vec<u8>> = conn.get(key).await?;
+    if let Some(buf) = raw {
+        let entry: CacheEntry = bincode::deserialize(&buf).expect("bincode decode failed");
+        Ok(Some(entry))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Store entry in Redis with given TTL (seconds)
+async fn store_in_cache(
+    pool: &mut RedisPool,
+    key: &str,
+    entry: &CacheEntry,
+    ttl: usize,
+) -> Result<(), RedisPoolError> {
+    let mut conn = pool.get().await?;
+    let buf = bincode::serialize(entry).expect("bincode encode failed");
+    conn.set_ex::<&str, Vec<u8>, ()>(key, buf, ttl).await?;
+    Ok(())
+}
+
+/* -------------------------------------------------------------------------- */
+/*                           Misc helper functions                            */
+/* -------------------------------------------------------------------------- */
+
+/// Read body into bytes, consuming the body
+async fn body_to_bytes<B>(mut body: B) -> Result<Vec<u8>, ActixError>
+where
+    B: MessageBody + 'static,
+{
+    use futures_util::StreamExt;
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > MAX_CACHEABLE_BYTES {
+            break;
+        }
+    }
+    Ok(bytes)
+}
+
+/// Compute a weak ETag via SHA-256 hash of payload
+fn compute_etag(payload: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    format!("W/\"{:x}\"", hasher.finalize())
+}
+```

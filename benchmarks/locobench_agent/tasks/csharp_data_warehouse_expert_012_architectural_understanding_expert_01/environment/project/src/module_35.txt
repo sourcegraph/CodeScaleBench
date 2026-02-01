@@ -1,0 +1,394 @@
+```csharp
+// -------------------------------------------------------------------------------------------------
+// File:        src/module_35.txt
+// Project:     PulseOps Warehouse — Serverless Productivity Intelligence Fabric (data_warehouse)
+// Description: TransformationDispatcher is the heart of the Strategy-Pattern driven transformation
+//              layer.  It dynamically discovers concrete ITransformationStrategy implementations,
+//              routes incoming RawRecord envelopes to the correct strategy, and handles DLQ
+//              fan-out on transformation failure.  The component is designed to run inside a
+//              serverless compute environment (AWS Lambda or Fargate) and is equally capable of
+//              serving real-time Kinesis streams or batch Glue jobs.
+// -------------------------------------------------------------------------------------------------
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Amazon.Runtime;
+using Amazon.SQS;
+using Amazon.SQS.Model;
+using Microsoft.Extensions.Logging;
+using Serilog;
+
+// ReSharper disable AsyncApostrophe
+namespace PulseOps.Warehouse.Transformations
+{
+    #region Records & DTOs
+
+    /// <summary>
+    /// Raw envelope produced by an upstream ingestion Lambda.
+    /// </summary>
+    /// <param name="EventType">Logical event type (e.g., "CalendarEvent", "GitPush").</param>
+    /// <param name="Payload">Opaque JSON payload.</param>
+    /// <param name="IngestedAt">Timestamp when the event first hit the lake.</param>
+    public sealed record RawRecord(string EventType, string Payload, DateTime IngestedAt);
+
+    /// <summary>
+    /// Normalized record after a successful transformation.  Serializable to Parquet/JSON.
+    /// </summary>
+    /// <param name="EventType"></param>
+    /// <param name="NormalizedPayload">Strongly-typed schema JSON.</param>
+    /// <param name="ProcessedAt"></param>
+    /// <param name="Metrics">Optional enrichment / observability metrics.</param>
+    public sealed record TransformedRecord(
+        string EventType,
+        string NormalizedPayload,
+        DateTime ProcessedAt,
+        IDictionary<string, object>? Metrics = null);
+
+    #endregion
+
+    #region Strategy Abstractions
+
+    /// <summary>
+    /// Contract for pluggable transformation strategies.
+    /// </summary>
+    public interface ITransformationStrategy
+    {
+        /// <summary>
+        /// Name of the logical event type this strategy handles.
+        /// </summary>
+        string EventType { get; }
+
+        /// <summary>
+        /// Actual transformation from raw to normalized schema.
+        /// </summary>
+        /// <exception cref="TransformationException">Thrown when the payload is malformed.</exception>
+        Task<TransformedRecord> TransformAsync(RawRecord raw, CancellationToken token);
+    }
+
+    /// <summary>
+    /// Domain-specific exception for transformation errors. Caught by dispatcher and routed to DLQ.
+    /// </summary>
+    public sealed class TransformationException : Exception
+    {
+        public TransformationException(string message, Exception? inner = null) : base(message, inner) { }
+    }
+
+    #endregion
+
+    #region Built-in Strategies (Samples)
+
+    /// <summary>
+    /// Example strategy for Microsoft 365 Calendar Events.
+    /// </summary>
+    internal sealed class CalendarEventTransformationStrategy : ITransformationStrategy
+    {
+        public string EventType => "CalendarEvent";
+
+        public async Task<TransformedRecord> TransformAsync(RawRecord raw, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+
+            try
+            {
+                var doc = JsonDocument.Parse(raw.Payload);
+                if (!doc.RootElement.TryGetProperty("durationMinutes", out var durationEl))
+                    throw new TransformationException("durationMinutes missing.");
+
+                var duration = durationEl.GetInt32();
+                var attendees = doc.RootElement.GetProperty("attendees").GetArrayLength();
+
+                var cost = duration / 60.0 * attendees * 95; // Simplistic meeting cost formula.
+
+                var normalized = new
+                {
+                    Id           = doc.RootElement.GetProperty("id").GetString(),
+                    Organizer    = doc.RootElement.GetProperty("organizer").GetString(),
+                    StartTimeUtc = doc.RootElement.GetProperty("startTime").GetDateTime(),
+                    EndTimeUtc   = doc.RootElement.GetProperty("endTime").GetDateTime(),
+                    AttendeeCnt  = attendees,
+                    DurationMin  = duration,
+                    CostUSD      = Math.Round(cost, 2)
+                };
+
+                string normalizedJson = JsonSerializer.Serialize(normalized);
+
+                return await Task.FromResult(new TransformedRecord(
+                    EventType,
+                    normalizedJson,
+                    DateTime.UtcNow,
+                    new Dictionary<string, object?>
+                    {
+                        ["durationMinutes"] = duration,
+                        ["attendeeCount"]   = attendees,
+                        ["meetingCost"]     = cost
+                    }));
+            }
+            catch (JsonException ex)
+            {
+                throw new TransformationException("Invalid CalendarEvent JSON.", ex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Example strategy for Git repository push events.
+    /// </summary>
+    internal sealed class GitPushTransformationStrategy : ITransformationStrategy
+    {
+        public string EventType => "GitPush";
+
+        public async Task<TransformedRecord> TransformAsync(RawRecord raw, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+
+            try
+            {
+                var doc = JsonDocument.Parse(raw.Payload);
+                var commitCount = doc.RootElement.GetProperty("commits").GetArrayLength();
+
+                var normalized = new
+                {
+                    Repository     = doc.RootElement.GetProperty("repository").GetProperty("full_name").GetString(),
+                    Branch         = doc.RootElement.GetProperty("ref").GetString(),
+                    CommitCount    = commitCount,
+                    Pusher         = doc.RootElement.GetProperty("pusher").GetProperty("name").GetString(),
+                    Timestamp      = doc.RootElement.GetProperty("head_commit").GetProperty("timestamp").GetDateTime()
+                };
+
+                string normalizedJson = JsonSerializer.Serialize(normalized);
+
+                return await Task.FromResult(new TransformedRecord(
+                    EventType,
+                    normalizedJson,
+                    DateTime.UtcNow,
+                    new Dictionary<string, object?>
+                    {
+                        ["commitCount"] = commitCount
+                    }));
+            }
+            catch (JsonException ex)
+            {
+                throw new TransformationException("Invalid GitPush JSON.", ex);
+            }
+        }
+    }
+
+    #endregion
+
+    #region DLQ Publisher
+
+    /// <summary>
+    /// Publishes failed records to an AWS SQS DLQ.
+    /// </summary>
+    internal sealed class SqsDeadLetterPublisher : IDisposable
+    {
+        private readonly AmazonSQSClient _client;
+        private readonly string _queueUrl;
+        private readonly ILogger<SqsDeadLetterPublisher> _logger;
+
+        public SqsDeadLetterPublisher(string queueUrl, ILogger<SqsDeadLetterPublisher> logger)
+        {
+            _queueUrl = queueUrl ?? throw new ArgumentNullException(nameof(queueUrl));
+            _logger   = logger   ?? throw new ArgumentNullException(nameof(logger));
+
+            // Use default credential chain (Lambda, ECS Task, etc.)
+            _client = new AmazonSQSClient();
+        }
+
+        public async Task PublishAsync(RawRecord failedRecord, string errorMessage, CancellationToken token)
+        {
+            try
+            {
+                var body = JsonSerializer.Serialize(new
+                {
+                    failedRecord.EventType,
+                    failedRecord.Payload,
+                    failedRecord.IngestedAt,
+                    Error = errorMessage
+                });
+
+                await _client.SendMessageAsync(new SendMessageRequest
+                {
+                    QueueUrl    = _queueUrl,
+                    MessageBody = body
+                }, token);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unable to publish message to DLQ.");
+                // Swallow: we don't want to throw from DLQ handler.
+            }
+        }
+
+        public void Dispose() => _client.Dispose();
+    }
+
+    #endregion
+
+    #region Dispatcher Core
+
+    /// <summary>
+    /// Responsible for routing <see cref="RawRecord"/> items to the correct <see cref="ITransformationStrategy"/>.
+    /// Uses reflection-based discovery with caching for performance.
+    /// </summary>
+    public sealed class TransformationDispatcher
+    {
+        private readonly IDictionary<string, ITransformationStrategy> _registry;
+        private readonly SqsDeadLetterPublisher                       _dlq;
+        private readonly ILogger<TransformationDispatcher>            _logger;
+
+        public TransformationDispatcher(
+            string deadLetterQueueUrl,
+            ILoggerFactory loggerFactory,
+            IEnumerable<Assembly>? additionalStrategyAssemblies = null)
+        {
+            _logger = loggerFactory.CreateLogger<TransformationDispatcher>();
+
+            // Dynamically load strategies.
+            var assemblies = new List<Assembly> { Assembly.GetExecutingAssembly() };
+            if (additionalStrategyAssemblies != null)
+                assemblies.AddRange(additionalStrategyAssemblies);
+
+            _registry = DiscoverStrategies(assemblies);
+            _logger.LogInformation("TransformationDispatcher initialized with {StrategyCount} strategies.",
+                _registry.Count);
+
+            _dlq = new SqsDeadLetterPublisher(deadLetterQueueUrl, loggerFactory.CreateLogger<SqsDeadLetterPublisher>());
+        }
+
+        /// <summary>
+        /// Discover strategies through reflection and build immutable registry.
+        /// </summary>
+        private static IDictionary<string, ITransformationStrategy> DiscoverStrategies(IEnumerable<Assembly> assemblies)
+        {
+            var dict = new ConcurrentDictionary<string, ITransformationStrategy>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var assembly in assemblies)
+            {
+                var strategyTypes = assembly
+                    .GetTypes()
+                    .Where(t => !t.IsAbstract && typeof(ITransformationStrategy).IsAssignableFrom(t));
+
+                foreach (var type in strategyTypes)
+                {
+                    var instance = (ITransformationStrategy)Activator.CreateInstance(type)!;
+                    if (!dict.TryAdd(instance.EventType, instance))
+                        throw new InvalidOperationException($"Duplicate strategy for event type '{instance.EventType}'.");
+                }
+            }
+
+            return dict;
+        }
+
+        /// <summary>
+        /// Entry-point: Transform a batch of raw records.
+        /// Safe-for-parallel execution.
+        /// </summary>
+        /// <returns>List of successfully transformed records.</returns>
+        public async Task<IReadOnlyCollection<TransformedRecord>> TransformAsync(
+            IEnumerable<RawRecord> rawBatch,
+            CancellationToken token = default)
+        {
+            var tasks = rawBatch.Select(raw => TransformSingleAsync(raw, token));
+            var transformed = await Task.WhenAll(tasks);
+
+            // Filter out nulls (failed records that went to DLQ).
+            return transformed.Where(record => record != null).Cast<TransformedRecord>().ToList();
+        }
+
+        /// <summary>
+        /// Handle an individual record with DLQ fallback.
+        /// </summary>
+        private async Task<TransformedRecord?> TransformSingleAsync(RawRecord raw, CancellationToken token)
+        {
+            if (!_registry.TryGetValue(raw.EventType, out var strategy))
+            {
+                var msg = $"No strategy registered for event type '{raw.EventType}'.";
+                _logger.LogWarning(msg);
+                await _dlq.PublishAsync(raw, msg, token);
+                return null;
+            }
+
+            try
+            {
+                return await strategy.TransformAsync(raw, token);
+            }
+            catch (TransformationException tex)
+            {
+                _logger.LogWarning(tex, "TransformationException for record EventType={EventType}", raw.EventType);
+                await _dlq.PublishAsync(raw, tex.Message, token);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error during transformation for EventType={EventType}", raw.EventType);
+                await _dlq.PublishAsync(raw, "Unhandled exception: " + ex.Message, token);
+            }
+
+            return null;
+        }
+    }
+
+    #endregion
+
+    #region Lambda Bootstrap (optional convenience wrapper)
+
+    /// <summary>
+    /// Lightweight AWS Lambda handler that wires up dispatcher, Serilog, etc.
+    /// </summary>
+    /// <remarks>
+    /// Deployed as: dotnet-lambda package / zip-deploy into a Lambda function wired with Kinesis trigger.
+    /// </remarks>
+    public sealed class LambdaEntryPoint
+    {
+        private readonly TransformationDispatcher _dispatcher;
+        private readonly ILogger<LambdaEntryPoint> _logger;
+
+        public LambdaEntryPoint()
+        {
+            // Serilog global config (could also be done in Main()).
+            Log.Logger = new LoggerConfiguration()
+                .MinimumLevel.Information()
+                .Enrich.FromLogContext()
+                .WriteTo.Console()
+                .CreateLogger();
+
+            var loggerFactory = LoggerFactory.Create(builder => builder
+                .AddSerilog(dispose: true)
+                .SetMinimumLevel(LogLevel.Information));
+
+            // Pull DLQ URL from environment variable.
+            string dlqUrl = Environment.GetEnvironmentVariable("DLQ_SQS_URL")
+                            ?? throw new InvalidOperationException("DLQ_SQS_URL env var missing.");
+
+            _dispatcher = new TransformationDispatcher(dlqUrl, loggerFactory);
+            _logger     = loggerFactory.CreateLogger<LambdaEntryPoint>();
+        }
+
+        /// <summary>
+        /// Lambda handler signature for Kinesis (records aggregated into a list of RawRecord by an upstream
+        /// deserialization layer).  This method focuses purely on transformation concerns.
+        /// </summary>
+        public async Task<IReadOnlyCollection<TransformedRecord>> HandlerAsync(
+            IList<RawRecord> rawRecords,
+            CancellationToken contextCancellationToken = default)
+        {
+            _logger.LogInformation("Received {RecordCount} records for transformation.", rawRecords.Count);
+
+            var transformed = await _dispatcher.TransformAsync(rawRecords, contextCancellationToken);
+
+            _logger.LogInformation("Successfully transformed {SuccessCount}/{Total}.",
+                transformed.Count, rawRecords.Count);
+
+            return transformed;
+        }
+    }
+
+    #endregion
+}
+```

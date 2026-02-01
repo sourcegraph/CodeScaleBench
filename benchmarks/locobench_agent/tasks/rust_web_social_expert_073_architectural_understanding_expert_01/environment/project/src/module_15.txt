@@ -1,0 +1,580 @@
+```rust
+//! src/module_15.rs
+//!
+//! An event–driven badge–awarding micro-service for the
+//! “EduPulse Live – Event-Driven Social Learning Hub” platform.
+//!
+//! This module demonstrates how the core application publishes
+//! domain events while an out-of-process, autonomous component
+//! (here: `BadgeAwardService`) consumes them, performs business
+//! logic, persists the result and publishes its own follow-up
+//! events.  
+//!
+//! The service is completely self-contained: it hosts an in-memory
+//! dispatcher for local development, yet persists events and state
+//! in Postgres so it can be moved into a distributed setting
+//! later on (e.g. with NATS/Kafka‐backed `Dispatcher`).
+//!
+//! Architectural patterns shown here:
+//!   • Repository Pattern      – decoupling persistence
+//!   • Service Layer           – `BadgeAwardService`
+//!   • Event Sourcing          – immutable `EventStore`
+//!   • Async Rust w/ Tokio     – non-blocking I/O
+//!   • Error Handling w/ thiserror + anyhow
+//!
+//! NOTE: In a real-world project this module would be split
+//! into several files/crates.  Everything is co-located here only
+//! to satisfy the single-file constraint of the exercise.
+
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc, RwLock},
+    task::JoinHandle,
+};
+use uuid::Uuid;
+
+/// Domain events which can be emitted by EduPulse services.
+///
+/// IMPORTANT: New variants **must** implement `Serialize`/`Deserialize`
+/// so they can be persisted in the event store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum DomainEvent {
+    QuizSubmitted(QuizSubmitted),
+    BadgeAwarded(BadgeAwarded),
+    // … more variants omitted for brevity
+}
+
+impl DomainEvent {
+    /// Helper returning event name for logging / metrics.
+    pub fn name(&self) -> &'static str {
+        match self {
+            DomainEvent::QuizSubmitted(_) => "QuizSubmitted",
+            DomainEvent::BadgeAwarded(_) => "BadgeAwarded",
+        }
+    }
+}
+
+/// Metadata common to all envelopes—separates immutable event data
+/// from peripheral transport concerns such as IDs and timestamps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub event: DomainEvent,
+}
+
+impl EventEnvelope {
+    pub fn new(event: DomainEvent) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            event,
+        }
+    }
+}
+
+/// Event data triggered when a learner submits a quiz.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuizSubmitted {
+    pub quiz_id: Uuid,
+    pub learner_id: Uuid,
+    pub score: f32,
+}
+
+/// Event data emitted once the learner qualifies for a badge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BadgeAwarded {
+    pub badge_id: Uuid,
+    pub learner_id: Uuid,
+    pub awarded_at: DateTime<Utc>,
+    pub reason: String,
+}
+
+/// Central event dispatcher.  
+/// Internally uses a Tokio broadcast channel so any number of
+/// in-process consumers can receive events concurrently.
+///
+/// In production you might replace the implementation with NATS,
+/// Kafka, RabbitMQ… etc., leaving the public API intact.
+#[derive(Clone)]
+pub struct Dispatcher {
+    sender: broadcast::Sender<EventEnvelope>,
+}
+
+impl Dispatcher {
+    /// Create a new dispatcher with a configurable ring buffer size.
+    pub fn new(channel_size: usize) -> Self {
+        let (sender, _rx) = broadcast::channel(channel_size);
+        Self { sender }
+    }
+
+    /// Publish an envelope to all subscribers.
+    pub async fn publish(&self, envelope: EventEnvelope) {
+        // broadcast::Sender::send is synchronous but inexpensive.
+        // Failure only occurs when there are no active receivers;
+        // still, we ignore that because the event is persisted in
+        // the store before reaching this point.
+        let _ = self.sender.send(envelope);
+    }
+
+    /// Subscribe to a continuous stream of events.
+    pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
+        self.sender.subscribe()
+    }
+}
+
+/// Persisted event stream; provides idempotent append + read access.
+/// Uses Postgres JSONB for flexible schema evolution.
+///
+/// Table DDL (run via migrations):
+/// ```sql
+/// CREATE TABLE IF NOT EXISTS event_store (
+///     id           UUID PRIMARY KEY,
+///     occurred_at  TIMESTAMP WITH TIME ZONE NOT NULL,
+///     event_name   TEXT NOT NULL,
+///     payload      JSONB NOT NULL
+/// );
+/// ```
+pub struct EventStore {
+    pool: PgPool,
+}
+
+impl EventStore {
+    pub async fn new(db_url: &str, max_connections: u32) -> Result<Self, sqlx::Error> {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(db_url)
+            .await?;
+        Ok(Self { pool })
+    }
+
+    /// Append envelope to store.
+    pub async fn append(&self, env: &EventEnvelope) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            r#"
+            INSERT INTO event_store (id, occurred_at, event_name, payload)
+            VALUES ($1, $2, $3, $4)
+            "#,
+            env.id,
+            env.occurred_at,
+            env.event.name(),
+            serde_json::to_value(&env.event)?
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Read events by name—useful for rebuilding read models.
+    pub async fn load_by_event(
+        &self,
+        event_name: &str,
+    ) -> Result<Vec<EventEnvelope>, sqlx::Error> {
+        let recs = sqlx::query!(
+            r#"
+            SELECT id, occurred_at, payload
+            FROM event_store
+            WHERE event_name = $1
+            ORDER BY occurred_at ASC
+            "#,
+            event_name
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        recs.into_iter()
+            .map(|r| {
+                let event = match event_name {
+                    "QuizSubmitted" => DomainEvent::QuizSubmitted(
+                        serde_json::from_value(r.payload)?,
+                    ),
+                    "BadgeAwarded" => DomainEvent::BadgeAwarded(
+                        serde_json::from_value(r.payload)?,
+                    ),
+                    _ => unreachable!("Unknown event stored in DB"),
+                };
+                Ok(EventEnvelope {
+                    id: r.id,
+                    occurred_at: r.occurred_at,
+                    event,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Error type covering all repository/service error cases.
+#[derive(Error, Debug)]
+pub enum ServiceError {
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("Event serialisation error: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("Internal channel closed")]
+    ChannelClosed,
+}
+
+/// Repository abstraction for badge persistence.
+#[async_trait]
+pub trait BadgeRepository: Send + Sync {
+    async fn learner_already_has_badge(
+        &self,
+        learner_id: Uuid,
+        badge_id: Uuid,
+    ) -> Result<bool, ServiceError>;
+
+    async fn assign_badge(
+        &self,
+        learner_id: Uuid,
+        badge: &BadgeAwarded,
+    ) -> Result<(), ServiceError>;
+}
+
+/// Postgres-based implementation of the `BadgeRepository`.
+///
+/// Table DDL:
+/// ```sql
+/// CREATE TABLE IF NOT EXISTS learner_badges (
+///     learner_id UUID NOT NULL,
+///     badge_id   UUID NOT NULL,
+///     awarded_at TIMESTAMP WITH TIME ZONE NOT NULL,
+///     reason     TEXT NOT NULL,
+///     PRIMARY KEY (learner_id, badge_id)
+/// );
+/// ```
+pub struct PgBadgeRepository {
+    pool: PgPool,
+}
+
+impl PgBadgeRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl BadgeRepository for PgBadgeRepository {
+    async fn learner_already_has_badge(
+        &self,
+        learner_id: Uuid,
+        badge_id: Uuid,
+    ) -> Result<bool, ServiceError> {
+        let res = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM learner_badges
+                WHERE learner_id = $1 AND badge_id = $2
+            ) AS "exists!"
+            "#,
+            learner_id,
+            badge_id
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(res.unwrap_or(false))
+    }
+
+    async fn assign_badge(
+        &self,
+        learner_id: Uuid,
+        badge: &BadgeAwarded,
+    ) -> Result<(), ServiceError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO learner_badges (learner_id, badge_id, awarded_at, reason)
+            VALUES ($1, $2, $3, $4)
+            "#,
+            learner_id,
+            badge.badge_id,
+            badge.awarded_at,
+            badge.reason
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+/// Business logic deciding whether a quiz submission qualifies
+/// for a badge.  Runs fully asynchronously, keeping its own
+/// subscription to the dispatcher.
+///
+/// Scoring rules used here are intentionally simple:  
+/// – Score ≥ 90 %      ⇒ “Quiz Master” badge (UUID hard-coded)  
+/// – Score exactly 100 ⇒ special “Perfect Score” badge
+pub struct BadgeAwardService<R: BadgeRepository + 'static> {
+    repo: Arc<R>,
+    dispatcher: Dispatcher,
+    event_store: Arc<EventStore>,
+    subscribed_badges: HashSet<Uuid>,
+}
+
+impl<R: BadgeRepository + 'static> BadgeAwardService<R> {
+    pub fn new(
+        repo: Arc<R>,
+        dispatcher: Dispatcher,
+        event_store: Arc<EventStore>,
+    ) -> Self {
+        // Hard-coded UUIDs of known badges.
+        let subscribed_badges = vec![
+            // “Quiz Master”
+            Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            // “Perfect Score”
+            Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+        ]
+        .into_iter()
+        .collect();
+
+        Self {
+            repo,
+            dispatcher,
+            event_store,
+            subscribed_badges,
+        }
+    }
+
+    /// Spawn the service on the Tokio runtime; returns its `JoinHandle`
+    /// so callers can `.await` graceful shutdown.
+    pub fn spawn(self: Arc<Self>) -> JoinHandle<()> {
+        let mut rx = self.dispatcher.subscribe();
+
+        tokio::spawn(async move {
+            loop {
+                select! {
+                    biased;
+
+                    // React to new events
+                    msg = rx.recv() => match msg {
+                        Ok(env) => {
+                            if let Err(e) = self.process_event(env).await {
+                                tracing::error!("BadgeAwardService failed: {e}");
+                            }
+                        },
+                        Err(broadcast::error::RecvError::Closed) => {
+                            tracing::warn!("Dispatcher closed, BadgeAwardService exiting.");
+                            break;
+                        },
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!("BadgeAwardService lagged, skipped {skipped} messages");
+                        },
+                    },
+
+                    // Allow cooperative cancellation.
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {},
+                }
+            }
+        })
+    }
+
+    async fn process_event(&self, env: EventEnvelope) -> Result<(), ServiceError> {
+        match env.event {
+            DomainEvent::QuizSubmitted(sub) => self.maybe_award_badge(sub).await?,
+            _ => { /* ignore */ }
+        }
+        Ok(())
+    }
+
+    async fn maybe_award_badge(&self, sub: QuizSubmitted) -> Result<(), ServiceError> {
+        // Determine qualifying badge.
+        let (badge_id, reason) = if (sub.score - 100.0).abs() < f32::EPSILON {
+            (
+                Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+                "Perfect quiz score!".to_owned(),
+            )
+        } else if sub.score >= 90.0 {
+            (
+                Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+                "Scored 90% or above on a quiz.".to_owned(),
+            )
+        } else {
+            return Ok(()); // Not eligible
+        };
+
+        // Filter unknown badge IDs (forward-compat).
+        if !self.subscribed_badges.contains(&badge_id) {
+            return Ok(());
+        }
+
+        // Idempotency check: learner may resubmit quiz multiple times.
+        if self
+            .repo
+            .learner_already_has_badge(sub.learner_id, badge_id)
+            .await?
+        {
+            return Ok(());
+        }
+
+        // Compose and persist badge award.
+        let badge = BadgeAwarded {
+            badge_id,
+            learner_id: sub.learner_id,
+            awarded_at: Utc::now(),
+            reason,
+        };
+
+        self.repo.assign_badge(sub.learner_id, &badge).await?;
+
+        let envelope = EventEnvelope::new(DomainEvent::BadgeAwarded(badge.clone()));
+        self.event_store.append(&envelope).await?;
+        self.dispatcher.publish(envelope).await;
+
+        tracing::info!(
+            learner=%sub.learner_id,
+            badge=%badge.badge_id,
+            "Badge awarded!"
+        );
+
+        Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  Bootstrap / Example
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Start an in-process example—useful when the module is compiled
+/// as `cargo run --example badge_service`.
+#[cfg(feature = "example")]
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Use dotenv if available.
+    dotenvy::dotenv().ok();
+    tracing_subscriber::fmt::init();
+
+    let db_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set (e.g. postgres://user:pw@localhost/web_social)");
+
+    // ── Infrastructure ───────────────────────────────────────────────
+    let event_store = Arc::new(EventStore::new(&db_url, 5).await?);
+    let dispatcher = Dispatcher::new(1024);
+
+    let badge_repo = Arc::new(PgBadgeRepository::new(event_store.pool.clone()));
+
+    // ── Start service ────────────────────────────────────────────────
+    let service = Arc::new(BadgeAwardService::new(
+        badge_repo,
+        dispatcher.clone(),
+        event_store.clone(),
+    ));
+    let handle = service.clone().spawn();
+
+    // ── Emit demo event ──────────────────────────────────────────────
+    let demo_event = EventEnvelope::new(DomainEvent::QuizSubmitted(
+        QuizSubmitted {
+            quiz_id: Uuid::new_v4(),
+            learner_id: Uuid::new_v4(),
+            score: 96.5,
+        },
+    ));
+    event_store.append(&demo_event).await?;
+    dispatcher.publish(demo_event).await;
+
+    // Wait for service to process event.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Cancel task gracefully (development only).
+    handle.abort();
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  Tests
+// ──────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Executor;
+
+    // Spawns a temporary in-memory Postgres (requires `postgres` feature
+    // of `sqlx-test` or a running database in CI).
+    #[tokio::test]
+    async fn badge_award_flow_happy_path() -> anyhow::Result<()> {
+        // Skip test when DATABASE_URL not provided; this allows `cargo test`
+        // without database.
+        let db_url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+
+        // Prepare schema (idempotent).
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&db_url)
+            .await?;
+        pool.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS event_store (
+                id UUID PRIMARY KEY,
+                occurred_at TIMESTAMPTZ NOT NULL,
+                event_name TEXT NOT NULL,
+                payload JSONB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS learner_badges (
+                learner_id UUID NOT NULL,
+                badge_id UUID NOT NULL,
+                awarded_at TIMESTAMPTZ NOT NULL,
+                reason TEXT NOT NULL,
+                PRIMARY KEY (learner_id, badge_id)
+            );
+            "#,
+        )
+        .await?;
+
+        let event_store = Arc::new(EventStore { pool: pool.clone() });
+        let dispatcher = Dispatcher::new(16);
+        let badge_repo = Arc::new(PgBadgeRepository::new(pool.clone()));
+
+        let service = Arc::new(BadgeAwardService::new(
+            badge_repo.clone(),
+            dispatcher.clone(),
+            event_store.clone(),
+        ));
+        let _handle = service.clone().spawn();
+
+        let learner_id = Uuid::new_v4();
+        let quiz_id = Uuid::new_v4();
+
+        // Emit qualifying quiz submission.
+        let env = EventEnvelope::new(DomainEvent::QuizSubmitted(
+            QuizSubmitted {
+                quiz_id,
+                learner_id,
+                score: 97.0,
+            },
+        ));
+        event_store.append(&env).await?;
+        dispatcher.publish(env.clone()).await;
+
+        // Wait for async processing.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // Verify badge persisted.
+        let badges = sqlx::query!(
+            "SELECT badge_id FROM learner_badges WHERE learner_id = $1",
+            learner_id
+        )
+        .fetch_all(pool.as_ref())
+        .await?;
+
+        assert_eq!(badges.len(), 1);
+        Ok(())
+    }
+}
+```

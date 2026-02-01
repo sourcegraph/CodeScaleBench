@@ -1,0 +1,344 @@
+```rust
+//! src/module_29.rs
+//! LedgerEntry query service with view-model validation, pagination helpers and
+//! Redis-backed response caching.
+//!
+//! This module is intentionally self-contained so it can serve as a template for
+//! the rest of the LedgerLink Nexus service layer. In production it would live
+//! in its own file/folder with dependency injection wiring provided by
+//! `axum`/`tower` or a similar HTTP abstraction.
+
+use std::{fmt, sync::Arc, time::Duration};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use redis::{aio::ConnectionLike, AsyncCommands};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tracing::{debug, error, instrument, warn};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+////////////////////////////////////////////////////////////////////////////////
+// Public DTOs (View-Model layer)
+////////////////////////////////////////////////////////////////////////////////
+
+/// Incoming query parameters for the `GET /ledger_entries` endpoint.
+///
+/// # Validation
+/// * `page_size` is clamped to `[1, 500]`.
+/// * `from` must be lower than or equal to `to` if both are supplied.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct LedgerEntriesQuery {
+    /// Tenant identifier – required for row-level security & cache scoping
+    #[validate(length(min = 1))]
+    pub tenant_id: String,
+
+    /// ISO-8601 timestamp inclusive lower bound (optional)
+    pub from: Option<DateTime<Utc>>,
+
+    /// ISO-8601 timestamp inclusive upper bound (optional)
+    pub to: Option<DateTime<Utc>>,
+
+    /// Pagination cursor – the opaque value returned in the previous call
+    pub cursor: Option<String>,
+
+    /// Desired page size (default 100, max 500)
+    #[validate(range(min = 1, max = 500))]
+    #[serde(default = "LedgerEntriesQuery::default_page_size")]
+    pub page_size: u16,
+}
+
+impl LedgerEntriesQuery {
+    fn default_page_size() -> u16 {
+        100
+    }
+
+    /// Additional manual validation because [`validator`] does not support
+    /// inter-field comparisons out of the box.
+    pub fn validate_logic(&self) -> Result<(), ValidationError> {
+        if let (Some(from), Some(to)) = (self.from, self.to) {
+            if from > to {
+                return Err(ValidationError::new("`from` is after `to`"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Envelope returned to the client.
+#[derive(Debug, Clone, Serialize)]
+pub struct Paginated<T> {
+    pub data: Vec<T>,
+    pub next_cursor: Option<String>,
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Domain layer (simplified)
+////////////////////////////////////////////////////////////////////////////////
+
+/// Immutable projection of a ledger entry.
+/// In real life this would contain many more fields.
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub tenant_id: String,
+    pub booked_at: DateTime<Utc>,
+    pub account_code: String,
+    pub amount_minor: i64,
+}
+
+/// Generic service error.
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation error: {0}")]
+    Validation(#[from] validator::ValidationErrors),
+
+    #[error("logical validation error: {0}")]
+    LogicalValidation(#[from] ValidationError),
+
+    #[error("repository error: {0}")]
+    Repository(#[from] RepositoryError),
+
+    #[error("redis error: {0}")]
+    Redis(#[from] redis::RedisError),
+
+    #[error("unknown service error: {0}")]
+    Other(String),
+}
+
+impl From<anyhow::Error> for ServiceError {
+    fn from(err: anyhow::Error) -> Self {
+        ServiceError::Other(err.to_string())
+    }
+}
+
+/// Repository-specific error.  Based on [`thiserror`] for structured handling.
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("postgres query failed: {0}")]
+    Postgres(#[from] sqlx::Error),
+
+    #[error("ledger entry not found")]
+    NotFound,
+
+    #[error("unexpected repository error: {0}")]
+    Other(String),
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Repository abstraction
+////////////////////////////////////////////////////////////////////////////////
+
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    /// Fetch a slice of entries for the given tenant, ordered by `booked_at`.
+    ///
+    /// * `cursor`     – opaque position token
+    /// * `page_size`  – desired slice length
+    async fn fetch_entries(
+        &self,
+        tenant_id: &str,
+        range: (Option<DateTime<Utc>>, Option<DateTime<Utc>>),
+        cursor: Option<&str>,
+        page_size: u16,
+    ) -> Result<(Vec<LedgerEntry>, Option<String> /* next cursor */), RepositoryError>;
+}
+
+/// Mock implementation needed for compilation.  Replace with real SQLx logic.
+pub struct MockLedgerEntryRepository;
+
+#[async_trait]
+impl LedgerEntryRepository for MockLedgerEntryRepository {
+    async fn fetch_entries(
+        &self,
+        tenant_id: &str,
+        range: (Option<DateTime<Utc>>, Option<DateTime<Utc>>),
+        _cursor: Option<&str>,
+        page_size: u16,
+    ) -> Result<(Vec<LedgerEntry>, Option<String>), RepositoryError> {
+        let (from, to) = range;
+        let now = Utc::now();
+        let booked_at = from.unwrap_or(now);
+        // Generate fake ledger entries
+        let entries: Vec<LedgerEntry> = (0..page_size)
+            .map(|_| LedgerEntry {
+                id: Uuid::new_v4(),
+                tenant_id: tenant_id.to_owned(),
+                booked_at,
+                account_code: "1000".into(),
+                amount_minor: 10_00,
+            })
+            .collect();
+        Ok((entries, None))
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Service implementation
+////////////////////////////////////////////////////////////////////////////////
+
+const CACHE_PREFIX: &str = "ledger_entries:v1";
+
+pub struct LedgerEntryQueryService<R, C>
+where
+    R: LedgerEntryRepository + 'static,
+    C: ConnectionLike + Send + Clone + 'static,
+{
+    repo: Arc<R>,
+    redis: C,
+    ttl: Duration,
+}
+
+impl<R, C> LedgerEntryQueryService<R, C>
+where
+    R: LedgerEntryRepository + 'static,
+    C: ConnectionLike + Send + Clone + 'static,
+{
+    pub fn new(repo: Arc<R>, redis: C, ttl_secs: u64) -> Self {
+        Self {
+            repo,
+            redis,
+            ttl: Duration::from_secs(ttl_secs),
+        }
+    }
+
+    /// Core query handler used by the HTTP layer.
+    ///
+    /// The algorithm:
+    /// 1. Validate/normalize incoming payload.
+    /// 2. Attempt a Redis cache hit.
+    /// 3. On miss, delegate to repository + back-fill cache.
+    #[instrument(skip(self), err)]
+    pub async fn get_ledger_entries(
+        &mut self,
+        query: LedgerEntriesQuery,
+    ) -> Result<Paginated<LedgerEntry>, ServiceError> {
+        // (1) Basic + logical validation
+        query.validate()?;
+        query.validate_logic()?;
+
+        let cache_key = compute_cache_key(&query);
+
+        // (2) Try cache
+        if let Ok(Some(cached)) = self.redis.get::<_, Vec<u8>>(&cache_key).await {
+            debug!("cache hit for key {}", cache_key);
+            let paginated: Paginated<LedgerEntry> = bincode::deserialize(&cached)?;
+            return Ok(paginated);
+        }
+
+        debug!("cache miss for key {}", cache_key);
+
+        // (3) Repository call
+        let (entries, next_cursor) = self
+            .repo
+            .fetch_entries(
+                &query.tenant_id,
+                (query.from, query.to),
+                query.cursor.as_deref(),
+                query.page_size,
+            )
+            .await?;
+
+        let paginated = Paginated {
+            data: entries,
+            next_cursor,
+        };
+
+        // Back-fill cache (fire-and-forget)
+        let encoded = bincode::serialize(&paginated)?;
+        let _: Result<(), redis::RedisError> = self
+            .redis
+            .set_ex(&cache_key, encoded, self.ttl.as_secs() as usize)
+            .await;
+        Ok(paginated)
+    }
+}
+
+/// Build a deterministic Redis key out of the query.
+fn compute_cache_key(q: &LedgerEntriesQuery) -> String {
+    let mut parts = vec![
+        CACHE_PREFIX.to_string(),
+        q.tenant_id.clone(),
+        q.page_size.to_string(),
+    ];
+    if let Some(ref cursor) = q.cursor {
+        parts.push(cursor.clone());
+    }
+    if let Some(ref from) = q.from {
+        parts.push(from.timestamp_millis().to_string());
+    }
+    if let Some(ref to) = q.to {
+        parts.push(to.timestamp_millis().to_string());
+    }
+    parts.join(":")
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Tests
+////////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use redis::aio::ConnectionManager;
+    use redis::Client;
+
+    #[tokio::test]
+    async fn test_compute_cache_key_changes_when_dates_change() {
+        let mut q = LedgerEntriesQuery {
+            tenant_id: "tenantA".into(),
+            from: None,
+            to: None,
+            cursor: None,
+            page_size: 25,
+        };
+        let k1 = compute_cache_key(&q);
+        q.from = Some(Utc::now());
+        let k2 = compute_cache_key(&q);
+        assert_ne!(k1, k2);
+    }
+
+    #[tokio::test]
+    async fn test_service_round_trip_with_mock_repo() -> anyhow::Result<()> {
+        // In-memory redis connection (requires `redis-server` in path).
+        let client = Client::open("redis://127.0.0.1/")?;
+        let conn = ConnectionManager::new(client).await?;
+        let repo = Arc::new(MockLedgerEntryRepository);
+
+        let mut svc = LedgerEntryQueryService::new(repo, conn, 60);
+
+        let query = LedgerEntriesQuery {
+            tenant_id: "tenant1".into(),
+            from: None,
+            to: None,
+            cursor: None,
+            page_size: 10,
+        };
+
+        let first = svc.get_ledger_entries(query.clone()).await?;
+        assert_eq!(first.data.len(), 10);
+
+        // Second call should hit the cache (verify with the tracing output).
+        let second = svc.get_ledger_entries(query).await?;
+        assert_eq!(second.data.len(), 10);
+
+        Ok(())
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Helper trait implementations
+////////////////////////////////////////////////////////////////////////////////
+
+impl fmt::Display for LedgerEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "LedgerEntry({}, {}, {}, {})",
+            self.id, self.account_code, self.booked_at, self.amount_minor
+        )
+    }
+}
+
+```

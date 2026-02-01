@@ -1,0 +1,396 @@
+```rust
+//! src/module_25.rs
+//!
+//! Event-driven infrastructure and domain services for the *Learning Pulse*
+//! feature of **EduPulse Live**.  
+//!
+//! This module exposes:
+//! 1. `DomainEvent` – the canonical enum for all pulse-related events.
+//! 2. `EventEnvelope<E>` – a metadata-rich wrapper that is persisted and
+//!    published to the broker.
+//! 3. `EventPublisher` – an async abstraction to decouple the message broker.
+//! 4. `EventStore` – a thin repository responsible for **atomic** persistence
+//!    and dispatch (outbox pattern).
+//! 5. `LearningPulseService` – the service layer façade for creating pulses,
+//!    leveraging the `EventStore` to guarantee *exactly-once* semantics.
+//!
+//! The code follows DDD tactical patterns (Entity, Repository, Domain-Service)
+//! while embracing *Rust* safety and async I/O performance.
+//!
+//! ```text
+//!  ┌─────────────┐    save()     ┌─────────────┐   publish()   ┌─────────────┐
+//!  │  HTTP/API   ├─────────────►│ EventStore  ├──────────────►│  Message    │
+//!  └─────────────┘               └─────────────┘               │   Broker    │
+//!        ▲                           │ ▲                       └─────────────┘
+//!        │ create_pulse()            │ │                       (NATS/Kafka…)
+//!        │                           ▼ │
+//!        │                    ┌─────────────┐
+//!        └────────────────────┤   Postgres  │
+//!                             └─────────────┘
+//! ```
+
+#![allow(clippy::missing_errors_doc, clippy::unused_async)] // Simplify example.
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPool, Postgres, Transaction};
+use thiserror::Error;
+use uuid::Uuid;
+
+// =========== Domain ======================================================= //
+
+/// Strongly-typed identifier for a [`LearningPulse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LearningPulseId(Uuid);
+
+impl LearningPulseId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+/// Core aggregate root representing a *Learning Pulse*.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningPulse {
+    pub id: LearningPulseId,
+    pub author_id: Uuid,
+    pub title: String,
+    pub body_markdown: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl LearningPulse {
+    pub fn new(
+        author_id: Uuid,
+        title: impl Into<String>,
+        body_markdown: impl Into<String>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            id: LearningPulseId::new(),
+            author_id,
+            title: title.into(),
+            body_markdown: body_markdown.into(),
+            created_at: Utc::now(),
+            expires_at,
+        }
+    }
+}
+
+// =========== Event Model ================================================== //
+
+/// Payload for the observable events within the *Learning Pulse* bounded-context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum DomainEvent {
+    LearningPulseCreated {
+        pulse_id: LearningPulseId,
+        author_id: Uuid,
+        title: String,
+    },
+    LearningPulseExpired {
+        pulse_id: LearningPulseId,
+    },
+    // Future-proofing: additional events can be added in a non-breaking fashion.
+}
+
+/// Extra metadata stored and transmitted with every [`DomainEvent`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope<E> {
+    pub id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub causation_id: Option<Uuid>,
+    pub correlation_id: Option<Uuid>,
+    pub payload: E,
+}
+
+impl<E> EventEnvelope<E> {
+    pub fn new(payload: E) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            payload,
+        }
+    }
+
+    pub fn with_correlation(mut self, correlation_id: Uuid) -> Self {
+        self.correlation_id = Some(correlation_id);
+        self
+    }
+}
+
+// =========== Application Errors =========================================== //
+
+#[derive(Debug, Error)]
+pub enum PulseError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("publisher error: {0}")]
+    Publisher(#[from] PublisherError),
+
+    #[error("invalid operation: {0}")]
+    Validation(String),
+}
+
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct PublisherError(String);
+
+// =========== Message Broker Abstraction =================================== //
+
+/// Publish event envelopes to the underlying message broker.
+///
+/// Implementations must guarantee *at-least-once* delivery.
+#[async_trait]
+pub trait EventPublisher: Send + Sync + 'static {
+    async fn publish(&self, envelope: &EventEnvelope<DomainEvent>) -> Result<(), PublisherError>;
+}
+
+/// A *NATS* implementation using the `async_nats` crate.
+#[cfg(feature = "nats")]
+pub mod nats_publisher {
+    use super::*;
+    use async_nats::{Connection, Subject};
+    use serde_json::to_vec;
+
+    /// Topic convention for domain events.
+    const SUBJECT: &str = "edupulse.events.learning_pulse";
+
+    pub struct NatsPublisher {
+        conn: Connection,
+        subject: Subject,
+    }
+
+    impl NatsPublisher {
+        pub fn new(conn: Connection) -> Self {
+            Self {
+                conn,
+                subject: SUBJECT.parse().expect("static subject is valid"),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EventPublisher for NatsPublisher {
+        async fn publish(
+            &self,
+            envelope: &EventEnvelope<DomainEvent>,
+        ) -> Result<(), PublisherError> {
+            let bytes = to_vec(envelope)
+                .map_err(|e| PublisherError(format!("serialize: {e}")))?;
+            self.conn
+                .publish(self.subject.clone(), bytes.into())
+                .await
+                .map_err(|e| PublisherError(format!("nats publish: {e}")))?;
+            Ok(())
+        }
+    }
+}
+
+// =========== Repository / Outbox Pattern ================================== //
+
+/// Outbox table row representation (for insertion only).
+#[derive(Debug, Serialize)]
+struct OutboxInsert<'a> {
+    event_id: Uuid,
+    aggregate_id: Uuid,
+    kind: &'a str,
+    // Stored as JSONB for flexibility.
+    payload: &'a serde_json::value::RawValue,
+    occurred_at: DateTime<Utc>,
+}
+
+/// Repository responsible for *atomic* persistence of the aggregate root
+/// and its domain events in the same SQL transaction.
+pub struct EventStore<P: EventPublisher> {
+    pool: PgPool,
+    publisher: P,
+}
+
+impl<P: EventPublisher> EventStore<P> {
+    pub fn new(pool: PgPool, publisher: P) -> Self {
+        Self { pool, publisher }
+    }
+
+    /// Persist aggregate + event in a single transaction,
+    /// then publish *after commit*. If publish fails, the tx
+    /// is rolled back (best effort) to avoid the *dual-write* problem.
+    pub async fn save_pulse(
+        &self,
+        pulse: &LearningPulse,
+        event: EventEnvelope<DomainEvent>,
+    ) -> Result<(), PulseError> {
+        let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
+
+        // 1. Insert the pulse.
+        sqlx::query!(
+            r#"
+            INSERT INTO learning_pulses (id, author_id, title, body_markdown, created_at, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+            pulse.id.0,
+            pulse.author_id,
+            pulse.title,
+            pulse.body_markdown,
+            pulse.created_at,
+            pulse.expires_at
+        )
+        .execute(&mut tx)
+        .await?;
+
+        // 2. Insert the envelope into the outbox.
+        let raw_json = serde_json::value::to_raw_value(&event)
+            .map_err(|e| PulseError::Validation(format!("json encode: {e}")))?;
+        sqlx::query!(
+            r#"
+            INSERT INTO outbox_events (event_id, aggregate_id, kind, payload, occurred_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            event.id,
+            pulse.id.0,
+            event_payload_kind(&event.payload),
+            raw_json.get(),
+            event.occurred_at
+        )
+        .execute(&mut tx)
+        .await?;
+
+        // 3. Commit – once committed, we attempt to publish.
+        tx.commit().await?;
+
+        // 4. Best-effort publish. If this fails we bubble the error, but
+        //    the DB changes are already durable. A background outbox
+        //    dispatcher will retry.
+        self.publisher.publish(&event).await?;
+
+        Ok(())
+    }
+}
+
+fn event_payload_kind(event: &DomainEvent) -> &'static str {
+    match event {
+        DomainEvent::LearningPulseCreated { .. } => "LearningPulseCreated",
+        DomainEvent::LearningPulseExpired { .. } => "LearningPulseExpired",
+    }
+}
+
+// =========== Service Layer ================================================ //
+
+/// Domain-level actions for *Learning Pulses*.
+pub struct LearningPulseService<P: EventPublisher> {
+    store: EventStore<P>,
+}
+
+impl<P: EventPublisher> LearningPulseService<P> {
+    pub fn new(store: EventStore<P>) -> Self {
+        Self { store }
+    }
+
+    /// Validates and creates a new `LearningPulse`.
+    pub async fn create_pulse(
+        &self,
+        author_id: Uuid,
+        title: String,
+        body_markdown: String,
+        expires_at: Option<DateTime<Utc>>,
+        correlation_id: Option<Uuid>,
+    ) -> Result<LearningPulseId, PulseError> {
+        if title.trim().is_empty() {
+            return Err(PulseError::Validation("Title cannot be empty".into()));
+        }
+
+        let pulse = LearningPulse::new(author_id, title.clone(), body_markdown, expires_at);
+
+        let event = EventEnvelope::new(DomainEvent::LearningPulseCreated {
+            pulse_id: pulse.id,
+            author_id,
+            title,
+        })
+        .with_correlation(correlation_id.unwrap_or_else(Uuid::new_v4));
+
+        self.store.save_pulse(&pulse, event).await?;
+        Ok(pulse.id)
+    }
+}
+
+// =========== Tests ======================================================== //
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    struct InMemPublisher {
+        pub published: Arc<std::sync::Mutex<Vec<EventEnvelope<DomainEvent>>>>,
+    }
+
+    #[async_trait]
+    impl EventPublisher for InMemPublisher {
+        async fn publish(&self, envelope: &EventEnvelope<DomainEvent>) -> Result<(), PublisherError> {
+            self.published.lock().unwrap().push(envelope.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn create_pulse_persists_and_publishes() {
+        let database_url = std::env::var("DATABASE_URL").expect("set for test");
+        let pool = PgPool::connect(&database_url).await.expect("db connect");
+
+        // Clean slate (idempotent for demo purposes)
+        sqlx::query!("DELETE FROM outbox_events").execute(&pool).await.unwrap();
+        sqlx::query!("DELETE FROM learning_pulses").execute(&pool).await.unwrap();
+
+        let memory_bus = InMemPublisher {
+            published: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+
+        let store = EventStore::new(pool.clone(), memory_bus);
+        let service = LearningPulseService::new(store);
+
+        let author = Uuid::new_v4();
+        let pulse_id = service
+            .create_pulse(author, "Rust Ownership".into(), "Explain borrowing".into(), None, None)
+            .await
+            .expect("creation succeeds");
+
+        // Verify DB row.
+        let record = sqlx::query!(
+            "SELECT id FROM learning_pulses WHERE id = $1",
+            pulse_id.0
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(record.is_some(), "pulse persisted");
+
+        // Verify publish.
+        let published = service
+            .store
+            .publisher
+            .as_any()
+            .downcast_ref::<InMemPublisher>()
+            .unwrap()
+            .published
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(published.len(), 1);
+    }
+
+    // Enable downcasting for the test above.
+    use std::any::Any;
+    trait CastablePublisher: EventPublisher + Any {}
+    impl<T> CastablePublisher for T where T: EventPublisher + Any {}
+    impl<P: EventPublisher> EventStore<P> {
+        pub fn publisher(&self) -> &dyn CastablePublisher {
+            &self.publisher
+        }
+    }
+}
+```

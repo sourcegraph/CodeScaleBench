@@ -1,0 +1,438 @@
+```rust
+//! module_4.rs
+//! -----------------------------------------------------------------------------
+//! Hyper-parameter Tuning & Automated Retraining Coordinator
+//!
+//! This module lives in the “Feature-Ops / Model-Ops” boundary and is responsible
+//! for orchestrating hyper-parameter search strategies (Strategy Pattern) and
+//! broadcasting re-training events (Observer Pattern) once an improvement over
+//! the baseline model is detected.
+//!
+//! The code below is **production-grade**: it is fully async, cancellation-safe,
+//! and built around trait objects so that new tuning strategies or observers can
+//! be injected at runtime without having to modify the core coordinator.
+//!
+//! External crates used (add to Cargo.toml):
+//!     anyhow          = "1"
+//!     async-trait     = "0.1"
+//!     rand            = "0.8"
+//!     serde           = { version = "1.0", features = ["derive"] }
+//!     thiserror       = "1"
+//!     tokio           = { version = "1", features = ["rt-multi-thread", "macros"] }
+//!
+//! -----------------------------------------------------------------------------
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use thiserror::Error;
+use tokio::{
+    sync::{broadcast, Mutex, RwLock},
+    task::JoinSet,
+    time::timeout,
+};
+
+/// Type-alias for naming hyper-parameters and their numeric values
+pub type HyperParams = HashMap<String, f64>;
+
+/// A single evaluation result produced by the tuner
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrialResult {
+    pub params: HyperParams,
+    pub metric: f64,
+    pub duration_ms: u128,
+}
+
+/// Aggregate of multiple trials
+#[derive(Debug, Default, Clone)]
+pub struct TuningSummary {
+    pub best_trial: Option<TrialResult>,
+    pub all_trials: Vec<TrialResult>,
+}
+
+/// Error types that can occur during tuning
+#[derive(Debug, Error)]
+pub enum TuningError {
+    #[error("evaluation timeout after {0:?}")]
+    Timeout(Duration),
+    #[error("evaluation failed: {0}")]
+    EvaluationFailed(String),
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+/// Consumers interested in re-training notifications implement this trait
+#[async_trait]
+pub trait RetrainingObserver: Send + Sync {
+    async fn on_retraining_required(&self, best_trial: TrialResult) -> Result<()>;
+}
+
+/// Contract that any hyper-parameter tuner must fulfill
+#[async_trait]
+pub trait HyperparameterTuner: Send + Sync {
+    /// Returns a user-friendly identifier (e.g. “grid”, “bayesian”)
+    fn name(&self) -> &'static str;
+
+    /// Perform the hyper-parameter search.
+    ///
+    /// Implementations should call `evaluate_fn` for each candidate and must
+    /// honor `max_duration`.
+    async fn tune<F>(
+        &self,
+        max_duration: Duration,
+        evaluate_fn: F,
+    ) -> Result<TuningSummary, TuningError>
+    where
+        F: Fn(HyperParams) -> Result<f64, TuningError> + Send + Sync;
+}
+
+/// A very small grid-search tuner — suitable for demo but realistic enough
+pub struct GridSearchTuner {
+    /// Fixed search space: parameter -> list of candidate values
+    search_space: HashMap<String, Vec<f64>>,
+}
+
+impl GridSearchTuner {
+    pub fn new(search_space: HashMap<String, Vec<f64>>) -> Self {
+        Self { search_space }
+    }
+
+    /// Cartesian product generator
+    fn expand_grid(&self) -> Vec<HyperParams> {
+        // Start with a single empty parameter set
+        let mut grids: Vec<HyperParams> = vec![HashMap::new()];
+
+        for (param_name, values) in &self.search_space {
+            let mut next_grid: Vec<HyperParams> = Vec::new();
+            for existing in &grids {
+                for v in values {
+                    let mut new_map = existing.clone();
+                    new_map.insert(param_name.clone(), *v);
+                    next_grid.push(new_map);
+                }
+            }
+            grids = next_grid;
+        }
+        grids
+    }
+}
+
+#[async_trait]
+impl HyperparameterTuner for GridSearchTuner {
+    fn name(&self) -> &'static str {
+        "grid"
+    }
+
+    async fn tune<F>(
+        &self,
+        max_duration: Duration,
+        evaluate_fn: F,
+    ) -> Result<TuningSummary, TuningError>
+    where
+        F: Fn(HyperParams) -> Result<f64, TuningError> + Send + Sync,
+    {
+        let start_time = Instant::now();
+        let mut summary = TuningSummary::default();
+
+        for params in self.expand_grid() {
+            // Respect wall-clock budget
+            if start_time.elapsed() >= max_duration {
+                return Err(TuningError::Timeout(max_duration));
+            }
+
+            let eval_start = Instant::now();
+
+            // In a production system evaluation is usually an async network
+            // or compute call. Here we call it synchronously for simplicity.
+            let metric = evaluate_fn(params.clone())?;
+            let trial = TrialResult {
+                params: params.clone(),
+                metric,
+                duration_ms: eval_start.elapsed().as_millis(),
+            };
+
+            // Keep aggregate stats
+            summary.all_trials.push(trial.clone());
+            if summary
+                .best_trial
+                .as_ref()
+                .map(|b| metric > b.metric)
+                .unwrap_or(true)
+            {
+                summary.best_trial = Some(trial);
+            }
+        }
+
+        Ok(summary)
+    }
+}
+
+/// A stochastic search tuner that randomly samples within ranges.
+///
+/// Demonstrates how easily new strategies can be plugged in.
+pub struct RandomSearchTuner {
+    ranges: HashMap<String, (f64, f64)>,
+    max_trials: usize,
+    rng: Arc<Mutex<StdRng>>,
+}
+
+impl RandomSearchTuner {
+    pub fn new(ranges: HashMap<String, (f64, f64)>, max_trials: usize, seed: u64) -> Self {
+        Self {
+            ranges,
+            max_trials,
+            rng: Arc::new(Mutex::new(StdRng::seed_from_u64(seed))),
+        }
+    }
+
+    fn sample(&self) -> HyperParams {
+        let mut rng_guard = self.rng.blocking_lock();
+        self.ranges
+            .iter()
+            .map(|(name, (low, high))| {
+                let v = rng_guard.gen_range(*low..=*high);
+                (name.clone(), v)
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl HyperparameterTuner for RandomSearchTuner {
+    fn name(&self) -> &'static str {
+        "random"
+    }
+
+    async fn tune<F>(
+        &self,
+        max_duration: Duration,
+        evaluate_fn: F,
+    ) -> Result<TuningSummary, TuningError>
+    where
+        F: Fn(HyperParams) -> Result<f64, TuningError> + Send + Sync,
+    {
+        let mut summary = TuningSummary::default();
+        let start_time = Instant::now();
+
+        for _ in 0..self.max_trials {
+            if start_time.elapsed() >= max_duration {
+                break;
+            }
+            let params = self.sample();
+            let eval_start = Instant::now();
+            let metric = evaluate_fn(params.clone())?;
+            let trial = TrialResult {
+                params: params.clone(),
+                metric,
+                duration_ms: eval_start.elapsed().as_millis(),
+            };
+
+            summary.all_trials.push(trial.clone());
+            if summary
+                .best_trial
+                .as_ref()
+                .map(|b| metric > b.metric)
+                .unwrap_or(true)
+            {
+                summary.best_trial = Some(trial);
+            }
+        }
+
+        Ok(summary)
+    }
+}
+
+/// A channel-based event bus for notifying observers
+#[derive(Clone)]
+pub struct RetrainingPublisher {
+    sender: broadcast::Sender<TrialResult>,
+}
+
+impl RetrainingPublisher {
+    pub fn new(buffer: usize) -> Self {
+        let (sender, _) = broadcast::channel(buffer);
+        Self { sender }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<TrialResult> {
+        self.sender.subscribe()
+    }
+
+    pub fn publish(&self, best_trial: TrialResult) -> Result<()> {
+        // Errors occur when there are no receivers; we ignore them
+        let _ = self.sender.send(best_trial);
+        Ok(())
+    }
+}
+
+/// Coordinator that binds everything together.
+pub struct TuningCoordinator {
+    tuner: Box<dyn HyperparameterTuner>,
+    observers: RwLock<Vec<Arc<dyn RetrainingObserver>>>,
+    publisher: RetrainingPublisher,
+}
+
+impl TuningCoordinator {
+    pub fn new(tuner: Box<dyn HyperparameterTuner>) -> Self {
+        Self {
+            tuner,
+            observers: RwLock::new(Vec::new()),
+            publisher: RetrainingPublisher::new(32),
+        }
+    }
+
+    /// Register an observer that will be notified of retraining events
+    pub async fn add_observer(&self, observer: Arc<dyn RetrainingObserver>) {
+        self.observers.write().await.push(observer);
+    }
+
+    /// Start the tuning run and notify observers if improvement is found
+    pub async fn run<F>(&self, time_budget: Duration, evaluate_fn: F) -> Result<()>
+    where
+        F: Fn(HyperParams) -> Result<f64, TuningError> + Send + Sync + 'static,
+    {
+        tracing::info!(
+            "Starting hyperparameter tuning using '{}' strategy with budget {:?}",
+            self.tuner.name(),
+            time_budget
+        );
+
+        let summary = self.tuner.tune(time_budget, evaluate_fn).await?;
+
+        if let Some(best) = &summary.best_trial {
+            tracing::info!(
+                "Tuning complete — best metric {:.4} achieved with {:?}",
+                best.metric,
+                best.params
+            );
+
+            // strategy: notify via channel *and* directly call observers
+            self.publisher
+                .publish(best.clone())
+                .context("failed to publish best trial")?;
+
+            // Fan-out async calls without awaiting all of them serially
+            let mut join_set = JoinSet::new();
+            for obs in self.observers.read().await.clone() {
+                let trial_clone = best.clone();
+                join_set.spawn(async move { obs.on_retraining_required(trial_clone).await });
+            }
+
+            // Enforce overall timeout so that one slow observer does not block
+            timeout(Duration::from_secs(30), async move {
+                while let Some(res) = join_set.join_next().await {
+                    if let Err(e) = res.context("observer task panicked")?? {
+                        tracing::warn!("observer returned error: {:?}", e);
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("observer fan-out timed out"))??;
+        } else {
+            tracing::warn!("No trials executed during tuning — check configuration");
+        }
+
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Example observer implementation
+// -----------------------------------------------------------------------------
+
+/// A sample retraining observer that simply logs the event.
+///
+/// In the real platform this would enqueue a job in the orchestration backend
+/// or directly trigger a *ModelTrainer* service via gRPC.
+pub struct LoggingObserver;
+
+#[async_trait]
+impl RetrainingObserver for LoggingObserver {
+    async fn on_retraining_required(&self, best_trial: TrialResult) -> Result<()> {
+        tracing::info!(
+            target: "retraining_observer",
+            "Retraining requested due to new best metric {:.4} with params {:?}",
+            best_trial.metric,
+            best_trial.params
+        );
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// (Optional) Integration Test
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Dummy evaluation function: simple convex parabola centered at (3, 3)
+    fn dummy_eval(params: HyperParams) -> Result<f64, TuningError> {
+        let x = params.get("x").copied().unwrap_or(0.0);
+        let y = params.get("y").copied().unwrap_or(0.0);
+        Ok(-(x - 3.0).powi(2) - (y - 3.0).powi(2)) // Higher is better
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grid_tuning_should_find_optimum() {
+        let tuner = GridSearchTuner::new(
+            vec![
+                ("x".into(), vec![0.0, 1.0, 2.0, 3.0]),
+                ("y".into(), vec![0.0, 1.0, 2.0, 3.0]),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let coord = TuningCoordinator::new(Box::new(tuner));
+        coord
+            .add_observer(Arc::new(LoggingObserver))
+            .await;
+
+        coord
+            .run(Duration::from_secs(10), dummy_eval)
+            .await
+            .expect("tuning failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn observers_should_be_notified() {
+        struct CounterObserver(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl RetrainingObserver for CounterObserver {
+            async fn on_retraining_required(&self, _best_trial: TrialResult) -> Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let tuner = GridSearchTuner::new(
+            vec![("x".into(), vec![3.0]), ("y".into(), vec![3.0])]
+                .into_iter()
+                .collect(),
+        );
+        let coord = TuningCoordinator::new(Box::new(tuner));
+        coord
+            .add_observer(Arc::new(CounterObserver(counter.clone())))
+            .await;
+
+        coord
+            .run(Duration::from_secs(10), dummy_eval)
+            .await
+            .unwrap();
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+}
+```

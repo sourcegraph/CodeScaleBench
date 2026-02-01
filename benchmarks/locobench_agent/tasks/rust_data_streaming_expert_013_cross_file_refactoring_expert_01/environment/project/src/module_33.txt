@@ -1,0 +1,335 @@
+```rust
+//! module_33 – Realtime analysis stage
+//!
+//! This module owns the “A-stage” in the ChirpPulse stream‐processing
+//! topology.  It receives pre-enriched social events from the
+//! `enriched_messages` Kafka topic, applies a pluggable analysis strategy
+//! (sentiment, toxicity, custom NLP, …), and publishes the resulting
+//! `AnalysisResult` to the `analysis_results` topic.
+//!
+//! Core design goals:
+//!   • Hot-swappable algorithms (strategy pattern powered by `arc-swap`)
+//!   • Zero-copy, back-pressure aware streaming (Tokio + rdkafka)
+//!   • Structured, async error handling (anyhow + thiserror)
+//!   • Extensive observability (tracing)
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::message::{BorrowedMessage, OwnedHeaders};
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::util::Timeout;
+use rdkafka::{ClientConfig, Message};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::select;
+use tokio::signal;
+use tokio_stream::StreamExt;
+use tracing::{error, info, instrument, trace};
+
+/// Input payload arriving from the enrichment stage.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnrichedMessage {
+    pub id: String,
+    pub user_id: String,
+    pub text: String,
+    pub language: Option<String>,
+    pub timestamp_ms: i64,
+}
+
+/// Output payload produced by this stage.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnalysisResult {
+    pub id: String,
+    pub sentiment: f32, // [-1.0, 1.0]
+    pub toxicity: f32,  // [0.0, +inf)
+    pub algorithm: String,
+    pub computed_at_ms: i64,
+}
+
+/// Abstract analysis strategy.
+///
+/// Implementors must be pure & stateless; any heavyweight runtime (e.g.
+/// ML model) should be Arc-wrapped inside the impl itself.
+pub trait AnalysisStrategy: Send + Sync + 'static {
+    fn name(&self) -> &'static str;
+
+    fn analyze(&self, msg: &EnrichedMessage) -> AnalysisResult;
+}
+
+/// A very lightweight rule-based sentiment implementation.
+/// (Default fallback when no smarter model is loaded.)
+pub struct RuleBasedSentiment;
+
+impl AnalysisStrategy for RuleBasedSentiment {
+    fn name(&self) -> &'static str {
+        "rule_based_v1"
+    }
+
+    fn analyze(&self, msg: &EnrichedMessage) -> AnalysisResult {
+        // Naive heuristic: positive if contains "😀", negative if "😡" etc.
+        let sentiment = if msg.text.contains(['😀', '😄', '😍']) {
+            0.75
+        } else if msg.text.contains(['😡', '🤬', '💀']) {
+            -0.8
+        } else {
+            0.0
+        };
+
+        AnalysisResult {
+            id: msg.id.clone(),
+            sentiment,
+            toxicity: (sentiment * -1.0).max(0.0), // silly proxy
+            algorithm: self.name().into(),
+            computed_at_ms: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+}
+
+/// Illustration of a heavier NLP-powered model.
+///
+/// In production this could embed a transformer running inside
+/// `onnxruntime` or `tch`; we stub it for brevity.
+pub struct TransformerV2 {
+    // placeholder for compiled model, tokenizers, etc.
+}
+
+impl TransformerV2 {
+    pub fn load() -> Result<Self> {
+        // Simulate expensive load
+        std::thread::sleep(Duration::from_millis(250));
+        Ok(Self {})
+    }
+}
+
+impl AnalysisStrategy for TransformerV2 {
+    fn name(&self) -> &'static str {
+        "transformer_v2"
+    }
+
+    fn analyze(&self, msg: &EnrichedMessage) -> AnalysisResult {
+        // ⚠️ Totally fake numbers; replace w/ real inference.
+        let hash = seahash::hash(msg.text.as_bytes());
+        let sentiment = (hash % 200) as f32 / 100.0 - 1.0; // [-1,1]
+        let toxicity = ((hash >> 8) % 100) as f32 / 10.0;
+
+        AnalysisResult {
+            id: msg.id.clone(),
+            sentiment,
+            toxicity,
+            algorithm: self.name().into(),
+            computed_at_ms: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+}
+
+/// Runtime holder for the active strategy, allowing atomic replacement.
+#[derive(Clone)]
+pub struct StrategyManager {
+    inner: Arc<ArcSwap<dyn AnalysisStrategy>>,
+}
+
+impl StrategyManager {
+    pub fn new(default_strategy: impl AnalysisStrategy) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(default_strategy)),
+        }
+    }
+
+    pub fn current(&self) -> Arc<dyn AnalysisStrategy> {
+        self.inner.load_full()
+    }
+
+    /// Swap in a new strategy (e.g. after a canary deploy).
+    pub fn swap(&self, new_strategy: impl AnalysisStrategy) {
+        self.inner.store(Arc::new(new_strategy));
+        info!(algo = %self.current().name(), "analysis strategy swapped");
+    }
+}
+
+/// Raised when incoming Kafka message cannot be parsed.
+#[derive(Debug, Error)]
+#[error("deserialization failure: {0}")]
+struct DeserializationError(String);
+
+/// Raised when the producer fails to publish the analysis result.
+#[derive(Debug, Error)]
+#[error("publish failure: {0}")]
+struct PublishError(String);
+
+/// Convert raw Kafka bytes into an `EnrichedMessage`.
+fn deserialize_input(msg: &BorrowedMessage<'_>) -> Result<EnrichedMessage> {
+    let payload = msg
+        .payload()
+        .ok_or_else(|| DeserializationError("empty payload".into()))?;
+    serde_json::from_slice(payload).context("json decode")
+}
+
+/// Build a configured Kafka consumer.
+///
+/// Configuration is intentionally strict: `enable.auto.commit` is disabled
+/// to guarantee “exactly once” semantics in combination with the producer’s
+/// idempotence and transactional support.
+fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer> {
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", group_id)
+        .set("enable.partition.eof", "false")
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()
+        .context("create consumer")?;
+    Ok(consumer)
+}
+
+/// Build a configured, idempotent Kafka producer.
+fn build_producer(brokers: &str) -> Result<FutureProducer> {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("enable.idempotence", "true")
+        .set("acks", "all")
+        .set("message.send.max.retries", "3")
+        .set("compression.type", "lz4")
+        .create()
+        .context("create producer")?;
+    Ok(producer)
+}
+
+/// Asynchronously publish a `AnalysisResult` to Kafka.
+async fn publish_result(
+    producer: &FutureProducer,
+    topic: &str,
+    result: &AnalysisResult,
+) -> Result<()> {
+    let payload = serde_json::to_vec(result)?;
+    let record = FutureRecord::<_, _>::to(topic)
+        .payload(&payload)
+        .key(&result.id)
+        .headers(OwnedHeaders::new().add("algorithm", &result.algorithm));
+
+    producer
+        .send(record, Timeout::After(Duration::from_secs(0)))
+        .await
+        .map_err(|(e, _)| PublishError(format!("kafka error: {:?}", e)))?
+        .map_err(|e| PublishError(format!("delivery status: {:?}", e)))?;
+
+    Ok(())
+}
+
+/// Entrypoint invoked by the service runtime (main.rs or orchestrator).
+///
+/// Spawns a Tokio task that consumes, analyzes, and produces records
+/// until a shutdown signal is received.
+#[instrument(skip_all)]
+pub async fn run_analysis_stage(
+    brokers: &str,
+    input_topic: &str,
+    output_topic: &str,
+    group_id: &str,
+) -> Result<()> {
+    let consumer = build_consumer(brokers, group_id)?;
+    consumer.subscribe(&[input_topic])?;
+
+    let producer = build_producer(brokers)?;
+
+    // Default strategy.
+    let strategies = StrategyManager::new(RuleBasedSentiment);
+
+    // Example: after boot, migrate to transformer in background
+    tokio::spawn({
+        let strategies = strategies.clone();
+        async move {
+            if let Ok(t) = TransformerV2::load() {
+                strategies.swap(t);
+            }
+        }
+    });
+
+    // Process stream until SIGINT/SIGTERM.
+    let mut stream = consumer.stream();
+
+    loop {
+        select! {
+            biased;
+
+            _ = signal::ctrl_c() => {
+                info!("shutdown signal received");
+                break;
+            }
+
+            maybe_msg = stream.next() => {
+                match maybe_msg {
+                    Some(Ok(borrowed)) => {
+                        if let Err(e) = handle_message(&strategies, &producer, &borrowed, output_topic).await {
+                            error!(error = %e, "failed to process message");
+                        }
+                        // Manual commit after processing to maintain EOS guarantees
+                        if let Err(e) = consumer.commit_message(&borrowed, CommitMode::Async) {
+                            error!(error = ?e, "failed to commit offset");
+                        }
+                    }
+                    Some(Err(e)) => {
+                        error!(error = ?e, "kafka error in consumer stream");
+                    }
+                    None => {
+                        // stream closed?
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[instrument(skip_all, fields(offset = msg.offset(), partition = msg.partition()))]
+async fn handle_message(
+    strategies: &StrategyManager,
+    producer: &FutureProducer,
+    msg: &BorrowedMessage<'_>,
+    output_topic: &str,
+) -> Result<()> {
+    trace!("received message from input topic");
+
+    let input = deserialize_input(msg)?;
+    let strategy = strategies.current();
+    let result = strategy.analyze(&input);
+
+    publish_result(producer, output_topic, &result)
+        .await
+        .context("publish result")?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rule_based_sentiment_infers_happy() {
+        let strat = RuleBasedSentiment;
+        let input = EnrichedMessage {
+            id: "1".into(),
+            user_id: "u".into(),
+            text: "I love Rust 😀".into(),
+            language: Some("en".into()),
+            timestamp_ms: 0,
+        };
+        let res = strat.analyze(&input);
+        assert!(res.sentiment > 0.0);
+    }
+
+    #[test]
+    fn strategy_manager_swaps() {
+        let mgr = StrategyManager::new(RuleBasedSentiment);
+        assert_eq!(mgr.current().name(), "rule_based_v1");
+        mgr.swap(RuleBasedSentiment); // swap with same impl
+        assert_eq!(mgr.current().name(), "rule_based_v1");
+    }
+}
+```

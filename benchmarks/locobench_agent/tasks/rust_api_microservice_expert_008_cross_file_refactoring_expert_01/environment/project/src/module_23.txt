@@ -1,0 +1,414 @@
+```rust
+//! src/module_23.rs
+//!
+//! Cash-flow forecast query service (CQRS ‑ “Q” side).
+//!
+//! This module owns the end-to-end flow from validated View-Model (DTO) to
+//! repository calls and optional response caching.  It demonstrates:
+//!   • Pagination helpers
+//!   • `validator`-based request validation
+//!   • `sqlx` (PostgreSQL) & `redis` integration
+//!   • Structured error handling with `thiserror`
+//!   • `tracing` instrumentation for distributed logging
+//!
+//! ─────────────────────────────────────────────────────────────────────────────
+
+#![allow(clippy::missing_async)]
+#![allow(clippy::unused_async)]
+
+use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, Utc};
+use redis::AsyncCommands;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgQueryAs, PgPool};
+use std::{cmp::max, sync::Arc};
+use thiserror::Error;
+use tracing::{debug, instrument};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+/// Per-page upper bound enforced for all endpoints offering pagination.
+const MAX_PER_PAGE: u32 = 500;
+/// Default number of seconds a cached page stays in Redis.
+const CACHE_TTL_SECS: usize = 60 * 5; // 5 min
+
+// ─────────────────────────────────────────────────────────────────────────────
+// View-Model (DTO) – Request
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// DTO representing a paginated cash-flow forecast query.
+#[derive(Debug, Clone, Validate, Deserialize)]
+pub struct CashFlowForecastRequest {
+    /// Tenant who owns the ledger data.
+    #[validate]
+    pub tenant_id: Uuid,
+
+    /// Inclusive start date for the forecast (YYYY-MM-DD in UTC).
+    #[validate(custom = "validate_ymd")]
+    pub from: NaiveDate,
+
+    /// Inclusive end date for the forecast (YYYY-MM-DD in UTC).
+    #[validate(custom = "validate_ymd")]
+    pub to: NaiveDate,
+
+    /// 1-based page index. Defaults to 1.
+    #[validate(range(min = 1))]
+    #[serde(default = "default_page")]
+    pub page: u32,
+
+    /// Number of records per page.
+    #[validate(range(min = 1, max = "MAX_PER_PAGE"))]
+    #[serde(default = "default_per_page")]
+    pub per_page: u32,
+}
+
+/// Ensure YYYY-MM-DD format can be parsed.
+fn validate_ymd(date: &NaiveDate) -> Result<(), ValidationError> {
+    // NaiveDate always parses, but we still ensure date isn't “bogus” and
+    // that it lies within a reasonable range (1970-01-01 .. 2100-01-01).
+    const MIN: i32 = 1970;
+    const MAX: i32 = 2100;
+    let year = date.year();
+    if year < MIN || year > MAX {
+        return Err(ValidationError::new("year_out_of_range"));
+    }
+    Ok(())
+}
+
+const fn default_page() -> u32 {
+    1
+}
+const fn default_per_page() -> u32 {
+    50
+}
+
+impl CashFlowForecastRequest {
+    /// Build a stable Redis key that uniquely identifies the request page.
+    fn redis_key(&self) -> String {
+        format!(
+            "cashflow:{}:{}:{}:{}:{}",
+            self.tenant_id, self.from, self.to, self.page, self.per_page
+        )
+    }
+
+    /// Returns the computed SQL offset.
+    fn offset(&self) -> i64 {
+        (self.page.saturating_sub(1) * self.per_page) as i64
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// View-Model – Response
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Public payload returned to API clients.
+#[derive(Debug, Clone, Serialize)]
+pub struct CashFlowForecastResponse {
+    pub forecasts: Vec<DailyCashForecast>,
+    pub pagination: PaginationMeta,
+    /// `true` when the record originated from Redis cache.
+    pub cache_hit: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PaginationMeta {
+    pub page: u32,
+    pub per_page: u32,
+    pub total_pages: u32,
+    pub total_items: i64,
+}
+
+/// An aggregated cash-flow snapshot for a given day.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct DailyCashForecast {
+    pub date: NaiveDate,
+    pub inflow: Decimal,
+    pub outflow: Decimal,
+    pub balance: Decimal,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Errors
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum ForecastServiceError {
+    #[error("validation failed: {0}")]
+    Validation(#[from] validator::ValidationErrors),
+
+    #[error("repository error: {0}")]
+    Repository(#[from] sqlx::Error),
+
+    #[error("cache error: {0}")]
+    Cache(#[from] redis::RedisError),
+
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Repository (DDD persistence layer)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+pub trait CashFlowForecastRepository: Send + Sync {
+    /// Aggregate ledger entries into daily sums for `tenant_id`.
+    async fn fetch_daily_forecast(
+        &self,
+        tenant_id: Uuid,
+        from: NaiveDate,
+        to: NaiveDate,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<DailyCashForecast>, i64 /* total_count */), sqlx::Error>;
+}
+
+/// PostgreSQL implementation backed by `sqlx`.
+pub struct PgForecastRepository {
+    pool: PgPool,
+}
+
+impl PgForecastRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl CashFlowForecastRepository for PgForecastRepository {
+    #[instrument(level = "debug", skip(self))]
+    async fn fetch_daily_forecast(
+        &self,
+        tenant_id: Uuid,
+        from: NaiveDate,
+        to: NaiveDate,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<DailyCashForecast>, i64), sqlx::Error> {
+        // The first query retrieves the paginated slice.
+        let forecasts: Vec<DailyCashForecast> = sqlx::query_as::<_, DailyCashForecast>(
+            r#"
+            SELECT
+                date_trunc('day', le.posted_at)::date            AS date,
+                SUM(CASE WHEN le.amount > 0 THEN le.amount ELSE 0 END) AS inflow,
+                SUM(CASE WHEN le.amount < 0 THEN le.amount ELSE 0 END) AS outflow,
+                SUM(le.amount) AS balance
+            FROM ledger_entries le
+            WHERE le.tenant_id = $1
+              AND le.posted_at::date BETWEEN $2 AND $3
+            GROUP BY date
+            ORDER BY date
+            LIMIT $4
+            OFFSET $5
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(from)
+        .bind(to)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // The second query retrieves total number of grouped days (for pagination).
+        let total: (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)
+            FROM (
+                SELECT date_trunc('day', le.posted_at)::date AS date
+                FROM ledger_entries le
+                WHERE le.tenant_id = $1
+                  AND le.posted_at::date BETWEEN $2 AND $3
+                GROUP BY date
+            ) AS grouped
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(from)
+        .bind(to)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok((forecasts, total.0))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Service Layer
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+pub trait CashFlowForecastService: Send + Sync {
+    async fn get_forecast(
+        &self,
+        req: CashFlowForecastRequest,
+    ) -> Result<CashFlowForecastResponse, ForecastServiceError>;
+}
+
+/// Default implementation combining Repo + Redis cache.
+pub struct CachedCashFlowForecastService<R> {
+    repo: Arc<R>,
+    redis: redis::aio::MultiplexedConnection,
+}
+
+impl<R> CachedCashFlowForecastService<R>
+where
+    R: CashFlowForecastRepository,
+{
+    pub async fn new(repo: Arc<R>, redis_client: redis::Client) -> Result<Self, redis::RedisError> {
+        Ok(Self {
+            repo,
+            redis: redis_client.get_multiplexed_async_connection().await?,
+        })
+    }
+}
+
+#[async_trait]
+impl<R> CashFlowForecastService for CachedCashFlowForecastService<R>
+where
+    R: CashFlowForecastRepository + 'static,
+{
+    #[instrument(level = "info", skip(self, req))]
+    async fn get_forecast(
+        &self,
+        mut req: CashFlowForecastRequest,
+    ) -> Result<CashFlowForecastResponse, ForecastServiceError> {
+        // Validate DTO (short-circuit on failure).
+        req.validate()?;
+
+        // Guard: ensure from ≤ to.
+        if req.from > req.to {
+            let mut errors = validator::ValidationErrors::new();
+            errors.add(
+                "from",
+                validator::ValidationError::new("from_date_after_to_date"),
+            );
+            return Err(ForecastServiceError::Validation(errors));
+        }
+
+        let cache_key = req.redis_key();
+
+        // Attempt to read from Redis first.
+        if let Ok(Some(blob)) = self.redis.get::<_, String>(&cache_key).await {
+            debug!("cache hit for key {cache_key}");
+            if let Ok(resp) = serde_json::from_str::<CashFlowForecastResponse>(&blob) {
+                return Ok(CashFlowForecastResponse {
+                    cache_hit: true,
+                    ..resp
+                });
+            } else {
+                // Corrupted entry – silently drop; the fresh query will overwrite.
+                debug!("cache deserialization failed, refreshing cache key {cache_key}");
+            }
+        }
+
+        // Fallback to repository.
+        let (forecasts, total_items) = self
+            .repo
+            .fetch_daily_forecast(
+                req.tenant_id,
+                req.from,
+                req.to,
+                req.per_page as i64,
+                req.offset(),
+            )
+            .await?;
+
+        let total_pages = max(
+            1,
+            ((total_items as f64) / (req.per_page as f64)).ceil() as u32,
+        );
+
+        let response = CashFlowForecastResponse {
+            forecasts,
+            pagination: PaginationMeta {
+                page: req.page,
+                per_page: req.per_page,
+                total_pages,
+                total_items,
+            },
+            cache_hit: false,
+        };
+
+        // Serialize and store in Redis, ignore errors (best effort).
+        if let Ok(serialized) = serde_json::to_string(&response) {
+            let _: Result<(), _> = self
+                .redis
+                .set_ex(&cache_key, serialized, CACHE_TTL_SECS)
+                .await;
+        }
+
+        Ok(response)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit Tests (async-runtime agnostic via `tokio::test`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    struct MockRepo;
+
+    #[async_trait]
+    impl CashFlowForecastRepository for MockRepo {
+        async fn fetch_daily_forecast(
+            &self,
+            _tenant_id: Uuid,
+            _from: NaiveDate,
+            _to: NaiveDate,
+            _limit: i64,
+            _offset: i64,
+        ) -> Result<(Vec<DailyCashForecast>, i64), sqlx::Error> {
+            Ok((
+                vec![DailyCashForecast {
+                    date: NaiveDate::from_ymd_opt(2023, 1, 1).unwrap(),
+                    inflow: Decimal::new(1000, 2),
+                    outflow: Decimal::new(-400, 2),
+                    balance: Decimal::new(600, 2),
+                }],
+                1,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn request_validation_works() {
+        let invalid_req = CashFlowForecastRequest {
+            tenant_id: Uuid::new_v4(),
+            from: NaiveDate::from_ymd_opt(2030, 1, 1).unwrap(),
+            to: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(), // from > to (invalid)
+            page: 0,
+            per_page: MAX_PER_PAGE + 1,
+        };
+        assert!(invalid_req.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn service_hits_repo_on_cache_miss() {
+        let repo = Arc::new(MockRepo);
+        // Ephemeral in-memory Redis substitute (mini-rediss).
+        let client =
+            redis::Client::open("redis://127.0.0.1/").expect("requires local redis for tests");
+        let service = CachedCashFlowForecastService::new(repo, client)
+            .await
+            .expect("redis connection");
+
+        let req = CashFlowForecastRequest {
+            tenant_id: Uuid::new_v4(),
+            from: NaiveDate::from_ymd_opt(2023, 1, 1).unwrap(),
+            to: NaiveDate::from_ymd_opt(2023, 1, 31).unwrap(),
+            page: 1,
+            per_page: 50,
+        };
+
+        let resp = service.get_forecast(req).await.unwrap();
+        assert!(!resp.cache_hit);
+        assert_eq!(resp.pagination.total_items, 1);
+    }
+}
+```

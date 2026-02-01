@@ -1,0 +1,340 @@
+```rust
+//! module_62.rs
+//!
+//! Dynamic, hot-swappable sentiment-scoring strategy at runtime.
+//!
+//! This module demonstrates how ChirpPulse can swap analysis algorithms
+//! on-the-fly without interrupting the stream processor.  A lightweight
+//! Kafka config topic drives which strategy should be active; listeners
+//! update a globally shared `Arc<dyn SentimentAlgorithm>` used by the
+//! real-time enrichment pipeline.
+//!
+//! High-level architecture
+//! -----------------------
+//!  1.  `SentimentAlgorithm` – trait each strategy must implement
+//!  2.  Concrete implementations (`LexiconV1`, `TransformerV2`, …)
+//!  3.  `AlgorithmFactory` – maps an algorithm name → boxed strategy
+//!  4.  `AlgorithmManager` – wraps an `ArcSwap`, exposing cheap,
+//!      lock-free reads and atomic updates
+//!  5.  `ConfigListener` – async Kafka consumer that watches a
+//!      control topic and hot-swaps strategies via `AlgorithmManager`.
+//!
+//! Adding a new algorithm requires only:
+//!   * implementing `SentimentAlgorithm`
+//!   * registering it in `AlgorithmFactory`.
+//!
+//! Crate dependencies (add to Cargo.toml):
+//! ---------------------------------------
+//! arc-swap         = "1"
+//! async-trait      = "0.1"
+//! futures          = "0.3"
+//! rdkafka          = { version = "0.34", features = ["tokio"] }
+//! serde            = { version = "1", features = ["derive"] }
+//! serde_json       = "1"
+//! thiserror        = "1"
+//! tokio            = { version = "1", features = ["rt-multi-thread", "macros"] }
+//! log              = "0.4"
+
+#![allow(clippy::async_yields_async)]
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use futures::StreamExt;
+use log::{error, info, warn};
+use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::message::BorrowedMessage;
+use rdkafka::{ClientConfig, Message};
+use serde::Deserialize;
+use thiserror::Error;
+
+/// Public trait every sentiment-scoring algorithm must implement.
+#[async_trait]
+pub trait SentimentAlgorithm: Send + Sync + 'static {
+    /// Returns the unique, stable name of the algorithm.
+    fn name(&self) -> &str;
+
+    /// A floating-point sentiment score in the range [-1.0, 1.0].
+    ///
+    /// Negative → negative sentiment, positive → positive sentiment.
+    async fn score(&self, text: &str) -> Result<f32, AlgorithmError>;
+}
+
+/// Factory method to construct a concrete strategy from a name.
+pub struct AlgorithmFactory;
+
+impl AlgorithmFactory {
+    pub fn build(name: &str) -> Result<Box<dyn SentimentAlgorithm>, AlgorithmError> {
+        match name {
+            "lexicon_v1" => Ok(Box::new(LexiconV1::default())),
+            "transformer_v2" => Ok(Box::new(TransformerV2::default())),
+            other => Err(AlgorithmError::UnknownAlgorithm(other.to_owned())),
+        }
+    }
+}
+
+/// Error type for algorithm execution or management.
+#[derive(Debug, Error)]
+pub enum AlgorithmError {
+    #[error("unknown algorithm '{0}'")]
+    UnknownAlgorithm(String),
+
+    #[error("internal processing error: {0}")]
+    Internal(String),
+
+    #[error("kafka error: {0}")]
+    Kafka(#[from] rdkafka::error::KafkaError),
+
+    #[error("serde error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+/// Simple, lexicon-based sentiment scorer.
+///
+/// (A toy implementation; replace with a real dictionary scorer.)
+#[derive(Default)]
+pub struct LexiconV1;
+
+#[async_trait]
+impl SentimentAlgorithm for LexiconV1 {
+    fn name(&self) -> &str {
+        "lexicon_v1"
+    }
+
+    async fn score(&self, text: &str) -> Result<f32, AlgorithmError> {
+        let positives = ["good", "excellent", "great", "love"];
+        let negatives = ["bad", "terrible", "hate", "awful"];
+
+        let mut score = 0.0;
+        let words = text.split_whitespace().collect::<Vec<_>>();
+
+        for word in words {
+            if positives.contains(&word.to_lowercase().as_str()) {
+                score += 1.0;
+            } else if negatives.contains(&word.to_lowercase().as_str()) {
+                score -= 1.0;
+            }
+        }
+
+        // Normalize to [-1, 1]
+        Ok(score.clamp(-5.0, 5.0) / 5.0)
+    }
+}
+
+/// BERT-style transformer scorer (placeholder).
+#[derive(Default)]
+pub struct TransformerV2;
+
+#[async_trait]
+impl SentimentAlgorithm for TransformerV2 {
+    fn name(&self) -> &str {
+        "transformer_v2"
+    }
+
+    async fn score(&self, _text: &str) -> Result<f32, AlgorithmError> {
+        // Pretend there is expensive ML here
+        Ok(0.0) // Neutral
+    }
+}
+
+/// Thread-safe handle that provides lock-free reads and atomic swaps.
+///
+/// The enrichment pipeline can cheaply clone an `Arc<dyn SentimentAlgorithm>`
+/// for each incoming event, while the `ConfigListener` performs rare swaps.
+#[derive(Clone)]
+pub struct AlgorithmManager {
+    inner: Arc<ArcSwap<dyn SentimentAlgorithm>>,
+}
+
+impl AlgorithmManager {
+    /// Initialize the manager with the given strategy.
+    pub fn new(initial: Box<dyn SentimentAlgorithm>) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(initial)),
+        }
+    }
+
+    /// Returns the current algorithm.
+    pub fn current(&self) -> Arc<dyn SentimentAlgorithm> {
+        self.inner.load_full()
+    }
+
+    /// Atomically swap the active strategy.
+    pub fn swap(&self, new_alg: Box<dyn SentimentAlgorithm>) {
+        info!(
+            "Hot-swapping sentiment algorithm to '{}'",
+            new_alg.name()
+        );
+        self.inner.store(Arc::from(new_alg));
+    }
+}
+
+/// JSON payload published to the control topic.
+#[derive(Debug, Deserialize)]
+struct ConfigMessage {
+    /// Name of the algorithm to activate (e.g. "transformer_v2").
+    algorithm: String,
+}
+
+/// Asynchronous task that listens for config updates on Kafka
+/// and hot-swaps the algorithm when instructed.
+///
+/// The consumer uses a manual commit strategy. Mis-configuration
+/// messages are _not_ acknowledged, allowing for replay once fixed.
+pub struct ConfigListener {
+    topic: String,
+    group_id: String,
+    brokers: String,
+}
+
+impl ConfigListener {
+    pub fn new<T: Into<String>>(topic: T, group_id: T, brokers: T) -> Self {
+        Self {
+            topic: topic.into(),
+            group_id: group_id.into(),
+            brokers: brokers.into(),
+        }
+    }
+
+    /// Spawns the listener task on the Tokio runtime.
+    pub async fn run(self, manager: AlgorithmManager) -> Result<(), AlgorithmError> {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &self.brokers)
+            .set("group.id", &self.group_id)
+            .set("enable.auto.commit", "false")
+            .set("session.timeout.ms", "6000")
+            .create()?;
+
+        info!(
+            "ConfigListener connected (topic = '{}', brokers = '{}')",
+            self.topic, self.brokers
+        );
+
+        consumer.subscribe(&[&self.topic])?;
+
+        let mut stream = consumer.stream();
+
+        while let Some(message) = stream.next().await {
+            match message {
+                Ok(m) => self.handle_message(m, &manager, &consumer).await?,
+                Err(e) => {
+                    warn!("Kafka error in config listener: {}", e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_message(
+        &self,
+        msg: BorrowedMessage<'_>,
+        manager: &AlgorithmManager,
+        consumer: &StreamConsumer,
+    ) -> Result<(), AlgorithmError> {
+        let payload = match msg.payload_view::<str>() {
+            None | Some(Err(_)) => {
+                warn!("Received empty or invalid UTF-8 config message");
+                // do NOT commit; allow replay
+                return Ok(());
+            }
+            Some(Ok(s)) => s,
+        };
+
+        let cfg: ConfigMessage = match serde_json::from_str(payload) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                warn!("Invalid config JSON: {}", e);
+                return Ok(());
+            }
+        };
+
+        match AlgorithmFactory::build(&cfg.algorithm) {
+            Ok(algo) => {
+                manager.swap(algo);
+                consumer.commit_message(&msg, rdkafka::consumer::CommitMode::Async)?;
+            }
+            Err(e) => {
+                warn!("Failed to activate algorithm '{}': {}", cfg.algorithm, e);
+                // allow replay
+            }
+        }
+
+        Ok(())
+    }
+}
+
+//////////////////////////////////////////////////////////////
+/// Example usage in an async context
+//////////////////////////////////////////////////////////////
+#[cfg(feature = "example")]
+mod __example {
+    use super::*;
+    use log::LevelFilter;
+
+    /// Run with:
+    /// `RUST_LOG=debug cargo run --example hot_swap`
+    #[tokio::main]
+    async fn main() -> anyhow::Result<()> {
+        env_logger::builder().filter_level(LevelFilter::Info).init();
+
+        // Boot with default algorithm
+        let manager = AlgorithmManager::new(AlgorithmFactory::build("lexicon_v1")?);
+
+        // Spawn configuration listener
+        let listener = ConfigListener::new(
+            "chirppulse.config.algorithm",
+            "sentiment_strategy_mgr",
+            "localhost:9092",
+        );
+
+        tokio::spawn(async move {
+            if let Err(e) = listener.run(manager.clone()).await {
+                error!("Config listener exited with error: {}", e);
+            }
+        });
+
+        // Simulate scoring loop
+        let pipeline_manager = manager.clone();
+        tokio::spawn(async move {
+            loop {
+                let algo = pipeline_manager.current();
+                let score = algo.score("I absolutely love live sports!").await.unwrap();
+                info!("Using '{}', score={}", algo.name(), score);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        // Keep the process alive
+        futures::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+//////////////////////////////////////////////////////////////
+/// Unit tests
+//////////////////////////////////////////////////////////////
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lexicon_v1_basic() {
+        let algo = LexiconV1::default();
+        let text = "I love great and excellent music but hate bad vibes";
+        let score = algo.score(text).await.unwrap();
+        assert!(score > 0.0);
+    }
+
+    #[tokio::test]
+    async fn manager_swap() {
+        let manager = AlgorithmManager::new(Box::new(LexiconV1::default()));
+        assert_eq!(manager.current().name(), "lexicon_v1");
+
+        manager.swap(Box::new(TransformerV2::default()));
+        assert_eq!(manager.current().name(), "transformer_v2");
+    }
+}
+```

@@ -1,0 +1,464 @@
+```cpp
+/*
+ * File: FortiLedger360/protos/fortiledger360/v1/backup.proto
+ * NOTE: Although the path suggests a .proto, FortiLedger360 follows a
+ * convention where “*.proto” sibling paths also host the C++ reference
+ * implementation of the generated gRPC service.  The actual protobuf IDL
+ * lives at “backup.proto.in”; this file provides the production-quality
+ * C++ service implementation that is compiled together with the generated
+ * code (`backup.pb.h`, `backup.grpc.pb.h`).
+ *
+ * Build:
+ *   protoc --cpp_out=. --grpc_out=. --plugin=protoc-gen-grpc=`which grpc_cpp_plugin` backup.proto.in
+ *   c++ -std=c++20 -I. backup_service.cpp -lgrpc++ -lprotobuf -pthread -o backup_service
+ */
+
+#include <chrono>
+#include <filesystem>
+#include <future>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <shared_mutex>
+#include <thread>
+#include <unordered_map>
+
+#include <grpcpp/grpcpp.h>
+#include <spdlog/spdlog.h>
+
+#include "backup.pb.h"
+#include "backup.grpc.pb.h"
+
+using grpc::Server;
+using grpc::ServerBuilder;
+using grpc::ServerContext;
+using grpc::Status;
+
+namespace fl360::backup {
+
+//------------------------------------------------------------------------------
+// Domain-level enums & helpers
+//------------------------------------------------------------------------------
+enum class OperationState
+{
+    kPending,
+    kInProgress,
+    kCompleted,
+    kFailed
+};
+
+std::string ToString(OperationState s)
+{
+    switch (s)
+    {
+        case OperationState::kPending:    return "PENDING";
+        case OperationState::kInProgress: return "IN_PROGRESS";
+        case OperationState::kCompleted:  return "COMPLETED";
+        case OperationState::kFailed:     return "FAILED";
+    }
+    return "UNKNOWN";
+}
+
+//------------------------------------------------------------------------------
+// Strategy Pattern – Provider interface & sample implementation
+//------------------------------------------------------------------------------
+struct BackupMeta
+{
+    std::string backup_id;
+    std::string tenant_id;
+    std::chrono::system_clock::time_point created_at;
+    std::uint64_t size_bytes = 0;
+};
+
+class IBackupProvider
+{
+public:
+    virtual ~IBackupProvider() = default;
+
+    virtual BackupMeta CreateBackup(const std::string& tenant_id,
+                                    const std::filesystem::path& source_path) = 0;
+
+    virtual void RestoreBackup(const std::string& tenant_id,
+                               const std::string& backup_id,
+                               const std::filesystem::path& destination_path) = 0;
+
+    virtual std::vector<BackupMeta> ListBackups(const std::string& tenant_id) = 0;
+};
+
+class LocalFilesystemBackupProvider final : public IBackupProvider
+{
+public:
+    explicit LocalFilesystemBackupProvider(std::filesystem::path backup_root)
+        : backup_root_(std::move(backup_root))
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(backup_root_, ec);
+        if (ec)
+        {
+            throw std::runtime_error("Could not create backup directory: " + ec.message());
+        }
+    }
+
+    BackupMeta CreateBackup(const std::string& tenant_id,
+                            const std::filesystem::path& source_path) override
+    {
+        auto backup_id  = GenerateBackupId();
+        auto tenant_dir = backup_root_ / tenant_id;
+
+        std::error_code ec;
+        std::filesystem::create_directories(tenant_dir, ec);
+        if (ec) throw std::runtime_error("Failed creating tenant dir: " + ec.message());
+
+        auto backup_file = tenant_dir / (backup_id + ".tar"); // Simulated archive
+        // In a real system we'd tar/zip/encrypt here. Simplified for brevity.
+        std::filesystem::copy(source_path, backup_file,
+                              std::filesystem::copy_options::recursive, ec);
+        if (ec) throw std::runtime_error("Copy failed: " + ec.message());
+
+        BackupMeta meta;
+        meta.backup_id   = backup_id;
+        meta.tenant_id   = tenant_id;
+        meta.created_at  = std::chrono::system_clock::now();
+        meta.size_bytes  = std::filesystem::file_size(backup_file, ec);
+        return meta;
+    }
+
+    void RestoreBackup(const std::string& tenant_id,
+                       const std::string& backup_id,
+                       const std::filesystem::path& destination_path) override
+    {
+        auto backup_file = backup_root_ / tenant_id / (backup_id + ".tar");
+
+        if (!std::filesystem::exists(backup_file))
+        {
+            throw std::runtime_error("Backup not found");
+        }
+        std::error_code ec;
+        std::filesystem::copy(backup_file, destination_path,
+                              std::filesystem::copy_options::recursive, ec);
+        if (ec) throw std::runtime_error("Restore copy failed: " + ec.message());
+    }
+
+    std::vector<BackupMeta> ListBackups(const std::string& tenant_id) override
+    {
+        std::vector<BackupMeta> backups;
+        std::error_code ec;
+        auto tenant_dir = backup_root_ / tenant_id;
+        if (!std::filesystem::exists(tenant_dir)) return backups;
+
+        for (auto& p : std::filesystem::directory_iterator(tenant_dir))
+        {
+            if (p.path().extension() != ".tar") continue;
+            BackupMeta meta;
+            meta.tenant_id  = tenant_id;
+            meta.backup_id  = p.path().stem().string();
+            meta.size_bytes = p.file_size(ec);
+            meta.created_at = std::filesystem::last_write_time(p.path());
+            backups.push_back(meta);
+        }
+        return backups;
+    }
+
+private:
+    static std::string GenerateBackupId()
+    {
+        auto now = std::chrono::system_clock::now().time_since_epoch().count();
+        return "bck_" + std::to_string(now);
+    }
+
+    std::filesystem::path backup_root_;
+};
+
+// Factory – returns the right provider based on tenant’s subscription tier, etc.
+class BackupProviderFactory
+{
+public:
+    static std::shared_ptr<IBackupProvider> AcquireProvider(const std::string& tenant_id)
+    {
+        // For demo: everyone gets FS provider in /var/lib/fl360/backups
+        static std::shared_ptr<IBackupProvider> default_provider =
+            std::make_shared<LocalFilesystemBackupProvider>("/var/lib/fl360/backups");
+        return default_provider;
+    }
+};
+
+//------------------------------------------------------------------------------
+// Operation Manager – Thread-safe registry of in-flight ops
+//------------------------------------------------------------------------------
+struct OperationInfo
+{
+    OperationState state;
+    std::string    message;      // Progress or error
+    BackupMeta     meta;         // Populated when completed
+};
+
+class OperationRegistry
+{
+public:
+    std::string Register()
+    {
+        std::unique_lock lk(m_);
+        const auto id = GenerateOpId();
+        ops_[id] = OperationInfo{OperationState::kPending, "", {}};
+        return id;
+    }
+
+    void UpdateState(const std::string& id, OperationState state, const std::string& msg = {})
+    {
+        std::unique_lock lk(m_);
+        auto it = ops_.find(id);
+        if (it != ops_.end())
+        {
+            it->second.state   = state;
+            it->second.message = msg;
+        }
+    }
+
+    void Complete(const std::string& id, const BackupMeta& meta)
+    {
+        std::unique_lock lk(m_);
+        ops_[id].state = OperationState::kCompleted;
+        ops_[id].meta  = meta;
+    }
+
+    std::optional<OperationInfo> Get(const std::string& id) const
+    {
+        std::shared_lock lk(m_);
+        auto it = ops_.find(id);
+        return (it != ops_.end()) ? std::optional<OperationInfo>(it->second) : std::nullopt;
+    }
+
+private:
+    static std::string GenerateOpId()
+    {
+        auto now = std::chrono::system_clock::now().time_since_epoch().count();
+        return "op_" + std::to_string(now);
+    }
+
+    mutable std::shared_mutex                    m_;
+    std::unordered_map<std::string, OperationInfo> ops_;
+};
+
+//------------------------------------------------------------------------------
+// gRPC Service Implementation
+//------------------------------------------------------------------------------
+class BackupServiceImpl final : public fortiledger360::v1::BackupService::Service
+{
+public:
+    explicit BackupServiceImpl() : pool_(std::thread::hardware_concurrency())
+    {
+        spdlog::info("BackupServiceImpl initialized with {} threads", pool_.size());
+    }
+
+    Status CreateBackup(ServerContext* ctx,
+                        const fortiledger360::v1::CreateBackupRequest* req,
+                        fortiledger360::v1::CreateBackupResponse* resp) override
+    {
+        const auto tenant_id = req->tenant_id();
+        const auto src_path  = req->source_path();
+
+        if (tenant_id.empty() || src_path.empty())
+        {
+            return Status(grpc::INVALID_ARGUMENT, "tenant_id and source_path are required");
+        }
+
+        const auto op_id = registry_.Register();
+        resp->set_operation_id(op_id);
+
+        // Fire-and-forget the real work.
+        AddTask([this, tenant_id, src_path, op_id]() {
+            ProcessCreateBackup(tenant_id, src_path, op_id);
+        });
+
+        return Status::OK;
+    }
+
+    Status GetBackupStatus(ServerContext*,
+                           const fortiledger360::v1::GetBackupStatusRequest* req,
+                           fortiledger360::v1::GetBackupStatusResponse* resp) override
+    {
+        auto info = registry_.Get(req->operation_id());
+        if (!info)
+        {
+            return Status(grpc::NOT_FOUND, "operation_id not found");
+        }
+
+        resp->set_status(ToProto(info->state));
+        resp->set_message(info->message);
+
+        if (info->state == OperationState::kCompleted)
+        {
+            auto* meta = resp->mutable_backup_meta();
+            meta->set_backup_id(info->meta.backup_id);
+            meta->set_tenant_id(info->meta.tenant_id);
+            meta->set_size_bytes(info->meta.size_bytes);
+            meta->set_created_at(std::chrono::duration_cast<std::chrono::seconds>(
+                                     info->meta.created_at.time_since_epoch())
+                                     .count());
+        }
+        return Status::OK;
+    }
+
+    Status ListBackups(ServerContext*,
+                       const fortiledger360::v1::ListBackupsRequest* req,
+                       fortiledger360::v1::ListBackupsResponse* resp) override
+    {
+        const auto tenant_id = req->tenant_id();
+        if (tenant_id.empty())
+        {
+            return Status(grpc::INVALID_ARGUMENT, "tenant_id is required");
+        }
+
+        try
+        {
+            auto provider = BackupProviderFactory::AcquireProvider(tenant_id);
+            for (const auto& meta : provider->ListBackups(tenant_id))
+            {
+                auto* out = resp->add_backups();
+                out->set_backup_id(meta.backup_id);
+                out->set_tenant_id(meta.tenant_id);
+                out->set_size_bytes(meta.size_bytes);
+                out->set_created_at(std::chrono::duration_cast<std::chrono::seconds>(
+                                        meta.created_at.time_since_epoch())
+                                        .count());
+            }
+            return Status::OK;
+        }
+        catch (const std::exception& ex)
+        {
+            spdlog::error("ListBackups failed: {}", ex.what());
+            return Status(grpc::INTERNAL, ex.what());
+        }
+    }
+
+    Status RestoreBackup(ServerContext*,
+                         const fortiledger360::v1::RestoreBackupRequest* req,
+                         fortiledger360::v1::RestoreBackupResponse* resp) override
+    {
+        const auto tenant_id = req->tenant_id();
+        const auto backup_id = req->backup_id();
+        const auto dst_path  = req->destination_path();
+
+        if (tenant_id.empty() || backup_id.empty() || dst_path.empty())
+        {
+            return Status(grpc::INVALID_ARGUMENT, "tenant_id, backup_id, and destination_path are required");
+        }
+
+        const auto op_id = registry_.Register();
+        resp->set_operation_id(op_id);
+
+        AddTask([this, tenant_id, backup_id, dst_path, op_id]() {
+            ProcessRestoreBackup(tenant_id, backup_id, dst_path, op_id);
+        });
+
+        return Status::OK;
+    }
+
+private:
+    // Thread-pool helper -------------------------------------------------------
+    template <typename F>
+    void AddTask(F&& f)
+    {
+        auto fut = std::async(std::launch::async, std::forward<F>(f));
+        pool_.push_back(std::move(fut));
+    }
+
+    // Business Logic ----------------------------------------------------------
+    void ProcessCreateBackup(const std::string& tenant_id,
+                             std::string source,
+                             const std::string& op_id)
+    {
+        registry_.UpdateState(op_id, OperationState::kInProgress, "Starting backup");
+        try
+        {
+            auto provider = BackupProviderFactory::AcquireProvider(tenant_id);
+            auto meta     = provider->CreateBackup(tenant_id, source);
+            registry_.Complete(op_id, meta);
+            spdlog::info("[{}] Backup completed for tenant {}", op_id, tenant_id);
+        }
+        catch (const std::exception& ex)
+        {
+            registry_.UpdateState(op_id, OperationState::kFailed, ex.what());
+            spdlog::error("[{}] Backup failed: {}", op_id, ex.what());
+        }
+    }
+
+    void ProcessRestoreBackup(const std::string& tenant_id,
+                              const std::string& backup_id,
+                              const std::string& dst,
+                              const std::string& op_id)
+    {
+        registry_.UpdateState(op_id, OperationState::kInProgress, "Starting restore");
+        try
+        {
+            auto provider = BackupProviderFactory::AcquireProvider(tenant_id);
+            provider->RestoreBackup(tenant_id, backup_id, dst);
+            registry_.UpdateState(op_id, OperationState::kCompleted, "Restore completed");
+            spdlog::info("[{}] Restore completed for tenant {}", op_id, tenant_id);
+        }
+        catch (const std::exception& ex)
+        {
+            registry_.UpdateState(op_id, OperationState::kFailed, ex.what());
+            spdlog::error("[{}] Restore failed: {}", op_id, ex.what());
+        }
+    }
+
+    // Proto enum mapping -------------------------------------------------------
+    static fortiledger360::v1::BackupStatus ToProto(OperationState s)
+    {
+        using fortiledger360::v1::BackupStatus;
+        switch (s)
+        {
+            case OperationState::kPending:    return BackupStatus::PENDING;
+            case OperationState::kInProgress: return BackupStatus::RUNNING;
+            case OperationState::kCompleted:  return BackupStatus::SUCCESS;
+            case OperationState::kFailed:     return BackupStatus::FAILED;
+        }
+        return BackupStatus::UNKNOWN;
+    }
+
+    // Members ------------------------------------------------------------------
+    OperationRegistry                   registry_;
+    std::vector<std::future<void>>      pool_;
+};
+
+//------------------------------------------------------------------------------
+// Server bootstrap
+//------------------------------------------------------------------------------
+void RunServer(const std::string& address)
+{
+    BackupServiceImpl service;
+
+    grpc::EnableDefaultHealthCheckService(true);
+    grpc::reflection::InitProtoReflectionServerBuilderPlugin();
+
+    ServerBuilder builder;
+    builder.AddListeningPort(address, grpc::InsecureServerCredentials());
+    builder.RegisterService(&service);
+
+    std::unique_ptr<Server> server(builder.BuildAndStart());
+    spdlog::info("BackupService listening on {}", address);
+    server->Wait();
+}
+
+} // namespace fl360::backup
+
+//------------------------------------------------------------------------------
+// Main entry (When built as standalone binary)
+//------------------------------------------------------------------------------
+int main(int argc, char* argv[])
+{
+    try
+    {
+        const std::string addr = (argc > 1) ? argv[1] : "0.0.0.0:50051";
+        fl360::backup::RunServer(addr);
+    }
+    catch (const std::exception& ex)
+    {
+        spdlog::critical("Fatal: {}", ex.what());
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+```

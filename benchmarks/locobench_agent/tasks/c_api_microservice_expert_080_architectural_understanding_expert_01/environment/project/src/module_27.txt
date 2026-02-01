@@ -1,0 +1,351 @@
+```c
+/**
+ * MercuryMonolith Commerce Hub
+ * ------------------------------------------
+ * File:        src/module_27.txt   (compiled as mm_response_cache.c)
+ * Module:      Response Cache + Metrics
+ *
+ * Synopsis:
+ *   Thread–safe, in-memory response cache with TTL-based eviction, soft LRU
+ *   pressure, Prometheus-compatible metrics, and structured logging.
+ *
+ *   This component is shared by both the REST gateway and GraphQL router to
+ *   eliminate duplicate backend round-trips for idempotent requests.
+ *
+ * Build:
+ *   This unit is self-contained except for three internal headers:
+ *     - mm_logger.h     (structured JSON logging)
+ *     - mm_metrics.h    (Prometheus text exposition)
+ *     - mm_mem.h        (xmalloc/xcalloc wrappers w/ OOM handling)
+ *
+ *   It depends on the header-only public-domain hashmap “uthash”.
+ *
+ * Copyright:
+ *   © 2024 MercuryMonolith™.  All rights reserved.
+ */
+
+#include <pthread.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "uthash.h"      /* https://troydhanson.github.io/uthash/ */
+#include "mm_logger.h"
+#include "mm_metrics.h"
+#include "mm_mem.h"
+
+#define MM_CACHE_NS            "mm_cache"
+#define MM_CACHE_DEFAULT_TTL   5   /* seconds */
+#define MM_CACHE_DEFAULT_MAX   1024
+
+/* ---------- Metrics ------------------------------------------------------ */
+
+static mm_metric_counter_t *metric_hits;
+static mm_metric_counter_t *metric_misses;
+static mm_metric_counter_t *metric_evictions;
+static mm_metric_gauge_t   *metric_items;
+
+/* Initialize Prometheus metrics once per process. */
+static void
+mm_cache_metrics_bootstrap(void)
+{
+    static pthread_once_t bootstrap_once = PTHREAD_ONCE_INIT;
+
+    pthread_once(&bootstrap_once, ^{
+        metric_hits      = mm_counter_register(MM_CACHE_NS, "hits_total",
+                          "Total number of cache hits.");
+        metric_misses    = mm_counter_register(MM_CACHE_NS, "misses_total",
+                          "Total number of cache misses.");
+        metric_evictions = mm_counter_register(MM_CACHE_NS, "evictions_total",
+                          "Number of entries evicted from cache.");
+        metric_items     = mm_gauge_register  (MM_CACHE_NS, "items",
+                          "Current number of items in cache.");
+    });
+}
+
+/* ---------- Data Structures --------------------------------------------- */
+
+typedef struct mm_cache_entry {
+    char            *key;          /* Hash key / request fingerprint        */
+    void            *blob;         /* Serialized response payload           */
+    size_t           blob_len;
+    time_t           ts_insert;    /* Insertion time                        */
+    time_t           ts_access;    /* Last access (for LRU)                 */
+    uint32_t         ttl;          /* Time-to-live (seconds)                */
+    UT_hash_handle   hh;           /* makes this structure hashable         */
+} mm_cache_entry_t;
+
+typedef struct mm_cache {
+    mm_cache_entry_t *table;       /* uthash head                           */
+    size_t            max_entries; /* soft limit                            */
+    pthread_rwlock_t  rwlock;      /* allow multiple readers, one writer    */
+} mm_cache_t;
+
+/* Forward declarations */
+static void mm_cache_evict_if_needed(mm_cache_t *c);
+static void mm_cache_evict_expired(mm_cache_t *c);
+
+/* ---------- Public API --------------------------------------------------- */
+
+/**
+ * mm_cache_create
+ * ----------------
+ * Allocates a new cache instance.  Returns NULL on allocation failure.
+ */
+mm_cache_t *
+mm_cache_create(size_t max_entries)
+{
+    mm_cache_metrics_bootstrap();
+
+    mm_cache_t *c = xcalloc(1, sizeof(*c));
+
+    c->max_entries = max_entries > 0 ? max_entries : MM_CACHE_DEFAULT_MAX;
+    pthread_rwlock_init(&c->rwlock, NULL);
+
+    LOG_INFO("cache.init",
+             KV("max_entries", "%zu", c->max_entries));
+
+    return c;
+}
+
+/**
+ * mm_cache_destroy
+ * -----------------
+ * Frees all memory associated with the cache.
+ */
+void
+mm_cache_destroy(mm_cache_t *c)
+{
+    if (!c) return;
+
+    /* Acquire write lock to block new readers. */
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    mm_cache_entry_t *e, *tmp;
+    HASH_ITER(hh, c->table, e, tmp) {
+        HASH_DEL(c->table, e);
+        free(e->key);
+        free(e->blob);
+        free(e);
+    }
+
+    pthread_rwlock_unlock(&c->rwlock);
+    pthread_rwlock_destroy(&c->rwlock);
+
+    free(c);
+
+    LOG_INFO("cache.destroy", NULL);
+}
+
+/**
+ * mm_cache_get
+ * ------------
+ * Fetches a cached blob (deep copy).  Caller must free(*out_blob).
+ *
+ * Returns:
+ *   0  = found
+ *  -1  = not found or expired
+ */
+int
+mm_cache_get(mm_cache_t *c,
+             const char *key,
+             void **out_blob,
+             size_t *out_len)
+{
+    int rc = -1;
+
+    pthread_rwlock_rdlock(&c->rwlock);
+
+    mm_cache_entry_t *e = NULL;
+    HASH_FIND_STR(c->table, key, e);
+
+    if (unlikely(!e)) {
+        mm_counter_inc(metric_misses);
+        goto done;
+    }
+
+    /* Lazy expiration on read */
+    if ((time(NULL) - e->ts_insert) >= e->ttl) {
+        rc = -1;
+        mm_counter_inc(metric_misses);
+        goto done;
+    }
+
+    /* HIT */
+    e->ts_access = time(NULL);
+    *out_blob = xmalloc(e->blob_len);
+    memcpy(*out_blob, e->blob, e->blob_len);
+    *out_len  = e->blob_len;
+    rc = 0;
+
+    mm_counter_inc(metric_hits);
+
+done:
+    pthread_rwlock_unlock(&c->rwlock);
+    return rc;
+}
+
+/**
+ * mm_cache_put
+ * -------------
+ * Inserts/Overwrites cache entry.  Returns 0 on success.
+ */
+int
+mm_cache_put(mm_cache_t       *c,
+             const char       *key,
+             const void       *blob,
+             size_t            blob_len,
+             uint32_t          ttl_sec)
+{
+    if (!key || !blob || blob_len == 0) return -1;
+    if (ttl_sec == 0) ttl_sec = MM_CACHE_DEFAULT_TTL;
+
+    time_t now = time(NULL);
+
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    mm_cache_entry_t *e = NULL;
+    HASH_FIND_STR(c->table, key, e);
+
+    if (e) { /* overwrite */
+        free(e->blob);
+    } else { /* new entry */
+        e = xcalloc(1, sizeof(*e));
+        e->key = xstrdup(key);
+        HASH_ADD_KEYPTR(hh, c->table, e->key, strlen(e->key), e);
+        mm_gauge_inc(metric_items);
+    }
+
+    e->blob      = xmalloc(blob_len);
+    memcpy(e->blob, blob, blob_len);
+    e->blob_len  = blob_len;
+    e->ts_insert = now;
+    e->ts_access = now;
+    e->ttl       = ttl_sec;
+
+    mm_cache_evict_expired(c);
+    mm_cache_evict_if_needed(c);
+
+    pthread_rwlock_unlock(&c->rwlock);
+    return 0;
+}
+
+/**
+ * mm_cache_invalidate
+ * --------------------
+ * Removes a single entry or, if key == NULL, flushes the entire cache.
+ */
+void
+mm_cache_invalidate(mm_cache_t *c, const char *key)
+{
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    if (key) {
+        mm_cache_entry_t *e = NULL;
+        HASH_FIND_STR(c->table, key, e);
+        if (e) {
+            HASH_DEL(c->table, e);
+            free(e->key);
+            free(e->blob);
+            free(e);
+            mm_gauge_dec(metric_items);
+            mm_counter_inc(metric_evictions);
+        }
+    } else { /* Flush all */
+        mm_cache_entry_t *e, *tmp;
+        HASH_ITER(hh, c->table, e, tmp) {
+            HASH_DEL(c->table, e);
+            free(e->key);
+            free(e->blob);
+            free(e);
+        }
+        mm_gauge_set(metric_items, 0);
+    }
+
+    pthread_rwlock_unlock(&c->rwlock);
+}
+
+/* ---------- Internal Helpers -------------------------------------------- */
+
+static void
+mm_cache_evict_expired(mm_cache_t *c)
+{
+    mm_cache_entry_t *e, *tmp;
+    time_t now = time(NULL);
+
+    HASH_ITER(hh, c->table, e, tmp) {
+        if ((now - e->ts_insert) >= e->ttl) {
+            HASH_DEL(c->table, e);
+            free(e->key);
+            free(e->blob);
+            free(e);
+            mm_gauge_dec(metric_items);
+            mm_counter_inc(metric_evictions);
+        }
+    }
+}
+
+/* Evict least-recently used entry when above size. */
+static void
+mm_cache_evict_if_needed(mm_cache_t *c)
+{
+    size_t items = HASH_COUNT(c->table);
+    if (items <= c->max_entries) return;
+
+    /* Find LRU candidate (linear scan). */
+    mm_cache_entry_t *e, *lru = NULL;
+    HASH_ITER(hh, c->table, e, lru /* reuse */, {
+        if (!lru || e->ts_access < lru->ts_access)
+            lru = e;
+    });
+
+    if (lru) {
+        HASH_DEL(c->table, lru);
+        free(lru->key);
+        free(lru->blob);
+        free(lru);
+        mm_gauge_dec(metric_items);
+        mm_counter_inc(metric_evictions);
+
+        LOG_DEBUG("cache.evict",
+                  KV("reason", "%s", "lru"),
+                  KV("items", "%zu", HASH_COUNT(c->table)));
+    }
+}
+
+/* ---------- Stress Test (dev only) -------------------------------------- */
+#ifdef MM_CACHE_TEST
+#include <stdio.h>
+
+static void
+selftest(void)
+{
+    mm_cache_t *c = mm_cache_create(3);
+
+    char payload[] = "hello world";
+    mm_cache_put(c, "/v1/ping", payload, sizeof payload, 2);
+
+    void *out = NULL;
+    size_t len = 0;
+    if (!mm_cache_get(c, "/v1/ping", &out, &len)) {
+        printf("HIT: %.*s\n", (int)len, (char *)out);
+        free(out);
+    }
+
+    sleep(3); /* expire */
+
+    if (mm_cache_get(c, "/v1/ping", &out, &len) == -1)
+        printf("MISS (expired)\n");
+
+    mm_cache_destroy(c);
+}
+
+int
+main(void)
+{
+    selftest();
+    return 0;
+}
+#endif /* MM_CACHE_TEST */
+```

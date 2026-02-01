@@ -1,0 +1,427 @@
+```rust
+//! LedgerLink Nexus – Account Snapshot Query Module
+//!
+//! This module implements the read-side (Query) of the
+//! `AccountSnapshot` domain object.  It demonstrates how LedgerLink
+//! combines repository isolation, request validation, pagination
+//! helpers, distributed response caching (Redis), structured logging
+//! (`tracing`) and multi-tenant authentication context.
+//!
+//! The public surface of this module purposely resembles production
+//! code you would find in a micro-service powering high-throughput
+//! B2B reconciliation workflows.
+
+#![allow(clippy::missing_errors_doc)] // intentionally omitted in this PoC
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use deadpool_postgres::{Client, Pool};
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use thiserror::Error;
+use tokio::time::{sleep, Duration};
+use tracing::{debug, instrument, warn};
+use validator::{Validate, ValidationErrors};
+
+/// *******************************************************************
+/// Domain-agnostic helper types
+/// *******************************************************************
+
+/// Cursor-based pagination request params (MVVM "ViewModel")
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct Pagination {
+    /// Max number of items to return (`limit` in SQL).
+    #[validate(range(min = 1, max = 250))]
+    pub page_size: u16,
+
+    /// Continuation cursor obtained from the previous call. Defaults to first page.
+    #[validate(length(min = 0, max = 128))]
+    pub cursor: Option<String>,
+}
+
+/// Generic paginated response envelope
+#[derive(Debug, Clone, Serialize)]
+pub struct Paginated<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+    pub total: u64,
+}
+
+/// *******************************************************************
+/// Tenant / auth context
+/// *******************************************************************
+
+/// Data extracted from the API-Gateway JWT. Passed through service-layer
+/// to provide row-level security & audit-trails.
+#[derive(Debug, Clone)]
+pub struct TenantContext {
+    pub tenant_id: String,
+    pub user_id: String,
+}
+
+/// *******************************************************************
+/// View & View-Model (DTOs)
+/// *******************************************************************
+
+/// Public JSON representation returned to API consumers
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountSnapshotView {
+    pub account_id: String,
+    pub balance: rust_decimal::Decimal,
+    pub currency: String,
+    pub as_of: DateTime<Utc>,
+}
+
+/// Filter parameters supplied by the caller
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct AccountSnapshotFilter {
+    #[validate(length(min = 1, max = 64))]
+    pub account_id: String,
+
+    /// Inclusive lower bound of snapshot date
+    pub from: Option<DateTime<Utc>>,
+
+    /// Inclusive upper bound of snapshot date
+    pub to: Option<DateTime<Utc>>,
+}
+
+/// *******************************************************************
+/// Error definitions
+/// *******************************************************************
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation failed: {0}")]
+    Validation(#[from] ValidationErrors),
+
+    #[error("database error: {0}")]
+    Database(#[from] tokio_postgres::Error),
+
+    #[error("cache error: {0}")]
+    Cache(#[from] redis::RedisError),
+
+    #[error("unknown service error: {0}")]
+    Unknown(String),
+}
+
+/// *******************************************************************
+/// Repository pattern – read-only projection
+/// *******************************************************************
+
+#[async_trait]
+pub trait AccountSnapshotRepository: Send + Sync + 'static {
+    async fn fetch_snapshots(
+        &self,
+        tenant_id: &str,
+        filter: &AccountSnapshotFilter,
+        pagination: &Pagination,
+    ) -> Result<(Vec<AccountSnapshotView>, Option<String>, u64), ServiceError>;
+}
+
+/// Postgres implementation.
+/// In production this would live in a separate `infrastructure` crate.
+pub struct PgAccountSnapshotRepository {
+    pool: Pool,
+}
+
+impl PgAccountSnapshotRepository {
+    pub fn new(pool: Pool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl AccountSnapshotRepository for PgAccountSnapshotRepository {
+    #[instrument(skip_all, fields(tenant = tenant_id))]
+    async fn fetch_snapshots(
+        &self,
+        tenant_id: &str,
+        filter: &AccountSnapshotFilter,
+        pagination: &Pagination,
+    ) -> Result<(Vec<AccountSnapshotView>, Option<String>, u64), ServiceError> {
+        // Acquire a pooled client – will retry internally.
+        let mut client = self.pool.get().await?;
+
+        let limit = i64::from(pagination.page_size);
+        let cursor_clause = pagination
+            .cursor
+            .as_deref()
+            .map(|c| "AND encoded_cursor < $5")
+            .unwrap_or("");
+
+        // --- MAIN QUERY -----------------------------------------------------
+        // Using RLS (Row-Level Security) so tenant_id is enforced by PostgreSQL.
+        let stmt = format!(
+            r#"
+            SELECT  account_id,
+                    balance,
+                    currency,
+                    as_of,
+                    encoded_cursor
+            FROM    account_snapshots
+            WHERE   tenant_id = $1
+            AND     account_id = $2
+            AND     ($3::timestamptz IS NULL OR as_of >= $3)
+            AND     ($4::timestamptz IS NULL OR as_of <= $4)
+            {cursor_clause}
+            ORDER BY encoded_cursor DESC         -- monotonic surrogate
+            LIMIT   $6
+            "#,
+        );
+
+        // Cursor/total count derived in one round-trip for simplicity.
+        let rows = client
+            .query(
+                &stmt,
+                &[
+                    &tenant_id,
+                    &filter.account_id,
+                    &filter.from,
+                    &filter.to,
+                    &pagination.cursor,
+                    &limit,
+                ],
+            )
+            .await?;
+
+        let mut items = Vec::with_capacity(rows.len());
+        let mut next_cursor: Option<String> = None;
+        for row in rows.iter() {
+            let view = AccountSnapshotView {
+                account_id: row.get("account_id"),
+                balance: row.get("balance"),
+                currency: row.get("currency"),
+                as_of: row.get("as_of"),
+            };
+            next_cursor = Some(row.get::<_, String>("encoded_cursor"));
+            items.push(view);
+        }
+
+        // Simpler total count (would normally be cached / approximated)
+        let total: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM account_snapshots WHERE tenant_id = $1 AND account_id = $2",
+                &[&tenant_id, &filter.account_id],
+            )
+            .await?
+            .get(0);
+
+        Ok((items, next_cursor, total as u64))
+    }
+}
+
+/// *******************************************************************
+/// Service layer with distributed cache
+/// *******************************************************************
+
+pub struct AccountSnapshotQueryService<R> {
+    repo: R,
+    redis: redis::aio::ConnectionManager,
+    /// Time-to-live in seconds for cached query results
+    ttl_secs: usize,
+}
+
+impl<R> AccountSnapshotQueryService<R>
+where
+    R: AccountSnapshotRepository,
+{
+    pub fn new(repo: R, redis: redis::aio::ConnectionManager, ttl_secs: usize) -> Self {
+        Self {
+            repo,
+            redis,
+            ttl_secs,
+        }
+    }
+
+    #[instrument(
+        name = "service.account_snapshot.query",
+        skip_all,
+        fields(
+            tenant = ?ctx.tenant_id,
+            account = ?filter.account_id,
+            page_size = pagination.page_size
+        )
+    )]
+    pub async fn get_snapshots(
+        &mut self,
+        ctx: &TenantContext,
+        filter: AccountSnapshotFilter,
+        pagination: Pagination,
+    ) -> Result<Paginated<AccountSnapshotView>, ServiceError> {
+        // -- Validate DTOs ---------------------------------------------------
+        filter.validate()?;
+        pagination.validate()?;
+
+        // -- Build cache key -------------------------------------------------
+        let cache_key = self.build_cache_key(ctx, &filter, &pagination);
+        debug!(%cache_key, "computed redis cache key");
+
+        // -- Try read-through cache -----------------------------------------
+        if let Some(cached) = self.fetch_cache(&cache_key).await? {
+            debug!("cache hit");
+            return Ok(cached);
+        }
+        debug!("cache miss");
+
+        // -- Delegate to repository -----------------------------------------
+        let (items, next_cursor, total) = self
+            .repo
+            .fetch_snapshots(&ctx.tenant_id, &filter, &pagination)
+            .await?;
+
+        let response = Paginated {
+            items,
+            next_cursor,
+            total,
+        };
+
+        // -- Hydrate cache (fire-and-forget) --------------------------------
+        self.put_cache(cache_key, &response).await?;
+
+        Ok(response)
+    }
+
+    fn build_cache_key(
+        &self,
+        ctx: &TenantContext,
+        filter: &AccountSnapshotFilter,
+        pagination: &Pagination,
+    ) -> String {
+        // Key contains tenant boundary, view-model hash & pagination
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(ctx.tenant_id.as_bytes());
+        hasher.update(filter.account_id.as_bytes());
+        if let Some(from) = filter.from {
+            hasher.update(from.to_rfc3339().as_bytes());
+        }
+        if let Some(to) = filter.to {
+            hasher.update(to.to_rfc3339().as_bytes());
+        }
+        if let Some(cursor) = &pagination.cursor {
+            hasher.update(cursor.as_bytes());
+        }
+        hasher.update(&pagination.page_size.to_be_bytes());
+
+        format!("cache:snapshot:{:x}", hasher.finalize())
+    }
+
+    #[instrument(skip_all, fields(cache_key = %key))]
+    async fn fetch_cache(
+        &mut self,
+        key: &str,
+    ) -> Result<Option<Paginated<AccountSnapshotView>>, ServiceError> {
+        // NOTE: network failures are not fatal; we degrade gracefully
+        match self.redis.get::<_, String>(key).await {
+            Ok(payload) => {
+                let result = serde_json::from_str(&payload)
+                    .map_err(|e| ServiceError::Unknown(format!("serde_json: {e}")))?;
+                Ok(Some(result))
+            }
+            Err(err) => {
+                warn!(%err, "redis read failed");
+                Ok(None)
+            }
+        }
+    }
+
+    #[instrument(skip_all, fields(cache_key = %key))]
+    async fn put_cache<T>(&mut self, key: String, value: &T) -> Result<(), ServiceError>
+    where
+        T: Serialize + ?Sized,
+    {
+        let payload = serde_json::to_string(value)
+            .map_err(|e| ServiceError::Unknown(format!("serde_json: {e}")))?;
+
+        // We do not want to block the response path excessively; if Redis
+        // is slow, we wait a bit but then bail out.
+        let mut conn = self.redis.clone();
+        tokio::select! {
+            res = conn.set_ex::<_, _, ()>(key, payload, self.ttl_secs) => {
+                if let Err(e) = res {
+                    warn!(%e, "failed to write redis cache");
+                }
+            }
+            _ = sleep(Duration::from_millis(25)) => {
+                warn!("redis cache write timed out");
+            }
+        };
+        Ok(())
+    }
+}
+
+/// *******************************************************************
+/// Tests (simplified, offline – uses `mockall` to illustrate concept)
+/// *******************************************************************
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockall::{automock, predicate::*};
+
+    // Fake repository returns deterministic data
+    #[automock]
+    #[async_trait]
+    trait RepoMock: Send + Sync {
+        async fn fetch_snapshots(
+            &self,
+            tenant_id: &str,
+            filter: &AccountSnapshotFilter,
+            pagination: &Pagination,
+        ) -> Result<(Vec<AccountSnapshotView>, Option<String>, u64), ServiceError>;
+    }
+
+    // Make Mock implement original trait
+    #[async_trait]
+    impl AccountSnapshotRepository for MockRepoMock {
+        async fn fetch_snapshots(
+            &self,
+            tenant_id: &str,
+            filter: &AccountSnapshotFilter,
+            pagination: &Pagination,
+        ) -> Result<(Vec<AccountSnapshotView>, Option<String>, u64), ServiceError> {
+            self.fetch_snapshots(tenant_id, filter, pagination).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validation_error() {
+        let mut repo = MockRepoMock::new();
+        repo.expect_fetch_snapshots().never();
+
+        // Use dummy in-memory Redis (simple-cache) for tests
+        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+        let mut redis_conn = client
+            .get_tokio_connection_manager()
+            .await
+            .expect("redis connect");
+
+        let mut service = AccountSnapshotQueryService::new(repo, redis_conn, 60);
+
+        // Intentionally invalid filter (empty account_id)
+        let filter = AccountSnapshotFilter {
+            account_id: "".into(),
+            from: None,
+            to: None,
+        };
+        let pagination = Pagination {
+            page_size: 100,
+            cursor: None,
+        };
+
+        let ctx = TenantContext {
+            tenant_id: "t".into(),
+            user_id: "u".into(),
+        };
+
+        let err = service
+            .get_snapshots(&ctx, filter, pagination)
+            .await
+            .expect_err("should fail");
+
+        matches!(err, ServiceError::Validation(_));
+    }
+}
+```

@@ -1,0 +1,429 @@
+```rust
+//! src/module_84.rs
+//!
+//! High-volume query service for paginated Ledger Entries with optional
+//! response-level caching.  This module lives in the **Service Layer**
+//! (CQRS ‑ Query side) and is wired into the GraphQL & REST façade.
+//!
+//! It demonstrates the general conventions used throughout LedgerLink Nexus:
+//! • Input DTO   → `Query` + validation  
+//! • Orchestration & logging inside `Service`  
+//! • Delegation to Repository for persistence  
+//! • Pluggable cache abstraction for read-through optimisations  
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Crate dependencies
+// ─────────────────────────────────────────────────────────────────────────────
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tracing::{debug, instrument};
+
+use std::sync::Arc;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Domain Model
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Canonical Ledger Entry persisted in the database.
+#[derive(Debug, Clone)]
+pub struct LedgerEntry {
+    pub id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
+    pub account_id: uuid::Uuid,
+    pub amount_minor_units: i64,
+    pub currency: rust_decimal::Currency,
+    pub occurred_at: DateTime<Utc>,
+    pub external_ref: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Data-Transfer Objects (View-Model side)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Read-only view of [`LedgerEntry`] returned to clients.
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerEntryDto {
+    pub id: String,
+    pub account_id: String,
+    pub amount_minor_units: i64,
+    pub currency: String,
+    pub occurred_at: DateTime<Utc>,
+    pub external_ref: Option<String>,
+}
+
+impl From<LedgerEntry> for LedgerEntryDto {
+    fn from(le: LedgerEntry) -> Self {
+        Self {
+            id: le.id.to_string(),
+            account_id: le.account_id.to_string(),
+            amount_minor_units: le.amount_minor_units,
+            currency: le.currency.to_string(),
+            occurred_at: le.occurred_at,
+            external_ref: le.external_ref,
+        }
+    }
+}
+
+/// Cursor-based pagination metadata embedded in the response.
+#[derive(Debug, Clone, Serialize)]
+pub struct PageMeta {
+    /// Opaque cursor pointing to the last item of the current page
+    pub next_cursor: Option<String>,
+    /// Number of records in this page
+    pub page_size: usize,
+    /// (Optional) Total available items when reasonably cheap to compute
+    pub total_estimate: Option<i64>,
+}
+
+/// Envelope returned to API consumers for a paginated collection.
+#[derive(Debug, Clone, Serialize)]
+pub struct PagedResponse<T> {
+    pub data: Vec<T>,
+    pub page: PageMeta,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Query Object & Validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Input parameters accepted by `ListLedgerEntriesService`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListLedgerEntriesQuery {
+    pub tenant_id: uuid::Uuid,
+    pub account_id: uuid::Uuid,
+    /// Base64-encoded opaque cursor supplied by the client (`None` for first page).
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Requested page size (bounded between 1 and 500).
+    pub page_size: u16,
+}
+
+impl ListLedgerEntriesQuery {
+    /// Perform syntactic validation. Semantic checks (e.g. tenant/access rights)
+    /// are handled in the authentication layer.
+    pub fn validate(&self) -> Result<(), QueryValidationError> {
+        let size = self.page_size;
+        if size == 0 || size > 500 {
+            return Err(QueryValidationError::InvalidPageSize(size));
+        }
+        Ok(())
+    }
+}
+
+/// Validation errors bubbled up to the REST/GraphQL boundary.
+#[derive(Debug, Error)]
+pub enum QueryValidationError {
+    #[error("invalid page size: {0} (allowed: 1-500)")]
+    InvalidPageSize(u16),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Repository Abstraction
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Filtering criteria for repository queries.
+#[derive(Debug)]
+struct RepoFilter {
+    tenant_id: uuid::Uuid,
+    account_id: uuid::Uuid,
+    cursor_occurred_at: Option<DateTime<Utc>>,
+    limit: usize,
+}
+
+/// Row + cursor out parameter.
+#[derive(Debug)]
+struct RepoPage {
+    entries: Vec<LedgerEntry>,
+    next_cursor: Option<DateTime<Utc>>,
+    total_estimate: Option<i64>,
+}
+
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync {
+    async fn fetch_page(&self, filter: RepoFilter) -> anyhow::Result<RepoPage>;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cache Abstraction
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+pub trait CacheBackend: Send + Sync {
+    async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>>;
+    async fn set(&self, key: &str, value: Vec<u8>, ttl_seconds: usize) -> anyhow::Result<()>;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Concrete Implementations (In-Memory to keep sample self-contained)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Dummy repository backed by an in-memory vector.
+/// In production, this is implemented via `sqlx` querying PostgreSQL.
+pub struct InMemoryLedgerRepo {
+    entries: Vec<LedgerEntry>,
+}
+
+impl InMemoryLedgerRepo {
+    pub fn new(seed: Vec<LedgerEntry>) -> Self {
+        Self { entries: seed }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for InMemoryLedgerRepo {
+    async fn fetch_page(&self, filter: RepoFilter) -> anyhow::Result<RepoPage> {
+        let mut items: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                e.tenant_id == filter.tenant_id
+                    && e.account_id == filter.account_id
+                    && match filter.cursor_occurred_at {
+                        Some(c) => e.occurred_at < c,
+                        None => true,
+                    }
+            })
+            .cloned()
+            .collect();
+
+        // Sort descending by occurred_at to get most recent first
+        items.sort_by_key(|e| std::cmp::Reverse(e.occurred_at));
+        let total_estimate = Some(items.len() as i64); // too expensive in prod
+        items.truncate(filter.limit);
+
+        let next_cursor = items.last().map(|e| e.occurred_at);
+        Ok(RepoPage {
+            entries: items,
+            next_cursor,
+            total_estimate,
+        })
+    }
+}
+
+/// Simple HashMap-based cache, NOT production-ready.
+pub struct MemoryCache {
+    inner: parking_lot::Mutex<std::collections::HashMap<String, (Vec<u8>, chrono::Duration)>>,
+}
+
+impl MemoryCache {
+    pub fn new() -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl CacheBackend for MemoryCache {
+    async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.inner.lock().get(key).map(|(v, _)| v.clone()))
+    }
+
+    async fn set(&self, key: &str, value: Vec<u8>, _ttl_seconds: usize) -> anyhow::Result<()> {
+        self.inner
+            .lock()
+            .insert(key.to_string(), (value, chrono::Duration::seconds(_ttl_seconds as i64)));
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Error Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation failed: {0}")]
+    Validation(#[from] QueryValidationError),
+    #[error("repository error: {0}")]
+    Repository(#[from] anyhow::Error),
+    #[error("cache error: {0}")]
+    Cache(#[from] anyhow::Error),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Service Implementation
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub struct ListLedgerEntriesService<R: LedgerEntryRepository, C: CacheBackend> {
+    repo: Arc<R>,
+    cache: Option<Arc<C>>,
+}
+
+impl<R, C> ListLedgerEntriesService<R, C>
+where
+    R: LedgerEntryRepository,
+    C: CacheBackend,
+{
+    pub fn new(repo: Arc<R>, cache: Option<Arc<C>>) -> Self {
+        Self { repo, cache }
+    }
+
+    #[instrument(skip_all, fields(account_id = %query.account_id, tenant_id = %query.tenant_id))]
+    pub async fn execute(
+        &self,
+        query: ListLedgerEntriesQuery,
+    ) -> Result<PagedResponse<LedgerEntryDto>, ServiceError> {
+        // 1. Input validation (fast-fail)
+        query.validate()?;
+
+        // 2. Attempt cache hit (if enabled)
+        let cache_key = Self::make_cache_key(&query);
+        if let Some(cache) = &self.cache {
+            if let Some(bytes) = cache.get(&cache_key).await? {
+                debug!("cache hit: ListLedgerEntries");
+                let resp: PagedResponse<LedgerEntryDto> = bincode::deserialize(&bytes)?;
+                return Ok(resp);
+            }
+        }
+
+        // 3. Translate Query → RepoFilter
+        let repo_filter = RepoFilter {
+            tenant_id: query.tenant_id,
+            account_id: query.account_id,
+            cursor_occurred_at: decode_cursor(query.cursor.as_deref()).ok(),
+            limit: query.page_size as usize,
+        };
+
+        // 4. Fetch from repository
+        let RepoPage {
+            entries,
+            next_cursor,
+            total_estimate,
+        } = self.repo.fetch_page(repo_filter).await?;
+
+        // 5. Map to DTOs
+        let dto_items: Vec<LedgerEntryDto> = entries.into_iter().map(Into::into).collect();
+
+        let page_meta = PageMeta {
+            next_cursor: next_cursor.map(|c| encode_cursor(&c)),
+            page_size: dto_items.len(),
+            total_estimate,
+        };
+
+        let response = PagedResponse {
+            data: dto_items,
+            page: page_meta,
+        };
+
+        // 6. Write to cache (fire & forget)
+        if let Some(cache) = &self.cache {
+            if let Ok(bytes) = bincode::serialize(&response) {
+                let _ = cache.set(&cache_key, bytes, 30).await; // 30-second TTL
+            }
+        }
+
+        Ok(response)
+    }
+
+    fn make_cache_key(query: &ListLedgerEntriesQuery) -> String {
+        format!(
+            "ledger_entries:{}:{}:{}:{}",
+            query.tenant_id,
+            query.account_id,
+            query.page_size,
+            query.cursor.as_deref().unwrap_or("null")
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cursor helpers (base64 encode/decode chrono::DateTime<Utc>)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn encode_cursor(dt: &DateTime<Utc>) -> String {
+    base64::encode_config(dt.to_rfc3339(), base64::URL_SAFE_NO_PAD)
+}
+
+fn decode_cursor(cursor: Option<&str>) -> Result<DateTime<Utc>, base64::DecodeError> {
+    let raw = cursor.ok_or(base64::DecodeError::InvalidLength)?;
+    let decoded = base64::decode_config(raw, base64::URL_SAFE_NO_PAD)?;
+    let s = String::from_utf8_lossy(&decoded);
+    Ok(DateTime::parse_from_rfc3339(&s)
+        .expect("invalid rfc3339 in cursor")
+        .with_timezone(&Utc))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit Tests (use `cargo test --lib`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::Decimal;
+
+    fn seed_entries(n: usize, tenant_id: uuid::Uuid, account_id: uuid::Uuid) -> Vec<LedgerEntry> {
+        (0..n)
+            .map(|i| LedgerEntry {
+                id: uuid::Uuid::new_v4(),
+                tenant_id,
+                account_id,
+                amount_minor_units: 100 + i as i64,
+                currency: rust_decimal::Currency::from("USD"),
+                occurred_at: Utc::now() - chrono::Duration::seconds(i as i64),
+                external_ref: None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_pagination_first_page() {
+        let tenant = uuid::Uuid::new_v4();
+        let account = uuid::Uuid::new_v4();
+        let repo = Arc::new(InMemoryLedgerRepo::new(seed_entries(50, tenant, account)));
+        let cache = Arc::new(MemoryCache::new());
+        let service = ListLedgerEntriesService::new(repo, Some(cache));
+
+        let query = ListLedgerEntriesQuery {
+            tenant_id: tenant,
+            account_id: account,
+            cursor: None,
+            page_size: 20,
+        };
+
+        let resp = service.execute(query).await.unwrap();
+        assert_eq!(resp.data.len(), 20);
+        assert!(resp.page.next_cursor.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_cache_roundtrip() {
+        let tenant = uuid::Uuid::new_v4();
+        let account = uuid::Uuid::new_v4();
+        let repo = Arc::new(InMemoryLedgerRepo::new(seed_entries(10, tenant, account)));
+        let cache = Arc::new(MemoryCache::new());
+        let service = ListLedgerEntriesService::new(repo.clone(), Some(cache.clone()));
+
+        let query = ListLedgerEntriesQuery {
+            tenant_id: tenant,
+            account_id: account,
+            cursor: None,
+            page_size: 5,
+        };
+
+        // first call populates cache
+        let _ = service.execute(query.clone()).await.unwrap();
+        // second call should hit cache (repo will still work, but we test for consistency)
+        let resp_cached = service.execute(query).await.unwrap();
+        assert_eq!(resp_cached.data.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_validation_error() {
+        let query = ListLedgerEntriesQuery {
+            tenant_id: uuid::Uuid::new_v4(),
+            account_id: uuid::Uuid::new_v4(),
+            cursor: None,
+            page_size: 0, // invalid
+        };
+
+        assert!(matches!(
+            query.validate().unwrap_err(),
+            QueryValidationError::InvalidPageSize(_)
+        ));
+    }
+}
+```

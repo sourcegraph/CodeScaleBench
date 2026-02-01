@@ -1,0 +1,494 @@
+/*
+ * MercuryMonolith Commerce Hub (api_microservice)
+ * ------------------------------------------------
+ * Module       : response_cache
+ * File path    : src/module_13.txt
+ * Language     : C99
+ *
+ * Description
+ * -----------
+ * Thread–safe, TTL-aware, Least-Recently-Used response cache
+ * used by the API-Gateway layer to short-circuit repeated
+ * REST/GraphQL calls.  This module is entirely self-contained
+ * (save for its dependency on the public-domain “uthash.h” file)
+ * and can be wired into any service boundary that requires a
+ * simple in-process key/value store with deterministic eviction.
+ *
+ * Key Features
+ * ------------
+ *  • O(1) lookup/update using uthash
+ *  • Doubly-linked LRU queue for eviction
+ *  • Per-entry TTL with lazy & capacity eviction
+ *  • Thread-safe via POSIX read/write lock
+ *  • Lightweight Prometheus-style metrics
+ *
+ * Build
+ * -----
+ *  gcc -std=c99 -Wall -Wextra -pedantic -pthread -c response_cache.c
+ *
+ * Copyright & License
+ * -------------------
+ * Copyright © 2023–2024 Helios Software
+ * Licensed under the MIT License.  See LICENSE file for details.
+ */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "uthash.h"        /* https://troydhanson.github.io/uthash/ */
+
+/*---------------------------------------------------------*
+ *                       Constants                         *
+ *---------------------------------------------------------*/
+#ifndef RC_DEFAULT_TTL_SEC
+#   define RC_DEFAULT_TTL_SEC  30U     /* fall-back TTL if caller passes 0 */
+#endif
+
+#ifndef RC_MAX_KEY_LEN
+#   define RC_MAX_KEY_LEN      1024U   /* sanity limit to avoid abuse      */
+#endif
+
+#ifndef RC_MAX_VALUE_LEN
+#   define RC_MAX_VALUE_LEN    (1024U * 1024U * 4U) /* hard-cap at 4 MiB   */
+#endif
+
+/*---------------------------------------------------------*
+ *                  Diagnostic & Logging                   *
+ *---------------------------------------------------------*/
+#ifndef RC_LOG
+#   define RC_LOG(fmt, ...) fprintf(stderr, "[RC] " fmt "\n", ##__VA_ARGS__)
+#endif
+
+/*---------------------------------------------------------*
+ *                       Structs                           *
+ *---------------------------------------------------------*/
+typedef struct rc_entry {
+    /* --- hash key --- */
+    char         *key;         /* dynamically allocated, NUL-terminated   */
+    UT_hash_handle hh;         /* uthash handle                           */
+
+    /* --- payload --- */
+    unsigned char *value;      /* opaque payload                          */
+    size_t         value_len;  /* payload length                          */
+    time_t         expires_at; /* epoch seconds                           */
+
+    /* --- LRU queue --- */
+    struct rc_entry *prev;
+    struct rc_entry *next;
+} rc_entry_t;
+
+typedef struct {
+    atomic_uint_fast64_t hits;       /* point-lookups that returned data  */
+    atomic_uint_fast64_t misses;     /* lookups that did not find data    */
+    atomic_uint_fast64_t stale;      /* lookups that found expired data   */
+    atomic_uint_fast64_t inserts;    /* successful puts                   */
+    atomic_uint_fast64_t evictions;  /* automatic (LRU/TTL) eviction      */
+} rc_metrics_t;
+
+typedef struct {
+    rc_entry_t      *table;          /* uthash hash table anchor          */
+    rc_entry_t      *lru_head;       /* most-recently-used entry          */
+    rc_entry_t      *lru_tail;       /* least-recently-used entry         */
+
+    size_t           capacity;       /* max number of entries             */
+    size_t           size;           /* current entry count               */
+    unsigned int     default_ttl;    /* seconds                           */
+
+    pthread_rwlock_t rwlock;         /* read-mostly workload optimized    */
+    rc_metrics_t     metrics;
+} rc_cache_t;
+
+/*---------------------------------------------------------*
+ *              Forward-declarations (private)             *
+ *---------------------------------------------------------*/
+static void       rc_lru_move_front(rc_cache_t *c, rc_entry_t *e);
+static void       rc_lru_append_front(rc_cache_t *c, rc_entry_t *e);
+static void       rc_lru_remove(rc_cache_t *c, rc_entry_t *e);
+static void       rc_evict_tail(rc_cache_t *c);
+static void       rc_free_entry(rc_entry_t *e);
+static bool       rc_entry_is_expired(const rc_entry_t *e, time_t now);
+static void       rc_purge_expired(rc_cache_t *c);
+
+/*---------------------------------------------------------*
+ *                    Public Interface                     *
+ *---------------------------------------------------------*/
+/*
+ * rc_cache_init
+ * -------------
+ * Initialize an empty cache with a maximum of `capacity`
+ * elements and the supplied default TTL (in seconds).  The
+ * TTL applies only when rc_cache_put is called with ttl = 0.
+ *
+ * Returns 0 on success, or errno on failure.
+ */
+int rc_cache_init(rc_cache_t *cache, size_t capacity, unsigned int default_ttl)
+{
+    if (!cache || capacity == 0) return EINVAL;
+
+    memset(cache, 0, sizeof(*cache));
+    cache->capacity    = capacity;
+    cache->default_ttl = default_ttl ? default_ttl : RC_DEFAULT_TTL_SEC;
+
+    if (pthread_rwlock_init(&cache->rwlock, NULL) != 0) {
+        return errno ? errno : EAGAIN;
+    }
+    return 0;
+}
+
+/*
+ * rc_cache_destroy
+ * ----------------
+ * Release all resources held by the cache.
+ */
+void rc_cache_destroy(rc_cache_t *cache)
+{
+    if (!cache) return;
+
+    pthread_rwlock_wrlock(&cache->rwlock);
+
+    rc_entry_t *cur, *tmp;
+    HASH_ITER(hh, cache->table, cur, tmp) {
+        HASH_DEL(cache->table, cur);
+        rc_free_entry(cur);
+    }
+    cache->table     = NULL;
+    cache->lru_head  = cache->lru_tail = NULL;
+    cache->size      = 0;
+
+    pthread_rwlock_unlock(&cache->rwlock);
+    pthread_rwlock_destroy(&cache->rwlock);
+}
+
+/*
+ * rc_cache_get
+ * ------------
+ * Retrieve a copy of the cached value associated with `key`.
+ * The returned pointer is heap-allocated and must be freed by
+ * the caller (using free(3)). On success, returns 0 and sets
+ * out_value/out_len; otherwise, returns ENOENT/ETIMEDOUT.
+ */
+int rc_cache_get(rc_cache_t *cache,
+                 const char *key,
+                 unsigned char **out_value,
+                 size_t *out_len)
+{
+    if (!cache || !key || !out_value || !out_len) return EINVAL;
+
+    *out_value = NULL;
+    *out_len   = 0;
+
+    const time_t now = time(NULL);
+    pthread_rwlock_rdlock(&cache->rwlock);
+
+    rc_entry_t *entry = NULL;
+    HASH_FIND_STR(cache->table, key, entry);
+    if (!entry) {
+        atomic_fetch_add_explicit(&cache->metrics.misses, 1, memory_order_relaxed);
+        pthread_rwlock_unlock(&cache->rwlock);
+        return ENOENT;
+    }
+
+    if (rc_entry_is_expired(entry, now)) {
+        atomic_fetch_add_explicit(&cache->metrics.stale, 1, memory_order_relaxed);
+        /* We need a write lock to remove the stale entry */
+        pthread_rwlock_unlock(&cache->rwlock);
+        pthread_rwlock_wrlock(&cache->rwlock);
+
+        /* Re-validate under write lock (double-check pattern) */
+        HASH_FIND_STR(cache->table, key, entry);
+        if (entry && rc_entry_is_expired(entry, now)) {
+            rc_lru_remove(cache, entry);
+            HASH_DEL(cache->table, entry);
+            cache->size--;
+            atomic_fetch_add_explicit(&cache->metrics.evictions, 1, memory_order_relaxed);
+            rc_free_entry(entry);
+        }
+        pthread_rwlock_unlock(&cache->rwlock);
+        return ETIMEDOUT;
+    }
+
+    /* Hit — copy value */
+    unsigned char *dup = malloc(entry->value_len);
+    if (!dup) {
+        pthread_rwlock_unlock(&cache->rwlock);
+        return ENOMEM;
+    }
+    memcpy(dup, entry->value, entry->value_len);
+    *out_value = dup;
+    *out_len   = entry->value_len;
+
+    /* Promote to MRU */
+    rc_lru_move_front(cache, entry);
+    atomic_fetch_add_explicit(&cache->metrics.hits, 1, memory_order_relaxed);
+
+    pthread_rwlock_unlock(&cache->rwlock);
+    return 0;
+}
+
+/*
+ * rc_cache_put
+ * ------------
+ * Insert or update an entry.  If ttl_sec is 0, the cache’s
+ * default TTL is applied.  The cache acquires a write lock
+ * during the operation.
+ */
+int rc_cache_put(rc_cache_t        *cache,
+                 const char        *key,
+                 const unsigned char *value,
+                 size_t             value_len,
+                 unsigned int       ttl_sec)
+{
+    if (!cache || !key || !value || value_len == 0) return EINVAL;
+    if (strlen(key) > RC_MAX_KEY_LEN || value_len > RC_MAX_VALUE_LEN) return EFBIG;
+
+    const time_t now = time(NULL);
+    const time_t expire_ts = now + (ttl_sec ? ttl_sec : cache->default_ttl);
+
+    pthread_rwlock_wrlock(&cache->rwlock);
+
+    rc_entry_t *entry = NULL;
+    HASH_FIND_STR(cache->table, key, entry);
+
+    if (entry) {
+        /* Update existing entry in-place */
+        unsigned char *new_val = realloc(entry->value, value_len);
+        if (!new_val) {
+            pthread_rwlock_unlock(&cache->rwlock);
+            return ENOMEM;
+        }
+        memcpy(new_val, value, value_len);
+        entry->value     = new_val;
+        entry->value_len = value_len;
+        entry->expires_at = expire_ts;
+
+        rc_lru_move_front(cache, entry);
+    } else {
+        /* Add new entry */
+        entry = calloc(1, sizeof(*entry));
+        if (!entry) {
+            pthread_rwlock_unlock(&cache->rwlock);
+            return ENOMEM;
+        }
+        entry->key = strdup(key);
+        entry->value = malloc(value_len);
+        if (!entry->key || !entry->value) {
+            rc_free_entry(entry);
+            pthread_rwlock_unlock(&cache->rwlock);
+            return ENOMEM;
+        }
+        memcpy(entry->value, value, value_len);
+        entry->value_len  = value_len;
+        entry->expires_at = expire_ts;
+
+        HASH_ADD_KEYPTR(hh, cache->table, entry->key, strlen(entry->key), entry);
+        rc_lru_append_front(cache, entry);
+        cache->size++;
+
+        /* Capacity eviction */
+        while (cache->size > cache->capacity) {
+            rc_evict_tail(cache);
+        }
+    }
+
+    atomic_fetch_add_explicit(&cache->metrics.inserts, 1, memory_order_relaxed);
+    pthread_rwlock_unlock(&cache->rwlock);
+    return 0;
+}
+
+/*
+ * rc_cache_clear
+ * --------------
+ * Remove every entry but keep cache structure intact.
+ */
+void rc_cache_clear(rc_cache_t *cache)
+{
+    if (!cache) return;
+    pthread_rwlock_wrlock(&cache->rwlock);
+
+    rc_entry_t *cur, *tmp;
+    HASH_ITER(hh, cache->table, cur, tmp) {
+        HASH_DEL(cache->table, cur);
+        rc_free_entry(cur);
+    }
+    cache->table    = NULL;
+    cache->lru_head = cache->lru_tail = NULL;
+    cache->size     = 0;
+
+    pthread_rwlock_unlock(&cache->rwlock);
+}
+
+/*
+ * rc_cache_metrics
+ * ----------------
+ * Snapshot cache metrics into caller-provided struct.
+ */
+void rc_cache_metrics(rc_cache_t *cache, rc_metrics_t *out)
+{
+    if (!cache || !out) return;
+    out->hits      = atomic_load_explicit(&cache->metrics.hits, memory_order_relaxed);
+    out->misses    = atomic_load_explicit(&cache->metrics.misses, memory_order_relaxed);
+    out->stale     = atomic_load_explicit(&cache->metrics.stale, memory_order_relaxed);
+    out->inserts   = atomic_load_explicit(&cache->metrics.inserts, memory_order_relaxed);
+    out->evictions = atomic_load_explicit(&cache->metrics.evictions, memory_order_relaxed);
+}
+
+/*---------------------------------------------------------*
+ *                 Internal Helper Functions               *
+ *---------------------------------------------------------*/
+static inline bool rc_entry_is_expired(const rc_entry_t *e, time_t now)
+{
+    return (e->expires_at <= now);
+}
+
+static void rc_free_entry(rc_entry_t *e)
+{
+    if (!e) return;
+    free(e->key);
+    free(e->value);
+    free(e);
+}
+
+/*---------------- LRU queue manipulation ----------------*/
+static void rc_lru_move_front(rc_cache_t *c, rc_entry_t *e)
+{
+    if (c->lru_head == e) return;       /* already MRU */
+
+    rc_lru_remove(c, e);
+    rc_lru_append_front(c, e);
+}
+
+static void rc_lru_append_front(rc_cache_t *c, rc_entry_t *e)
+{
+    e->next = c->lru_head;
+    e->prev = NULL;
+
+    if (c->lru_head)
+        c->lru_head->prev = e;
+    c->lru_head = e;
+
+    if (!c->lru_tail)
+        c->lru_tail = e;
+}
+
+static void rc_lru_remove(rc_cache_t *c, rc_entry_t *e)
+{
+    if (e->prev)
+        e->prev->next = e->next;
+    else
+        c->lru_head = e->next;
+
+    if (e->next)
+        e->next->prev = e->prev;
+    else
+        c->lru_tail = e->prev;
+
+    e->prev = e->next = NULL;
+}
+
+static void rc_evict_tail(rc_cache_t *c)
+{
+    rc_entry_t *victim = c->lru_tail;
+    if (!victim) return;
+
+    rc_lru_remove(c, victim);
+    HASH_DEL(c->table, victim);
+    c->size--;
+    atomic_fetch_add_explicit(&c->metrics.evictions, 1, memory_order_relaxed);
+    rc_free_entry(victim);
+}
+
+/*
+ * rc_purge_expired
+ * ----------------
+ * Remove expired entries; called opportunistically.
+ */
+static void rc_purge_expired(rc_cache_t *c)
+{
+    const time_t now = time(NULL);
+
+    rc_entry_t *cur, *tmp;
+    HASH_ITER(hh, c->table, cur, tmp) {
+        if (rc_entry_is_expired(cur, now)) {
+            rc_lru_remove(c, cur);
+            HASH_DEL(c->table, cur);
+            c->size--;
+            atomic_fetch_add_explicit(&c->metrics.evictions, 1, memory_order_relaxed);
+            rc_free_entry(cur);
+        }
+    }
+}
+
+/*---------------------------------------------------------*
+ *            Optional Periodic Maintenance API            *
+ *---------------------------------------------------------*/
+/*
+ * rc_cache_maintenance
+ * --------------------
+ * Convenience helper that a caller can run on a timer to
+ * purge expired entries en masse. Safe to run concurrently
+ * with regular Get/Put operations.
+ */
+void rc_cache_maintenance(rc_cache_t *cache)
+{
+    if (!cache) return;
+    pthread_rwlock_wrlock(&cache->rwlock);
+    rc_purge_expired(cache);
+    pthread_rwlock_unlock(&cache->rwlock);
+}
+
+/*---------------------------------------------------------*
+ *                       Self-Test                         *
+ *---------------------------------------------------------*/
+#ifdef RC_SELFTEST
+
+#include <unistd.h>
+
+static void dump_metrics(const rc_metrics_t *m)
+{
+    printf("hits=%" PRIuFAST64 ", misses=%" PRIuFAST64
+           ", stale=%" PRIuFAST64 ", inserts=%" PRIuFAST64
+           ", evictions=%" PRIuFAST64 "\n",
+           m->hits, m->misses, m->stale, m->inserts, m->evictions);
+}
+
+int main(void)
+{
+    rc_cache_t cache;
+    int rc = rc_cache_init(&cache, 4, 2);
+    assert(rc == 0);
+
+    const char *k = "/v1/products?sku=42";
+    const char *v = "{\"id\":42,\"name\":\"Milk\"}";
+    rc_cache_put(&cache, k, (const unsigned char *)v, strlen(v) + 1, 0);
+
+    unsigned char *out;
+    size_t len;
+
+    rc = rc_cache_get(&cache, k, &out, &len);
+    assert(rc == 0);
+    printf("GET: %s\n", out);
+    free(out);
+
+    sleep(3); /* let entry expire */
+
+    rc = rc_cache_get(&cache, k, &out, &len);
+    assert(rc == ETIMEDOUT);
+
+    rc_metrics_t m;
+    rc_cache_metrics(&cache, &m);
+    dump_metrics(&m);
+
+    rc_cache_destroy(&cache);
+    return 0;
+}
+#endif /* RC_SELFTEST */

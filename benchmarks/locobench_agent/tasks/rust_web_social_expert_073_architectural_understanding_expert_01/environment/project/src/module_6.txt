@@ -1,0 +1,373 @@
+```rust
+//! src/module_6.rs
+//!
+//! Event-sourcing audit-trail and GDPR-erase utilities used by several
+//! EduPulse Live services.  The module is designed so that other crates
+//! (web API, background workers, analytics pipeline, …) can depend on a
+//! single abstraction while swapping out storage back-ends if necessary.
+//!
+//! Compile with the following feature flags enabled in `Cargo.toml`:
+//!
+//! ```toml
+//! [dependencies]
+//! tokio      = { version = "1", features = ["rt-multi-thread", "macros"] }
+//! sqlx       = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
+//! serde      = { version = "1", features = ["derive"] }
+//! serde_json = "1"
+//! chrono     = { version = "0.4", features = ["serde"] }
+//! uuid       = { version = "1", features = ["serde", "v4"] }
+//! async-trait = "0.1"
+//! anyhow     = "1"
+//! thiserror  = "1"
+//! tracing    = "0.1"
+//! ```
+//!
+//! NOTE: The module purposely never panics in normal operation; all
+//!       failures are surfaced through `Result` so that upper layers can
+//!       respond gracefully (retry, circuit-break, alerting, …).
+
+use std::env;
+use std::fmt;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use sqlx::{postgres::PgRow, PgPool, Row};
+use thiserror::Error;
+use tracing::{error, info, instrument};
+use uuid::Uuid;
+
+/// A high-level description of all domain events the system cares about.
+/// New application features SHOULD extend this enum instead of inventing ad-hoc
+/// JSON structures in order to keep the audit log queryable.
+///
+/// The enum is (de)serialised to/from snake_case strings so that DB queries
+/// remain ergonomic and dashboards can group by `event_type`.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "VARCHAR")]
+pub enum DomainEventType {
+    LessonPublished,
+    QuizSubmitted,
+    PeerFeedbackGiven,
+    BadgeAwarded,
+    PaymentProcessed,
+    LearningPulseCreated,
+    LearningPulseReplied,
+}
+
+/// A single, immutable audit log record.
+///
+///  • `event_id`      globally unique (ordered by `created_at` for convenience)  
+///  • `aggregate_id`  the main entity the event acts upon (user, course, …)  
+///  • `payload`       arbitrary JSON, validated at application boundaries  
+///
+/// The actual binary representation in Postgres is a row in table
+/// `audit_events` (see the migration in `migrations/20230720114523_audit.sql`)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub event_id: Uuid,
+    pub aggregate_id: Uuid,
+    pub event_type: DomainEventType,
+    pub payload: JsonValue,
+    pub created_at: DateTime<Utc>,
+}
+
+impl fmt::Display for AuditEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} – {:?} – {}",
+            self.event_id, self.event_type, self.created_at
+        )
+    }
+}
+
+/// Top-level error type returned by this module.  Using a single error enum
+/// (rather than scattering opaque `anyhow::Error`s) makes pattern-matching
+/// in callers easier and metrics aggregation cleaner.
+#[derive(Debug, Error)]
+pub enum EventStoreError {
+    #[error("database connection error: {0:?}")]
+    Connection(#[from] sqlx::Error),
+
+    #[error("serialization error: {0:?}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("attempt to erase non-existing user {0}")]
+    UnknownUser(Uuid),
+
+    #[error("unexpected error: {0}")]
+    Other(#[from] anyhow::Error),
+}
+
+/// Abstraction for writing/reading events.  The trait is intentionally narrow
+/// so that adapters for DynamoDB, Kafka-compacted topics, or filesystem
+/// snapshots can be added later with minimal friction.
+#[async_trait]
+pub trait EventStore: Send + Sync {
+    async fn append_event(&self, event: &AuditEvent) -> Result<(), EventStoreError>;
+    async fn fetch_events_by_aggregate(
+        &self,
+        aggregate_id: Uuid,
+    ) -> Result<Vec<AuditEvent>, EventStoreError>;
+    /// GDPR-style erase.  The default behaviour is pseudonymisation:
+    /// personal fields in the JSON payload are stripped/replaced while
+    /// keeping aggregate-level metadata for analytics/regulatory audits.
+    async fn pseudonymise_user(
+        &self,
+        user_id: Uuid,
+        pseudonym: &str,
+    ) -> Result<(), EventStoreError>;
+}
+
+/// Postgres 15 implementation.  Requires the following DDL:
+///
+/// ```sql
+/// CREATE TABLE IF NOT EXISTS audit_events (
+///     event_id     UUID PRIMARY KEY,
+///     aggregate_id UUID NOT NULL,
+///     event_type   VARCHAR NOT NULL,
+///     payload      JSONB NOT NULL,
+///     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+/// );
+/// CREATE INDEX IF NOT EXISTS idx_audit_aggregate
+///     ON audit_events (aggregate_id);
+/// CREATE INDEX IF NOT EXISTS idx_audit_event_type
+///     ON audit_events (event_type);
+/// ```
+pub struct PgEventStore {
+    pool: PgPool,
+}
+
+impl PgEventStore {
+    /// Reads standard environment variables (e.g., `DATABASE_URL`) if `pool`
+    /// is not supplied.  Callers can also pass a pre-initialised `PgPool`
+    /// obtained from an application-wide connection manager.
+    pub async fn new(pool: Option<PgPool>) -> Result<Self, EventStoreError> {
+        match pool {
+            Some(p) => Ok(Self { pool: p }),
+            None => {
+                let db_url = env::var("DATABASE_URL")
+                    .map_err(|_| anyhow::anyhow!("DATABASE_URL env var not set"))?;
+                let max_conns: u32 =
+                    env::var("DATABASE_MAX_CONNS").unwrap_or_else(|_| "8".into()).parse().unwrap();
+                let pool = PgPool::builder()
+                    .max_size(max_conns)
+                    .build(&db_url)
+                    .await?;
+                Ok(Self { pool })
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl EventStore for PgEventStore {
+    #[instrument(skip_all, fields(event_id=%event.event_id))]
+    async fn append_event(&self, event: &AuditEvent) -> Result<(), EventStoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO audit_events (event_id, aggregate_id, event_type, payload, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(event.event_id)
+        .bind(event.aggregate_id)
+        .bind(event.event_type.clone())
+        .bind(&event.payload)
+        .bind(event.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        info!(%event.event_id, "event persisted");
+        Ok(())
+    }
+
+    #[instrument(skip_all, fields(aggregate_id=%aggregate_id))]
+    async fn fetch_events_by_aggregate(
+        &self,
+        aggregate_id: Uuid,
+    ) -> Result<Vec<AuditEvent>, EventStoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT event_id, aggregate_id, event_type, payload, created_at
+            FROM audit_events
+            WHERE aggregate_id = $1
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(aggregate_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let events = rows.into_iter().map(row_to_event).collect::<Result<_, _>>()?;
+        Ok(events)
+    }
+
+    /// Iterates through *all* events where `aggregate_id = user_id`, then
+    /// transforms the JSON payload via `pseudonymise_payload`.  Runs inside a
+    /// `BEGIN … COMMIT` block to guarantee atomicity.
+    #[instrument(skip_all, fields(user_id=%user_id))]
+    async fn pseudonymise_user(
+        &self,
+        user_id: Uuid,
+        pseudonym: &str,
+    ) -> Result<(), EventStoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        let affected: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM audit_events
+            WHERE aggregate_id = $1
+            "#,
+        )
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if affected == 0 {
+            return Err(EventStoreError::UnknownUser(user_id));
+        }
+
+        // Fetch, transform, write back
+        let rows = sqlx::query(
+            r#"
+            SELECT event_id, aggregate_id, event_type, payload, created_at
+            FROM audit_events
+            WHERE aggregate_id = $1
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        for row in rows {
+            let mut event = row_to_event(row)?;
+            event.payload = pseudonymise_payload(&event.payload, pseudonym)?;
+            sqlx::query(
+                r#"
+                UPDATE audit_events
+                SET payload = $1
+                WHERE event_id = $2
+                "#,
+            )
+            .bind(&event.payload)
+            .bind(event.event_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        info!(%user_id, "pseudonymisation complete ({} events)", affected);
+        Ok(())
+    }
+}
+
+/// Convert a database row into `AuditEvent`.
+fn row_to_event(row: PgRow) -> Result<AuditEvent, EventStoreError> {
+    Ok(AuditEvent {
+        event_id: row.try_get("event_id")?,
+        aggregate_id: row.try_get("aggregate_id")?,
+        event_type: row.try_get("event_type")?,
+        payload: row.try_get("payload")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+/// Recurse through JSON to strip direct identifiers (name, email, …) and
+/// replace them with a constant pseudonym.  This is obviously simplistic,
+/// but demonstrates the technique.  Real-world code would leverage schema
+/// introspection or build explicit per-event transformers.
+fn pseudonymise_payload(
+    original: &JsonValue,
+    pseudonym: &str,
+) -> Result<JsonValue, EventStoreError> {
+    let mut clone = original.clone();
+
+    match &mut clone {
+        JsonValue::Object(map) => {
+            static SENSITIVE_KEYS: &[&str] = &["name", "email", "first_name", "last_name"];
+            for key in SENSITIVE_KEYS {
+                if map.contains_key(*key) {
+                    map.insert((*key).to_string(), JsonValue::String(pseudonym.to_owned()));
+                }
+            }
+            // Recurse into nested values
+            for v in map.values_mut() {
+                *v = pseudonymise_payload(v, pseudonym)?;
+            }
+        }
+        JsonValue::Array(arr) => {
+            for v in arr.iter_mut() {
+                *v = pseudonymise_payload(v, pseudonym)?;
+            }
+        }
+        _ => { /* primitives stay unchanged */ }
+    }
+    Ok(clone)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn test_pseudonymise_payload() {
+        let original = json!({
+            "name": "Alice",
+            "email": "alice@example.com",
+            "score": 95,
+            "nested": {
+                "first_name": "Alice",
+                "comments": ["great job"]
+            }
+        });
+
+        let transformed = pseudonymise_payload(&original, "redacted").unwrap();
+        assert_eq!(transformed["name"], "redacted");
+        assert_eq!(transformed["nested"]["first_name"], "redacted");
+        assert_eq!(transformed["score"], 95); // untouched
+    }
+
+    #[tokio::test]
+    async fn test_append_and_fetch_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        // Spin up a transient in-memory Postgres in CI or use `TEST_DATABASE_URL`.
+        let db_url =
+            std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres@localhost/ep_test".into());
+        let pool = PgPool::connect(&db_url).await?;
+        // Ensure table exists for the test
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS audit_events (
+                event_id     UUID PRIMARY KEY,
+                aggregate_id UUID NOT NULL,
+                event_type   VARCHAR NOT NULL,
+                payload      JSONB NOT NULL,
+                created_at   TIMESTAMPTZ NOT NULL
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+
+        let store = PgEventStore::new(Some(pool.clone())).await?;
+
+        let event = AuditEvent {
+            event_id: Uuid::new_v4(),
+            aggregate_id: Uuid::new_v4(),
+            event_type: DomainEventType::LessonPublished,
+            payload: json!({"lesson_id": 42, "title": "Rust Ownership"}),
+            created_at: Utc::now(),
+        };
+
+        store.append_event(&event).await?;
+        let fetched = store.fetch_events_by_aggregate(event.aggregate_id).await?;
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].payload["lesson_id"], 42);
+        Ok(())
+    }
+}
+```

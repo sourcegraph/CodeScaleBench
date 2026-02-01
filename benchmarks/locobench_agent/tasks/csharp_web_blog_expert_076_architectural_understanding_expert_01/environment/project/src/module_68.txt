@@ -1,0 +1,248 @@
+```csharp
+// File: src/module_68.txt  (intentionally kept with .txt extension to satisfy project scaffolding tools)
+// Project: TempoScribe Pro – Hexagonal Productivity Blog Suite (web_blog)
+
+using System;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Logging;
+using Polly;
+using Polly.Retry;
+using Stripe;
+
+namespace TempoScribePro.Modules.Payments
+{
+    #region Domain Layer (Ports & Domain Exceptions)
+
+    /// <summary>
+    /// Command issued by the Application layer to trigger a premium-post payment.
+    /// </summary>
+    public sealed record PaymentCommand(
+        Guid UserId,
+        Guid PostId,
+        decimal Amount,
+        string Currency,
+        string Description,
+        string PaymentMethodToken);
+
+    /// <summary>
+    /// Result of a payment attempt—either success, failure, or unknown.
+    /// </summary>
+    public sealed record PaymentResult(
+        bool Succeeded,
+        string GatewayTransactionId,
+        string FailureCode,
+        string FailureMessage,
+        DateTimeOffset ProcessedAtUtc);
+
+    /// <summary>
+    /// Abstraction over any payment gateway (Stripe, Braintree, test-double, etc.).
+    /// </summary>
+    public interface IPaymentGateway
+    {
+        Task<PaymentResult> ChargeAsync(PaymentCommand command, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Port for persisting a successful premium access grant.
+    /// </summary>
+    public interface IPremiumAccessRepository
+    {
+        Task GrantAsync(Guid userId, Guid postId, string transactionId, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Port for publishing domain events (outbox pattern, message broker, etc.).
+    /// </summary>
+    public interface IEventBus
+    {
+        Task PublishAsync<TEvent>(TEvent @event, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Signals a permanent, unrecoverable failure when processing a payment.
+    /// </summary>
+    public sealed class PaymentProcessingException : Exception
+    {
+        public PaymentProcessingException(string message, Exception? inner = null) : base(message, inner) { }
+    }
+
+    #endregion
+
+    #region Application Layer (Service)
+
+    /// <summary>
+    /// Application-level service orchestrating the steps required to charge a user for a premium post.
+    /// Implements cross-cutting concerns (retry, logging, caching invalidations).
+    /// </summary>
+    public sealed class PaymentProcessingService
+    {
+        private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(2);
+        private const string CacheKeyTemplate = "premium:{0}:{1}"; // {userId}:{postId}
+
+        private readonly IPaymentGateway _gateway;
+        private readonly IPremiumAccessRepository _accessRepo;
+        private readonly IEventBus _eventBus;
+        private readonly IDistributedCache _cache;
+        private readonly ILogger<PaymentProcessingService> _logger;
+        private readonly AsyncRetryPolicy _retryPolicy;
+
+        public PaymentProcessingService(
+            IPaymentGateway gateway,
+            IPremiumAccessRepository accessRepo,
+            IEventBus eventBus,
+            IDistributedCache cache,
+            ILogger<PaymentProcessingService> logger)
+        {
+            _gateway = gateway ?? throw new ArgumentNullException(nameof(gateway));
+            _accessRepo = accessRepo ?? throw new ArgumentNullException(nameof(accessRepo));
+            _eventBus = eventBus ?? throw new ArgumentNullException(nameof(eventBus));
+            _cache = cache ?? throw new ArgumentNullException(nameof(cache));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+            _retryPolicy = Policy
+                .Handle<Exception>(ex => !(ex is PaymentProcessingException))
+                .WaitAndRetryAsync(3, retryAttempt => RetryDelay,
+                    (exception, ts, attempt, ctx) =>
+                    {
+                        _logger.LogWarning(exception,
+                            "[Payments] Transient failure when charging user (attempt {Attempt}/3).", attempt);
+                    });
+        }
+
+        /// <summary>
+        /// Executes the payment workflow: charge, persist, publish, and invalidate cache.
+        /// </summary>
+        public Task<PaymentResult> ProcessAsync(PaymentCommand command, CancellationToken ct = default) =>
+            _retryPolicy.ExecuteAsync(async () =>
+            {
+                ct.ThrowIfCancellationRequested();
+                _logger.LogInformation("[Payments] Initiating payment for User:{UserId}, Post:{PostId}, Amount:{Amount}{Currency}.",
+                    command.UserId, command.PostId, command.Amount, command.Currency);
+
+                var result = await _gateway.ChargeAsync(command, ct).ConfigureAwait(false);
+
+                if (!result.Succeeded)
+                {
+                    _logger.LogError("[Payments] Payment failed for User:{UserId}, Post:{PostId}. FailureCode:{Code}, Message:{Message}",
+                        command.UserId, command.PostId, result.FailureCode, result.FailureMessage);
+
+                    throw new PaymentProcessingException($"Payment failed: {result.FailureMessage}");
+                }
+
+                _logger.LogInformation("[Payments] Payment succeeded. TransactionId:{TransactionId}", result.GatewayTransactionId);
+
+                // 1. Persist access
+                await _accessRepo.GrantAsync(command.UserId, command.PostId, result.GatewayTransactionId, ct)
+                    .ConfigureAwait(false);
+
+                // 2. Publish domain event
+                await _eventBus.PublishAsync(
+                        new PremiumPostPurchasedEvent(command.UserId, command.PostId, result.GatewayTransactionId,
+                            result.ProcessedAtUtc), ct)
+                    .ConfigureAwait(false);
+
+                // 3. Invalidate read-side cache so front-end can immediately reveal premium content
+                var cacheKey = string.Format(CacheKeyTemplate, command.UserId, command.PostId);
+                await _cache.RemoveAsync(cacheKey, ct).ConfigureAwait(false);
+
+                return result;
+            });
+
+    }
+
+    /// <summary>
+    /// Event raised when a premium post has been purchased.
+    /// </summary>
+    public sealed record PremiumPostPurchasedEvent(
+        Guid UserId,
+        Guid PostId,
+        string TransactionId,
+        DateTimeOffset PurchasedAtUtc);
+
+    #endregion
+
+    #region Infrastructure Layer (Stripe Adapter)
+
+    /// <summary>
+    /// Stripe implementation of <see cref="IPaymentGateway"/>.
+    /// </summary>
+    public sealed class StripePaymentGateway : IPaymentGateway
+    {
+        private readonly StripeClient _client;
+        private readonly ILogger<StripePaymentGateway> _logger;
+
+        public StripePaymentGateway(string apiKey, ILogger<StripePaymentGateway> logger)
+        {
+            _client = new StripeClient(apiKey);
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        public async Task<PaymentResult> ChargeAsync(PaymentCommand command, CancellationToken ct)
+        {
+            try
+            {
+                var service = new PaymentIntentService(_client);
+                var intent = await service.CreateAsync(new PaymentIntentCreateOptions
+                {
+                    Amount = (long)(command.Amount * 100),  // Stripe accepts amounts in cents
+                    Currency = command.Currency,
+                    PaymentMethod = command.PaymentMethodToken,
+                    Confirm = true,
+                    Description = command.Description,
+                    Metadata = new System.Collections.Generic.Dictionary<string, string>
+                    {
+                        { "post_id", command.PostId.ToString() },
+                        { "user_id", command.UserId.ToString() }
+                    }
+                }, requestOptions: null, cancellationToken: ct);
+
+                if (intent.Status == "succeeded")
+                {
+                    return new PaymentResult(
+                        true,
+                        intent.Id,
+                        FailureCode: string.Empty,
+                        FailureMessage: string.Empty,
+                        ProcessedAtUtc: DateTimeOffset.UtcNow);
+                }
+
+                _logger.LogWarning("[Stripe] Unexpected intent status {Status} for PaymentIntent:{Id}.", intent.Status, intent.Id);
+
+                return new PaymentResult(
+                    false,
+                    intent.Id,
+                    FailureCode: intent.Status,
+                    FailureMessage: "Payment did not succeed.",
+                    ProcessedAtUtc: DateTimeOffset.UtcNow);
+            }
+            catch (StripeException ex)
+            {
+                _logger.LogError(ex, "[Stripe] StripeException during charge. Code:{Code}, DeclineCode:{DeclineCode}, Param:{Param}",
+                    ex.StripeError?.Code, ex.StripeError?.DeclineCode, ex.StripeError?.Param);
+
+                return new PaymentResult(
+                    false,
+                    GatewayTransactionId: ex.StripeError?.ChargeId ?? string.Empty,
+                    FailureCode: ex.StripeError?.Code ?? "stripe_error",
+                    FailureMessage: ex.Message,
+                    ProcessedAtUtc: DateTimeOffset.UtcNow);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Ensure cooperative cancellation is bubbled up
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Stripe] Unknown error while charging.");
+                throw;
+            }
+        }
+    }
+
+    #endregion
+}
+```

@@ -1,0 +1,701 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * Module 31  – Response Cache
+ *
+ * Description:
+ *   A thread-safe, in-memory HTTP/GraphQL response cache supporting
+ *   TTL, size limits, and LRU eviction.  It is intended to sit in front
+ *   of service & repository layers to short-circuit identical requests
+ *   (e.g.   GET /catalog/items?page=2).
+ *
+ *   Metrics and structured logging are integrated to satisfy the
+ *   observability requirements of on-premise deployments.
+ *
+ * File path:
+ *   src/module_31.txt          (compiled as .c)
+ *
+ * Build flags:
+ *   -std=c11 -pthread
+ *
+ * Public API (see function comments for details):
+ *   mm_cache_init
+ *   mm_cache_destroy
+ *   mm_cache_put
+ *   mm_cache_get
+ *   mm_cache_invalidate
+ *   mm_cache_purge
+ *   mm_cache_metrics_snapshot
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+#include <errno.h>
+
+/* ---------------------------------------------------------------------------
+ * Logger shim
+ * -------------------------------------------------------------------------*/
+#ifndef MM_LOGGER_H
+/*  In production builds <mm_logger.h> is available globally.                 */
+/*  We provide a fallback to keep this unit self-contained for unit tests.    */
+typedef enum { LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR } mm_log_level_t;
+
+static inline void mm_log(mm_log_level_t lvl, const char *fmt, ...)
+{
+    const char *lvl_str = (lvl == LOG_DEBUG) ? "DEBUG" :
+                          (lvl == LOG_INFO)  ? "INFO"  :
+                          (lvl == LOG_WARN)  ? "WARN"  : "ERROR";
+
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "[%s] ", lvl_str);
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+}
+#endif /* MM_LOGGER_H */
+
+
+/* ---------------------------------------------------------------------------
+ * Constants & Macros
+ * -------------------------------------------------------------------------*/
+#define MM_CACHE_MODULE_VERSION  "31.3.0"   /* Semantic versioning       */
+
+#define MM_CACHE_DEFAULT_TBL_SIZE  2048u    /* Must be power-of-two      */
+#define MM_CACHE_MIN_TTL           1u       /* Seconds                   */
+#define MM_CACHE_MAX_KEYLEN        1024u
+#define MM_CACHE_MAX_CONTENTTYPE   128u
+#define MM_CACHE_MAX_ETAG          128u
+
+#define unlikely(x) __builtin_expect(!!(x), 0)
+
+/* ---------------------------------------------------------------------------
+ * Data Types
+ * -------------------------------------------------------------------------*/
+typedef struct mm_cache_entry {
+    char              *key;
+    unsigned char     *payload;
+    size_t             payload_len;
+
+    char              *content_type;        /* MIME type (optional)  */
+    char              *etag;                /* Strong/Weak ETag      */
+
+    time_t             expiry_ts;           /* Epoch time            */
+    uint64_t           last_access;         /* Monotonic counter     */
+
+    struct mm_cache_entry *prev, *next;     /* LRU list              */
+} mm_cache_entry_t;
+
+typedef struct {
+    /* Configuration */
+    size_t   capacity_bytes;   /* Max RAM in bytes                    */
+    size_t   max_entries;      /* Cap on element count                */
+
+    /* Internal state */
+    size_t   current_bytes;
+    size_t   entry_count;
+    size_t   tbl_size;         /* Hash table size (power of two)      */
+    mm_cache_entry_t **table;
+
+    mm_cache_entry_t *lru_head;/* MRU                                 */
+    mm_cache_entry_t *lru_tail;/* LRU                                 */
+
+    /* Concurrency control */
+    pthread_rwlock_t rwlock;
+
+    /* Metrics */
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+} mm_cache_t;
+
+
+/* Publicly exported metrics snapshot */
+typedef struct {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    size_t   entry_count;
+    size_t   current_bytes;
+} mm_cache_metrics_t;
+
+
+/* ---------------------------------------------------------------------------
+ * Forward declarations
+ * -------------------------------------------------------------------------*/
+static uint64_t mm_fnv1a_hash(const void *data, size_t len);
+static int      mm_cache_grow_table(mm_cache_t *c, size_t new_size);
+static void     mm_cache_lru_touch(mm_cache_t *c, mm_cache_entry_t *e);
+static void     mm_cache_evict_if_needed(mm_cache_t *c, size_t add_bytes);
+
+
+/* ---------------------------------------------------------------------------
+ * API IMPLEMENTATION
+ * -------------------------------------------------------------------------*/
+
+/*
+ * mm_cache_init
+ * ----------------------------------------------------------------------------
+ * Initializes a response cache instance.
+ *
+ * Arguments:
+ *   c               – pointer to an allocated mm_cache_t
+ *   max_entries     – upper bound on number of cache records
+ *   capacity_bytes  – max memory usage for payloads + metadata
+ *
+ * Return:
+ *   0 on success, errno-compatible error code otherwise.
+ */
+int mm_cache_init(mm_cache_t *c,
+                  size_t max_entries,
+                  size_t capacity_bytes)
+{
+    if (!c || max_entries == 0 || capacity_bytes == 0)
+        return EINVAL;
+
+    memset(c, 0, sizeof(*c));
+
+    c->max_entries    = max_entries;
+    c->capacity_bytes = capacity_bytes;
+
+    /* Initial hash table size: next power-of-two >= max_entries * 2          */
+    size_t tbl_size = MM_CACHE_DEFAULT_TBL_SIZE;
+    while (tbl_size < (max_entries << 1)) tbl_size <<= 1;
+
+    if (mm_cache_grow_table(c, tbl_size) != 0)
+        return ENOMEM;
+
+    if (pthread_rwlock_init(&c->rwlock, NULL) != 0)
+        return errno;
+
+    mm_log(LOG_INFO, "Response cache initialized (ver=%s, max_entries=%zu, "
+                     "capacity=%zu KiB)",
+                     MM_CACHE_MODULE_VERSION,
+                     max_entries,
+                     capacity_bytes >> 10);
+    return 0;
+}
+
+/*
+ * mm_cache_destroy
+ * ----------------------------------------------------------------------------
+ * Frees all memory associated with the cache.
+ */
+void mm_cache_destroy(mm_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    for (size_t i = 0; i < c->tbl_size; ++i) {
+        mm_cache_entry_t *e = c->table[i];
+        if (e) {
+            free(e->key);
+            free(e->payload);
+            free(e->content_type);
+            free(e->etag);
+            free(e);
+        }
+    }
+    free(c->table);
+
+    pthread_rwlock_unlock(&c->rwlock);
+    pthread_rwlock_destroy(&c->rwlock);
+    memset(c, 0, sizeof(*c));
+}
+
+/*
+ * mm_cache_put
+ * ----------------------------------------------------------------------------
+ * Stores a response in the cache.
+ *
+ * The cache takes ownership of the payload data (it copies it internally).
+ *
+ * Arguments:
+ *   key             – request hash key  (string)
+ *   payload         – response body
+ *   payload_len     – size of response body
+ *   content_type    – MIME type (may be NULL)
+ *   etag            – optional ETag header
+ *   ttl_seconds     – time-to-live for this cache record
+ *
+ * Return:
+ *   0 on success, errno code on failure
+ */
+int mm_cache_put(mm_cache_t *c,
+                 const char *key,
+                 const unsigned char *payload,
+                 size_t payload_len,
+                 const char *content_type,
+                 const char *etag,
+                 uint32_t ttl_seconds)
+{
+    if (!c || !key || !payload || payload_len == 0)
+        return EINVAL;
+
+    if (strlen(key) > MM_CACHE_MAX_KEYLEN)
+        return ENAMETOOLONG;
+
+    if (ttl_seconds < MM_CACHE_MIN_TTL)
+        ttl_seconds = MM_CACHE_MIN_TTL;
+
+    /* Pre-allocate memory before acquiring write lock to minimize lock time */
+    mm_cache_entry_t *new_entry = calloc(1, sizeof(*new_entry));
+    if (!new_entry)
+        return ENOMEM;
+
+    new_entry->key = strdup(key);
+    if (!new_entry->key) { free(new_entry); return ENOMEM; }
+
+    new_entry->payload = malloc(payload_len);
+    if (!new_entry->payload) { free(new_entry->key); free(new_entry); return ENOMEM; }
+    memcpy(new_entry->payload, payload, payload_len);
+    new_entry->payload_len = payload_len;
+
+    if (content_type) {
+        if (strlen(content_type) > MM_CACHE_MAX_CONTENTTYPE) {
+            free(new_entry->payload); free(new_entry->key); free(new_entry);
+            return ENAMETOOLONG;
+        }
+        new_entry->content_type = strdup(content_type);
+        if (!new_entry->content_type) goto oom;
+    }
+
+    if (etag) {
+        if (strlen(etag) > MM_CACHE_MAX_ETAG) {
+            free(new_entry->content_type); free(new_entry->payload);
+            free(new_entry->key); free(new_entry); return ENAMETOOLONG;
+        }
+        new_entry->etag = strdup(etag);
+        if (!new_entry->etag) goto oom;
+    }
+
+    new_entry->expiry_ts   = time(NULL) + ttl_seconds;
+    new_entry->last_access = (uint64_t)clock();
+
+    /* Lock and insert */
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    /* Evict expired + ensure capacity before insertion */
+    mm_cache_evict_if_needed(c, payload_len);
+
+    uint64_t hash = mm_fnv1a_hash(key, strlen(key));
+    size_t idx = hash & (c->tbl_size - 1);
+
+    while (c->table[idx] && strcmp(c->table[idx]->key, key) != 0)
+        idx = (idx + 1) & (c->tbl_size - 1);
+
+    mm_cache_entry_t *existing = c->table[idx];
+    if (existing) {
+        /* Replace existing entry */
+        c->current_bytes -= existing->payload_len;
+        free(existing->payload);
+        existing->payload       = new_entry->payload;
+        existing->payload_len   = new_entry->payload_len;
+        existing->expiry_ts     = new_entry->expiry_ts;
+        existing->last_access   = new_entry->last_access;
+
+        free(existing->content_type);
+        existing->content_type  = new_entry->content_type;
+
+        free(existing->etag);
+        existing->etag          = new_entry->etag;
+
+        /* Touch */
+        mm_cache_lru_touch(c, existing);
+
+        free(new_entry->key); /* key identical */
+        free(new_entry);      /* container freed */
+    } else {
+        /* Insert brand new entry */
+        c->table[idx] = new_entry;
+        c->entry_count++;
+        c->current_bytes += payload_len;
+
+        /* Add to LRU head */
+        new_entry->next = c->lru_head;
+        if (c->lru_head)
+            c->lru_head->prev = new_entry;
+        c->lru_head = new_entry;
+        if (!c->lru_tail)
+            c->lru_tail = new_entry;
+    }
+
+    pthread_rwlock_unlock(&c->rwlock);
+    return 0;
+
+oom:
+    free(new_entry->etag);
+    free(new_entry->content_type);
+    free(new_entry->payload);
+    free(new_entry->key);
+    free(new_entry);
+    return ENOMEM;
+}
+
+/*
+ * mm_cache_get
+ * ----------------------------------------------------------------------------
+ * Retrieves a cached response. Ownership of *payload_out is transferred to
+ * the caller (caller must free). content_type_out & etag_out point to
+ * internal strings – do not free, DO copy if retained beyond processing.
+ *
+ * Return:
+ *   1  – cache HIT  (payload populated)
+ *   0  – cache MISS
+ *  <0  – negative errno on internal failure
+ */
+int mm_cache_get(mm_cache_t *c,
+                 const char *key,
+                 unsigned char **payload_out,
+                 size_t *payload_len_out,
+                 const char **content_type_out,
+                 const char **etag_out,
+                 uint32_t *age_out)
+{
+    if (!c || !key || !payload_out || !payload_len_out)
+        return -EINVAL;
+
+    pthread_rwlock_rdlock(&c->rwlock);
+
+    uint64_t hash = mm_fnv1a_hash(key, strlen(key));
+    size_t idx = hash & (c->tbl_size - 1);
+
+    while (c->table[idx] && strcmp(c->table[idx]->key, key) != 0)
+        idx = (idx + 1) & (c->tbl_size - 1);
+
+    mm_cache_entry_t *e = c->table[idx];
+
+    /* Fast path: MISS */
+    if (!e) {
+        c->misses++;
+        pthread_rwlock_unlock(&c->rwlock);
+        return 0;
+    }
+
+    /* Check expiration */
+    time_t now = time(NULL);
+    if (e->expiry_ts < now) {
+        /* Upgrade to write lock to remove expired entry */
+        pthread_rwlock_unlock(&c->rwlock);
+        pthread_rwlock_wrlock(&c->rwlock);
+
+        /* ensure another thread hasn't removed it */
+        if (c->table[idx] == e) {
+            /* Detach from LRU */
+            if (e->prev) e->prev->next = e->next;
+            if (e->next) e->next->prev = e->prev;
+            if (e == c->lru_head) c->lru_head = e->next;
+            if (e == c->lru_tail) c->lru_tail = e->prev;
+
+            /* Hash slot removal */
+            c->table[idx] = NULL;
+            c->entry_count--;
+            c->current_bytes -= e->payload_len;
+
+            /* Rehash cluster (Robin Hood deletion not necessary for small table) */
+            size_t j = (idx + 1) & (c->tbl_size - 1);
+            while (c->table[j]) {
+                mm_cache_entry_t *move = c->table[j];
+                c->table[j] = NULL;
+
+                size_t new_idx = mm_fnv1a_hash(move->key, strlen(move->key)) & (c->tbl_size - 1);
+                while (c->table[new_idx])
+                    new_idx = (new_idx + 1) & (c->tbl_size - 1);
+                c->table[new_idx] = move;
+                j = (j + 1) & (c->tbl_size - 1);
+            }
+
+            free(e->key);
+            free(e->payload);
+            free(e->content_type);
+            free(e->etag);
+            free(e);
+        }
+
+        c->misses++;
+        pthread_rwlock_unlock(&c->rwlock);
+        return 0;
+    }
+
+    /* HIT */
+    e->last_access = (uint64_t)clock();
+    c->hits++;
+
+    /* Copy payload for caller */
+    unsigned char *payload_dup = malloc(e->payload_len);
+    if (!payload_dup) {
+        pthread_rwlock_unlock(&c->rwlock);
+        return -ENOMEM;
+    }
+    memcpy(payload_dup, e->payload, e->payload_len);
+
+    *payload_out      = payload_dup;
+    *payload_len_out  = e->payload_len;
+    if (content_type_out) *content_type_out = e->content_type;
+    if (etag_out)        *etag_out          = e->etag;
+    if (age_out)         *age_out           = (uint32_t)(now - (e->expiry_ts - now));
+
+    /* Defer LRU touch after releasing read lock to cut contention.          */
+    pthread_rwlock_unlock(&c->rwlock);
+
+    pthread_rwlock_wrlock(&c->rwlock);
+    mm_cache_lru_touch(c, e);
+    pthread_rwlock_unlock(&c->rwlock);
+
+    return 1;
+}
+
+/*
+ * mm_cache_invalidate
+ * ----------------------------------------------------------------------------
+ * Removes a single entry from the cache (e.g. after POST/PUT/DELETE).
+ */
+void mm_cache_invalidate(mm_cache_t *c, const char *key)
+{
+    if (!c || !key) return;
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    uint64_t hash = mm_fnv1a_hash(key, strlen(key));
+    size_t idx = hash & (c->tbl_size - 1);
+
+    while (c->table[idx] && strcmp(c->table[idx]->key, key) != 0)
+        idx = (idx + 1) & (c->tbl_size - 1);
+
+    mm_cache_entry_t *e = c->table[idx];
+    if (!e) {
+        pthread_rwlock_unlock(&c->rwlock);
+        return;
+    }
+
+    /* Detach */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (e == c->lru_head) c->lru_head = e->next;
+    if (e == c->lru_tail) c->lru_tail = e->prev;
+
+    c->table[idx] = NULL;
+    c->entry_count--;
+    c->current_bytes -= e->payload_len;
+
+    /* Rehash cluster */
+    size_t j = (idx + 1) & (c->tbl_size - 1);
+    while (c->table[j]) {
+        mm_cache_entry_t *move = c->table[j];
+        c->table[j] = NULL;
+
+        size_t new_idx = mm_fnv1a_hash(move->key, strlen(move->key)) & (c->tbl_size - 1);
+        while (c->table[new_idx])
+            new_idx = (new_idx + 1) & (c->tbl_size - 1);
+        c->table[new_idx] = move;
+
+        j = (j + 1) & (c->tbl_size - 1);
+    }
+
+    free(e->key);
+    free(e->payload);
+    free(e->content_type);
+    free(e->etag);
+    free(e);
+
+    pthread_rwlock_unlock(&c->rwlock);
+    mm_log(LOG_DEBUG, "Cache invalidated: %s", key);
+}
+
+/*
+ * mm_cache_purge
+ * ----------------------------------------------------------------------------
+ * Removes every entry from the cache.
+ */
+void mm_cache_purge(mm_cache_t *c)
+{
+    if (!c) return;
+    pthread_rwlock_wrlock(&c->rwlock);
+
+    for (size_t i = 0; i < c->tbl_size; ++i) {
+        mm_cache_entry_t *e = c->table[i];
+        if (e) {
+            free(e->key);
+            free(e->payload);
+            free(e->content_type);
+            free(e->etag);
+            free(e);
+        }
+        c->table[i] = NULL;
+    }
+
+    c->entry_count   = 0;
+    c->current_bytes = 0;
+    c->lru_head = c->lru_tail = NULL;
+
+    pthread_rwlock_unlock(&c->rwlock);
+    mm_log(LOG_INFO, "Cache fully purged");
+}
+
+/*
+ * mm_cache_metrics_snapshot
+ * ----------------------------------------------------------------------------
+ * Captures a read-only snapshot of metrics for Prometheus scrape thread.
+ */
+void mm_cache_metrics_snapshot(const mm_cache_t *c,
+                               mm_cache_metrics_t *out)
+{
+    if (!c || !out) return;
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&c->rwlock);
+
+    out->hits          = c->hits;
+    out->misses        = c->misses;
+    out->evictions     = c->evictions;
+    out->entry_count   = c->entry_count;
+    out->current_bytes = c->current_bytes;
+
+    pthread_rwlock_unlock((pthread_rwlock_t *)&c->rwlock);
+}
+
+/* ---------------------------------------------------------------------------
+ * INTERNAL HELPERS
+ * -------------------------------------------------------------------------*/
+
+/* Fowler-Noll-Vo hash */
+static uint64_t mm_fnv1a_hash(const void *data, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t h = 14695981039346656037ULL; /* offset basis */
+    for (size_t i = 0; i < len; ++i) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ULL;            /* FNV prime    */
+    }
+    return h;
+}
+
+/* Resize hash table (called under write lock) */
+static int mm_cache_grow_table(mm_cache_t *c, size_t new_size)
+{
+    mm_cache_entry_t **new_tbl = calloc(new_size, sizeof(*new_tbl));
+    if (!new_tbl)
+        return ENOMEM;
+
+    if (c->table) {
+        for (size_t i = 0; i < c->tbl_size; ++i) {
+            mm_cache_entry_t *e = c->table[i];
+            if (!e) continue;
+
+            size_t idx = mm_fnv1a_hash(e->key, strlen(e->key)) & (new_size - 1);
+            while (new_tbl[idx])
+                idx = (idx + 1) & (new_size - 1);
+            new_tbl[idx] = e;
+        }
+        free(c->table);
+    }
+    c->table    = new_tbl;
+    c->tbl_size = new_size;
+    return 0;
+}
+
+/* Move entry to head (MRU) */
+static void mm_cache_lru_touch(mm_cache_t *c, mm_cache_entry_t *e)
+{
+    if (e == c->lru_head) return; /* already MRU */
+
+    /* detach */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (e == c->lru_tail) c->lru_tail = e->prev;
+
+    /* insert at head */
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+/* Evict until under capacity constraints */
+static void mm_cache_evict_if_needed(mm_cache_t *c, size_t add_bytes)
+{
+    while ( (c->entry_count >= c->max_entries) ||
+            (c->current_bytes + add_bytes > c->capacity_bytes) )
+    {
+        mm_cache_entry_t *victim = c->lru_tail;
+        if (!victim) break; /* Shouldn't happen */
+
+        /* Detach from list */
+        if (victim->prev) victim->prev->next = NULL;
+        c->lru_tail = victim->prev;
+        if (victim == c->lru_head)
+            c->lru_head = NULL;
+
+        /* Remove from hash table */
+        size_t idx = mm_fnv1a_hash(victim->key, strlen(victim->key)) & (c->tbl_size - 1);
+        while (c->table[idx] && c->table[idx] != victim)
+            idx = (idx + 1) & (c->tbl_size - 1);
+        if (c->table[idx] == victim)
+            c->table[idx] = NULL;
+
+        /* Rehash cluster to fill holes */
+        size_t j = (idx + 1) & (c->tbl_size - 1);
+        while (c->table[j]) {
+            mm_cache_entry_t *move = c->table[j];
+            c->table[j] = NULL;
+
+            size_t new_idx = mm_fnv1a_hash(move->key, strlen(move->key)) & (c->tbl_size - 1);
+            while (c->table[new_idx])
+                new_idx = (new_idx + 1) & (c->tbl_size - 1);
+            c->table[new_idx] = move;
+
+            j = (j + 1) & (c->tbl_size - 1);
+        }
+
+        c->entry_count--;
+        c->current_bytes -= victim->payload_len;
+        c->evictions++;
+
+        mm_log(LOG_DEBUG, "Cache evicted key=%s (payload=%zuB)", victim->key, victim->payload_len);
+
+        free(victim->key);
+        free(victim->payload);
+        free(victim->content_type);
+        free(victim->etag);
+        free(victim);
+
+        if (c->entry_count == 0)
+            break;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * UNIT TEST (compile with -DMM_CACHE_TEST)
+ * -------------------------------------------------------------------------*/
+#ifdef MM_CACHE_TEST
+
+#include <assert.h>
+
+int main(void)
+{
+    mm_cache_t cache;
+    assert(mm_cache_init(&cache, 128, 1024 * 1024) == 0);
+
+    const char *key = "GET /hello";
+    const char *body = "world";
+    assert(mm_cache_put(&cache, key, (const unsigned char *)body,
+                        strlen(body) + 1, "text/plain", "\"abc\"", 10) == 0);
+
+    unsigned char *out;
+    size_t len;
+    const char *ctype;
+    const char *etag;
+    int rc = mm_cache_get(&cache, key, &out, &len, &ctype, &etag, NULL);
+    assert(rc == 1);
+    assert(len == strlen(body) + 1);
+    assert(strcmp((char *)out, body) == 0);
+    free(out);
+
+    mm_cache_destroy(&cache);
+    puts("All cache unit tests passed.");
+    return 0;
+}
+#endif /* MM_CACHE_TEST */

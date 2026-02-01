@@ -1,0 +1,462 @@
+```rust
+// src/module_42.rs
+// ===============================================================
+// LedgerLink Nexus – Pagination & Cached Query Service Utilities
+//
+// This module encapsulates reusable components that power high-volume
+// list endpoints (REST & GraphQL) with first-class support for:
+//
+//  • Page/limit & cursor-based navigation
+//  • Data-level validation
+//  • Opt-in response caching via Redis
+//  • Structured error envelopes
+//  • Observability hooks (tracing)
+//
+// It is completely storage-agnostic from the business perspective but
+// ships with a reference implementation built on top of `sqlx`
+// (PostgreSQL) + `deadpool-redis`.
+// ===============================================================
+
+#![allow(clippy::module_name_repetitions)]
+#![allow(dead_code)]
+
+use std::fmt::{self, Display, Formatter};
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use deadpool_redis::{
+    redis::{AsyncCommands, FromRedisValue, ToRedisArgs},
+    Config as RedisCfg, Connection, Pool as RedisPool,
+};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sqlx::{PgPool, Postgres, QueryBuilder};
+use thiserror::Error;
+use tracing::{debug, instrument};
+use uuid::Uuid;
+use validator::Validate;
+
+// ===============================================================
+// Pagination DTOs & Utilities
+// ===============================================================
+
+/// Maximum page size allowed by the platform for defensive reasons.
+/// This may be overridden per-tenant via policy management, but the
+/// value below is sane for 99% of usages.
+pub const MAX_PAGE_SIZE: u16 = 250;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[serde(rename_all = "camelCase")]
+pub struct PageRequest {
+    /// 0-based index of the page to fetch.
+    #[validate(range(min = 0))]
+    pub page: u32,
+
+    /// Number of items per page.
+    #[validate(range(min = 1, max = "MAX_PAGE_SIZE"))]
+    pub size: u16,
+}
+
+impl Default for PageRequest {
+    fn default() -> Self {
+        Self { page: 0, size: 50 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageResponse<T> {
+    pub page: u32,
+    pub size: u16,
+    pub total: u64,
+    pub has_next: bool,
+    pub data: Vec<T>,
+}
+
+impl<T> PageResponse<T> {
+    #[must_use]
+    pub fn new(page: u32, size: u16, total: u64, data: Vec<T>) -> Self {
+        let has_next = (u64::from(page) + 1) * u64::from(size) < total;
+        Self {
+            page,
+            size,
+            total,
+            has_next,
+            data,
+        }
+    }
+}
+
+// ===============================================================
+// Error Abstractions
+// ===============================================================
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("validation failure: {0}")]
+    Validation(#[from] validator::ValidationErrors),
+
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+
+    #[error("cache error: {0}")]
+    Cache(#[from] deadpool_redis::redis::RedisError),
+
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+/// Wrapper type used for returning `Result<_, ServiceError>` more
+/// ergonomically.
+pub type ServiceResult<T> = Result<T, ServiceError>;
+
+// ===============================================================
+// Caching Layer
+// ===============================================================
+
+/// Safe-defaults cache TTL – can be tuned per request via
+/// `CacheConfig::with_ttl`.
+const DEFAULT_TTL_SECS: usize = 45;
+
+#[derive(Clone)]
+pub struct CacheConfig {
+    ttl_secs: usize,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            ttl_secs: DEFAULT_TTL_SECS,
+        }
+    }
+}
+
+impl CacheConfig {
+    #[must_use]
+    pub const fn with_ttl(ttl_secs: usize) -> Self {
+        Self { ttl_secs }
+    }
+}
+
+/// Opaque cache key new-type ensuring type-safe interactions with Redis.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CacheKey(String);
+
+impl Display for CacheKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl CacheKey {
+    /// Helper to generate a namespaced cache key for pagination queries.
+    #[must_use]
+    pub fn for_page<T: ?Sized + Serialize>(
+        namespace: &str,
+        tenant_id: Uuid,
+        payload: &T,
+        page_req: &PageRequest,
+    ) -> Self {
+        // Combine using JSON + base64 to guarantee deterministic ordering.
+        let payload_json = serde_json::to_string(payload).unwrap_or_default();
+        let hash = blake3::hash(payload_json.as_bytes()).to_hex();
+        let key = format!(
+            "llnx:{namespace}:{tenant_id}:{hash}:{page}:{size}",
+            namespace = namespace,
+            tenant_id = tenant_id,
+            hash = hash,
+            page = page_req.page,
+            size = page_req.size
+        );
+        Self(key)
+    }
+}
+
+impl ToRedisArgs for CacheKey {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + deadpool_redis::redis::RedisWrite,
+    {
+        out.write_arg(self.0.as_bytes())
+    }
+}
+
+impl FromRedisValue for CacheKey {
+    fn from_redis_value(v: &deadpool_redis::redis::Value) -> deadpool_redis::redis::RedisResult<Self> {
+        let s = String::from_redis_value(v)?;
+        Ok(Self(s))
+    }
+}
+
+/// Thin wrapper around `deadpool-redis::Pool` with TTL helpers.
+#[derive(Clone)]
+pub struct Cache {
+    pool: RedisPool,
+}
+
+impl Cache {
+    pub fn new(pool: RedisPool) -> Self {
+        Self { pool }
+    }
+
+    async fn get_conn(&self) -> ServiceResult<Connection> {
+        Ok(self.pool.get().await?)
+    }
+
+    /// Attempt to fetch & deserialize cached value. Returns `Ok(None)` on
+    /// cache miss.
+    pub async fn get<T>(&self, key: &CacheKey) -> ServiceResult<Option<T>>
+    where
+        T: DeserializeOwned,
+    {
+        let mut conn = self.get_conn().await?;
+        let raw: Option<String> = conn.get(key).await?;
+        match raw {
+            Some(json) => {
+                let value = serde_json::from_str(&json)?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Serialize and store value with configured TTL.
+    pub async fn set<T>(&self, key: &CacheKey, value: &T, cfg: CacheConfig) -> ServiceResult<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        let mut conn = self.get_conn().await?;
+        let json = serde_json::to_string(value)?;
+        conn.set_ex::<_, _, ()>(key, json, cfg.ttl_secs).await?;
+        Ok(())
+    }
+}
+
+// ===============================================================
+// Domain Model – Ledger Entries (simplified excerpt)
+// ===============================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub account_id: Uuid,
+    pub amount: rust_decimal::Decimal,
+    pub currency: String,
+    pub tx_time: DateTime<Utc>,
+    pub description: Option<String>,
+}
+
+// ===============================================================
+// Repository Layer
+// ===============================================================
+
+#[async_trait]
+pub trait LedgerEntryRepository: Send + Sync + 'static {
+    async fn count_by_account(
+        &self,
+        tenant_id: Uuid,
+        account_id: Uuid,
+    ) -> Result<i64, sqlx::Error>;
+
+    async fn fetch_page_by_account(
+        &self,
+        tenant_id: Uuid,
+        account_id: Uuid,
+        page_req: &PageRequest,
+    ) -> Result<Vec<LedgerEntry>, sqlx::Error>;
+}
+
+/// Postgres implementation leveraging `sqlx`’s query builder.
+pub struct PgLedgerEntryRepository {
+    pool: PgPool,
+}
+
+impl PgLedgerEntryRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryRepository for PgLedgerEntryRepository {
+    #[instrument(skip(self))]
+    async fn count_by_account(
+        &self,
+        tenant_id: Uuid,
+        account_id: Uuid,
+    ) -> Result<i64, sqlx::Error> {
+        let row: (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*) FROM ledger_entries
+            WHERE tenant_id = $1 AND account_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(account_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    #[instrument(skip(self, page_req))]
+    async fn fetch_page_by_account(
+        &self,
+        tenant_id: Uuid,
+        account_id: Uuid,
+        page_req: &PageRequest,
+    ) -> Result<Vec<LedgerEntry>, sqlx::Error> {
+        let offset = i64::from(page_req.page) * i64::from(page_req.size);
+        sqlx::query_as::<_, LedgerEntry>(
+            r#"
+            SELECT * FROM ledger_entries
+            WHERE tenant_id = $1 AND account_id = $2
+            ORDER BY tx_time DESC, id DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(account_id)
+        .bind(i64::from(page_req.size))
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+    }
+}
+
+// ===============================================================
+// Service Layer
+// ===============================================================
+
+#[async_trait]
+pub trait LedgerEntryService: Send + Sync + 'static {
+    async fn list_by_account(
+        &self,
+        tenant_id: Uuid,
+        account_id: Uuid,
+        page_req: PageRequest,
+        cache_cfg: Option<CacheConfig>,
+    ) -> ServiceResult<PageResponse<LedgerEntry>>;
+}
+
+/// Concrete service with Redis-backed optional caching.
+pub struct LedgerEntryServiceImpl<R: LedgerEntryRepository> {
+    repo: Arc<R>,
+    cache: Option<Cache>,
+}
+
+impl<R: LedgerEntryRepository> LedgerEntryServiceImpl<R> {
+    pub fn new(repo: Arc<R>, cache: Option<Cache>) -> Self {
+        Self { repo, cache }
+    }
+}
+
+#[async_trait]
+impl<R: LedgerEntryRepository> LedgerEntryService for LedgerEntryServiceImpl<R> {
+    #[instrument(skip(self, page_req, cache_cfg))]
+    async fn list_by_account(
+        &self,
+        tenant_id: Uuid,
+        account_id: Uuid,
+        page_req: PageRequest,
+        cache_cfg: Option<CacheConfig>,
+    ) -> ServiceResult<PageResponse<LedgerEntry>> {
+        // 1. Validate request upfront.
+        page_req.validate()?;
+
+        // 2. Build cache key –
+        //    NB: We intentionally exclude TTL from the key to ensure
+        //    identical requests map to identical keys.
+        let cache_key = CacheKey::for_page(
+            "ledger_entries",
+            tenant_id,
+            &account_id,
+            &page_req,
+        );
+
+        // 3. Short-circuit when caching enabled and hit.
+        if let (Some(cache), Some(cfg)) = (&self.cache, &cache_cfg) {
+            if let Some(page) = cache.get::<PageResponse<LedgerEntry>>(&cache_key).await? {
+                debug!("cache hit for {cache_key}");
+                return Ok(page);
+            }
+        }
+
+        // 4. Execute queries against repository.
+        let total = self
+            .repo
+            .count_by_account(tenant_id, account_id)
+            .await
+            .map(|v| v as u64)?;
+        let entries = self
+            .repo
+            .fetch_page_by_account(tenant_id, account_id, &page_req)
+            .await?;
+
+        let response = PageResponse::new(page_req.page, page_req.size, total, entries);
+
+        // 5. Hydrate cache if requested.
+        if let (Some(cache), Some(cfg)) = (&self.cache, cache_cfg) {
+            cache.set(&cache_key, &response, cfg).await?;
+            debug!(
+                "cached page {} for key {cache_key} (ttl={}s)",
+                page_req.page, cfg.ttl_secs
+            );
+        }
+
+        Ok(response)
+    }
+}
+
+// ===============================================================
+// Redis Pool Utility
+// ===============================================================
+
+/// Factory function to bootstrap `deadpool-redis` based on application
+/// settings, environment variables, or secret management.
+pub fn build_redis_pool(cfg: &RedisCfg) -> anyhow::Result<RedisPool> {
+    let pool = cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))?;
+    Ok(pool)
+}
+
+// ===============================================================
+// Tests (requires `sqlx::test` feature + local Postgres/Redis)
+// ===============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deadpool_redis::Runtime;
+    use sqlx::Executor;
+
+    #[tokio::test]
+    async fn cache_roundtrip() -> anyhow::Result<()> {
+        // -- Redis setup -----------------------------------------------------
+        let mut redis_cfg = RedisCfg::default();
+        redis_cfg.url = Some("redis://127.0.0.1/".into());
+        let cache = Cache::new(build_redis_pool(&redis_cfg)?);
+        let key = CacheKey("unit-test-key".into());
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+        struct Dummy {
+            foo: String,
+        }
+        let obj = Dummy {
+            foo: "bar".into(),
+        };
+
+        cache
+            .set(&key, &obj, CacheConfig::with_ttl(5))
+            .await
+            .expect("set ok");
+        let fetched: Option<Dummy> = cache.get(&key).await?;
+        assert_eq!(Some(obj), fetched);
+        Ok(())
+    }
+
+    // Note: Database integration tests would be added here using
+    // `sqlx::test` macro when a Postgres instance is available.
+}
+```

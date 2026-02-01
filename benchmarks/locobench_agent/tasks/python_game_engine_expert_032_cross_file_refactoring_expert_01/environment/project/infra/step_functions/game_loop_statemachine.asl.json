@@ -1,0 +1,324 @@
+```python
+"""
+LedgerQuest Engine – Game-Loop State-Machine Definition
+------------------------------------------------------
+
+This module builds and (optionally) deploys the core game-loop AWS Step Functions
+state machine used by the LedgerQuest Engine.  The state machine orchestrates
+each frame-tick by invoking small, stateless Lambda functions that operate on
+externalised entity data (DynamoDB, S3, etc.).  The design embraces the classic
+game-loop phases—input, AI, physics, rendering, and persistence—while staying
+completely serverless and horizontally scalable.
+
+Why is this file a *.asl.json in source control but a Python module here?
+---------------------------------------------------------------------------
+The CI pipeline expects a pure ASL JSON file in `infra/step_functions`, but
+authoring complex ASL by hand is error-prone.  This Python module generates the
+same JSON deterministically, enables compile-time linting, strong typing, and
+unit tests, and can even bootstrap/deploy the state machine via `boto3`.
+
+Running the module directly will:
+    1. Emit the ASL JSON to the canonical path expected by CDK/Terraform.
+    2. Optionally create/update the Step Function in the target AWS account
+       when the `--deploy` flag is provided.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict
+
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
+
+# --------------------------------------------------------------------------- #
+# Configuration dataclass                                                     #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class LambdaArns:
+    """Fully-qualified ARNs for the Lambda functions invoked by the state machine."""
+
+    process_input: str
+    update_ai: str
+    physics_step: str
+    render_frame: str
+    persist_state: str
+
+
+@dataclass(frozen=True)
+class GameLoopStateMachineConfig:
+    """
+    All inputs required to generate and/or deploy the state machine definition.
+    """
+
+    lambda_arns: LambdaArns
+    role_arn: str  # IAM role assumed by Step Functions
+    state_machine_name: str = "LedgerQuest-GameLoop"
+    tick_rate_hz: int = 30  # Target number of game-loop iterations per second
+
+    # Output path for the generated ASL file (overridden in CI for artefact store)
+    output_path: Path = Path(__file__).with_suffix(".asl.json")
+
+
+# --------------------------------------------------------------------------- #
+# State machine builder                                                       #
+# --------------------------------------------------------------------------- #
+
+
+def _seconds_per_tick(tick_rate_hz: int) -> float:
+    """Small helper to convert a tick rate to a Step Functions-compatible duration."""
+    return max(1.0 / tick_rate_hz, 0.001)  # SFN minimum is 0.001 seconds
+
+
+def build_state_machine(cfg: GameLoopStateMachineConfig) -> Dict[str, Any]:
+    """
+    Return the Amazon States Language (ASL) document for the LedgerQuest game loop.
+
+    The state machine is intentionally linear and deterministic to guarantee
+    strict ordering of mutations against entity state in DynamoDB.
+    """
+    # Shorthand for readability
+    lbd = cfg.lambda_arns
+
+    seconds_per_tick = _seconds_per_tick(cfg.tick_rate_hz)
+
+    definition = {
+        "Comment": "LedgerQuest Engine – Single-Shard Game Loop.",
+        "StartAt": "InitializeFrame",
+        "Version": "1.0",
+        "TimeoutSeconds": 60,
+        "States": {
+            "InitializeFrame": {
+                "Type": "Pass",
+                "ResultPath": "$.metadata",
+                "Result": {
+                    "frameStartEpochMs.$": "$$.State.EnteredTime",
+                    "tickRateHz": cfg.tick_rate_hz,
+                },
+                "Next": "ProcessInput",
+            },
+            "ProcessInput": _lambda_task_state(
+                name="ProcessInput",
+                function_arn=lbd.process_input,
+                next_state="UpdateAI",
+            ),
+            "UpdateAI": _lambda_task_state(
+                name="UpdateAI",
+                function_arn=lbd.update_ai,
+                next_state="PhysicsStep",
+            ),
+            "PhysicsStep": _lambda_task_state(
+                name="PhysicsStep",
+                function_arn=lbd.physics_step,
+                next_state="RenderFrame",
+            ),
+            "RenderFrame": _lambda_task_state(
+                name="RenderFrame",
+                function_arn=lbd.render_frame,
+                next_state="PersistState",
+            ),
+            "PersistState": _lambda_task_state(
+                name="PersistState",
+                function_arn=lbd.persist_state,
+                next_state="WaitForNextTick",
+            ),
+            "WaitForNextTick": {
+                "Type": "Wait",
+                "Seconds": seconds_per_tick,
+                "Next": "LoopDecider",
+            },
+            "LoopDecider": {
+                "Type": "Choice",
+                "Choices": [
+                    {
+                        "Variable": "$.continue",
+                        "BooleanEquals": True,
+                        "Next": "InitializeFrame",
+                    }
+                ],
+                "Default": "GameFinished",
+            },
+            "GameFinished": {
+                "Type": "Succeed",
+                "Comment": "Game ended normally.",
+            },
+        },
+    }
+    return definition
+
+
+def _lambda_task_state(
+    *, name: str, function_arn: str, next_state: str
+) -> Dict[str, Any]:
+    """
+    DRY helper to create a Lambda task state with common error handling and
+    exponential back-off strategy.
+    """
+    return {
+        "Type": "Task",
+        "Resource": "arn:aws:states:::lambda:invoke",
+        "Parameters": {
+            "FunctionName": function_arn,
+            "Payload.$": "$",
+        },
+        "TimeoutSeconds": 10,
+        "Retry": [
+            {
+                "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6,
+                "BackoffRate": 2.0,
+            }
+        ],
+        "Catch": [
+            {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.error",
+                "Next": "GameFinished",
+            }
+        ],
+        "Next": next_state,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# JSON emission & deployment helpers                                          #
+# --------------------------------------------------------------------------- #
+
+
+def write_asl(cfg: GameLoopStateMachineConfig, definition: Dict[str, Any]) -> None:
+    """Persist the generated ASL to disk (pretty-printed and sorted)."""
+    cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
+    with cfg.output_path.open("w", encoding="utf-8") as fp:
+        json.dump(definition, fp, indent=2, sort_keys=True)
+    logging.info("Wrote state-machine ASL to %s", cfg.output_path)
+
+
+def deploy_state_machine(cfg: GameLoopStateMachineConfig, definition: Dict[str, Any]) -> None:
+    """
+    Create or update the Step Function in AWS, idempotently.
+
+    Requires AWS credentials configured via environment variables, instance
+    profile, or ~/.aws/credentials.
+    """
+    client = boto3.client("stepfunctions")
+
+    # Attempt to find an existing state machine by name.
+    try:
+        paginator = client.get_paginator("list_state_machines")
+        for page in paginator.paginate():
+            match = next(
+                (sm for sm in page["stateMachines"] if sm["name"] == cfg.state_machine_name),
+                None,
+            )
+            if match:
+                _update_state_machine(client, match["stateMachineArn"], cfg, definition)
+                return
+    except (BotoCoreError, ClientError) as ex:
+        logging.error("Unable to list Step Functions: %s", ex)
+        raise SystemExit(2)
+
+    # Not found → create new
+    try:
+        resp = client.create_state_machine(
+            name=cfg.state_machine_name,
+            definition=json.dumps(definition),
+            roleArn=cfg.role_arn,
+            type="STANDARD",  # or "EXPRESS" if latency is critical
+            tags=[{"key": "Project", "value": "LedgerQuest"}],
+        )
+        logging.info("Created new state machine %s", resp["stateMachineArn"])
+    except (BotoCoreError, ClientError) as ex:
+        logging.error("Unable to create Step Function: %s", ex)
+        raise SystemExit(2)
+
+
+def _update_state_machine(
+    client: "boto3.client",
+    state_machine_arn: str,
+    cfg: GameLoopStateMachineConfig,
+    definition: Dict[str, Any],
+) -> None:
+    """Helper to update an existing state machine with a new definition."""
+    try:
+        client.update_state_machine(
+            stateMachineArn=state_machine_arn,
+            definition=json.dumps(definition),
+            roleArn=cfg.role_arn,
+        )
+        logging.info("Updated existing state machine %s", state_machine_arn)
+    except (BotoCoreError, ClientError) as ex:
+        logging.error("Unable to update Step Function: %s", ex)
+        raise SystemExit(2)
+
+
+# --------------------------------------------------------------------------- #
+# CLI                                                                         #
+# --------------------------------------------------------------------------- #
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate & deploy LedgerQuest game-loop state machine.")
+    parser.add_argument("--process-input-arn", required=True, help="Lambda ARN for the input-processing task")
+    parser.add_argument("--update-ai-arn", required=True, help="Lambda ARN for the AI update task")
+    parser.add_argument("--physics-step-arn", required=True, help="Lambda ARN for the physics step task")
+    parser.add_argument("--render-frame-arn", required=True, help="Lambda ARN for the frame rendering task")
+    parser.add_argument("--persist-state-arn", required=True, help="Lambda ARN for the state persistence task")
+    parser.add_argument("--iam-role-arn", required=True, help="IAM role ARN assumed by Step Functions")
+    parser.add_argument("--tick-rate", type=int, default=30, help="Target ticks per second (default 30)")
+    parser.add_argument("--state-machine-name", default="LedgerQuest-GameLoop")
+    parser.add_argument("--output", type=Path, help="Override output path for the ASL JSON")
+    parser.add_argument("--deploy", action="store_true", help="Create/Update the state machine in AWS")
+    parser.add_argument("-v", "--verbose", action="count", default=0)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s  %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    cfg = GameLoopStateMachineConfig(
+        lambda_arns=LambdaArns(
+            process_input=args.process_input_arn,
+            update_ai=args.update_ai_arn,
+            physics_step=args.physics_step_arn,
+            render_frame=args.render_frame_arn,
+            persist_state=args.persist_state_arn,
+        ),
+        role_arn=args.iam_role_arn,
+        state_machine_name=args.state_machine_name,
+        tick_rate_hz=args.tick_rate,
+        output_path=args.output or GameLoopStateMachineConfig.output_path,
+    )
+
+    definition = build_state_machine(cfg)
+    write_asl(cfg, definition)
+
+    if args.deploy:
+        deploy_state_machine(cfg, definition)
+
+
+if __name__ == "__main__":
+    # Sanity check that AWS credentials exist *before* building anything
+    if "AWS_REGION" not in os.environ and "AWS_DEFAULT_REGION" not in os.environ:
+        os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+        logging.warning("AWS region not specified; defaulting to us-east-1")
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.error("Interrupted by user")
+        sys.exit(130)
+```

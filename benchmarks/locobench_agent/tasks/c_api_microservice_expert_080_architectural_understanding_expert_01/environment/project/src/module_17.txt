@@ -1,0 +1,422 @@
+/*
+ * MercuryMonolith Commerce Hub
+ * --------------------------------
+ * src/module_17.txt  (pretend .c)
+ *
+ * Response Cache (LRU + TTL)
+ *
+ * This module provides a thread–safe, in-memory response cache that is used by the
+ * API gateway layer to accelerate frequently-requested resources (e.g., catalog
+ * look-ups, configuration, and low-volatility reference data).  It exposes a small
+ * surface area that can be consumed by higher-level middleware without leaking
+ * implementation details.
+ *
+ * Dependencies:
+ *      - pthread (native)
+ *      - uthash  (single-header hash table — https://troydhanson.github.io/uthash/)
+ *
+ * The module is completely self-contained; external project types (mm_logger_t,
+ * mm_metrics_t, mm_buffer_t) are forward-declared with minimal interfaces so that
+ * this file can be dropped into the larger code-base without modification.
+ */
+
+#include <pthread.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <time.h>
+
+/* 3rd-party single-header hash table */
+#include "uthash.h"
+
+/* ──────────────────────────────────────────────────────────────────────────────
+ * Forward declarations to avoid tight coupling with the rest of the code-base.
+ * In the real project these come from <mm_logging.h>, <mm_metrics.h>,
+ * <mm_buffer.h>, etc.
+ * ──────────────────────────────────────────────────────────────────────────── */
+typedef enum {
+    MM_LOG_TRACE = 0,
+    MM_LOG_DEBUG,
+    MM_LOG_INFO,
+    MM_LOG_WARN,
+    MM_LOG_ERROR,
+    MM_LOG_FATAL
+} mm_log_level_t;
+
+typedef struct mm_logger {
+    void (*log)(struct mm_logger *self, mm_log_level_t lvl,
+                const char *fmt, ...) __attribute__((format(printf,3,4)));
+} mm_logger_t;
+
+typedef struct mm_metrics {
+    void (*inc_counter)(struct mm_metrics *self, const char *name);
+    void (*observe_histogram)(struct mm_metrics *self, const char *name,
+                              double value);
+} mm_metrics_t;
+
+/* Simple, ref-counted byte buffer used throughout the monolith. */
+typedef struct mm_buffer {
+    uint8_t *data;
+    size_t   len;
+    uint32_t refcnt;
+} mm_buffer_t;
+
+/* Buffer helpers */
+static mm_buffer_t *mm_buffer_new(const void *src, size_t len)
+{
+    mm_buffer_t *b = malloc(sizeof *b);
+    if (!b) return NULL;
+    b->data = malloc(len);
+    if (!b->data) { free(b); return NULL; }
+    memcpy(b->data, src, len);
+    b->len = len;
+    b->refcnt = 1;
+    return b;
+}
+
+static mm_buffer_t *mm_buffer_clone(mm_buffer_t *orig)
+{
+    if (orig) __sync_add_and_fetch(&orig->refcnt, 1);
+    return orig;
+}
+
+static void mm_buffer_release(mm_buffer_t *buf)
+{
+    if (!buf) return;
+    if (__sync_sub_and_fetch(&buf->refcnt, 1) == 0) {
+        free(buf->data);
+        free(buf);
+    }
+}
+/* ──────────────────────────────────────────────────────────────────────────── */
+
+typedef struct cache_entry {
+    char             *key;         /* UTF-8 route + query string */
+    mm_buffer_t      *value;       /* Cached HTTP/GraphQL payload */
+    time_t            created_at;  /* Epoch seconds (monotonic not req.) */
+
+    struct cache_entry *prev;      /* LRU doubly-linked list pointers */
+    struct cache_entry *next;
+
+    UT_hash_handle     hh;         /* uthash linkage */
+} cache_entry_t;
+
+typedef struct mm_response_cache {
+    cache_entry_t  *table;         /* Hash table (key → cache_entry)     */
+    cache_entry_t  *lru_head;      /* Most recently used                 */
+    cache_entry_t  *lru_tail;      /* Least recently used                */
+
+    size_t          count;         /* # of live entries                  */
+    size_t          capacity;      /* Hard limit                         */
+    uint32_t        ttl;           /* Seconds until expiry               */
+
+    pthread_rwlock_t lock;         /* Reader–writer lock                 */
+
+    mm_logger_t    *logger;        /* External structured logger         */
+    mm_metrics_t   *metrics;       /* Metrics collector (Prometheus)     */
+} mm_response_cache_t;
+
+/* Public API ──────────────────────────────────────────────────────────────── */
+mm_response_cache_t *
+mm_cache_create(size_t capacity, uint32_t ttl_seconds,
+                mm_logger_t *logger, mm_metrics_t *metrics);
+
+void mm_cache_destroy(mm_response_cache_t *cache);
+
+bool mm_cache_get(mm_response_cache_t *cache,
+                  const char *key, mm_buffer_t **out_buf);
+
+bool mm_cache_put(mm_response_cache_t *cache,
+                  const char *key, const void *payload, size_t len);
+
+void mm_cache_prune(mm_response_cache_t *cache); /* manual house-keeping */
+
+/* Internal helpers ────────────────────────────────────────────────────────── */
+static void     lru_move_to_front(mm_response_cache_t *c, cache_entry_t *e);
+static void     lru_evict_tail(mm_response_cache_t *c);
+static void     detach_node(mm_response_cache_t *c, cache_entry_t *e);
+static void     attach_front(mm_response_cache_t *c, cache_entry_t *e);
+static time_t   now_sec(void);
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * IMPLEMENTATION
+ * ────────────────────────────────────────────────────────────────────────── */
+
+mm_response_cache_t *
+mm_cache_create(size_t capacity, uint32_t ttl_seconds,
+                mm_logger_t *logger, mm_metrics_t *metrics)
+{
+    mm_response_cache_t *c = calloc(1, sizeof *c);
+    if (!c) return NULL;
+
+    c->capacity = capacity ? capacity : 1024; /* default if 0 */
+    c->ttl      = ttl_seconds ? ttl_seconds : 60;
+    c->logger   = logger;
+    c->metrics  = metrics;
+
+    pthread_rwlock_init(&c->lock, NULL);
+
+    if (logger && logger->log)
+        logger->log(logger, MM_LOG_INFO,
+                    "[cache] Initialized (capacity=%zu, ttl=%u)",
+                    c->capacity, c->ttl);
+    return c;
+}
+
+void mm_cache_destroy(mm_response_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_rwlock_wrlock(&c->lock);
+
+    cache_entry_t *cur, *tmp;
+    HASH_ITER(hh, c->table, cur, tmp) {
+        HASH_DEL(c->table, cur);
+        mm_buffer_release(cur->value);
+        free(cur->key);
+        free(cur);
+    }
+
+    pthread_rwlock_unlock(&c->lock);
+    pthread_rwlock_destroy(&c->lock);
+    free(c);
+}
+
+bool mm_cache_get(mm_response_cache_t *c,
+                  const char *key, mm_buffer_t **out_buf)
+{
+    if (!c || !key || !out_buf) return false;
+
+    bool hit = false;
+
+    /* Acquire read lock first (optimistic) */
+    pthread_rwlock_rdlock(&c->lock);
+
+    cache_entry_t *e;
+    HASH_FIND_STR(c->table, key, e);
+    if (e && (now_sec() - e->created_at <= c->ttl)) {
+        *out_buf = mm_buffer_clone(e->value);
+        hit = true;
+    }
+
+    pthread_rwlock_unlock(&c->lock);
+
+    /* If hit, we still need to move the node to front (requires write lock) */
+    if (hit) {
+        pthread_rwlock_wrlock(&c->lock);
+        HASH_FIND_STR(c->table, key, e);
+        if (e) lru_move_to_front(c, e);
+        pthread_rwlock_unlock(&c->lock);
+
+        if (c->metrics && c->metrics->inc_counter)
+            c->metrics->inc_counter(c->metrics, "cache_hits");
+
+        return true;
+    }
+
+    /* Cache miss or expired entry (handle expire under write lock) */
+    pthread_rwlock_wrlock(&c->lock);
+
+    HASH_FIND_STR(c->table, key, e);
+    if (e && (now_sec() - e->created_at > c->ttl)) {
+        /* Expired — remove */
+        if (c->logger && c->logger->log)
+            c->logger->log(c->logger, MM_LOG_DEBUG,
+                            "[cache] Expired entry '%s'", key);
+
+        detach_node(c, e);
+        HASH_DEL(c->table, e);
+        mm_buffer_release(e->value);
+        free(e->key);
+        free(e);
+        c->count--;
+    }
+
+    pthread_rwlock_unlock(&c->lock);
+
+    if (c->metrics && c->metrics->inc_counter)
+        c->metrics->inc_counter(c->metrics, "cache_misses");
+
+    return false;
+}
+
+bool mm_cache_put(mm_response_cache_t *c,
+                  const char *key, const void *payload, size_t len)
+{
+    if (!c || !key || !payload || !len) return false;
+
+    /* Allocate entry before locking to keep lock duration minimal */
+    cache_entry_t *e = calloc(1, sizeof *e);
+    if (!e) return false;
+
+    e->key = strdup(key);
+    e->value = mm_buffer_new(payload, len);
+    e->created_at = now_sec();
+    if (!e->key || !e->value) {
+        free(e->key);
+        mm_buffer_release(e->value);
+        free(e);
+        return false;
+    }
+
+    pthread_rwlock_wrlock(&c->lock);
+
+    cache_entry_t *existing;
+    HASH_FIND_STR(c->table, key, existing);
+    if (existing) {
+        /* Replace */
+        detach_node(c, existing);
+        HASH_DEL(c->table, existing);
+        mm_buffer_release(existing->value);
+        free(existing->key);
+        free(existing);
+        c->count--;
+    }
+
+    HASH_ADD_KEYPTR(hh, c->table, e->key, strlen(e->key), e);
+    attach_front(c, e);
+    c->count++;
+
+    if (c->count > c->capacity)
+        lru_evict_tail(c);
+
+    pthread_rwlock_unlock(&c->lock);
+
+    if (c->metrics && c->metrics->inc_counter)
+        c->metrics->inc_counter(c->metrics, "cache_insert");
+
+    return true;
+}
+
+void mm_cache_prune(mm_response_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_rwlock_wrlock(&c->lock);
+
+    cache_entry_t *cur, *tmp;
+    time_t now = now_sec();
+    size_t removed = 0;
+
+    HASH_ITER(hh, c->table, cur, tmp) {
+        if ((now - cur->created_at) > c->ttl) {
+            detach_node(c, cur);
+            HASH_DEL(c->table, cur);
+            mm_buffer_release(cur->value);
+            free(cur->key);
+            free(cur);
+            c->count--;
+            removed++;
+        }
+    }
+
+    pthread_rwlock_unlock(&c->lock);
+
+    if (removed && c->logger && c->logger->log)
+        c->logger->log(c->logger, MM_LOG_INFO,
+                        "[cache] Pruned %zu expired entries", removed);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Internal helpers
+ * ────────────────────────────────────────────────────────────────────────── */
+
+static inline time_t now_sec(void)
+{
+    return time(NULL);
+}
+
+static void detach_node(mm_response_cache_t *c, cache_entry_t *e)
+{
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+
+    if (c->lru_head == e) c->lru_head = e->next;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    e->prev = e->next = NULL;
+}
+
+static void attach_front(mm_response_cache_t *c, cache_entry_t *e)
+{
+    e->next = c->lru_head;
+    e->prev = NULL;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+static void lru_move_to_front(mm_response_cache_t *c, cache_entry_t *e)
+{
+    if (c->lru_head == e) return; /* already front */
+    detach_node(c, e);
+    attach_front(c, e);
+}
+
+static void lru_evict_tail(mm_response_cache_t *c)
+{
+    if (!c->lru_tail) return;
+
+    cache_entry_t *victim = c->lru_tail;
+
+    if (c->logger && c->logger->log)
+        c->logger->log(c->logger, MM_LOG_DEBUG,
+                        "[cache] Evicting LRU '%s'", victim->key);
+
+    detach_node(c, victim);
+    HASH_DEL(c->table, victim);
+    mm_buffer_release(victim->value);
+    free(victim->key);
+    free(victim);
+    c->count--;
+
+    if (c->metrics && c->metrics->inc_counter)
+        c->metrics->inc_counter(c->metrics, "cache_evictions");
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Self-test (compile with -DMM_CACHE_UNIT_TEST)
+ * ────────────────────────────────────────────────────────────────────────── */
+#ifdef MM_CACHE_UNIT_TEST
+static void dummy_log(mm_logger_t *self, mm_log_level_t lvl, const char *fmt, ...)
+{
+    (void)self;(void)lvl;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+}
+
+static void dummy_inc(mm_metrics_t *self, const char *name)
+{ (void)self; fprintf(stderr, "[metric] %s++\n", name); }
+
+static void dummy_obs(mm_metrics_t *self, const char *name, double v)
+{ (void)self; fprintf(stderr, "[metric] %s=%f\n", name, v); }
+
+int main(void)
+{
+    mm_logger_t logger = { .log = dummy_log };
+    mm_metrics_t metrics = { .inc_counter = dummy_inc,
+                             .observe_histogram = dummy_obs };
+
+    mm_response_cache_t *c = mm_cache_create(4, 2, &logger, &metrics);
+
+    mm_cache_put(c, "/ping", "pong", 4);
+    mm_cache_put(c, "/hello", "world", 5);
+
+    mm_buffer_t *buf;
+    if (mm_cache_get(c, "/ping", &buf)) {
+        fwrite(buf->data, 1, buf->len, stdout);
+        putchar('\n');
+        mm_buffer_release(buf);
+    }
+
+    sleep(3);
+    mm_cache_get(c, "/ping", &buf); /* should miss (expired) */
+
+    mm_cache_destroy(c);
+    return 0;
+}
+#endif

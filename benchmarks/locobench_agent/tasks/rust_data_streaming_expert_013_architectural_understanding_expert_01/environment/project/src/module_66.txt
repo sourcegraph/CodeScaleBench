@@ -1,0 +1,390 @@
+```rust
+//! module_66 – Dynamic, strategy-based real-time analysis stage
+//!
+//! This module owns the “hot-swappable analysis” micro-service.  
+//! It consumes a Kafka topic that carries `EnrichedEvent`s and, using the
+//! Strategy Pattern, executes a pluggable `Analyzer` implementation selected
+//! at run time from config (or toggled live through an internal channel).
+//!
+//! The code purposefully keeps hard dependencies (Kafka, async runtime, JSON
+//! serialization, metrics) but abstracts over them so the surrounding project
+//! can wire mocks for integration tests.
+
+// --------  External crates  -------------------------------------------------
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use log::{error, info, warn};
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    message::BorrowedMessage,
+    ClientConfig, Message,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as Json;
+use std::{collections::HashMap, sync::Arc};
+use tokio::{
+    select,
+    sync::{broadcast, RwLock},
+    task::JoinHandle,
+};
+
+// --------  Public exports  --------------------------------------------------
+pub use analyzer::{Analyzer, AnalyzerFactory, DynAnalyzer};
+pub use config::{AnalyzerKind, AnalyzerReloadMsg};
+pub use processor::{AnalysisProcessor, ProcessorHandle};
+
+// --------  Constants / types  ----------------------------------------------
+const KAFKA_GROUP_ID: &str = "chirp-pulse.analysis";
+const ANALYSIS_TOPIC: &str = "chirp.enriched";
+
+// --------  Domain structs  --------------------------------------------------
+#[derive(Debug, Deserialize)]
+pub struct EnrichedEvent {
+    pub id: String,
+    pub network: String,
+    pub lang: String,
+    pub text: String,
+    pub metadata: Json,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Output structure emitted after analysis
+#[derive(Debug, Serialize)]
+pub struct AnalysisResult {
+    pub event_id: String,
+    pub analyzer: String,
+    /// A score between 0.0–1.0
+    pub score: f64,
+    /// Optional additional payload
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<Json>,
+    pub processed_at: DateTime<Utc>,
+}
+
+// ============================================================================
+//  Strategy Pattern: Analyzer trait + implementations
+// ============================================================================
+mod analyzer {
+    use super::*;
+    use std::time::Instant;
+
+    /// A trait implemented by any run-time selectable analyzer
+    #[async_trait]
+    pub trait Analyzer: Send + Sync + 'static {
+        /// Human-readable name (unique)
+        fn name(&self) -> &str;
+
+        /// Perform analysis synchronously or asynchronously.
+        async fn analyze(&self, event: &EnrichedEvent) -> Result<AnalysisResult>;
+
+        /// Optional metric hook
+        fn record_latency(&self, _duration_ms: u128) {}
+    }
+
+    pub type DynAnalyzer = Arc<dyn Analyzer>;
+
+    // ------------------------------------------------------------------------
+    // Sentiment analysis ‑ demo / placeholder
+    // ------------------------------------------------------------------------
+    pub struct SentimentAnalyzer;
+
+    #[async_trait]
+    impl Analyzer for SentimentAnalyzer {
+        fn name(&self) -> &str {
+            "sentiment"
+        }
+
+        async fn analyze(&self, event: &EnrichedEvent) -> Result<AnalysisResult> {
+            let started = Instant::now();
+
+            // A toy algorithm: positive words minus negative words
+            static POSITIVE: &[&str] = &["good", "great", "love", "happy", "win"];
+            static NEGATIVE: &[&str] = &["bad", "hate", "sad", "angry", "loss"];
+
+            let text = event.text.to_lowercase();
+            let mut score: f64 = 0.5; // neutral baseline
+
+            for p in POSITIVE {
+                if text.contains(p) {
+                    score += 0.1;
+                }
+            }
+            for n in NEGATIVE {
+                if text.contains(n) {
+                    score -= 0.1;
+                }
+            }
+            score = score.clamp(0.0, 1.0);
+
+            let res = AnalysisResult {
+                event_id: event.id.clone(),
+                analyzer: self.name().to_string(),
+                score,
+                extra: None,
+                processed_at: Utc::now(),
+            };
+
+            self.record_latency(started.elapsed().as_millis());
+            Ok(res)
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Toxicity scoring ‑ demo / placeholder
+    // ------------------------------------------------------------------------
+    pub struct ToxicityAnalyzer;
+
+    #[async_trait]
+    impl Analyzer for ToxicityAnalyzer {
+        fn name(&self) -> &str {
+            "toxicity"
+        }
+
+        async fn analyze(&self, event: &EnrichedEvent) -> Result<AnalysisResult> {
+            let started = Instant::now();
+            // Another toy algorithm: count expletives
+            static BAD_WORDS: &[&str] = &["damn", "crap", "darn", "shit", "fuck"];
+
+            let text = event.text.to_lowercase();
+            let hits = BAD_WORDS.iter().filter(|w| text.contains(**w)).count();
+            // Map to score: each hit adds 0.2 toxicity
+            let mut score = hits as f64 * 0.2;
+            score = score.clamp(0.0, 1.0);
+
+            let res = AnalysisResult {
+                event_id: event.id.clone(),
+                analyzer: self.name().to_string(),
+                score,
+                extra: Some(json!({ "bad_word_hits": hits })),
+                processed_at: Utc::now(),
+            };
+
+            self.record_latency(started.elapsed().as_millis());
+            Ok(res)
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Factory & registry
+    // ------------------------------------------------------------------------
+    #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AnalyzerKind {
+        Sentiment,
+        Toxicity,
+    }
+
+    impl From<AnalyzerKind> for DynAnalyzer {
+        fn from(kind: AnalyzerKind) -> Self {
+            match kind {
+                AnalyzerKind::Sentiment => Arc::new(SentimentAnalyzer),
+                AnalyzerKind::Toxicity => Arc::new(ToxicityAnalyzer),
+            }
+        }
+    }
+
+    /// Thread-safe factory that holds a registry + maybe extra metadata
+    pub struct AnalyzerFactory {
+        cache: RwLock<HashMap<AnalyzerKind, DynAnalyzer>>,
+    }
+
+    impl AnalyzerFactory {
+        pub fn new() -> Self {
+            Self {
+                cache: RwLock::new(HashMap::new()),
+            }
+        }
+
+        /// Returns an analyzer instance, reusing if possible.
+        pub async fn get(&self, kind: AnalyzerKind) -> DynAnalyzer {
+            {
+                let map = self.cache.read().await;
+                if let Some(a) = map.get(&kind) {
+                    return a.clone();
+                }
+            }
+            // create & insert
+            let mut map = self.cache.write().await;
+            let instance = DynAnalyzer::from(kind);
+            map.insert(kind, instance.clone());
+            instance
+        }
+    }
+}
+
+// ============================================================================
+//  Config reloadable at run time (observer pattern with broadcast channel)
+// ============================================================================
+mod config {
+    use super::*;
+
+    /// Message broadcast to live processors letting them reload the analyzer
+    #[derive(Clone, Debug)]
+    pub struct AnalyzerReloadMsg {
+        pub new_kind: AnalyzerKind,
+    }
+}
+
+// ============================================================================
+//  Stream processor implementation
+// ============================================================================
+mod processor {
+    use super::*;
+
+    pub struct AnalysisProcessor {
+        consumer: StreamConsumer,
+        current_analyzer: RwLock<DynAnalyzer>,
+        factory: AnalyzerFactory,
+        reload_rx: broadcast::Receiver<AnalyzerReloadMsg>,
+    }
+
+    impl AnalysisProcessor {
+        pub async fn spawn(
+            bootstrap_servers: &str,
+            initial_kind: AnalyzerKind,
+            reload_rx: broadcast::Receiver<AnalyzerReloadMsg>,
+        ) -> Result<ProcessorHandle> {
+            // Build Kafka consumer
+            let consumer: StreamConsumer = ClientConfig::new()
+                .set("bootstrap.servers", bootstrap_servers)
+                .set("group.id", KAFKA_GROUP_ID)
+                .set("enable.partition.eof", "false")
+                .set("auto.offset.reset", "latest")
+                .create()
+                .context("failed to create kafka consumer")?;
+
+            consumer
+                .subscribe(&[ANALYSIS_TOPIC])
+                .context("failed to subscribe")?;
+
+            let factory = AnalyzerFactory::new();
+            let initial_analyzer = factory.get(initial_kind).await;
+
+            let processor = Self {
+                consumer,
+                current_analyzer: RwLock::new(initial_analyzer),
+                factory,
+                reload_rx,
+            };
+
+            let handle = tokio::spawn(async move { processor.run().await });
+            Ok(ProcessorHandle { handle })
+        }
+
+        async fn run(self) -> Result<()> {
+            loop {
+                select! {
+                    msg = self.consumer.recv() => {
+                        match msg {
+                            Err(e) => {
+                                error!("Kafka error: {e}");
+                            }
+                            Ok(m) => {
+                                if let Err(e) = self.handle_message(&m).await {
+                                    error!("processing error: {e:#}");
+                                }
+                            }
+                        }
+                    }
+                    recv = self.reload_rx.recv() => {
+                        match recv {
+                            Ok(reload) => {
+                                self.switch_analyzer(reload.new_kind).await;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                warn!("reload channel closed; shutting down processor");
+                                break;
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!("reload channel lagged; skipped {skipped} messages");
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        async fn handle_message(&self, msg: &BorrowedMessage<'_>) -> Result<()> {
+            let payload = msg
+                .payload_view::<str>()
+                .ok_or_else(|| anyhow::anyhow!("empty payload"))??;
+
+            let enriched: EnrichedEvent = serde_json::from_str(payload)
+                .context("failed to deserialize EnrichedEvent")?;
+
+            let analyzer = self.current_analyzer.read().await.clone();
+            let result = analyzer.analyze(&enriched).await?;
+
+            // For this demo we just log; in prod we would publish to another topic
+            info!(
+                "event={} analyzer={} score={:.2}",
+                result.event_id, result.analyzer, result.score
+            );
+
+            Ok(())
+        }
+
+        async fn switch_analyzer(&self, new_kind: AnalyzerKind) {
+            let new_analyzer = self.factory.get(new_kind).await;
+            let mut guard = self.current_analyzer.write().await;
+            *guard = new_analyzer;
+            info!("🔄 Switched analyzer to {:?}", new_kind);
+        }
+    }
+
+    /// JoinHandle wrapper to allow graceful shutdown controls later
+    pub struct ProcessorHandle {
+        handle: JoinHandle<Result<()>>,
+    }
+
+    impl ProcessorHandle {
+        pub async fn join(self) -> Result<()> {
+            self.handle.await?
+        }
+    }
+}
+
+// ============================================================================
+//  Utility helpers & re-exports
+// ============================================================================
+use serde_json::json;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{sleep, Duration};
+
+    #[tokio::test]
+    async fn factory_reuses_instances() {
+        let factory = AnalyzerFactory::new();
+        let a = factory.get(AnalyzerKind::Sentiment).await;
+        let b = factory.get(AnalyzerKind::Sentiment).await;
+        let c = factory.get(AnalyzerKind::Toxicity).await;
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(!Arc::ptr_eq(&a, &c));
+    }
+
+    #[tokio::test]
+    async fn analyzer_switch_updates_state() -> Result<()> {
+        let (tx, rx) = broadcast::channel(4);
+        let processor = AnalysisProcessor::spawn(
+            "localhost:9092",
+            AnalyzerKind::Sentiment,
+            rx
+        )
+        .await?;
+        // In tests we won't connect to real Kafka; let the processor warm up then switch
+        sleep(Duration::from_millis(50)).await;
+        tx.send(AnalyzerReloadMsg {
+            new_kind: AnalyzerKind::Toxicity,
+        })
+        .unwrap();
+        sleep(Duration::from_millis(50)).await;
+        // Ideally inspect internal state, but we trust logs for now
+        processor.handle.abort();
+        Ok(())
+    }
+}
+```

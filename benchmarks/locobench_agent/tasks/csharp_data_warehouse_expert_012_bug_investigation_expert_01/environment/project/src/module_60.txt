@@ -1,0 +1,348 @@
+```csharp
+// ---------------------------------------------------------------------------------------------------------------------
+// File:    src/module_60.txt            (yes, extension is .txt, but it contains valid C# source code)
+// Project: PulseOps Warehouse — Serverless Productivity Intelligence Fabric (data_warehouse)
+// Purpose: Runtime registry + orchestrator for KPI-computation strategies.
+// ---------------------------------------------------------------------------------------------------------------------
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace PulseOps.Warehouse.KpiComputation
+{
+    #region Contracts & DTOs
+    /// <summary>
+    ///     Represents a unit of KPI result data emitted by a computation strategy.
+    /// </summary>
+    /// <param name="KpiName">Unique KPI identifier.</param>
+    /// <param name="Value">Computed numeric value.</param>
+    /// <param name="Timestamp">UTC timestamp at which computation occurred.</param>
+    /// <param name="Metadata">Additional metadata to enrich the result (labels, units, etc.).</param>
+    public sealed record KpiResult(
+        string KpiName,
+        double Value,
+        DateTime Timestamp,
+        IReadOnlyDictionary<string, string> Metadata);
+
+    /// <summary>
+    ///     Context object passed to KPI computation strategies.  Provides the raw data slice on which
+    ///     to operate as well as the analytic window in UTC.
+    /// </summary>
+    public sealed record KpiComputationContext(
+        IDictionary<string, object> Data,
+        DateTimeOffset WindowStart,
+        DateTimeOffset WindowEnd);
+
+    /// <summary>
+    ///     Implemented by all pluggable KPI computation strategies.
+    /// </summary>
+    public interface IKpiComputationStrategy
+    {
+        /// <summary>The canonical KPI identifier.</summary>
+        string KpiName { get; }
+
+        /// <summary>
+        ///     Performs the KPI computation asynchronously.
+        /// </summary>
+        /// <remarks>
+        ///     Implementations must be pure (side-effect free) and thread-safe.  They should
+        ///     never mutate the incoming context.
+        /// </remarks>
+        ValueTask<KpiResult> ComputeAsync(
+            KpiComputationContext context,
+            CancellationToken cancellationToken = default);
+    }
+    #endregion
+
+    #region Attribute-based discovery
+    /// <summary>
+    ///     Decorating a class with <see cref="KpiStrategyAttribute"/> auto-registers it with
+    ///     <see cref="KpiStrategyRegistry"/> at startup time.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Class, Inherited = false)]
+    public sealed class KpiStrategyAttribute : Attribute
+    {
+        public KpiStrategyAttribute(string kpiName) => KpiName = kpiName;
+
+        public string KpiName { get; }
+    }
+    #endregion
+
+    #region Strategy Registry
+    /// <summary>
+    ///     Thread-safe runtime registry that maps KPI keys to active computation strategies.
+    ///     Discoverable via DI singleton.
+    /// </summary>
+    public sealed class KpiStrategyRegistry
+    {
+        private readonly ILogger<KpiStrategyRegistry> _logger;
+        private readonly ConcurrentDictionary<string, IKpiComputationStrategy> _strategies;
+
+        public KpiStrategyRegistry(ILogger<KpiStrategyRegistry> logger)
+        {
+            _logger = logger;
+            _strategies = new ConcurrentDictionary<string, IKpiComputationStrategy>(
+                StringComparer.OrdinalIgnoreCase);
+
+            DiscoverStrategies();
+        }
+
+        /// <summary>
+        ///     Returns <c>true</c> if a strategy for <paramref name="kpiName"/> is present.
+        /// </summary>
+        public bool Contains(string kpiName) => _strategies.ContainsKey(kpiName);
+
+        /// <summary>
+        ///     Retrieves the strategy or throws an informative <see cref="KeyNotFoundException"/>.
+        /// </summary>
+        /// <exception cref="KeyNotFoundException">Thrown when no strategy is registered.</exception>
+        public IKpiComputationStrategy Get(string kpiName)
+        {
+            if (!_strategies.TryGetValue(kpiName, out var strategy))
+            {
+                throw new KeyNotFoundException(
+                    $"No KPI computation strategy registered for key '{kpiName}'. " +
+                    $"Ensure a class is decorated with [KpiStrategy(\"{kpiName}\")].");
+            }
+
+            return strategy;
+        }
+
+        /// <summary>
+        ///     Adds or replaces a strategy at runtime.  Used by feature-flag rollouts.
+        /// </summary>
+        public void Upsert(IKpiComputationStrategy strategy)
+        {
+            _strategies.AddOrUpdate(strategy.KpiName, strategy, (_, __) => strategy);
+            _logger.LogInformation("Registered KPI strategy: {KpiName} ({Type})",
+                strategy.KpiName, strategy.GetType().FullName);
+        }
+
+        private void DiscoverStrategies()
+        {
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+            // Scan all loaded assemblies (excluding Microsoft / System to speed things up).
+            var assemblies = AppDomain.CurrentDomain
+                                      .GetAssemblies()
+                                      .Where(a => !a.FullName.StartsWith("System.", StringComparison.Ordinal) &&
+                                                  !a.FullName.StartsWith("Microsoft.", StringComparison.Ordinal))
+                                      .ToArray();
+
+            int count = 0;
+            foreach (var assembly in assemblies)
+            {
+                foreach (var candidate in assembly.GetTypes())
+                {
+                    if (candidate.IsAbstract ||
+                        candidate.IsInterface ||
+                        !typeof(IKpiComputationStrategy).IsAssignableFrom(candidate))
+                        continue;
+
+                    var attribute = candidate.GetCustomAttribute<KpiStrategyAttribute>();
+                    if (attribute is null)
+                        continue;
+
+                    // Instantiate via Activator; strategy must have a public parameterless ctor.
+                    if (Activator.CreateInstance(candidate) is not IKpiComputationStrategy instance)
+                    {
+                        _logger.LogWarning("Failed to instantiate KPI strategy '{StrategyType}'. Skipping.",
+                            candidate.FullName);
+                        continue;
+                    }
+
+                    Upsert(instance);
+                    count++;
+                }
+            }
+
+            stopwatch.Stop();
+            _logger.LogInformation("KPI strategy discovery complete — {Count} strategies loaded in {ElapsedMs}ms.",
+                count, stopwatch.ElapsedMilliseconds);
+        }
+    }
+    #endregion
+
+    #region Orchestrator
+    /// <summary>
+    ///     Orchestrates KPI computations in parallel, respecting cancellation tokens and
+    ///     aggregating failures in a structured way.
+    /// </summary>
+    public sealed class KpiComputationOrchestrator
+    {
+        private readonly KpiStrategyRegistry _registry;
+        private readonly ILogger<KpiComputationOrchestrator> _logger;
+
+        public KpiComputationOrchestrator(
+            KpiStrategyRegistry registry,
+            ILogger<KpiComputationOrchestrator> logger)
+        {
+            _registry = registry;
+            _logger = logger;
+        }
+
+        /// <summary>
+        ///     Computes a batch of KPI names against the same data context, executing work in
+        ///     parallel while enforcing a configurable degree of parallelism.
+        /// </summary>
+        /// <param name="kpiNames">The KPI identifiers to compute.</param>
+        /// <param name="context">Shared context passed to each strategy.</param>
+        /// <param name="maxParallelism">Limits in-flight computations (1-32 recommended).</param>
+        /// <param name="cancellationToken">Token to cancel the entire batch.</param>
+        /// <returns>Collection of <see cref="KpiResult"/> plus any failures (exceptions).</returns>
+        public async Task<(IReadOnlyList<KpiResult> Results, IReadOnlyList<Exception> Errors)> ComputeBatchAsync(
+            IEnumerable<string> kpiNames,
+            KpiComputationContext context,
+            int maxParallelism = 8,
+            CancellationToken cancellationToken = default)
+        {
+            if (context is null) throw new ArgumentNullException(nameof(context));
+            if (kpiNames is null) throw new ArgumentNullException(nameof(kpiNames));
+            if (maxParallelism is < 1 or > 32)
+                throw new ArgumentOutOfRangeException(nameof(maxParallelism),
+                    "maxParallelism must be between 1 and 32.");
+
+            var resultBag = new ConcurrentBag<KpiResult>();
+            var errorBag = new ConcurrentBag<Exception>();
+
+            using var semaphore = new SemaphoreSlim(maxParallelism);
+
+            var tasks = kpiNames.Select(async kpiName =>
+            {
+                await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    var strategy = _registry.Get(kpiName);
+                    var result = await strategy.ComputeAsync(context, cancellationToken).ConfigureAwait(false);
+                    resultBag.Add(result);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Bubble up cancellation — don’t treat as error.
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    errorBag.Add(ex);
+                    _logger.LogError(ex, "Failed to compute KPI '{Kpi}'.", kpiName);
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            });
+
+            try
+            {
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // caller cancelled — swallow here, propagate via token.
+            }
+
+            return (resultBag.ToArray(), errorBag.ToArray());
+        }
+    }
+    #endregion
+
+    #region Sample Strategies
+    // NOTE: These sample implementations are intentionally simple.  Production strategies would,
+    //       for example, query Athena / S3 parquet, leverage Apache Arrow, or perform complex ML
+    //       inference via SageMaker endpoints.  The samples demonstrate the pluggability only.
+
+    /// <summary>
+    ///     Focus-time ratio = (Coding/Deep work minutes) ÷ Total minutes in analytic window.
+    ///     Requires that the context includes:
+    ///         - "DeepWorkMinutes" (double)
+    ///         - "WindowMinutes"   (double)
+    /// </summary>
+    [KpiStrategy("focus_time_ratio")]
+    public sealed class FocusTimeRatioStrategy : IKpiComputationStrategy
+    {
+        public string KpiName => "focus_time_ratio";
+
+        public ValueTask<KpiResult> ComputeAsync(
+            KpiComputationContext context,
+            CancellationToken cancellationToken = default)
+        {
+            if (!context.Data.TryGetValue("DeepWorkMinutes", out var deepWork) ||
+                !context.Data.TryGetValue("WindowMinutes", out var window))
+                throw new ArgumentException("Required keys missing: DeepWorkMinutes or WindowMinutes");
+
+            double deepWorkMinutes = Convert.ToDouble(deepWork);
+            double windowMinutes = Convert.ToDouble(window);
+
+            if (windowMinutes <= 0)
+                throw new DivideByZeroException("WindowMinutes must be > 0");
+
+            var ratio = deepWorkMinutes / windowMinutes;
+
+            var metadata = new Dictionary<string, string>
+            {
+                ["unit"] = "ratio",
+                ["deepWorkMinutes"] = deepWorkMinutes.ToString("F0"),
+                ["windowMinutes"] = windowMinutes.ToString("F0")
+            };
+
+            var result = new KpiResult(
+                KpiName,
+                Math.Round(ratio, 4),
+                DateTime.UtcNow,
+                metadata);
+
+            return ValueTask.FromResult(result);
+        }
+    }
+
+    /// <summary>
+    ///     Meeting cost index = Σ(MeetingMinutes × AttendeeHourlyRate) ÷ WindowMinutes.
+    ///     Requires the context includes a sequences of meetings under "Meetings":
+    ///         IReadOnlyList&lt;(double Minutes, double HourlyRate)&gt;
+    /// </summary>
+    [KpiStrategy("meeting_cost_index")]
+    public sealed class MeetingCostIndexStrategy : IKpiComputationStrategy
+    {
+        public string KpiName => "meeting_cost_index";
+
+        public ValueTask<KpiResult> ComputeAsync(
+            KpiComputationContext context,
+            CancellationToken cancellationToken = default)
+        {
+            if (!context.Data.TryGetValue("Meetings", out var rawMeetings) ||
+                rawMeetings is not IEnumerable<(double Minutes, double HourlyRate)> meetings)
+                throw new ArgumentException("Meeting data missing or invalid.");
+
+            var totalCost = meetings.Sum(m => m.Minutes * (m.HourlyRate / 60.0));
+            var windowMinutes = (context.WindowEnd - context.WindowStart).TotalMinutes;
+
+            if (windowMinutes <= 0)
+                throw new DivideByZeroException("Invalid analytic window.");
+
+            double index = totalCost / windowMinutes;
+
+            var metadata = new Dictionary<string, string>
+            {
+                ["unit"] = "currency_per_minute",
+                ["meetingCount"] = meetings.Count().ToString(),
+                ["totalCost"] = totalCost.ToString("F2")
+            };
+
+            var result = new KpiResult(
+                KpiName,
+                Math.Round(index, 4),
+                DateTime.UtcNow,
+                metadata);
+
+            return ValueTask.FromResult(result);
+        }
+    }
+    #endregion
+}
+```

@@ -1,0 +1,383 @@
+```rust
+// src/module_43.rs
+//! Event outbox and NATS-based publisher implementation for EduPulse Live.
+//!
+//! This module contains a minimal yet production-ready implementation of the
+//! *Transactional Outbox Pattern* plus a pluggable NATS publisher.  Every domain
+//! change that should be published to the wider system is first persisted in the
+//! `outbox_events` table inside the same transaction that updates the domain
+//! model.  A background worker (`OutboxWorker`) then picks up undispatched
+//! events and forwards them through NATS JetStream while guaranteeing *at-least
+//! once* delivery.
+//!
+//! NOTE: Only the write/publish side is implemented here—consumers are free to
+//! subscribe by subject (e.g. `edupulse.event.*`).
+
+use std::{sync::Arc, time::Duration};
+
+use async_nats::{jetstream, Client as NatsClient};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
+use thiserror::Error;
+use tokio::{task::JoinHandle, time::sleep};
+use tracing::{error, info, instrument};
+use uuid::Uuid;
+
+/* ------------------------------------------------------------------------------------------------
+ * Domain Event Definitions
+ * --------------------------------------------------------------------------------------------- */
+
+/// Base trait for all events emitted by EduPulse Live.
+#[async_trait]
+pub trait DomainEvent: Send + Sync + Serialize + 'static {
+    /// Version of the event schema.  Use semantic versioning.
+    fn schema_version(&self) -> &'static str;
+
+    /// NATS subject the event will be published to.
+    fn subject(&self) -> &'static str;
+}
+
+/// Event raised when a GDPR erase request has been processed successfully.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberErased {
+    pub member_id: Uuid,
+    pub initiated_by_admin: bool,
+}
+
+#[async_trait]
+impl DomainEvent for MemberErased {
+    fn schema_version(&self) -> &'static str {
+        "1.0.0"
+    }
+
+    fn subject(&self) -> &'static str {
+        "edupulse.event.member.erased"
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Outbox Storage Abstractions
+ * --------------------------------------------------------------------------------------------- */
+
+/// Raw row stored in `outbox_events`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub id: Uuid,
+    pub aggregate_id: Uuid,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub schema_version: String,
+    pub correlation_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub dispatched_at: Option<DateTime<Utc>>,
+}
+
+impl EventEnvelope {
+    /// Creates a new, *undispatched* envelope from a concrete event instance.
+    pub fn from_event<E: DomainEvent>(aggregate_id: Uuid, event: &E) -> sqlx::Result<Self> {
+        Ok(Self {
+            id: Uuid::new_v4(),
+            aggregate_id,
+            event_type: std::any::type_name::<E>().into(),
+            payload: serde_json::to_value(event)?,
+            schema_version: event.schema_version().into(),
+            correlation_id: None,
+            created_at: Utc::now(),
+            dispatched_at: None,
+        })
+    }
+}
+
+/// Repository API for the outbox table.
+#[async_trait]
+pub trait OutboxRepository: Send + Sync {
+    async fn enqueue<E: DomainEvent>(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        aggregate_id: Uuid,
+        event: &E,
+    ) -> sqlx::Result<()>;
+
+    async fn claim_batch(&self, limit: i64) -> sqlx::Result<Vec<EventEnvelope>>;
+
+    async fn mark_dispatched(&self, event_ids: &[Uuid]) -> sqlx::Result<()>;
+}
+
+pub struct SqlxOutboxRepository {
+    pool: PgPool,
+}
+
+impl SqlxOutboxRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl OutboxRepository for SqlxOutboxRepository {
+    #[instrument(skip_all)]
+    async fn enqueue<E: DomainEvent>(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        aggregate_id: Uuid,
+        event: &E,
+    ) -> sqlx::Result<()> {
+        let envelope = EventEnvelope::from_event(aggregate_id, event)?;
+        sqlx::query!(
+            r#"
+            INSERT INTO outbox_events(
+                id, aggregate_id, event_type, payload,
+                schema_version, correlation_id, created_at
+            ) VALUES($1, $2, $3, $4, $5, $6, $7)
+            "#,
+            envelope.id,
+            envelope.aggregate_id,
+            envelope.event_type,
+            envelope.payload,
+            envelope.schema_version,
+            envelope.correlation_id,
+            envelope.created_at
+        )
+        .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
+    #[instrument(skip_all)]
+    async fn claim_batch(&self, limit: i64) -> sqlx::Result<Vec<EventEnvelope>> {
+        // Use SKIP LOCKED to avoid multiple workers processing the same rows.
+        let rows = sqlx::query_as!(
+            EventEnvelope,
+            r#"
+            UPDATE outbox_events
+            SET dispatched_at = NOW()
+            WHERE id IN (
+                SELECT id FROM outbox_events
+                WHERE dispatched_at IS NULL
+                ORDER BY created_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+            )
+            RETURNING *
+            "#,
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    #[instrument(skip_all)]
+    async fn mark_dispatched(&self, event_ids: &[Uuid]) -> sqlx::Result<()> {
+        if event_ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query!(
+            r#"
+            DELETE FROM outbox_events
+            WHERE id = ANY($1)
+            "#,
+            event_ids
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Publisher Abstractions
+ * --------------------------------------------------------------------------------------------- */
+
+/// Errors that may occur when publishing an event.
+#[derive(Error, Debug)]
+pub enum PublishError {
+    #[error("NATS client error: {0}")]
+    Nats(#[from] async_nats::Error),
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+}
+
+/// Publishes an envelope to an external message broker.
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<(), PublishError>;
+}
+
+/// NATS JetStream backed publisher.
+pub struct NatsJetStreamPublisher {
+    client: NatsClient,
+    jetstream: jetstream::Context,
+}
+
+impl NatsJetStreamPublisher {
+    pub async fn new(nats_url: &str) -> Result<Self, async_nats::Error> {
+        let client = async_nats::connect(nats_url).await?;
+        let jetstream = jetstream::new(client.clone());
+        Ok(Self { client, jetstream })
+    }
+}
+
+#[async_trait]
+impl EventPublisher for NatsJetStreamPublisher {
+    #[instrument(skip_all)]
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<(), PublishError> {
+        let subject = envelope.event_type.replace("::", ".").to_lowercase();
+
+        let payload = serde_json::to_vec(envelope)?;
+        self.jetstream
+            .publish(subject, payload.into())
+            .await
+            .map(|_| ())
+            .map_err(PublishError::from)
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Outbox Worker
+ * --------------------------------------------------------------------------------------------- */
+
+/// Continuously polls the outbox table, publishes to NATS and deletes processed rows.
+pub struct OutboxWorker<R: OutboxRepository, P: EventPublisher> {
+    repo: Arc<R>,
+    publisher: Arc<P>,
+    poll_interval: Duration,
+    batch_size: i64,
+}
+
+impl<R, P> OutboxWorker<R, P>
+where
+    R: OutboxRepository + 'static,
+    P: EventPublisher + 'static,
+{
+    pub fn new(repo: Arc<R>, publisher: Arc<P>) -> Self {
+        Self {
+            repo,
+            publisher,
+            poll_interval: Duration::from_secs(2),
+            batch_size: 100,
+        }
+    }
+
+    /// Spawns the worker on a Tokio task and returns its handle.
+    pub fn spawn(self) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                match self.tick().await {
+                    Ok(0) => {
+                        // No events; sleep a bit longer to unload CPU.
+                        sleep(self.poll_interval * 2).await;
+                    }
+                    Ok(_) => {} // Immediately attempt next batch.
+                    Err(e) => {
+                        error!("OutboxWorker error: {e:?}");
+                        sleep(self.poll_interval).await;
+                    }
+                }
+            }
+        })
+    }
+
+    #[instrument(skip_all, err)]
+    async fn tick(&self) -> sqlx::Result<usize> {
+        let events = self.repo.claim_batch(self.batch_size).await?;
+        let mut acked: Vec<Uuid> = Vec::with_capacity(events.len());
+
+        for e in &events {
+            match self.publisher.publish(e).await {
+                Ok(_) => acked.push(e.id),
+                Err(publish_err) => {
+                    error!(event_id = %e.id, "Failed to publish event: {publish_err}");
+                }
+            }
+        }
+
+        // Remove only successfully published events.
+        self.repo.mark_dispatched(&acked).await?;
+        info!("Dispatched {} events, {} acknowledged", events.len(), acked.len());
+        Ok(events.len())
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Bootstrapping Helper
+ * --------------------------------------------------------------------------------------------- */
+
+/// Starts the outbox worker with a fresh connection pool and NATS client.
+///
+/// # Panics
+/// Panics if connection to Postgres or NATS cannot be established.
+pub async fn bootstrap() -> anyhow::Result<JoinHandle<()>> {
+    // These would normally come from environment variables or a typed config struct.
+    let postgres_dsn =
+        std::env::var("DATABASE_URL").expect("env DATABASE_URL is required for outbox");
+    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into());
+
+    // Lazily create a pool; sqlx will manage connections internally.
+    let pg_pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&postgres_dsn)
+        .await?;
+
+    let repo = Arc::new(SqlxOutboxRepository::new(pg_pool));
+    let publisher = Arc::new(NatsJetStreamPublisher::new(&nats_url).await?);
+
+    Ok(OutboxWorker::new(repo, publisher).spawn())
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Tests (requires `cargo test -- --nocapture`)
+ * --------------------------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Executor;
+
+    #[tokio::test]
+    async fn enqueue_and_claim_roundtrip() -> sqlx::Result<()> {
+        let _ = dotenv::dotenv(); // Load env for DATABASE_URL in CI.
+        let postgres_dsn =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL env var must be set for tests");
+        let pool = PgPoolOptions::new().max_connections(1).connect(&postgres_dsn).await?;
+
+        // In tests we spin up a temp table using an explicit transaction which will be rolled back.
+        let mut tx = pool.begin().await?;
+        tx.execute(
+            r#"
+            CREATE TEMP TABLE IF NOT EXISTS outbox_events (
+                id UUID PRIMARY KEY,
+                aggregate_id UUID NOT NULL,
+                event_type TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                schema_version TEXT NOT NULL,
+                correlation_id UUID NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                dispatched_at TIMESTAMPTZ NULL
+            )
+            "#,
+        )
+        .await?;
+
+        let repo = SqlxOutboxRepository::new(pool.clone());
+        let member_id = Uuid::new_v4();
+        let event = MemberErased {
+            member_id,
+            initiated_by_admin: true,
+        };
+
+        repo.enqueue(&mut tx, member_id, &event).await?;
+        tx.commit().await?;
+
+        let claimed = repo.claim_batch(10).await?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].aggregate_id, member_id);
+
+        repo.mark_dispatched(&[claimed[0].id]).await?;
+        Ok(())
+    }
+}
+```

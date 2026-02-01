@@ -1,0 +1,478 @@
+```rust
+//! src/module_77.rs
+//! Hyper-parameter tuning utilities used by VisuTility Orchestrator
+//!
+//! This module demonstrates the Strategy, Factory, and Observer patterns
+//! to provide pluggable hyper-parameter tuning back-ends while emitting
+//! structured events that can be consumed by experiment trackers,
+//! dashboards, or automated re-training triggers.
+
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, Mutex, Weak},
+    time::{Duration, Instant},
+};
+
+use async_trait::async_trait;
+use rand::{distributions::Uniform, prelude::*};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::task;
+
+/// Anything in the platform that wants to be informed about tuning progress
+/// implements this trait.  
+/// The Observer Pattern is implemented through a very small, allocation-free
+/// event bus (see `EventBus` below).
+#[async_trait]
+pub trait TuningEventHandler: Send + Sync {
+    async fn on_event(&self, event: TuningEvent);
+}
+
+/// Enum of the events we produce while tuning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TuningEvent {
+    TrialStarted {
+        trial_id: usize,
+        parameters: HyperParams,
+    },
+    TrialCompleted {
+        trial_id: usize,
+        objective: f32,
+        duration: Duration,
+        parameters: HyperParams,
+    },
+    TuningFinished {
+        best_trial_id: usize,
+        best_objective: f32,
+        best_parameters: HyperParams,
+        total_duration: Duration,
+    },
+}
+
+/// Very small event bus—thread-safe, allocation-friendly.
+///
+/// This could be swapped out for a fully-fledged pub/sub implementation
+/// (Kafka, NATS, Redis Stream, etc) but is intentionally lightweight.
+#[derive(Clone, Default)]
+pub struct EventBus {
+    /// Vector of weak references so handlers can be dropped without
+    /// requiring explicit deregistration.
+    handlers: Arc<Mutex<Vec<Weak<dyn TuningEventHandler>>>>,
+}
+
+impl EventBus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn subscribe(&self, handler: Arc<dyn TuningEventHandler>) {
+        self.handlers.lock().unwrap().push(Arc::downgrade(&handler));
+    }
+
+    async fn emit(&self, event: TuningEvent) {
+        let mut stale_handlers = Vec::new();
+
+        for (idx, handler_weak) in self.handlers.lock().unwrap().iter().enumerate() {
+            if let Some(handler_arc) = handler_weak.upgrade() {
+                handler_arc.on_event(event.clone()).await;
+            } else {
+                stale_handlers.push(idx);
+            }
+        }
+
+        // Cleanup stale handlers
+        if !stale_handlers.is_empty() {
+            let mut handlers = self.handlers.lock().unwrap();
+            for idx in stale_handlers.into_iter().rev() {
+                handlers.swap_remove(idx);
+            }
+        }
+    }
+}
+
+/// Any tuner algorithm must implement this trait.
+/// Strategy Pattern: different tuning algorithms share the common interface.
+#[async_trait]
+pub trait HyperparameterTuner: Send + Sync {
+    async fn tune(&mut self) -> Result<TuningSummary, TuningError>;
+}
+
+/// A summary of the tuning run—serializable for experiment tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuningSummary {
+    pub best_trial_id: usize,
+    pub best_objective: f32,
+    pub best_parameters: HyperParams,
+    pub trials_ran: usize,
+    pub total_time: Duration,
+}
+
+/// Commonly raised errors during hyper-parameter tuning.
+#[derive(Error, Debug)]
+pub enum TuningError {
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+/// Enumerates the algorithms we support; can be serialized from config files.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum TuningAlgorithm {
+    RandomSearch,
+    GridSearch,
+    // Bayesian, HyperBand, etc. can be added here
+}
+
+impl fmt::Display for TuningAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            TuningAlgorithm::RandomSearch => "random_search",
+            TuningAlgorithm::GridSearch => "grid_search",
+        };
+        write!(f, "{text}")
+    }
+}
+
+/// Range specification for a single hyper-parameter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HyperParamRange {
+    Continuous { min: f32, max: f32 },
+    Discrete { choices: Vec<f32> },
+}
+
+impl HyperParamRange {
+    /// Sample one value uniformly from the range.
+    fn sample(&self, rng: &mut impl Rng) -> f32 {
+        match self {
+            HyperParamRange::Continuous { min, max } => {
+                rng.sample(Uniform::new_inclusive(*min, *max))
+            }
+            HyperParamRange::Discrete { choices } => {
+                let idx = rng.gen_range(0..choices.len());
+                choices[idx]
+            }
+        }
+    }
+
+    /// Generate the full grid for grid-search algorithms.
+    fn full_grid(&self) -> Vec<f32> {
+        match self {
+            HyperParamRange::Continuous { min, max } => {
+                // For simplicity, break into 10 buckets
+                (0..=10)
+                    .map(|i| min + ((*max - *min) * i as f32 / 10.0))
+                    .collect()
+            }
+            HyperParamRange::Discrete { choices } => choices.clone(),
+        }
+    }
+}
+
+/// A full set of hyper-parameters for one trial.  
+/// Using `serde_json::Value` would be more flexible but numeric values are
+/// enough for this example.
+pub type HyperParams = HashMap<String, f32>;
+
+/// Tune-time configuration that can be read from YAML/JSON/Protobuf, etc.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HyperparameterTuningConfig {
+    pub algorithm: TuningAlgorithm,
+    pub search_space: HashMap<String, HyperParamRange>,
+    pub max_trials: usize,
+}
+
+/// Factory Pattern: pick the correct strategy implementation at runtime.
+pub struct TunerFactory;
+
+impl TunerFactory {
+    pub fn build(
+        cfg: HyperparameterTuningConfig,
+        event_bus: EventBus,
+    ) -> Result<Box<dyn HyperparameterTuner>, TuningError> {
+        match cfg.algorithm {
+            TuningAlgorithm::RandomSearch => Ok(Box::new(RandomSearchTuner::new(cfg, event_bus))),
+            TuningAlgorithm::GridSearch => Ok(Box::new(GridSearchTuner::new(cfg, event_bus))),
+        }
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Random Search Implementation
+ * ----------------------------------------------------------------------- */
+
+struct RandomSearchTuner {
+    cfg: HyperparameterTuningConfig,
+    event_bus: EventBus,
+    rng: ThreadRng,
+}
+
+impl RandomSearchTuner {
+    fn new(cfg: HyperparameterTuningConfig, event_bus: EventBus) -> Self {
+        Self {
+            cfg,
+            event_bus,
+            rng: rand::thread_rng(),
+        }
+    }
+
+    fn sample_hyperparams(&mut self) -> HyperParams {
+        self.cfg
+            .search_space
+            .iter()
+            .map(|(k, v)| (k.clone(), v.sample(&mut self.rng)))
+            .collect()
+    }
+}
+
+#[async_trait]
+impl HyperparameterTuner for RandomSearchTuner {
+    async fn tune(&mut self) -> Result<TuningSummary, TuningError> {
+        let start = Instant::now();
+        let mut best_objective = f32::MAX;
+        let mut best_trial_id = 0;
+        let mut best_params = HyperParams::new();
+
+        for trial_id in 0..self.cfg.max_trials {
+            let params = self.sample_hyperparams();
+            self.event_bus
+                .emit(TuningEvent::TrialStarted {
+                    trial_id,
+                    parameters: params.clone(),
+                })
+                .await;
+
+            // Run the expensive objective function in a separate task so the
+            // caller's async runtime remains responsive.
+            let params_clone = params.clone();
+            let obj_start = Instant::now();
+            let objective = task::spawn_blocking(move || mock_objective_fn(&params_clone))
+                .await
+                .map_err(|e| TuningError::Internal(e.to_string()))?;
+
+            let duration = obj_start.elapsed();
+
+            self.event_bus
+                .emit(TuningEvent::TrialCompleted {
+                    trial_id,
+                    objective,
+                    duration,
+                    parameters: params.clone(),
+                })
+                .await;
+
+            if objective < best_objective {
+                best_objective = objective;
+                best_trial_id = trial_id;
+                best_params = params;
+            }
+        }
+
+        let total_time = start.elapsed();
+        self.event_bus
+            .emit(TuningEvent::TuningFinished {
+                best_trial_id,
+                best_objective,
+                best_parameters: best_params.clone(),
+                total_duration: total_time,
+            })
+            .await;
+
+        Ok(TuningSummary {
+            best_trial_id,
+            best_objective,
+            best_parameters: best_params,
+            trials_ran: self.cfg.max_trials,
+            total_time,
+        })
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Grid Search Implementation
+ * ----------------------------------------------------------------------- */
+
+struct GridSearchTuner {
+    cfg: HyperparameterTuningConfig,
+    event_bus: EventBus,
+    grid: Vec<HyperParams>,
+}
+
+impl GridSearchTuner {
+    fn new(cfg: HyperparameterTuningConfig, event_bus: EventBus) -> Self {
+        let grid = build_grid(&cfg.search_space);
+        Self { cfg, event_bus, grid }
+    }
+}
+
+#[async_trait]
+impl HyperparameterTuner for GridSearchTuner {
+    async fn tune(&mut self) -> Result<TuningSummary, TuningError> {
+        if self.grid.is_empty() {
+            return Err(TuningError::InvalidConfig(
+                "Grid search produced zero combinations".into(),
+            ));
+        }
+
+        let total_trials = self.cfg.max_trials.min(self.grid.len());
+        let start = Instant::now();
+        let mut best_objective = f32::MAX;
+        let mut best_trial_id = 0;
+        let mut best_params = HyperParams::new();
+
+        for trial_id in 0..total_trials {
+            let params = self.grid[trial_id].clone();
+
+            self.event_bus
+                .emit(TuningEvent::TrialStarted {
+                    trial_id,
+                    parameters: params.clone(),
+                })
+                .await;
+
+            let obj_start = Instant::now();
+            let objective = task::spawn_blocking(move || mock_objective_fn(&params))
+                .await
+                .map_err(|e| TuningError::Internal(e.to_string()))?;
+            let duration = obj_start.elapsed();
+
+            self.event_bus
+                .emit(TuningEvent::TrialCompleted {
+                    trial_id,
+                    objective,
+                    duration,
+                    parameters: params.clone(),
+                })
+                .await;
+
+            if objective < best_objective {
+                best_objective = objective;
+                best_trial_id = trial_id;
+                best_params = params.clone();
+            }
+        }
+
+        let total_time = start.elapsed();
+        self.event_bus
+            .emit(TuningEvent::TuningFinished {
+                best_trial_id,
+                best_objective,
+                best_parameters: best_params.clone(),
+                total_duration: total_time,
+            })
+            .await;
+
+        Ok(TuningSummary {
+            best_trial_id,
+            best_objective,
+            best_parameters: best_params,
+            trials_ran: total_trials,
+            total_time,
+        })
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Helper Functions
+ * ----------------------------------------------------------------------- */
+
+/// Mock objective function—replace with real model training + validation.
+/// Lower is better.
+fn mock_objective_fn(params: &HyperParams) -> f32 {
+    // Deterministic-ish “objective” so unit tests can assert repeatably.
+    params.values().fold(0.0, |acc, v| acc + (v * v)).sqrt()
+}
+
+/// Build a Cartesian product of all parameter ranges.
+/// For large spaces consider lazy evaluation or iterators.
+fn build_grid(search_space: &HashMap<String, HyperParamRange>) -> Vec<HyperParams> {
+    fn cartesian(
+        keys: &[String],
+        search_space: &HashMap<String, HyperParamRange>,
+        idx: usize,
+        current: &mut HyperParams,
+        grid: &mut Vec<HyperParams>,
+    ) {
+        if idx == keys.len() {
+            grid.push(current.clone());
+            return;
+        }
+
+        let key = &keys[idx];
+        for val in search_space[key].full_grid() {
+            current.insert(key.clone(), val);
+            cartesian(keys, search_space, idx + 1, current, grid);
+        }
+        current.remove(key);
+    }
+
+    let keys: Vec<String> = search_space.keys().cloned().collect();
+    let mut grid = Vec::new();
+    let mut current = HyperParams::new();
+    cartesian(&keys, search_space, 0, &mut current, &mut grid);
+    grid
+}
+
+/* --------------------------------------------------------------------------
+ * Example Observer—writes events to `tracing` & stdout
+ * ----------------------------------------------------------------------- */
+
+use tracing::{info, Level};
+struct LoggingObserver;
+
+#[async_trait]
+impl TuningEventHandler for LoggingObserver {
+    async fn on_event(&self, event: TuningEvent) {
+        info!(?event, "tuning_event");
+        // In a real implementation this could forward to Kafka, InfluxDB, etc.
+        println!("EVENT: {event:?}");
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * When compiled as `cargo test` run a quick smoke test.
+ * ----------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::FmtSubscriber;
+
+    #[tokio::test]
+    async fn test_random_search_smoke() {
+        // Enable logging for the observer
+        let subscriber = FmtSubscriber::builder().with_max_level(Level::INFO).finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+
+        let mut space = HashMap::new();
+        space.insert(
+            "lr".into(),
+            HyperParamRange::Continuous { min: 0.0001, max: 0.1 },
+        );
+        space.insert(
+            "dropout".into(),
+            HyperParamRange::Discrete {
+                choices: vec![0.1, 0.2, 0.3],
+            },
+        );
+
+        let cfg = HyperparameterTuningConfig {
+            algorithm: TuningAlgorithm::RandomSearch,
+            search_space: space,
+            max_trials: 5,
+        };
+
+        let bus = EventBus::new();
+        bus.subscribe(Arc::new(LoggingObserver));
+
+        let mut tuner = TunerFactory::build(cfg, bus).unwrap();
+        let summary = tuner.tune().await.unwrap();
+
+        assert!(summary.trials_ran == 5);
+        assert!(summary.best_objective.is_finite());
+    }
+}
+```

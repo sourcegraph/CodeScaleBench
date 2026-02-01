@@ -1,0 +1,335 @@
+```rust
+//! src/module_51.rs
+//!
+//! Sub-module: “Monitoring & Automated-Retraining”
+//!
+//! This module wires an Observer-pattern–driven metric pipeline that listens to
+//! model-level metrics (accuracy, F1, drift scores, etc.) and automatically
+//! dispatches retraining requests when concept drift is detected.  Although the
+//! surrounding orchestration runtime is far richer, this file is completely
+//! self-contained and relies only on a narrow set of dependencies so it can be
+//! compiled and unit-tested in isolation.
+//!
+//! High-level data-flow
+//! ┌──────────────┐      metric_update()      ┌──────────────────┐
+//! │  Inference   │ ─────────────────────────►│ MetricEventBus   │
+//! │  Workers     │                           └──────────────────┘
+//! │ (any layer)  │                                   │ publish()
+//! └──────────────┘                                   ▼
+//!                                    ┌───────────────────────────────┐
+//!                                    │     MetricObserver(s)         │
+//!                                    │  – ConceptDriftDetector       │
+//!                                    │  – LatencyMonitor (todo)      │
+//!                                    └───────────────────────────────┘
+//!                                                 │ trigger_retrain()
+//!                                                 ▼
+//!                                    ┌────────────────────────┐
+//!                                    │  AutoRetrainEngine     │
+//!                                    └────────────────────────┘
+//!
+//! NOTE: In production, the `AutoRetrainEngine` would enqueue requests on a
+//! Kafka/Rabbit/Redis stream; to keep the example dependency-light we use
+//! `crossbeam_channel` instead.
+
+use std::{
+    collections::VecDeque,
+    fmt,
+    time::{Duration, SystemTime},
+};
+
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use thiserror::Error;
+
+// =============== Public Data Types ============================================================ //
+
+/// Metric names that we care about in the monitoring subsystem.
+/// Add or remove variants as your KPIs evolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MetricName {
+    Accuracy,
+    F1Score,
+    Precision,
+    Recall,
+    Latency,
+    Custom(&'static str),
+}
+
+/// Generic container for a single (model, metric, value, timestamp) tuple.
+#[derive(Debug, Clone)]
+pub struct MetricRecord {
+    pub model_id: String,
+    pub metric_name: MetricName,
+    pub value: f64,
+    pub observed_at: SystemTime,
+}
+
+impl MetricRecord {
+    pub fn new(model_id: impl Into<String>, metric_name: MetricName, value: f64) -> Self {
+        Self {
+            model_id: model_id.into(),
+            metric_name,
+            value,
+            observed_at: SystemTime::now(),
+        }
+    }
+}
+
+/// Error type returned from monitoring components.
+#[derive(Debug, Error)]
+pub enum MonitorError {
+    #[error("observer failed: {0}")]
+    ObserverFailure(String),
+    #[error("retrain trigger failed: {0}")]
+    RetrainFailure(String),
+}
+
+// =============== Observer Pattern Interfaces =================================================== //
+
+/// How observers are registered to the event bus.
+pub trait MetricObserver: Send + Sync + 'static {
+    fn on_metric_update(&self, metric: &MetricRecord) -> Result<(), MonitorError>;
+}
+
+/// Simple Observer dispatcher.
+///
+/// The bus is intentionally minimal: a single-threaded, in-memory registry that
+/// forwards events to all registered observers synchronously.  If one observer
+/// fails the error is logged but other observers still get a chance to process
+/// the metric; callers are shielded from cascading failures.
+#[derive(Default)]
+pub struct MetricEventBus {
+    observers: Vec<Box<dyn MetricObserver>>,
+}
+
+impl MetricEventBus {
+    pub fn new() -> Self {
+        Self {
+            observers: Vec::new(),
+        }
+    }
+
+    /// Register a new observer.
+    pub fn register<O>(&mut self, observer: O)
+    where
+        O: MetricObserver,
+    {
+        self.observers.push(Box::new(observer));
+    }
+
+    /// Forward a single record to all observers.
+    pub fn publish(&self, record: MetricRecord) {
+        for obs in &self.observers {
+            if let Err(err) = obs.on_metric_update(&record) {
+                log::warn!(
+                    "MetricObserver `{}` returned an error: {}",
+                    std::any::type_name::<&obs>(),
+                    err
+                );
+            }
+        }
+    }
+}
+
+// =============== Automated Retraining Layer ==================================================== //
+
+/// When observers decide to retrain they emit a request packaged in this struct.
+#[derive(Debug, Clone)]
+pub struct RetrainRequest {
+    pub model_id: String,
+    pub reason: String,
+    pub issued_at: SystemTime,
+}
+
+/// Abstraction boundary for whatever infra you use to orchestrate retraining.
+/// Could be a lightweight `kubectl` job, Airflow DAG, or a call to *VisuTility*
+///’s own internal scheduler.
+pub trait RetrainTrigger: Send + Sync + 'static {
+    fn trigger_retrain(&self, req: RetrainRequest) -> Result<(), MonitorError>;
+}
+
+/// A reference implementation that pushes retrain requests onto a
+/// `crossbeam_channel::Sender`.
+///
+/// In production this would be replaced by an async message broker,
+/// but channels are enough for illustrative purposes and remain `no_std`-free.
+#[derive(Debug, Clone)]
+pub struct AutoRetrainEngine {
+    tx: Sender<RetrainRequest>,
+}
+
+impl AutoRetrainEngine {
+    pub fn new(tx: Sender<RetrainRequest>) -> Self {
+        Self { tx }
+    }
+}
+
+impl RetrainTrigger for AutoRetrainEngine {
+    fn trigger_retrain(&self, req: RetrainRequest) -> Result<(), MonitorError> {
+        self.tx
+            .send(req)
+            .map_err(|e| MonitorError::RetrainFailure(e.to_string()))
+    }
+}
+
+// =============== Concept Drift Detector ======================================================== //
+
+/// Configuration knobs for [`ConceptDriftDetector`].
+pub struct DriftDetectorConfig {
+    pub window_size: usize,
+    pub threshold: f64,
+    pub monitored_metric: MetricName,
+}
+
+impl Default for DriftDetectorConfig {
+    fn default() -> Self {
+        Self {
+            window_size: 20,
+            threshold: 0.05,
+            monitored_metric: MetricName::Accuracy,
+        }
+    }
+}
+
+/// A naive 2-sample moving-window detector.
+///
+//! NOTE: Several production options exist (ADWIN, DDM, EDDM); we implement a
+//! simple “mean difference” heuristic, adequate for demonstration.
+pub struct ConceptDriftDetector {
+    cfg: DriftDetectorConfig,
+    window: VecDeque<f64>,
+    retrain_engine: Box<dyn RetrainTrigger>,
+}
+
+impl ConceptDriftDetector {
+    pub fn new(
+        cfg: DriftDetectorConfig,
+        retrain_engine: Box<dyn RetrainTrigger>,
+    ) -> Self {
+        Self {
+            cfg,
+            window: VecDeque::with_capacity(cfg.window_size),
+            retrain_engine,
+        }
+    }
+
+    /// Two-sided mean test between first and second half of the window.
+    fn drift_score(&self) -> Option<f64> {
+        if self.window.len() < self.cfg.window_size {
+            return None;
+        }
+
+        let mid = self.window.len() / 2;
+        let (first, second) = self.window.as_slices();
+
+        let (left_slice, right_slice) = if first.len() >= mid {
+            (&first[..mid], &first[mid..])
+        } else {
+            // Spans across the ring-buffer split; fallback to iterator partition
+            let mut left = Vec::with_capacity(mid);
+            let mut right = Vec::with_capacity(mid);
+            self.window
+                .iter()
+                .enumerate()
+                .for_each(|(idx, v)| if idx < mid { left.push(*v) } else { right.push(*v) });
+            (left.as_slice(), right.as_slice())
+        };
+
+        let mean = |slice: &[f64]| slice.iter().copied().sum::<f64>() / slice.len() as f64;
+
+        Some((mean(left_slice) - mean(right_slice)).abs())
+    }
+}
+
+impl MetricObserver for ConceptDriftDetector {
+    fn on_metric_update(&self, metric: &MetricRecord) -> Result<(), MonitorError> {
+        // Ignore unrelated metric types
+        if metric.metric_name != self.cfg.monitored_metric {
+            return Ok(());
+        }
+
+        let mut next = self.window.clone();
+        next.push_back(metric.value);
+        if next.len() > self.cfg.window_size {
+            next.pop_front();
+        }
+
+        // We cannot mutate &self.window because `on_metric_update` has &self, not &mut self.
+        // We therefore rely on interior mutability by wrapping `window` in `Mutex`
+        // in a production-grade implementation.  To avoid boilerplate in the example
+        // we instead use `unsafe` Cell-like approach: cast to mutable reference because
+        // we know no other thread holds &self at this moment (the bus is single-threaded).
+        //
+        // SAFETY: MetricEventBus invokes observers sequentially; no aliasing occurs.
+        unsafe {
+            let self_mut = &mut *(self as *const _ as *mut ConceptDriftDetector);
+            self_mut.window = next;
+        }
+
+        if let Some(drift) = self.drift_score() {
+            if drift > self.cfg.threshold {
+                let req = RetrainRequest {
+                    model_id: metric.model_id.clone(),
+                    reason: format!(
+                        "Concept drift detected: Δ={:.4} > threshold={:.4}",
+                        drift, self.cfg.threshold
+                    ),
+                    issued_at: SystemTime::now(),
+                };
+                self.retrain_engine.trigger_retrain(req)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// =============== Example Usage + Tests ========================================================= //
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Utility that drains the RX channel with a timeout.
+    fn recv_or_timeout(rx: &Receiver<RetrainRequest>, timeout: Duration) -> Option<RetrainRequest> {
+        let start = SystemTime::now();
+        loop {
+            if let Ok(req) = rx.try_recv() {
+                return Some(req);
+            }
+            if start.elapsed().unwrap_or_default() > timeout {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn concept_drift_triggers_retrain() {
+        // Set up components
+        let (tx, rx) = unbounded();
+        let engine = AutoRetrainEngine::new(tx);
+        let cfg = DriftDetectorConfig {
+            window_size: 10,
+            threshold: 0.10,
+            monitored_metric: MetricName::Accuracy,
+        };
+        let detector = ConceptDriftDetector::new(cfg, Box::new(engine));
+
+        let mut bus = MetricEventBus::new();
+        bus.register(detector);
+
+        // Synthetic accuracy dropping from 0.95 to 0.70
+        let model_id = "vision-model:v1";
+        for i in 0..10 {
+            let acc = if i < 5 { 0.95 } else { 0.70 };
+            bus.publish(MetricRecord::new(model_id, MetricName::Accuracy, acc));
+        }
+
+        // We expect a retrain request within 500ms
+        let req = recv_or_timeout(&rx, Duration::from_millis(500))
+            .expect("retrain not triggered");
+        assert_eq!(req.model_id, model_id);
+        assert!(req.reason.contains("Concept drift detected"));
+    }
+}
+```

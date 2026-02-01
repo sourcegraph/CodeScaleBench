@@ -1,0 +1,451 @@
+```rust
+//! src/module_56.rs
+//!
+//! Reconfigurable, strategy-pattern driven sentiment engine used by
+//! ChirpPulse’s enrichment microservice.  The engine consumes raw social
+//! events from an async channel, enriches them with a sentiment score using the
+//! currently active strategy, and publishes the enriched payload downstream.
+//!
+//! The strategy can be hot-swapped at runtime by editing a single TOML config
+//! file.  A lightweight file-watcher notifies the engine of configuration
+//! changes and the strategy is swapped without interrupting the data-flow.
+//!
+//! Build-time feature flags make the module easy to mock in unit tests while
+//! still using real Kafka producers/consumers in production.
+//
+// --------------- Crate Dependencies ---------------
+// tokio           = { version = "1.34", features = ["rt", "fs", "macros"] }
+// serde           = { version = "1.0",  features = ["derive"] }
+// serde_json      = "1.0"
+// toml            = "0.7"
+// async-trait     = "0.1"
+// anyhow          = "1.0"
+// notify          = "6.1"
+// tracing         = "0.1"
+//
+// Optional (behind `kafka` feature):
+// rdkafka         = { version = "0.34", optional = true, features = ["tokio"] }
+//
+// --------------------------------------------------
+
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use notify::{Config as NotifyConfig, RecursiveMode, RecommendedWatcher, Watcher};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    fs,
+    select,
+    sync::{mpsc, watch, RwLock},
+    task,
+};
+use tracing::{debug, error, info, warn};
+
+/// Maximum number of inflight events the channel will buffer before back-pressuring
+const CHANNEL_CAPACITY: usize = 16_384;
+
+/// Public API surface
+pub mod api {
+    use super::*;
+
+    /// Raw, unprocessed social-stream event
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct RawEvent {
+        pub id: String,
+        pub user_id: String,
+        pub text: String,
+        pub timestamp: i64,
+        // Additional metadata elided
+    }
+
+    /// Enriched event emitted by the sentiment engine
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct EnrichedEvent {
+        pub id: String,
+        pub user_id: String,
+        pub text: String,
+        pub timestamp: i64,
+        pub sentiment: f32,
+        pub processed_at: i64,
+        pub strategy_version: String,
+    }
+}
+
+// --------------- Strategy Pattern Implementation -----------------
+
+#[async_trait]
+pub trait SentimentStrategy: Send + Sync {
+    /// Human-readable identifier (used for telemetry & auditing)
+    fn version(&self) -> &str;
+
+    /// Perform the analysis.  Must be fast (<1 ms) or spawn its own blocking task.
+    async fn score(&self, text: &str) -> Result<f32>;
+}
+
+/// Extremely naive, rule-based heuristic sentiment scorer.
+/// Suitable as a safe-mode fallback when heavy ML models fail.
+pub struct RuleBasedStrategy;
+
+#[async_trait]
+impl SentimentStrategy for RuleBasedStrategy {
+    fn version(&self) -> &str {
+        "rule-based-v1"
+    }
+
+    async fn score(&self, text: &str) -> Result<f32> {
+        let lowered = text.to_ascii_lowercase();
+        let pos = ["good", "love", "awesome", "yay"]
+            .iter()
+            .filter(|w| lowered.contains(*w))
+            .count() as f32;
+        let neg = ["bad", "hate", "terrible", "boo"]
+            .iter()
+            .filter(|w| lowered.contains(*w))
+            .count() as f32;
+
+        Ok(match (pos - neg).clamp(-5.0, 5.0) {
+            x if x > 0.0 => x / 5.0,
+            x if x < 0.0 => x / 5.0,
+            _ => 0.0,
+        })
+    }
+}
+
+/// Placeholder for an ML-based implementation.  Here we fake the latency but
+/// the interface would realistically make a gRPC/tch-rs/onnxruntime call.
+pub struct MlStrategy;
+
+#[async_trait]
+impl SentimentStrategy for MlStrategy {
+    fn version(&self) -> &str {
+        "ml-bert-v3"
+    }
+
+    async fn score(&self, text: &str) -> Result<f32> {
+        // Simulate inferencing latency
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        // For brevity: randomish score based on hash
+        let hash = seahash::hash(text.as_bytes());
+        Ok((hash % 2000) as f32 / 1000.0 - 1.0) // Value in [-1.0, 1.0]
+    }
+}
+
+// --------------- Config & Hot-Reloading ---------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StrategyKind {
+    RuleBased,
+    Ml,
+}
+
+impl StrategyKind {
+    fn build(self) -> Arc<dyn SentimentStrategy> {
+        match self {
+            StrategyKind::RuleBased => Arc::new(RuleBasedStrategy),
+            StrategyKind::Ml => Arc::new(MlStrategy),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EngineConfig {
+    /// Which strategy to use for scoring
+    strategy: StrategyKind,
+
+    /// How many enrichment worker tasks to spawn
+    #[serde(default = "EngineConfig::default_parallelism")]
+    parallelism: usize,
+}
+
+impl EngineConfig {
+    fn default_parallelism() -> usize {
+        num_cpus::get().max(2)
+    }
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            strategy: StrategyKind::RuleBased,
+            parallelism: Self::default_parallelism(),
+        }
+    }
+}
+
+async fn load_config(path: &Path) -> Result<EngineConfig> {
+    let data = fs::read_to_string(path)
+        .await
+        .with_context(|| format!("reading config file {}", path.display()))?;
+    let cfg: EngineConfig =
+        toml::from_str(&data).with_context(|| "parsing engine config TOML")?;
+    Ok(cfg)
+}
+
+// --------------- Sentiment Engine --------------------------------
+
+pub struct SentimentEngine {
+    /// Sender for raw events
+    pub in_tx: mpsc::Sender<api::RawEvent>,
+    /// Receiver for enriched events
+    pub out_rx: mpsc::Receiver<api::EnrichedEvent>,
+    /// Handle to shutdown signal
+    shutdown_tx: watch::Sender<bool>,
+}
+
+impl SentimentEngine {
+    /// Spin up the engine using an initial config file.
+    ///
+    /// The function returns immediately; internal tasks live on the Tokio
+    /// runtime until the [`SentimentEngine`] instance is dropped.
+    pub async fn new<P: Into<PathBuf>>(config_path: P) -> Result<Self> {
+        let config_path = config_path.into();
+        let cfg = load_config(&config_path).await?;
+
+        // Watch channel for strategy updates
+        let (strategy_tx, strategy_rx) =
+            watch::channel::<Arc<dyn SentimentStrategy>>(cfg.strategy.build());
+
+        // Watch channel for shutdown
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Input/output channels
+        let (in_tx, mut in_rx) = mpsc::channel::<api::RawEvent>(CHANNEL_CAPACITY);
+        let (out_tx, out_rx) = mpsc::channel::<api::EnrichedEvent>(CHANNEL_CAPACITY);
+
+        // Spawn config-file watcher
+        let watcher_strategy_tx = strategy_tx.clone();
+        let watcher_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = watch_config_file(
+                config_path,
+                watcher_strategy_tx,
+                watcher_shutdown,
+            )
+            .await
+            {
+                error!(%e, "config-file watcher failed");
+            }
+        });
+
+        // Spawn worker pool
+        for id in 0..cfg.parallelism {
+            let mut local_in_rx = in_rx.clone();
+            let out_tx = out_tx.clone();
+            let mut strategy_rx = strategy_rx.clone();
+            let mut shutdown_rx = shutdown_rx.clone();
+            task::Builder::new()
+                .name(&format!("sentiment-worker-{id}"))
+                .spawn(async move {
+                    while let Some(event) = select! {
+                        biased;
+                        _ = shutdown_rx.changed() => break,
+                        maybe = local_in_rx.recv() => maybe,
+                    } {
+                        process_event(event, &out_tx, &mut strategy_rx).await;
+                    }
+                    debug!("worker {id} exiting");
+                })
+                .expect("spawn sentiment worker");
+        }
+
+        Ok(Self {
+            in_tx,
+            out_rx,
+            shutdown_tx,
+        })
+    }
+}
+
+impl Drop for SentimentEngine {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+}
+
+// --------------- Internal Helpers --------------------------------
+
+async fn process_event(
+    event: api::RawEvent,
+    out_tx: &mpsc::Sender<api::EnrichedEvent>,
+    strategy_rx: &mut watch::Receiver<Arc<dyn SentimentStrategy>>,
+) {
+    let start = Instant::now();
+    // Obtain current strategy
+    let strategy = strategy_rx.borrow().clone();
+
+    match strategy.score(&event.text).await {
+        Ok(score) => {
+            let enriched = api::EnrichedEvent {
+                id: event.id,
+                user_id: event.user_id,
+                text: event.text,
+                timestamp: event.timestamp,
+                sentiment: score,
+                processed_at: chrono::Utc::now().timestamp_millis(),
+                strategy_version: strategy.version().to_string(),
+            };
+            if let Err(e) = out_tx.send(enriched).await {
+                warn!(%e, "failed to forward enriched event");
+            }
+        }
+        Err(e) => {
+            error!(%e, "sentiment scoring failed");
+        }
+    }
+    debug!(
+        elapsed_ms = start.elapsed().as_millis(),
+        strategy = strategy.version(),
+        "event processed"
+    );
+}
+
+/// Watch the config file for changes and update the active strategy when the
+/// `strategy` field changes.
+async fn watch_config_file(
+    path: PathBuf,
+    strategy_tx: watch::Sender<Arc<dyn SentimentStrategy>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    // Initial canonicalised metadata so we can detect self-events
+    let mut last_modified = fs::metadata(&path).await?.modified()?;
+
+    let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel(8);
+
+    // Spawn the synchronous notify watcher on a blocking thread
+    let mut watcher: RecommendedWatcher = Watcher::new(
+        move |res| {
+            if let Ok(event) = res {
+                let _ = evt_tx.blocking_send(event);
+            }
+        },
+        NotifyConfig::default().with_poll_interval(Duration::from_secs(3)),
+    )?;
+    watcher.watch(&path, RecursiveMode::NonRecursive)?;
+
+    info!(file=%path.display(), "started config-file watcher");
+
+    loop {
+        select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                info!("config-file watcher shutting down");
+                break;
+            },
+            Some(evt) = evt_rx.recv() => {
+                // Basic debouncing: only act if mtime changed
+                let modified = fs::metadata(&path).await?.modified()?;
+                if modified > last_modified {
+                    last_modified = modified;
+                    match load_config(&path).await {
+                        Ok(cfg) => {
+                            info!(strategy=?cfg.strategy, "loaded new sentiment config");
+                            let _ = strategy_tx.send(cfg.strategy.build());
+                        }
+                        Err(e) => {
+                            error!(%e, "failed to reload sentiment config");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// --------------- Tests -------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use api::{EnrichedEvent, RawEvent};
+
+    #[tokio::test]
+    async fn test_rule_based_scoring() {
+        let strat = RuleBasedStrategy;
+        assert!(strat.score("I love rust, it's awesome").await.unwrap() > 0.0);
+        assert!(strat.score("This is terrible and bad").await.unwrap() < 0.0);
+    }
+
+    #[tokio::test]
+    async fn integration_flow() -> Result<()> {
+        // Write temp config
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("sentiment.toml");
+        fs::write(
+            &cfg_path,
+            r#"strategy = "rule_based"
+parallelism = 2
+"#,
+        )
+        .await?;
+
+        let engine = SentimentEngine::new(&cfg_path).await?;
+        let raw = RawEvent {
+            id: "1".into(),
+            user_id: "u".into(),
+            text: "I love cheese".into(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        };
+        engine.in_tx.send(raw).await.unwrap();
+        let enriched = engine.out_rx.recv().await.unwrap();
+        assert_eq!(enriched.id, "1");
+        assert!(enriched.sentiment > 0.0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hot_swap_strategy() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("sentiment.toml");
+        fs::write(
+            &cfg_path,
+            r#"strategy = "rule_based""#,
+        )
+        .await?;
+        let engine = SentimentEngine::new(&cfg_path).await?;
+
+        // Fire first message with rule-based
+        engine
+            .in_tx
+            .send(api::RawEvent {
+                id: "1".into(),
+                user_id: "u".into(),
+                text: "neutral text".into(),
+                timestamp: 0,
+            })
+            .await?;
+        let EnrichedEvent {
+            strategy_version, ..
+        } = engine.out_rx.recv().await.unwrap();
+        assert_eq!(strategy_version, "rule-based-v1");
+
+        // Update config to ML strategy
+        fs::write(&cfg_path, r#"strategy = "ml""#).await?;
+
+        // Give watcher time to reload
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Fire second message
+        engine
+            .in_tx
+            .send(api::RawEvent {
+                id: "2".into(),
+                user_id: "u".into(),
+                text: "neutral text".into(),
+                timestamp: 0,
+            })
+            .await?;
+        let EnrichedEvent {
+            strategy_version, ..
+        } = engine.out_rx.recv().await.unwrap();
+        assert_eq!(strategy_version, "ml-bert-v3");
+        Ok(())
+    }
+}
+```

@@ -1,0 +1,396 @@
+```rust
+//! Module 54 − Hyper-parameter tuning + metric-based retraining trigger.
+//!
+//! This module demonstrates how VisuTility Orchestrator wires together
+//! Strategy, Factory, and Observer patterns to enable adaptive
+//! hyper-parameter tuning and automated retraining triggers.
+//!
+//! The code is intentionally self-contained but designed to integrate
+//! with the wider orchestrator through trait-based interfaces and the
+//! internal event bus.
+
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use crossbeam_channel::{bounded, select, tick, Receiver, Sender};
+use rand::prelude::*;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+//
+// ---------- Domain Types -------------------------------------------------------------------------
+//
+
+/// Human-readable identifier for model runs.
+pub type RunId = String;
+
+/// Dynamic hyper-parameter bag.
+/// Numeric values are represented as `f64`; discrete options can be handled
+/// by mapping them to an ordinal integer or by string-to-index mapping.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyperParameterConfig {
+    pub params: HashMap<String, f64>,
+}
+
+impl HyperParameterConfig {
+    pub fn new() -> Self {
+        Self {
+            params: HashMap::new(),
+        }
+    }
+
+    pub fn insert<S: Into<String>>(&mut self, key: S, value: f64) {
+        self.params.insert(key.into(), value);
+    }
+
+    pub fn get(&self, key: &str) -> Option<f64> {
+        self.params.get(key).cloned()
+    }
+}
+
+/// Training (or validation) metrics used as feedback for tuning.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TrainingMetrics {
+    pub accuracy: f32,
+    pub f1_score: f32,
+    pub loss: f32,
+}
+
+/// Signal produced when retraining should be triggered.
+#[derive(Debug, Clone)]
+pub struct RetrainEvent {
+    /// Identifier of the model that should be retrained.
+    pub model_id: String,
+
+    /// Reason for retraining (metric degraded, data drift, etc.).
+    pub reason: String,
+}
+
+//
+// ---------- Error Types --------------------------------------------------------------------------
+//
+
+#[derive(Error, Debug)]
+pub enum TunerError {
+    #[error("The parameter `{0}` is missing from the provided configuration.")]
+    MissingParam(String),
+
+    #[error("Internal randomness failed")]
+    Randomness(#[from] rand::Error),
+}
+
+/// Result alias for the tuner subsystem.
+pub type TunerResult<T> = std::result::Result<T, TunerError>;
+
+//
+// ---------- Hyper-parameter Tuning — Strategy Pattern --------------------------------------------
+//
+
+/// Strategy trait for hyper-parameter tuning algorithms.
+pub trait HyperparameterTuner: Send {
+    /// Returns the name of the strategy (for audit / experiment tracking).
+    fn strategy_name(&self) -> &'static str;
+
+    /// Given an initial configuration and the latest metrics, propose a new config.
+    fn tune(
+        &mut self,
+        last_config: &HyperParameterConfig,
+        last_metrics: &TrainingMetrics,
+    ) -> TunerResult<HyperParameterConfig>;
+}
+
+/// Naïve grid-search tuning strategy.
+pub struct GridSearchTuner {
+    /// Step size applied to each parameter during search.
+    step_size: f64,
+}
+
+impl GridSearchTuner {
+    pub fn new(step_size: f64) -> Self {
+        Self { step_size }
+    }
+}
+
+impl HyperparameterTuner for GridSearchTuner {
+    fn strategy_name(&self) -> &'static str {
+        "grid_search"
+    }
+
+    fn tune(
+        &mut self,
+        last_config: &HyperParameterConfig,
+        _last_metrics: &TrainingMetrics,
+    ) -> TunerResult<HyperParameterConfig> {
+        // Very small example: bump each param by `step_size`
+        let mut new_cfg = last_config.clone();
+        for value in new_cfg.params.values_mut() {
+            *value += self.step_size;
+        }
+        Ok(new_cfg)
+    }
+}
+
+/// Very light-weight pseudo-Bayesian tuner mock (random exploration).
+pub struct BayesianTuner {
+    rng: ThreadRng,
+    exploration_rate: f64,
+}
+
+impl BayesianTuner {
+    pub fn new(exploration_rate: f64) -> Self {
+        Self {
+            rng: thread_rng(),
+            exploration_rate,
+        }
+    }
+}
+
+impl HyperparameterTuner for BayesianTuner {
+    fn strategy_name(&self) -> &'static str {
+        "bayesian_search"
+    }
+
+    fn tune(
+        &mut self,
+        last_config: &HyperParameterConfig,
+        _last_metrics: &TrainingMetrics,
+    ) -> TunerResult<HyperParameterConfig> {
+        let mut new_cfg = last_config.clone();
+        for value in new_cfg.params.values_mut() {
+            let noise: f64 = self.rng.gen::<f64>() * self.exploration_rate;
+            *value += noise - (self.exploration_rate / 2.0);
+        }
+        Ok(new_cfg)
+    }
+}
+
+//
+// ---------- Factory Pattern: TunerFactory --------------------------------------------------------
+//
+
+/// Available tuning strategy identifiers.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TunerKind {
+    GridSearch,
+    Bayesian,
+}
+
+/// Factory responsible for creating boxed [`HyperparameterTuner`]s.
+pub struct TunerFactory;
+
+impl TunerFactory {
+    pub fn create(kind: TunerKind) -> Box<dyn HyperparameterTuner> {
+        match kind {
+            TunerKind::GridSearch => Box::new(GridSearchTuner::new(0.05)),
+            TunerKind::Bayesian => Box::new(BayesianTuner::new(0.10)),
+        }
+    }
+}
+
+//
+// ---------- Observer Pattern: PerformanceMonitor -------------------------------------------------
+//
+
+/// Trait for observers interested in metric updates.
+pub trait MetricsObserver: Send {
+    /// Called whenever new training metrics are recorded.
+    fn on_metrics_update(&mut self, metrics: &TrainingMetrics);
+}
+
+/// Concrete observer that monitors metrics & pushes [`RetrainEvent`]s.
+pub struct PerformanceMonitor {
+    history: VecDeque<TrainingMetrics>,
+    window: usize,
+    threshold_pct: f32,
+    tx_retrain: Sender<RetrainEvent>,
+    model_id: String,
+}
+
+impl PerformanceMonitor {
+    /// Create a new monitor.
+    ///
+    /// * `window` – number of recent metrics used to compute rolling mean.
+    /// * `threshold_pct` – acceptable degradation percentage vs. best.
+    pub fn new(
+        model_id: String,
+        window: usize,
+        threshold_pct: f32,
+        tx_retrain: Sender<RetrainEvent>,
+    ) -> Self {
+        Self {
+            history: VecDeque::with_capacity(window),
+            window,
+            threshold_pct,
+            tx_retrain,
+            model_id,
+        }
+    }
+
+    /// Computes moving average loss over the internal window.
+    fn avg_loss(&self) -> Option<f32> {
+        if self.history.is_empty() {
+            return None;
+        }
+        Some(
+            self.history
+                .iter()
+                .map(|m| m.loss)
+                .sum::<f32>()
+                / self.history.len() as f32,
+        )
+    }
+}
+
+impl MetricsObserver for PerformanceMonitor {
+    fn on_metrics_update(&mut self, metrics: &TrainingMetrics) {
+        // Maintain bounded window.
+        if self.history.len() == self.window {
+            self.history.pop_front();
+        }
+        self.history.push_back(*metrics);
+
+        // Compute rolling avg and detect degradation.
+        if let Some(avg_loss) = self.avg_loss() {
+            let worst_allowed = avg_loss * (1.0 + self.threshold_pct);
+            if metrics.loss > worst_allowed {
+                // Push retrain event.
+                let evt = RetrainEvent {
+                    model_id: self.model_id.clone(),
+                    reason: format!(
+                        "Loss degraded {:.2}% vs. rolling mean",
+                        (metrics.loss / avg_loss - 1.0) * 100.0
+                    ),
+                };
+                // It's okay to ignore send errors — they indicate closed consumer.
+                let _ = self.tx_retrain.send(evt);
+            }
+        }
+    }
+}
+
+//
+// ---------- Orchestration Boilerplate ------------------------------------------------------------
+//
+
+/// Coordinator that glues together tuner, observer, and async channels.
+///
+/// It represents a coarse-grained task that would likely run in a Tokio
+/// executor in the real orchestrator; here we model it with plain threads
+/// for minimal dependencies.
+///
+/// The loop:
+/// 1. Consumes new metrics from `rx_metrics`.
+/// 2. Feeds them to the tuner.
+/// 3. Broadcasts them to observers.
+/// 4. Emits new hyper-parameter configs via `tx_config`.
+pub struct TuningCoordinator {
+    tuner: Mutex<Box<dyn HyperparameterTuner>>,
+    observers: Mutex<Vec<Box<dyn MetricsObserver>>>,
+    rx_metrics: Receiver<(HyperParameterConfig, TrainingMetrics)>,
+    tx_config: Sender<HyperParameterConfig>,
+}
+
+impl TuningCoordinator {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tuner: Box<dyn HyperparameterTuner>,
+        observers: Vec<Box<dyn MetricsObserver>>,
+        rx_metrics: Receiver<(HyperParameterConfig, TrainingMetrics)>,
+        tx_config: Sender<HyperParameterConfig>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            tuner: Mutex::new(tuner),
+            observers: Mutex::new(observers),
+            rx_metrics,
+            tx_config,
+        })
+    }
+
+    /// Blocking loop; should be spawned on its own thread / executor.
+    pub fn start(self: Arc<Self>) {
+        std::thread::spawn(move || {
+            let ticker = tick(Duration::from_secs(1));
+
+            loop {
+                select! {
+                    recv(self.rx_metrics) -> msg => {
+                        match msg {
+                            Ok((cfg, metrics)) => {
+                                // 1) Produce new config via tuner.
+                                let mut tuner = self.tuner.lock().expect("poisoned lock");
+                                match tuner.tune(&cfg, &metrics) {
+                                    Ok(new_cfg) => {
+                                        // Send back to upstream training service
+                                        if let Err(err) = self.tx_config.send(new_cfg) {
+                                            eprintln!("TuningCoordinator: failed to send new config: {err}");
+                                        }
+                                    }
+                                    Err(e) => eprintln!("TuningCoordinator: tune() failed: {e:?}"),
+                                }
+
+                                // 2) Notify observers.
+                                for obs in self.observers.lock().expect("poisoned lock").iter_mut() {
+                                    obs.on_metrics_update(&metrics);
+                                }
+                            }
+                            Err(_) => {
+                                // Upstream closed. Shutdown gracefully.
+                                break;
+                            }
+                        }
+                    }
+                    recv(ticker) -> _ => {
+                        // Heart-beat for logging / metrics integration.
+                        // In prod we would emit metrics to Prometheus here.
+                    }
+                }
+            }
+        });
+    }
+}
+
+//
+// ---------- Self-contained Integration Test -------------------------------------------------------
+//
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn end_to_end_flow() {
+        // a) Wire channels.
+        let (tx_metrics, rx_metrics) = bounded::<(HyperParameterConfig, TrainingMetrics)>(4);
+        let (tx_cfg_out, rx_cfg_out) = bounded::<HyperParameterConfig>(4);
+        let (tx_retrain, _rx_retrain) = bounded::<RetrainEvent>(4);
+
+        // b) Concrete strategy + observer.
+        let tuner = TunerFactory::create(TunerKind::GridSearch);
+        let monitor = PerformanceMonitor::new("model-xyz".into(), 4, 0.05, tx_retrain);
+
+        // c) Coordinator.
+        let coord = TuningCoordinator::new(tuner, vec![Box::new(monitor)], rx_metrics, tx_cfg_out);
+        coord.start();
+
+        // d) Push dummy metrics.
+        let mut cfg = HyperParameterConfig::new();
+        cfg.insert("lr", 0.01);
+        cfg.insert("momentum", 0.9);
+
+        for i in 0..5 {
+            let mut metrics = TrainingMetrics {
+                accuracy: 0.9,
+                f1_score: 0.92,
+                loss: 0.1 + i as f32 * 0.02,
+            };
+            tx_metrics.send((cfg.clone(), metrics)).unwrap();
+
+            // Receive tuned config.
+            let new_cfg = rx_cfg_out.recv().unwrap();
+            assert!(new_cfg.get("lr").is_some());
+        }
+    }
+}
+```

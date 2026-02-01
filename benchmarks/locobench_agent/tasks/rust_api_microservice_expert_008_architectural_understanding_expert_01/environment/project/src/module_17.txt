@@ -1,0 +1,349 @@
+```rust
+//! src/module_17.rs
+//! LedgerLink Nexus – Ledger‐Entry Query Service (module_17)
+//!
+//! This module exposes a production-grade query service that pulls paginated
+//! ledger entries from PostgreSQL, enriches them with domain metadata, and
+//! serves them through a read-through Redis cache.  
+//!
+//! Design goals
+//! ------------
+//! • Command/Query separation – read-side only, no mutations here.  
+//! • Explicit View ↔ ViewModel ↔ Domain separation.  
+//! • End-to-end request validation using the `validator` crate.  
+//! • Structured logging (`tracing`) for observability.  
+//! • Vendor-agnostic repository trait to keep persistence concerns isolated.  
+//!
+//! NOTE: wiring (e.g. Actix-web / Axum handlers) lives elsewhere; this module
+//! focuses purely on the service & repository abstraction.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sqlx::{postgres::PgRow, PgPool, Row};
+use thiserror::Error;
+use tokio::time::{sleep, Duration};
+use tracing::{debug, error, info, instrument};
+use uuid::Uuid;
+use validator::Validate;
+
+/// Maximum page size enforced by the API gateway.
+pub const MAX_PAGE_SIZE: u32 = 250;
+/// Default cache TTL for paginated ledger entry results.
+const CACHE_TTL_SECONDS: usize = 30;
+
+/// Public DTO – accepted from HTTP/GraphQL layer.
+/// The DTO is validated before being processed.
+#[derive(Clone, Debug, Deserialize, Validate)]
+pub struct LedgerEntryQueryDto {
+    /// Tenant‐scoped account identifier (UUID v4).
+    #[validate(length(min = 36, max = 36))]
+    pub account_id: String,
+
+    /// Requested page (1-based indexing).
+    #[validate(range(min = 1))]
+    pub page: u32,
+
+    /// Items per page (soft-capped by `MAX_PAGE_SIZE`).
+    #[validate(range(min = 1, max = "MAX_PAGE_SIZE"))]
+    pub per_page: u32,
+
+    /// Optional inclusive ISO8601 (UTC) start filter.
+    #[validate(custom = "validate_optional_utc_timestamp")]
+    pub from_utc: Option<String>,
+
+    /// Optional inclusive ISO8601 (UTC) end filter.
+    #[validate(custom = "validate_optional_utc_timestamp")]
+    pub to_utc: Option<String>,
+}
+
+/// Validate an optional ISO-8601 UTC timestamp string.
+fn validate_optional_utc_timestamp(ts: &str) -> Result<(), validator::ValidationError> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|_| ())
+        .map_err(|_| validator::ValidationError::new("invalid_timestamp"))
+}
+
+/// Internal representation of filters passed to the repository.
+#[derive(Clone, Debug)]
+struct LedgerEntryFilter {
+    account_id: Uuid,
+    from_utc: Option<chrono::DateTime<chrono::Utc>>,
+    to_utc: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Domain model – as stored in Postgres (simplified for demo).
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub amount: rust_decimal::Decimal,
+    pub currency: String,
+    pub posted_at: chrono::DateTime<chrono::Utc>,
+    pub narrative: String,
+}
+
+/// Paginated response view model.
+#[derive(Debug, Serialize)]
+pub struct PaginatedLedgerEntries {
+    pub entries: Vec<LedgerEntry>,
+    pub page: u32,
+    pub per_page: u32,
+    pub total_pages: u32,
+    pub total_items: i64,
+}
+
+/// Service-level errors bubbled up to the transport layer.
+#[derive(Debug, Error)]
+pub enum QueryServiceError {
+    #[error("validation error: {0}")]
+    Validation(String),
+
+    #[error("repository error: {0}")]
+    Repository(#[from] RepositoryError),
+
+    #[error("cache error: {0}")]
+    Cache(#[from] redis::RedisError),
+}
+
+/// Persistence-layer errors (not exposed verbatim over the wire).
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("db error: {0}")]
+    Db(#[from] sqlx::Error),
+
+    #[error("unexpected null where value not allowed")]
+    Null,
+}
+
+/// Read-side repository abstraction for ledger entries.
+#[async_trait]
+pub trait LedgerEntryReadRepository: Send + Sync + 'static {
+    async fn fetch_paginated(
+        &self,
+        filter: &LedgerEntryFilter,
+        page: u32,
+        per_page: u32,
+    ) -> Result<(Vec<LedgerEntry>, i64), RepositoryError>;
+}
+
+/// Postgres implementation.
+pub struct PgLedgerEntryRepository {
+    pool: PgPool,
+}
+
+impl PgLedgerEntryRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LedgerEntryReadRepository for PgLedgerEntryRepository {
+    #[instrument(skip(self))]
+    async fn fetch_paginated(
+        &self,
+        filter: &LedgerEntryFilter,
+        page: u32,
+        per_page: u32,
+    ) -> Result<(Vec<LedgerEntry>, i64), RepositoryError> {
+        let offset = (page - 1) * per_page;
+        let mut query = String::from(
+            r#"
+            SELECT id,
+                   account_id,
+                   amount,
+                   currency,
+                   posted_at,
+                   narrative,
+                   COUNT(*) OVER() AS full_count
+            FROM ledger_entries
+            WHERE account_id = $1
+        "#,
+        );
+
+        // Dynamically build date filters if provided.
+        if filter.from_utc.is_some() {
+            query.push_str(" AND posted_at >= $2");
+        }
+        if filter.to_utc.is_some() {
+            query.push_str(" AND posted_at <= $3");
+        }
+        query.push_str(" ORDER BY posted_at DESC LIMIT $4 OFFSET $5");
+
+        // Flatten bind parameters.
+        let mut rows = sqlx::query(&query);
+        rows = rows.bind(filter.account_id);
+        if let Some(from) = filter.from_utc {
+            rows = rows.bind(from);
+        }
+        if let Some(to) = filter.to_utc {
+            rows = rows.bind(to);
+        }
+        rows = rows.bind(per_page as i64).bind(offset as i64);
+
+        let pg_rows: Vec<PgRow> = rows.fetch_all(&self.pool).await?;
+
+        let total_items = pg_rows
+            .get(0)
+            .map(|r| r.try_get::<i64, _>("full_count").unwrap_or(0))
+            .unwrap_or(0);
+
+        let entries = pg_rows
+            .into_iter()
+            .map(|row| LedgerEntry {
+                id: row.try_get("id")?,
+                account_id: row.try_get("account_id")?,
+                amount: row.try_get("amount")?,
+                currency: row.try_get("currency")?,
+                posted_at: row.try_get("posted_at")?,
+                narrative: row.try_get("narrative")?,
+            })
+            .collect();
+
+        Ok((entries, total_items))
+    }
+}
+
+/// Query service orchestrates validation, caching and repository IO.
+pub struct LedgerEntryQueryService<R: LedgerEntryReadRepository> {
+    repo: Arc<R>,
+    redis: Arc<redis::Client>,
+}
+
+impl<R: LedgerEntryReadRepository> LedgerEntryQueryService<R> {
+    pub fn new(repo: Arc<R>, redis: Arc<redis::Client>) -> Self {
+        Self { repo, redis }
+    }
+
+    /// Core entry point used by controllers/handlers.
+    #[instrument(skip(self))]
+    pub async fn get_ledger_entries(
+        &self,
+        dto: LedgerEntryQueryDto,
+    ) -> Result<PaginatedLedgerEntries, QueryServiceError> {
+        // 1) Validate DTO.
+        dto.validate()
+            .map_err(|e| QueryServiceError::Validation(e.to_string()))?;
+
+        // 2) Transform DTO → internal filter.
+        let filter = LedgerEntryFilter {
+            account_id: Uuid::parse_str(&dto.account_id)
+                .map_err(|e| QueryServiceError::Validation(e.to_string()))?,
+            from_utc: parse_optional_ts(dto.from_utc.as_deref())?,
+            to_utc: parse_optional_ts(dto.to_utc.as_deref())?,
+        };
+
+        // 3) Fast path – attempt cache hit.
+        let cache_key = build_cache_key(&filter, dto.page, dto.per_page);
+        if let Ok(Some(blob)) = self.redis.get::<_, Vec<u8>>(&cache_key).await {
+            debug!("cache hit for key={}", cache_key);
+            // small artificial latency to simulate serialization cost
+            sleep(Duration::from_millis(2)).await;
+            let cached = bincode::deserialize::<PaginatedLedgerEntries>(&blob)
+                .map_err(|e| QueryServiceError::Cache(redis::RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "bincode deserialize",
+                    format!("{e:?}"),
+                ))))?;
+            return Ok(cached);
+        }
+
+        // 4) Repository call.
+        let (entries, total_items) = self
+            .repo
+            .fetch_paginated(&filter, dto.page, dto.per_page)
+            .await?;
+
+        let total_pages = (total_items as f64 / dto.per_page as f64).ceil() as u32;
+
+        let response = PaginatedLedgerEntries {
+            entries,
+            page: dto.page,
+            per_page: dto.per_page,
+            total_pages,
+            total_items,
+        };
+
+        // 5) Populate cache (fire-and-forget).
+        let redis = self.redis.clone();
+        let key = cache_key.clone();
+        let payload = bincode::serialize(&response).expect("serialize PaginatedLedgerEntries");
+        tokio::spawn(async move {
+            let mut conn = match redis.get_async_connection().await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("failed to obtain redis connection: {:?}", e);
+                    return;
+                }
+            };
+            let _: Result<(), _> = conn
+                .set_ex(key, payload, CACHE_TTL_SECONDS)
+                .await
+                .inspect_err(|e| error!("failed to set redis cache: {:?}", e));
+        });
+
+        Ok(response)
+    }
+}
+
+/// Build a deterministic cache key from the filter & pagination directives.
+fn build_cache_key(filter: &LedgerEntryFilter, page: u32, per_page: u32) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(filter.account_id.as_bytes());
+    if let Some(from) = filter.from_utc {
+        hasher.update(from.timestamp_millis().to_be_bytes());
+    }
+    if let Some(to) = filter.to_utc {
+        hasher.update(to.timestamp_millis().to_be_bytes());
+    }
+    hasher.update(page.to_be_bytes());
+    hasher.update(per_page.to_be_bytes());
+    format!("ledger_entries:{:x}", hasher.finalize())
+}
+
+fn parse_optional_ts(s: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, QueryServiceError> {
+    match s {
+        Some(raw) => chrono::DateTime::parse_from_rfc3339(raw)
+            .map(|dt| Some(dt.with_timezone(&chrono::Utc)))
+            .map_err(|e| QueryServiceError::Validation(e.to_string())),
+        None => Ok(None),
+    }
+}
+
+/* ---------- Tests ---------- */
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Executor;
+
+    #[tokio::test]
+    async fn cache_key_is_deterministic() {
+        let filter = LedgerEntryFilter {
+            account_id: Uuid::new_v4(),
+            from_utc: None,
+            to_utc: None,
+        };
+        let k1 = build_cache_key(&filter, 1, 20);
+        let k2 = build_cache_key(&filter, 1, 20);
+        assert_eq!(k1, k2);
+    }
+
+    #[tokio::test]
+    async fn dto_validation_works() {
+        let dto = LedgerEntryQueryDto {
+            account_id: "invalid-uuid".into(),
+            page: 0,
+            per_page: 0,
+            from_utc: None,
+            to_utc: None,
+        };
+        assert!(dto.validate().is_err());
+    }
+
+    // An integration test using a temporary Postgres + Redis would live here.
+}
+```

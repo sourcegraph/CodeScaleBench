@@ -1,0 +1,612 @@
+/**
+ * MercuryMonolith Commerce Hub
+ * Module 32  –  Response Cache (In-Memory LRU w/ TTL + Metrics)
+ *
+ * File: src/module_32.txt   (C source)
+ *
+ * This component provides a thread-safe, time-aware Least-Recently-Used
+ * cache intended for short-lived HTTP/GraphQL response caching.  The
+ * implementation keeps memory footprint bounded via a capacity limit,
+ * automatically evicts stale entries, and publishes internal statistics
+ * that can be scraped by the Prometheus integration layer.
+ *
+ * Key features
+ *  • Lock-striped hash table for low-contention lookups
+ *  • Global doubly-linked LRU list for O(1) eviction
+ *  • Configurable default TTL, per-entry overrides
+ *  • Background reaper thread for lazy expiration
+ *  • Atomic metrics counters (hits/misses/evictions/memory)
+ *
+ * NOTE: This file purposefully contains no MercuryMonolith specific
+ * dependencies so it can be reused by other binaries or unit tests.
+ */
+
+#define _GNU_SOURCE     /* For pthread_setname_np */
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
+#include <errno.h>
+#include <time.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <assert.h>
+
+/* ------------------------------------------------------------------------- */
+/*                         Public API – Forward Decls                        */
+/* ------------------------------------------------------------------------- */
+
+typedef struct mm_cache mm_cache_t;
+
+/* Error/Status codes returned by operations */
+typedef enum {
+    MMC_OK = 0,
+    MMC_ERR_NOMEM      = -1,  /* malloc/calloc failed                           */
+    MMC_ERR_NOTFOUND   = -2,  /* key absent or expired                          */
+    MMC_ERR_BUSY       = -3,  /* lock contention / internal error               */
+    MMC_ERR_INVALID    = -4   /* invalid argument                               */
+} mmc_status_e;
+
+/* Statistics snapshot (all counters are monotonic) */
+typedef struct {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    uint64_t items;
+    uint64_t bytes;          /* total payload bytes currently in cache          */
+} mm_cache_stats_t;
+
+/* Construction / Destruction */
+mm_cache_t * mm_cache_create(size_t capacity_items,
+                             size_t capacity_bytes,
+                             uint32_t default_ttl_ms);
+
+void         mm_cache_destroy(mm_cache_t *c);
+
+/* CRUD operations */
+mmc_status_e mm_cache_put(mm_cache_t  *c,
+                          const void  *key,
+                          size_t       key_len,
+                          const void  *payload,
+                          size_t       payload_len,
+                          uint32_t     ttl_ms);     /* 0 = use default TTL    */
+
+mmc_status_e mm_cache_get(mm_cache_t  *c,
+                          const void  *key,
+                          size_t       key_len,
+                          void       **payload_out,
+                          size_t      *payload_len_out); /* Caller owns buffer */
+
+/* Metrics */
+void         mm_cache_stats(mm_cache_t *c, mm_cache_stats_t *out_stats);
+
+/* ------------------------------------------------------------------------- */
+/*                           Hash & Time Helpers                             */
+/* ------------------------------------------------------------------------- */
+
+/* Simple 64-bit FNV-1a hash for byte arrays */
+static inline uint64_t
+fnv1a_hash(const void *data, size_t len)
+{
+    const uint8_t *p = (const uint8_t*)data;
+    uint64_t hash = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= p[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+/* Monotonic clock helper (milliseconds) */
+static inline uint64_t
+now_ms(void)
+{
+    struct timespec ts;
+#if defined(CLOCK_MONOTONIC_RAW)
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+    return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
+
+/* ------------------------------------------------------------------------- */
+/*                          Internal Data Structures                         */
+/* ------------------------------------------------------------------------- */
+
+typedef struct mmc_entry {
+    /* Hash table linkage */
+    struct mmc_entry   *hnext;
+
+    /* Global LRU double-linked list linkage */
+    struct mmc_entry   *prev;
+    struct mmc_entry   *next;
+
+    uint32_t            key_len;
+    uint32_t            payload_len;
+    uint64_t            expire_at;   /* ms epoch from now_ms()                 */
+    uint8_t             data[];      /* key[key_len] + payload[payload_len]    */
+} mmc_entry_t;
+
+/* Striped lock for buckets */
+#define MMC_LOCKS  64  /* Must be a power of 2 */
+typedef struct {
+    pthread_mutex_t mu;
+} mmc_lock_t;
+
+/* Core Cache Object */
+struct mm_cache {
+    size_t              capacity_items;
+    size_t              capacity_bytes;
+
+    _Atomic size_t      curr_items;
+    _Atomic size_t      curr_bytes;
+
+    _Atomic uint64_t    hits;
+    _Atomic uint64_t    misses;
+    _Atomic uint64_t    evictions;
+
+    uint32_t            default_ttl_ms;
+
+    /* Hash table */
+    size_t              hash_pow;      /* buckets = 1 << hash_pow               */
+    mmc_entry_t       **buckets;       /* array[bucket_cnt] of entry*           */
+
+    mmc_lock_t          bucket_locks[MMC_LOCKS];
+
+    /* LRU list (most recent at head) */
+    mmc_entry_t        *lru_head;
+    mmc_entry_t        *lru_tail;
+    pthread_mutex_t     lru_mu;        /* protects LRU list + memory tally      */
+
+    /* Reaper thread */
+    pthread_t           reaper;
+    _Atomic int         stop_reaper;
+};
+
+/* ------------------------------------------------------------------------- */
+/*                              Lock Helpers                                 */
+/* ------------------------------------------------------------------------- */
+
+static inline void
+lock_bucket(mmc_lock_t *l)
+{
+    if (pthread_mutex_lock(&l->mu) != 0) abort();
+}
+
+static inline void
+unlock_bucket(mmc_lock_t *l)
+{
+    if (pthread_mutex_unlock(&l->mu) != 0) abort();
+}
+
+static inline void
+lock_lru(mm_cache_t *c)
+{
+    if (pthread_mutex_lock(&c->lru_mu) != 0) abort();
+}
+
+static inline void
+unlock_lru(mm_cache_t *c)
+{
+    if (pthread_mutex_unlock(&c->lru_mu) != 0) abort();
+}
+
+/* ------------------------------------------------------------------------- */
+/*                       Internal Helper Functionality                       */
+/* ------------------------------------------------------------------------- */
+
+/* Remove entry from hash table bucket list (caller holds bucket lock) */
+static void
+hash_remove(mm_cache_t *c, size_t idx, mmc_entry_t *e)
+{
+    mmc_entry_t **cur = &c->buckets[idx];
+    while (*cur) {
+        if (*cur == e) {
+            *cur = e->hnext;
+            return;
+        }
+        cur = &(*cur)->hnext;
+    }
+    /* Should not reach here */
+    abort();
+}
+
+/* Remove entry from LRU list (caller holds lru_mu) */
+static void
+lru_detach(mm_cache_t *c, mmc_entry_t *e)
+{
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_head == e) c->lru_head = e->next;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+    e->prev = e->next = NULL;
+}
+
+/* Insert entry at head of LRU list (caller holds lru_mu) */
+static void
+lru_insert_head(mm_cache_t *c, mmc_entry_t *e)
+{
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+/* Reclaim memory for entry and update counters (caller holds neither lock) */
+static void
+free_entry(mm_cache_t *c, mmc_entry_t *e)
+{
+    atomic_fetch_sub(&c->curr_items, 1);
+    atomic_fetch_sub(&c->curr_bytes, e->payload_len);
+    free(e);
+}
+
+/* Compute bucket index from hash */
+static inline size_t
+bucket_idx(mm_cache_t *c, uint64_t hash)
+{
+    return hash & ((1ULL << c->hash_pow) - 1ULL);
+}
+
+/* ------------------------------------------------------------------------- */
+/*                          Background Reaper Thread                         */
+/* ------------------------------------------------------------------------- */
+
+#define REAPER_SLEEP_MS 500
+
+static void *
+reaper_fn(void *arg)
+{
+    mm_cache_t *c = (mm_cache_t*)arg;
+    pthread_setname_np(pthread_self(), "mmcache-reaper");
+
+    while (!atomic_load(&c->stop_reaper)) {
+        uint64_t now = now_ms();
+
+        /* Scan buckets under lock striping */
+        for (size_t b = 0; b < (1ULL << c->hash_pow); ++b) {
+            mmc_lock_t *lock = &c->bucket_locks[b % MMC_LOCKS];
+            lock_bucket(lock);
+
+            mmc_entry_t **cur = &c->buckets[b];
+            while (*cur) {
+                mmc_entry_t *e = *cur;
+                if (e->expire_at <= now) {
+                    /* Expired: remove from bucket list */
+                    *cur = e->hnext;
+
+                    /* Remove from LRU list under lru_mu */
+                    lock_lru(c);
+                    lru_detach(c, e);
+                    unlock_lru(c);
+
+                    atomic_fetch_add(&c->evictions, 1);
+                    free_entry(c, e);
+                    continue;       /* cur already advanced */
+                }
+                cur = &(*cur)->hnext;
+            }
+
+            unlock_bucket(lock);
+        }
+
+        /* Evict overflow items if over capacity */
+        while (atomic_load(&c->curr_items) > c->capacity_items ||
+               atomic_load(&c->curr_bytes) > c->capacity_bytes)
+        {
+            lock_lru(c);
+            mmc_entry_t *victim = c->lru_tail;
+            if (!victim) {
+                unlock_lru(c);
+                break;
+            }
+
+            /* Remove victim from LRU list */
+            lru_detach(c, victim);
+            unlock_lru(c);
+
+            /* Remove from hash bucket */
+            size_t idx = bucket_idx(c, fnv1a_hash(victim->data, victim->key_len));
+            mmc_lock_t *bl = &c->bucket_locks[idx % MMC_LOCKS];
+            lock_bucket(bl);
+            hash_remove(c, idx, victim);
+            unlock_bucket(bl);
+
+            atomic_fetch_add(&c->evictions, 1);
+            free_entry(c, victim);
+        }
+
+        struct timespec ts;
+        ts.tv_sec  = REAPER_SLEEP_MS / 1000;
+        ts.tv_nsec = (REAPER_SLEEP_MS % 1000) * 1000000L;
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------------- */
+/*                             Public API Impl                               */
+/* ------------------------------------------------------------------------- */
+
+mm_cache_t *
+mm_cache_create(size_t capacity_items,
+                size_t capacity_bytes,
+                uint32_t default_ttl_ms)
+{
+    if (capacity_items == 0 || capacity_bytes == 0)
+        return NULL;
+
+    mm_cache_t *c = calloc(1, sizeof(mm_cache_t));
+    if (!c) return NULL;
+
+    c->capacity_items   = capacity_items;
+    c->capacity_bytes   = capacity_bytes;
+    c->default_ttl_ms   = default_ttl_ms == 0 ? 10000 : default_ttl_ms;
+
+    /* Choose bucket count as next power of 2 >= capacity_items / 4  (heuristic) */
+    size_t buckets = 1;
+    while (buckets < (capacity_items >> 2)) buckets <<= 1;
+    c->hash_pow = 0;
+    while ((1ULL << c->hash_pow) < buckets) c->hash_pow++;
+
+    c->buckets = calloc((1ULL << c->hash_pow), sizeof(void*));
+    if (!c->buckets) { free(c); return NULL; }
+
+    /* Initialize locks */
+    for (size_t i = 0; i < MMC_LOCKS; ++i) {
+        if (pthread_mutex_init(&c->bucket_locks[i].mu, NULL) != 0)
+            goto fail;
+    }
+
+    if (pthread_mutex_init(&c->lru_mu, NULL) != 0)
+        goto fail;
+
+    /* Spawn reaper */
+    if (pthread_create(&c->reaper, NULL, reaper_fn, c) != 0)
+        goto fail;
+
+    return c;
+
+fail:
+    /* best-effort cleanup */
+    for (size_t i = 0; i < MMC_LOCKS; ++i)
+        pthread_mutex_destroy(&c->bucket_locks[i].mu);
+    pthread_mutex_destroy(&c->lru_mu);
+    free(c->buckets);
+    free(c);
+    return NULL;
+}
+
+void
+mm_cache_destroy(mm_cache_t *c)
+{
+    if (!c) return;
+
+    atomic_store(&c->stop_reaper, 1);
+    pthread_join(c->reaper, NULL);
+
+    /* Free all entries */
+    for (size_t b = 0; b < (1ULL << c->hash_pow); ++b) {
+        mmc_entry_t *e = c->buckets[b];
+        while (e) {
+            mmc_entry_t *next = e->hnext;
+            free(e);
+            e = next;
+        }
+    }
+
+    /* Destroy locks */
+    for (size_t i = 0; i < MMC_LOCKS; ++i)
+        pthread_mutex_destroy(&c->bucket_locks[i].mu);
+    pthread_mutex_destroy(&c->lru_mu);
+
+    free(c->buckets);
+    free(c);
+}
+
+mmc_status_e
+mm_cache_put(mm_cache_t  *c,
+             const void  *key,
+             size_t       key_len,
+             const void  *payload,
+             size_t       payload_len,
+             uint32_t     ttl_ms)
+{
+    if (!c || !key || key_len == 0 || !payload || payload_len == 0)
+        return MMC_ERR_INVALID;
+
+    uint64_t hash = fnv1a_hash(key, key_len);
+    size_t idx = bucket_idx(c, hash);
+    mmc_lock_t *lock = &c->bucket_locks[idx % MMC_LOCKS];
+
+    /* Allocate new entry prior to locking to reduce contention */
+    mmc_entry_t *new_e = calloc(1, sizeof(mmc_entry_t) + key_len + payload_len);
+    if (!new_e) return MMC_ERR_NOMEM;
+
+    new_e->key_len      = (uint32_t)key_len;
+    new_e->payload_len  = (uint32_t)payload_len;
+    new_e->expire_at    = now_ms() + (ttl_ms ? ttl_ms : c->default_ttl_ms);
+    memcpy(new_e->data, key, key_len);
+    memcpy(new_e->data + key_len, payload, payload_len);
+
+    /* Critical section: bucket & LRU modifications */
+    lock_bucket(lock);
+
+    mmc_entry_t *prev = NULL, *cur = c->buckets[idx];
+    while (cur) {
+        if (cur->key_len == key_len &&
+            memcmp(cur->data, key, key_len) == 0)
+        {
+            break;   /* Found existing key */
+        }
+        prev = cur;
+        cur = cur->hnext;
+    }
+
+    if (cur) {
+        /* Replace payload – keep memory footprint constant if possible */
+        if (cur->payload_len >= payload_len) {
+            memcpy(cur->data + key_len, payload, payload_len);
+            atomic_fetch_sub(&c->curr_bytes, cur->payload_len - payload_len);
+            cur->payload_len = (uint32_t)payload_len;
+        } else {
+            /* Need bigger entry – allocate new, swap */
+            if (prev) prev->hnext = new_e;
+            else      c->buckets[idx] = new_e;
+            new_e->hnext = cur->hnext;
+
+            lock_lru(c);
+            lru_detach(c, cur);
+            lru_insert_head(c, new_e);
+            unlock_lru(c);
+
+            free_entry(c, cur);
+            cur = new_e;
+            new_e = NULL; /* Already consumed */
+        }
+        cur->expire_at = now_ms() + (ttl_ms ? ttl_ms : c->default_ttl_ms);
+
+        /* Move to LRU head */
+        lock_lru(c);
+        lru_detach(c, cur);
+        lru_insert_head(c, cur);
+        unlock_lru(c);
+
+        unlock_bucket(lock);
+        if (new_e) free(new_e);
+        return MMC_OK;
+    }
+
+    /* Insert new entry */
+    new_e->hnext = c->buckets[idx];
+    c->buckets[idx] = new_e;
+    new_e = NULL; /* ownership transferred */
+
+    atomic_fetch_add(&c->curr_items, 1);
+    atomic_fetch_add(&c->curr_bytes, payload_len);
+
+    unlock_bucket(lock);
+
+    /* LRU insert */
+    lock_lru(c);
+    lru_insert_head(c, c->buckets[idx]); /* we know head entry */
+    unlock_lru(c);
+
+    return MMC_OK;
+}
+
+mmc_status_e
+mm_cache_get(mm_cache_t  *c,
+             const void  *key,
+             size_t       key_len,
+             void       **payload_out,
+             size_t      *payload_len_out)
+{
+    if (!c || !key || key_len == 0 || !payload_out || !payload_len_out)
+        return MMC_ERR_INVALID;
+
+    uint64_t hash = fnv1a_hash(key, key_len);
+    size_t idx = bucket_idx(c, hash);
+    mmc_lock_t *lock = &c->bucket_locks[idx % MMC_LOCKS];
+
+    lock_bucket(lock);
+
+    mmc_entry_t *cur = c->buckets[idx];
+    while (cur) {
+        if (cur->key_len == key_len &&
+            memcmp(cur->data, key, key_len) == 0)
+            break;
+        cur = cur->hnext;
+    }
+
+    if (!cur) {
+        unlock_bucket(lock);
+        atomic_fetch_add(&c->misses, 1);
+        return MMC_ERR_NOTFOUND;
+    }
+
+    uint64_t n = now_ms();
+    if (cur->expire_at <= n) {
+        /* Expired – treat as miss; eviction deferred to reaper */
+        unlock_bucket(lock);
+        atomic_fetch_add(&c->misses, 1);
+        return MMC_ERR_NOTFOUND;
+    }
+
+    /* Copy payload for caller */
+    void *buf = malloc(cur->payload_len);
+    if (!buf) {
+        unlock_bucket(lock);
+        return MMC_ERR_NOMEM;
+    }
+    memcpy(buf, cur->data + cur->key_len, cur->payload_len);
+
+    /* Update LRU */
+    lock_lru(c);
+    lru_detach(c, cur);
+    lru_insert_head(c, cur);
+    unlock_lru(c);
+
+    unlock_bucket(lock);
+
+    *payload_out = buf;
+    *payload_len_out = cur->payload_len;
+
+    atomic_fetch_add(&c->hits, 1);
+    return MMC_OK;
+}
+
+void
+mm_cache_stats(mm_cache_t *c, mm_cache_stats_t *out_stats)
+{
+    if (!c || !out_stats) return;
+    out_stats->hits      = atomic_load(&c->hits);
+    out_stats->misses    = atomic_load(&c->misses);
+    out_stats->evictions = atomic_load(&c->evictions);
+    out_stats->items     = atomic_load(&c->curr_items);
+    out_stats->bytes     = atomic_load(&c->curr_bytes);
+}
+
+/* ------------------------------------------------------------------------- */
+/*                               Test Driver                                */
+/* ------------------------------------------------------------------------- */
+/* Compile standalone:
+ *     gcc -pthread -std=c11 -Wall -O2 module_32.txt -o mmcache_demo
+ * Then run ./mmcache_demo
+ */
+#ifdef MMCACHE_DEMO_MAIN
+#include <stdio.h>
+
+int main(void)
+{
+    mm_cache_t *cache = mm_cache_create(1024, 10 * 1024 * 1024, 5000);
+    assert(cache);
+
+    const char *k = "hello";
+    const char *v = "world";
+
+    mmc_status_e st = mm_cache_put(cache, k, strlen(k), v, strlen(v), 0);
+    assert(st == MMC_OK);
+
+    void *out;
+    size_t outlen;
+    st = mm_cache_get(cache, k, strlen(k), &out, &outlen);
+    if (st == MMC_OK) {
+        printf("hit: %.*s\n", (int)outlen, (char*)out);
+        free(out);
+    }
+
+    mm_cache_stats_t stats;
+    mm_cache_stats(cache, &stats);
+    printf("hits=%" PRIu64 " misses=%" PRIu64 " evictions=%" PRIu64
+           " items=%" PRIu64 " bytes=%" PRIu64 "\n",
+           stats.hits, stats.misses, stats.evictions,
+           stats.items, stats.bytes);
+
+    mm_cache_destroy(cache);
+    return 0;
+}
+#endif /* MMCACHE_DEMO_MAIN */

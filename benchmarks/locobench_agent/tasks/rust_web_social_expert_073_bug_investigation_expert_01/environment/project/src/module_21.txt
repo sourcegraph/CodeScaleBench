@@ -1,0 +1,358 @@
+```rust
+//! src/module_21.rs
+//!
+//! Domain-event infrastructure for EduPulse Live.
+//!
+//! This module provides a production-quality, event-sourcing foundation that
+//! persists domain events to PostgreSQL and publishes them to an external
+//! message broker (NATS).  It follows a clean-architecture approach and can be
+//! wired into the service layer of any bounded context (e.g. Learning Pulses,
+//! Quizzes, Badges).  All public structs are `Send + Sync` and suitable for
+//! asynchronous runtimes such as Tokio.
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgRow, PgPool, Postgres, Row, Transaction};
+use tracing::{debug, error, info};
+use uuid::Uuid;
+
+/// Type alias for easier refactoring.
+pub type AggregateId = Uuid;
+
+/// ------------------------------------------------------------------------------------------------
+/// Domain event definitions
+/// ------------------------------------------------------------------------------------------------
+
+/// Marker trait that every domain event must implement.
+pub trait VersionedEvent: Send + Sync + Serialize + for<'de> Deserialize<'de> {
+    /// Returns the semantic name of the event (e.g. `LessonPublished`).
+    fn event_type(&self) -> &'static str;
+}
+
+/// Event emitted whenever a teacher publishes a new lesson.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LessonPublishedEvent {
+    pub teacher_id: Uuid,
+    pub lesson_id: Uuid,
+    pub title: String,
+}
+
+impl VersionedEvent for LessonPublishedEvent {
+    fn event_type(&self) -> &'static str {
+        "LessonPublished"
+    }
+}
+
+/// Event emitted on quiz submission.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct QuizSubmittedEvent {
+    pub student_id: Uuid,
+    pub quiz_id: Uuid,
+    pub score_raw: i32,
+}
+
+impl VersionedEvent for QuizSubmittedEvent {
+    fn event_type(&self) -> &'static str {
+        "QuizSubmitted"
+    }
+}
+
+/// Event emitted when a learner replies to a learning pulse.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LearningPulseRespondedEvent {
+    pub responder_id: Uuid,
+    pub pulse_id: Uuid,
+    /// `Url` cannot be easily serialized with `serde_json` by default, so we
+    /// stick to `String`.
+    pub artefact_url: String,
+}
+
+impl VersionedEvent for LearningPulseRespondedEvent {
+    fn event_type(&self) -> &'static str {
+        "LearningPulseResponded"
+    }
+}
+
+/// Convenience enum to allow (de)serialisation of heterogeneous events.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type", content = "payload")]
+pub enum DomainEvent {
+    LessonPublished(LessonPublishedEvent),
+    QuizSubmitted(QuizSubmittedEvent),
+    LearningPulseResponded(LearningPulseRespondedEvent),
+}
+
+impl DomainEvent {
+    /// Returns the inner event type for indexing/metrics.
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            DomainEvent::LessonPublished(e) => e.event_type(),
+            DomainEvent::QuizSubmitted(e) => e.event_type(),
+            DomainEvent::LearningPulseResponded(e) => e.event_type(),
+        }
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Event envelope
+/// ------------------------------------------------------------------------------------------------
+
+/// Metadata wrapper that adds envelope information required by the event store.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EventEnvelope {
+    pub id: Uuid,
+    pub aggregate_id: AggregateId,
+    pub sequence: i64,
+    pub occurred_at: DateTime<Utc>,
+    pub event: DomainEvent,
+}
+
+impl EventEnvelope {
+    /// Creates a fully populated envelope for a freshly produced domain event.
+    pub fn new(aggregate_id: AggregateId, sequence: i64, event: DomainEvent) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            aggregate_id,
+            sequence,
+            occurred_at: Utc::now(),
+            event,
+        }
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Event store (PostgreSQL, JSONB backed)
+/// ------------------------------------------------------------------------------------------------
+
+/// SQL used to insert a new event.  The JSON payload is stored in its canonical
+/// form so it can be indexed by GIN/JSONB operators.
+const INSERT_EVENT_SQL: &str = r#"
+    INSERT INTO domain_events
+            (id, aggregate_id, sequence, occurred_at, event_type, payload)
+     VALUES ($1, $2, $3, $4, $5, $6)
+"#;
+
+/// SQL used to select events by aggregate id (event replay).
+const SELECT_BY_AGGREGATE_SQL: &str = r#"
+    SELECT id, aggregate_id, sequence, occurred_at, payload
+      FROM domain_events
+     WHERE aggregate_id = $1
+  ORDER BY sequence ASC
+"#;
+
+/// Primary interface of the event store.
+#[async_trait]
+pub trait EventStore: Send + Sync {
+    async fn append(&self, tx: &mut Transaction<'_, Postgres>, evt: &EventEnvelope) -> Result<()>;
+    async fn stream_by_aggregate(&self, aggregate_id: AggregateId) -> Result<Vec<EventEnvelope>>;
+}
+
+/// Concrete implementation for PostgreSQL (`sqlx`).
+pub struct PgEventStore {
+    pool: PgPool,
+}
+
+impl PgEventStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl EventStore for PgEventStore {
+    async fn append(&self, tx: &mut Transaction<'_, Postgres>, evt: &EventEnvelope) -> Result<()> {
+        let payload = serde_json::to_value(&evt.event)
+            .context("Serialising domain event to JSON failed")?;
+
+        sqlx::query(INSERT_EVENT_SQL)
+            .bind(evt.id)
+            .bind(evt.aggregate_id)
+            .bind(evt.sequence)
+            .bind(evt.occurred_at)
+            .bind(evt.event.event_type())
+            .bind(payload)
+            .execute(&mut *tx)
+            .await
+            .context("Inserting event into PostgreSQL failed")?;
+
+        debug!("Event persisted: {:#?}", evt);
+        Ok(())
+    }
+
+    async fn stream_by_aggregate(&self, aggregate_id: AggregateId) -> Result<Vec<EventEnvelope>> {
+        let rows: Vec<PgRow> = sqlx::query(SELECT_BY_AGGREGATE_SQL)
+            .bind(aggregate_id)
+            .fetch_all(&self.pool)
+            .await
+            .context("Querying events for aggregate failed")?;
+
+        rows.into_iter()
+            .map(|row| {
+                let id: Uuid = row.try_get("id")?;
+                let aggregate_id: Uuid = row.try_get("aggregate_id")?;
+                let sequence: i64 = row.try_get("sequence")?;
+                let occurred_at: DateTime<Utc> = row.try_get("occurred_at")?;
+                let payload: serde_json::Value = row.try_get("payload")?;
+
+                let event: DomainEvent = serde_json::from_value(payload)
+                    .context("Deserialising domain event failed")?;
+
+                Ok(EventEnvelope {
+                    id,
+                    aggregate_id,
+                    sequence,
+                    occurred_at,
+                    event,
+                })
+            })
+            .collect()
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Event publisher (NATS, fan-out for downstream services)
+/// ------------------------------------------------------------------------------------------------
+
+/// External publisher trait to abstract away the concrete broker.
+#[async_trait]
+pub trait EventPublisher: Send + Sync {
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<()>;
+}
+
+/// NATS implementation using `async_nats`.
+pub struct NatsEventPublisher {
+    client: async_nats::Client,
+    /// Base subject to publish to (events get routed using dot-suffixes).
+    subject_root: String,
+}
+
+impl NatsEventPublisher {
+    pub fn new(client: async_nats::Client, subject_root: impl Into<String>) -> Self {
+        Self {
+            client,
+            subject_root: subject_root.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl EventPublisher for NatsEventPublisher {
+    async fn publish(&self, envelope: &EventEnvelope) -> Result<()> {
+        let subject = format!("{}.{}", self.subject_root, envelope.event.event_type());
+        let data = serde_json::to_vec(envelope)
+            .context("Serialising envelope for broker failed")?;
+
+        self.client
+            .publish(subject.clone(), data.into())
+            .await
+            .context("Publishing to NATS failed")?;
+
+        info!(%subject, "Event published to broker");
+        Ok(())
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Event bus (transactional writer + publisher)
+/// ------------------------------------------------------------------------------------------------
+
+/// High-level façade that guarantees “persist then publish” semantics.
+#[derive(Clone)]
+pub struct EventBus<E: EventStore, P: EventPublisher> {
+    store: Arc<E>,
+    publisher: Arc<P>,
+    pool: PgPool,
+}
+
+impl<E: EventStore, P: EventPublisher> EventBus<E, P> {
+    pub fn new(store: E, publisher: P, pool: PgPool) -> Self {
+        Self {
+            store: Arc::new(store),
+            publisher: Arc::new(publisher),
+            pool,
+        }
+    }
+
+    /// Atomically persists the event and publishes it to the broker.  If
+    /// publishing fails, the transaction is rolled back ensuring downstream
+    /// consumers never observe an event that the source of truth does not have.
+    pub async fn commit(&self, envelope: EventEnvelope) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("Opening DB transaction failed")?;
+
+        self.store.append(&mut tx, &envelope).await?;
+
+        // Flush to DB before publishing so re-connection / retries are idempotent.
+        tx.commit().await.context("Committing DB transaction failed")?;
+
+        // Publish outside of the transaction—if this fails, we *could* try to
+        // mark the event as “outbox pending” and use a background dispatcher.
+        // For brevity, a simple publish-or-error approach is implemented.
+        self.publisher.publish(&envelope).await?;
+
+        Ok(())
+    }
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Tests (requires running Postgres & NATS locally)
+/// ------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn setup() -> (PgPool, async_nats::Client) {
+        let pg = PgPool::connect_lazy("postgres://postgres:postgres@localhost:5432/edupulse_test")
+            .expect("DB connection");
+
+        // NOTE: In CI, start NATS with `docker run -p 4222:4222 nats:alpine`.
+        let nats = async_nats::connect("localhost").await.expect("NATS connection");
+        (pg, nats)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn round_trip_event_flow() -> Result<()> {
+        let (pg, nats) = setup().await;
+        let store = PgEventStore::new(pg.clone());
+        let publisher = NatsEventPublisher::new(nats.clone(), "edupulse.events");
+        let bus = EventBus::new(store, publisher, pg.clone());
+
+        // Subscribe before publishing to catch the event.
+        let mut sub = nats
+            .subscribe("edupulse.events.LessonPublished")
+            .await
+            .expect("subscribe");
+
+        // Produce event
+        let aggregate_id = Uuid::new_v4();
+        let event = DomainEvent::LessonPublished(LessonPublishedEvent {
+            teacher_id: Uuid::new_v4(),
+            lesson_id: Uuid::new_v4(),
+            title: "Advanced Rust Patterns".to_string(),
+        });
+
+        let envelope = EventEnvelope::new(aggregate_id, 1, event);
+        bus.commit(envelope.clone()).await?;
+
+        // Receive from NATS (give it some time on CI)
+        let msg = tokio::time::timeout(Duration::from_secs(3), sub.next())
+            .await
+            .expect("message timed out")
+            .expect("no message");
+
+        let received: EventEnvelope = serde_json::from_slice(&msg.payload)?;
+        assert_eq!(envelope.id, received.id);
+
+        Ok(())
+    }
+}
+```

@@ -1,0 +1,442 @@
+```rust
+//! src/module_52.rs
+//!
+//! Hot-swappable analysis strategy subsystem.
+//!
+//! This module implements a thread-safe, runtime-replaceable strategy pattern
+//! that powers ChirpPulse’s enrichment/analysis stage.  A background task
+//! listens for configuration updates (e.g. from ZooKeeper, Consul, or an
+//! internal “control topic”) and atomically switches the active strategy
+//! without interrupting in-flight processing.
+//!
+//! Key design goals:
+//!   • Zero-downtime hot swapping
+//!   • Non-blocking data path (lock-free reads)
+//!   • Observability (structured logging + metrics)
+//!   • Graceful error handling
+//!
+//! Down-stream workers obtain an `Arc<dyn AnalysisStrategy>` via
+//! `AnalysisHandle`, guaranteeing wait-free read access even during upgrades.
+//!
+//! Usage example (simplified):
+//!
+//! ```ignore
+//! let (mut handle, controller) = AnalysisController::new(initial_cfg)?;
+//! tokio::spawn(controller.run());
+//!
+//! while let Some(event) = next_event().await {
+//!     let result = handle.analyze(&event).await?;
+//!     sink.send(result).await?;
+//! }
+//! ```
+
+#![allow(clippy::async_yields_async)]
+#![deny(rustdoc::all, missing_docs)]
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
+use futures::{stream::BoxStream, StreamExt};
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use tokio::{
+    select,
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
+use tracing::{debug, error, info, instrument, warn};
+
+/// Public handle exposed to workers.
+///
+/// Cloneable, cheaply shareable reference to the current analysis strategy.
+#[derive(Clone)]
+pub struct AnalysisHandle {
+    strategy_rx: watch::Receiver<Arc<dyn AnalysisStrategy>>,
+}
+
+impl AnalysisHandle {
+    /// Analyze an incoming social event with the *currently active* strategy.
+    #[instrument(skip(self, event))]
+    pub async fn analyze(&self, event: &SocialEvent) -> Result<AnalysisOutcome> {
+        // Wait-free read path: `watch::Receiver::borrow()` doesn’t allocate.
+        let strat = self.strategy_rx.borrow().clone();
+        strat.analyze(event).await
+    }
+}
+
+/// Background controller responsible for reacting to configuration changes
+/// and swapping strategies.
+///
+/// Internally a `watch::Sender` disseminates the latest strategy instance to
+/// all `AnalysisHandle`s.
+pub struct AnalysisController {
+    cfg_stream: BoxStream<'static, StrategyConfig>,
+    strategy_tx: watch::Sender<Arc<dyn AnalysisStrategy>>,
+    registry: StrategyRegistry,
+}
+
+impl AnalysisController {
+    /// Build a new controller with an initial configuration and a stream of
+    /// future updates.
+    pub fn new(
+        initial_cfg: StrategyConfig,
+        cfg_stream: BoxStream<'static, StrategyConfig>,
+    ) -> Result<(AnalysisHandle, Self)> {
+        let mut registry = StrategyRegistry::default();
+        registry.register_builtin_strategies();
+
+        let initial_strategy = registry
+            .instantiate(&initial_cfg)
+            .context("failed to build initial analysis strategy")?;
+
+        let (strategy_tx, strategy_rx) = watch::channel(initial_strategy);
+
+        let handle = AnalysisHandle { strategy_rx };
+
+        Ok((
+            handle,
+            Self {
+                cfg_stream,
+                strategy_tx,
+                registry,
+            },
+        ))
+    }
+
+    /// Spawn the controller on the tokio runtime.
+    pub fn spawn(self) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            if let Err(e) = self.run().await {
+                error!(error = ?e, "analysis controller exited with error");
+            }
+        })
+    }
+
+    /// Blocking loop: listen for cfg updates, rebuild strategy, broadcast.
+    #[instrument(name = "AnalysisController::run", skip(self))]
+    pub async fn run(mut self) -> Result<()> {
+        let mut last_reload = Instant::now();
+
+        while let Some(cfg) = self.cfg_stream.next().await {
+            match self.registry.instantiate(&cfg) {
+                Ok(strategy) => {
+                    self.strategy_tx.send(strategy)?;
+                    info!(
+                        algo = cfg.algorithm.as_str(),
+                        "activated new analysis strategy (elapsed={}ms)",
+                        last_reload.elapsed().as_millis()
+                    );
+                    last_reload = Instant::now();
+                }
+                Err(e) => {
+                    error!(error = ?e, "failed to build strategy from new config; keeping old");
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Strategy trait + infrastructure
+ * ---------------------------------------------------------------------- */
+
+/// Output of an analysis invocation.
+#[derive(Debug, Serialize)]
+pub struct AnalysisOutcome {
+    pub sentiment_score: f32,
+    pub toxicity_score: f32,
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// An incoming social event.
+#[derive(Debug, Deserialize)]
+pub struct SocialEvent {
+    pub id: String,
+    pub author_id: String,
+    pub text: String,
+    pub timestamp: DateTime<Utc>,
+    // Omitted: language, geo, etc.
+}
+
+/// Strategy interface.
+///
+/// Implementors must be thread-safe (`Send + Sync`) and cheap to clone
+/// (`Arc<dyn …>` is used by callers).
+#[async_trait]
+pub trait AnalysisStrategy: Send + Sync {
+    /// Human-readable name (for metrics).
+    fn name(&self) -> &'static str;
+
+    /// Analyze a single event.
+    async fn analyze(&self, event: &SocialEvent) -> Result<AnalysisOutcome>;
+}
+
+type StrategyBuilder = dyn Fn(&StrategyConfig) -> Result<Arc<dyn AnalysisStrategy>>
+    + Send
+    + Sync
+    + 'static;
+
+/// Map of algorithm name → builder.
+#[derive(Default)]
+pub struct StrategyRegistry {
+    map: DashMap<String, Arc<StrategyBuilder>>,
+}
+
+impl StrategyRegistry {
+    /// Register a builder.
+    pub fn register<F, S>(&self, name: &str, builder: F)
+    where
+        F: Fn(&StrategyConfig) -> Result<Arc<dyn AnalysisStrategy>> + Send + Sync + 'static,
+        S: AnalysisStrategy,
+    {
+        if self.map.insert(name.to_string(), Arc::new(builder)).is_some() {
+            warn!(algorithm = name, "overwriting existing strategy registration");
+        }
+    }
+
+    /// Register built-in strategies shipped with the binary.
+    pub fn register_builtin_strategies(&mut self) {
+        self.register::<SimpleSentiment>("simple_sentiment", |cfg| {
+            Ok(Arc::new(SimpleSentiment::new(cfg)?))
+        });
+
+        self.register::<ToxicityAndSentiment>("toxicity_v1", |cfg| {
+            Ok(Arc::new(ToxicityAndSentiment::new(cfg)?))
+        });
+    }
+
+    /// Instantiate a strategy from config.
+    pub fn instantiate(&self, cfg: &StrategyConfig) -> Result<Arc<dyn AnalysisStrategy>> {
+        let key = cfg.algorithm.clone();
+        let builder = self
+            .map
+            .get(&key)
+            .ok_or_else(|| anyhow!("unknown algorithm {:?}", key))?;
+
+        (builder)(cfg)
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Strategy configs
+ * ---------------------------------------------------------------------- */
+
+/// Wire format for configuration updates.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StrategyConfig {
+    pub algorithm: String,
+    /// Algorithm-specific JSON body passed to the builder.
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+impl StrategyConfig {
+    /// Helper: fetch param or default.
+    fn param_or<T>(&self, key: &str, default: T) -> Result<T>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        match self.params.get(key) {
+            Some(v) => serde_json::from_value(v.clone())
+                .with_context(|| format!("parameter {:?} has wrong type", key)),
+            None => Ok(default),
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Concrete strategies
+ * ---------------------------------------------------------------------- */
+
+/// Baseline sentiment analyzer using afinn wordlist (placeholder).
+pub struct SimpleSentiment {
+    /// Simplistic hashmap of word → weight.
+    lexicon: HashMap<String, i32>,
+}
+
+impl SimpleSentiment {
+    fn new(_cfg: &StrategyConfig) -> Result<Self> {
+        static LEXICON: Lazy<HashMap<String, i32>> = Lazy::new(|| {
+            include_str!("../assets/afinn-111.txt")
+                .lines()
+                .filter_map(|l| {
+                    let mut parts = l.split('\t');
+                    Some((parts.next()?.to_string(), parts.next()?.parse::<i32>().ok()?))
+                })
+                .collect()
+        });
+
+        Ok(Self {
+            lexicon: LEXICON.clone(),
+        })
+    }
+}
+
+#[async_trait]
+impl AnalysisStrategy for SimpleSentiment {
+    fn name(&self) -> &'static str {
+        "simple_sentiment"
+    }
+
+    #[instrument(skip(self, event))]
+    async fn analyze(&self, event: &SocialEvent) -> Result<AnalysisOutcome> {
+        let mut score = 0i32;
+        for w in event.text.split_whitespace() {
+            if let Some(weight) = self.lexicon.get(&w.to_lowercase()) {
+                score += weight;
+            }
+        }
+
+        Ok(AnalysisOutcome {
+            sentiment_score: score as f32 / 50.0,
+            toxicity_score: 0.0,
+            extra: HashMap::new(),
+        })
+    }
+}
+
+/// More sophisticated strategy that performs both sentiment and toxicity
+/// scoring, possibly delegating to external micro-services.
+pub struct ToxicityAndSentiment {
+    endpoint: String,
+    timeout: Duration,
+    client: reqwest::Client,
+}
+
+impl ToxicityAndSentiment {
+    fn new(cfg: &StrategyConfig) -> Result<Self> {
+        let endpoint = cfg.param_or("endpoint", "http://localhost:8080/score")?;
+        let timeout: u64 = cfg.param_or("timeout_ms", 800)?;
+        Ok(Self {
+            endpoint,
+            timeout: Duration::from_millis(timeout),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(timeout))
+                .build()?,
+        })
+    }
+}
+
+#[async_trait]
+impl AnalysisStrategy for ToxicityAndSentiment {
+    fn name(&self) -> &'static str {
+        "toxicity_v1"
+    }
+
+    #[instrument(skip(self, event))]
+    async fn analyze(&self, event: &SocialEvent) -> Result<AnalysisOutcome> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            text: &'a str,
+            id: &'a str,
+        }
+
+        #[derive(Deserialize)]
+        struct Resp {
+            sentiment: f32,
+            toxicity: f32,
+            #[serde(default)]
+            extra: HashMap<String, serde_json::Value>,
+        }
+
+        let resp: Resp = self
+            .client
+            .post(&self.endpoint)
+            .json(&Req {
+                text: &event.text,
+                id: &event.id,
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        Ok(AnalysisOutcome {
+            sentiment_score: resp.sentiment,
+            toxicity_score: resp.toxicity,
+            extra: resp.extra,
+        })
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Configuration update source (mock for demo)
+ * ---------------------------------------------------------------------- */
+
+/// Return a mocked stream that emits a new strategy every `interval`.
+///
+/// In production this would be a Kafka consumer or etcd watch.
+pub fn mock_cfg_stream(interval: Duration) -> BoxStream<'static, StrategyConfig> {
+    use tokio_stream::wrappers::IntervalStream;
+
+    let mut toggled = false;
+    IntervalStream::new(tokio::time::interval(interval))
+        .map(move |_| {
+            toggled = !toggled;
+            if toggled {
+                serde_json::from_str::<StrategyConfig>(
+                    r#"{"algorithm":"toxicity_v1","params":{"endpoint":"http://ml:9000/score","timeout_ms":1000}}"#,
+                )
+                .unwrap()
+            } else {
+                serde_json::from_str::<StrategyConfig>(r#"{"algorithm":"simple_sentiment"}"#).unwrap()
+            }
+        })
+        .boxed()
+}
+
+/* -------------------------------------------------------------------------
+ * End-to-end demo (only compiled with `--features demo`)
+ * ---------------------------------------------------------------------- */
+#[cfg(feature = "demo")]
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
+    let (handle, controller) = AnalysisController::new(
+        serde_json::from_str(r#"{"algorithm":"simple_sentiment"}"#)?,
+        mock_cfg_stream(Duration::from_secs(30)),
+    )?;
+
+    controller.spawn();
+
+    // Simulate incoming events.
+    let (mut tx, mut rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        for i in 0.. {
+            let ev = SocialEvent {
+                id: format!("tw-{i}"),
+                author_id: "user42".into(),
+                text: if i % 2 == 0 {
+                    "I love Rust so much ❤️"
+                } else {
+                    "This is utter garbage and I hate it"
+                }
+                .into(),
+                timestamp: Utc::now(),
+            };
+            tx.send(ev).await.ok();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+
+    while let Some(ev) = rx.recv().await {
+        match handle.analyze(&ev).await {
+            Ok(out) => debug!(?out, "analysis"),
+            Err(e) => error!(error = ?e, "analysis error"),
+        }
+    }
+
+    Ok(())
+}
+```

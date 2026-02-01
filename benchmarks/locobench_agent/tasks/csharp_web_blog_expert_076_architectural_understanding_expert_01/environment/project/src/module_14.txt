@@ -1,0 +1,241 @@
+```csharp
+// File: src/module_14.txt
+// Project: TempoScribe Pro – Hexagonal Productivity Blog Suite (web_blog)
+// Language: C#
+// Description:
+//     Production-grade Scheduled Publishing Coordinator that bridges the domain-level
+//     scheduling policy with infrastructural concerns (database, distributed lock,
+//     and publishing port). Implements robust error handling, structured logging,
+//     metrics, and retry semantics.
+//     NOTE: All referenced ports/interfaces are defined elsewhere in the solution.
+
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Polly;
+using Polly.Retry;
+
+namespace TempoScribePro.Application.Scheduling
+{
+    /// <summary>
+    /// Periodically scans for posts that are scheduled for publication and publishes
+    /// them using the publishing port.  Runs as an <see cref="IHostedService"/> so it
+    /// can be wired into ASP.NET Core’s background service infrastructure.
+    /// </summary>
+    public sealed class ScheduledPublishingCoordinator : BackgroundService
+    {
+        private const string DistributedLockKey = "tempo-scribe:scheduler:scheduled-publishing";
+        private readonly TimeSpan _pollInterval = TimeSpan.FromSeconds(30);
+        private readonly TimeSpan _distributedLockTtl = TimeSpan.FromMinutes(2);
+        private readonly int _batchSize = 20;
+
+        private readonly IScheduledPostRepository _repository;
+        private readonly IPublishingPort _publishingPort;
+        private readonly IClock _clock;
+        private readonly IDistributedLockProvider _lockProvider;
+        private readonly IBackgroundTaskMetrics _metrics;
+        private readonly ILogger<ScheduledPublishingCoordinator> _logger;
+
+        private readonly AsyncRetryPolicy _retryPolicy;
+
+        public ScheduledPublishingCoordinator(
+            IScheduledPostRepository repository,
+            IPublishingPort publishingPort,
+            IClock clock,
+            IDistributedLockProvider lockProvider,
+            IBackgroundTaskMetrics metrics,
+            ILogger<ScheduledPublishingCoordinator> logger)
+        {
+            _repository      = repository      ?? throw new ArgumentNullException(nameof(repository));
+            _publishingPort  = publishingPort  ?? throw new ArgumentNullException(nameof(publishingPort));
+            _clock           = clock           ?? throw new ArgumentNullException(nameof(clock));
+            _lockProvider    = lockProvider    ?? throw new ArgumentNullException(nameof(lockProvider));
+            _metrics         = metrics         ?? throw new ArgumentNullException(nameof(metrics));
+            _logger          = logger          ?? throw new ArgumentNullException(nameof(logger));
+
+            // Retry transient errors (e.g., DB or network hiccups) with exponential back-off.
+            _retryPolicy = Policy
+                .Handle<Exception>(ex => ex is not OperationCanceledException)
+                .WaitAndRetryAsync(
+                    retryCount: 3,
+                    sleepDurationProvider: attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)),
+                    onRetry: (ex, delay, attempt, ctx) =>
+                    {
+                        _logger.LogWarning(ex,
+                            "Retrying scheduled publishing batch (attempt {Attempt}) in {Delay}.",
+                            attempt,
+                            delay);
+                    });
+        }
+
+        /// <inheritdoc/>
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        {
+            _logger.LogInformation("ScheduledPublishingCoordinator started.");
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await using var @lock = await _lockProvider.TryAcquireAsync(
+                        DistributedLockKey,
+                        _distributedLockTtl,
+                        stoppingToken);
+
+                    // If another node holds the lock, skip this iteration
+                    if (@lock is null)
+                    {
+                        await Task.Delay(_pollInterval, stoppingToken);
+                        continue;
+                    }
+
+                    await _retryPolicy.ExecuteAsync(
+                        ct => PublishDuePostsAsync(ct),
+                        stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    // Host is shutting down; exit gracefully.
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Fatal error while executing scheduled publishing batch.");
+                    _metrics.IncrementFatalErrorCount(nameof(ScheduledPublishingCoordinator));
+                    // Swallow to prevent background service crash; will retry in next loop.
+                }
+
+                // Wait before next polling cycle
+                await Task.Delay(_pollInterval, stoppingToken);
+            }
+
+            _logger.LogInformation("ScheduledPublishingCoordinator stopped.");
+        }
+
+        /// <summary>
+        /// Fetches due posts from the repository and publishes them through the port.
+        /// </summary>
+        private async Task PublishDuePostsAsync(CancellationToken ct)
+        {
+            var now = _clock.UtcNow;
+            IReadOnlyList<Post> duePosts =
+                await _repository.GetScheduledPostsDueAsync(now, _batchSize, ct);
+
+            if (duePosts.Count == 0)
+            {
+                _logger.LogDebug("No posts due for publication at {Now}.", now);
+                return;
+            }
+
+            _logger.LogInformation("Processing {Count} scheduled post(s) at {Now}.",
+                duePosts.Count,
+                now);
+
+            foreach (var post in duePosts)
+            {
+                try
+                {
+                    await _publishingPort.PublishAsync(post, ct);
+
+                    // Mark as published in the repository
+                    await _repository.MarkAsPublishedAsync(post, ct);
+
+                    _metrics.IncrementProcessedCount(nameof(ScheduledPublishingCoordinator));
+                    _logger.LogInformation("Published scheduled post {PostId}.", post.Id);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogError(ex,
+                        "Failed to publish scheduled post {PostId}. Will retry in next cycle.",
+                        post.Id);
+
+                    _metrics.IncrementErrorCount(nameof(ScheduledPublishingCoordinator));
+                    // Do not throw—continue with remaining posts.
+                }
+            }
+        }
+    }
+
+    #region Port & Domain Contracts
+
+    /// <summary>
+    /// Adapter-agnostic gateway responsible for publishing a post to its final medium
+    /// (REST, GraphQL, WebSocket broadcast, etc.).
+    /// </summary>
+    public interface IPublishingPort
+    {
+        Task PublishAsync(Post post, CancellationToken cancellationToken);
+    }
+
+    /// <summary>
+    /// Repository abstraction for querying and updating scheduled posts.
+    /// </summary>
+    public interface IScheduledPostRepository
+    {
+        Task<IReadOnlyList<Post>> GetScheduledPostsDueAsync(
+            DateTimeOffset asOf,
+            int batchSize,
+            CancellationToken cancellationToken);
+
+        Task MarkAsPublishedAsync(Post post, CancellationToken cancellationToken);
+    }
+
+    /// <summary>
+    /// Provides an IDisposable distributed lock handle to coordinate cron-like tasks
+    /// across multiple nodes.
+    /// </summary>
+    public interface IDistributedLockProvider
+    {
+        /// <summary>
+        /// Attempts to acquire a lock for the specified resource key. Returns null if
+        /// another node already owns the lock.
+        /// </summary>
+        Task<IAsyncDisposable?> TryAcquireAsync(
+            string resourceKey,
+            TimeSpan ttl,
+            CancellationToken cancellationToken);
+    }
+
+    /// <summary>
+    /// Records metrics for background task health monitoring (e.g., Prometheus counters).
+    /// </summary>
+    public interface IBackgroundTaskMetrics
+    {
+        void IncrementProcessedCount(string workerName);
+        void IncrementErrorCount(string workerName);
+        void IncrementFatalErrorCount(string workerName);
+    }
+
+    /// <summary>
+    /// Abstraction over system clock for testability.
+    /// </summary>
+    public interface IClock
+    {
+        DateTimeOffset UtcNow { get; }
+    }
+
+    /// <summary>
+    /// Domain entity representing a blog post. Only properties relevant to this file
+    /// are included; other members live in the domain project.
+    /// </summary>
+    public sealed class Post
+    {
+        public Guid Id { get; }
+
+        public DateTimeOffset ScheduledForUtc { get; }
+
+        // Additional domain properties (Title, Content, Metadata, etc.) omitted for brevity.
+
+        public Post(Guid id, DateTimeOffset scheduledForUtc)
+        {
+            Id = id;
+            ScheduledForUtc = scheduledForUtc;
+        }
+    }
+
+    #endregion
+}
+```

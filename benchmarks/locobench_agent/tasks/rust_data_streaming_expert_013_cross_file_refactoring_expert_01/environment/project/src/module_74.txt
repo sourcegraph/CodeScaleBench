@@ -1,0 +1,514 @@
+```rust
+//! module_74 – Hot-swappable, real-time sentiment analysis service
+//!
+//! This module owns the “strategy” side of ChirpPulse’s sentiment pipeline.  A
+//! Tokio task (`SentimentService`) consumes raw messages from Kafka, delegates
+//! the textual payload to a pluggable strategy (`SentimentStrategy`), and then
+//! forwards an enriched record to a downstream topic.  The strategy object is
+//! protected by an `Arc<RwLock<…>>`, enabling atomic live swaps without
+//! restarting the service.
+//!
+//! Compile-time feature flags let us run without Kafka when doing offline unit
+//! tests (`--features dummy_mq`).
+
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::module_name_repetitions)]
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    task,
+    time::sleep,
+};
+use tracing::{debug, error, info, instrument, warn};
+
+#[cfg(not(feature = "dummy_mq"))]
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    error::KafkaError,
+    message::OwnedHeaders,
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Message,
+};
+
+/// High-level error enumeration for the sentiment module.
+#[derive(Debug, Error)]
+pub enum SentimentError {
+    #[error("input json deserialization failed: {0}")]
+    Deserialization(serde_json::Error),
+
+    #[error("serialization error: {0}")]
+    Serialization(serde_json::Error),
+
+    #[cfg(not(feature = "dummy_mq"))]
+    #[error("kafka error: {0}")]
+    Kafka(#[from] KafkaError),
+
+    #[error("internal channel send error")]
+    Channel,
+}
+
+/// A simple sentiment score model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentimentScore {
+    pub polarity: f32, // −1.0 = extremely negative, +1.0 = extremely positive
+    pub magnitude: f32,
+}
+
+/// Input schema for an incoming social message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawEvent {
+    pub text: String,
+    pub created_at: DateTime<Utc>,
+    pub author_id: String,
+    pub metadata: HashMap<String, String>,
+}
+
+/// Output schema for the enriched message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichedEvent {
+    #[serde(flatten)]
+    pub raw: RawEvent,
+    pub sentiment: SentimentScore,
+    pub processed_at: DateTime<Utc>,
+}
+
+/// Strategy trait – pluggable sentiment scorer.
+#[async_trait]
+pub trait SentimentStrategy: Send + Sync + 'static {
+    async fn analyze(&self, text: &str) -> SentimentScore;
+    fn name(&self) -> &'static str;
+}
+
+/// Dumb rule-based implementation (baseline fallback).
+pub struct LexiconStrategy;
+
+#[async_trait]
+impl SentimentStrategy for LexiconStrategy {
+    async fn analyze(&self, text: &str) -> SentimentScore {
+        let mut score = 0f32;
+        let mut magnitude = 0f32;
+
+        for token in text.split_whitespace() {
+            match token.to_ascii_lowercase().as_str() {
+                "love" | "great" | "awesome" | "good" => {
+                    score += 1.0;
+                    magnitude += 1.0;
+                }
+                "hate" | "awful" | "bad" | "terrible" => {
+                    score -= 1.0;
+                    magnitude += 1.0;
+                }
+                _ => {}
+            }
+        }
+
+        if magnitude != 0.0 {
+            score /= magnitude;
+        }
+
+        SentimentScore { polarity: score, magnitude }
+    }
+
+    fn name(&self) -> &'static str {
+        "lexicon-v1"
+    }
+}
+
+/// Toy ML-based strategy that pretends to query a model server.
+///
+/// In production this would issue a gRPC or HTTP request to a remote inference
+/// service.  To keep the example self-contained we just return random numbers
+/// that *look* plausible.
+pub struct MLStrategy;
+
+#[async_trait]
+impl SentimentStrategy for MLStrategy {
+    async fn analyze(&self, _text: &str) -> SentimentScore {
+        let mut rng = rand::thread_rng();
+        let polarity = rng.gen_range(-1.0..=1.0);
+        let magnitude = rng.gen_range(0.0..=1.0).max(polarity.abs());
+
+        SentimentScore { polarity, magnitude }
+    }
+
+    fn name(&self) -> &'static str {
+        "ml-v2"
+    }
+}
+
+/// Thread-safe container around the current strategy.
+#[derive(Clone)]
+pub struct StrategyManager {
+    inner: Arc<RwLock<Box<dyn SentimentStrategy>>>,
+}
+
+impl StrategyManager {
+    pub fn new(initial: Box<dyn SentimentStrategy>) -> Self {
+        Self { inner: Arc::new(RwLock::new(initial)) }
+    }
+
+    /// Swap the strategy at runtime.
+    pub fn swap(&self, new_strategy: Box<dyn SentimentStrategy>) {
+        let old_name = self.inner.read().name();
+        let new_name = new_strategy.name();
+        *self.inner.write() = new_strategy;
+        info!(old = old_name, new = new_name, "sentiment strategy updated");
+    }
+
+    pub async fn analyze(&self, text: &str) -> SentimentScore {
+        self.inner.read().analyze(text).await
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.inner.read().name()
+    }
+}
+
+/// Configuration for the service.
+#[derive(Debug, Clone)]
+pub struct ServiceConfig {
+    /// Consumer topic with raw events.
+    pub input_topic: String,
+    /// Topic to publish enriched events.
+    pub output_topic: String,
+    /// Kafka brokers (`host1:9092,host2:9092`).
+    pub brokers: String,
+    /// Consumer group id.
+    pub group_id: String,
+    /// Maximum parallel in-flight tasks.
+    pub worker_concurrency: usize,
+    /// Soft shutdown timeout.
+    pub shutdown_grace: Duration,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            input_topic: "chirppulse.raw".to_owned(),
+            output_topic: "chirppulse.enriched".to_owned(),
+            brokers: "localhost:9092".to_owned(),
+            group_id: "sentiment-service".to_owned(),
+            worker_concurrency: 16,
+            shutdown_grace: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Sentiment service handle – join on it to await clean shutdown.
+pub struct SentimentService {
+    shutdown_tx: UnboundedSender<()>,
+    join_handle: task::JoinHandle<()>,
+}
+
+impl SentimentService {
+    /// Spawn the service in the current Tokio runtime.
+    pub fn spawn(config: ServiceConfig, strategies: StrategyManager) -> Self {
+        let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
+        let join_handle = task::spawn(Self::run(config, strategies, shutdown_rx));
+
+        Self { shutdown_tx, join_handle }
+    }
+
+    pub async fn stop(self) -> Result<(), SentimentError> {
+        // Ask runner to shut down.
+        self.shutdown_tx.send(()).map_err(|_| SentimentError::Channel)?;
+        // Wait for graceful termination.
+        self.join_handle.await.expect("task panicked");
+        Ok(())
+    }
+
+    #[instrument(name = "sentiment_service", skip_all, level = "info")]
+    async fn run(
+        config: ServiceConfig,
+        strategies: StrategyManager,
+        mut shutdown_rx: UnboundedReceiver<()>,
+    ) {
+        #[cfg(feature = "dummy_mq")]
+        let (mut consumer, mut producer) = dummy_broker::connect(&config);
+        #[cfg(not(feature = "dummy_mq"))]
+        let (consumer, producer) = match kafka::connect(&config) {
+            Ok(ok) => ok,
+            Err(e) => {
+                error!(error = ?e, "failed to connect to kafka");
+                return;
+            }
+        };
+
+        // Worker pool processes messages concurrently but with bounded
+        // parallelism to avoid overwhelming the strategy or downstream.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(config.worker_concurrency));
+
+        info!(topic = %config.input_topic, "sentiment service started");
+
+        loop {
+            select! {
+                biased;
+
+                // Shutdown signal
+                _ = shutdown_rx.recv() => {
+                    info!("shutdown signal received, draining in-flight tasks");
+                    break;
+                }
+
+                maybe_msg = consumer.recv() => {
+                    let msg = match maybe_msg {
+                        Ok(Some(m)) => m,
+                        Ok(None) => continue, // no message available
+                        Err(e) => {
+                            warn!(error = ?e, "broker error");
+                            continue;
+                        }
+                    };
+
+                    let permit = match semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            // Pool at capacity: we can drop or backpressure.
+                            debug!("worker pool saturated, backing off");
+                            sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
+                    };
+
+                    let strategies = strategies.clone();
+                    let producer = producer.clone();
+                    let output_topic = config.output_topic.clone();
+
+                    task::spawn(async move {
+                        let _permit = permit;
+                        if let Err(e) = Self::process_message(msg, strategies, producer, output_topic.as_str()).await {
+                            error!(error = ?e, "failed to process message");
+                        }
+                    });
+                }
+            }
+        }
+
+        // Wait for workers to finish.
+        debug!("waiting for workers to finish");
+        let _ = semaphore.acquire_many(config.worker_concurrency as u32).await;
+
+        info!("sentiment service exited");
+    }
+
+    #[instrument(skip(msg, strategies, producer))]
+    async fn process_message<M, P>(
+        msg: M,
+        strategies: StrategyManager,
+        mut producer: P,
+        output_topic: &str,
+    ) -> Result<(), SentimentError>
+    where
+        M: Into<Vec<u8>> + Send + 'static,
+        P: OutputProducer + Send + 'static,
+    {
+        let payload = msg.into();
+        let raw: RawEvent = serde_json::from_slice(&payload).map_err(SentimentError::Deserialization)?;
+
+        let sentiment = strategies.analyze(&raw.text).await;
+        let enriched = EnrichedEvent {
+            raw,
+            sentiment,
+            processed_at: Utc::now(),
+        };
+
+        let bytes = serde_json::to_vec(&enriched).map_err(SentimentError::Serialization)?;
+        producer.send(output_topic.to_string(), bytes).await?;
+
+        Ok(())
+    }
+}
+
+/* -------------------------------------------------------------------------------------------------
+ *  Message broker abstraction
+ * ------------------------------------------------------------------------------------------------/
+*/
+
+/// Trait shielding message producers so we can compile without Kafka.
+#[async_trait]
+trait OutputProducer: Clone + Send + Sync {
+    async fn send(&mut self, topic: String, payload: Vec<u8>) -> Result<(), SentimentError>;
+}
+
+/// Trait shielding consumers (streaming interface).
+trait InputConsumer {
+    type Message: Into<Vec<u8>> + Send + 'static;
+
+    fn recv(&self) -> task::JoinHandle<Result<Option<Self::Message>, SentimentError>>;
+}
+
+#[cfg(not(feature = "dummy_mq"))]
+mod kafka {
+    use super::*;
+    use rdkafka::{
+        consumer::{Consumer, StreamConsumer},
+        producer::{FutureProducer, FutureRecord},
+        Message,
+    };
+
+    pub(super) fn connect(
+        cfg: &ServiceConfig,
+    ) -> Result<(KafkaConsumer, KafkaProducer), SentimentError> {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.brokers)
+            .set("group.id", &cfg.group_id)
+            .set("auto.offset.reset", "earliest")
+            .create()
+            .map_err(SentimentError::Kafka)?;
+
+        consumer
+            .subscribe(&[&cfg.input_topic])
+            .map_err(SentimentError::Kafka)?;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.brokers)
+            .set("message.timeout.ms", "5000")
+            .create()
+            .map_err(SentimentError::Kafka)?;
+
+        Ok((KafkaConsumer { inner: consumer }, KafkaProducer { inner: producer }))
+    }
+
+    #[derive(Clone)]
+    pub(super) struct KafkaProducer {
+        inner: FutureProducer,
+    }
+
+    #[async_trait]
+    impl OutputProducer for KafkaProducer {
+        async fn send(&mut self, topic: String, payload: Vec<u8>) -> Result<(), SentimentError> {
+            self.inner
+                .send(
+                    FutureRecord::to(&topic)
+                        .payload(&payload)
+                        .key("")
+                        .headers(OwnedHeaders::new().add("content-type", "application/json")),
+                    0,
+                )
+                .await
+                .map_err(|(e, _)| SentimentError::Kafka(e))?;
+            Ok(())
+        }
+    }
+
+    pub(super) struct KafkaConsumer {
+        inner: StreamConsumer,
+    }
+
+    impl InputConsumer for KafkaConsumer {
+        type Message = Vec<u8>;
+
+        fn recv(&self) -> task::JoinHandle<Result<Option<Self::Message>, SentimentError>> {
+            let consumer = self.inner.clone();
+            task::spawn_blocking(move || match consumer.poll(Duration::from_millis(250)) {
+                None => Ok(None),
+                Some(Ok(m)) => Ok(m.payload().map(|p| p.to_vec())),
+                Some(Err(e)) => Err(SentimentError::Kafka(e)),
+            })
+        }
+    }
+}
+
+#[cfg(feature = "dummy_mq")]
+mod dummy_broker {
+    //! Fallback implementation for `cargo test` – avoids needing a running
+    //! Kafka broker. Messages are exchanged over an in-memory channel.
+
+    use super::*;
+
+    pub(super) fn connect(
+        cfg: &ServiceConfig,
+    ) -> (DummyConsumer, DummyProducer) {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        // Spawn a task that injects a random message every few seconds.
+        let topic = cfg.input_topic.clone();
+        task::spawn(async move {
+            loop {
+                let raw = RawEvent {
+                    text: "I love open-source, but rustc compile times are awful!".to_string(),
+                    created_at: Utc::now(),
+                    author_id: "bot-42".into(),
+                    metadata: HashMap::default(),
+                };
+                if tx.send(serde_json::to_vec(&raw).unwrap()).is_err() {
+                    break;
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
+        });
+
+        (
+            DummyConsumer { rx },
+            DummyProducer { tx: tx.clone() },
+        )
+    }
+
+    #[derive(Clone)]
+    pub(super) struct DummyProducer {
+        tx: UnboundedSender<Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl OutputProducer for DummyProducer {
+        async fn send(&mut self, _topic: String, payload: Vec<u8>) -> Result<(), SentimentError> {
+            self.tx.send(payload).map_err(|_| SentimentError::Channel)
+        }
+    }
+
+    pub(super) struct DummyConsumer {
+        rx: UnboundedReceiver<Vec<u8>>,
+    }
+
+    impl InputConsumer for DummyConsumer {
+        type Message = Vec<u8>;
+
+        fn recv(&self) -> task::JoinHandle<Result<Option<Self::Message>, SentimentError>> {
+            let mut rx = self.rx.clone();
+            task::spawn(async move { Ok(rx.recv().await) })
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------------------------------
+ *  Tests
+ * ------------------------------------------------------------------------------------------------/
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swap_strategy_live() {
+        tracing_subscriber::fmt::try_init().ok();
+
+        let cfg = ServiceConfig::default();
+        let manager = StrategyManager::new(Box::new(LexiconStrategy));
+
+        let service = SentimentService::spawn(cfg, manager.clone());
+
+        // Wait a bit for the dummy broker to inject a message
+        sleep(Duration::from_secs(3)).await;
+
+        // Hot-swap the strategy
+        manager.swap(Box::new(MLStrategy));
+
+        // Wait again to observe new strategy in action
+        sleep(Duration::from_secs(3)).await;
+
+        service.stop().await.unwrap();
+    }
+}
+```

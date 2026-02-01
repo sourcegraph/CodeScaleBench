@@ -1,0 +1,427 @@
+```rust
+//! src/module_43.txt
+//!
+//! ChirpPulse – Module 43: Hot-Swappable Sentiment Stream Processor
+//! ===============================================================
+//! This module owns the logic that
+//!   1. Consumes raw social events from Kafka
+//!   2. Enriches them with sentiment scores using a pluggable `SentimentStrategy`
+//!   3. Publishes the enriched event back to Kafka / forward sink
+//!
+//! A strategy can be swapped at runtime by editing a small YAML
+//! manifest on disk; a file-watcher detects the change and *atomically*
+//! updates the strategy for *all* new events without interrupting the
+//! consumer group. This pattern lets data-scientists experiment with
+//! alternative models in production while keeping the pipeline running.
+//!
+//! NOTE: Real models would call heavy ML/AI crates or HTTP services;
+//! here we stub them with simple heuristics to keep the example
+//! self-contained.
+
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::must_use_candidate)]
+
+use std::{
+    fs,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use futures::StreamExt;
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use rdkafka::{
+    consumer::{ConsumeError, Consumer, StreamConsumer},
+    message::{BorrowedMessage, OwnedHeaders},
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::mpsc::{self, UnboundedReceiver},
+    task::JoinHandle,
+};
+use tracing::{debug, error, info, instrument};
+
+/// ------- Public API --------------------------------------------------------
+
+/// Start the sentiment processor.
+///
+/// `manifest_path` – Path to the YAML file describing which strategy
+/// should be loaded. Every time the file changes, the strategy is
+/// re-evaluated.
+///
+/// Cancels on `Ctrl-C` or any unrecoverable error.
+pub async fn run(manifest_path: PathBuf) -> Result<(), ProcessorError> {
+    // Install tracing subscriber only once for the entire binary
+    // (call is idempotent when used in libraries).
+    let _ = tracing_subscriber::fmt::try_init();
+
+    info!("Starting sentiment processor (manifest: {manifest_path:?})");
+
+    // 1) Build Kafka consumer + producer.
+    let consumer: StreamConsumer = kafka_consumer("raw_social_events")?;
+    let producer: FutureProducer = kafka_producer()?;
+
+    // 2) Load initial strategy, then spawn watcher that sends hot-reload
+    //    signals through a channel.
+    let strategy = ArcSwap::from(Arc::new(load_strategy(&manifest_path)?));
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    let watcher_handle =
+        spawn_manifest_watcher(manifest_path.clone(), tx).map_err(ProcessorError::IO)?;
+
+    let processor_handle =
+        spawn_stream_processor(consumer, producer, Arc::clone(&strategy)).map_err(|e| {
+            // Cancel watcher if processing failed immediately
+            watcher_handle.abort();
+            e
+        })?;
+
+    // 3) Event loop: listen for reload requests and update the swap.
+    main_event_loop(rx, strategy).await?;
+
+    // 4) Wait for background tasks (optional graceful shutdown).
+    select! {
+        _ = processor_handle => info!("Stream processor finished."),
+        _ = watcher_handle => info!("Manifest watcher finished.")
+    }
+
+    Ok(())
+}
+
+/// ------- Domain Model ------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct RawEvent {
+    id: String,
+    text: String,
+    #[serde(default)]
+    lang: Option<String>,
+    timestamp: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct EnrichedEvent {
+    id: String,
+    text: String,
+    lang: String,
+    sentiment: f32,
+    timestamp: i64,
+}
+
+/// ------- Strategy Pattern --------------------------------------------------
+
+/// Errors thrown by strategies
+#[derive(Debug, Error)]
+pub enum StrategyError {
+    #[error("unsupported language: {0}")]
+    UnsupportedLanguage(String),
+    #[error("model error: {0}")]
+    Model(String),
+}
+
+#[async_trait]
+pub trait SentimentStrategy: Send + Sync {
+    /// Short name for logging / metrics.
+    fn name(&self) -> &'static str;
+
+    /// Compute a polarity score in range [-1.0, 1.0].
+    async fn analyze(&self, text: &str, lang: &str) -> Result<f32, StrategyError>;
+}
+
+/// Dummy rule-based strategy used as a safe fallback.
+pub struct DummyRuleBased;
+
+#[async_trait]
+impl SentimentStrategy for DummyRuleBased {
+    fn name(&self) -> &'static str {
+        "dummy-rule-based"
+    }
+
+    async fn analyze(&self, text: &str, _lang: &str) -> Result<f32, StrategyError> {
+        // Extremely naive heuristic for demo purposes
+        let positive = ["good", "excellent", "love", "wow"];
+        let negative = ["bad", "terrible", "hate", "ugh"];
+
+        let mut score = 0f32;
+        let lowercase = text.to_lowercase();
+
+        for word in positive {
+            if lowercase.contains(word) {
+                score += 0.25;
+            }
+        }
+        for word in negative {
+            if lowercase.contains(word) {
+                score -= 0.25;
+            }
+        }
+        Ok(score.clamp(-1.0, 1.0))
+    }
+}
+
+/// Proxy that pretends to call an external ML service.
+pub struct RemoteAiModel;
+
+#[async_trait]
+impl SentimentStrategy for RemoteAiModel {
+    fn name(&self) -> &'static str {
+        "remote-ai-model"
+    }
+
+    #[instrument(skip(self, text), fields(strategy = "remote-ai-model"))]
+    async fn analyze(&self, text: &str, _lang: &str) -> Result<f32, StrategyError> {
+        // Simulate network latency.
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        // Fake: compute hash of text to produce pseudo-random score
+        let hash = seahash::hash(text.as_bytes());
+        Ok(((hash % 200) as f32) / 100.0 - 1.0) // [-1,1]
+    }
+}
+
+/// YAML manifest describing which strategy to load.
+#[derive(Debug, Deserialize)]
+struct StrategyManifest {
+    strategy: String,
+}
+
+/// Select concrete strategy based on manifest.
+fn strategy_factory(code: &str) -> Arc<dyn SentimentStrategy> {
+    match code {
+        "remote" | "remote-ai-model" => Arc::new(RemoteAiModel),
+        _ => Arc::new(DummyRuleBased),
+    }
+}
+
+fn load_strategy(manifest_path: &PathBuf) -> Result<Arc<dyn SentimentStrategy>, ProcessorError> {
+    let raw = fs::read_to_string(manifest_path)?;
+    let manifest: StrategyManifest = serde_yaml::from_str(&raw)?;
+    let strategy = strategy_factory(manifest.strategy.as_str());
+
+    info!("Loaded strategy '{}'", strategy.name());
+    Ok(strategy)
+}
+
+/// ------- Kafka / Streaming -------------------------------------------------
+
+/// Minimal helper to construct a consumer pointing at the given topic.
+fn kafka_consumer(topic: &str) -> Result<StreamConsumer, ProcessorError> {
+    let group_id = "chirppulse-sentiment";
+    let brokers = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".into());
+
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .set("group.id", group_id)
+        .set("enable.auto.commit", "true")
+        .set("auto.offset.reset", "earliest")
+        .create()?;
+
+    consumer.subscribe(&[topic])?;
+    Ok(consumer)
+}
+
+/// Minimal helper to construct a producer.
+fn kafka_producer() -> Result<FutureProducer, ProcessorError> {
+    let brokers = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".into());
+
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .set("message.timeout.ms", "5000")
+        .create()?;
+
+    Ok(producer)
+}
+
+/// Spawn the core asynchronous stream processor loop.
+///
+/// Returns the handle so the caller can observe its termination.
+fn spawn_stream_processor(
+    consumer: StreamConsumer,
+    producer: FutureProducer,
+    strategy: ArcSwap<dyn SentimentStrategy>,
+) -> Result<JoinHandle<()>, ProcessorError> {
+    let handle = tokio::spawn(async move {
+        let mut stream = consumer.stream();
+
+        while let Some(res) = stream.next().await {
+            match res {
+                Ok(msg) => {
+                    if let Err(e) = handle_message(&msg, &producer, &strategy).await {
+                        error!("Failed to process message: {e}");
+                    }
+                }
+                Err(err) => match err {
+                    ConsumeError::MessageConsumption(m) => {
+                        error!("Kafka consumption error: {m:?}");
+                    }
+                    other => {
+                        // Unwrap fatal errors; break to let supervisor restart.
+                        error!("Fatal Kafka error: {other}");
+                        break;
+                    }
+                },
+            }
+        }
+    });
+    Ok(handle)
+}
+
+#[instrument(skip(msg, producer, strategy))]
+async fn handle_message(
+    msg: &BorrowedMessage<'_>,
+    producer: &FutureProducer,
+    strategy: &ArcSwap<dyn SentimentStrategy>,
+) -> Result<(), ProcessorError> {
+    let start = Instant::now();
+
+    let payload = msg
+        .payload_view::<str>()
+        .map_err(|_| ProcessorError::Serde("invalid UTF-8".into()))?
+        .ok_or_else(|| ProcessorError::Serde("empty payload".into()))?;
+
+    let raw_event: RawEvent = serde_json::from_str(payload)?;
+
+    let lang = raw_event.lang.clone().unwrap_or_else(|| "en".to_owned());
+
+    let sentiment = strategy.load().analyze(&raw_event.text, &lang).await?;
+
+    let enriched = EnrichedEvent {
+        id: raw_event.id,
+        text: raw_event.text,
+        lang,
+        sentiment,
+        timestamp: raw_event.timestamp,
+    };
+
+    let serialized = serde_json::to_string(&enriched)?;
+
+    let record = FutureRecord::to("enriched_social_events")
+        .payload(&serialized)
+        .key(&enriched.id)
+        .headers(
+            OwnedHeaders::new()
+                .add("content-type", "application/json")
+                .add("strategy", strategy.load().name()),
+        );
+
+    // Fire-and-forget with timeout – in production you might await result.
+    let _ = producer.send(record, Duration::from_secs(0));
+
+    debug!(
+        "Processed event {} in {:?}",
+        enriched.id,
+        start.elapsed()
+    );
+
+    Ok(())
+}
+
+/// ------- Manifest Watcher --------------------------------------------------
+
+/// Spawn filesystem watcher that notifies channel when manifest changes.
+fn spawn_manifest_watcher(
+    manifest_path: PathBuf,
+    tx: mpsc::UnboundedSender<()>,
+) -> Result<JoinHandle<()>, std::io::Error> {
+    // Notify works on blocking thread; spawn separate task.
+    let handle = tokio::spawn(async move {
+        // Channel between notify (sync) and async world.
+        let (notify_tx, mut notify_rx) = std::sync::mpsc::channel();
+
+        // Run watcher in blocking thread to avoid stalling async executor.
+        let mut watcher: RecommendedWatcher =
+            Watcher::new_immediate(move |res| match res {
+                Ok(event) => {
+                    if matches!(event.kind, EventKind::Modify(_)) {
+                        let _ = notify_tx.send(());
+                    }
+                }
+                Err(e) => error!("Watcher error: {e}"),
+            })?;
+
+        watcher.watch(&manifest_path, RecursiveMode::NonRecursive)?;
+
+        info!("Watching manifest for changes at {manifest_path:?}");
+
+        // Drain blocking channel into async
+        loop {
+            // Block until change
+            if notify_rx.recv().is_ok() {
+                if tx.send(()).is_err() {
+                    break; // Receiver closed
+                }
+            } else {
+                break; // Watcher finished
+            }
+        }
+
+        Ok::<_, std::io::Error>(())
+    });
+
+    Ok(handle)
+}
+
+/// Process reload events: load new strategy and swap atomically.
+async fn main_event_loop(
+    mut rx: UnboundedReceiver<()>,
+    strategy: ArcSwap<dyn SentimentStrategy>,
+) -> Result<(), ProcessorError> {
+    let manifest_path = std::env::var("STRATEGY_MANIFEST")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("strategy.yaml"));
+
+    while let Some(_) = rx.recv().await {
+        match load_strategy(&manifest_path) {
+            Ok(new_strategy) => {
+                info!("Switching to strategy '{}'", new_strategy.name());
+                strategy.store(new_strategy);
+            }
+            Err(e) => error!("Failed to reload strategy: {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// ------- Top-Level Errors ---------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum ProcessorError {
+    #[error("kafka error: {0}")]
+    Kafka(#[from] rdkafka::error::KafkaError),
+    #[error("serde error: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("yaml error: {0}")]
+    Yaml(#[from] serde_yaml::Error),
+    #[error("io error: {0}")]
+    IO(#[from] std::io::Error),
+    #[error("strategy error: {0}")]
+    Strategy(#[from] StrategyError),
+}
+
+/// ------- Tests -------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dummy_strategy_works() {
+        let strat = DummyRuleBased;
+        assert!(strat.analyze("I love rust, it's excellent!", "en").await.unwrap() > 0.0);
+        assert!(strat.analyze("ugh, terrible bug", "en").await.unwrap() < 0.0);
+    }
+
+    #[test]
+    fn manifest_deserialization() {
+        let yaml = r#"strategy: remote-ai-model"#;
+        let m: StrategyManifest = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(m.strategy, "remote-ai-model");
+    }
+}
+```

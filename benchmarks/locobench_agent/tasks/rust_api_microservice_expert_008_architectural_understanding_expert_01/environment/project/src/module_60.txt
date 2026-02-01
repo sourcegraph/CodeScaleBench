@@ -1,0 +1,339 @@
+//! src/module_60.rs
+//!
+//! Pagination, caching and response helpers for LedgerLink Nexus.
+//!
+//! This module is *framework agnostic* but ships with ready-made Actix‐Web glue to
+//! streamline JSON rendering, cursor pagination and HTTP cache controls.  Nothing here
+//! is Ledger-specific, so it can be re-used by any micro-service inside the Nexus
+//! constellation.
+
+use actix_web::{
+    get,
+    http::{header, HeaderValue, StatusCode},
+    web, HttpRequest, HttpResponse, ResponseError,
+};
+use anyhow::Context;
+use async_trait::async_trait;
+use chrono::NaiveDateTime;
+use deadpool_postgres::Pool;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fmt::Display;
+use thiserror::Error;
+use tokio_postgres::Row;
+use validator::{Validate, ValidationError};
+
+/* -------------------------------------------------------------------------- */
+/*                               Pagination                                   */
+/* -------------------------------------------------------------------------- */
+
+/// Hard upper-bound enforced by validation layer.
+pub const MAX_PAGE_SIZE: u16 = 500;
+
+/// Cursor based pagination inspired by Relay spec.
+#[derive(Debug, Deserialize, Validate)]
+pub struct PaginationParams {
+    /// Opaque base64 cursor that points to the element *after* the last one from the
+    /// previous page.
+    #[validate(custom = "validate_cursor")]
+    pub after: Option<String>,
+
+    /// Amount of items to return, inclusive. Server rejects anything above
+    /// [`MAX_PAGE_SIZE`].
+    #[validate(range(min = 1, max = "MAX_PAGE_SIZE"))]
+    pub first: Option<u16>,
+}
+
+/// Custom validator for cursor format.
+fn validate_cursor(cursor: &str) -> Result<(), ValidationError> {
+    base64::decode(cursor)
+        .map(|_| ())
+        .map_err(|_| ValidationError::new("invalid_cursor"))
+}
+
+/// Relay-style pagination meta block.
+#[derive(Debug, Serialize)]
+pub struct PageInfo {
+    pub has_next_page: bool,
+    pub end_cursor: Option<String>,
+    pub total_count: Option<u64>,
+}
+
+/// Generic container returned by list endpoints.
+#[derive(Debug, Serialize)]
+pub struct Paginated<T> {
+    pub data: Vec<T>,
+    pub page_info: PageInfo,
+}
+
+/// Repository structs that implement this trait can be plugged into the generic
+/// [`paginate`] helper.
+#[async_trait]
+pub trait Pageable {
+    type Item: Send + Sync + Serialize;
+
+    async fn fetch_page(
+        &self,
+        cursor: Option<&str>,
+        page_size: u16,
+    ) -> anyhow::Result<(Vec<Self::Item>, Option<String>, bool)>;
+}
+
+/// Thin convenience wrapper that orchestrates cursor pagination flow.
+pub async fn paginate<R>(
+    repo: &R,
+    params: &PaginationParams,
+) -> anyhow::Result<Paginated<R::Item>>
+where
+    R: Pageable + Sync,
+{
+    let size = params.first.unwrap_or(50);
+    let (records, end_cursor, has_next_page) =
+        repo.fetch_page(params.after.as_deref(), size).await?;
+    Ok(Paginated {
+        data: records,
+        page_info: PageInfo {
+            has_next_page,
+            end_cursor,
+            total_count: None,
+        },
+    })
+}
+
+/* -------------------------------------------------------------------------- */
+/*                             Cache Directives                               */
+/* -------------------------------------------------------------------------- */
+
+/// Describes how HTTP/GraphQL clients may cache a particular response.
+#[derive(Debug, Clone, Copy)]
+pub enum CacheDirective {
+    /// Content never changes and can be stored forever.
+    Immutable,
+    /// Content may be reused for the specified amount of seconds.
+    MaxAge(u32),
+    /// Response must not be cached.
+    NoCache,
+}
+
+impl CacheDirective {
+    fn to_header_value(self) -> HeaderValue {
+        match self {
+            CacheDirective::Immutable => {
+                HeaderValue::from_static("public, max-age=31536000, immutable")
+            }
+            CacheDirective::MaxAge(s) => {
+                HeaderValue::from_str(&format!("public, max-age={s}")).unwrap()
+            }
+            CacheDirective::NoCache => {
+                HeaderValue::from_static("no-cache, no-store, must-revalidate")
+            }
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                        Unified JSON response helper                        */
+/* -------------------------------------------------------------------------- */
+
+/// Convenience wrapper that handles JSON serialization, [`ETag`] calculation and the
+/// `Cache-Control` header.
+pub struct JsonResponse<T> {
+    payload: T,
+    cache: CacheDirective,
+}
+
+impl<T> JsonResponse<T>
+where
+    T: Serialize,
+{
+    pub fn new(payload: T, cache: CacheDirective) -> Self {
+        Self { payload, cache }
+    }
+
+    pub fn into_http(self, req: &HttpRequest) -> actix_web::Result<HttpResponse> {
+        let serialized = serde_json::to_vec(&self.payload)
+            .context("failed to serialize JSON body")?;
+
+        // Stable weak ETag so clients can leverage conditional GETs.
+        let mut hasher = Sha256::new();
+        hasher.update(&serialized);
+        let tag = format!(r#"W/"{:x}""#, hasher.finalize());
+        let etag = HeaderValue::from_str(&tag).unwrap();
+
+        // Handle If-None-Match pre-condition.
+        if let Some(client_tag) = req.headers().get(header::IF_NONE_MATCH) {
+            if client_tag == &etag {
+                return Ok(HttpResponse::NotModified()
+                    .insert_header((header::ETAG, etag))
+                    .insert_header((header::CACHE_CONTROL, self.cache.to_header_value()))
+                    .finish());
+            }
+        }
+
+        Ok(HttpResponse::Ok()
+            .insert_header((header::ETAG, etag))
+            .insert_header((header::CACHE_CONTROL, self.cache.to_header_value()))
+            .content_type("application/json")
+            .body(serialized))
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                  Errors                                    */
+/* -------------------------------------------------------------------------- */
+
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("validation error: {0}")]
+    Validation(#[from] validator::ValidationErrors),
+    #[error("{0}")]
+    Anyhow(#[from] anyhow::Error),
+}
+
+impl ResponseError for ApiError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            ApiError::Validation(_) => StatusCode::BAD_REQUEST,
+            ApiError::Anyhow(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    fn error_response(&self) -> HttpResponse {
+        HttpResponse::build(self.status_code()).json(serde_json::json!({
+            "error": self.to_string()
+        }))
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                    Domain model & repository example                       */
+/* -------------------------------------------------------------------------- */
+
+/// Simplified Ledger Entry domain aggregate.
+#[derive(Debug, Serialize)]
+pub struct LedgerEntry {
+    id: i64,
+    description: String,
+    amount_cents: i64,
+    created_at: NaiveDateTime,
+}
+
+/// POC implementation using [`tokio_postgres`] + [`deadpool_postgres`].
+pub struct LedgerEntryRepository {
+    pool: Pool,
+}
+
+impl LedgerEntryRepository {
+    pub fn new(pool: Pool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl Pageable for LedgerEntryRepository {
+    type Item = LedgerEntry;
+
+    async fn fetch_page(
+        &self,
+        cursor: Option<&str>,
+        page_size: u16,
+    ) -> anyhow::Result<(Vec<Self::Item>, Option<String>, bool)> {
+        let pg_client = self.pool.get().await?;
+        let cursor_id: i64 = match cursor {
+            Some(c) => String::from_utf8(base64::decode(c)?)?.parse()?,
+            None => 0,
+        };
+
+        // `LIMIT page_size + 1` allows us to cheaply determine `has_next_page`.
+        let rows: Vec<Row> = pg_client
+            .query(
+                "
+                SELECT id, description, amount_cents, created_at
+                  FROM ledger_entries
+                 WHERE id > $1
+              ORDER BY id ASC
+                 LIMIT $2 + 1
+                ",
+                &[&cursor_id, &(page_size as i64)],
+            )
+            .await?;
+
+        let has_next_page = rows.len() as u16 > page_size;
+        let trimmed_rows = if has_next_page {
+            &rows[..rows.len() - 1]
+        } else {
+            &rows
+        };
+
+        let data = trimmed_rows
+            .iter()
+            .map(|r| LedgerEntry {
+                id: r.get("id"),
+                description: r.get("description"),
+                amount_cents: r.get("amount_cents"),
+                created_at: r.get("created_at"),
+            })
+            .collect::<Vec<_>>();
+
+        let end_cursor = data
+            .last()
+            .map(|e| base64::encode(e.id.to_string()));
+
+        Ok((data, end_cursor, has_next_page))
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                               HTTP Handler                                 */
+/* -------------------------------------------------------------------------- */
+
+#[get("/v1/ledger_entries")]
+async fn list_ledger_entries(
+    repo: web::Data<LedgerEntryRepository>,
+    params: web::Query<PaginationParams>,
+    req: HttpRequest,
+) -> Result<HttpResponse, ApiError> {
+    params.validate()?; // ① validate query args
+
+    let paginated = paginate(&*repo, &params).await?; // ② fetch data
+    let resp = JsonResponse::new(paginated, CacheDirective::MaxAge(60)); // ③ wrap
+
+    resp.into_http(&req).map_err(ApiError::from) // ④ render
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                  Tests                                     */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use validator::Validate;
+
+    #[test]
+    fn cursor_validation() {
+        let invalid = PaginationParams {
+            after: Some("$$garbage".into()),
+            first: Some(10),
+        };
+        assert!(invalid.validate().is_err());
+
+        let valid = PaginationParams {
+            after: Some(base64::encode("42")),
+            first: Some(25),
+        };
+        assert!(valid.validate().is_ok());
+    }
+
+    #[test]
+    fn cache_header_values() {
+        assert_eq!(
+            CacheDirective::Immutable.to_header_value(),
+            HeaderValue::from_static("public, max-age=31536000, immutable")
+        );
+        assert_eq!(
+            CacheDirective::NoCache.to_header_value(),
+            HeaderValue::from_static("no-cache, no-store, must-revalidate")
+        );
+    }
+}

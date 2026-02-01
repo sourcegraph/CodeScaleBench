@@ -1,0 +1,454 @@
+```rust
+//! ChirpPulse – Sentiment Analyzer Module
+//!
+//! This file implements the **strategy pattern** for run–time–switchable
+//! sentiment–analysis algorithms.  An `AnalyzerRegistry` holds the
+//! currently-active strategy behind an `Arc<RwLock<…>>`, making it
+//! possible to change the algorithm without restarting long-running
+//! stream-processing tasks.
+//
+//! The module also includes small reference implementations
+//! (`NaiveBayesAnalyzer`, `LexiconAnalyzer`) so the library remains fully
+//! self-contained and immediately runnable.  Integrators may replace these
+//! with a production-grade model (e.g. an on-device ONNX/TensorRT model)
+//! by registering their own `Box<dyn SentimentAnalyzer>` at run time.
+//!
+//! The public surface of the module is intentionally narrow: only
+//! `AnalyzerRegistry`, `SentimentScore`, and `SentimentLabel` need to be
+//! imported by the rest of the platform.
+
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::{Arc, RwLock},
+    time::Instant,
+};
+
+use anyhow::{anyhow, Result};
+use once_cell::sync::Lazy;
+use prometheus::{CounterVec, HistogramOpts, HistogramVec, Registry};
+use rand::seq::SliceRandom;
+use regex::Regex;
+use thiserror::Error;
+
+/// ----------------------------------------------------------------------------
+/// Public Data Types
+/// ----------------------------------------------------------------------------
+
+/// High-level sentiment label.
+//
+// NOTE: We keep the enum small on purpose so it can be efficiently serialized
+// via `repr(u8)` into Kafka messages or Parquet rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SentimentLabel {
+    Negative = 0,
+    Neutral = 1,
+    Positive = 2,
+    Mixed = 3,
+}
+
+impl fmt::Display for SentimentLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SentimentLabel::Negative => write!(f, "negative"),
+            SentimentLabel::Neutral => write!(f, "neutral"),
+            SentimentLabel::Positive => write!(f, "positive"),
+            SentimentLabel::Mixed => write!(f, "mixed"),
+        }
+    }
+}
+
+/// Numeric sentiment representation.
+#[derive(Debug, Clone)]
+pub struct SentimentScore {
+    /// Polarity in range [-1.0, 1.0] where ‑1 is most negative.
+    pub polarity: f32,
+    /// Strength of the signal (similar to magnitude).
+    pub magnitude: f32,
+    /// Categorical label derived from `polarity`.
+    pub label: SentimentLabel,
+}
+
+impl SentimentScore {
+    /// Convenience constructor that clamps the polarity.
+    pub fn new(polarity: f32, magnitude: f32) -> Self {
+        let p = polarity.clamp(-1.0, 1.0);
+        let label = if p > 0.25 {
+            SentimentLabel::Positive
+        } else if p < -0.25 {
+            SentimentLabel::Negative
+        } else {
+            SentimentLabel::Neutral
+        };
+
+        Self {
+            polarity: p,
+            magnitude: magnitude.clamp(0.0, 1.0),
+            label,
+        }
+    }
+}
+
+/// Errors emitted by analyzers.
+#[derive(Error, Debug)]
+pub enum AnalyzerError {
+    #[error("required model file missing: {0}")]
+    MissingModel(String),
+
+    #[error("internal analyzer failure: {0}")]
+    Internal(String),
+}
+
+/// Strategy trait for sentiment analyzers.
+///
+/// All implementations must be thread-safe because we share them between
+/// async executors and blocking tasks.
+pub trait SentimentAnalyzer: Send + Sync {
+    /// Analyze text and produce a sentiment score.
+    fn analyze(&self, text: &str) -> Result<SentimentScore, AnalyzerError>;
+
+    /// Name of the strategy (telemetry, debugging).
+    fn name(&self) -> &'static str;
+}
+
+/// ----------------------------------------------------------------------------
+/// Registry (Strategy Pattern + Observer Pattern)
+/// ----------------------------------------------------------------------------
+
+/// A thread-safe registry that allows swapping the active analyzer in O(1).
+///
+/// Internally, the strategy is stored inside an `Arc` so clones are cheap and
+/// many threads may compute sentiment in parallel without hitting the lock.
+#[derive(Clone)]
+pub struct AnalyzerRegistry {
+    inner: Arc<RwLock<Arc<dyn SentimentAnalyzer>>>,
+    metrics: Arc<AnalyzerMetrics>,
+}
+
+impl AnalyzerRegistry {
+    /// Build a new registry and set *default* as the initial analyzer.
+    pub fn new(default: impl SentimentAnalyzer + 'static) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Arc::new(default))),
+            metrics: Arc::new(AnalyzerMetrics::global()),
+        }
+    }
+
+    /// Switch the active analyzer at run time.
+    ///
+    /// All future calls to [`Self::analyze`] will see the new strategy.  Current
+    /// in-flight calls continue using the old implementation because they hold
+    /// an `Arc` clone unaffected by this mutation.
+    pub fn set_analyzer(
+        &self,
+        new_analyzer: impl SentimentAnalyzer + 'static,
+    ) -> Result<()> {
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| anyhow!("analyzer registry poisoned"))?;
+
+        *guard = Arc::new(new_analyzer);
+        Ok(())
+    }
+
+    /// Analyze text using the current strategy.
+    ///
+    /// This is a light wrapper that forwards to the active analyzer while
+    /// recording Prometheus metrics.
+    pub fn analyze(&self, text: &str) -> Result<SentimentScore> {
+        let start = Instant::now();
+
+        // Acquire read lock and clone the Arc so we can drop the lock asap.
+        let analyzer_arc = {
+            let guard = self
+                .inner
+                .read()
+                .map_err(|_| anyhow!("analyzer registry poisoned"))?;
+            guard.clone()
+        };
+
+        // Perform analysis.
+        match analyzer_arc.analyze(text) {
+            Ok(score) => {
+                self.metrics
+                    .calls
+                    .with_label_values(&[analyzer_arc.name(), "ok"])
+                    .inc();
+                self.metrics
+                    .latency
+                    .with_label_values(&[analyzer_arc.name()])
+                    .observe(start.elapsed().as_secs_f64());
+                Ok(score)
+            }
+            Err(e) => {
+                self.metrics
+                    .calls
+                    .with_label_values(&[analyzer_arc.name(), "err"])
+                    .inc();
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Current analyzer name (useful for debug endpoints).
+    pub fn current_strategy(&self) -> String {
+        let guard = self
+            .inner
+            .read()
+            .expect("registry poisoned while querying name");
+        guard.name().to_owned()
+    }
+}
+
+/// Prometheus metrics helper.
+struct AnalyzerMetrics {
+    calls: CounterVec,
+    latency: HistogramVec,
+}
+
+impl AnalyzerMetrics {
+    fn global() -> Self {
+        static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
+        static INSTANCE: Lazy<AnalyzerMetrics> = Lazy::new(|| {
+            let calls = CounterVec::new(
+                prometheus::Opts::new("sentiment_calls", "Sentiment analyzer invocations"),
+                &["strategy", "status"],
+            )
+            .expect("metric init failed");
+
+            let latency = HistogramVec::new(
+                HistogramOpts::new("sentiment_latency_seconds", "Latency of analyze()"),
+                &["strategy"],
+            )
+            .expect("metric init failed");
+
+            REGISTRY
+                .register(Box::new(calls.clone()))
+                .expect("metric registration failed");
+            REGISTRY
+                .register(Box::new(latency.clone()))
+                .expect("metric registration failed");
+
+            AnalyzerMetrics { calls, latency }
+        });
+
+        INSTANCE.clone()
+    }
+}
+
+/// ----------------------------------------------------------------------------
+/// Reference Implementations (Strategies)
+/// ----------------------------------------------------------------------------
+
+/// A *very* small toy lexicon based analyzer (purely deterministic).
+#[derive(Default)]
+pub struct LexiconAnalyzer {
+    positive: HashSet<&'static str>,
+    negative: HashSet<&'static str>,
+    word_re: Regex,
+}
+
+impl LexiconAnalyzer {
+    pub fn new() -> Self {
+        // The lexicon is obviously incomplete and only for demonstration.
+        // Production code can load the lexicon from an external file
+        // (e.g. LIWC, NRC) and hot-reload it on change.
+        let positive = HashSet::from(["love", "great", "awesome", "good", "amazing"]);
+        let negative = HashSet::from(["hate", "bad", "terrible", "awful", "worse"]);
+
+        Self {
+            positive,
+            negative,
+            word_re: Regex::new(r"(?i)\b[a-z']+\b").unwrap(),
+        }
+    }
+}
+
+impl SentimentAnalyzer for LexiconAnalyzer {
+    fn analyze(&self, text: &str) -> Result<SentimentScore, AnalyzerError> {
+        let mut pos = 0;
+        let mut neg = 0;
+
+        for word in self.word_re.find_iter(text) {
+            let token = word.as_str().to_lowercase();
+            if self.positive.contains(token.as_str()) {
+                pos += 1;
+            } else if self.negative.contains(token.as_str()) {
+                neg += 1;
+            }
+        }
+
+        let total = pos + neg;
+        if total == 0 {
+            return Ok(SentimentScore::new(0.0, 0.0)); // Neutral baseline
+        }
+
+        let polarity = (pos as f32 - neg as f32) / total as f32;
+        let magnitude = (total as f32 / 10.0).clamp(0.0, 1.0);
+
+        Ok(SentimentScore::new(polarity, magnitude))
+    }
+
+    fn name(&self) -> &'static str {
+        "lexicon"
+    }
+}
+
+/// A pseudo Bayesian analyzer to illustrate a more complex strategy.
+///
+/// NOTE: This implementation is random and *not* a real classifier; the real
+/// system is expected to load an actual Naïve Bayes model or a transformer.
+/// We mimic heavier init and compute costs to make benchmarking easier.
+pub struct NaiveBayesAnalyzer {
+    categories: Vec<SentimentLabel>,
+    priors: HashMap<SentimentLabel, f32>,
+}
+
+impl NaiveBayesAnalyzer {
+    /// Load a model (here we fake it).
+    pub fn load() -> Result<Self, AnalyzerError> {
+        // Pretend to read from a file, show error handling.
+        let model_path = std::env::var("CP_NB_MODEL_PATH").unwrap_or_default();
+        if model_path.is_empty() {
+            return Err(AnalyzerError::MissingModel(
+                "$CP_NB_MODEL_PATH not set".into(),
+            ));
+        }
+
+        // For illustration we do *not* actually parse the file.
+        Ok(Self {
+            categories: vec![
+                SentimentLabel::Negative,
+                SentimentLabel::Neutral,
+                SentimentLabel::Positive,
+            ],
+            priors: HashMap::from([
+                (SentimentLabel::Negative, 0.33),
+                (SentimentLabel::Neutral, 0.33),
+                (SentimentLabel::Positive, 0.34),
+            ]),
+        })
+    }
+}
+
+impl SentimentAnalyzer for NaiveBayesAnalyzer {
+    fn analyze(&self, _text: &str) -> Result<SentimentScore, AnalyzerError> {
+        // Use random output to simulate stochastics.
+        let label = *self
+            .categories
+            .choose(&mut rand::thread_rng())
+            .expect("categories not empty");
+        let polarity = match label {
+            SentimentLabel::Positive => 0.6,
+            SentimentLabel::Negative => -0.6,
+            SentimentLabel::Neutral => 0.0,
+            SentimentLabel::Mixed => 0.1,
+        };
+        Ok(SentimentScore::new(polarity, 0.8))
+    }
+
+    fn name(&self) -> &'static str {
+        "naive_bayes"
+    }
+}
+
+/// ----------------------------------------------------------------------------
+/// Stream Integration Example
+/// ----------------------------------------------------------------------------
+
+/// A small self-contained DTO to be sent downstream.
+#[derive(Debug, Clone)]
+pub struct EnrichedPost<'a> {
+    pub id: &'a str,
+    pub text: &'a str,
+    pub sentiment: SentimentScore,
+}
+
+/// Process an iterator of raw messages and produce enriched posts.
+///
+/// The function intentionally accepts any iterator so it can be used from
+/// synchronous code or wrapped inside an async task.
+///
+/// Example:
+/// ```ignore
+/// let registry = AnalyzerRegistry::new(LexiconAnalyzer::new());
+/// let posts = vec![("1", "I love rust"), ("2", "I hate spam")];
+/// for enriched in enrich_stream(posts.into_iter(), &registry) {
+///     println!("{:?}", enriched);
+/// }
+/// ```
+pub fn enrich_stream<'a, I>(
+    raw_stream: I,
+    registry: &AnalyzerRegistry,
+) -> impl Iterator<Item = Result<EnrichedPost<'a>>>
+where
+    I: Iterator<Item = (&'a str, &'a str)> + 'a,
+{
+    raw_stream.map(move |(id, text)| {
+        registry
+            .analyze(text)
+            .map(|sentiment| EnrichedPost { id, text, sentiment })
+    })
+}
+
+/// ----------------------------------------------------------------------------
+/// Tests
+/// ----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lexicon_basic() {
+        let lex = LexiconAnalyzer::new();
+        let score = lex.analyze("I love love love this great thing").unwrap();
+        assert!(score.polarity > 0.5);
+        assert_eq!(score.label, SentimentLabel::Positive);
+
+        let score = lex.analyze("terrible awful bad!").unwrap();
+        assert!(score.polarity < -0.5);
+        assert_eq!(score.label, SentimentLabel::Negative);
+
+        let score = lex.analyze("meh").unwrap();
+        assert_eq!(score.label, SentimentLabel::Neutral);
+    }
+
+    #[test]
+    fn registry_switch() {
+        let registry = AnalyzerRegistry::new(LexiconAnalyzer::new());
+
+        let before = registry.current_strategy();
+        assert_eq!(before, "lexicon");
+
+        registry
+            .set_analyzer(
+                NaiveBayesAnalyzer::load()
+                    .unwrap_or_else(|_| NaiveBayesAnalyzer {
+                        categories: vec![SentimentLabel::Neutral],
+                        priors: HashMap::new(),
+                    }),
+            )
+            .expect("switch ok");
+
+        let after = registry.current_strategy();
+        assert_eq!(after, "naive_bayes");
+    }
+
+    #[test]
+    fn enrich_stream_ok() {
+        let registry = AnalyzerRegistry::new(LexiconAnalyzer::new());
+        let raw = vec![("1", "awesome"), ("2", "awful")];
+
+        let enriched: Vec<_> = super::enrich_stream(raw.into_iter(), &registry)
+            .collect::<Result<_>>()
+            .unwrap();
+
+        assert_eq!(enriched.len(), 2);
+        assert_eq!(enriched[0].sentiment.label, SentimentLabel::Positive);
+        assert_eq!(enriched[1].sentiment.label, SentimentLabel::Negative);
+    }
+}
+```

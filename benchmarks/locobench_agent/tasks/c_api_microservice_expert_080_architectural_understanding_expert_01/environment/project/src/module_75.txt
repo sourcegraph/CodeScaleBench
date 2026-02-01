@@ -1,0 +1,460 @@
+```c
+/**
+ * MercuryMonolith Commerce Hub
+ * Module 75 – Response Cache Implementation
+ *
+ * File:    src/module_75.txt  (compiled as response_cache.c)
+ * Author:  MercuryMonolith Core Team
+ *
+ * Description:
+ *   Thread-safe, in-memory LRU cache for HTTP/GraphQL responses with
+ *   TTL-based eviction and Prometheus-compatible metrics.
+ *
+ *   The cache is intentionally generic and key-agnostic: callers are
+ *   expected to generate the cache key (typically SHA-256 of the fully
+ *   qualified request, headers, and auth context) and provide the raw
+ *   response payload.  Reference counting allows zero-copy reads while
+ *   concurrently serving multiple readers.
+ *
+ *   Hot paths are lock-free for reads when entries are found and fresh;
+ *   writes and evictions are protected by a single mutex to simplify
+ *   implementation while keeping contention low in practice (hit ratio
+ *   > 90 % for typical workloads).
+ *
+ *   Compile flags:
+ *      gcc -std=c11 -O2 -Wall -Werror -pthread -c response_cache.c
+ */
+
+#include <assert.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "core/log.h"           /* project-local structured logging */
+#include "core/metrics.h"       /* prometheus metrics helper        */
+#include "core/memory.h"        /* custom allocator wrappers        */
+#include "core/clock.h"         /* monotonic clock utility          */
+#include "http/response.h"      /* opaque response container        */
+
+/* --------------------------------------------------------------
+ * Constants
+ * -------------------------------------------------------------- */
+
+#ifndef RESPONSE_CACHE_DEFAULT_CAPACITY
+#define RESPONSE_CACHE_DEFAULT_CAPACITY  8192U     /* entries      */
+#endif
+
+#ifndef RESPONSE_CACHE_DEFAULT_TTL_SEC
+#define RESPONSE_CACHE_DEFAULT_TTL_SEC      60U    /* seconds      */
+#endif
+
+#define FNV_OFFSET_BASIS   14695981039346656037ULL
+#define FNV_PRIME          1099511628211ULL
+
+/* --------------------------------------------------------------
+ * Data structures
+ * -------------------------------------------------------------- */
+
+/* Doubly linked list node holding cached response */
+typedef struct cache_entry {
+    char               *key;             /* heap-allocated cache key             */
+    uint64_t            hash;            /* pre-computed FNV hash                */
+    http_response_t    *payload;         /* shared response object               */
+    uint32_t            ttl_sec;         /* TTL in seconds                       */
+    uint64_t            expires_ns;      /* absolute monotonic expiration (ns)   */
+    struct cache_entry *prev;            /* LRU – previous                       */
+    struct cache_entry *next;            /* LRU – next                           */
+    _Atomic uint32_t    refcnt;          /* readers currently using this entry   */
+} cache_entry_t;
+
+/* Hash map bucket – separate chaining w/ intrusive list */
+typedef struct bucket {
+    cache_entry_t *head;
+} bucket_t;
+
+typedef struct response_cache {
+    uint32_t      capacity;      /* max number of entries                     */
+    uint32_t      size;          /* current entries (best-effort, non-atomic) */
+    uint32_t      ttl_default;   /* fallback TTL                              */
+
+    bucket_t     *table;         /* hash table                                */
+    uint32_t      table_size;    /* number of buckets (power of two)          */
+
+    cache_entry_t *lru_head;     /* most recently used                        */
+    cache_entry_t *lru_tail;     /* least recently used                       */
+
+    pthread_mutex_t lock;        /* protects writes & LRU modifications       */
+
+    /* Metrics (Prometheus counters & gauges) */
+    prom_counter_t *hits;
+    prom_counter_t *misses;
+    prom_counter_t *evictions;
+    prom_gauge_t   *items;
+} response_cache_t;
+
+/* Forward declarations */
+static uint64_t fnv1a_hash(const void *data, size_t len);
+static void      promote_lru_unlocked(response_cache_t *c, cache_entry_t *e);
+static void      evict_if_needed_unlocked(response_cache_t *c);
+static void      free_entry(cache_entry_t *e);
+
+/* --------------------------------------------------------------
+ * Public API
+ * -------------------------------------------------------------- */
+
+response_cache_t *
+response_cache_create(uint32_t capacity, uint32_t ttl_sec)
+{
+    if (capacity == 0) {
+        capacity = RESPONSE_CACHE_DEFAULT_CAPACITY;
+    }
+    if (ttl_sec == 0) {
+        ttl_sec = RESPONSE_CACHE_DEFAULT_TTL_SEC;
+    }
+
+    response_cache_t *c = mm_calloc(1, sizeof(*c));
+    if (!c) {
+        MLOG_FATAL("response_cache_create: out of memory");
+        return NULL;
+    }
+
+    /* Simple load factor of ~0.75 */
+    c->table_size = 1U;
+    while (c->table_size < capacity * 4U / 3U) {
+        c->table_size <<= 1U;
+    }
+    c->table = mm_calloc(c->table_size, sizeof(bucket_t));
+    if (!c->table) {
+        MLOG_FATAL("response_cache_create: cannot allocate hash table");
+        mm_free(c);
+        return NULL;
+    }
+
+    c->capacity     = capacity;
+    c->ttl_default  = ttl_sec;
+    pthread_mutex_init(&c->lock, NULL);
+
+    /* Register Prometheus metrics */
+    c->hits      = prom_counter_create("response_cache_hits_total",
+                                       "Total cache hits", NULL);
+    c->misses    = prom_counter_create("response_cache_misses_total",
+                                       "Total cache misses", NULL);
+    c->evictions = prom_counter_create("response_cache_evictions_total",
+                                       "Total cache evictions", NULL);
+    c->items     = prom_gauge_create("response_cache_items",
+                                     "Current number of cached items", NULL);
+    prom_gauge_set(c->items, 0);
+
+    return c;
+}
+
+void
+response_cache_destroy(response_cache_t *c)
+{
+    if (!c) return;
+
+    pthread_mutex_lock(&c->lock);
+    for (uint32_t i = 0; i < c->table_size; ++i) {
+        cache_entry_t *e = c->table[i].head;
+        while (e) {
+            cache_entry_t *next = e->next;
+            free_entry(e);
+            e = next;
+        }
+    }
+    pthread_mutex_unlock(&c->lock);
+
+    prom_counter_destroy(c->hits);
+    prom_counter_destroy(c->misses);
+    prom_counter_destroy(c->evictions);
+    prom_gauge_destroy(c->items);
+
+    mm_free(c->table);
+    pthread_mutex_destroy(&c->lock);
+    mm_free(c);
+}
+
+/**
+ * Retrieve a cached response if present and not expired.
+ *
+ * Return value:
+ *   NON-NULL pointer to http_response_t on hit.
+ *   NULL on miss or expired entry (expired entries are evicted lazily).
+ *
+ * The returned response is reference-counted; caller must call
+ * http_response_dec_ref() when done.
+ */
+http_response_t *
+response_cache_get(response_cache_t *c, const char *key, size_t key_len)
+{
+    const uint64_t hash = fnv1a_hash(key, key_len);
+    const uint32_t idx  = hash & (c->table_size - 1U);
+
+    /* First do a lock-free optimistic lookup */
+    cache_entry_t *e = atomic_load_explicit((_Atomic cache_entry_t **)&c->table[idx].head,
+                                            memory_order_acquire);
+
+    while (e) {
+        if (e->hash == hash && strlen(e->key) == key_len &&
+            memcmp(e->key, key, key_len) == 0)
+        {
+            /* Not expired? */
+            uint64_t now = clk_monotonic_ns();
+            if (now < atomic_load_explicit((_Atomic uint64_t *)&e->expires_ns,
+                                           memory_order_relaxed))
+            {
+                /* Increase refcount before potential promotion */
+                atomic_fetch_add_explicit(&e->refcnt, 1, memory_order_acquire);
+                prom_counter_inc(c->hits);
+
+                /* Promote to LRU head (rare – requires lock) */
+                pthread_mutex_lock(&c->lock);
+                promote_lru_unlocked(c, e);
+                pthread_mutex_unlock(&c->lock);
+
+                return http_response_inc_ref(e->payload);
+            } else {
+                /* Expired – handle under lock */
+                break;
+            }
+        }
+        e = e->next;
+    }
+
+    prom_counter_inc(c->misses);
+
+    /* If we reached here, either miss or expired; remove expired node */
+    if (e) {
+        pthread_mutex_lock(&c->lock);
+        /* double-check under lock */
+        uint64_t now = clk_monotonic_ns();
+        if (now >= e->expires_ns) {
+            /* Detach from bucket list */
+            bucket_t *bucket = &c->table[idx];
+            cache_entry_t *cur = bucket->head, *prev = NULL;
+            while (cur && cur != e) {
+                prev = cur;
+                cur = cur->next;
+            }
+            if (cur) {
+                if (prev) prev->next = cur->next;
+                else      bucket->head = cur->next;
+            }
+
+            /* Detach from LRU list */
+            if (e->prev) e->prev->next = e->next;
+            if (e->next) e->next->prev = e->prev;
+            if (c->lru_head == e) c->lru_head = e->next;
+            if (c->lru_tail == e) c->lru_tail = e->prev;
+
+            free_entry(e);
+            c->size--;
+            prom_gauge_dec(c->items);
+        }
+        pthread_mutex_unlock(&c->lock);
+    }
+
+    return NULL;
+}
+
+/**
+ * Put response into cache.  Ownership of `response` is transferred.
+ * Caller must NOT free or reuse `response` after calling put.
+ *
+ * Parameters:
+ *   key/key_len – opaque identifier, must be unique for a request variant.
+ *   ttl_sec     – override TTL. 0 => use default cache ttl.
+ *   response    – heap-allocated http_response_t*, refcnt must be 1.
+ *
+ * The function steals reference; on eviction, the response is freed.
+ */
+void
+response_cache_put(response_cache_t *c,
+                   const char       *key,
+                   size_t            key_len,
+                   uint32_t          ttl_sec,
+                   http_response_t  *response)
+{
+    assert(response);
+    if (ttl_sec == 0) ttl_sec = c->ttl_default;
+
+    uint64_t hash = fnv1a_hash(key, key_len);
+    uint32_t idx  = hash & (c->table_size - 1U);
+
+    cache_entry_t *e = mm_calloc(1, sizeof(*e));
+    if (!e) {
+        MLOG_ERROR("response_cache_put: OOM");
+        http_response_dec_ref(response);
+        return;
+    }
+    e->key        = mm_memdup(key, key_len + 1);
+    e->hash       = hash;
+    e->payload    = response;
+    e->ttl_sec    = ttl_sec;
+    e->expires_ns = clk_monotonic_ns() + ((uint64_t)ttl_sec * 1'000'000'000ULL);
+    e->refcnt     = 1; /* one reference held by cache */
+
+    /* Insert into structures */
+    pthread_mutex_lock(&c->lock);
+
+    /* Prepend into bucket (separate chaining) */
+    e->next = c->table[idx].head;
+    c->table[idx].head = e;
+
+    /* LRU head */
+    e->prev = NULL;
+    e->next = NULL;
+    if (c->lru_head) {
+        e->next = c->lru_head;
+        c->lru_head->prev = e;
+    }
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+
+    c->size++;
+    prom_gauge_inc(c->items);
+
+    /* Evict if over capacity */
+    evict_if_needed_unlocked(c);
+
+    pthread_mutex_unlock(&c->lock);
+}
+
+/* --------------------------------------------------------------
+ * Internal helpers
+ * -------------------------------------------------------------- */
+
+static uint64_t
+fnv1a_hash(const void *data, size_t len)
+{
+    uint64_t hash = FNV_OFFSET_BASIS;
+    const unsigned char *ptr = data;
+
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= ptr[i];
+        hash *= FNV_PRIME;
+    }
+    return hash;
+}
+
+static void
+promote_lru_unlocked(response_cache_t *c, cache_entry_t *e)
+{
+    if (c->lru_head == e) return; /* already head */
+
+    /* Detach */
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+
+    /* Move to head */
+    e->prev = NULL;
+    e->next = c->lru_head;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+static void
+evict_if_needed_unlocked(response_cache_t *c)
+{
+    while (c->size > c->capacity) {
+        cache_entry_t *victim = c->lru_tail;
+        if (!victim) break;
+
+        /* Don't evict if someone is holding it */
+        if (atomic_load_explicit(&victim->refcnt, memory_order_acquire) > 1) {
+            /* Scan backwards to find an evictable entry */
+            victim = victim->prev;
+            continue;
+        }
+
+        /* Remove from bucket */
+        uint32_t idx = victim->hash & (c->table_size - 1U);
+        bucket_t *bucket = &c->table[idx];
+        cache_entry_t *cur = bucket->head, *prev = NULL;
+        while (cur && cur != victim) {
+            prev = cur;
+            cur = cur->next;
+        }
+        if (cur) {
+            if (prev) prev->next = cur->next;
+            else      bucket->head = cur->next;
+        }
+
+        /* Remove from LRU list */
+        if (victim->prev) victim->prev->next = victim->next;
+        if (victim->next) victim->next->prev = victim->prev;
+        if (c->lru_head == victim) c->lru_head = victim->next;
+        if (c->lru_tail == victim) c->lru_tail = victim->prev;
+
+        free_entry(victim);
+        c->size--;
+        prom_gauge_dec(c->items);
+        prom_counter_inc(c->evictions);
+    }
+}
+
+static void
+free_entry(cache_entry_t *e)
+{
+    if (!e) return;
+    http_response_dec_ref(e->payload);
+    mm_free(e->key);
+    mm_free(e);
+}
+
+/* --------------------------------------------------------------
+ * Metrics helper – expose current size for prometheus scrapes
+ * -------------------------------------------------------------- */
+uint32_t
+response_cache_size(const response_cache_t *c)
+{
+    return c ? c->size : 0;
+}
+
+/* --------------------------------------------------------------
+ * Unit-style sanity test (only compiled in debug mode)
+ * -------------------------------------------------------------- */
+#ifdef TEST_RESPONSE_CACHE
+
+#include "http/response.h"
+
+static void self_test(void)
+{
+    response_cache_t *c = response_cache_create(4, 2);
+
+    http_response_t *r1 = http_response_from_string("Hello, world!");
+    response_cache_put(c, "k1", 2, 0, r1);
+
+    assert(response_cache_get(c, "k1", 2) != NULL); /* hit */
+
+    sleep(3); /* expire */
+
+    assert(response_cache_get(c, "k1", 2) == NULL); /* miss */
+
+    /* Fill to trigger eviction */
+    for (int i = 0; i < 8; ++i) {
+        char key[4];
+        snprintf(key, sizeof key, "x%d", i);
+        response_cache_put(c, key, strlen(key), 60,
+                           http_response_from_string("payload"));
+    }
+    assert(response_cache_size(c) <= 4);
+
+    response_cache_destroy(c);
+}
+
+int main(void)
+{
+    self_test();
+}
+
+#endif /* TEST_RESPONSE_CACHE */
+```

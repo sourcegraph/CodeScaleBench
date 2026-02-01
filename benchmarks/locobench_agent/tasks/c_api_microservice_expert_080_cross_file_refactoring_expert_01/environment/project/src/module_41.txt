@@ -1,0 +1,551 @@
+```c
+/**
+ * src/module_41.txt
+ *
+ * MercuryMonolith Commerce Hub – Response Cache
+ *
+ * A thread-safe, TTL-aware, size-bounded, LRU in-memory cache for HTTP / GraphQL
+ * responses.  Intended to be used by the Presentation / Gateway layer to reduce
+ * latency and backend load for idempotent queries (e.g. catalog, configuration,
+ * user preferences).
+ *
+ * The implementation is self-contained, uses only libc + pthreads, and exposes a
+ * small C API.  Integration with the existing logging and monitoring facilities
+ * is performed via thin adapter macros (LOG_* / METRIC_*).  The cache is
+ * initialized as a singleton because the monolith is single-process.
+ *
+ * Compile flags recommended:
+ *   -std=c11 -Wall -Wextra -Werror -pedantic -pthread
+ */
+
+#include <assert.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+/*------------------------------------------------------------------------------
+ * External logger / metrics stubs
+ *----------------------------------------------------------------------------*/
+#ifndef LOG_DEBUG
+#define LOG_DEBUG(fmt, ...)  fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...)   fprintf(stderr, "[INFO ] " fmt "\n", ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)   fprintf(stderr, "[WARN ] " fmt "\n", ##__VA_ARGS__)
+#define LOG_ERROR(fmt, ...)  fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+#endif
+
+#ifndef METRIC_INC
+#define METRIC_INC(counter)          /* placeholder */
+#define METRIC_OBSERVE(hist, value)  /* placeholder */
+#endif
+
+/*------------------------------------------------------------------------------
+ * Constants & configuration
+ *----------------------------------------------------------------------------*/
+
+#define CACHE_KEY_MAX     256   /* bytes, including ASCIIZ terminator */
+#define CACHE_ENTRY_OVERHEAD sizeof(struct cache_entry)
+#define NANOSECONDS_IN_SEC 1000000000ull
+
+/*------------------------------------------------------------------------------
+ * Data structures
+ *----------------------------------------------------------------------------*/
+
+typedef struct cache_entry
+{
+    char                    key[CACHE_KEY_MAX];
+    void                   *payload;          /* malloc'd blob                      */
+    size_t                  payload_len;
+    struct timespec         expires_at;       /* absolute time                      */
+
+    struct cache_entry     *prev;             /* for doubly linked LRU list         */
+    struct cache_entry     *next;
+} cache_entry_t;
+
+typedef struct
+{
+    /* Hash table */
+    cache_entry_t        **buckets;
+    size_t                 bucket_count;
+
+    /* LRU doubly linked list (most recent at head) */
+    cache_entry_t         *lru_head;
+    cache_entry_t         *lru_tail;
+
+    /* Size constraints */
+    size_t                 max_entries;
+    size_t                 max_bytes;
+    size_t                 current_entries;
+    size_t                 current_bytes;
+
+    /* Defaults */
+    uint32_t               default_ttl_sec;
+
+    /* Concurrency */
+    pthread_mutex_t        lock;
+
+    /* Stats */
+    atomic_uint_least64_t  hits;
+    atomic_uint_least64_t  misses;
+    atomic_uint_least64_t  evictions;
+} response_cache_t;
+
+/* Singleton instance (allocated in cache_init) */
+static response_cache_t *g_cache = NULL;
+
+/*------------------------------------------------------------------------------
+ * Misc helpers
+ *----------------------------------------------------------------------------*/
+
+static inline uint64_t
+freq_hash64(const void *data, size_t len)
+{
+    /* Fowler–Noll–Vo hash (FNV-1a, 64-bit) */
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t       h = 14695981039346656037ull;
+    for (size_t i = 0; i < len; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static inline void
+timespec_add_seconds(struct timespec *ts, uint32_t seconds)
+{
+    ts->tv_sec  += seconds;
+    /* tv_nsec remains unchanged */
+}
+
+static inline bool
+timespec_is_expired(const struct timespec *now, const struct timespec *expires)
+{
+    return (now->tv_sec > expires->tv_sec) ||
+           (now->tv_sec == expires->tv_sec && now->tv_nsec >= expires->tv_nsec);
+}
+
+/*------------------------------------------------------------------------------
+ * Internal API
+ *----------------------------------------------------------------------------*/
+
+static cache_entry_t *
+cache_entry_create(const char *key,
+                   const void *payload,
+                   size_t      payload_len,
+                   uint32_t    ttl_sec)
+{
+    cache_entry_t *e = calloc(1, sizeof(*e));
+    if (!e) {
+        return NULL;
+    }
+
+    /* Copy key (NUL-terminated) */
+    strncpy(e->key, key, CACHE_KEY_MAX - 1);
+    e->key[CACHE_KEY_MAX - 1] = '\0';
+
+    /* Copy payload */
+    e->payload = malloc(payload_len);
+    if (!e->payload) {
+        free(e);
+        return NULL;
+    }
+    memcpy(e->payload, payload, payload_len);
+    e->payload_len = payload_len;
+
+    /* Set expiration timestamp */
+    clock_gettime(CLOCK_REALTIME_COARSE, &e->expires_at);
+    timespec_add_seconds(&e->expires_at, ttl_sec);
+
+    e->prev = e->next = NULL;
+    return e;
+}
+
+static void
+cache_entry_destroy(cache_entry_t *e)
+{
+    if (!e) return;
+    free(e->payload);
+    free(e);
+}
+
+/* Detach entry from LRU list (does not free) */
+static void
+lru_detach(response_cache_t *c, cache_entry_t *e)
+{
+    if (e->prev) e->prev->next = e->next;
+    if (e->next) e->next->prev = e->prev;
+    if (c->lru_head == e) c->lru_head = e->next;
+    if (c->lru_tail == e) c->lru_tail = e->prev;
+    e->prev = e->next = NULL;
+}
+
+/* Insert entry as new MRU (head) */
+static void
+lru_insert_mru(response_cache_t *c, cache_entry_t *e)
+{
+    e->next = c->lru_head;
+    e->prev = NULL;
+    if (c->lru_head) c->lru_head->prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+/* Evict the LRU (tail) until within capacity */
+static void
+cache_trim_to_limit(response_cache_t *c)
+{
+    while ((c->current_entries > c->max_entries) ||
+           (c->current_bytes   > c->max_bytes)) {
+
+        cache_entry_t *victim = c->lru_tail;
+        if (!victim) break; /* Should not happen */
+
+        uint64_t bucket_idx =
+            freq_hash64(victim->key, strlen(victim->key)) % c->bucket_count;
+
+        /* Remove from hash chain */
+        cache_entry_t **cur = &c->buckets[bucket_idx];
+        while (*cur && *cur != victim)
+            cur = &(*cur)->next; /* using .next as chain pointer temporarily */
+        if (*cur == victim)
+            *cur = victim->next; /* Remove from chain */
+
+        /* Detach from LRU */
+        lru_detach(c, victim);
+
+        c->current_entries -= 1;
+        c->current_bytes   -= (victim->payload_len + CACHE_ENTRY_OVERHEAD);
+
+        cache_entry_destroy(victim);
+        atomic_fetch_add_explicit(&c->evictions, 1, memory_order_relaxed);
+        LOG_DEBUG("cache: evicted LRU entry");
+    }
+}
+
+/*------------------------------------------------------------------------------
+ * Public API
+ *----------------------------------------------------------------------------*/
+
+/**
+ * cache_init
+ *
+ * Must be called once at program startup before any other cache_* function.
+ * Returns 0 on success, -1 on failure (errno is set).
+ */
+int
+cache_init(size_t   max_entries,
+           size_t   max_bytes,
+           uint32_t default_ttl_sec,
+           size_t   bucket_count_hint)
+{
+    if (g_cache) {
+        errno = EALREADY;
+        return -1;
+    }
+
+    response_cache_t *c = calloc(1, sizeof(*c));
+    if (!c) return -1;
+
+    c->bucket_count   = (bucket_count_hint < 16) ? 16 : bucket_count_hint;
+    c->buckets        = calloc(c->bucket_count, sizeof(cache_entry_t *));
+    if (!c->buckets) {
+        free(c);
+        return -1;
+    }
+
+    c->max_entries     = max_entries;
+    c->max_bytes       = max_bytes;
+    c->default_ttl_sec = default_ttl_sec;
+
+    pthread_mutex_init(&c->lock, NULL);
+    atomic_init(&c->hits, 0);
+    atomic_init(&c->misses, 0);
+    atomic_init(&c->evictions, 0);
+
+    g_cache = c;
+    LOG_INFO("cache: initialized (%zu entries, %zu bytes, ttl=%us, buckets=%zu)",
+             max_entries, max_bytes, default_ttl_sec, c->bucket_count);
+    return 0;
+}
+
+/**
+ * cache_put
+ *
+ * Insert or update a cache entry.  A NULL payload or zero length will remove
+ * the key (equivalent to cache_invalidate).  TTL of 0 uses the default TTL.
+ *
+ * Returns 0 on success or negative errno-style codes.
+ */
+int
+cache_put(const char *key, const void *payload, size_t len, uint32_t ttl_sec)
+{
+    if (!g_cache || !key || strlen(key) == 0 || strlen(key) >= CACHE_KEY_MAX)
+        return -EINVAL;
+
+    if (!payload || len == 0)
+        return cache_invalidate(key);
+
+    if (ttl_sec == 0)
+        ttl_sec = g_cache->default_ttl_sec;
+
+    pthread_mutex_lock(&g_cache->lock);
+
+    uint64_t bucket_idx = freq_hash64(key, strlen(key)) % g_cache->bucket_count;
+    cache_entry_t **head = &g_cache->buckets[bucket_idx];
+    cache_entry_t *e = *head;
+
+    /* Search */
+    while (e && strcmp(e->key, key) != 0)
+        e = e->next; /* chain ptr */
+
+    if (e) {
+        /* Update in place */
+        lru_detach(g_cache, e);
+
+        g_cache->current_bytes -= e->payload_len;
+
+        void *new_payload = realloc(e->payload, len);
+        if (!new_payload) {
+            pthread_mutex_unlock(&g_cache->lock);
+            return -ENOMEM;
+        }
+        e->payload = new_payload;
+        memcpy(e->payload, payload, len);
+        e->payload_len = len;
+
+        clock_gettime(CLOCK_REALTIME_COARSE, &e->expires_at);
+        timespec_add_seconds(&e->expires_at, ttl_sec);
+
+        g_cache->current_bytes += len;
+        lru_insert_mru(g_cache, e);
+    } else {
+        /* Create new entry */
+        e = cache_entry_create(key, payload, len, ttl_sec);
+        if (!e) {
+            pthread_mutex_unlock(&g_cache->lock);
+            return -ENOMEM;
+        }
+
+        /* Prepend to bucket chain */
+        e->next = *head;
+        *head   = e;
+
+        /* Add to LRU */
+        lru_insert_mru(g_cache, e);
+
+        g_cache->current_entries += 1;
+        g_cache->current_bytes   += (len + CACHE_ENTRY_OVERHEAD);
+    }
+
+    cache_trim_to_limit(g_cache);
+    pthread_mutex_unlock(&g_cache->lock);
+    return 0;
+}
+
+/**
+ * cache_get
+ *
+ * Attempt to retrieve a cache entry.  On hit, a malloc'd copy of the payload is
+ * returned via *out_buf (caller must free).  Returns 0 on hit, 1 on miss,
+ * negative on error.
+ */
+int
+cache_get(const char *key, void **out_buf, size_t *out_len)
+{
+    if (!g_cache || !key || !out_buf || !out_len)
+        return -EINVAL;
+
+    *out_buf = NULL;
+    *out_len = 0;
+
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME_COARSE, &now);
+
+    pthread_mutex_lock(&g_cache->lock);
+
+    uint64_t bucket_idx = freq_hash64(key, strlen(key)) % g_cache->bucket_count;
+    cache_entry_t **head = &g_cache->buckets[bucket_idx];
+    cache_entry_t *e = *head;
+
+    while (e && strcmp(e->key, key) != 0)
+        e = e->next; /* chain ptr */
+
+    if (!e) {
+        atomic_fetch_add_explicit(&g_cache->misses, 1, memory_order_relaxed);
+        pthread_mutex_unlock(&g_cache->lock);
+        return 1; /* miss */
+    }
+
+    /* Check expiry */
+    if (timespec_is_expired(&now, &e->expires_at)) {
+        /* Remove expired entry */
+        lru_detach(g_cache, e);
+
+        /* Remove from chain */
+        cache_entry_t **cur = head;
+        while (*cur && *cur != e) cur = &(*cur)->next;
+        if (*cur == e) *cur = e->next;
+
+        g_cache->current_entries -= 1;
+        g_cache->current_bytes   -= (e->payload_len + CACHE_ENTRY_OVERHEAD);
+        cache_entry_destroy(e);
+
+        atomic_fetch_add_explicit(&g_cache->misses, 1, memory_order_relaxed);
+        pthread_mutex_unlock(&g_cache->lock);
+        return 1; /* expired -> treat as miss */
+    }
+
+    /* Hit -> promote to MRU */
+    lru_detach(g_cache, e);
+    lru_insert_mru(g_cache, e);
+
+    /* Copy payload */
+    void *buf = malloc(e->payload_len);
+    if (!buf) {
+        pthread_mutex_unlock(&g_cache->lock);
+        return -ENOMEM;
+    }
+    memcpy(buf, e->payload, e->payload_len);
+    *out_buf = buf;
+    *out_len = e->payload_len;
+
+    atomic_fetch_add_explicit(&g_cache->hits, 1, memory_order_relaxed);
+    pthread_mutex_unlock(&g_cache->lock);
+    return 0; /* hit */
+}
+
+/**
+ * cache_invalidate
+ *
+ * Removes entry if present.  Returns 0 if removed, 1 if not found, negative on
+ * errors.
+ */
+int
+cache_invalidate(const char *key)
+{
+    if (!g_cache || !key)
+        return -EINVAL;
+
+    pthread_mutex_lock(&g_cache->lock);
+    uint64_t bucket_idx = freq_hash64(key, strlen(key)) % g_cache->bucket_count;
+    cache_entry_t **cur = &g_cache->buckets[bucket_idx];
+    cache_entry_t *e = *cur;
+
+    while (e && strcmp(e->key, key) != 0) {
+        cur = &e->next;
+        e = e->next;
+    }
+
+    if (!e) {
+        pthread_mutex_unlock(&g_cache->lock);
+        return 1; /* not found */
+    }
+
+    /* Remove */
+    *cur = e->next;
+    lru_detach(g_cache, e);
+
+    g_cache->current_entries -= 1;
+    g_cache->current_bytes   -= (e->payload_len + CACHE_ENTRY_OVERHEAD);
+    cache_entry_destroy(e);
+    pthread_mutex_unlock(&g_cache->lock);
+    return 0;
+}
+
+/**
+ * cache_metrics_snapshot
+ *
+ * Exposes statistics for Prometheus scrape.
+ */
+void
+cache_metrics_snapshot(uint64_t *hits,
+                       uint64_t *misses,
+                       uint64_t *evictions,
+                       size_t   *current_entries,
+                       size_t   *current_bytes)
+{
+    if (!g_cache) return;
+    if (hits)      *hits      = atomic_load_explicit(&g_cache->hits, memory_order_relaxed);
+    if (misses)    *misses    = atomic_load_explicit(&g_cache->misses, memory_order_relaxed);
+    if (evictions) *evictions = atomic_load_explicit(&g_cache->evictions, memory_order_relaxed);
+
+    pthread_mutex_lock(&g_cache->lock);
+    if (current_entries) *current_entries = g_cache->current_entries;
+    if (current_bytes)   *current_bytes   = g_cache->current_bytes;
+    pthread_mutex_unlock(&g_cache->lock);
+}
+
+/**
+ * cache_shutdown
+ *
+ * Frees all resources.  Idempotent.
+ */
+void
+cache_shutdown(void)
+{
+    if (!g_cache) return;
+
+    pthread_mutex_lock(&g_cache->lock);
+
+    /* Walk buckets */
+    for (size_t i = 0; i < g_cache->bucket_count; ++i) {
+        cache_entry_t *e = g_cache->buckets[i];
+        while (e) {
+            cache_entry_t *next = e->next;
+            cache_entry_destroy(e);
+            e = next;
+        }
+    }
+
+    free(g_cache->buckets);
+    pthread_mutex_unlock(&g_cache->lock);
+    pthread_mutex_destroy(&g_cache->lock);
+
+    free(g_cache);
+    g_cache = NULL;
+    LOG_INFO("cache: shutdown complete");
+}
+
+/*------------------------------------------------------------------------------
+ * Unit test when compiled standalone
+ *----------------------------------------------------------------------------*/
+#ifdef RESPONSE_CACHE_SELFTEST
+
+static void
+selftest(void)
+{
+    assert(cache_init(8, 1 << 20, 2, 32) == 0);
+
+    const char *key = "ping";
+    const char *val = "pong";
+    assert(cache_put(key, val, strlen(val) + 1, 1) == 0);
+
+    void  *buf = NULL;
+    size_t len = 0;
+    assert(cache_get(key, &buf, &len) == 0);
+    assert(len == strlen(val) + 1);
+    assert(strcmp(buf, val) == 0);
+    free(buf);
+
+    sleep(2); /* allow TTL to expire */
+
+    assert(cache_get(key, &buf, &len) == 1); /* miss */
+    cache_shutdown();
+    LOG_INFO("self-test OK");
+}
+
+int main(void)
+{
+    selftest();
+    return 0;
+}
+
+#endif /* RESPONSE_CACHE_SELFTEST */
+```

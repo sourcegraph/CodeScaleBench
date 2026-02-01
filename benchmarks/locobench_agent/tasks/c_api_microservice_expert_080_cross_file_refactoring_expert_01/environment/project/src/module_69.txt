@@ -1,0 +1,534 @@
+```c
+/*
+ * MercuryMonolith Commerce Hub
+ * Module 69  –  Response Cache Manager
+ *
+ * Description:
+ *   Thread-safe in-memory response cache with TTL, LRU eviction,
+ *   structured logging, and Prometheus-compatible metrics export.
+ *
+ *   This component is used by the API-gateway layer to accelerate
+ *   frequently requested REST / GraphQL queries while retaining
+ *   fine-grained invalidation hooks for the service & repository
+ *   layers.  It is deliberately implemented without third-party
+ *   dependencies to keep the monolith self-contained.
+ *
+ * Author:  MercuryMonolith Core Team
+ * License: Apache-2.0
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdatomic.h>
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+
+/* =========================  Configuration  ========================= */
+
+/* Maximum number of cached objects (soft limit, eviction is best-effort). */
+#ifndef MM_CACHE_CAPACITY
+#  define MM_CACHE_CAPACITY 4096
+#endif
+
+/* Default TTL in seconds unless overridden by caller. */
+#ifndef MM_CACHE_DEFAULT_TTL
+#  define MM_CACHE_DEFAULT_TTL 60
+#endif
+
+/* Logging facility — can be overridden by defining MM_CACHE_LOG(level, fmt, ...) */
+#ifndef MM_CACHE_LOG
+#  define MM_CACHE_LOG(level, fmt, ...) \
+        fprintf(stderr, "[Cache:%s] " fmt "\n", level, ##__VA_ARGS__)
+#endif
+
+/* Hash map backend — simple open addressing; power-of-two buckets. */
+#define BUCKET_COUNT 8192u   /* Must be power-of-two for fast masking. */
+#define BUCKET_MASK  (BUCKET_COUNT - 1)
+
+/* =========================  Data Types  ========================= */
+
+typedef struct _cache_entry {
+    /* Key & data */
+    char            *key;          /* NULL-terminated */
+    uint8_t         *blob;         /* Arbitrary opaque payload */
+    size_t           blob_len;
+    time_t           expiry;       /* Absolute UTC seconds */
+
+    /* LRU chain */
+    struct _cache_entry *prev;
+    struct _cache_entry *next;
+
+    /* Hash chain */
+    struct _cache_entry *hnext;
+} cache_entry_t;
+
+typedef struct
+{
+    cache_entry_t  *buckets[BUCKET_COUNT];
+    cache_entry_t  *lru_head;      /* Most recently used */
+    cache_entry_t  *lru_tail;      /* Least recently used */
+
+    size_t          size;          /* # of live entries */
+    pthread_mutex_t mtx;
+
+    /* Prometheus metrics (atomic for fast reads) */
+    atomic_uint_least64_t hits;
+    atomic_uint_least64_t misses;
+    atomic_uint_least64_t evictions;
+} mm_cache_t;
+
+/* =========================  Utilities  ========================= */
+
+static inline uint32_t
+fnv1a_32(const char *data)
+{
+    uint32_t hash = 2166136261u;
+    while (*data)
+    {
+        hash ^= (uint8_t)(*data++);
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+/* =========================  Core Primitives  ========================= */
+
+static void
+lru_promote(mm_cache_t *cache, cache_entry_t *ce)
+{
+    /* Already at head? */
+    if (cache->lru_head == ce) return;
+
+    /* Detach */
+    if (ce->prev) ce->prev->next = ce->next;
+    if (ce->next) ce->next->prev = ce->prev;
+
+    if (cache->lru_tail == ce)
+        cache->lru_tail = ce->prev;
+
+    /* Insert at head */
+    ce->prev          = NULL;
+    ce->next          = cache->lru_head;
+    if (cache->lru_head)
+        cache->lru_head->prev = ce;
+    cache->lru_head   = ce;
+
+    if (!cache->lru_tail)
+        cache->lru_tail = ce;
+}
+
+static void
+lru_append(mm_cache_t *cache, cache_entry_t *ce)
+{
+    ce->prev = NULL;
+    ce->next = cache->lru_head;
+    if (cache->lru_head)
+        cache->lru_head->prev = ce;
+    cache->lru_head = ce;
+    if (!cache->lru_tail)
+        cache->lru_tail = ce;
+}
+
+/* =========================  Public API  ========================= */
+
+mm_cache_t *
+mm_cache_create(void)
+{
+    mm_cache_t *cache = calloc(1, sizeof(mm_cache_t));
+    if (!cache)
+    {
+        MM_CACHE_LOG("ERROR", "Failed to allocate cache");
+        return NULL;
+    }
+    pthread_mutex_init(&cache->mtx, NULL);
+    return cache;
+}
+
+void
+mm_cache_destroy(mm_cache_t *cache)
+{
+    if (!cache) return;
+
+    pthread_mutex_lock(&cache->mtx);
+    for (size_t i = 0; i < BUCKET_COUNT; ++i)
+    {
+        cache_entry_t *cur = cache->buckets[i];
+        while (cur)
+        {
+            cache_entry_t *nx = cur->hnext;
+            free(cur->key);
+            free(cur->blob);
+            free(cur);
+            cur = nx;
+        }
+    }
+    pthread_mutex_unlock(&cache->mtx);
+    pthread_mutex_destroy(&cache->mtx);
+    free(cache);
+}
+
+static void
+hash_insert(mm_cache_t *cache, cache_entry_t *ce)
+{
+    uint32_t h = fnv1a_32(ce->key) & BUCKET_MASK;
+    ce->hnext = cache->buckets[h];
+    cache->buckets[h] = ce;
+}
+
+static cache_entry_t *
+hash_lookup(mm_cache_t *cache, const char *key)
+{
+    uint32_t h = fnv1a_32(key) & BUCKET_MASK;
+    cache_entry_t *cur = cache->buckets[h];
+    while (cur)
+    {
+        if (strcmp(cur->key, key) == 0)
+            return cur;
+        cur = cur->hnext;
+    }
+    return NULL;
+}
+
+static void
+hash_remove(mm_cache_t *cache, cache_entry_t *ce)
+{
+    uint32_t h = fnv1a_32(ce->key) & BUCKET_MASK;
+    cache_entry_t **cur = &cache->buckets[h];
+    while (*cur)
+    {
+        if (*cur == ce)
+        {
+            *cur = ce->hnext;
+            return;
+        }
+        cur = &(*cur)->hnext;
+    }
+}
+
+/*
+ * mm_cache_put:
+ *   Stores (or overwrites) a payload under the specified key.
+ *   `ttl_sec` of 0 means "use default TTL".
+ *
+ *   The payload is copied; the caller retains ownership of the input buffer.
+ */
+bool
+mm_cache_put(mm_cache_t *cache,
+             const char *key,
+             const uint8_t *payload,
+             size_t len,
+             uint32_t ttl_sec)
+{
+    if (!cache || !key || !payload || len == 0)
+        return false;
+
+    bool replaced = false;
+    time_t now    = time(NULL);
+
+    pthread_mutex_lock(&cache->mtx);
+
+    cache_entry_t *ce = hash_lookup(cache, key);
+    if (ce)
+    {
+        /* Replace */
+        free(ce->blob);
+        ce->blob     = malloc(len);
+        if (!ce->blob)
+        {
+            pthread_mutex_unlock(&cache->mtx);
+            return false;
+        }
+        memcpy(ce->blob, payload, len);
+        ce->blob_len = len;
+        ce->expiry   = now + (ttl_sec ? ttl_sec : MM_CACHE_DEFAULT_TTL);
+        replaced     = true;
+
+        lru_promote(cache, ce);
+    }
+    else
+    {
+        /* Make new entry */
+        ce = calloc(1, sizeof(cache_entry_t));
+        if (!ce)
+        {
+            pthread_mutex_unlock(&cache->mtx);
+            return false;
+        }
+        ce->key  = strdup(key);
+        ce->blob = malloc(len);
+        if (!ce->key || !ce->blob)
+        {
+            free(ce->key);
+            free(ce->blob);
+            free(ce);
+            pthread_mutex_unlock(&cache->mtx);
+            return false;
+        }
+        memcpy(ce->blob, payload, len);
+        ce->blob_len = len;
+        ce->expiry   = now + (ttl_sec ? ttl_sec : MM_CACHE_DEFAULT_TTL);
+
+        hash_insert(cache, ce);
+        lru_append(cache, ce);
+        cache->size++;
+    }
+
+    /* Evict if over capacity */
+    while (cache->size > MM_CACHE_CAPACITY && cache->lru_tail)
+    {
+        cache_entry_t *victim = cache->lru_tail;
+
+        if (victim->prev)
+            victim->prev->next = NULL;
+        cache->lru_tail = victim->prev;
+        if (cache->lru_head == victim)
+            cache->lru_head = NULL;
+
+        hash_remove(cache, victim);
+
+        free(victim->key);
+        free(victim->blob);
+        free(victim);
+
+        cache->size--;
+        atomic_fetch_add_explicit(&cache->evictions, 1, memory_order_relaxed);
+    }
+
+    pthread_mutex_unlock(&cache->mtx);
+
+    MM_CACHE_LOG("INFO", "%s entry for key='%s' (ttl=%us)",
+                 replaced ? "Updated" : "Cached", key,
+                 (unsigned)(ttl_sec ? ttl_sec : MM_CACHE_DEFAULT_TTL));
+    return true;
+}
+
+/*
+ * mm_cache_get:
+ *   Returns a malloc'd copy of the cached payload (caller responsible
+ *   for free()) or NULL if not found / expired.
+ */
+uint8_t *
+mm_cache_get(mm_cache_t *cache,
+             const char *key,
+             size_t *out_len)
+{
+    if (!cache || !key) return NULL;
+
+    uint8_t *copy = NULL;
+    time_t   now  = time(NULL);
+
+    pthread_mutex_lock(&cache->mtx);
+    cache_entry_t *ce = hash_lookup(cache, key);
+
+    if (ce && ce->expiry >= now)
+    {
+        /* Hit */
+        copy = malloc(ce->blob_len);
+        if (copy)
+        {
+            memcpy(copy, ce->blob, ce->blob_len);
+            if (out_len) *out_len = ce->blob_len;
+        }
+        lru_promote(cache, ce);
+        atomic_fetch_add_explicit(&cache->hits, 1, memory_order_relaxed);
+    }
+    else
+    {
+        /* Miss or expired */
+        if (ce)
+        {
+            /* Remove expired entry */
+            if (ce->prev) ce->prev->next = ce->next;
+            if (ce->next) ce->next->prev = ce->prev;
+            if (cache->lru_head == ce) cache->lru_head = ce->next;
+            if (cache->lru_tail == ce) cache->lru_tail = ce->prev;
+
+            hash_remove(cache, ce);
+            free(ce->key);
+            free(ce->blob);
+            free(ce);
+            cache->size--;
+
+            atomic_fetch_add_explicit(&cache->evictions, 1, memory_order_relaxed);
+        }
+        atomic_fetch_add_explicit(&cache->misses, 1, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&cache->mtx);
+
+    return copy;
+}
+
+/*
+ * mm_cache_invalidate:
+ *   Removes a single cache entry if present.
+ */
+bool
+mm_cache_invalidate(mm_cache_t *cache, const char *key)
+{
+    if (!cache || !key) return false;
+
+    bool removed = false;
+
+    pthread_mutex_lock(&cache->mtx);
+    cache_entry_t *ce = hash_lookup(cache, key);
+    if (ce)
+    {
+        /* Detach from LRU */
+        if (ce->prev) ce->prev->next = ce->next;
+        if (ce->next) ce->next->prev = ce->prev;
+        if (cache->lru_head == ce) cache->lru_head = ce->next;
+        if (cache->lru_tail == ce) cache->lru_tail = ce->prev;
+
+        /* Hash remove */
+        hash_remove(cache, ce);
+
+        free(ce->key);
+        free(ce->blob);
+        free(ce);
+
+        cache->size--;
+        removed = true;
+        atomic_fetch_add_explicit(&cache->evictions, 1, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&cache->mtx);
+
+    if (removed)
+        MM_CACHE_LOG("INFO", "Invalidated key='%s'", key);
+    else
+        MM_CACHE_LOG("DEBUG", "Invalidate request for missing key='%s'", key);
+
+    return removed;
+}
+
+/*
+ * mm_cache_flush_all:
+ *   Invalidates ALL entries in the cache (use sparingly).
+ */
+void
+mm_cache_flush_all(mm_cache_t *cache)
+{
+    if (!cache) return;
+
+    pthread_mutex_lock(&cache->mtx);
+    for (size_t i = 0; i < BUCKET_COUNT; ++i)
+    {
+        cache_entry_t *cur = cache->buckets[i];
+        while (cur)
+        {
+            cache_entry_t *nx = cur->hnext;
+            free(cur->key);
+            free(cur->blob);
+            free(cur);
+            cur = nx;
+        }
+        cache->buckets[i] = NULL;
+    }
+    cache->lru_head = cache->lru_tail = NULL;
+    cache->size     = 0;
+    pthread_mutex_unlock(&cache->mtx);
+
+    MM_CACHE_LOG("INFO", "Cache flushed");
+}
+
+/*
+ * mm_cache_prometheus_export:
+ *   Exports cache metrics as a newline-delimited Prometheus text
+ *   exposition format block.  The caller must free() the returned
+ *   string when done.
+ *
+ *   Example output:
+ *     # TYPE mm_cache_hits_total counter
+ *     mm_cache_hits_total 1024
+ *     ...
+ */
+char *
+mm_cache_prometheus_export(mm_cache_t *cache)
+{
+    if (!cache) return NULL;
+
+    /* We know exactly how many lines we have — pre-size buffer. */
+    const char *tpl =
+        "# HELP mm_cache_hits_total Total number of cache hits\n"
+        "# TYPE mm_cache_hits_total counter\n"
+        "mm_cache_hits_total %lu\n"
+        "# HELP mm_cache_misses_total Total number of cache misses\n"
+        "# TYPE mm_cache_misses_total counter\n"
+        "mm_cache_misses_total %lu\n"
+        "# HELP mm_cache_evictions_total Total number of evictions/expirations\n"
+        "# TYPE mm_cache_evictions_total counter\n"
+        "mm_cache_evictions_total %lu\n"
+        "# HELP mm_cache_entries Gauge of current cache entries\n"
+        "# TYPE mm_cache_entries gauge\n"
+        "mm_cache_entries %zu\n";
+
+    size_t sz = snprintf(NULL, 0, tpl,
+                         (unsigned long)atomic_load(&cache->hits),
+                         (unsigned long)atomic_load(&cache->misses),
+                         (unsigned long)atomic_load(&cache->evictions),
+                         cache->size);
+
+    char *buf = malloc(sz + 1);
+    if (!buf) return NULL;
+
+    snprintf(buf, sz + 1, tpl,
+             (unsigned long)atomic_load(&cache->hits),
+             (unsigned long)atomic_load(&cache->misses),
+             (unsigned long)atomic_load(&cache->evictions),
+             cache->size);
+
+    return buf;
+}
+
+/* =========================  Periodic Maintenance  ========================= */
+
+/*
+ * mm_cache_purge_expired:
+ *   Scans and removes expired entries (O(N) worst-case).  Intended to be
+ *   triggered by a housekeeping thread every few seconds.
+ */
+size_t
+mm_cache_purge_expired(mm_cache_t *cache)
+{
+    if (!cache) return 0;
+
+    size_t purged = 0;
+    time_t now    = time(NULL);
+
+    pthread_mutex_lock(&cache->mtx);
+    cache_entry_t *cur = cache->lru_tail; /* Start from cold tail */
+    while (cur)
+    {
+        cache_entry_t *prev = cur->prev;
+
+        if (cur->expiry < now)
+        {
+            /* Detach from LRU */
+            if (cur->prev) cur->prev->next = cur->next;
+            if (cur->next) cur->next->prev = cur->prev;
+            if (cache->lru_head == cur) cache->lru_head = cur->next;
+            if (cache->lru_tail == cur) cache->lru_tail = cur->prev;
+
+            /* Hash remove */
+            hash_remove(cache, cur);
+
+            free(cur->key);
+            free(cur->blob);
+            free(cur);
+
+            cache->size--;
+            purged++;
+            atomic_fetch_add_explicit(&cache->evictions, 1, memory_order_relaxed);
+        }
+        cur = prev;
+    }
+    pthread_mutex_unlock(&cache->mtx);
+
+    if (purged)
+        MM_CACHE_LOG("INFO", "Purged %zu expired entries", purged);
+
+    return purged;
+}
+```
