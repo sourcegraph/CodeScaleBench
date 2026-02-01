@@ -1,6 +1,6 @@
 # CodeContextBench Benchmarks
 
-This directory contains all benchmark task definitions for evaluating coding agents with and without Sourcegraph MCP. The canonical task selection is defined in [`selected_benchmark_tasks.json`](../selected_benchmark_tasks.json) (117 tasks across 10 benchmarks).
+This directory contains all benchmark task definitions for evaluating coding agents with and without Sourcegraph MCP. The canonical task selection is defined in [`selected_benchmark_tasks.json`](../selected_benchmark_tasks.json) (125 tasks across 11 benchmarks).
 
 See [`docs/TASK_SELECTION.md`](../docs/TASK_SELECTION.md) for the selection methodology.
 
@@ -105,6 +105,17 @@ See [`docs/TASK_SELECTION.md`](../docs/TASK_SELECTION.md) for the selection meth
 
 ---
 
+### 11. [dibench/](dibench/) - Dependency Inference
+**Tasks**: 8
+**Languages**: Python, Rust, JavaScript, C#
+**SDLC Phase**: Implementation (feature)
+**Focus**: Infer and configure missing dependencies in build files by analyzing source code
+**Source**: Microsoft DI-Bench (https://github.com/microsoft/DI-Bench)
+**Task Format**: Harbor (task.toml, instruction.md, tests/)
+**Note**: Each task includes the full project repo with dependencies stripped from build files.
+
+---
+
 ## Benchmark Summary
 
 | Benchmark | Tasks | Languages | SDLC Phase |
@@ -115,11 +126,12 @@ See [`docs/TASK_SELECTION.md`](../docs/TASK_SELECTION.md) for the selection meth
 | repoqa | 10 | Python, C++, Java, Rust, TypeScript | Code navigation |
 | dependeval_benchmark | 9 | Python, Java, JavaScript | Refactoring, Maintenance |
 | tac_mcp_value | 8 | C++, Python | Mixed (4 phases) |
+| dibench | 8 | Python, Rust, JavaScript, C# | Dependency inference |
 | kubernetes_docs | 5 | Go | Documentation |
 | big_code_mcp | 4 | Go, Rust, C++, TypeScript | Feature implementation |
-| sweperf | 3 | Python | Testing & QA |
 | 10figure | 5 | Go | Architecture, Bug fix, Refactoring, Testing |
-| **Total** | **117** | | |
+| sweperf | 3 | Python | Testing & QA |
+| **Total** | **125** | | |
 
 ---
 
@@ -160,7 +172,7 @@ See [`docs/CONFIGS.md`](../docs/CONFIGS.md) for the full tool-by-tool breakdown 
 
 Unused or superseded benchmarks have been moved to [`_archived/`](../_archived/):
 - `benchmarks_10figure/` - Original 10figure prototype (superseded by benchmarks/10figure/)
-- `benchmarks_dibench/` - Dependency inference (adapter-based, variable task count)
+- `benchmarks_dibench/` - Original DI-Bench adapter (superseded by benchmarks/dibench/)
 - `benchmarks_repoqa/` - Original RepoQA adapter (superseded by benchmarks/repoqa/)
 - `benchmarks_no_external_repos/` - Hello world, PRD bench, DevAI bench prototypes
 

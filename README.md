@@ -20,7 +20,8 @@ This repository contains **benchmark task definitions**, **evaluation configs**,
 | `big_code_mcp` | 4 | Go, Rust, C++, TypeScript | Test suite | Feature implementation |
 | `sweperf` | 3 | Python | Test suite | Testing & QA |
 | `10figure` | 5 | Go | Test suite | Architecture, Refactoring, Bug fix, Testing |
-| **Total** | **117** | | | |
+| `dibench` | 8 | Python, Rust, JavaScript, C# | Syntax + dependency validation | Dependency inference |
+| **Total** | **125** | | | |
 
 ---
 
@@ -52,6 +53,7 @@ benchmarks/              # Task definitions organized by benchmark suite
   tac_mcp_value/         #   TheAgentCompany tasks (8 tasks)
   sweperf/               #   Performance testing (3 tasks)
   10figure/              #   Enterprise codebase challenges (5 tasks)
+  dibench/               #   Dependency inference tasks (8 tasks)
 ralph/                   # Agent working directory
   configs/               #   3-config comparison YAML + shell runners per benchmark
   scripts/               #   Metrics extraction and evaluation pipeline

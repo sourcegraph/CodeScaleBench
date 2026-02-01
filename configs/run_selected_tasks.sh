@@ -143,6 +143,7 @@ BENCH_BASE = {
     'sweperf': 'benchmarks/sweperf',
     'repoqa': 'benchmarks/repoqa',
     '10figure': 'benchmarks/10figure',
+    'dibench': 'benchmarks/dibench',
 }
 
 for task in selection['tasks']:

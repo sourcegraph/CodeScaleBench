@@ -2,7 +2,7 @@
 
 ## Overview
 
-Selected **117 tasks** from 835 available across 10 benchmarks, stratified by SDLC phase with MCP benefit scoring.
+Selected **125 tasks** from 835 available across 11 benchmarks, stratified by SDLC phase with MCP benefit scoring.
 
 ## SDLC Phase Coverage
 
@@ -10,7 +10,7 @@ Selected **117 tasks** from 835 available across 10 benchmarks, stratified by SD
 |------------|-------|------------|
 | Requirements & Discovery | 2 | tac_mcp_value |
 | Architecture & Design | 10 | locobench_agent, 10figure |
-| Implementation (feature) | 8 | big_code_mcp, github_mined, tac_mcp_value |
+| Implementation (feature) | 16 | big_code_mcp, github_mined, tac_mcp_value, dibench |
 | Implementation (bug fix) | 51 | github_mined, locobench_agent, swebench_pro, 10figure |
 | Implementation (refactoring) | 18 | dependeval_benchmark, locobench_agent, 10figure |
 | Testing & QA | 5 | sweperf, tac_mcp_value, 10figure |
@@ -30,20 +30,21 @@ Selected **117 tasks** from 835 available across 10 benchmarks, stratified by SD
 | sweperf | 3 | 3 | All selected (small benchmark) |
 | tac_mcp_value | 8 | 8 | All selected (small benchmark) |
 | 10figure | 5 | 5 | All selected (small benchmark) |
+| dibench | 387 | 8 | 2 per language (python, rust, javascript, csharp), moderate patch complexity |
 
 ## Language Distribution
 
 | Language | Tasks |
 |----------|-------|
-| python | 29 |
+| python | 33 |
 | go | 24 |
-| cpp | 17 |
-| typescript | 9 |
-| rust | 8 |
+| cpp | 19 |
+| rust | 12 |
+| typescript | 11 |
+| javascript | 8 |
 | c | 7 |
-| javascript | 6 |
-| csharp | 3 |
-| java | 3 |
+| csharp | 5 |
+| java | 5 |
 | python,cpp | 1 |
 
 ## MCP Benefit Scoring
@@ -77,6 +78,9 @@ All bug_investigation tasks (3) selected first, then all cross_file_refactoring 
 ### GitHub Mined (~12 tasks)
 All PyTorch cross-module tasks. Selection prioritizes hard difficulty, then tasks with the most files modified in the ground truth PR.
 
+### DI-Bench (8 tasks)
+2 per language (Python, Rust, JavaScript, C#) from the 387 regular-difficulty instances. Selected for single build file, moderate patch size (3-12 dependency additions), and well-known repositories. Tasks use syntax + dependency presence validators instead of full CI/CD execution.
+
 ### Small Benchmarks (all selected)
-big_code_mcp (4), kubernetes_docs (5), tac_mcp_value (8), dependeval_benchmark (9), sweperf (3) -- all tasks selected due to small size.
+big_code_mcp (4), kubernetes_docs (5), tac_mcp_value (8), dependeval_benchmark (9), sweperf (3), 10figure (5) -- all tasks selected due to small size.
 
