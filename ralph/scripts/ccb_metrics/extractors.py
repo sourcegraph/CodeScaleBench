@@ -246,6 +246,133 @@ def extract_swebench_partial_score(
     return passed / required
 
 
+def _empty_tool_usage() -> dict:
+    """Return a dict with all tool usage fields set to None."""
+    return {
+        "tool_calls_total": None,
+        "tool_calls_mcp": None,
+        "tool_calls_local": None,
+        "tool_calls_by_name": None,
+        "mcp_ratio": None,
+    }
+
+
+# Tools bundled with Claude Code (non-MCP)
+_LOCAL_TOOLS = {
+    "Bash", "Read", "Edit", "Write", "Grep", "Glob",
+    "Task", "TaskOutput", "TodoWrite", "WebFetch", "WebSearch",
+    "NotebookEdit", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
+    "Skill", "TaskStop", "ToolSearch",
+}
+
+
+def _is_mcp_tool(name: str) -> bool:
+    """Return True if the tool name indicates an MCP tool (mcp__ prefix)."""
+    return name.startswith("mcp__")
+
+
+def _build_tool_usage_dict(tool_counts: dict[str, int]) -> dict:
+    """Build the standard tool usage dict from a {name: count} mapping."""
+    if not tool_counts:
+        return _empty_tool_usage()
+
+    total = sum(tool_counts.values())
+    mcp = sum(c for name, c in tool_counts.items() if _is_mcp_tool(name))
+    local = sum(c for name, c in tool_counts.items() if name in _LOCAL_TOOLS)
+
+    return {
+        "tool_calls_total": total,
+        "tool_calls_mcp": mcp,
+        "tool_calls_local": local,
+        "tool_calls_by_name": dict(tool_counts),
+        "mcp_ratio": mcp / total if total > 0 else 0.0,
+    }
+
+
+def extract_tool_usage_from_trajectory(
+    trajectory_json_path: str | Path,
+) -> dict:
+    """Parse ATIF v1.2 trajectory.json to extract tool usage counts.
+
+    Iterates steps[].tool_calls[].function_name and categorises each tool
+    as MCP (mcp__* prefix) or local (Bash, Read, Edit, etc.).
+
+    Args:
+        trajectory_json_path: Path to the agent/trajectory.json file.
+
+    Returns:
+        Dict with keys: tool_calls_total, tool_calls_mcp, tool_calls_local,
+        tool_calls_by_name (Counter dict), mcp_ratio (mcp/total).
+        Returns None-valued dict if file is missing or unparseable.
+    """
+    path = Path(trajectory_json_path)
+    if not path.is_file():
+        return _empty_tool_usage()
+
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return _empty_tool_usage()
+
+    tool_counts: dict[str, int] = {}
+    steps = data.get("steps") or []
+    for step in steps:
+        tool_calls = step.get("tool_calls") or []
+        for tc in tool_calls:
+            name = tc.get("function_name")
+            if name:
+                tool_counts[name] = tool_counts.get(name, 0) + 1
+
+    return _build_tool_usage_dict(tool_counts)
+
+
+def extract_tool_usage_from_transcript(
+    claude_code_txt_path: str | Path,
+) -> dict:
+    """Parse JSONL claude-code.txt to extract tool usage counts.
+
+    Fallback when trajectory.json is missing. Finds entries with
+    type='assistant' that have tool_use content blocks and counts tool names.
+
+    Args:
+        claude_code_txt_path: Path to the agent/claude-code.txt JSONL file.
+
+    Returns:
+        Dict with keys: tool_calls_total, tool_calls_mcp, tool_calls_local,
+        tool_calls_by_name (Counter dict), mcp_ratio (mcp/total).
+        Returns None-valued dict if file is missing or unparseable.
+    """
+    path = Path(claude_code_txt_path)
+    if not path.is_file():
+        return _empty_tool_usage()
+
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return _empty_tool_usage()
+
+    tool_counts: dict[str, int] = {}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("type") != "assistant":
+            continue
+        message = entry.get("message") or {}
+        content = message.get("content") or []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                name = block.get("name")
+                if name:
+                    tool_counts[name] = tool_counts.get(name, 0) + 1
+
+    return _build_tool_usage_dict(tool_counts)
+
+
 def extract_reward_from_file(
     reward_txt_path: str | Path,
 ) -> Optional[float]:
