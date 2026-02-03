@@ -3,7 +3,7 @@
 #
 # Runs all 5 Kubernetes documentation tasks across 3 configurations:
 #   1. Baseline (no MCP)
-#   2. MCP-NoDeepSearch (Sourcegraph tools without Deep Search)
+#   2. MCP-Base (Sourcegraph tools without Deep Search)
 #   3. MCP-Full (Sourcegraph + Deep Search hybrid)
 #
 # Usage:
@@ -11,8 +11,8 @@
 #
 # Options:
 #   --baseline-only        Run only baseline (no MCP)
-#   --no-deepsearch-only   Run only MCP-NoDeepSearch
-#   --full-only            Run only MCP-Full (sourcegraph_hybrid)
+#   --base-only   Run only MCP-Base
+#   --full-only            Run only MCP-Full (sourcegraph_full)
 #   --model MODEL          Override model (default: claude-opus-4-5-20251101)
 #   --category CATEGORY    Run category (default: official)
 #
@@ -68,7 +68,7 @@ MODEL="${MODEL:-anthropic/claude-opus-4-5-20251101}"
 CONCURRENCY=2
 TIMEOUT_MULTIPLIER=3  # 3x default for 900s task timeout
 RUN_BASELINE=true
-RUN_NO_DEEPSEARCH=true
+RUN_BASE=true
 RUN_FULL=true
 CATEGORY="${CATEGORY:-official}"
 
@@ -76,18 +76,18 @@ CATEGORY="${CATEGORY:-official}"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --baseline-only)
-            RUN_NO_DEEPSEARCH=false
+            RUN_BASE=false
             RUN_FULL=false
             shift
             ;;
-        --no-deepsearch-only)
+        --base-only)
             RUN_BASELINE=false
             RUN_FULL=false
             shift
             ;;
         --full-only)
             RUN_BASELINE=false
-            RUN_NO_DEEPSEARCH=false
+            RUN_BASE=false
             shift
             ;;
         --model)
@@ -106,10 +106,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Check MCP credentials if MCP modes requested
-if { [ "$RUN_NO_DEEPSEARCH" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
+if { [ "$RUN_BASE" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
     echo "WARNING: MCP modes requested but SOURCEGRAPH_ACCESS_TOKEN not set"
     echo "Skipping MCP runs. Use --baseline-only to suppress this warning."
-    RUN_NO_DEEPSEARCH=false
+    RUN_BASE=false
     RUN_FULL=false
 fi
 
@@ -151,7 +151,7 @@ echo "Tasks: ${#TASK_IDS[@]}"
 echo "Concurrency: ${CONCURRENCY}"
 echo "Jobs directory: ${JOBS_BASE}"
 echo "Run baseline: ${RUN_BASELINE}"
-echo "Run MCP-NoDeepSearch: ${RUN_NO_DEEPSEARCH}"
+echo "Run MCP-Base: ${RUN_BASE}"
 echo "Run MCP-Full: ${RUN_FULL}"
 echo ""
 
@@ -206,29 +206,29 @@ if [ "$RUN_BASELINE" = true ]; then
 fi
 
 # ============================================
-# RUN MCP-NoDeepSearch (sourcegraph_no_deepsearch)
+# RUN MCP-Base (sourcegraph_base)
 # ============================================
-if [ "$RUN_NO_DEEPSEARCH" = true ]; then
+if [ "$RUN_BASE" = true ]; then
     echo ""
-    echo "[MCP-NoDeepSearch] Starting 5-task MCP-NoDeepSearch run..."
+    echo "[MCP-Base] Starting 5-task MCP-Base run..."
     echo ""
 
     SOURCEGRAPH_REPO_NAME="sg-benchmarks/kubernetes--8c9c67c0" \
-    BASELINE_MCP_TYPE=sourcegraph_no_deepsearch harbor run \
+    BASELINE_MCP_TYPE=sourcegraph_base harbor run \
         --path "${TASKS_DIR}" \
         --task-name "*" \
         --agent-import-path "${AGENT_PATH}" \
         --model "${MODEL}" \
-        --jobs-dir "${JOBS_BASE}/sourcegraph_no_deepsearch" \
+        --jobs-dir "${JOBS_BASE}/sourcegraph_base" \
         -n ${CONCURRENCY} \
         --timeout-multiplier ${TIMEOUT_MULTIPLIER} \
-        2>&1 | tee "${JOBS_BASE}/sourcegraph_no_deepsearch.log"
+        2>&1 | tee "${JOBS_BASE}/sourcegraph_base.log"
 
-    extract_all_metrics "${JOBS_BASE}/sourcegraph_no_deepsearch" "ccb_k8sdocs" "sourcegraph_no_deepsearch"
+    extract_all_metrics "${JOBS_BASE}/sourcegraph_base" "ccb_k8sdocs" "sourcegraph_base"
 fi
 
 # ============================================
-# RUN MCP-Full (sourcegraph_hybrid)
+# RUN MCP-Full (sourcegraph_full)
 # ============================================
 if [ "$RUN_FULL" = true ]; then
     echo ""
@@ -236,17 +236,17 @@ if [ "$RUN_FULL" = true ]; then
     echo ""
 
     SOURCEGRAPH_REPO_NAME="sg-benchmarks/kubernetes--8c9c67c0" \
-    BASELINE_MCP_TYPE=sourcegraph_hybrid harbor run \
+    BASELINE_MCP_TYPE=sourcegraph_full harbor run \
         --path "${TASKS_DIR}" \
         --task-name "*" \
         --agent-import-path "${AGENT_PATH}" \
         --model "${MODEL}" \
-        --jobs-dir "${JOBS_BASE}/sourcegraph_hybrid" \
+        --jobs-dir "${JOBS_BASE}/sourcegraph_full" \
         -n ${CONCURRENCY} \
         --timeout-multiplier ${TIMEOUT_MULTIPLIER} \
-        2>&1 | tee "${JOBS_BASE}/sourcegraph_hybrid.log"
+        2>&1 | tee "${JOBS_BASE}/sourcegraph_full.log"
 
-    extract_all_metrics "${JOBS_BASE}/sourcegraph_hybrid" "ccb_k8sdocs" "sourcegraph_hybrid"
+    extract_all_metrics "${JOBS_BASE}/sourcegraph_full" "ccb_k8sdocs" "sourcegraph_full"
 fi
 
 echo ""
@@ -261,12 +261,12 @@ if [ "$RUN_BASELINE" = true ]; then
     echo "  cat ${JOBS_BASE}/baseline/*/result.json | jq -s 'map(.trials[].verifier_result.rewards.reward) | {mean: (add/length), count: length}'"
     echo ""
 fi
-if [ "$RUN_NO_DEEPSEARCH" = true ]; then
-    echo "  # MCP-NoDeepSearch summary"
-    echo "  cat ${JOBS_BASE}/sourcegraph_no_deepsearch/*/result.json | jq -s 'map(.trials[].verifier_result.rewards.reward) | {mean: (add/length), count: length}'"
+if [ "$RUN_BASE" = true ]; then
+    echo "  # MCP-Base summary"
+    echo "  cat ${JOBS_BASE}/sourcegraph_base/*/result.json | jq -s 'map(.trials[].verifier_result.rewards.reward) | {mean: (add/length), count: length}'"
     echo ""
 fi
 if [ "$RUN_FULL" = true ]; then
     echo "  # MCP-Full summary"
-    echo "  cat ${JOBS_BASE}/sourcegraph_hybrid/*/result.json | jq -s 'map(.trials[].verifier_result.rewards.reward) | {mean: (add/length), count: length}'"
+    echo "  cat ${JOBS_BASE}/sourcegraph_full/*/result.json | jq -s 'map(.trials[].verifier_result.rewards.reward) | {mean: (add/length), count: length}'"
 fi

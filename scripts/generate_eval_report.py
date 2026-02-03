@@ -321,6 +321,84 @@ def _build_mcp_benefit_correlation(runs: list[RunMetrics]) -> Optional[tuple[lis
     return headers, rows
 
 
+def _build_search_patterns(runs: list[RunMetrics]) -> Optional[tuple[list[str], list[list[str]]]]:
+    """Table: Search pattern metrics per config x benchmark."""
+    # Only show if any run has search data
+    has_data = any(
+        t.search_calls_keyword is not None or t.search_calls_nls is not None
+        for r in runs for t in r.tasks
+    )
+    if not has_data:
+        return None
+
+    headers = [
+        "Benchmark", "Config",
+        "Mean Keyword Searches", "Mean NLS Searches", "Mean Deep Searches",
+        "Mean DS/KW Ratio",
+    ]
+    rows = []
+    for r in sorted(runs, key=lambda x: (x.benchmark, x.config_name)):
+        rows.append([
+            r.benchmark,
+            r.config_name,
+            _fmt(_safe_mean([t.search_calls_keyword for t in r.tasks]), 1),
+            _fmt(_safe_mean([t.search_calls_nls for t in r.tasks]), 1),
+            _fmt(_safe_mean([t.search_calls_deepsearch for t in r.tasks]), 1),
+            _fmt(r.mean_deepsearch_keyword_ratio),
+        ])
+    return headers, rows
+
+
+def _build_code_changes(runs: list[RunMetrics]) -> Optional[tuple[list[str], list[list[str]]]]:
+    """Table: Code change metrics per config x benchmark."""
+    has_data = any(
+        t.files_modified is not None
+        for r in runs for t in r.tasks
+    )
+    if not has_data:
+        return None
+
+    headers = [
+        "Benchmark", "Config",
+        "Mean Files Modified", "Mean Lines Added", "Mean Lines Removed",
+    ]
+    rows = []
+    for r in sorted(runs, key=lambda x: (x.benchmark, x.config_name)):
+        rows.append([
+            r.benchmark,
+            r.config_name,
+            _fmt(_safe_mean([t.files_modified for t in r.tasks]), 1),
+            _fmt(_safe_mean([t.lines_added for t in r.tasks]), 1),
+            _fmt(_safe_mean([t.lines_removed for t in r.tasks]), 1),
+        ])
+    return headers, rows
+
+
+def _build_cache_efficiency(runs: list[RunMetrics]) -> Optional[tuple[list[str], list[list[str]]]]:
+    """Table: Cache efficiency metrics per config x benchmark."""
+    has_data = any(
+        t.cache_hit_rate is not None or t.input_output_ratio is not None
+        for r in runs for t in r.tasks
+    )
+    if not has_data:
+        return None
+
+    headers = [
+        "Benchmark", "Config",
+        "Mean Cache Hit Rate", "Mean Input/Output Ratio", "Mean Cost (USD)",
+    ]
+    rows = []
+    for r in sorted(runs, key=lambda x: (x.benchmark, x.config_name)):
+        rows.append([
+            r.benchmark,
+            r.config_name,
+            _fmt(r.mean_cache_hit_rate),
+            _fmt(r.mean_input_output_ratio, 1),
+            _fmt_usd(_safe_mean([t.cost_usd for t in r.tasks])),
+        ])
+    return headers, rows
+
+
 def _build_swebench_partial(runs: list[RunMetrics]) -> Optional[tuple[list[str], list[list[str]]]]:
     """Table 6: SWE-Bench Pro partial scores per config."""
     swe_runs = [r for r in runs if "swebench" in r.benchmark.lower()]
@@ -425,6 +503,21 @@ def generate_report(
 
     h, r = _build_tool_utilization(runs)
     tables.append(("Tool Utilization", "tool_utilization", h, r))
+
+    search = _build_search_patterns(runs)
+    if search:
+        h, r = search
+        tables.append(("Search Patterns", "search_patterns", h, r))
+
+    code_chg = _build_code_changes(runs)
+    if code_chg:
+        h, r = code_chg
+        tables.append(("Code Changes", "code_changes", h, r))
+
+    cache_eff = _build_cache_efficiency(runs)
+    if cache_eff:
+        h, r = cache_eff
+        tables.append(("Cache Efficiency", "cache_efficiency", h, r))
 
     swe = _build_swebench_partial(runs)
     if swe:

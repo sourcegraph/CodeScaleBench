@@ -139,7 +139,7 @@ See [`docs/TASK_SELECTION.md`](../docs/TASK_SELECTION.md) for the selection meth
 
 ### 3-Config Comparison (Recommended)
 
-Each benchmark has a shell runner in [`configs/`](../configs/) that executes selected tasks across the 3-config matrix (Baseline, MCP-NoDeepSearch, MCP-Full):
+Each benchmark has a shell runner in [`configs/`](../configs/) that executes selected tasks across the 3-config matrix (Baseline, MCP-Base, MCP-Full):
 
 ```bash
 # Run all selected tasks for a benchmark

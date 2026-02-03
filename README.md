@@ -32,8 +32,8 @@ All benchmarks are evaluated across three agent configurations that vary the ext
 | Paper Config Name | `BASELINE_MCP_TYPE` | MCP Tools Available |
 |-------------------|---------------------|---------------------|
 | Baseline | `none` | None (agent uses only built-in tools) |
-| MCP-NoDeepSearch | `sourcegraph_no_deepsearch` | `sg_keyword_search`, `sg_read_file`, `sg_find_file`, `sg_nls_search`, `sg_search_suggestions`, `sg_get_context` (6 tools) |
-| MCP-Full | `sourcegraph_hybrid` | All MCP-NoDeepSearch tools + `sg_deepsearch`, `sg_deepsearch_read` (8 tools) |
+| MCP-Base | `sourcegraph_base` | `sg_keyword_search`, `sg_read_file`, `sg_find_file`, `sg_nls_search`, `sg_search_suggestions`, `sg_get_context` (6 tools) |
+| MCP-Full | `sourcegraph_full` | All MCP-Base tools + `sg_deepsearch`, `sg_deepsearch_read` (8 tools) |
 
 See [docs/CONFIGS.md](docs/CONFIGS.md) for the full tool-by-tool breakdown.
 

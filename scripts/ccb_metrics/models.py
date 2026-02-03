@@ -58,10 +58,21 @@ class TaskMetrics:
     tool_calls_by_name: Optional[dict[str, int]] = None
     mcp_ratio: Optional[float] = None
 
+    # Search patterns
+    search_queries: Optional[list[dict]] = None
+    search_calls_keyword: Optional[int] = None
+    search_calls_nls: Optional[int] = None
+    search_calls_deepsearch: Optional[int] = None
+    deepsearch_keyword_ratio: Optional[float] = None
+
     # Code changes
     files_modified: Optional[int] = None
     lines_added: Optional[int] = None
     lines_removed: Optional[int] = None
+
+    # Derived efficiency
+    input_output_ratio: Optional[float] = None
+    cache_hit_rate: Optional[float] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -127,6 +138,22 @@ class RunMetrics:
     def mean_mcp_ratio(self) -> Optional[float]:
         return _safe_mean([t.mcp_ratio for t in self.tasks])
 
+    @property
+    def mean_deepsearch_keyword_ratio(self) -> Optional[float]:
+        return _safe_mean([t.deepsearch_keyword_ratio for t in self.tasks])
+
+    @property
+    def mean_input_output_ratio(self) -> Optional[float]:
+        return _safe_mean([t.input_output_ratio for t in self.tasks])
+
+    @property
+    def mean_cache_hit_rate(self) -> Optional[float]:
+        return _safe_mean([t.cache_hit_rate for t in self.tasks])
+
+    @property
+    def mean_files_modified(self) -> Optional[float]:
+        return _safe_mean([t.files_modified for t in self.tasks])
+
     def to_dict(self) -> dict:
         return {
             "run_id": self.run_id,
@@ -143,6 +170,10 @@ class RunMetrics:
             "mean_tokens": self.mean_tokens,
             "mean_wall_clock": self.mean_wall_clock,
             "mean_mcp_ratio": self.mean_mcp_ratio,
+            "mean_deepsearch_keyword_ratio": self.mean_deepsearch_keyword_ratio,
+            "mean_input_output_ratio": self.mean_input_output_ratio,
+            "mean_cache_hit_rate": self.mean_cache_hit_rate,
+            "mean_files_modified": self.mean_files_modified,
         }
 
     @classmethod
@@ -150,7 +181,9 @@ class RunMetrics:
         tasks_data = data.pop("tasks", [])
         # Remove computed properties that may be in serialized form
         for key in ("mean_reward", "mean_partial_score", "pass_rate",
-                     "mean_tokens", "mean_wall_clock", "mean_mcp_ratio"):
+                     "mean_tokens", "mean_wall_clock", "mean_mcp_ratio",
+                     "mean_deepsearch_keyword_ratio", "mean_input_output_ratio",
+                     "mean_cache_hit_rate", "mean_files_modified"):
             data.pop(key, None)
         known = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in known}

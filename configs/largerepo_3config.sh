@@ -3,7 +3,7 @@
 #
 # Runs all 4 large repo tasks across 3 configurations:
 #   1. Baseline (no MCP)
-#   2. MCP-NoDeepSearch (Sourcegraph MCP without deep search)
+#   2. MCP-Base (Sourcegraph MCP without deep search)
 #   3. MCP-Full (Sourcegraph MCP + deep search)
 #
 # Usage:
@@ -11,8 +11,8 @@
 #
 # Options:
 #   --baseline-only        Run only baseline (no MCP)
-#   --no-deepsearch-only   Run only MCP-NoDeepSearch
-#   --full-only            Run only MCP-Full (sourcegraph_hybrid)
+#   --base-only   Run only MCP-Base
+#   --full-only            Run only MCP-Full (sourcegraph_full)
 #   --model MODEL          Override model (default: claude-opus-4-5-20251101)
 #   --category CATEGORY    Override run category (default: official)
 #
@@ -68,7 +68,7 @@ MODEL="${MODEL:-anthropic/claude-opus-4-5-20251101}"
 CONCURRENCY=1  # Big codebases - run serially
 TIMEOUT_MULTIPLIER=10  # 10x default timeout for large repos
 RUN_BASELINE=true
-RUN_NO_DEEPSEARCH=true
+RUN_BASE=true
 RUN_FULL=true
 CATEGORY="${CATEGORY:-official}"
 
@@ -76,18 +76,18 @@ CATEGORY="${CATEGORY:-official}"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --baseline-only)
-            RUN_NO_DEEPSEARCH=false
+            RUN_BASE=false
             RUN_FULL=false
             shift
             ;;
-        --no-deepsearch-only)
+        --base-only)
             RUN_BASELINE=false
             RUN_FULL=false
             shift
             ;;
         --full-only)
             RUN_BASELINE=false
-            RUN_NO_DEEPSEARCH=false
+            RUN_BASE=false
             shift
             ;;
         --model)
@@ -106,10 +106,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Check MCP credentials if MCP modes requested
-if { [ "$RUN_NO_DEEPSEARCH" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
+if { [ "$RUN_BASE" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
     echo "WARNING: MCP modes requested but SOURCEGRAPH_ACCESS_TOKEN not set"
     echo "Skipping MCP runs. Use --baseline-only to suppress this warning."
-    RUN_NO_DEEPSEARCH=false
+    RUN_BASE=false
     RUN_FULL=false
 fi
 
@@ -252,7 +252,7 @@ run_task_batch() {
 log_section "Big Code MCP 3-Config Benchmark Comparison"
 echo "Starting benchmark run..."
 echo "  Baseline: $RUN_BASELINE"
-echo "  MCP-NoDeepSearch: $RUN_NO_DEEPSEARCH"
+echo "  MCP-Base: $RUN_BASE"
 echo "  MCP-Full: $RUN_FULL"
 echo "  Model: $MODEL"
 echo "  Benchmark Directory: $BENCHMARK_DIR"
@@ -267,14 +267,14 @@ if [ "$RUN_BASELINE" = true ]; then
     run_task_batch "baseline" "none"
 fi
 
-# Run MCP-NoDeepSearch (Sourcegraph MCP without deep search)
-if [ "$RUN_NO_DEEPSEARCH" = true ]; then
-    run_task_batch "sourcegraph_no_deepsearch" "sourcegraph_no_deepsearch"
+# Run MCP-Base (Sourcegraph MCP without deep search)
+if [ "$RUN_BASE" = true ]; then
+    run_task_batch "sourcegraph_base" "sourcegraph_base"
 fi
 
 # Run MCP-Full (Sourcegraph MCP + deep search)
 if [ "$RUN_FULL" = true ]; then
-    run_task_batch "sourcegraph_hybrid" "sourcegraph_hybrid"
+    run_task_batch "sourcegraph_full" "sourcegraph_full"
 fi
 
 # ============================================
@@ -289,14 +289,14 @@ if [ "$RUN_BASELINE" = true ]; then
     echo "  ls -la $JOBS_BASE/baseline/"
     echo ""
 fi
-if [ "$RUN_NO_DEEPSEARCH" = true ]; then
-    echo "  # MCP-NoDeepSearch summary"
-    echo "  ls -la $JOBS_BASE/sourcegraph_no_deepsearch/"
+if [ "$RUN_BASE" = true ]; then
+    echo "  # MCP-Base summary"
+    echo "  ls -la $JOBS_BASE/sourcegraph_base/"
     echo ""
 fi
 if [ "$RUN_FULL" = true ]; then
     echo "  # MCP-Full summary"
-    echo "  ls -la $JOBS_BASE/sourcegraph_hybrid/"
+    echo "  ls -la $JOBS_BASE/sourcegraph_full/"
     echo ""
 fi
 echo ""
@@ -305,6 +305,6 @@ echo "  cat $JOBS_BASE/*/*/result.json | jq -r '.trials[].verifier_result.reward
 echo ""
 echo "Expected observations:"
 echo "  - Baseline: Slower codebase exploration, may miss patterns"
-echo "  - MCP-NoDeepSearch: Fast keyword + NLS search, no deep reasoning"
+echo "  - MCP-Base: Fast keyword + NLS search, no deep reasoning"
 echo "  - MCP-Full: Deep semantic search + architectural understanding"
 echo ""

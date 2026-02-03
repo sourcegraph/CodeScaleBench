@@ -3,7 +3,7 @@
 #
 # Runs selected SWE-bench Pro instances (from selected_benchmark_tasks.json) across 3 configurations:
 #   1. Baseline (no MCP)
-#   2. MCP-NoDeepSearch (Sourcegraph tools without Deep Search)
+#   2. MCP-Base (Sourcegraph tools without Deep Search)
 #   3. MCP-Full (Sourcegraph + Deep Search hybrid)
 #
 # Usage:
@@ -11,8 +11,8 @@
 #
 # Options:
 #   --baseline-only        Run only baseline (no MCP)
-#   --no-deepsearch-only   Run only MCP-NoDeepSearch
-#   --full-only            Run only MCP-Full (sourcegraph_hybrid)
+#   --base-only   Run only MCP-Base
+#   --full-only            Run only MCP-Full (sourcegraph_full)
 #   --model MODEL          Override model (default: claude-opus-4-5-20251101)
 #   --concurrency N        Number of concurrent tasks (default: 2)
 #   --category CATEGORY    Run category (default: official)
@@ -68,7 +68,7 @@ MODEL="${MODEL:-anthropic/claude-opus-4-5-20251101}"
 CONCURRENCY=2
 TIMEOUT_MULTIPLIER=10
 RUN_BASELINE=true
-RUN_NO_DEEPSEARCH=true
+RUN_BASE=true
 RUN_FULL=true
 CATEGORY="${CATEGORY:-official}"
 
@@ -76,18 +76,18 @@ CATEGORY="${CATEGORY:-official}"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --baseline-only)
-            RUN_NO_DEEPSEARCH=false
+            RUN_BASE=false
             RUN_FULL=false
             shift
             ;;
-        --no-deepsearch-only)
+        --base-only)
             RUN_BASELINE=false
             RUN_FULL=false
             shift
             ;;
         --full-only)
             RUN_BASELINE=false
-            RUN_NO_DEEPSEARCH=false
+            RUN_BASE=false
             shift
             ;;
         --model)
@@ -110,10 +110,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Check MCP credentials if MCP modes requested
-if { [ "$RUN_NO_DEEPSEARCH" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
+if { [ "$RUN_BASE" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
     echo "WARNING: MCP modes requested but SOURCEGRAPH_ACCESS_TOKEN not set"
     echo "Skipping MCP runs. Use --baseline-only to suppress this warning."
-    RUN_NO_DEEPSEARCH=false
+    RUN_BASE=false
     RUN_FULL=false
 fi
 
@@ -156,7 +156,7 @@ echo "Concurrency: ${CONCURRENCY}"
 echo "Timeout multiplier: ${TIMEOUT_MULTIPLIER}x"
 echo "Jobs directory: ${JOBS_BASE}"
 echo "Run baseline: ${RUN_BASELINE}"
-echo "Run MCP-NoDeepSearch: ${RUN_NO_DEEPSEARCH}"
+echo "Run MCP-Base: ${RUN_BASE}"
 echo "Run MCP-Full: ${RUN_FULL}"
 echo ""
 
@@ -190,6 +190,60 @@ extract_all_metrics() {
     done
 }
 
+# Build SOURCEGRAPH_REPO_NAME for swebenchpro tasks.
+# Parses task_id to derive the sg-benchmarks repo name.
+get_swebench_sg_repo() {
+    local task_id=$1
+    local sg_repo
+    sg_repo=$(python3 -c "
+import re, sys
+tid = '$task_id'
+# SWE-bench Pro task_id format: instance_{org}__{repo}-{commit40hex}[-vXXX]
+# or: {org}__{repo}-{commit40hex}
+m = re.match(r'(?:instance_)?(.+?)__(.+?)-([a-f0-9]{7,40})', tid)
+if m:
+    org = m.group(1).replace('__','/')
+    repo = m.group(2)
+    commit = m.group(3)[:8]
+    print(f'{org}--{repo}--{commit}')
+" 2>/dev/null)
+
+    if [ -n "$sg_repo" ]; then
+        echo "sg-benchmarks/$sg_repo"
+    else
+        echo ""
+    fi
+}
+
+# Run MCP mode tasks one-by-one so SOURCEGRAPH_REPO_NAME can be set per task
+run_swebench_mcp_task_batch() {
+    local mode=$1
+    local mcp_type=$2
+    local jobs_subdir="${JOBS_BASE}/${mode}"
+    mkdir -p "$jobs_subdir"
+    for task_id in "${TASK_IDS[@]}"; do
+        local sg_repo=$(get_swebench_sg_repo "$task_id")
+        if [ -n "$sg_repo" ]; then
+            export SOURCEGRAPH_REPO_NAME="$sg_repo"
+            echo "  [${mode}] Task ${task_id} -> SOURCEGRAPH_REPO_NAME=${sg_repo}"
+        else
+            unset SOURCEGRAPH_REPO_NAME 2>/dev/null || true
+            echo "  [${mode}] Task ${task_id} -> no SG repo mapping (could not parse task_id)"
+        fi
+        BASELINE_MCP_TYPE=$mcp_type harbor run \
+            --dataset swebenchpro \
+            -t "$task_id" \
+            --agent-import-path "$AGENT_PATH" \
+            --model "$MODEL" \
+            --jobs-dir "$jobs_subdir" \
+            -n $CONCURRENCY \
+            --timeout-multiplier $TIMEOUT_MULTIPLIER \
+            2>&1 | tee "${jobs_subdir}/${task_id}.log" || true
+    done
+    unset SOURCEGRAPH_REPO_NAME 2>/dev/null || true
+    extract_all_metrics "$jobs_subdir" "ccb_swebenchpro" "$mode"
+}
+
 # ============================================
 # RUN BASELINE (no MCP)
 # ============================================
@@ -212,45 +266,27 @@ if [ "$RUN_BASELINE" = true ]; then
 fi
 
 # ============================================
-# RUN MCP-NoDeepSearch (sourcegraph_no_deepsearch)
+# RUN MCP-Base (sourcegraph_base)
+# Per-task iteration to set SOURCEGRAPH_REPO_NAME for indexed repos
 # ============================================
-if [ "$RUN_NO_DEEPSEARCH" = true ]; then
+if [ "$RUN_BASE" = true ]; then
     echo ""
-    echo "[MCP-NoDeepSearch] Starting selected-task MCP-NoDeepSearch run..."
+    echo "[MCP-Base] Starting per-task MCP-Base run..."
     echo ""
 
-    BASELINE_MCP_TYPE=sourcegraph_no_deepsearch harbor run \
-        --dataset swebenchpro \
-        ${TASK_NAME_ARGS} \
-        --agent-import-path "${AGENT_PATH}" \
-        --model "${MODEL}" \
-        --jobs-dir "${JOBS_BASE}/sourcegraph_no_deepsearch" \
-        -n ${CONCURRENCY} \
-        --timeout-multiplier ${TIMEOUT_MULTIPLIER} \
-        2>&1 | tee "${JOBS_BASE}/sourcegraph_no_deepsearch.log"
-
-    extract_all_metrics "${JOBS_BASE}/sourcegraph_no_deepsearch" "ccb_swebenchpro" "sourcegraph_no_deepsearch"
+    run_swebench_mcp_task_batch "sourcegraph_base" "sourcegraph_base"
 fi
 
 # ============================================
-# RUN MCP-Full (sourcegraph_hybrid)
+# RUN MCP-Full (sourcegraph_full)
+# Per-task iteration to set SOURCEGRAPH_REPO_NAME for indexed repos
 # ============================================
 if [ "$RUN_FULL" = true ]; then
     echo ""
-    echo "[MCP-Full] Starting selected-task MCP-Full run..."
+    echo "[MCP-Full] Starting per-task MCP-Full run..."
     echo ""
 
-    BASELINE_MCP_TYPE=sourcegraph_hybrid harbor run \
-        --dataset swebenchpro \
-        ${TASK_NAME_ARGS} \
-        --agent-import-path "${AGENT_PATH}" \
-        --model "${MODEL}" \
-        --jobs-dir "${JOBS_BASE}/sourcegraph_hybrid" \
-        -n ${CONCURRENCY} \
-        --timeout-multiplier ${TIMEOUT_MULTIPLIER} \
-        2>&1 | tee "${JOBS_BASE}/sourcegraph_hybrid.log"
-
-    extract_all_metrics "${JOBS_BASE}/sourcegraph_hybrid" "ccb_swebenchpro" "sourcegraph_hybrid"
+    run_swebench_mcp_task_batch "sourcegraph_full" "sourcegraph_full"
 fi
 
 echo ""
@@ -265,12 +301,12 @@ if [ "$RUN_BASELINE" = true ]; then
     echo "  cat ${JOBS_BASE}/baseline/*/result.json | jq -s '[.[] | select(.trials[].verifier_result.resolved == true)] | length'"
     echo ""
 fi
-if [ "$RUN_NO_DEEPSEARCH" = true ]; then
-    echo "  # MCP-NoDeepSearch - count resolved"
-    echo "  cat ${JOBS_BASE}/sourcegraph_no_deepsearch/*/result.json | jq -s '[.[] | select(.trials[].verifier_result.resolved == true)] | length'"
+if [ "$RUN_BASE" = true ]; then
+    echo "  # MCP-Base - count resolved"
+    echo "  cat ${JOBS_BASE}/sourcegraph_base/*/result.json | jq -s '[.[] | select(.trials[].verifier_result.resolved == true)] | length'"
     echo ""
 fi
 if [ "$RUN_FULL" = true ]; then
     echo "  # MCP-Full - count resolved"
-    echo "  cat ${JOBS_BASE}/sourcegraph_hybrid/*/result.json | jq -s '[.[] | select(.trials[].verifier_result.resolved == true)] | length'"
+    echo "  cat ${JOBS_BASE}/sourcegraph_full/*/result.json | jq -s '[.[] | select(.trials[].verifier_result.resolved == true)] | length'"
 fi

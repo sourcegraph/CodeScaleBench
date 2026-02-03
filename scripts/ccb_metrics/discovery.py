@@ -23,6 +23,11 @@ from .extractors import (
     extract_swebench_partial_score,
     extract_reward_from_file,
     extract_run_config,
+    extract_search_patterns_from_trajectory,
+    extract_search_patterns_from_transcript,
+    extract_code_changes_from_trajectory,
+    extract_code_changes_from_transcript,
+    calculate_cost_from_tokens,
 )
 
 
@@ -156,6 +161,44 @@ def _process_task_dir(
         tm.tool_calls_local = tool_usage["tool_calls_local"]
         tm.tool_calls_by_name = tool_usage["tool_calls_by_name"]
         tm.mcp_ratio = tool_usage["mcp_ratio"]
+
+    # Search patterns — prefer trajectory, fall back to transcript
+    search = extract_search_patterns_from_trajectory(trajectory_path)
+    if search.get("search_calls_keyword") is None and search.get("search_calls_nls") is None:
+        search = extract_search_patterns_from_transcript(transcript_path)
+
+    if search.get("search_calls_keyword") is not None or search.get("search_calls_nls") is not None:
+        tm.search_queries = search["search_queries"]
+        tm.search_calls_keyword = search["search_calls_keyword"]
+        tm.search_calls_nls = search["search_calls_nls"]
+        tm.search_calls_deepsearch = search["search_calls_deepsearch"]
+        tm.deepsearch_keyword_ratio = search["deepsearch_keyword_ratio"]
+
+    # Code changes — prefer trajectory, fall back to transcript
+    changes = extract_code_changes_from_trajectory(trajectory_path)
+    if changes.get("files_modified") is None:
+        changes = extract_code_changes_from_transcript(transcript_path)
+
+    if changes.get("files_modified") is not None:
+        tm.files_modified = changes["files_modified"]
+        tm.lines_added = changes["lines_added"]
+        tm.lines_removed = changes["lines_removed"]
+
+    # Derived efficiency metrics
+    if tm.input_tokens is not None and tm.output_tokens is not None and tm.output_tokens > 0:
+        tm.input_output_ratio = tm.input_tokens / tm.output_tokens
+
+    if tm.cache_read_tokens is not None and tm.cache_creation_tokens is not None:
+        cache_total = tm.cache_read_tokens + tm.cache_creation_tokens
+        if cache_total > 0:
+            tm.cache_hit_rate = tm.cache_read_tokens / cache_total
+
+    # Cost fallback: calculate from tokens if not already set
+    if tm.cost_usd is None:
+        tm.cost_usd = calculate_cost_from_tokens(
+            tm.input_tokens, tm.output_tokens,
+            tm.cache_creation_tokens, tm.cache_read_tokens,
+        )
 
     return tm
 

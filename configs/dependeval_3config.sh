@@ -3,7 +3,7 @@
 #
 # Runs selected DependEval tasks (from selected_benchmark_tasks.json) across 3 configurations:
 #   1. Baseline (no MCP)
-#   2. MCP-NoDeepSearch (Sourcegraph tools without Deep Search)
+#   2. MCP-Base (Sourcegraph tools without Deep Search)
 #   3. MCP-Full (Sourcegraph + Deep Search hybrid)
 #
 # Usage:
@@ -11,8 +11,8 @@
 #
 # Options:
 #   --baseline-only        Run only baseline (no MCP)
-#   --no-deepsearch-only   Run only MCP-NoDeepSearch
-#   --full-only            Run only MCP-Full (sourcegraph_hybrid)
+#   --base-only   Run only MCP-Base
+#   --full-only            Run only MCP-Full (sourcegraph_full)
 #   --model MODEL          Override model (default: claude-opus-4-5-20251101)
 #   --category CATEGORY    Run category (default: official)
 #
@@ -68,7 +68,7 @@ MODEL="${MODEL:-anthropic/claude-opus-4-5-20251101}"
 CONCURRENCY=2
 TIMEOUT_MULTIPLIER=10
 RUN_BASELINE=true
-RUN_NO_DEEPSEARCH=true
+RUN_BASE=true
 RUN_FULL=true
 CATEGORY="${CATEGORY:-official}"
 
@@ -76,18 +76,18 @@ CATEGORY="${CATEGORY:-official}"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --baseline-only)
-            RUN_NO_DEEPSEARCH=false
+            RUN_BASE=false
             RUN_FULL=false
             shift
             ;;
-        --no-deepsearch-only)
+        --base-only)
             RUN_BASELINE=false
             RUN_FULL=false
             shift
             ;;
         --full-only)
             RUN_BASELINE=false
-            RUN_NO_DEEPSEARCH=false
+            RUN_BASE=false
             shift
             ;;
         --model)
@@ -106,10 +106,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Check MCP credentials if MCP modes requested
-if { [ "$RUN_NO_DEEPSEARCH" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
+if { [ "$RUN_BASE" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
     echo "WARNING: MCP modes requested but SOURCEGRAPH_ACCESS_TOKEN not set"
     echo "Skipping MCP runs. Use --baseline-only to suppress this warning."
-    RUN_NO_DEEPSEARCH=false
+    RUN_BASE=false
     RUN_FULL=false
 fi
 
@@ -255,7 +255,7 @@ run_task_batch() {
 log_section "DependEval 9-Task 3-Config Benchmark Comparison"
 echo "Starting benchmark run..."
 echo "  Baseline: $RUN_BASELINE"
-echo "  MCP-NoDeepSearch: $RUN_NO_DEEPSEARCH"
+echo "  MCP-Base: $RUN_BASE"
 echo "  MCP-Full: $RUN_FULL"
 echo "  Model: $MODEL"
 echo "  Benchmark Directory: $BENCHMARK_DIR"
@@ -268,12 +268,12 @@ if [ "$RUN_BASELINE" = true ]; then
     run_task_batch "baseline" "none"
 fi
 
-if [ "$RUN_NO_DEEPSEARCH" = true ]; then
-    run_task_batch "sourcegraph_no_deepsearch" "sourcegraph_no_deepsearch"
+if [ "$RUN_BASE" = true ]; then
+    run_task_batch "sourcegraph_base" "sourcegraph_base"
 fi
 
 if [ "$RUN_FULL" = true ]; then
-    run_task_batch "sourcegraph_hybrid" "sourcegraph_hybrid"
+    run_task_batch "sourcegraph_full" "sourcegraph_full"
 fi
 
 log_section "Benchmark Complete"

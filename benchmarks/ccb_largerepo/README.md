@@ -91,7 +91,7 @@ bash configs/largerepo_3config.sh
 
 ```bash
 bash configs/largerepo_3config.sh --baseline-only
-bash configs/largerepo_3config.sh --no-deepsearch-only
+bash configs/largerepo_3config.sh --base-only
 bash configs/largerepo_3config.sh --full-only
 ```
 
@@ -112,8 +112,8 @@ Output is written to `runs/` with one subdirectory per MCP configuration:
 ```
 runs/{category}/largerepo_selected_opus_{TIMESTAMP}/
 ├── baseline/                        # No MCP
-├── sourcegraph_no_deepsearch/       # MCP without deep search
-└── sourcegraph_hybrid/              # Full MCP (all 13 tools)
+├── sourcegraph_base/       # MCP without deep search
+└── sourcegraph_full/              # Full MCP (all 13 tools)
 ```
 
 Per-task metrics can be extracted with:

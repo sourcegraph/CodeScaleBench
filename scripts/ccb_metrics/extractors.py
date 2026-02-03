@@ -449,16 +449,23 @@ def extract_run_config(
                         result["tools"] = entry.get("tools")
                         result["mcp_servers"] = entry.get("mcp_servers")
                         result["model"] = entry.get("model")
-                        # Infer mcp_mode from mcp_servers
+                        # Infer mcp_mode from mcp_servers + available tools
                         servers = entry.get("mcp_servers") or []
                         server_names = [s.get("name") for s in servers if isinstance(s, dict)]
+                        tools_list = entry.get("tools") or []
+                        has_sg = "sourcegraph" in server_names
+                        has_ds_server = "deepsearch" in server_names
+                        has_ds_tool = (
+                            "mcp__sourcegraph__sg_deepsearch" in tools_list
+                            or "mcp__deepsearch__deepsearch" in tools_list
+                        )
                         if not server_names:
                             result["mcp_mode"] = "none"
-                        elif "sourcegraph" in server_names and "deepsearch" in server_names:
-                            result["mcp_mode"] = "sourcegraph_hybrid"
-                        elif "sourcegraph" in server_names:
-                            result["mcp_mode"] = "sourcegraph_no_deepsearch"
-                        elif "deepsearch" in server_names:
+                        elif has_sg and (has_ds_server or has_ds_tool):
+                            result["mcp_mode"] = "sourcegraph_full"
+                        elif has_sg:
+                            result["mcp_mode"] = "sourcegraph_base"
+                        elif has_ds_server or has_ds_tool:
                             result["mcp_mode"] = "deepsearch"
                         else:
                             result["mcp_mode"] = ",".join(server_names)
@@ -467,6 +474,356 @@ def extract_run_config(
                 pass
 
     return result
+
+
+def _empty_search_patterns() -> dict:
+    """Return a dict with all search pattern fields set to None."""
+    return {
+        "search_queries": None,
+        "search_calls_keyword": None,
+        "search_calls_nls": None,
+        "search_calls_deepsearch": None,
+        "deepsearch_keyword_ratio": None,
+    }
+
+
+# MCP search tool name mappings
+_SEARCH_TOOL_MAP = {
+    "mcp__sourcegraph__sg_keyword_search": "keyword",
+    "mcp__sourcegraph__sg_nls_search": "nls",
+    "mcp__sourcegraph__sg_deepsearch": "deepsearch",
+    # Also support short names without server prefix
+    "sg_keyword_search": "keyword",
+    "sg_nls_search": "nls",
+    "sg_deepsearch": "deepsearch",
+}
+
+
+def _classify_search_tool(name: str) -> Optional[str]:
+    """Classify a tool name as keyword/nls/deepsearch, or None."""
+    if name in _SEARCH_TOOL_MAP:
+        return _SEARCH_TOOL_MAP[name]
+    # Handle variations like mcp__<server>__sg_keyword_search
+    for suffix, category in (
+        ("sg_keyword_search", "keyword"),
+        ("sg_nls_search", "nls"),
+        ("sg_deepsearch", "deepsearch"),
+    ):
+        if name.endswith(suffix):
+            return category
+    return None
+
+
+def _build_search_results(
+    queries: list[dict],
+    counts: dict[str, int],
+) -> dict:
+    """Build the standard search pattern dict from collected data."""
+    keyword = counts.get("keyword", 0)
+    nls = counts.get("nls", 0)
+    deepsearch = counts.get("deepsearch", 0)
+    total_search = keyword + nls + deepsearch
+
+    if total_search == 0:
+        return _empty_search_patterns()
+
+    ds_ratio = deepsearch / total_search if total_search > 0 else None
+
+    return {
+        "search_queries": queries if queries else None,
+        "search_calls_keyword": keyword,
+        "search_calls_nls": nls,
+        "search_calls_deepsearch": deepsearch,
+        "deepsearch_keyword_ratio": ds_ratio,
+    }
+
+
+def extract_search_patterns_from_trajectory(
+    trajectory_json_path: str | Path,
+) -> dict:
+    """Parse ATIF v1.2 trajectory.json to extract MCP search tool usage.
+
+    Iterates steps[].tool_calls[] looking for function_names matching
+    MCP search tools (sg_keyword_search, sg_nls_search, sg_deepsearch).
+
+    Args:
+        trajectory_json_path: Path to the agent/trajectory.json file.
+
+    Returns:
+        Dict with keys: search_queries, search_calls_keyword,
+        search_calls_nls, search_calls_deepsearch, deepsearch_keyword_ratio.
+    """
+    path = Path(trajectory_json_path)
+    if not path.is_file():
+        return _empty_search_patterns()
+
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return _empty_search_patterns()
+
+    queries: list[dict] = []
+    counts: dict[str, int] = {}
+
+    steps = data.get("steps") or []
+    for step_idx, step in enumerate(steps):
+        step_id = step.get("step_id", step_idx)
+        tool_calls = step.get("tool_calls") or []
+        for tc in tool_calls:
+            name = tc.get("function_name") or ""
+            category = _classify_search_tool(name)
+            if category is None:
+                continue
+            counts[category] = counts.get(category, 0) + 1
+            args = tc.get("arguments") or {}
+            query = args.get("query", "")
+            queries.append({
+                "tool": name,
+                "query": query,
+                "step_id": step_id,
+            })
+
+    return _build_search_results(queries, counts)
+
+
+def extract_search_patterns_from_transcript(
+    claude_code_txt_path: str | Path,
+) -> dict:
+    """Parse claude-code.txt JSONL to extract MCP search tool usage.
+
+    Fallback when trajectory.json is missing.
+
+    Args:
+        claude_code_txt_path: Path to the agent/claude-code.txt JSONL file.
+
+    Returns:
+        Dict with same schema as extract_search_patterns_from_trajectory.
+    """
+    path = Path(claude_code_txt_path)
+    if not path.is_file():
+        return _empty_search_patterns()
+
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return _empty_search_patterns()
+
+    queries: list[dict] = []
+    counts: dict[str, int] = {}
+    step_counter = 0
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("type") != "assistant":
+            continue
+        message = entry.get("message") or {}
+        content = message.get("content") or []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = block.get("name") or ""
+            category = _classify_search_tool(name)
+            if category is None:
+                continue
+            counts[category] = counts.get(category, 0) + 1
+            inp = block.get("input") or {}
+            query = inp.get("query", "")
+            queries.append({
+                "tool": name,
+                "query": query,
+                "step_id": step_counter,
+            })
+        step_counter += 1
+
+    return _build_search_results(queries, counts)
+
+
+def _empty_code_changes() -> dict:
+    """Return a dict with all code change fields set to None."""
+    return {
+        "files_modified": None,
+        "lines_added": None,
+        "lines_removed": None,
+    }
+
+
+def extract_code_changes_from_trajectory(
+    trajectory_json_path: str | Path,
+) -> dict:
+    """Parse trajectory.json to extract code change metrics.
+
+    Looks for Edit and Write tool calls to count files modified,
+    lines added, and lines removed.
+
+    Args:
+        trajectory_json_path: Path to the agent/trajectory.json file.
+
+    Returns:
+        Dict with keys: files_modified, lines_added, lines_removed.
+    """
+    path = Path(trajectory_json_path)
+    if not path.is_file():
+        return _empty_code_changes()
+
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return _empty_code_changes()
+
+    files_touched: set[str] = set()
+    lines_added = 0
+    lines_removed = 0
+
+    steps = data.get("steps") or []
+    for step in steps:
+        tool_calls = step.get("tool_calls") or []
+        for tc in tool_calls:
+            name = tc.get("function_name") or ""
+            args = tc.get("arguments") or {}
+
+            if name == "Edit":
+                fp = args.get("file_path")
+                if fp:
+                    files_touched.add(fp)
+                old = args.get("old_string", "")
+                new = args.get("new_string", "")
+                if old:
+                    lines_removed += old.count("\n") + 1
+                if new:
+                    lines_added += new.count("\n") + 1
+
+            elif name == "Write":
+                fp = args.get("file_path")
+                if fp:
+                    files_touched.add(fp)
+                content = args.get("content", "")
+                if content:
+                    lines_added += content.count("\n") + 1
+
+    if not files_touched:
+        return _empty_code_changes()
+
+    return {
+        "files_modified": len(files_touched),
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
+    }
+
+
+def extract_code_changes_from_transcript(
+    claude_code_txt_path: str | Path,
+) -> dict:
+    """Parse claude-code.txt JSONL to extract code change metrics.
+
+    Fallback when trajectory.json is missing.
+
+    Args:
+        claude_code_txt_path: Path to the agent/claude-code.txt JSONL file.
+
+    Returns:
+        Dict with same schema as extract_code_changes_from_trajectory.
+    """
+    path = Path(claude_code_txt_path)
+    if not path.is_file():
+        return _empty_code_changes()
+
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return _empty_code_changes()
+
+    files_touched: set[str] = set()
+    lines_added = 0
+    lines_removed = 0
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("type") != "assistant":
+            continue
+        message = entry.get("message") or {}
+        content = message.get("content") or []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = block.get("name") or ""
+            inp = block.get("input") or {}
+
+            if name == "Edit":
+                fp = inp.get("file_path")
+                if fp:
+                    files_touched.add(fp)
+                old = inp.get("old_string", "")
+                new = inp.get("new_string", "")
+                if old:
+                    lines_removed += old.count("\n") + 1
+                if new:
+                    lines_added += new.count("\n") + 1
+
+            elif name == "Write":
+                fp = inp.get("file_path")
+                if fp:
+                    files_touched.add(fp)
+                content_str = inp.get("content", "")
+                if content_str:
+                    lines_added += content_str.count("\n") + 1
+
+    if not files_touched:
+        return _empty_code_changes()
+
+    return {
+        "files_modified": len(files_touched),
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
+    }
+
+
+# Opus 4.5 pricing (USD per million tokens)
+_OPUS_INPUT_PRICE = 15.0
+_OPUS_OUTPUT_PRICE = 75.0
+_OPUS_CACHE_WRITE_PRICE = 18.75
+_OPUS_CACHE_READ_PRICE = 1.50
+
+
+def calculate_cost_from_tokens(
+    input_tokens: Optional[int],
+    output_tokens: Optional[int],
+    cache_creation: Optional[int] = None,
+    cache_read: Optional[int] = None,
+) -> Optional[float]:
+    """Calculate USD cost from token counts using Opus 4.5 pricing.
+
+    Args:
+        input_tokens: Number of input tokens (non-cache).
+        output_tokens: Number of output tokens.
+        cache_creation: Number of cache creation (write) tokens.
+        cache_read: Number of cache read tokens.
+
+    Returns:
+        Estimated cost in USD, or None if input/output tokens unavailable.
+    """
+    if input_tokens is None or output_tokens is None:
+        return None
+
+    cost = (input_tokens / 1_000_000) * _OPUS_INPUT_PRICE
+    cost += (output_tokens / 1_000_000) * _OPUS_OUTPUT_PRICE
+    if cache_creation:
+        cost += (cache_creation / 1_000_000) * _OPUS_CACHE_WRITE_PRICE
+    if cache_read:
+        cost += (cache_read / 1_000_000) * _OPUS_CACHE_READ_PRICE
+
+    return round(cost, 6)
 
 
 def extract_reward_from_file(
