@@ -38,6 +38,9 @@ cd "$REPO_ROOT"
 AGENT_DIR="${AGENT_DIR:-$HOME/evals/custom_agents/agents/claudecode}"
 export PYTHONPATH="${AGENT_DIR}:$(pwd):$PYTHONPATH"
 
+# Shared config: subscription mode + token refresh
+source "$SCRIPT_DIR/_common.sh"
+
 SELECTION_FILE="$REPO_ROOT/configs/selected_benchmark_tasks.json"
 
 # ============================================
@@ -127,6 +130,8 @@ if { [ "$RUN_BASE" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_A
     RUN_BASE=false
     RUN_FULL=false
 fi
+
+ensure_fresh_token
 
 # ============================================
 # EXTRACT TASKS FROM SELECTION FILE

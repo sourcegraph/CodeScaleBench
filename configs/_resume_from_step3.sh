@@ -13,9 +13,15 @@ cd "$SCRIPT_DIR/.."
 AGENT_DIR="${AGENT_DIR:-$HOME/evals/custom_agents/agents/claudecode}"
 export PYTHONPATH="${AGENT_DIR}:$(pwd):$PYTHONPATH"
 
+# Shared config: subscription mode + token refresh
+source "$SCRIPT_DIR/_common.sh"
+
 if [ -f ~/evals/.env.local ]; then
     source ~/evals/.env.local
 fi
+
+
+ensure_fresh_token
 
 echo "=============================================="
 echo "Locobench Runs (baseline + sourcegraph_full)"

@@ -29,6 +29,9 @@ cd "$SCRIPT_DIR/.."
 AGENT_DIR="${AGENT_DIR:-$HOME/evals/custom_agents/agents/claudecode}"
 export PYTHONPATH="${AGENT_DIR}:$(pwd):$PYTHONPATH"
 
+# Shared config: subscription mode + token refresh
+source "$SCRIPT_DIR/_common.sh"
+
 # ============================================
 # LOAD CREDENTIALS
 # ============================================
@@ -58,6 +61,8 @@ else
     echo "SOURCEGRAPH_ACCESS_TOKEN: not set"
 fi
 echo ""
+
+ensure_fresh_token
 
 # ============================================
 # CONFIGURATION

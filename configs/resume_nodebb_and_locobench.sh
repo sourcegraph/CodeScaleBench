@@ -20,6 +20,9 @@ cd "$SCRIPT_DIR/.."
 AGENT_DIR="${AGENT_DIR:-$HOME/evals/custom_agents/agents/claudecode}"
 export PYTHONPATH="${AGENT_DIR}:$(pwd):$PYTHONPATH"
 
+# Shared config: subscription mode + token refresh
+source "$SCRIPT_DIR/_common.sh"
+
 # Load credentials
 if [ -f ~/evals/.env.local ]; then
     source ~/evals/.env.local
@@ -34,6 +37,9 @@ if [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
     echo "ERROR: SOURCEGRAPH_ACCESS_TOKEN is not set (needed for MCP modes)"
     exit 1
 fi
+
+
+ensure_fresh_token
 
 SELECTION_FILE="$SCRIPT_DIR/selected_benchmark_tasks.json"
 AGENT_PATH="agents.claude_baseline_agent:BaselineClaudeCodeAgent"
