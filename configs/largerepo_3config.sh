@@ -191,6 +191,8 @@ run_task_batch() {
     local mcp_type=$2
     local jobs_subdir="${JOBS_BASE}/${mode}"
 
+    ensure_fresh_token
+
     log_section "Running Big Code MCP - Mode: $mode"
 
     echo "Configuration:"
@@ -245,6 +247,7 @@ run_task_batch() {
 
     # Extract metrics for all completed tasks in this mode
     extract_all_metrics "$jobs_subdir" "ccb_largerepo" "$mode"
+    validate_and_report "$jobs_subdir" "$mode"
 
     log_section "Completed Big Code MCP - Mode: $mode"
     echo "Job results: $jobs_subdir"
@@ -285,6 +288,8 @@ fi
 # ============================================
 # SUMMARY
 # ============================================
+print_validation_summary "$JOBS_BASE"
+
 log_section "Benchmark Complete"
 echo "Results saved to: $JOBS_BASE"
 echo ""

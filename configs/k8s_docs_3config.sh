@@ -193,6 +193,7 @@ extract_all_metrics() {
 # RUN BASELINE (no MCP)
 # ============================================
 if [ "$RUN_BASELINE" = true ]; then
+    ensure_fresh_token
     echo ""
     echo "[BASELINE] Starting 5-task baseline run..."
     echo ""
@@ -208,12 +209,14 @@ if [ "$RUN_BASELINE" = true ]; then
         2>&1 | tee "${JOBS_BASE}/baseline.log"
 
     extract_all_metrics "${JOBS_BASE}/baseline" "ccb_k8sdocs" "baseline"
+    validate_and_report "${JOBS_BASE}/baseline" "baseline"
 fi
 
 # ============================================
 # RUN MCP-Base (sourcegraph_base)
 # ============================================
 if [ "$RUN_BASE" = true ]; then
+    ensure_fresh_token
     echo ""
     echo "[MCP-Base] Starting 5-task MCP-Base run..."
     echo ""
@@ -230,12 +233,14 @@ if [ "$RUN_BASE" = true ]; then
         2>&1 | tee "${JOBS_BASE}/sourcegraph_base.log"
 
     extract_all_metrics "${JOBS_BASE}/sourcegraph_base" "ccb_k8sdocs" "sourcegraph_base"
+    validate_and_report "${JOBS_BASE}/sourcegraph_base" "sourcegraph_base"
 fi
 
 # ============================================
 # RUN MCP-Full (sourcegraph_full)
 # ============================================
 if [ "$RUN_FULL" = true ]; then
+    ensure_fresh_token
     echo ""
     echo "[MCP-Full] Starting 5-task MCP-Full run..."
     echo ""
@@ -252,7 +257,10 @@ if [ "$RUN_FULL" = true ]; then
         2>&1 | tee "${JOBS_BASE}/sourcegraph_full.log"
 
     extract_all_metrics "${JOBS_BASE}/sourcegraph_full" "ccb_k8sdocs" "sourcegraph_full"
+    validate_and_report "${JOBS_BASE}/sourcegraph_full" "sourcegraph_full"
 fi
+
+print_validation_summary "$JOBS_BASE"
 
 echo ""
 echo "=============================================="

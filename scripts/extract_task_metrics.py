@@ -83,10 +83,22 @@ def process_task_dir(
         if tokens.get("total_cost_usd") is not None and tm.cost_usd is None:
             tm.cost_usd = tokens["total_cost_usd"]
 
-    # Reward fallback from reward.txt
+    # Reward fallback from reward.txt or reward.json
     if tm.reward is None:
         reward_path = task_dir / "verifier" / "reward.txt"
         reward = extract_reward_from_file(reward_path)
+        if reward is None:
+            # Some benchmarks (e.g. repoqa) write reward.json with a "score" key
+            reward_json_path = task_dir / "verifier" / "reward.json"
+            if reward_json_path.is_file():
+                try:
+                    rdata = json.loads(reward_json_path.read_text())
+                    for key in ("reward", "score"):
+                        if key in rdata:
+                            reward = float(rdata[key])
+                            break
+                except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                    pass
         if reward is not None:
             tm.reward = reward
             tm.status = "passed" if reward > 0 else "failed"

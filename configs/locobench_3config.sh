@@ -208,6 +208,7 @@ run_mcp_task_batch() {
     local mode=$1
     local mcp_type=$2
     local jobs_subdir="${JOBS_BASE}/${mode}"
+    ensure_fresh_token
     mkdir -p "$jobs_subdir"
     for task_id in "${TASK_IDS[@]}"; do
         local task_path="${TASKS_DIR}/${task_id}"
@@ -231,6 +232,7 @@ run_mcp_task_batch() {
     done
     unset SOURCEGRAPH_REPO_NAME 2>/dev/null || true
     extract_all_metrics "$jobs_subdir" "ccb_locobench" "$mode"
+    validate_and_report "$jobs_subdir" "$mode"
 }
 
 # ============================================
@@ -259,6 +261,7 @@ if [ "$RUN_BASELINE" = true ]; then
     done
 
     extract_all_metrics "${BASELINE_JOBS}" "ccb_locobench" "baseline"
+    validate_and_report "${BASELINE_JOBS}" "baseline"
 fi
 
 # ============================================
@@ -284,6 +287,8 @@ if [ "$RUN_FULL" = true ]; then
 
     run_mcp_task_batch "sourcegraph_full" "sourcegraph_full"
 fi
+
+print_validation_summary "$JOBS_BASE"
 
 echo ""
 echo "=============================================="

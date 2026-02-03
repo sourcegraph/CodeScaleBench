@@ -379,6 +379,7 @@ run_benchmark() {
 
     # Extract per-task metrics
     extract_all_metrics "$jobs_dir" "$bm" "$mcp_mode"
+    validate_and_report "$jobs_dir" "$mcp_mode"
 }
 
 # ============================================
@@ -395,6 +396,8 @@ for bm in $(echo "${!BENCHMARK_COUNTS[@]}" | tr ' ' '\n' | sort); do
         run_benchmark "$bm" "sourcegraph_full" "sourcegraph_full"
     fi
 done
+
+print_validation_summary
 
 echo ""
 echo "=============================================="

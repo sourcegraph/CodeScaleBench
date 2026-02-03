@@ -134,6 +134,15 @@ for t in tasks:
         print(t['task_id'])
 ")
 
+# Also read task_dir for correct path resolution (task_id != directory name)
+readarray -t TASK_REL_DIRS < <(python3 -c "
+import json, os
+tasks = json.load(open('$SELECTION_FILE'))['tasks']
+for t in tasks:
+    if t['benchmark'] == 'ccb_repoqa':
+        print(os.path.relpath(t['task_dir'], 'ccb_repoqa/tasks'))
+")
+
 # Sourcegraph repo name mapping for RepoQA tasks
 # These override SOURCEGRAPH_REPO_NAME so the agent searches the correct repo
 declare -A TASK_SG_REPO_NAMES=(
@@ -211,12 +220,16 @@ run_task_batch() {
     local mcp_type=$2
     local jobs_subdir="${JOBS_BASE}/${mode}"
 
+    ensure_fresh_token
+
     log_section "Running RepoQA - Mode: $mode"
 
     mkdir -p "$jobs_subdir"
 
+    local idx=0
     for task_id in "${TASK_IDS[@]}"; do
-        local task_path="${TASKS_DIR}/${task_id}"
+        local task_path="${TASKS_DIR}/${TASK_REL_DIRS[$idx]}"
+        idx=$((idx + 1))
 
         if [ ! -d "$task_path" ]; then
             echo "ERROR: Task directory not found: $task_path"
@@ -252,6 +265,7 @@ run_task_batch() {
 
     # Extract metrics for all completed tasks in this mode
     extract_all_metrics "$jobs_subdir" "ccb_repoqa" "$mode"
+    validate_and_report "$jobs_subdir" "$mode"
 
     log_section "Completed RepoQA - Mode: $mode"
 }
@@ -270,6 +284,8 @@ fi
 if [ "$RUN_FULL" = true ]; then
     run_task_batch "sourcegraph_full" "sourcegraph_full"
 fi
+
+print_validation_summary "$JOBS_BASE"
 
 echo ""
 echo "=============================================="

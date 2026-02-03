@@ -68,11 +68,13 @@ def extract_task_from_result_json(
     reward = None
     verifier_result = data.get("verifier_result") or {}
     rewards = verifier_result.get("rewards") or {}
-    if "reward" in rewards:
-        try:
-            reward = float(rewards["reward"])
-        except (TypeError, ValueError):
-            pass
+    for key in ("reward", "score"):
+        if key in rewards:
+            try:
+                reward = float(rewards[key])
+            except (TypeError, ValueError):
+                continue
+            break
 
     # Status
     if data.get("exception_info"):

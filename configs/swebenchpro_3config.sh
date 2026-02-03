@@ -225,6 +225,7 @@ run_swebench_mcp_task_batch() {
     local mode=$1
     local mcp_type=$2
     local jobs_subdir="${JOBS_BASE}/${mode}"
+    ensure_fresh_token
     mkdir -p "$jobs_subdir"
     for task_id in "${TASK_IDS[@]}"; do
         local sg_repo=$(get_swebench_sg_repo "$task_id")
@@ -247,6 +248,7 @@ run_swebench_mcp_task_batch() {
     done
     unset SOURCEGRAPH_REPO_NAME 2>/dev/null || true
     extract_all_metrics "$jobs_subdir" "ccb_swebenchpro" "$mode"
+    validate_and_report "$jobs_subdir" "$mode"
 }
 
 # ============================================
@@ -268,6 +270,7 @@ if [ "$RUN_BASELINE" = true ]; then
         2>&1 | tee "${JOBS_BASE}/baseline.log"
 
     extract_all_metrics "${JOBS_BASE}/baseline" "ccb_swebenchpro" "baseline"
+    validate_and_report "${JOBS_BASE}/baseline" "baseline"
 fi
 
 # ============================================
@@ -293,6 +296,8 @@ if [ "$RUN_FULL" = true ]; then
 
     run_swebench_mcp_task_batch "sourcegraph_full" "sourcegraph_full"
 fi
+
+print_validation_summary "$JOBS_BASE"
 
 echo ""
 echo "=============================================="

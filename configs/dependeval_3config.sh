@@ -198,6 +198,8 @@ run_task_batch() {
     local mcp_type=$2
     local jobs_subdir="${JOBS_BASE}/${mode}"
 
+    ensure_fresh_token
+
     log_section "Running DependEval - Mode: $mode"
 
     echo "Configuration:"

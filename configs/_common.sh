@@ -104,3 +104,64 @@ ensure_fresh_token() {
         refresh_claude_token || echo "WARNING: Token refresh failed — runs may fail if token expires"
     fi
 }
+
+# ============================================
+# POST-TASK VALIDATION
+# ============================================
+# Accumulator for validation warnings across all batches in a run.
+VALIDATION_LOG=""
+
+validate_and_report() {
+    local jobs_dir=$1
+    local mode=$2
+    echo "Validating task results in $jobs_dir..."
+    local _val_output
+    _val_output=$(python3 "$(dirname "${BASH_SOURCE[0]}")/../scripts/validate_task_run.py" \
+        --jobs-dir "$jobs_dir" --config "$mode" 2>&1) || true
+    echo "$_val_output"
+    VALIDATION_LOG+="$_val_output"$'\n'
+}
+
+print_validation_summary() {
+    local run_dir="${1:-}"
+    if [ -z "$VALIDATION_LOG" ]; then
+        return
+    fi
+    echo ""
+    echo "=============================================="
+    echo "Validation Summary"
+    echo "=============================================="
+    echo "$VALIDATION_LOG"
+
+    # Aggregate all config-level flagged_tasks.json into a run-level file
+    if [ -n "$run_dir" ] && [ -d "$run_dir" ]; then
+        python3 -c "
+import json, glob, os, sys
+run_dir = sys.argv[1]
+all_flags = []
+configs_seen = []
+tasks_checked = 0
+for fp in sorted(glob.glob(os.path.join(run_dir, '*/flagged_tasks.json'))):
+    with open(fp) as f:
+        data = json.load(f)
+    configs_seen.append(data.get('config', ''))
+    tasks_checked += data.get('tasks_checked', 0)
+    all_flags.extend(data.get('flags', []))
+if not configs_seen:
+    sys.exit(0)
+summary = {
+    'configs': configs_seen,
+    'tasks_checked': tasks_checked,
+    'total_flags': len(all_flags),
+    'critical_count': sum(1 for f in all_flags if f['severity'] == 'CRITICAL'),
+    'warning_count': sum(1 for f in all_flags if f['severity'] == 'WARNING'),
+    'info_count': sum(1 for f in all_flags if f['severity'] == 'INFO'),
+    'flags': all_flags,
+}
+out = os.path.join(run_dir, 'flagged_tasks.json')
+with open(out, 'w') as f:
+    json.dump(summary, f, indent=2)
+print(f'Run-level summary: {out}')
+" "$run_dir" 2>&1 || true
+    fi
+}

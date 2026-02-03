@@ -213,6 +213,8 @@ run_task_batch() {
     local mcp_type=$2
     local jobs_subdir="${JOBS_BASE}/${mode}"
 
+    ensure_fresh_token
+
     log_section "Running PyTorch - Mode: $mode"
 
     mkdir -p "$jobs_subdir"
@@ -254,6 +256,7 @@ run_task_batch() {
 
     # Extract metrics for all completed tasks in this mode
     extract_all_metrics "$jobs_subdir" "ccb_pytorch" "$mode"
+    validate_and_report "$jobs_subdir" "$mode"
 
     log_section "Completed PyTorch - Mode: $mode"
 }
@@ -272,6 +275,8 @@ fi
 if [ "$RUN_FULL" = true ]; then
     run_task_batch "sourcegraph_full" "sourcegraph_full"
 fi
+
+print_validation_summary "$JOBS_BASE"
 
 echo ""
 echo "=============================================="
