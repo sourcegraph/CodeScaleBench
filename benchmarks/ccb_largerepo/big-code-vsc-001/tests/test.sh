@@ -1,9 +1,9 @@
 #!/bin/bash
-# Test script for VS Code scrollend event implementation
+# Test script for VS Code stale diagnostics after git branch switch
 # Verifies that:
-# 1. scrollend event fires in scroll handlers
-# 2. Tests pass
-# 3. No regressions in scroll performance
+# 1. Diagnostics-related files were modified
+# 2. TypeScript language features contain git/branch awareness
+# 3. No regressions in diagnostics pipeline
 
 set -e
 
