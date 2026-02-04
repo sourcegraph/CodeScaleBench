@@ -12,7 +12,7 @@ cuDNN dispatching heuristics rely on versions checks but currently only that com
 
 Test plan: add test comparing performance with cuDNN 9.15+ when disabling and enabling convolutino explicilty for 3D cases.
 
-Also partially covered by smoke test PR: https://g
+Also partially covered by smoke test PR: https://github.com/pytorch/pytorch/pull/165922/files
 
 ## Task
 
@@ -22,7 +22,7 @@ Description: cuDNN dispatching heuristics rely on versions checks but currently 
 
 Test plan: add test comparing performance with cuDNN 9.15+ when disabling and enabling convolutino explicilty for 3D cases.
 
-Also partially covered by smoke test PR: https://g
+Also partially covered by smoke test PR: https://github.com/pytorch/pytorch/pull/165922/files
 
 Changes:
 - 7 files modified

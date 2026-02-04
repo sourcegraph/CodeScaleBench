@@ -15,7 +15,9 @@ Previously, pruning based on shared memory limits only worked on NVIDIA GPUs (us
 
 ## Changes
 - `torch/csrc/cuda/Module.cpp`: Expose `shared_memory_per_block` property for ROCm builds
-- `torch/_C/__init__.pyi.in`: Add type hint for the new 
+- `torch/_C/__init__.pyi.in`: Add type hint for the new property
+- `torch/_inductor/template_heuristics/triton.py`: Update `_get_exceeding_shared_memory_checker()` to fall back to `shared_memory_per_block` when `shared_memory_per_block_optin` is unavailable
+- `test/inductor/test_triton_heuristics.py`: Enable `test_prune_configs_over_shared_memory_limit` for ROCm
 
 ## Task
 
@@ -28,7 +30,9 @@ Previously, pruning based on shared memory limits only worked on NVIDIA GPUs (us
 
 ## Changes
 - `torch/csrc/cuda/Module.cpp`: Expose `shared_memory_per_block` property for ROCm builds
-- `torch/_C/__init__.pyi.in`: Add type hint for the new 
+- `torch/_C/__init__.pyi.in`: Add type hint for the new property
+- `torch/_inductor/template_heuristics/triton.py`: Update `_get_exceeding_shared_memory_checker()` to fall back to `shared_memory_per_block` when `shared_memory_per_block_optin` is unavailable
+- `test/inductor/test_triton_heuristics.py`: Enable `test_prune_configs_over_shared_memory_limit` for ROCm
 
 Changes:
 - 4 files modified
