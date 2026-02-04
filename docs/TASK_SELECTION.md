@@ -83,3 +83,38 @@ All PyTorch cross-module tasks. Selection prioritizes hard difficulty, then task
 ### Small Benchmarks (all selected)
 ccb_largerepo (4), ccb_k8sdocs (5), ccb_tac (8), ccb_sweperf (3), ccb_crossrepo (5) -- all tasks selected due to small size.
 
+## Difficulty Calibration Methodology
+
+Difficulty labels were calibrated per-benchmark using objective metrics rather than uniform assignment. Each benchmark uses the metric most relevant to its task structure.
+
+### Per-Benchmark Rules
+
+| Benchmark | Metric | Thresholds |
+|-----------|--------|------------|
+| ccb_swebenchpro | Files changed in solution patch | 1-3 files → medium, 4-10 → hard, 11+ → very_hard |
+| ccb_pytorch | LOC changed (additions + deletions) | <50 LOC → medium, 50-200 → hard, >200 → very_hard, 110+ files or 3500+ LOC → critical |
+| ccb_locobench | Task category + context size | bug_investigation/cross_file_refactoring → hard, architectural_understanding with >1M tokens → expert |
+| ccb_repoqa | Source file count in target repo | <50 source files → medium, >100 source files → hard |
+| ccb_dibench | Uniform (moderate patch complexity) | All tasks → medium |
+| ccb_k8sdocs | Manual assessment | 1 medium, 4 hard |
+| ccb_largerepo | Uniform (all require large-repo navigation) | All tasks → hard |
+| ccb_crossrepo | Manual assessment | 1 easy, 4 hard |
+| ccb_tac | Manual assessment | 6 medium, 2 hard |
+| ccb_sweperf | Manual assessment | 2 medium, 1 hard |
+
+### The "critical" Difficulty Tier
+
+Two PyTorch tasks (sgt-008 and sgt-025) are classified as "critical" — a tier above "very_hard" reserved for release-engineering-scale changes. sgt-008 modifies 110 files and sgt-025 changes 3526 LOC. These tasks also have no time limit, as they exceed what can be reasonably completed within a fixed timeout.
+
+### Difficulty Distribution
+
+| Difficulty | Count | % |
+|------------|-------|---|
+| easy | 1 | 0.9% |
+| medium | 22 | 19.0% |
+| hard | 58 | 50.0% |
+| very_hard | 24 | 20.7% |
+| critical | 2 | 1.7% |
+| expert | 9 | 7.8% |
+| **Total** | **116** | **100%** |
+
