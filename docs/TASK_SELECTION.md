@@ -2,7 +2,7 @@
 
 ## Overview
 
-Selected **116 tasks** from 835 available across 10 benchmarks, stratified by SDLC phase with MCP benefit scoring.
+Selected **119 tasks** from 835 available across 11 benchmarks, stratified by SDLC phase with MCP benefit scoring.
 
 ## SDLC Phase Coverage
 
@@ -13,7 +13,7 @@ Selected **116 tasks** from 835 available across 10 benchmarks, stratified by SD
 | Implementation (feature) | 16 | ccb_largerepo, ccb_pytorch, ccb_tac, ccb_dibench |
 | Implementation (bug fix) | 51 | ccb_pytorch, ccb_locobench, ccb_swebenchpro, ccb_crossrepo |
 | Implementation (refactoring) | 15 | ccb_locobench, ccb_crossrepo |
-| Testing & QA | 5 | ccb_sweperf, ccb_tac, ccb_crossrepo |
+| Testing & QA | 8 | ccb_sweperf, ccb_tac, ccb_crossrepo, ccb_codereview |
 | Documentation | 5 | ccb_k8sdocs |
 | Maintenance | 2 | ccb_tac |
 
@@ -29,6 +29,7 @@ Selected **116 tasks** from 835 available across 10 benchmarks, stratified by SD
 | ccb_sweperf | 3 | 3 | All selected (small benchmark) |
 | ccb_tac | 8 | 8 | All selected (small benchmark) |
 | ccb_crossrepo | 5 | 5 | All selected (small benchmark) |
+| ccb_codereview | 3 | 3 | All selected (small benchmark) |
 | ccb_dibench | 387 | 8 | 2 per language (python, rust, javascript, csharp), moderate patch complexity |
 
 ## Language Distribution
@@ -81,5 +82,5 @@ All PyTorch cross-module tasks. Selection prioritizes hard difficulty, then task
 2 per language (Python, Rust, JavaScript, C#) from the 387 regular-difficulty instances. Selected for single build file, moderate patch size (3-12 dependency additions), and well-known repositories. Tasks use syntax + dependency presence validators instead of full CI/CD execution.
 
 ### Small Benchmarks (all selected)
-ccb_largerepo (4), ccb_k8sdocs (5), ccb_tac (8), ccb_sweperf (3), ccb_crossrepo (5) -- all tasks selected due to small size.
+ccb_largerepo (4), ccb_k8sdocs (5), ccb_tac (8), ccb_sweperf (3), ccb_crossrepo (5), ccb_codereview (3) -- all tasks selected due to small size.
 
