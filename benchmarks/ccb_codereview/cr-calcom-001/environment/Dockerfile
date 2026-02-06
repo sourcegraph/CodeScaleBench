@@ -25,14 +25,10 @@ RUN git clone --filter=blob:none --no-checkout https://github.com/calcom/cal.com
     git config user.name "Agent"
 
 # Inject defects into the codebase
-COPY environment/inject_defects.sh /tmp/inject_defects.sh
+COPY inject_defects.sh /tmp/inject_defects.sh
 RUN chmod +x /tmp/inject_defects.sh && /tmp/inject_defects.sh && rm /tmp/inject_defects.sh
 
-# Create directories for verifier
+# Create directories for verifier (tests uploaded at runtime by Harbor verifier)
 RUN mkdir -p /workspace/tests /logs/verifier
-
-# Copy ground truth files to /workspace/tests/ (agent should not see these directly)
-COPY tests/ /workspace/tests/
-RUN chmod +x /workspace/tests/test.sh
 
 WORKDIR /workspace

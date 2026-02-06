@@ -46,7 +46,7 @@ fi
 # 50% detection F1 (precision × recall of reported defects)
 # 50% fix score (proportion of defects with correct code fixes)
 
-EXPECTED_DEFECTS="/workspace/tests/expected_defects.json"
+EXPECTED_DEFECTS="/tests/expected_defects.json"
 REVIEW_JSON="/workspace/review.json"
 
 FINAL_SCORE=$(python3 - "$EXPECTED_DEFECTS" "$REVIEW_JSON" <<'PYEOF'

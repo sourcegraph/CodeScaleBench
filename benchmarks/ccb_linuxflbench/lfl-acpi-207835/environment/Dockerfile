@@ -4,6 +4,5 @@
 # See benchmarks/ccb_linuxflbench/README.md for details.
 FROM ccb-linux-base:v5.6.7
 
-# Copy task-specific test files (thin layer — rebuilds are fast)
-COPY tests/ /workspace/tests/
-RUN chmod +x /workspace/tests/test.sh
+# Tests are uploaded at runtime by Harbor verifier to /tests/
+# No additional build steps needed — base image has everything.
