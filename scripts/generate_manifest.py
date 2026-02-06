@@ -113,7 +113,7 @@ def extract_task_info(task_entry: dict) -> dict:
     exception = data.get("exception_info")
     verifier = data.get("verifier_result") or {}
     rewards = verifier.get("rewards") or {}
-    reward = rewards.get("reward") if rewards.get("reward") is not None else rewards.get("score")
+    reward = rewards.get("reward")
 
     if exception is not None:
         status = "errored"
