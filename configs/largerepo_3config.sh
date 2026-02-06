@@ -137,10 +137,10 @@ for t in tasks:
 # Sourcegraph repo name mapping for Big Code tasks
 # These override SOURCEGRAPH_REPO_NAME so the agent searches the correct repo
 declare -A TASK_SG_REPO_NAMES=(
-    ["big-code-k8s-001"]="sg-benchmarks/kubernetes--latest"
-    ["big-code-servo-001"]="sg-benchmarks/servo--latest"
-    ["big-code-trt-001"]="sg-benchmarks/TensorRT-LLM--latest"
-    ["big-code-vsc-001"]="sg-benchmarks/vscode--latest"
+    ["big-code-k8s-001"]="sg-benchmarks/kubernetes--7c48c2bd"
+    ["big-code-servo-001"]="sg-benchmarks/servo--be6a2f99"
+    ["big-code-trt-001"]="sg-benchmarks/TensorRT-LLM--b98f3fca"
+    ["big-code-vsc-001"]="sg-benchmarks/vscode--138f619c"
 )
 
 # Derive short model name for run directory (matches V2 id_generator convention)
