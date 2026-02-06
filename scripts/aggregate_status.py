@@ -63,6 +63,17 @@ DIR_PREFIX_TO_SUITE = {
 
 CONFIGS = ["baseline", "sourcegraph_base", "sourcegraph_full"]
 
+SELECTION_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "selected_benchmark_tasks.json"
+
+# Benchmarks excluded from gap analysis (no run configs or intentionally skipped)
+GAP_EXCLUDED_SUITES = {"ccb_dependeval"}
+
+# Configs intentionally missing for certain suites (e.g., DIBench MCP archived)
+GAP_EXCLUDED_SUITE_CONFIGS = {
+    ("ccb_dibench", "sourcegraph_base"),
+    ("ccb_dibench", "sourcegraph_full"),
+}
+
 
 def should_skip(dirname: str) -> bool:
     return any(pat in dirname for pat in SKIP_PATTERNS)
@@ -212,6 +223,7 @@ def scan_all_tasks(
     config_filter: str | None = None,
     since_minutes: int | None = None,
     failures_only: bool = False,
+    include_gaps: bool = False,
 ) -> dict:
     """Scan runs/official/ and classify all tasks.
 
@@ -223,7 +235,7 @@ def scan_all_tasks(
     error_summary = defaultdict(lambda: {"count": 0, "label": "", "severity": ""})
 
     if not RUNS_DIR.exists():
-        return _build_output(tasks, totals, by_suite, error_summary)
+        return _build_output(tasks, totals, by_suite, error_summary, include_gaps=include_gaps)
 
     now = time.time()
     since_cutoff = None
@@ -281,7 +293,7 @@ def scan_all_tasks(
                     error_summary[fp_id]["label"] = fp["label"]
                     error_summary[fp_id]["severity"] = fp["severity"]
 
-    return _build_output(tasks, totals, by_suite, error_summary)
+    return _build_output(tasks, totals, by_suite, error_summary, include_gaps=include_gaps)
 
 
 def _iter_task_dirs(config_path: Path):
@@ -313,9 +325,127 @@ def _iter_task_dirs(config_path: Path):
             yield entry
 
 
-def _build_output(tasks, totals, by_suite, error_summary) -> dict:
-    """Assemble the final output dict."""
+def _match_task_id_to_run_name(task_id: str, run_names: set[str]) -> str | None:
+    """Match a full task_id from selection config to a truncated run task_name.
+
+    Run task names are derived from directory names which may be truncated.
+    Handles:
+    - Bidirectional prefix matching
+    - ccb_ prefix stripping (selection uses ccb_repoqa-*, runs use repoqa-*)
+    - Gap-fill hyphen vs underscore naming variants
+    """
+    if task_id in run_names:
+        return task_id
+
+    # Generate candidate forms of the task_id
+    candidates = [task_id]
+
+    # Strip ccb_{benchmark}- prefix (e.g., ccb_repoqa-foo → repoqa-foo)
+    if task_id.startswith("ccb_"):
+        stripped = task_id[4:]  # remove "ccb_"
+        candidates.append(stripped)
+
+    # Gap-fill naming: hyphens vs double underscores
+    # e.g., instance_nodebb-nodebb-76c6e3028 vs instance_nodebb__nodebb-76c6e302
+    for c in list(candidates):
+        if "-" in c and "__" not in c:
+            # Try converting first hyphen after "instance_" to "__"
+            if c.startswith("instance_"):
+                rest = c[len("instance_"):]
+                parts = rest.split("-", 1)
+                if len(parts) == 2:
+                    candidates.append(f"instance_{parts[0]}__{parts[1]}")
+
+    for rn in run_names:
+        for cand in candidates:
+            if cand.startswith(rn) or rn.startswith(cand):
+                return rn
+    return None
+
+
+def compute_gap_analysis(tasks: list[dict]) -> dict | None:
+    """Cross-reference expected tasks from selection config against actual runs.
+
+    Returns a gap_analysis dict with missing tasks per suite/config, or None
+    if the selection config is unavailable.
+    """
+    if not SELECTION_CONFIG.is_file():
+        return None
+
+    try:
+        selection = json.loads(SELECTION_CONFIG.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    expected_tasks = selection.get("tasks", [])
+    if not expected_tasks:
+        return None
+
+    # Build lookup of actual run task_names per (suite, config)
+    actual_by_key: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for t in tasks:
+        actual_by_key[(t["suite"], t["config"])].add(t["task_name"])
+
+    # Build expected tasks per suite
+    expected_by_suite: dict[str, list[dict]] = defaultdict(list)
+    for t in expected_tasks:
+        expected_by_suite[t["benchmark"]].append(t)
+
+    gaps_by_suite: dict[str, dict] = {}
+    total_expected = 0
+    total_present = 0
+    total_missing = 0
+
+    for suite in sorted(expected_by_suite.keys()):
+        if suite in GAP_EXCLUDED_SUITES:
+            continue
+
+        suite_expected = expected_by_suite[suite]
+        suite_info: dict = {"expected": len(suite_expected), "configs": {}}
+
+        for config in CONFIGS:
+            if (suite, config) in GAP_EXCLUDED_SUITE_CONFIGS:
+                continue
+
+            run_names = actual_by_key.get((suite, config), set())
+            missing = []
+            present_count = 0
+
+            for expected_task in suite_expected:
+                task_id = expected_task["task_id"]
+                match = _match_task_id_to_run_name(task_id, run_names)
+                if match is None:
+                    missing.append(task_id)
+                else:
+                    present_count += 1
+
+            total_expected += len(suite_expected)
+            total_present += present_count
+            total_missing += len(missing)
+
+            suite_info["configs"][config] = {
+                "present": present_count,
+                "missing_count": len(missing),
+                "missing_task_ids": missing,
+            }
+
+        if any(
+            cfg_info["missing_count"] > 0
+            for cfg_info in suite_info["configs"].values()
+        ):
+            gaps_by_suite[suite] = suite_info
+
     return {
+        "total_expected_task_runs": total_expected,
+        "total_present": total_present,
+        "total_missing": total_missing,
+        "suites_with_gaps": gaps_by_suite,
+    }
+
+
+def _build_output(tasks, totals, by_suite, error_summary, include_gaps: bool = False) -> dict:
+    """Assemble the final output dict."""
+    out = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "totals": dict(totals),
         "by_suite": {
@@ -328,6 +458,13 @@ def _build_output(tasks, totals, by_suite, error_summary) -> dict:
         "error_summary": dict(error_summary),
         "tasks": tasks,
     }
+
+    if include_gaps:
+        gap = compute_gap_analysis(tasks)
+        if gap is not None:
+            out["gap_analysis"] = gap
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +564,19 @@ def format_table(output: dict) -> str:
             lines.append(f"  {info['count']:>3d}x  [{info['severity']:>8s}]  {fp_id}: {info['label']}")
         lines.append("")
 
+    # Gap analysis
+    gap = output.get("gap_analysis")
+    if gap and gap["total_missing"] > 0:
+        lines.append(f"GAP ANALYSIS: {gap['total_missing']} missing task runs "
+                      f"(of {gap['total_expected_task_runs']} expected)")
+        for suite, info in sorted(gap["suites_with_gaps"].items()):
+            for cfg, cfg_info in sorted(info["configs"].items()):
+                n = cfg_info["missing_count"]
+                if n > 0:
+                    short_cfg = cfg.replace("sourcegraph_", "SG_")
+                    lines.append(f"  {suite:25s} {short_cfg:12s} {n:>3d} missing")
+        lines.append("")
+
     # Task details (only non-pass or if few tasks)
     non_pass = [t for t in output["tasks"] if t["status"] != "completed_pass"]
     if non_pass:
@@ -478,6 +628,10 @@ def parse_args():
         help="Write per-task status.json files alongside result.json",
     )
     parser.add_argument(
+        "--gap-analysis", action="store_true",
+        help="Include gap analysis: cross-reference expected tasks from selection config against actual runs",
+    )
+    parser.add_argument(
         "--watch", action="store_true",
         help="Continuous re-scan mode",
     )
@@ -496,6 +650,7 @@ def run_once(args) -> dict:
         config_filter=args.config,
         since_minutes=args.since,
         failures_only=args.failures_only,
+        include_gaps=args.gap_analysis,
     )
 
     if args.write_status:
