@@ -10,11 +10,6 @@
 Debug a broken development environment by navigating to the repository to find
 requirements documentation and fixing version mismatches.
 
-**Why this benefits from MCP:**
-- Finding requirements documentation in repository
-- Understanding version constraints and compatibility
-- Cross-referencing installed vs required versions
-- Navigating documentation to find solutions
 
 ## Task
 

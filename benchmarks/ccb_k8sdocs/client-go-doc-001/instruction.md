@@ -9,7 +9,7 @@
 
 Generate comprehensive package documentation (`doc.go`) for the `staging/src/k8s.io/client-go` package in Kubernetes. This is the official Go client library for the Kubernetes API. The existing documentation has been stripped from the workspace. You must infer the documentation entirely from the source code.
 
-**Why this requires cross-package context:** client-go is a top-level library that integrates 6+ sub-packages (kubernetes, dynamic, discovery, rest, tools/cache, tools/clientcmd). Understanding its full scope requires exploring how these sub-packages interact, what patterns they enable (informers, listers, workqueues), and how they connect to the API server. Sourcegraph search provides this cross-package context efficiently.
+**Why this requires cross-package context:** client-go is a top-level library that integrates 6+ sub-packages (kubernetes, dynamic, discovery, rest, tools/cache, tools/clientcmd). Understanding its full scope requires exploring how these sub-packages interact, what patterns they enable (informers, listers, workqueues), and how they connect to the API server.
 
 ## Task
 

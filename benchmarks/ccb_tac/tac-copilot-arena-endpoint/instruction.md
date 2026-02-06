@@ -10,11 +10,6 @@
 Clone an API server codebase, understand the existing endpoint implementation patterns,
 and add a new mock endpoint that mirrors an existing endpoint's response format.
 
-**Why this benefits from MCP:**
-- Understanding existing endpoint implementation patterns
-- Finding how the `create_pair` endpoint works
-- Understanding the API structure and return formats
-- Navigating the codebase to find relevant files
 
 ## Task
 
@@ -41,5 +36,4 @@ and add a new mock endpoint that mirrors an existing endpoint's response format.
 ## Notes
 
 - This task tests understanding of existing API patterns
-- MCP helps quickly understand the create_pair implementation
 - Deterministic grading via API response validation

@@ -25,7 +25,7 @@ Changes needed:
 - 78 additions, 16 deletions
 
 Required tasks (ALL MUST BE COMPLETED):
-1. Understand the issue being fixed (use Sourcegraph MCP if available)
+1. Understand the issue being fixed
 2. Review the solution in the merged PR
 3. **IMPLEMENT THE FIX** in the actual code files (especially NCCLUtils.cpp and NCCLUtils.hpp)
 4. Verify: run "make test" successfully

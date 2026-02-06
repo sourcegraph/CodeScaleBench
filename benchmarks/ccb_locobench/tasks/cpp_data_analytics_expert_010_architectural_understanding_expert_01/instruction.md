@@ -60,8 +60,7 @@ An expert developer would approach this task systematically:
 ## Instructions
 
 1. Explore the codebase in `/app/project/` to understand the existing implementation
-2. Use MCP tools for efficient code navigation and understanding
-3. **IMPORTANT**: Write your solution to `/logs/agent/solution.md` (this path is required for verification)
+2. **IMPORTANT**: Write your solution to `/logs/agent/solution.md` (this path is required for verification)
 
 Your response should:
 - Be comprehensive and address all aspects of the task
@@ -69,18 +68,6 @@ Your response should:
 - Provide concrete recommendations or implementations as requested
 - Consider the architectural implications of your solution
 
-## MCP Search Instructions (if using Sourcegraph/Deep Search)
-
-When using MCP tools to search the codebase, you MUST specify the correct repository:
-
-**Repository**: `sg-benchmarks/locobench-cpp_data_analytics_expert_010`
-
-Example MCP queries:
-- "In sg-benchmarks/locobench-cpp_data_analytics_expert_010, where is the main entry point?"
-- "Search sg-benchmarks/locobench-cpp_data_analytics_expert_010 for error handling code"
-- "In sg-benchmarks/locobench-cpp_data_analytics_expert_010, how does the authentication flow work?"
-
-**IMPORTANT**: Always include the full repository path `sg-benchmarks/locobench-cpp_data_analytics_expert_010` in your MCP search queries to ensure you're searching the correct codebase.
 
 ## Output Format
 

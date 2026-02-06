@@ -9,7 +9,7 @@
 
 Generate comprehensive package documentation (`doc.go`) for the `pkg/kubelet/cm` (Container Manager) package in Kubernetes. The existing documentation has been stripped from the workspace. You must infer the documentation entirely from the source code.
 
-**Why this requires MCP:** The container manager interacts with many other kubelet subsystems. Understanding its full scope requires searching across the codebase for how it's used, what interfaces it implements, and how subpackages relate. Sourcegraph search on the `kubernetes-stripped` repository provides this cross-package context efficiently.
+**Why this requires cross-package context:** The container manager interacts with many other kubelet subsystems. Understanding its full scope requires searching across the codebase for how it's used, what interfaces it implements, and how subpackages relate.
 
 ## Task
 

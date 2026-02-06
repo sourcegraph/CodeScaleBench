@@ -24,16 +24,10 @@ You are searching a large codebase for a specific function based on its behavior
 This function **cannot be found by searching for its name** because the name is not provided. You must:
 
 1. **Understand the behavior** described above
-2. **Use Sourcegraph MCP semantic search** to find functions matching this behavior
+2. **Search the codebase** to find functions matching this behavior
 3. **Explore the code** using call graphs and references
 4. **Narrow down** candidates until you find the exact function
 
-### Sourcegraph MCP Tools You Should Use
-
-- **`search_codebase`**: Semantic search for functions by behavior
-- **`get_definition`**: Look up function definitions
-- **`get_references`**: Find where functions are called
-- **`get_call_graph`**: Understand function call relationships
 
 ## Output Format
 
@@ -82,4 +76,3 @@ Replace:
 - **Partial** (0.3-0.6): Close approximation
 - **Incorrect** (0.0): Wrong function entirely
 
-Use Sourcegraph MCP liberally. That's the point of this task.

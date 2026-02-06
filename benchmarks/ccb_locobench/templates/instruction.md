@@ -44,25 +44,14 @@
 - Then document your changes in solution.md
 - Your actual code modifications will be evaluated
 
-### Step 2: Use Deep Search MCP for Code Discovery
-
-You have access to the deepsearch MCP server. Use it for intelligent code search:
-
-**Repository**: {github_org}/{github_repo}
-
-When making Deep Search queries, ALWAYS reference the repository:
-- "In {github_org}/{github_repo}, where is the authentication logic?"
-- "Search {github_org}/{github_repo} for error handling patterns"
-- "In {github_org}/{github_repo}, how does the data flow from X to Y?"
-
-### Step 3: Explore the Codebase
+### Step 2: Explore the Codebase
 
 The repository is mounted at /app/project/. Use file exploration tools to:
 - Understand directory structure
 - Read relevant source files
 - Trace dependencies and relationships
 
-### Step 4: Write Your Solution
+### Step 3: Write Your Solution
 
 **OUTPUT FILE**: /logs/agent/solution.md
 
