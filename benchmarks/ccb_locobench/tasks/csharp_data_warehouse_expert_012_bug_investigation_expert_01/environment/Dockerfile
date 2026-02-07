@@ -30,6 +30,9 @@ RUN mkdir -p /app /logs /workspace /installed-agent &&     chmod 777 /logs /work
 # Copy project files
 COPY project /app/project
 
+# Make project writable for agent user (code modification tasks)
+RUN chmod -R 777 /app/project
+
 # Install Node.js 22 and Claude Code globally
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - &&     apt-get install -y nodejs &&     npm install -g @anthropic-ai/claude-code@latest &&     rm -rf /var/lib/apt/lists/*
 

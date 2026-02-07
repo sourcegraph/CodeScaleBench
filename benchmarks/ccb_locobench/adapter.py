@@ -431,6 +431,9 @@ RUN mkdir -p /app /logs /workspace /tests
 # Copy project files
 COPY project /app/project
 
+# Make project writable for agent user (code modification tasks)
+RUN chmod -R 777 /app/project
+
 WORKDIR /app
 
 CMD ["/bin/bash"]

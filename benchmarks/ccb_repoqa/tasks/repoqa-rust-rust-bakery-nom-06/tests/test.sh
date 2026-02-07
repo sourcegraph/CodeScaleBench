@@ -66,9 +66,14 @@ try:
     with open('/tests/ground_truth.json') as f:
         ground_truth = json.load(f)
     
-    # Load agent output
+    # Load agent output (strip markdown code fences if agent wrapped JSON)
+    import re
     with open('/app/solution.json') as f:
-        agent_output = json.load(f)
+        raw = f.read()
+    m = re.search(r'```(?:json)?\s*\n(.*?)```', raw, re.DOTALL)
+    if m:
+        raw = m.group(1).strip()
+    agent_output = json.loads(raw)
     
     # Verify
     verifier = SemanticRetrievalQAVerifier(ground_truth)

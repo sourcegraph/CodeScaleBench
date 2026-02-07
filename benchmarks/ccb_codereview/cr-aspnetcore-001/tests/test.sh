@@ -63,11 +63,19 @@ num_expected = len(expected)
 
 # ── Detection scoring ────────────────────────────────────
 # Parse agent's review.json — match by file path
+# Strip markdown code fences if the agent wrapped JSON in ```json blocks
+import re
+def strip_code_fences(text):
+    m = re.search(r'```(?:json)?\s*\n(.*?)```', text, re.DOTALL)
+    return m.group(1).strip() if m else text.strip()
+
 reported = []
 if os.path.isfile(review_path):
     try:
         with open(review_path) as f:
-            reported = json.load(f)
+            raw = f.read()
+        raw = strip_code_fences(raw)
+        reported = json.loads(raw)
         if not isinstance(reported, list):
             reported = []
     except (json.JSONDecodeError, ValueError):

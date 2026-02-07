@@ -59,6 +59,9 @@ RUN mkdir -p /app /logs /workspace
 # Copy project files (project/ is inside environment/ directory)
 COPY project /app/project
 
+# Make project writable for agent user (code modification tasks)
+RUN chmod -R 777 /app/project
+
 # Note: test files are NOT copied here - Harbor uploads them to /tests
 # at verification time using docker compose cp
 
