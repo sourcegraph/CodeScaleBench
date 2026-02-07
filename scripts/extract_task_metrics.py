@@ -80,17 +80,18 @@ def process_task_dir(
     if tm.task_id == "unknown":
         tm.task_id = _extract_task_id(task_dir.name)
 
-    # Token fallback from transcript
-    if tm.input_tokens is None:
-        transcript_path = task_dir / "agent" / "claude-code.txt"
-        tokens = extract_task_tokens_from_transcript(transcript_path)
-        if tokens.get("input_tokens") is not None:
-            tm.input_tokens = tokens["input_tokens"]
-            tm.output_tokens = tokens["output_tokens"]
-            tm.cache_creation_tokens = tokens.get("cache_creation_input_tokens")
-            tm.cache_read_tokens = tokens.get("cache_read_input_tokens")
-        if tokens.get("total_cost_usd") is not None and tm.cost_usd is None:
-            tm.cost_usd = tokens["total_cost_usd"]
+    # Token data: prefer transcript (actual API usage) over result.json
+    # (result.json n_input_tokens can include cumulative MCP result tokens,
+    # inflating counts by 100x for MCP-enabled runs)
+    transcript_path = task_dir / "agent" / "claude-code.txt"
+    tokens = extract_task_tokens_from_transcript(transcript_path)
+    if tokens.get("input_tokens") is not None:
+        tm.input_tokens = tokens["input_tokens"]
+        tm.output_tokens = tokens["output_tokens"]
+        tm.cache_creation_tokens = tokens.get("cache_creation_input_tokens")
+        tm.cache_read_tokens = tokens.get("cache_read_input_tokens")
+    if tokens.get("total_cost_usd") is not None:
+        tm.cost_usd = tokens["total_cost_usd"]
 
     # Reward fallback from reward.txt or reward.json
     if tm.reward is None:
