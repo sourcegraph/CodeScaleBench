@@ -149,14 +149,14 @@ declare -A TASK_SG_REPO_NAMES=(
     ["sgt-002"]="sg-benchmarks/pytorch--ca246612"
     ["sgt-003"]="sg-benchmarks/pytorch--d18007a1"
     ["sgt-005"]="sg-benchmarks/pytorch--ca246612"
-    ["sgt-007"]="sg-benchmarks/pytorch--a61b434d"
+    ["sgt-008"]="sg-benchmarks/pytorch--863edc78"
     ["sgt-009"]="sg-benchmarks/pytorch--863edc78"
     ["sgt-010"]="sg-benchmarks/pytorch--5811a8d7"
+    ["sgt-012"]="sg-benchmarks/pytorch--e3e93c71"
     ["sgt-014"]="sg-benchmarks/pytorch--cbe1a35d"
     ["sgt-016"]="sg-benchmarks/pytorch--cbe1a35d"
-    ["sgt-017"]="sg-benchmarks/pytorch--cbe1a35d"
     ["sgt-021"]="sg-benchmarks/pytorch--cbe1a35d"
-    ["sgt-024"]="sg-benchmarks/pytorch--cbe1a35d"
+    ["sgt-025"]="sg-benchmarks/pytorch--e8ca8cc3"
 )
 
 # Derive short model name for run directory (matches V2 id_generator convention)

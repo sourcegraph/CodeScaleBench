@@ -74,8 +74,22 @@ See [AGENTS.md](AGENTS.md) for parallel execution details and multi-account setu
 Uses Claude Max subscription OAuth tokens (not API keys).
 
 - Credentials: `~/.claude/.credentials.json` (single account) or `~/.claude-homes/accountN/.claude/.credentials.json` (multi-account)
-- Auto-refresh: 30-minute margin before expiry
+- Auto-refresh: 30-minute margin before expiry via `refresh_claude_token()` in `_common.sh`
 - Multi-account: Round-robin distribution across Max-plan accounts for parallel runs
+
+### Headless Token Refresh
+
+When automated token refresh fails (e.g., Cloudflare 1010 block), use the headless login script to re-authenticate via browser:
+
+```bash
+# Refresh all accounts (account1, account2, account3)
+python3 scripts/headless_login.py --all-accounts
+
+# Refresh a single account
+python3 scripts/headless_login.py --home ~/.claude-homes/account1
+```
+
+The script generates an OAuth URL — open it in your local browser, log in, paste the authorization code back into the terminal. Skip account2 (team plan, not used) by entering a blank code.
 
 ## Key Commands
 
