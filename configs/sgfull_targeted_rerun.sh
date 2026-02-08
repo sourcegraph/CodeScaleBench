@@ -1,6 +1,12 @@
 #!/bin/bash
 # Targeted SG_full rerun for failed tasks only (beads-8t7)
 # Sequences: SWE-bench Pro + RepoQA first, then K8s, then PyTorch
+#
+# Guardrails:
+#   - Canary probe on batch 1 (first task validates infra before remaining 11)
+#   - Token health check before each batch (stops on unrecoverable auth)
+#   - Post-batch canary validation on single-task batches (2 & 3)
+#   - Subscription-only auth enforcement
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,19 +20,35 @@ if [ -f ~/evals/.env.local ]; then
     source ~/evals/.env.local
 fi
 
+# Subscription-only auth
+enforce_subscription_mode
+
 AGENT_PATH="agents.claude_baseline_agent:BaselineClaudeCodeAgent"
 MODEL="anthropic/claude-opus-4-6"
 TIMEOUT_MULTIPLIER=10
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
+# Enable canary by default for targeted reruns
+CANARY_ENABLED=${CANARY_ENABLED:-true}
+
 setup_dual_accounts
-ensure_fresh_token_all
+
+# Pre-flight token health
+if ! check_token_health; then
+    echo ""
+    echo "FATAL: Token health check failed. Run:"
+    echo "  python3 scripts/headless_login.py --all-accounts"
+    exit 1
+fi
 
 echo "=============================================="
 echo "Targeted SG_full Rerun (beads-8t7)"
 echo "=============================================="
 echo "Parallel jobs: ${PARALLEL_JOBS}"
+echo "Canary: ${CANARY_ENABLED}"
 echo ""
+
+BATCH_RESULTS=()
 
 # ============================================
 # BATCH 1: SWE-bench Pro (11 failed tasks) + RepoQA (1 task)
@@ -118,8 +140,22 @@ _batch1_run_single() {
     fi
 }
 
-run_tasks_parallel ALL_BATCH1_TASKS _batch1_run_single || true
+# Canary: first task probes infra, remaining 11 only run if it's clean
+run_canary_then_batch ALL_BATCH1_TASKS _batch1_run_single "$SWEPRO_JOBS" "sourcegraph_full"
+batch1_exit=$?
 
+if [ $batch1_exit -ne 0 ] && [ "$CANARY_ENABLED" = "true" ]; then
+    echo "BATCH 1 BLOCKED by canary — stopping all batches"
+    BATCH_RESULTS+=("batch1:blocked")
+    echo ""
+    echo "=============================================="
+    echo "Targeted rerun ABORTED (canary stop signal)"
+    echo "=============================================="
+    echo "Check: ${SWEPRO_JOBS}/canary_verdict.json"
+    exit 1
+fi
+
+BATCH_RESULTS+=("batch1:completed")
 echo ""
 echo ">>> BATCH 1 COMPLETE"
 echo ""
@@ -129,42 +165,82 @@ echo ""
 # ============================================
 echo ">>> BATCH 2: K8s Docs (5 tasks)"
 echo ""
-ensure_fresh_token_all
 
-bash configs/k8s_docs_3config.sh --full-only
+# Token health gate
+if ! check_token_health; then
+    echo "BLOCKED: Token health check failed before K8s Docs batch"
+    BATCH_RESULTS+=("batch2:blocked_auth")
+    echo "Skipping remaining batches."
+else
+    CANARY_ENABLED=$CANARY_ENABLED bash configs/k8s_docs_3config.sh --full-only || true
 
-echo ""
-echo ">>> BATCH 2 COMPLETE"
-echo ""
+    # Validate K8s result (k8s uses single harbor run, so check post-hoc)
+    K8S_LATEST=$(ls -td runs/official/k8s_docs_opus_*/sourcegraph_full 2>/dev/null | head -1)
+    if [ -n "$K8S_LATEST" ]; then
+        if validate_canary_result "$K8S_LATEST" "sourcegraph_full"; then
+            BATCH_RESULTS+=("batch2:completed")
+        else
+            echo "WARNING: K8s Docs had systemic issues (see canary_verdict.json)"
+            BATCH_RESULTS+=("batch2:failed_canary")
+        fi
+    else
+        echo "WARNING: No K8s Docs output directory found"
+        BATCH_RESULTS+=("batch2:no_output")
+    fi
+
+    echo ""
+    echo ">>> BATCH 2 COMPLETE"
+    echo ""
+fi
 
 # ============================================
 # BATCH 3: PyTorch sgt-025 (1 task) — separate
 # ============================================
 echo ">>> BATCH 3: PyTorch sgt-025 (1 task)"
 echo ""
-ensure_fresh_token_all
 
-PYTORCH_JOBS="runs/official/pytorch_rerun_opus_${TIMESTAMP}/sourcegraph_full"
-mkdir -p "$PYTORCH_JOBS"
+# Token health gate
+if ! check_token_health; then
+    echo "BLOCKED: Token health check failed before PyTorch batch"
+    BATCH_RESULTS+=("batch3:blocked_auth")
+else
+    PYTORCH_JOBS="runs/official/pytorch_rerun_opus_${TIMESTAMP}/sourcegraph_full"
+    mkdir -p "$PYTORCH_JOBS"
 
-SOURCEGRAPH_REPO_NAME="sg-benchmarks/pytorch--e8ca8cc3" \
-BASELINE_MCP_TYPE=sourcegraph_full harbor run \
-    --path "benchmarks/ccb_pytorch/sgt-025" \
-    --agent-import-path "$AGENT_PATH" \
-    --model "$MODEL" \
-    --jobs-dir "$PYTORCH_JOBS" \
-    -n 2 \
-    --timeout-multiplier 3 \
-    2>&1 | tee "${PYTORCH_JOBS}/sgt-025.log" || true
+    SOURCEGRAPH_REPO_NAME="sg-benchmarks/pytorch--e8ca8cc3" \
+    BASELINE_MCP_TYPE=sourcegraph_full harbor run \
+        --path "benchmarks/ccb_pytorch/sgt-025" \
+        --agent-import-path "$AGENT_PATH" \
+        --model "$MODEL" \
+        --jobs-dir "$PYTORCH_JOBS" \
+        -n 2 \
+        --timeout-multiplier 3 \
+        2>&1 | tee "${PYTORCH_JOBS}/sgt-025.log" || true
 
-echo ""
-echo ">>> BATCH 3 COMPLETE"
-echo ""
+    # Validate PyTorch result post-hoc
+    if validate_canary_result "$PYTORCH_JOBS" "sourcegraph_full"; then
+        BATCH_RESULTS+=("batch3:completed")
+    else
+        echo "WARNING: PyTorch sgt-025 had systemic issues"
+        BATCH_RESULTS+=("batch3:failed_canary")
+    fi
 
+    echo ""
+    echo ">>> BATCH 3 COMPLETE"
+    echo ""
+fi
+
+# ============================================
+# SUMMARY
+# ============================================
 echo "=============================================="
-echo "All targeted reruns complete!"
+echo "Targeted Rerun Summary"
 echo "=============================================="
+for r in "${BATCH_RESULTS[@]}"; do
+    echo "  $r"
+done
+echo ""
 echo "SWE-bench Pro results: $SWEPRO_JOBS"
 echo "RepoQA results: $REPOQA_JOBS"
 echo "K8s Docs: check runs/official/k8s_docs_opus_*"
-echo "PyTorch results: $PYTORCH_JOBS"
+echo "PyTorch results: ${PYTORCH_JOBS:-skipped}"
