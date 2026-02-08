@@ -44,18 +44,8 @@ else
     echo ""
 fi
 
-# Verify required credentials based on auth mode
-if [ "$USE_SUBSCRIPTION" = "true" ]; then
-    echo "Auth mode: Claude Max subscription (2-account)"
-else
-    if [ -z "$ANTHROPIC_API_KEY" ]; then
-        echo "ERROR: ANTHROPIC_API_KEY not set and USE_SUBSCRIPTION is not true"
-        echo "Set USE_SUBSCRIPTION=true in ~/evals/.env.local for subscription mode,"
-        echo "or set ANTHROPIC_API_KEY for API mode."
-        exit 1
-    fi
-    echo "Auth mode: API key (ANTHROPIC_API_KEY: ${#ANTHROPIC_API_KEY} chars)"
-fi
+# Verify auth mode (subscription-only)
+enforce_subscription_mode
 if [ -n "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
     echo "SOURCEGRAPH_ACCESS_TOKEN: set (${#SOURCEGRAPH_ACCESS_TOKEN} chars)"
 else

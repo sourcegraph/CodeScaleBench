@@ -3,11 +3,16 @@
 # Source this at the top of every *_3config.sh and run_selected_tasks.sh.
 
 # ============================================
-# AUTHENTICATION MODE
+# AUTHENTICATION MODE — SUBSCRIPTION ONLY
 # ============================================
-# Set to "true" for Claude Max subscription (OAuth tokens), "false" for API key.
-# API mode uses ANTHROPIC_API_KEY from .env.local; subscription mode uses ~/.claude/.credentials.json.
-export USE_SUBSCRIPTION=${USE_SUBSCRIPTION:-true}
+# All runs use Claude Max subscription (OAuth tokens).
+# API key mode has been removed. USE_SUBSCRIPTION is always true.
+export USE_SUBSCRIPTION=true
+
+# Guard function: call this in each 3config script instead of the old if/else auth block.
+enforce_subscription_mode() {
+    echo "Auth mode: Claude Max subscription"
+}
 
 # ============================================
 # FAIL-FAST MODE
@@ -161,17 +166,6 @@ SKIP_ACCOUNTS="${SKIP_ACCOUNTS:-account2}"
 # Auto-sets PARALLEL_JOBS = SESSIONS_PER_ACCOUNT * num_accounts when not explicitly set.
 setup_multi_accounts() {
     CLAUDE_HOMES=()
-
-    # API mode: no multi-account needed
-    if [ "$USE_SUBSCRIPTION" != "true" ]; then
-        CLAUDE_HOMES=("$HOME")
-        echo "API mode (USE_SUBSCRIPTION=false) — single account"
-        if [ "$PARALLEL_JOBS" -eq 0 ]; then
-            PARALLEL_JOBS=$(nproc 2>/dev/null || echo 8)
-            echo "Parallel jobs auto-set to $PARALLEL_JOBS (CPU count)"
-        fi
-        return
-    fi
 
     # Check for explicit account directories: account1, account2, ...
     local account_num=1
@@ -497,4 +491,212 @@ with open(out, 'w') as f:
 print(f'Run-level summary: {out}')
 " "$run_dir" 2>&1 || true
     fi
+}
+
+# ============================================
+# CANARY GUARDRAILS
+# ============================================
+# When CANARY_ENABLED=true, run_canary_then_batch runs the first task alone,
+# validates it for systemic stop signals, and only continues if it passes.
+CANARY_ENABLED=${CANARY_ENABLED:-false}
+
+# validate_canary_result: check a canary task's result.json for systemic failures.
+# Args: $1 = jobs_subdir (e.g., runs/official/pytorch_opus_ts/baseline)
+#        $2 = mode (baseline, sourcegraph_base, sourcegraph_full)
+# Writes canary_verdict.json to jobs_subdir.
+# Returns 0 (pass) or 1 (stop).
+validate_canary_result() {
+    local jobs_subdir=$1
+    local mode=$2
+
+    python3 - "$jobs_subdir" "$mode" <<'CANARY_EOF'
+import json, glob, os, sys
+
+jobs_subdir = sys.argv[1]
+mode = sys.argv[2]
+
+# Find the most recent result.json under jobs_subdir
+result_files = sorted(glob.glob(os.path.join(jobs_subdir, "**", "result.json"), recursive=True),
+                      key=os.path.getmtime)
+
+verdict = {"pass": True, "reason": "no_issues", "mode": mode, "result_file": None}
+
+if not result_files:
+    verdict = {"pass": False, "reason": "no_result_json", "mode": mode, "result_file": None,
+               "message": "No result.json produced — Harbor/Docker may be broken"}
+    json.dump(verdict, open(os.path.join(jobs_subdir, "canary_verdict.json"), "w"), indent=2)
+    print(f"CANARY STOP: {verdict['message']}")
+    sys.exit(1)
+
+result_file = result_files[-1]
+verdict["result_file"] = result_file
+
+try:
+    data = json.load(open(result_file))
+except (json.JSONDecodeError, OSError) as e:
+    verdict = {"pass": False, "reason": "corrupt_result", "mode": mode,
+               "result_file": result_file, "message": f"Cannot parse result.json: {e}"}
+    json.dump(verdict, open(os.path.join(jobs_subdir, "canary_verdict.json"), "w"), indent=2)
+    print(f"CANARY STOP: {verdict['message']}")
+    sys.exit(1)
+
+# Check systemic stop signals
+trials = data.get("trials", [])
+trial = trials[0] if trials else {}
+
+# 1. agent_result == null → agent never executed
+agent_result = trial.get("agent_result")
+if agent_result is None and trials:
+    verdict = {"pass": False, "reason": "agent_null", "mode": mode,
+               "result_file": result_file, "message": "agent_result is null — agent never executed"}
+    json.dump(verdict, open(os.path.join(jobs_subdir, "canary_verdict.json"), "w"), indent=2)
+    print(f"CANARY STOP: {verdict['message']}")
+    sys.exit(1)
+
+# 2. n_output_tokens == 0 → auth failed silently
+n_output = trial.get("n_output_tokens", -1)
+if n_output == 0:
+    verdict = {"pass": False, "reason": "zero_tokens", "mode": mode,
+               "result_file": result_file, "message": "n_output_tokens=0 — auth failed silently"}
+    json.dump(verdict, open(os.path.join(jobs_subdir, "canary_verdict.json"), "w"), indent=2)
+    print(f"CANARY STOP: {verdict['message']}")
+    sys.exit(1)
+
+# 3. exception_type checks
+exc_info = data.get("exception_info", trial.get("exception_info", {})) or {}
+exc_type = exc_info.get("exception_type", exc_info.get("type", ""))
+exc_msg = exc_info.get("exception_message", exc_info.get("message", ""))
+exc_combined = f"{exc_type} {exc_msg}"
+
+# AgentSetupTimeoutError → Docker/infra broken
+if "AgentSetupTimeoutError" in exc_type:
+    verdict = {"pass": False, "reason": "agent_setup_timeout", "mode": mode,
+               "result_file": result_file, "message": f"AgentSetupTimeoutError — Docker/infra broken"}
+    json.dump(verdict, open(os.path.join(jobs_subdir, "canary_verdict.json"), "w"), indent=2)
+    print(f"CANARY STOP: {verdict['message']}")
+    sys.exit(1)
+
+# 4. Fingerprint-based checks
+import re
+
+STOP_FINGERPRINTS = [
+    ("token_refresh_403",
+     re.compile(r"403|Forbidden|token.*refresh|refresh.*token|credentials.*expired", re.I),
+     "OAuth token refresh failure"),
+    ("docker_compose_fail",
+     re.compile(r"docker.compose.*fail|compose.*error|container.*fail.*start", re.I),
+     "Docker/container infrastructure broken"),
+]
+
+# mcp_connection only stops MCP configs
+if mode in ("sourcegraph_base", "sourcegraph_full"):
+    STOP_FINGERPRINTS.append(
+        ("mcp_connection",
+         re.compile(r"mcp.*(?:connection|timeout|refused|error)|sourcegraph.*(?:fail|error|timeout)", re.I),
+         "MCP server connection failure")
+    )
+
+for fp_id, pattern, label in STOP_FINGERPRINTS:
+    if pattern.search(exc_combined):
+        verdict = {"pass": False, "reason": fp_id, "mode": mode,
+                   "result_file": result_file, "message": f"{label}: {exc_combined[:200]}"}
+        json.dump(verdict, open(os.path.join(jobs_subdir, "canary_verdict.json"), "w"), indent=2)
+        print(f"CANARY STOP: {verdict['message']}")
+        sys.exit(1)
+
+# 5. All clear — task may have failed on its own merits, but no systemic issue
+reward = None
+vr = trial.get("verifier_result", {}) or {}
+rewards_obj = vr.get("rewards", {}) or {}
+reward = rewards_obj.get("reward", rewards_obj.get("score"))
+
+verdict = {"pass": True, "reason": "no_issues", "mode": mode,
+           "result_file": result_file, "reward": reward,
+           "message": f"Canary passed (reward={reward})"}
+json.dump(verdict, open(os.path.join(jobs_subdir, "canary_verdict.json"), "w"), indent=2)
+print(f"CANARY PASS: {verdict['message']}")
+sys.exit(0)
+CANARY_EOF
+}
+
+# run_canary_then_batch: wraps run_tasks_parallel with canary-first logic.
+# Args: $1 = task_id_array_name
+#        $2 = command_builder_function
+#        $3 = jobs_subdir (for canary verdict output)
+#        $4 = mode (baseline, sourcegraph_base, sourcegraph_full)
+# Falls through to run_tasks_parallel if CANARY_ENABLED != true or only 1 task.
+run_canary_then_batch() {
+    local -n _canary_task_ids=$1
+    local cmd_fn=$2
+    local jobs_subdir=$3
+    local mode=$4
+    local num_tasks=${#_canary_task_ids[@]}
+
+    # Fall through if canary disabled or only 1 task
+    if [ "$CANARY_ENABLED" != "true" ] || [ "$num_tasks" -le 1 ]; then
+        run_tasks_parallel "$1" "$cmd_fn" || true
+        return $?
+    fi
+
+    echo ""
+    echo "CANARY: Running first task as canary probe..."
+    echo ""
+
+    # Pop first task as canary
+    local canary_id="${_canary_task_ids[0]}"
+    local canary_arr=("$canary_id")
+
+    # Run canary synchronously (1 task, effectively serial)
+    local saved_parallel=$PARALLEL_JOBS
+    PARALLEL_JOBS=1
+    run_tasks_parallel canary_arr "$cmd_fn" || true
+    PARALLEL_JOBS=$saved_parallel
+
+    # Validate canary result
+    if ! validate_canary_result "$jobs_subdir" "$mode"; then
+        echo ""
+        echo "CANARY BLOCKED: Systemic issue detected — skipping remaining ${num_tasks} tasks"
+        echo "See: ${jobs_subdir}/canary_verdict.json"
+        echo ""
+        return 1
+    fi
+
+    # Canary passed — run remaining tasks
+    local remaining_ids=("${_canary_task_ids[@]:1}")
+    if [ ${#remaining_ids[@]} -gt 0 ]; then
+        echo ""
+        echo "CANARY CLEAR: Running remaining ${#remaining_ids[@]} tasks..."
+        echo ""
+        run_tasks_parallel remaining_ids "$cmd_fn" || true
+    fi
+}
+
+# ============================================
+# TOKEN HEALTH CHECK (for overnight orchestrator)
+# ============================================
+# Checks and refreshes tokens for all accounts. Returns 1 if unrecoverable.
+check_token_health() {
+    local all_ok=true
+
+    for home_dir in "${CLAUDE_HOMES[@]}"; do
+        local creds_file="${home_dir}/.claude/.credentials.json"
+        if [ ! -f "$creds_file" ]; then
+            echo "TOKEN HEALTH FAIL: No credentials at $creds_file"
+            all_ok=false
+            continue
+        fi
+
+        # Try refresh
+        if ! HOME="$home_dir" refresh_claude_token 2>/dev/null; then
+            echo "TOKEN HEALTH FAIL: Cannot refresh token for HOME=$home_dir"
+            all_ok=false
+        fi
+    done
+
+    export HOME="$REAL_HOME"
+
+    if [ "$all_ok" = false ]; then
+        return 1
+    fi
+    return 0
 }

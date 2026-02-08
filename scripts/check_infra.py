@@ -186,7 +186,7 @@ def check_multi_account_tokens() -> list[dict]:
 
 
 def check_env_local() -> dict:
-    """Check ~/evals/.env.local for required variables."""
+    """Check ~/evals/.env.local for required variables (subscription-only mode)."""
     env_file = Path(REAL_HOME) / "evals" / ".env.local"
 
     if not env_file.is_file():
@@ -197,26 +197,19 @@ def check_env_local() -> dict:
         }
 
     content = env_file.read_text()
-    has_api_key = "ANTHROPIC_API_KEY" in content
     has_sg_token = "SOURCEGRAPH_ACCESS_TOKEN" in content
 
-    issues = []
-    if not has_api_key:
-        issues.append("ANTHROPIC_API_KEY not set")
     if not has_sg_token:
-        issues.append("SOURCEGRAPH_ACCESS_TOKEN not set (MCP modes will fail)")
-
-    if issues:
         return {
             "check": "env_local",
-            "status": "WARN" if has_api_key else "FAIL",
-            "message": "; ".join(issues),
+            "status": "WARN",
+            "message": "SOURCEGRAPH_ACCESS_TOKEN not set (MCP modes will fail)",
         }
 
     return {
         "check": "env_local",
         "status": "OK",
-        "message": "ANTHROPIC_API_KEY and SOURCEGRAPH_ACCESS_TOKEN found",
+        "message": "SOURCEGRAPH_ACCESS_TOKEN found (subscription-only mode — no API key needed)",
     }
 
 

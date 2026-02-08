@@ -44,18 +44,8 @@ else
     echo ""
 fi
 
-# Verify required credentials based on auth mode
-if [ "$USE_SUBSCRIPTION" = "true" ]; then
-    echo "Auth mode: Claude Max subscription (2-account)"
-else
-    if [ -z "$ANTHROPIC_API_KEY" ]; then
-        echo "ERROR: ANTHROPIC_API_KEY not set and USE_SUBSCRIPTION is not true"
-        echo "Set USE_SUBSCRIPTION=true in ~/evals/.env.local for subscription mode,"
-        echo "or set ANTHROPIC_API_KEY for API mode."
-        exit 1
-    fi
-    echo "Auth mode: API key (ANTHROPIC_API_KEY: ${#ANTHROPIC_API_KEY} chars)"
-fi
+# Verify auth mode (subscription-only)
+enforce_subscription_mode
 if [ -n "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
     echo "SOURCEGRAPH_ACCESS_TOKEN: set (${#SOURCEGRAPH_ACCESS_TOKEN} chars)"
 else
@@ -243,7 +233,7 @@ run_mcp_task_batch() {
             2>&1 | tee "${jobs_subdir}/${task_id}.log" || true
     }
 
-    run_tasks_parallel TASK_IDS _locobench_mcp_run_single || true
+    run_canary_then_batch TASK_IDS _locobench_mcp_run_single "$jobs_subdir" "$mode"
 
     extract_all_metrics "$jobs_subdir" "ccb_locobench" "$mode"
     validate_and_report "$jobs_subdir" "$mode"
@@ -277,7 +267,7 @@ if [ "$RUN_BASELINE" = true ]; then
             2>&1 | tee "${BASELINE_JOBS}/${task_id}.log" || true
     }
 
-    run_tasks_parallel TASK_IDS _locobench_baseline_run_single || true
+    run_canary_then_batch TASK_IDS _locobench_baseline_run_single "$BASELINE_JOBS" "baseline"
 
     extract_all_metrics "${BASELINE_JOBS}" "ccb_locobench" "baseline"
     validate_and_report "${BASELINE_JOBS}" "baseline"
