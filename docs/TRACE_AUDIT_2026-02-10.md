@@ -185,44 +185,59 @@ These should be classified as `errored` (infrastructure) not `failed` (agent fai
 
 ## 4. Corrected Scores
 
-After accounting for the auth-failed run corruption and zero-token failures:
+### MANIFEST Fixes Applied
 
-| Suite | Config | Current | Corrected | Change |
-|-------|--------|--------:|----------:|-------:|
-| ccb_swebenchpro | SG_full | 0.361 | **0.667** | **+0.306** |
-| ccb_locobench | SG_base | 0.363 | **0.504** | **+0.141** (18 valid tasks only) |
+1. **Dedup logic**: Now prefers non-zero-token results over zero-token results (prevents auth-failed runs from overwriting valid data)
+2. **Infrastructure failure classification**: Zero-token (int 0) auth failures and null-token crash failures (<=5 claude-code.txt lines) are classified as `errored`
+3. **Mean reward**: Errored tasks excluded from mean (infra failures are not agent failures)
 
-### Corrected Cross-Config Comparison
+### Per-Suite Corrected Scores
 
 | Suite | Baseline | SG_base | SG_full |
 |-------|---------|---------|---------|
-| ccb_swebenchpro | 0.390 | 0.317 | **0.667** (was 0.361) |
-| ccb_locobench | 0.449 | **0.504** (was 0.363) | 0.499 |
+| ccb_codereview | 0.933 | 0.980 | 1.000 |
+| ccb_crossrepo | 0.571 | 0.587 | 0.387 |
+| ccb_dependeval | 0.636 | 0.665 | 0.720 |
+| ccb_dibench | 0.500 | 0.500 | 0.500 |
+| ccb_k8sdocs | 0.920 | 0.920 | 0.920 |
+| ccb_largerepo | 0.250 | 0.250 | 0.425 |
+| ccb_linuxflbench | 0.860 | 0.820 | 0.880 |
+| ccb_locobench | 0.449 | 0.504 (7 errored) | 0.499 |
+| ccb_pytorch | 0.083 | 0.081 | 0.265 (1 errored) |
+| ccb_repoqa | 1.000 | 1.000 | 1.000 |
+| ccb_swebenchpro | 0.640 (16 errored) | 0.591 (19 errored) | 0.806 (5 errored) |
+| ccb_sweperf | 0.591 | 0.032 | 0.367 |
+| ccb_tac | 0.492 | 0.365 | 0.544 |
 
-**Impact on weighted averages:**
-- Current: BL=0.521, SG_base=0.478, SG_full=0.555
-- After SWE-Pro SG_full correction (11 tasks × 1.0 delta): SG_full weighted average increases significantly
+**Note**: SWE-bench Pro means are now computed over scored tasks only (errored excluded). Different configs have different errored counts due to per-batch auth failures. For fair cross-config comparison, use matched task sets.
+
+### Weighted Averages (all suites, scored tasks only)
+
+| Config | Total Tasks | Errored | Scored | Mean Reward |
+|--------|--------:|--------:|-------:|------------:|
+| Baseline | 161 | 16 | 145 | **0.578** |
+| SG_base | 161 | 26 | 135 | **0.570** |
+| SG_full | 156 | 6 | 150 | **0.657** |
+
+**SG_full delta vs baseline: +0.079** on scored tasks.
 
 ---
 
-## 5. Recommended Actions
+## 5. Actions Taken
 
-### Critical (Do Now)
-1. **Archive** `swebenchpro_selected_opus_20260208_005525` → `archive/swebenchpro_selected_opus_20260208_005525__auth_failed`
-2. **Fix** `generate_manifest.py` to skip zero-token results in dedup (prefer results with `n_output_tokens > 0`)
-3. **Regenerate** MANIFEST.json
+### Critical (Done)
+1. **DONE**: Archived `swebenchpro_selected_opus_20260208_005525` (auth-failed run)
+2. **DONE**: Fixed `generate_manifest.py` dedup to prefer non-zero-token results
+3. **DONE**: Classified zero-token/crash tasks as `errored`, excluded from mean_reward
+4. **DONE**: Regenerated MANIFEST.json
 
-### High Priority
-4. **Rerun** 7 LoCoBench SG_base gap-fill tasks (zero-token from auth failure)
-5. **Reclassify** 6 persistent infrastructure failures as `errored` in MANIFEST
+### Tracked (Beads Issues Filed)
+5. **beads-rxg** (P1): Rerun 7 LoCoBench SG_base gap-fill tasks
+6. **beads-1in** (P2): Investigate Deep Search non-adoption (1/129 usage)
+7. **beads-5m5** (P4): Document PyTorch sgt-025 as permanently excluded
 
-### Medium Priority
-6. **Investigate** Deep Search non-adoption — only 1/129 SG_full tasks actually used Deep Search despite preamble instructions
-7. **Clean** instruction templates for RepoQA, LargeRepo, LoCoBench baselines (cosmetic — no functional impact)
-
-### Low Priority
-8. Document PyTorch sgt-025 as permanently excluded from SG_full
-9. Consider removing `go_to_definition`, `get_contributor_repos` from SG_base config (unused)
+### No Action Needed
+8. Instruction template cleanup — source templates already clean (commit b4d30b2c). Contamination only in historical run artifacts.
 
 ---
 
@@ -231,12 +246,12 @@ After accounting for the auth-failed run corruption and zero-token failures:
 | Check | Result |
 |-------|--------|
 | Baseline MCP tool calls | **CLEAN** (0/175 traces) |
-| SG_base MCP adoption (MANIFEST) | **100%** (57/57 tasks) |
-| SG_full MCP adoption (MANIFEST) | **98%** (56/57, 1 errored) |
+| SG_base MCP adoption (MANIFEST) | **100%** scored tasks |
+| SG_full MCP adoption (MANIFEST) | **98%** scored tasks (1 Docker errored) |
 | Deep Search actual usage | **LOW** (~1/129 actual invocations) |
-| Baseline instruction contamination | 30/156 tasks (no functional impact) |
-| Auth-failed run corruption | **CRITICAL** (11 tasks corrupted) |
-| Zero-token infrastructure failures | 45 tasks across 4 runs |
-| Persistent Docker failures | 6 unique tasks, all configs |
+| Baseline instruction contamination | 30/156 runs (no functional impact, source templates clean) |
+| Auth-failed run corruption | **FIXED** (archived + dedup hardened) |
+| Infrastructure failures | Classified as `errored`, excluded from mean |
+| Persistent Docker failures | 6 unique tasks (protonmail, openlibrary-92db, tutanota) |
 
-**Bottom line**: MCP is correctly provisioned and used in SG configs. The main data quality issue is a single auth-failed run corrupting SWE-bench Pro SG_full scores. After correction, SG_full's SWE-bench Pro performance is much stronger (0.667 vs reported 0.361).
+**Bottom line**: All critical data integrity issues are resolved. The MANIFEST now correctly classifies infrastructure failures, excludes them from means, and prevents zero-token results from overwriting valid data. SG_full shows meaningful improvement over baseline (+0.079 weighted mean).

@@ -78,6 +78,19 @@ def _parse_started_at(data: dict) -> str:
     return data.get("started_at", "")
 
 
+def _has_agent_output(data: dict) -> bool:
+    """Check if the agent actually produced output (non-zero tokens).
+
+    Zero-token results indicate infrastructure failures (auth errors,
+    Docker crashes) where the agent never ran. These should not overwrite
+    valid results during dedup.
+    """
+    agent_result = data.get("agent_result") or {}
+    n_input = agent_result.get("n_input_tokens") or 0
+    n_output = agent_result.get("n_output_tokens") or 0
+    return n_input > 0 or n_output > 0
+
+
 def scan_config_dir(config_path: Path) -> dict[str, dict]:
     """Scan a config directory (e.g., baseline/) for task-level results.
 
@@ -141,7 +154,41 @@ def extract_task_info(task_entry: dict) -> dict:
     rewards = verifier.get("rewards") or {}
     reward = rewards.get("reward")
 
+    # Check for trajectory and cost
+    has_trajectory = (trial_dir / "agent" / "trajectory.json").exists()
+    agent_result = data.get("agent_result") or {}
+    has_cost = bool(agent_result.get("n_input_tokens", 0) or agent_result.get("n_output_tokens", 0))
+
+    # Detect infrastructure failures where the agent never ran
+    n_input = agent_result.get("n_input_tokens")
+    n_output = agent_result.get("n_output_tokens")
+    # Auth failures: tokens are explicitly 0 (agent started but auth failed)
+    zero_token = (n_input == 0 and n_output == 0)
+    # Crash failures: tokens are null, no trajectory, verifier saw nothing useful,
+    # AND the agent trace is tiny (<=5 lines). This distinguishes true crashes
+    # (protonmail Node v16, openlibrary setup fail) from H3 token-logging bugs
+    # where the agent ran fine but tokens weren't recorded.
+    crash_failure = False
+    if (
+        n_input is None
+        and n_output is None
+        and not has_trajectory
+        and (reward is None or reward == 0)
+    ):
+        cc_path = trial_dir / "agent" / "claude-code.txt"
+        cc_lines = 0
+        if cc_path.exists():
+            with open(cc_path) as f:
+                for i, _ in enumerate(f, 1):
+                    if i > 5:
+                        break
+                cc_lines = i
+        crash_failure = cc_lines <= 5
+
     if exception is not None:
+        status = "errored"
+        reward_val = 0.0
+    elif zero_token or crash_failure:
         status = "errored"
         reward_val = 0.0
     elif reward is not None and reward > 0:
@@ -150,11 +197,6 @@ def extract_task_info(task_entry: dict) -> dict:
     else:
         status = "failed"
         reward_val = float(reward) if reward is not None else 0.0
-
-    # Check for trajectory and cost
-    has_trajectory = (trial_dir / "agent" / "trajectory.json").exists()
-    agent_result = data.get("agent_result") or {}
-    has_cost = bool(agent_result.get("n_input_tokens", 0) or agent_result.get("n_output_tokens", 0))
 
     info = {
         "status": status,
@@ -224,10 +266,20 @@ def main():
                 if existing is None:
                     all_tasks[key][task_name] = task_entry
                 else:
-                    new_ts = _parse_started_at(task_entry["data"])
-                    old_ts = _parse_started_at(existing["data"])
-                    if new_ts >= old_ts:
+                    new_has_output = _has_agent_output(task_entry["data"])
+                    old_has_output = _has_agent_output(existing["data"])
+                    if new_has_output and not old_has_output:
+                        # New result has agent output, old doesn't — prefer new
                         all_tasks[key][task_name] = task_entry
+                    elif not new_has_output and old_has_output:
+                        # Old result has agent output, new doesn't — keep old
+                        pass
+                    else:
+                        # Both have or both lack output — use timestamp
+                        new_ts = _parse_started_at(task_entry["data"])
+                        old_ts = _parse_started_at(existing["data"])
+                        if new_ts >= old_ts:
+                            all_tasks[key][task_name] = task_entry
 
     # Build MANIFEST
     runs = {}
@@ -264,14 +316,17 @@ def main():
                 errored += 1
             else:
                 failed += 1
-            total_reward += info["reward"]
+            # Exclude errored tasks from mean reward (infra failures, not agent failures)
+            if info["status"] != "errored":
+                total_reward += info["reward"]
 
             if "judge_score" in info:
                 judge_score_sum += info["judge_score"]
                 judge_count += 1
 
         task_count = len(task_infos)
-        mean_reward = round(total_reward / task_count, 3) if task_count > 0 else 0.0
+        scored_count = task_count - errored
+        mean_reward = round(total_reward / scored_count, 3) if scored_count > 0 else 0.0
         mean_judge_score = round(judge_score_sum / judge_count, 3) if judge_count > 0 else None
 
         # Extract timestamp from first task's data
