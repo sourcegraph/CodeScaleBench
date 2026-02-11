@@ -94,6 +94,24 @@ for line in patch_text.splitlines():
         elif line.startswith("-") and not line.startswith("---"):
             files[current]["removed"].append(line[1:])
 
+# Fallback: if no "diff --git" headers found, parse standard unified diff
+# format using "--- a/" and "+++ b/" lines to identify files.
+if not files:
+    current = None
+    for line in patch_text.splitlines():
+        if line.startswith("+++ b/"):
+            current = line[6:]
+            files[current] = {"added": [], "removed": []}
+        elif line.startswith("+++ ") and not line.startswith("+++ /dev/null"):
+            # Handle "+++ path" without b/ prefix
+            current = line[4:].lstrip("b/") if line[4:].startswith("b/") else line[4:]
+            files[current] = {"added": [], "removed": []}
+        elif current:
+            if line.startswith("+") and not line.startswith("+++"):
+                files[current]["added"].append(line[1:])
+            elif line.startswith("-") and not line.startswith("---"):
+                files[current]["removed"].append(line[1:])
+
 if not files:
     result = {"overall_score": 0.0, "error": "No files in patch"}
 else:

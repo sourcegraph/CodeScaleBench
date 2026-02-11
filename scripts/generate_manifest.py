@@ -112,6 +112,7 @@ def scan_config_dir(config_path: Path) -> dict[str, dict]:
                 try:
                     data = json.loads(result_file.read_text())
                     task_name = data.get("task_name", batch_dir.name.rsplit("__", 1)[0])
+                    task_name = _normalize_task_name(task_name)
                     tasks[task_name] = {
                         "data": data,
                         "trial_dir": batch_dir,
@@ -132,6 +133,7 @@ def scan_config_dir(config_path: Path) -> dict[str, dict]:
                     try:
                         data = json.loads(result_file.read_text())
                         task_name = data.get("task_name", trial_dir.name.rsplit("__", 1)[0])
+                        task_name = _normalize_task_name(task_name)
                         # Latest wins (sorted order = latest batch dir last)
                         tasks[task_name] = {
                             "data": data,
@@ -219,6 +221,67 @@ def extract_task_info(task_entry: dict) -> dict:
     return info
 
 
+def _normalize_task_name(name: str) -> str:
+    """Normalize task name for matching across naming conventions.
+
+    Handles the dash-vs-underscore discrepancy in SWE-bench Pro task names:
+    - Selection JSON uses: instance_protonmail__webclients-HASH (double underscore)
+    - Some result.json uses: instance_protonmail-webclients-HASH (single dash)
+
+    Strategy: for 'instance_ORG__REPO-HASH' pattern, normalize ORG__REPO to ORG__REPO
+    by replacing the first single-dash separator after 'instance_' with '__'.
+    """
+    if not name.startswith("instance_"):
+        return name
+    # Already uses __ separator — canonical form
+    if "__" in name[len("instance_"):]:
+        return name
+    # Convert first dash after 'instance_' to '__'
+    # e.g. instance_nodebb-nodebb-HASH -> instance_nodebb__nodebb-HASH
+    suffix = name[len("instance_"):]
+    dash_pos = suffix.find("-")
+    if dash_pos > 0:
+        return "instance_" + suffix[:dash_pos] + "__" + suffix[dash_pos + 1:]
+    return name
+
+
+def load_selected_tasks(path: Path) -> dict[str, set[str]]:
+    """Load selected_benchmark_tasks.json and return {suite: {task_name, ...}}.
+
+    Used to filter MANIFEST to only include selected tasks, removing extras
+    from old batches (e.g. PyTorch sgt-007/017/024, SWE-Pro gap-fill originals).
+
+    Handles naming convention differences:
+    - Selection may use 'ccb_dibench-foo' but result.json uses 'dibench-foo'
+    - Selection may use 'instance_org__repo-hash' but result.json uses 'instance_org-repo-hash'
+    Both forms are added to the allowed set.
+    """
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        tasks_list = data.get("tasks", data) if isinstance(data, dict) else data
+        result: dict[str, set[str]] = defaultdict(set)
+        for t in tasks_list:
+            suite = t.get("benchmark", t.get("suite", ""))
+            if not suite.startswith("ccb_"):
+                suite = "ccb_" + suite
+            task_name = t.get("task_name", t.get("task_id", ""))
+            if suite and task_name:
+                normalized = _normalize_task_name(task_name)
+                result[suite].add(normalized)
+                # Also add without ccb_ suite prefix (e.g. ccb_dibench-foo -> dibench-foo)
+                # because result.json often omits the ccb_ prefix
+                if normalized.startswith("ccb_"):
+                    result[suite].add(normalized[4:])
+                # Also add with ccb_ prefix for the reverse case
+                if not normalized.startswith("ccb_"):
+                    result[suite].add("ccb_" + normalized)
+        return dict(result)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Generate MANIFEST.json from on-disk run results.")
@@ -228,7 +291,20 @@ def main():
         default=PROJECT_ROOT / "judge_scores.json",
         help="Path to centralized judge_scores.json (default: ./judge_scores.json)",
     )
+    parser.add_argument(
+        "--selected-only",
+        action="store_true",
+        default=True,
+        help="Filter to only tasks in selected_benchmark_tasks.json (default: True)",
+    )
+    parser.add_argument(
+        "--no-selected-filter",
+        action="store_true",
+        help="Disable filtering — include all tasks found on disk",
+    )
     cli_args = parser.parse_args()
+    if cli_args.no_selected_filter:
+        cli_args.selected_only = False
 
     if not RUNS_DIR.exists():
         print(f"ERROR: Runs directory not found: {RUNS_DIR}", file=sys.stderr)
@@ -280,6 +356,30 @@ def main():
                         old_ts = _parse_started_at(existing["data"])
                         if new_ts >= old_ts:
                             all_tasks[key][task_name] = task_entry
+
+    # Filter to selected tasks only (removes extras from old batches)
+    selected_tasks = {}
+    if cli_args.selected_only:
+        selection_path = PROJECT_ROOT / "configs" / "selected_benchmark_tasks.json"
+        selected_tasks = load_selected_tasks(selection_path)
+        if selected_tasks:
+            filtered_count = 0
+            for key in list(all_tasks.keys()):
+                suite, config = key
+                allowed = selected_tasks.get(suite)
+                if allowed is None:
+                    # Suite not in selection file — keep all (might be new benchmark)
+                    continue
+                before = len(all_tasks[key])
+                all_tasks[key] = {
+                    tn: te for tn, te in all_tasks[key].items()
+                    if _normalize_task_name(tn) in allowed
+                }
+                removed = before - len(all_tasks[key])
+                if removed:
+                    filtered_count += removed
+            if filtered_count:
+                print(f"  Filtered out {filtered_count} tasks not in selected_benchmark_tasks.json")
 
     # Build MANIFEST
     runs = {}
