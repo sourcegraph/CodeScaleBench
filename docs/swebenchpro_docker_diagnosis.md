@@ -129,3 +129,28 @@ Current MANIFEST (463 tasks, 39 runs) includes these infra-fail results as `rewa
 The rate-limit failures cluster in **BL and SG_base configs from the Feb 8-9 batch** (`swebenchpro_gapfill_opus_20260208_235352` and `swebenchpro_gapfill_opus_20260209_023525`). These ran when the subscription was likely exhausted. SG_full runs from the Feb 10 batch (`swebenchpro_rerun_opus_20260210_163436`) generally succeeded, confirming these aren't Docker issues.
 
 The protonmail failure is Docker-related and affects ALL configs equally.
+
+## Fix Applied: Protonmail Node.js Upgrade (2026-02-11)
+
+**Problem**: Base images (`jefzda/sweap-images:protonmail.webclients-*`) ship Alpine 3.18.3 with Node.js v16.20.2 pre-installed at `/usr/local/bin/node`. Alpine's `apk add nodejs` installs Node 18.20.1 at `/usr/bin/node` but the old v16 binary at `/usr/local/bin/node` takes precedence in PATH. Claude Code ≥2.1.37 requires Node ≥18 and crashes on startup.
+
+**Fix**: Added Node.js upgrade step to all 4 protonmail Dockerfiles (both local and Harbor cache):
+```dockerfile
+# Upgrade Node.js from v16 (base image) to v18 (required by Claude Code >= 2.1.37)
+RUN apk del nodejs nodejs-current npm 2>/dev/null || true; \
+    rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx 2>/dev/null || true; \
+    apk add --no-cache nodejs npm
+```
+
+**Verification**:
+- All 4 local Dockerfiles (`benchmarks/ccb_swebenchpro/tasks/instance_protonmail-webclients-*/environment/Dockerfile`) build successfully
+- All 4 Harbor cached Dockerfiles (`~/.cache/harbor/tasks/*/instance_protonmail__webclients-*/environment/Dockerfile`) build successfully
+- Node.js v18.20.1 confirmed in all 8 built images
+- `npm install -g @anthropic-ai/claude-code@latest` succeeds without `EBADENGINE` warnings
+- Claude Code installs and starts correctly
+
+**Tasks fixed** (4 task IDs × 3 configs = 12 runs to re-run):
+1. `instance_protonmail__webclients-369fd37de29c14c690cb3b1c09a949189734026f`
+2. `instance_protonmail__webclients-8be4f6cb9380fcd2e67bcb18cef931ae0d4b869c`
+3. `instance_protonmail__webclients-c6f65d205c401350a226bb005f42fac1754b0b5b`
+4. `instance_protonmail__webclients-caf10ba9ab2677761c88522d1ba8ad025779c492`
