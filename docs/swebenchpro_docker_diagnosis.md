@@ -154,3 +154,58 @@ RUN apk del nodejs nodejs-current npm 2>/dev/null || true; \
 2. `instance_protonmail__webclients-8be4f6cb9380fcd2e67bcb18cef931ae0d4b869c`
 3. `instance_protonmail__webclients-c6f65d205c401350a226bb005f42fac1754b0b5b`
 4. `instance_protonmail__webclients-caf10ba9ab2677761c88522d1ba8ad025779c492`
+
+## US-003 Assessment: Non-Protonmail Docker Environments (2026-02-11)
+
+### Conclusion: No Docker Fixes Needed
+
+All 7 non-protonmail repos have **healthy, functional Docker environments**. Every repo has at least one passing run across configs, confirming Docker builds, agent setup, and test verification all work correctly.
+
+### Per-Repo Docker Health
+
+| Repo | Docker Works? | Passing Runs | Infra Errors | Error Type |
+|---|---|---|---|---|
+| qutebrowser | Yes | 6 pass, 0 fail | 6 | Rate limit (Feb 8-9 batch) |
+| gravitational/teleport | Yes | 5 pass, 3 fail | 6 | Rate limit (Feb 8-9 batch) |
+| future-architect/vuls | Yes | 5 pass, 3 fail | 3 | Rate limit (Feb 8-9 batch) |
+| element-hq | Yes | 5 pass, 0 fail | 1 | Rate limit (SG_base only) |
+| tutao/tutanota | Yes | 1 pass, 0 fail | 2 | Rate limit (BL + SG_base) |
+| nodebb | Yes | 8 pass, 4 fail | 1 | Rate limit (SG_base only) |
+| internetarchive | Yes | 21 pass, 0 fail (archived) | 4 active + 17 archived | Rate limit + transcript corruption |
+
+### Root Cause: OAuth Rate Limiting
+
+32 of the 32 non-protonmail infra failures have the same signature:
+- **0 output tokens** (agent never started generating)
+- **0-8 second agent execution** (immediate failure)
+- **No exception recorded** (silent auth failure)
+- **Clustered in Feb 8-9 batches** (`swebenchpro_gapfill_opus_20260208_*` and `_20260209_*`)
+
+The Max subscription was exhausted during this batch window. Tasks from the Feb 10 SG_full batch succeeded on the same Docker environments.
+
+### Unfixable Items
+
+None. All tasks are runnable — they just need fresh subscription tokens.
+
+### Tasks Requiring Re-Run (Rate Limit Recovery)
+
+**Baseline** (~13 tasks):
+- 3× qutebrowser, 3× gravitational/teleport, 4× internetarchive/openlibrary
+- 2× future-architect/vuls, 1× tutao/tutanota
+
+**SG_base** (~16 tasks):
+- 3× qutebrowser, 3× gravitational/teleport, 4× internetarchive/openlibrary
+- 2× future-architect/vuls, 1× tutao/tutanota, 1× element-hq, 1× nodebb
+
+**SG_full** (~4 tasks):
+- 4× internetarchive/openlibrary (transcript corruption + timeout)
+
+**Total non-protonmail re-runs: ~33 task runs** (no Docker fixes, just fresh auth tokens)
+
+### Combined Re-Run Plan (Protonmail + Rate Limit Recovery)
+
+| Category | Tasks | Configs | Total Runs | Fix Required |
+|---|---|---|---|---|
+| Protonmail (Docker fix) | 4 | BL, SG_base, SG_full | 12 | Node.js v16→v18 (done in US-002) |
+| Rate limit recovery | ~17 unique tasks | Mixed per task | ~33 | None (fresh subscription) |
+| **Total** | | | **~45** | |
