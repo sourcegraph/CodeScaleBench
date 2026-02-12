@@ -1,17 +1,15 @@
 #!/bin/bash
-# Large Repo 4-Task 3-Config Comparison Script
+# Large Repo 4-Task 2-Config Comparison Script
 #
-# Runs all 4 large repo tasks across 3 configurations:
+# Runs all 4 large repo tasks across 2 configurations:
 #   1. Baseline (no MCP)
-#   2. MCP-Base (Sourcegraph MCP without deep search)
-#   3. MCP-Full (Sourcegraph MCP + deep search)
+#   2. MCP-Full (Sourcegraph MCP + deep search)
 #
 # Usage:
 #   ./configs/largerepo_3config.sh [options]
 #
 # Options:
 #   --baseline-only        Run only baseline (no MCP)
-#   --base-only   Run only MCP-Base
 #   --full-only            Run only MCP-Full (sourcegraph_full)
 #   --model MODEL          Override model (default: claude-opus-4-6)
 #   --category CATEGORY    Override run category (default: official)
@@ -64,7 +62,6 @@ MODEL="${MODEL:-anthropic/claude-opus-4-6}"
 CONCURRENCY=1  # Big codebases - run serially
 TIMEOUT_MULTIPLIER=10  # 10x default timeout for large repos
 RUN_BASELINE=true
-RUN_BASE=true
 RUN_FULL=true
 CATEGORY="${CATEGORY:-official}"
 
@@ -72,18 +69,11 @@ CATEGORY="${CATEGORY:-official}"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --baseline-only)
-            RUN_BASE=false
-            RUN_FULL=false
-            shift
-            ;;
-        --base-only)
-            RUN_BASELINE=false
             RUN_FULL=false
             shift
             ;;
         --full-only)
             RUN_BASELINE=false
-            RUN_BASE=false
             shift
             ;;
         --model)
@@ -109,12 +99,6 @@ done
 setup_dual_accounts
 
 # Check MCP credentials if MCP modes requested
-if { [ "$RUN_BASE" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
-    echo "WARNING: MCP modes requested but SOURCEGRAPH_ACCESS_TOKEN not set"
-    echo "Skipping MCP runs. Use --baseline-only to suppress this warning."
-    RUN_BASE=false
-    RUN_FULL=false
-fi
 
 # Load task IDs from canonical selection file
 SELECTION_FILE="$SCRIPT_DIR/selected_benchmark_tasks.json"
@@ -252,10 +236,9 @@ run_task_batch() {
 # ============================================
 # MAIN EXECUTION
 # ============================================
-log_section "Big Code MCP 3-Config Benchmark Comparison"
+log_section "Big Code MCP 2-Config Benchmark Comparison"
 echo "Starting benchmark run..."
 echo "  Baseline: $RUN_BASELINE"
-echo "  MCP-Base: $RUN_BASE"
 echo "  MCP-Full: $RUN_FULL"
 echo "  Model: $MODEL"
 echo "  Benchmark Directory: $BENCHMARK_DIR"
@@ -268,11 +251,6 @@ mkdir -p "$JOBS_BASE"
 # Run baseline (no MCP)
 if [ "$RUN_BASELINE" = true ]; then
     run_task_batch "baseline" "none"
-fi
-
-# Run MCP-Base (Sourcegraph MCP without deep search)
-if [ "$RUN_BASE" = true ]; then
-    run_task_batch "sourcegraph_base" "sourcegraph_base"
 fi
 
 # Run MCP-Full (Sourcegraph MCP + deep search)
@@ -294,11 +272,6 @@ if [ "$RUN_BASELINE" = true ]; then
     echo "  ls -la $JOBS_BASE/baseline/"
     echo ""
 fi
-if [ "$RUN_BASE" = true ]; then
-    echo "  # MCP-Base summary"
-    echo "  ls -la $JOBS_BASE/sourcegraph_base/"
-    echo ""
-fi
 if [ "$RUN_FULL" = true ]; then
     echo "  # MCP-Full summary"
     echo "  ls -la $JOBS_BASE/sourcegraph_full/"
@@ -309,7 +282,6 @@ echo "Analyze task results:"
 echo "  cat $JOBS_BASE/*/*/result.json | jq -r '.trials[].verifier_result.rewards.reward'"
 echo ""
 echo "Expected observations:"
-echo "  - Baseline: Slower codebase exploration, may miss patterns"
-echo "  - MCP-Base: Fast keyword + NLS search, no deep reasoning"
-echo "  - MCP-Full: Deep semantic search + architectural understanding"
+echo "  - Baseline: No MCP tools, relies on local search only"
+echo "  - MCP-Full: Sourcegraph MCP + deep search for codebase understanding"
 echo ""

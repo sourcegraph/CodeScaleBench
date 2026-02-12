@@ -1,27 +1,29 @@
 #!/bin/bash
-# Investigation Benchmark 3-Config Comparison Script
+# LinuxFLBench 5-Task 2-Config Comparison Script
 #
-# Runs investigation tasks (code investigation, impact analysis, debugging)
-# across 3 configurations:
-#   1. Baseline (no MCP)
-#   2. MCP-Base (Sourcegraph tools without Deep Search)
-#   3. MCP-Full (Sourcegraph + Deep Search hybrid)
+# Linux kernel fault localization benchmark (250 tasks from LinuxFLBench).
+# Initial selection: 5 tasks across ACPI, wireless, NFS, SATA, and sound subsystems.
+# Each task: given a bug report, identify the buggy file(s) and function(s) in ~28K-file kernel.
+#
+# Runs selected tasks across 2 configurations:
+#   1. Baseline (no MCP) - agent uses only local repo files
+#   2. MCP-Full (Sourcegraph + Deep Search hybrid)
 #
 # Usage:
-#   ./configs/investigation_3config.sh [OPTIONS]
+#   ./configs/linuxflbench_3config.sh [OPTIONS]
 #
 # Options:
 #   --baseline-only        Run only baseline (no MCP)
-#   --base-only            Run only MCP-Base
 #   --full-only            Run only MCP-Full (sourcegraph_full)
 #   --model MODEL          Override model (default: claude-opus-4-6)
 #   --category CATEGORY    Run category (default: official)
-#   --parallel N           Number of parallel task subshells (default: 1)
-#   --task TASK_ID         Run only a specific task (e.g., inv-impact-001)
 #
 # Prerequisites:
 #   - ~/evals/.env.local with USE_SUBSCRIPTION=true (default: 2-account Max subscription)
 #   - SOURCEGRAPH_ACCESS_TOKEN in .env.local (required for MCP modes)
+#
+# Note: Docker build is slow (~10min) due to Linux kernel partial clone (~2GB).
+# Consider pre-building images: docker build -t ccb-lfl-<task_id> benchmarks/ccb_linuxflbench/<task_id>/environment/
 
 set -e
 
@@ -60,41 +62,25 @@ ensure_fresh_token
 # ============================================
 # CONFIGURATION
 # ============================================
-TASKS_DIR="/home/stephanie_jarmak/CodeContextBench/benchmarks/ccb_investigation"
+SUITE="ccb_linuxflbench"
+TASKS_DIR="/home/stephanie_jarmak/CodeContextBench/benchmarks/${SUITE}"
 AGENT_PATH="agents.claude_baseline_agent:BaselineClaudeCodeAgent"
 MODEL="${MODEL:-anthropic/claude-opus-4-6}"
-CONCURRENCY=2
+CONCURRENCY=1
 TIMEOUT_MULTIPLIER=10
 RUN_BASELINE=true
-RUN_BASE=true
 RUN_FULL=true
 CATEGORY="${CATEGORY:-official}"
-TASK_FILTER=""
-
-# All investigation task IDs
-ALL_TASK_IDS=(
-    "inv-impact-001"
-    "inv-regression-001"
-    "inv-debug-001"
-    "inv-migration-001"
-)
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --baseline-only)
-            RUN_BASE=false
-            RUN_FULL=false
-            shift
-            ;;
-        --base-only)
-            RUN_BASELINE=false
             RUN_FULL=false
             shift
             ;;
         --full-only)
             RUN_BASELINE=false
-            RUN_BASE=false
             shift
             ;;
         --model)
@@ -109,10 +95,6 @@ while [[ $# -gt 0 ]]; do
             PARALLEL_JOBS="$2"
             shift 2
             ;;
-        --task)
-            TASK_FILTER="$2"
-            shift 2
-            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -120,31 +102,35 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Apply task filter
-if [ -n "$TASK_FILTER" ]; then
-    TASK_IDS=("$TASK_FILTER")
-else
-    TASK_IDS=("${ALL_TASK_IDS[@]}")
-fi
-
 # Set up dual-account support (auto-detects second account)
 setup_dual_accounts
 
 # Check MCP credentials if MCP modes requested
-if { [ "$RUN_BASE" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
-    echo "WARNING: MCP modes requested but SOURCEGRAPH_ACCESS_TOKEN not set"
-    echo "Skipping MCP runs. Use --baseline-only to suppress this warning."
-    RUN_BASE=false
-    RUN_FULL=false
+
+# Load task IDs from canonical selection file
+SELECTION_FILE="$SCRIPT_DIR/selected_benchmark_tasks.json"
+if [ ! -f "$SELECTION_FILE" ]; then
+    echo "ERROR: selected_benchmark_tasks.json not found at $SELECTION_FILE"
+    echo "Run: python3 scripts/select_benchmark_tasks.py"
+    exit 1
 fi
 
-# Sourcegraph repo name mapping for investigation tasks
-# All are major public repos directly indexed on Sourcegraph
+readarray -t TASK_IDS < <(python3 -c "
+import json
+tasks = json.load(open('$SELECTION_FILE'))['tasks']
+for t in tasks:
+    if t['benchmark'] == '${SUITE}':
+        print(t['task_id'])
+")
+
+# Sourcegraph repo name mapping for LinuxFLBench tasks
+# All tasks use the Linux kernel — map to the Sourcegraph-indexed repo
 declare -A TASK_SG_REPO_NAMES=(
-    ["inv-impact-001"]="github.com/kubernetes/kubernetes"
-    ["inv-regression-001"]="github.com/grafana/grafana"
-    ["inv-debug-001"]="github.com/prometheus/prometheus"
-    ["inv-migration-001"]="github.com/django/django"
+    ["lfl-acpi-207835"]="github.com/sg-benchmarks/linux--55b2af1c"
+    ["lfl-wifi-206661"]="github.com/sg-benchmarks/linux--11a48a5a"
+    ["lfl-nfs-117651"]="github.com/sg-benchmarks/linux--07cc49f6"
+    ["lfl-sata-203475"]="github.com/sg-benchmarks/linux--fa5941f4"
+    ["lfl-sound-53441"]="github.com/sg-benchmarks/linux--07c4ee00"
 )
 
 # Derive short model name for run directory
@@ -159,19 +145,16 @@ case "$_model_lower" in
 esac
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-JOBS_BASE="runs/${CATEGORY}/investigation_${MODEL_SHORT}_${TIMESTAMP}"
+JOBS_BASE="runs/${CATEGORY}/linuxflbench_${MODEL_SHORT}_${TIMESTAMP}"
 
 echo "=============================================="
-echo "Investigation 3-Config Benchmark"
+echo "LinuxFLBench 5-Task 2-Config Benchmark"
 echo "=============================================="
 echo "Model: ${MODEL}"
-echo "Tasks: ${TASK_IDS[*]}"
-echo "Task count: ${#TASK_IDS[@]}"
+echo "Tasks: ${#TASK_IDS[@]}"
 echo "Concurrency: ${CONCURRENCY}"
-echo "Parallel jobs: ${PARALLEL_JOBS}"
 echo "Jobs directory: ${JOBS_BASE}"
 echo "Run baseline: ${RUN_BASELINE}"
-echo "Run MCP-Base: ${RUN_BASE}"
 echo "Run MCP-Full: ${RUN_FULL}"
 echo ""
 
@@ -200,7 +183,7 @@ extract_all_metrics() {
                 --task-dir "$result_dir" \
                 --benchmark "$benchmark" \
                 --config "$config" \
-                --selected-tasks "$SCRIPT_DIR/selected_benchmark_tasks.json" \
+                --selected-tasks "$SELECTION_FILE" \
                 2>&1 || echo "  WARNING: metrics extraction failed for $(basename $result_dir)"
         fi
     done
@@ -213,24 +196,24 @@ run_task_batch() {
 
     ensure_fresh_token_all
 
-    log_section "Running Investigation - Mode: $mode"
+    log_section "Running LinuxFLBench - Mode: $mode"
 
     mkdir -p "$jobs_subdir"
 
-    _investigation_run_single() {
-        local task_id=$1
-        local task_home=$2
+    for task_id in "${TASK_IDS[@]}"; do
         local task_path="${TASKS_DIR}/${task_id}"
 
         if [ ! -d "$task_path" ]; then
             echo "ERROR: Task directory not found: $task_path"
-            return 1
+            continue
         fi
 
-        echo "Running task: $task_id ($mode) [HOME=$task_home]"
+        echo "Running task: $task_id ($mode)"
 
+        # Set Sourcegraph repo name override for this task
         local sg_repo="${TASK_SG_REPO_NAMES[$task_id]:-}"
         if [ -n "$sg_repo" ]; then
+            echo "  SOURCEGRAPH_REPO_NAME: $sg_repo"
             export SOURCEGRAPH_REPO_NAME="$sg_repo"
         else
             unset SOURCEGRAPH_REPO_NAME 2>/dev/null || true
@@ -246,16 +229,17 @@ run_task_batch() {
             2>&1 | tee "${jobs_subdir}/${task_id}.log" \
             || {
                 echo "WARNING: Task $task_id failed (exit code: $?)"
+                echo "Continuing with remaining tasks..."
             }
-    }
 
-    run_canary_then_batch TASK_IDS _investigation_run_single "$jobs_subdir" "$mode"
+        echo ""
+    done
 
     # Extract metrics for all completed tasks in this mode
-    extract_all_metrics "$jobs_subdir" "ccb_investigation" "$mode"
+    extract_all_metrics "$jobs_subdir" "${SUITE}" "$mode"
     validate_and_report "$jobs_subdir" "$mode"
 
-    log_section "Completed Investigation - Mode: $mode"
+    log_section "Completed LinuxFLBench - Mode: $mode"
 }
 
 # ============================================
@@ -265,9 +249,6 @@ if [ "$RUN_BASELINE" = true ]; then
     run_task_batch "baseline" "none"
 fi
 
-if [ "$RUN_BASE" = true ]; then
-    run_task_batch "sourcegraph_base" "sourcegraph_base"
-fi
 
 if [ "$RUN_FULL" = true ]; then
     run_task_batch "sourcegraph_full" "sourcegraph_full"
@@ -277,9 +258,10 @@ print_validation_summary "$JOBS_BASE"
 
 echo ""
 echo "=============================================="
-echo "Investigation Benchmark Complete!"
+echo "Benchmark Complete!"
 echo "=============================================="
 echo "Results saved to: ${JOBS_BASE}"
 echo ""
 echo "View results:"
 echo "  cat ${JOBS_BASE}/*/*/result.json | jq -r '.trials[].verifier_result.rewards.reward'"
+echo ""

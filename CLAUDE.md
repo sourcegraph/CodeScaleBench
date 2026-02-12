@@ -5,7 +5,7 @@
 ```
 configs/
   _common.sh                 # Shared infra: token refresh, parallel execution, multi-account
-  *_3config.sh               # Per-benchmark run scripts (12 total; DependEval has no 3config yet)
+  *_2config.sh               # Per-benchmark run scripts (14 total: baseline + SG_full)
   selected_benchmark_tasks.json  # Task selection with metadata, difficulty, MCP scores
 
 benchmarks/
@@ -57,14 +57,14 @@ docs/
 ## Running Tasks
 
 ```bash
-# Run a single benchmark (3 configs: baseline, SG_base, SG_full)
-./configs/pytorch_3config.sh
+# Run a single benchmark (2 configs: baseline, SG_full)
+./configs/pytorch_2config.sh
 
 # Run with parallel execution
-./configs/pytorch_3config.sh --parallel
+./configs/pytorch_2config.sh --parallel
 
 # Override parallelism
-./configs/pytorch_3config.sh --parallel 4
+./configs/pytorch_2config.sh --parallel 4
 ```
 
 See [AGENTS.md](AGENTS.md) for parallel execution details and multi-account setup.
@@ -151,7 +151,7 @@ MAINTENANCE
 
 | Skill | Script | Purpose |
 |-------|--------|---------|
-| `/compare-configs` | `scripts/compare_configs.py` | Show divergent tasks across baseline/SG_base/SG_full, "MCP helps" vs "MCP hurts" |
+| `/compare-configs` | `scripts/compare_configs.py` | Show divergent tasks across baseline/SG_full, "MCP helps" vs "MCP hurts" |
 | `/cost-report` | `scripts/cost_report.py` | Token usage and estimated cost by suite/config, most expensive tasks |
 | `/generate-report` | `scripts/generate_report.py` | Aggregate CCB evaluation report from completed runs |
 | `/evaluate-traces` | `scripts/audit_traces.py` | Comprehensive trace evaluation: data integrity, output quality, efficiency analysis |

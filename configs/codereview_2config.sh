@@ -1,17 +1,15 @@
 #!/bin/bash
-# DIBench 8-Task 3-Config Comparison Script
+# Code Review Benchmark 2-Config Comparison Script
 #
-# Runs selected DIBench tasks (from selected_benchmark_tasks.json) across 3 configurations:
+# Runs selected code review tasks (from selected_benchmark_tasks.json) across 2 configurations:
 #   1. Baseline (no MCP)
-#   2. MCP-Base (Sourcegraph tools without Deep Search)
-#   3. MCP-Full (Sourcegraph + Deep Search hybrid)
+#   2. MCP-Full (Sourcegraph + Deep Search hybrid)
 #
 # Usage:
-#   ./configs/dibench_3config.sh [OPTIONS]
+#   ./configs/codereview_3config.sh [OPTIONS]
 #
 # Options:
 #   --baseline-only        Run only baseline (no MCP)
-#   --base-only   Run only MCP-Base
 #   --full-only            Run only MCP-Full (sourcegraph_full)
 #   --model MODEL          Override model (default: claude-opus-4-6)
 #   --category CATEGORY    Run category (default: official)
@@ -58,13 +56,12 @@ ensure_fresh_token
 # ============================================
 # CONFIGURATION
 # ============================================
-TASKS_DIR="/home/stephanie_jarmak/CodeContextBench/benchmarks/ccb_dibench"
+TASKS_DIR="/home/stephanie_jarmak/CodeContextBench/benchmarks/ccb_codereview"
 AGENT_PATH="agents.claude_baseline_agent:BaselineClaudeCodeAgent"
 MODEL="${MODEL:-anthropic/claude-opus-4-6}"
 CONCURRENCY=2
 TIMEOUT_MULTIPLIER=10
 RUN_BASELINE=true
-RUN_BASE=true
 RUN_FULL=true
 CATEGORY="${CATEGORY:-official}"
 
@@ -72,18 +69,11 @@ CATEGORY="${CATEGORY:-official}"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --baseline-only)
-            RUN_BASE=false
-            RUN_FULL=false
-            shift
-            ;;
-        --base-only)
-            RUN_BASELINE=false
             RUN_FULL=false
             shift
             ;;
         --full-only)
             RUN_BASELINE=false
-            RUN_BASE=false
             shift
             ;;
         --model)
@@ -109,12 +99,6 @@ done
 setup_dual_accounts
 
 # Check MCP credentials if MCP modes requested
-if { [ "$RUN_BASE" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
-    echo "WARNING: MCP modes requested but SOURCEGRAPH_ACCESS_TOKEN not set"
-    echo "Skipping MCP runs. Use --baseline-only to suppress this warning."
-    RUN_BASE=false
-    RUN_FULL=false
-fi
 
 # Load task IDs from canonical selection file
 SELECTION_FILE="$SCRIPT_DIR/selected_benchmark_tasks.json"
@@ -128,35 +112,19 @@ readarray -t TASK_IDS < <(python3 -c "
 import json
 tasks = json.load(open('$SELECTION_FILE'))['tasks']
 for t in tasks:
-    if t['benchmark'] == 'ccb_dibench':
+    if t['benchmark'] == 'ccb_codereview' and not t.get('excluded', False):
         print(t['task_id'])
 ")
 
-# Also read task_dir for correct path resolution (task_id != directory name)
-readarray -t TASK_REL_DIRS < <(python3 -c "
-import json, os
-tasks = json.load(open('$SELECTION_FILE'))['tasks']
-for t in tasks:
-    if t['benchmark'] == 'ccb_dibench':
-        print(os.path.relpath(t['task_dir'], 'ccb_dibench'))
-")
-
-# Sourcegraph repo name mapping for DIBench tasks
-# These override SOURCEGRAPH_REPO_NAME so the agent searches the correct repo
-# DIBench uses STRIPPED repos (dependency declarations removed) to avoid leaking answers.
-# The --dibench repos in sg-benchmarks contain the same modified code the agent sees locally.
+# Sourcegraph repo name mapping for code review tasks
+# Each task targets a different public GitHub repo
 declare -A TASK_SG_REPO_NAMES=(
-    ["ccb_dibench-python-inducer-cgen"]="sg-benchmarks/cgen--dibench"
-    ["ccb_dibench-python-rhinosec-iamactionhunter"]="sg-benchmarks/IAMActionHunter--dibench"
-    ["ccb_dibench-rust-mitsuhiko-similar-asserts"]="sg-benchmarks/similar-asserts--dibench"
-    ["ccb_dibench-rust-rusticata-pcap-parser"]="sg-benchmarks/pcap-parser--dibench"
-    ["ccb_dibench-js-eslint-markdown"]="sg-benchmarks/markdown--dibench"
-    ["ccb_dibench-js-motdotla-dotenv-expand"]="sg-benchmarks/dotenv-expand--dibench"
-    ["ccb_dibench-csharp-irongut-codecoveragesummary"]="sg-benchmarks/CodeCoverageSummary--dibench"
-    ["ccb_dibench-csharp-dotnetkoans"]="sg-benchmarks/DotNetKoans--dibench"
+    ["cr-aspnetcore-001"]="github.com/sg-benchmarks/aspnetcore--87525573"
+    ["cr-calcom-001"]="github.com/sg-benchmarks/cal.com--4b99072b"
+    ["cr-ghost-001"]="github.com/sg-benchmarks/Ghost--b43bfc85"
 )
 
-# Derive short model name for run directory (matches V2 id_generator convention)
+# Derive short model name for run directory
 _model_lower=$(echo "$MODEL" | awk -F/ '{print $NF}' | tr '[:upper:]' '[:lower:]')
 case "$_model_lower" in
     *opus*)   MODEL_SHORT="opus" ;;
@@ -168,10 +136,10 @@ case "$_model_lower" in
 esac
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-JOBS_BASE="runs/${CATEGORY}/dibench_${MODEL_SHORT}_${TIMESTAMP}"
+JOBS_BASE="runs/${CATEGORY}/codereview_${MODEL_SHORT}_${TIMESTAMP}"
 
 echo "=============================================="
-echo "DIBench 8-Task 3-Config Benchmark"
+echo "Code Review 2-Config Benchmark"
 echo "=============================================="
 echo "Model: ${MODEL}"
 echo "Tasks: ${#TASK_IDS[@]}"
@@ -179,7 +147,6 @@ echo "Concurrency: ${CONCURRENCY}"
 echo "Parallel jobs: ${PARALLEL_JOBS}"
 echo "Jobs directory: ${JOBS_BASE}"
 echo "Run baseline: ${RUN_BASELINE}"
-echo "Run MCP-Base: ${RUN_BASE}"
 echo "Run MCP-Full: ${RUN_FULL}"
 echo ""
 
@@ -214,12 +181,6 @@ extract_all_metrics() {
     done
 }
 
-# Build task_id -> rel_dir mapping for parallel access
-declare -A TASK_ID_TO_REL_DIR
-for (( _i=0; _i<${#TASK_IDS[@]}; _i++ )); do
-    TASK_ID_TO_REL_DIR["${TASK_IDS[$_i]}"]="${TASK_REL_DIRS[$_i]}"
-done
-
 run_task_batch() {
     local mode=$1
     local mcp_type=$2
@@ -227,15 +188,14 @@ run_task_batch() {
 
     ensure_fresh_token_all
 
-    log_section "Running DIBench - Mode: $mode"
+    log_section "Running Code Review - Mode: $mode"
 
     mkdir -p "$jobs_subdir"
 
-    _dibench_run_single() {
+    _codereview_run_single() {
         local task_id=$1
         local task_home=$2
-        local rel_dir="${TASK_ID_TO_REL_DIR[$task_id]}"
-        local task_path="${TASKS_DIR}/${rel_dir}"
+        local task_path="${TASKS_DIR}/${task_id}"
 
         if [ ! -d "$task_path" ]; then
             echo "ERROR: Task directory not found: $task_path"
@@ -258,20 +218,19 @@ run_task_batch() {
             --jobs-dir "$jobs_subdir" \
             -n $CONCURRENCY \
             --timeout-multiplier $TIMEOUT_MULTIPLIER \
-            --force-build \
             2>&1 | tee "${jobs_subdir}/${task_id}.log" \
             || {
                 echo "WARNING: Task $task_id failed (exit code: $?)"
             }
     }
 
-    run_canary_then_batch TASK_IDS _dibench_run_single "$jobs_subdir" "$mode"
+    run_canary_then_batch TASK_IDS _codereview_run_single "$jobs_subdir" "$mode"
 
     # Extract metrics for all completed tasks in this mode
-    extract_all_metrics "$jobs_subdir" "ccb_dibench" "$mode"
+    extract_all_metrics "$jobs_subdir" "ccb_codereview" "$mode"
     validate_and_report "$jobs_subdir" "$mode"
 
-    log_section "Completed DIBench - Mode: $mode"
+    log_section "Completed Code Review - Mode: $mode"
 }
 
 # ============================================
@@ -281,9 +240,6 @@ if [ "$RUN_BASELINE" = true ]; then
     run_task_batch "baseline" "none"
 fi
 
-if [ "$RUN_BASE" = true ]; then
-    run_task_batch "sourcegraph_base" "sourcegraph_base"
-fi
 
 if [ "$RUN_FULL" = true ]; then
     run_task_batch "sourcegraph_full" "sourcegraph_full"

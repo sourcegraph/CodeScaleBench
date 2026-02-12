@@ -1,17 +1,15 @@
 #!/bin/bash
-# SWE-Perf 3-Task 3-Config Comparison Script
+# RepoQA 10-Task 2-Config Comparison Script
 #
-# Runs selected SWE-Perf tasks (from selected_benchmark_tasks.json) across 3 configurations:
+# Runs selected RepoQA tasks (from selected_benchmark_tasks.json) across 2 configurations:
 #   1. Baseline (no MCP)
-#   2. MCP-Base (Sourcegraph tools without Deep Search)
-#   3. MCP-Full (Sourcegraph + Deep Search hybrid)
+#   2. MCP-Full (Sourcegraph + Deep Search hybrid)
 #
 # Usage:
-#   ./configs/sweperf_3config.sh [OPTIONS]
+#   ./configs/repoqa_3config.sh [OPTIONS]
 #
 # Options:
 #   --baseline-only        Run only baseline (no MCP)
-#   --base-only   Run only MCP-Base
 #   --full-only            Run only MCP-Full (sourcegraph_full)
 #   --model MODEL          Override model (default: claude-opus-4-6)
 #   --category CATEGORY    Run category (default: official)
@@ -58,13 +56,12 @@ ensure_fresh_token
 # ============================================
 # CONFIGURATION
 # ============================================
-TASKS_DIR="/home/stephanie_jarmak/CodeContextBench/benchmarks/ccb_sweperf/tasks"
+TASKS_DIR="/home/stephanie_jarmak/CodeContextBench/benchmarks/ccb_repoqa/tasks"
 AGENT_PATH="agents.claude_baseline_agent:BaselineClaudeCodeAgent"
 MODEL="${MODEL:-anthropic/claude-opus-4-6}"
 CONCURRENCY=2
 TIMEOUT_MULTIPLIER=10
 RUN_BASELINE=true
-RUN_BASE=true
 RUN_FULL=true
 CATEGORY="${CATEGORY:-official}"
 
@@ -72,18 +69,11 @@ CATEGORY="${CATEGORY:-official}"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --baseline-only)
-            RUN_BASE=false
-            RUN_FULL=false
-            shift
-            ;;
-        --base-only)
-            RUN_BASELINE=false
             RUN_FULL=false
             shift
             ;;
         --full-only)
             RUN_BASELINE=false
-            RUN_BASE=false
             shift
             ;;
         --model)
@@ -109,12 +99,6 @@ done
 setup_dual_accounts
 
 # Check MCP credentials if MCP modes requested
-if { [ "$RUN_BASE" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
-    echo "WARNING: MCP modes requested but SOURCEGRAPH_ACCESS_TOKEN not set"
-    echo "Skipping MCP runs. Use --baseline-only to suppress this warning."
-    RUN_BASE=false
-    RUN_FULL=false
-fi
 
 # Load task IDs from canonical selection file
 SELECTION_FILE="$SCRIPT_DIR/selected_benchmark_tasks.json"
@@ -128,7 +112,7 @@ readarray -t TASK_IDS < <(python3 -c "
 import json
 tasks = json.load(open('$SELECTION_FILE'))['tasks']
 for t in tasks:
-    if t['benchmark'] == 'ccb_sweperf':
+    if t['benchmark'] == 'ccb_repoqa':
         print(t['task_id'])
 ")
 
@@ -137,17 +121,23 @@ readarray -t TASK_REL_DIRS < <(python3 -c "
 import json, os
 tasks = json.load(open('$SELECTION_FILE'))['tasks']
 for t in tasks:
-    if t['benchmark'] == 'ccb_sweperf':
-        print(os.path.relpath(t['task_dir'], 'ccb_sweperf/tasks'))
+    if t['benchmark'] == 'ccb_repoqa':
+        print(os.path.relpath(t['task_dir'], 'ccb_repoqa/tasks'))
 ")
 
-# Sourcegraph repo name mapping for SWE-Perf tasks
+# Sourcegraph repo name mapping for RepoQA tasks
 # These override SOURCEGRAPH_REPO_NAME so the agent searches the correct repo
-# Pinned to specific commits for reproducibility (previously --latest)
 declare -A TASK_SG_REPO_NAMES=(
-    ["ccb_sweperf-001"]="sg-benchmarks/numpy--a639fbf5"
-    ["ccb_sweperf-002"]="sg-benchmarks/scikit-learn--cb7e82dd"
-    ["ccb_sweperf-003"]="sg-benchmarks/pandas--41968da5"
+    ["ccb_repoqa-cpp-apache-logging-log4cxx-03"]="sg-benchmarks/apache--logging-log4cxx--502f5711"
+    ["ccb_repoqa-cpp-skypjack-uvw-00"]="sg-benchmarks/skypjack--uvw--ba10b276"
+    ["ccb_repoqa-java-google-gson-03"]="sg-benchmarks/google--gson--ee61e3f0"
+    ["ccb_repoqa-java-square-retrofit-04"]="sg-benchmarks/square--retrofit--10014c2b"
+    ["ccb_repoqa-python-psf-black-01"]="sg-benchmarks/psf--black--f03ee113"
+    ["ccb_repoqa-python-python-poetry-poetry-08"]="sg-benchmarks/python-poetry--poetry--21ffd992"
+    ["ccb_repoqa-rust-rust-bakery-nom-06"]="sg-benchmarks/rust-bakery--nom--e87c7da9"
+    ["ccb_repoqa-rust-helix-editor-helix-03"]="sg-benchmarks/helix-editor--helix--e69292e5"
+    ["ccb_repoqa-typescript-xenova-transformers.js-08"]="sg-benchmarks/xenova--transformers.js--64274313"
+    ["ccb_repoqa-typescript-expressjs-express-07"]="sg-benchmarks/expressjs--express--815f7993"
 )
 
 # Derive short model name for run directory (matches V2 id_generator convention)
@@ -162,10 +152,10 @@ case "$_model_lower" in
 esac
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-JOBS_BASE="runs/${CATEGORY}/sweperf_${MODEL_SHORT}_${TIMESTAMP}"
+JOBS_BASE="runs/${CATEGORY}/repoqa_${MODEL_SHORT}_${TIMESTAMP}"
 
 echo "=============================================="
-echo "SWE-Perf 3-Task 3-Config Benchmark"
+echo "RepoQA 10-Task 2-Config Benchmark"
 echo "=============================================="
 echo "Model: ${MODEL}"
 echo "Tasks: ${#TASK_IDS[@]}"
@@ -173,7 +163,6 @@ echo "Concurrency: ${CONCURRENCY}"
 echo "Parallel jobs: ${PARALLEL_JOBS}"
 echo "Jobs directory: ${JOBS_BASE}"
 echo "Run baseline: ${RUN_BASELINE}"
-echo "Run MCP-Base: ${RUN_BASE}"
 echo "Run MCP-Full: ${RUN_FULL}"
 echo ""
 
@@ -221,11 +210,11 @@ run_task_batch() {
 
     ensure_fresh_token_all
 
-    log_section "Running SWE-Perf - Mode: $mode"
+    log_section "Running RepoQA - Mode: $mode"
 
     mkdir -p "$jobs_subdir"
 
-    _sweperf_run_single() {
+    _repoqa_run_single() {
         local task_id=$1
         local task_home=$2
         local rel_dir="${TASK_ID_TO_REL_DIR[$task_id]}"
@@ -258,13 +247,13 @@ run_task_batch() {
             }
     }
 
-    run_canary_then_batch TASK_IDS _sweperf_run_single "$jobs_subdir" "$mode"
+    run_canary_then_batch TASK_IDS _repoqa_run_single "$jobs_subdir" "$mode"
 
     # Extract metrics for all completed tasks in this mode
-    extract_all_metrics "$jobs_subdir" "ccb_sweperf" "$mode"
+    extract_all_metrics "$jobs_subdir" "ccb_repoqa" "$mode"
     validate_and_report "$jobs_subdir" "$mode"
 
-    log_section "Completed SWE-Perf - Mode: $mode"
+    log_section "Completed RepoQA - Mode: $mode"
 }
 
 # ============================================
@@ -274,9 +263,6 @@ if [ "$RUN_BASELINE" = true ]; then
     run_task_batch "baseline" "none"
 fi
 
-if [ "$RUN_BASE" = true ]; then
-    run_task_batch "sourcegraph_base" "sourcegraph_base"
-fi
 
 if [ "$RUN_FULL" = true ]; then
     run_task_batch "sourcegraph_full" "sourcegraph_full"
@@ -291,4 +277,4 @@ echo "=============================================="
 echo "Results saved to: ${JOBS_BASE}"
 echo ""
 echo "View results:"
-echo "  cat ${JOBS_BASE}/*/*/result.json | jq -r '.trials[].verifier_result.rewards.reward'"
+echo "  cat ${JOBS_BASE}/*/*/result.json | jq -r '.verifier_result.rewards | .reward // .score'"

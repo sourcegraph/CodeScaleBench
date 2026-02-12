@@ -1,17 +1,15 @@
 #!/bin/bash
-# SWE-bench Pro 3-Config Comparison Script
+# SWE-bench Pro 2-Config Comparison Script
 #
-# Runs selected SWE-bench Pro instances (from selected_benchmark_tasks.json) across 3 configurations:
+# Runs selected SWE-bench Pro instances (from selected_benchmark_tasks.json) across 2 configurations:
 #   1. Baseline (no MCP)
-#   2. MCP-Base (Sourcegraph tools without Deep Search)
-#   3. MCP-Full (Sourcegraph + Deep Search hybrid)
+#   2. MCP-Full (Sourcegraph + Deep Search hybrid)
 #
 # Usage:
 #   ./configs/swebenchpro_3config.sh [OPTIONS]
 #
 # Options:
 #   --baseline-only        Run only baseline (no MCP)
-#   --base-only   Run only MCP-Base
 #   --full-only            Run only MCP-Full (sourcegraph_full)
 #   --model MODEL          Override model (default: claude-opus-4-6)
 #   --concurrency N        Number of concurrent tasks (default: 2)
@@ -64,7 +62,6 @@ MODEL="${MODEL:-anthropic/claude-opus-4-6}"
 CONCURRENCY=2
 TIMEOUT_MULTIPLIER=10
 RUN_BASELINE=true
-RUN_BASE=true
 RUN_FULL=true
 CATEGORY="${CATEGORY:-official}"
 
@@ -72,18 +69,11 @@ CATEGORY="${CATEGORY:-official}"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --baseline-only)
-            RUN_BASE=false
-            RUN_FULL=false
-            shift
-            ;;
-        --base-only)
-            RUN_BASELINE=false
             RUN_FULL=false
             shift
             ;;
         --full-only)
             RUN_BASELINE=false
-            RUN_BASE=false
             shift
             ;;
         --model)
@@ -113,12 +103,6 @@ done
 setup_dual_accounts
 
 # Check MCP credentials if MCP modes requested
-if { [ "$RUN_BASE" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
-    echo "WARNING: MCP modes requested but SOURCEGRAPH_ACCESS_TOKEN not set"
-    echo "Skipping MCP runs. Use --baseline-only to suppress this warning."
-    RUN_BASE=false
-    RUN_FULL=false
-fi
 
 # Load task IDs from canonical selection file
 SELECTION_FILE="$SCRIPT_DIR/selected_benchmark_tasks.json"
@@ -151,7 +135,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 JOBS_BASE="runs/${CATEGORY}/swebenchpro_selected_${MODEL_SHORT}_${TIMESTAMP}"
 
 echo "=============================================="
-echo "SWE-bench Pro 3-Config Benchmark"
+echo "SWE-bench Pro 2-Config Benchmark"
 echo "=============================================="
 echo "Model: ${MODEL}"
 echo "Tasks: ${#TASK_IDS[@]}"
@@ -160,7 +144,6 @@ echo "Parallel jobs: ${PARALLEL_JOBS}"
 echo "Timeout multiplier: ${TIMEOUT_MULTIPLIER}x"
 echo "Jobs directory: ${JOBS_BASE}"
 echo "Run baseline: ${RUN_BASELINE}"
-echo "Run MCP-Base: ${RUN_BASE}"
 echo "Run MCP-Full: ${RUN_FULL}"
 echo ""
 
@@ -295,18 +278,6 @@ if [ "$RUN_BASELINE" = true ]; then
 fi
 
 # ============================================
-# RUN MCP-Base (sourcegraph_base)
-# Per-task iteration to set SOURCEGRAPH_REPO_NAME for indexed repos
-# ============================================
-if [ "$RUN_BASE" = true ]; then
-    echo ""
-    echo "[MCP-Base] Starting per-task MCP-Base run..."
-    echo ""
-
-    run_swebench_mcp_task_batch "sourcegraph_base" "sourcegraph_base"
-fi
-
-# ============================================
 # RUN MCP-Full (sourcegraph_full)
 # Per-task iteration to set SOURCEGRAPH_REPO_NAME for indexed repos
 # ============================================
@@ -330,11 +301,6 @@ echo "View results:"
 if [ "$RUN_BASELINE" = true ]; then
     echo "  # Baseline - count resolved"
     echo "  cat ${JOBS_BASE}/baseline/*/result.json | jq -s '[.[] | select(.trials[].verifier_result.resolved == true)] | length'"
-    echo ""
-fi
-if [ "$RUN_BASE" = true ]; then
-    echo "  # MCP-Base - count resolved"
-    echo "  cat ${JOBS_BASE}/sourcegraph_base/*/result.json | jq -s '[.[] | select(.trials[].verifier_result.resolved == true)] | length'"
     echo ""
 fi
 if [ "$RUN_FULL" = true ]; then

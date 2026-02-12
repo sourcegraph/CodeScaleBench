@@ -1,21 +1,20 @@
 #!/bin/bash
-# PyTorch 12-Task 3-Config Comparison Script
+# TheAgentCompany (TAC) 8-Task 2-Config Comparison Script
 #
-# Runs selected PyTorch tasks (from selected_benchmark_tasks.json) across 3 configurations:
+# Runs selected TAC tasks (from selected_benchmark_tasks.json) across 2 configurations:
 #   1. Baseline (no MCP)
-#   2. MCP-Base (Sourcegraph tools without Deep Search)
-#   3. MCP-Full (Sourcegraph + Deep Search hybrid)
+#   2. MCP-Full (Sourcegraph + Deep Search hybrid)
 #
 # Usage:
-#   ./configs/pytorch_3config.sh [OPTIONS]
+#   ./configs/tac_3config.sh [OPTIONS]
 #
 # Options:
 #   --baseline-only        Run only baseline (no MCP)
-#   --base-only   Run only MCP-Base
 #   --full-only            Run only MCP-Full (sourcegraph_full)
 #   --model MODEL          Override model (default: claude-opus-4-6)
 #   --category CATEGORY    Run category (default: official)
 #   --parallel N           Number of parallel task subshells (default: 1)
+#   --skip-server-check    Skip TAC server health check
 #
 # Prerequisites:
 #   - ~/evals/.env.local with USE_SUBSCRIPTION=true (default: 2-account Max subscription)
@@ -56,34 +55,69 @@ echo ""
 ensure_fresh_token
 
 # ============================================
+# TAC SERVER CHECK
+# ============================================
+check_tac_server() {
+    local ok=true
+
+    # Check /etc/hosts
+    if ! grep -q "the-agent-company.com" /etc/hosts 2>/dev/null; then
+        echo "ERROR: /etc/hosts missing 'the-agent-company.com' entry"
+        echo "  Fix: echo '127.0.0.1 the-agent-company.com' | sudo tee -a /etc/hosts"
+        ok=false
+    fi
+
+    # Check GitLab
+    if ! curl -sf --max-time 5 "http://the-agent-company.com:8929/" >/dev/null 2>&1; then
+        echo "ERROR: TAC GitLab not reachable at :8929"
+        ok=false
+    fi
+
+    # Check RocketChat
+    if ! curl -sf --max-time 5 "http://the-agent-company.com:3000/" >/dev/null 2>&1; then
+        echo "WARNING: TAC RocketChat not reachable at :3000 (needed by some tasks)"
+    fi
+
+    # Check API server (healthcheck endpoints are per-service)
+    if ! curl -sf --max-time 5 "http://the-agent-company.com:2999/api/healthcheck/gitlab" >/dev/null 2>&1; then
+        echo "WARNING: TAC API server not reachable at :2999 (needed by some tasks)"
+    fi
+
+    if [ "$ok" = false ]; then
+        echo ""
+        echo "TAC server infrastructure is required. Setup instructions:"
+        echo "  1. curl -fsSL https://github.com/TheAgentCompany/the-agent-company-backup-data/releases/download/setup-script-20241208/setup.sh | sh"
+        echo "  2. echo '127.0.0.1 the-agent-company.com' | sudo tee -a /etc/hosts"
+        echo ""
+        echo "Use --skip-server-check to bypass this check."
+        exit 1
+    fi
+
+    echo "TAC server: OK (GitLab reachable)"
+}
+
+# ============================================
 # CONFIGURATION
 # ============================================
-TASKS_DIR="/home/stephanie_jarmak/CodeContextBench/benchmarks/ccb_pytorch"
+TASKS_DIR="/home/stephanie_jarmak/CodeContextBench/benchmarks/ccb_tac"
 AGENT_PATH="agents.claude_baseline_agent:BaselineClaudeCodeAgent"
 MODEL="${MODEL:-anthropic/claude-opus-4-6}"
 CONCURRENCY=2
 TIMEOUT_MULTIPLIER=10
 RUN_BASELINE=true
-RUN_BASE=true
 RUN_FULL=true
+SKIP_SERVER_CHECK=false
 CATEGORY="${CATEGORY:-official}"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --baseline-only)
-            RUN_BASE=false
-            RUN_FULL=false
-            shift
-            ;;
-        --base-only)
-            RUN_BASELINE=false
             RUN_FULL=false
             shift
             ;;
         --full-only)
             RUN_BASELINE=false
-            RUN_BASE=false
             shift
             ;;
         --model)
@@ -98,6 +132,10 @@ while [[ $# -gt 0 ]]; do
             PARALLEL_JOBS="$2"
             shift 2
             ;;
+        --skip-server-check)
+            SKIP_SERVER_CHECK=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -105,16 +143,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Verify TAC server infrastructure
+if [ "$SKIP_SERVER_CHECK" = false ]; then
+    check_tac_server
+fi
+
 # Set up dual-account support (auto-detects second account)
 setup_dual_accounts
 
 # Check MCP credentials if MCP modes requested
-if { [ "$RUN_BASE" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
-    echo "WARNING: MCP modes requested but SOURCEGRAPH_ACCESS_TOKEN not set"
-    echo "Skipping MCP runs. Use --baseline-only to suppress this warning."
-    RUN_BASE=false
-    RUN_FULL=false
-fi
 
 # Load task IDs from canonical selection file
 SELECTION_FILE="$SCRIPT_DIR/selected_benchmark_tasks.json"
@@ -128,25 +165,21 @@ readarray -t TASK_IDS < <(python3 -c "
 import json
 tasks = json.load(open('$SELECTION_FILE'))['tasks']
 for t in tasks:
-    if t['benchmark'] == 'ccb_pytorch':
+    if t['benchmark'] == 'ccb_tac' and not t.get('excluded', False):
         print(t['task_id'])
 ")
 
-# Sourcegraph repo name mapping for PyTorch tasks
-# Each task uses a specific pytorch commit; repos are indexed as pytorch--{hash8}
+# Sourcegraph repo name mapping for TAC tasks
+# These override SOURCEGRAPH_REPO_NAME so the agent searches the correct repo
 declare -A TASK_SG_REPO_NAMES=(
-    ["sgt-001"]="sg-benchmarks/pytorch--ca246612"
-    ["sgt-002"]="sg-benchmarks/pytorch--ca246612"
-    ["sgt-003"]="sg-benchmarks/pytorch--d18007a1"
-    ["sgt-005"]="sg-benchmarks/pytorch--ca246612"
-    ["sgt-008"]="sg-benchmarks/pytorch--863edc78"
-    ["sgt-009"]="sg-benchmarks/pytorch--863edc78"
-    ["sgt-010"]="sg-benchmarks/pytorch--5811a8d7"
-    ["sgt-012"]="sg-benchmarks/pytorch--e3e93c71"
-    ["sgt-014"]="sg-benchmarks/pytorch--cbe1a35d"
-    ["sgt-016"]="sg-benchmarks/pytorch--cbe1a35d"
-    ["sgt-021"]="sg-benchmarks/pytorch--cbe1a35d"
-    ["sgt-025"]="sg-benchmarks/pytorch--e8ca8cc3"
+    ["tac-buffer-pool-manager"]="sg-benchmarks/bustub--d5f79431"
+    ["tac-copilot-arena-endpoint"]="sg-benchmarks/copilot-arena--latest"
+    ["tac-dependency-change"]="sg-benchmarks/OpenHands--latest"
+    ["tac-find-in-codebase-1"]="sg-benchmarks/llama.cpp--56399714"
+    ["tac-find-in-codebase-2"]="sg-benchmarks/llama.cpp--56399714"
+    ["tac-implement-hyperloglog"]="sg-benchmarks/bustub--d5f79431"
+    ["tac-troubleshoot-dev-setup"]="sg-benchmarks/copilot-arena--latest"
+    ["tac-write-unit-test"]="sg-benchmarks/OpenHands--latest"
 )
 
 # Derive short model name for run directory (matches V2 id_generator convention)
@@ -161,10 +194,10 @@ case "$_model_lower" in
 esac
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-JOBS_BASE="runs/${CATEGORY}/pytorch_${MODEL_SHORT}_${TIMESTAMP}"
+JOBS_BASE="runs/${CATEGORY}/tac_${MODEL_SHORT}_${TIMESTAMP}"
 
 echo "=============================================="
-echo "PyTorch 12-Task 3-Config Benchmark"
+echo "TAC 8-Task 2-Config Benchmark"
 echo "=============================================="
 echo "Model: ${MODEL}"
 echo "Tasks: ${#TASK_IDS[@]}"
@@ -172,7 +205,6 @@ echo "Concurrency: ${CONCURRENCY}"
 echo "Parallel jobs: ${PARALLEL_JOBS}"
 echo "Jobs directory: ${JOBS_BASE}"
 echo "Run baseline: ${RUN_BASELINE}"
-echo "Run MCP-Base: ${RUN_BASE}"
 echo "Run MCP-Full: ${RUN_FULL}"
 echo ""
 
@@ -214,12 +246,11 @@ run_task_batch() {
 
     ensure_fresh_token_all
 
-    log_section "Running PyTorch - Mode: $mode"
+    log_section "Running TAC - Mode: $mode"
 
     mkdir -p "$jobs_subdir"
 
-    # Define per-task command for parallel runner
-    _pytorch_run_single() {
+    _tac_run_single() {
         local task_id=$1
         local task_home=$2
         local task_path="${TASKS_DIR}/${task_id}"
@@ -251,13 +282,13 @@ run_task_batch() {
             }
     }
 
-    run_canary_then_batch TASK_IDS _pytorch_run_single "$jobs_subdir" "$mode"
+    run_canary_then_batch TASK_IDS _tac_run_single "$jobs_subdir" "$mode"
 
     # Extract metrics for all completed tasks in this mode
-    extract_all_metrics "$jobs_subdir" "ccb_pytorch" "$mode"
+    extract_all_metrics "$jobs_subdir" "ccb_tac" "$mode"
     validate_and_report "$jobs_subdir" "$mode"
 
-    log_section "Completed PyTorch - Mode: $mode"
+    log_section "Completed TAC - Mode: $mode"
 }
 
 # ============================================
@@ -267,9 +298,6 @@ if [ "$RUN_BASELINE" = true ]; then
     run_task_batch "baseline" "none"
 fi
 
-if [ "$RUN_BASE" = true ]; then
-    run_task_batch "sourcegraph_base" "sourcegraph_base"
-fi
 
 if [ "$RUN_FULL" = true ]; then
     run_task_batch "sourcegraph_full" "sourcegraph_full"
