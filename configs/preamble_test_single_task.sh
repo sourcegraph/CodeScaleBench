@@ -69,6 +69,7 @@ fi
 
 TASK_ID=$(python3 -c "import json; print(json.load(open('$TASK_FILE'))['tasks'][0]['task_id'])")
 TASK_DIR=$(python3 -c "import json; print(json.load(open('$TASK_FILE'))['tasks'][0]['task_dir'])")
+TASK_REPO=$(python3 -c "import json; print(json.load(open('$TASK_FILE'))['tasks'][0].get('repo', ''))")
 
 echo "============================================"
 echo "Preamble V3 Validation Test — Single Task"
@@ -115,6 +116,9 @@ if [ "$RUN_FULL" = true ]; then
     echo ""
 
     ensure_fresh_token
+
+    # Set Sourcegraph repo name from task metadata
+    export SOURCEGRAPH_REPO_NAME="${TASK_REPO}"
 
     BASELINE_MCP_TYPE=sourcegraph_full harbor run \
         --path "benchmarks/$TASK_DIR" \
