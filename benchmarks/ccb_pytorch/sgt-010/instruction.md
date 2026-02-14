@@ -32,21 +32,22 @@ Tasks:
 1. Understand the issue being fixed
 2. Review the solution in the merged PR
 3. Implement the fix to pass all tests
-4. Verify: run "make test" successfully
+4. Verify your changes compile and match the expected fix
 
 ## Success Criteria
 
-All tests pass: run "make test" successfully.
+Code changes match the expected ground-truth fix.
 Code follows repository conventions.
 No regressions in existing functionality.
 All 7 modified files updated correctly.
 
 ## Testing
 
-Run the test command to verify your implementation:
+Your implementation will be automatically verified:
 
-```bash
-make test
+```
+The verifier will compare your code changes against the expected ground-truth diff.
+Score = 0.35 * file_recall + 0.45 * line_recall + 0.20 * line_precision
 ```
 
 **Time Limit:** 10 minutes  

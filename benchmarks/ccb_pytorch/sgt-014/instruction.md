@@ -22,21 +22,22 @@ Tasks:
 1. Fix offset remapping logic in `torch/_dynamo/resume_execution.py`
 2. Adjust `symbolic_convert.py` for correct exception table entry and STORE_ATTR handling
 3. Move and update test cases in test_ctx_manager.py
-4. Verify: run "make test" successfully
+4. Verify your changes compile and match the expected fix
 
 ## Success Criteria
 
-All tests pass: run "make test" successfully.
+Code changes match the expected ground-truth fix.
 Code follows repository conventions.
 No regressions in existing functionality.
 All 4 modified files updated correctly.
 
 ## Testing
 
-Run the test command to verify your implementation:
+Your implementation will be automatically verified:
 
-```bash
-make test
+```
+The verifier will compare your code changes against the expected ground-truth diff.
+Score = 0.35 * file_recall + 0.45 * line_recall + 0.20 * line_precision
 ```
 
 **Time Limit:** 10 minutes  

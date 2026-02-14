@@ -162,15 +162,99 @@ REAL_HOME="$HOME"
 
 # List of account directory names to SKIP (e.g., non-Max-plan accounts).
 # Override via SKIP_ACCOUNTS env var (space-separated).
-# Default: skip account2 (regular plan, not Max — too rate-limited for parallel runs).
-SKIP_ACCOUNTS="${SKIP_ACCOUNTS:-account2}"
+# By default, no accounts are skipped — accounts with expired/invalid tokens
+# are detected and skipped automatically in setup_multi_accounts.
+SKIP_ACCOUNTS="${SKIP_ACCOUNTS:-}"
+
+# Check whether an account's OAuth token is valid (or can be refreshed).
+# Args: $1 = account home directory (e.g., ~/.claude-homes/account1)
+# Returns 0 if the token is valid (or was successfully refreshed), 1 otherwise.
+# Uses REFRESH_MARGIN (default 30 min) as the validity threshold.
+_check_account_token() {
+    local account_home=$1
+    local creds_file="$account_home/.claude/.credentials.json"
+
+    if [ ! -f "$creds_file" ]; then
+        echo "    No credentials file"
+        return 1
+    fi
+
+    # First check current token validity
+    local token_status
+    token_status=$(python3 - "$creds_file" "$REFRESH_MARGIN" <<'TOKCHK'
+import json, sys, time
+
+creds_file = sys.argv[1]
+margin = int(sys.argv[2])
+
+try:
+    with open(creds_file) as f:
+        creds = json.load(f)
+except (json.JSONDecodeError, OSError) as e:
+    print(f"corrupt:{e}")
+    sys.exit(0)
+
+oauth = creds.get("claudeAiOauth", {})
+if not oauth:
+    print("no_oauth")
+    sys.exit(0)
+
+expires_at_ms = oauth.get("expiresAt", 0)
+now_ms = int(time.time() * 1000)
+remaining_s = (expires_at_ms - now_ms) / 1000
+
+if remaining_s > margin:
+    mins = int(remaining_s / 60)
+    print(f"valid:{mins}")
+else:
+    mins = int(remaining_s / 60)
+    has_refresh = bool(oauth.get("refreshToken"))
+    print(f"expiring:{mins}:{has_refresh}")
+TOKCHK
+    )
+
+    local status_type="${token_status%%:*}"
+
+    case "$status_type" in
+        valid)
+            local mins="${token_status#valid:}"
+            echo "    Token valid (${mins} min remaining)"
+            return 0
+            ;;
+        expiring)
+            # Token is expired or expiring soon — try refresh
+            echo "    Token expiring soon — attempting refresh..."
+            if HOME="$account_home" refresh_claude_token 2>&1 | sed 's/^/    /'; then
+                echo "    Token refreshed successfully"
+                return 0
+            else
+                echo "    Token refresh FAILED"
+                return 1
+            fi
+            ;;
+        no_oauth)
+            echo "    No OAuth credentials in file"
+            return 1
+            ;;
+        corrupt*)
+            echo "    Credentials file corrupt: ${token_status#corrupt:}"
+            return 1
+            ;;
+        *)
+            echo "    Unknown token status: $token_status"
+            return 1
+            ;;
+    esac
+}
 
 # Detect all accounts under ~/.claude-homes/accountN/ (N=1,2,3,...).
 # Skips accounts listed in SKIP_ACCOUNTS.
+# Also skips accounts with expired/invalid tokens (after attempting refresh).
 # Falls back to $HOME if no account directories are found.
 # Auto-sets PARALLEL_JOBS = SESSIONS_PER_ACCOUNT * num_accounts when not explicitly set.
 setup_multi_accounts() {
     CLAUDE_HOMES=()
+    local skipped_accounts=()
 
     # Check for explicit account directories: account1, account2, ...
     local account_num=1
@@ -179,10 +263,18 @@ setup_multi_accounts() {
         local account_home="$REAL_HOME/.claude-homes/$account_name"
         if [ -f "$account_home/.claude/.credentials.json" ]; then
             # Check skip list
-            if [[ " $SKIP_ACCOUNTS " == *" $account_name "* ]]; then
+            if [[ -n "$SKIP_ACCOUNTS" ]] && [[ " $SKIP_ACCOUNTS " == *" $account_name "* ]]; then
                 echo "  Skipping $account_name (in SKIP_ACCOUNTS)"
+                skipped_accounts+=("$account_name")
             else
-                CLAUDE_HOMES+=("$account_home")
+                # Check token validity
+                echo "  Checking $account_name token..."
+                if _check_account_token "$account_home"; then
+                    CLAUDE_HOMES+=("$account_home")
+                else
+                    echo "  Skipping $account_name (token expired/invalid — re-authenticate with: python3 scripts/headless_login.py --home ~/.claude-homes/$account_name)"
+                    skipped_accounts+=("$account_name")
+                fi
             fi
             account_num=$((account_num + 1))
         else
@@ -190,8 +282,14 @@ setup_multi_accounts() {
         fi
     done
 
+    # Restore HOME in case refresh_claude_token changed it
+    export HOME="$REAL_HOME"
+
     # Fallback: if no account dirs found, use $HOME
     if [ ${#CLAUDE_HOMES[@]} -eq 0 ]; then
+        if [ ${#skipped_accounts[@]} -gt 0 ]; then
+            echo "WARNING: All accounts were skipped (${skipped_accounts[*]}). Falling back to \$HOME."
+        fi
         CLAUDE_HOMES=("$HOME")
         echo "Single-account mode (using \$HOME)"
     else
@@ -199,6 +297,9 @@ setup_multi_accounts() {
         for i in "${!CLAUDE_HOMES[@]}"; do
             echo "  slot $((i+1)): ${CLAUDE_HOMES[$i]}"
         done
+        if [ ${#skipped_accounts[@]} -gt 0 ]; then
+            echo "  skipped: ${skipped_accounts[*]}"
+        fi
     fi
 
     # Auto-set PARALLEL_JOBS = sessions_per_account * num_accounts

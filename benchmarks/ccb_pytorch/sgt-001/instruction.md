@@ -23,11 +23,11 @@ Tasks:
 1. Understand the thread safety issue with `ncclCommGetAsyncError`
 2. Implement mutex-based synchronization in NCCLUtils.cpp/hpp
 3. Update ProcessGroupNCCL.cpp to use the new thread-safe wrapper
-4. Verify: run "make test" successfully
+4. Verify your changes compile and match the expected fix
 
 ## Success Criteria
 
-- All tests pass: run "make test" successfully.
+- Code changes match the expected ground-truth fix.
 - Code changes are committed to git (verify with `git diff HEAD`)
 - Code follows repository conventions.
 - No regressions in existing functionality.
@@ -35,10 +35,11 @@ Tasks:
 
 ## Testing
 
-Run the test command to verify your implementation:
+Your implementation will be automatically verified:
 
-```bash
-make test
+```
+The verifier will compare your code changes against the expected ground-truth diff.
+Score = 0.35 * file_recall + 0.45 * line_recall + 0.20 * line_precision
 ```
 
 **Time Limit:** 10 minutes  

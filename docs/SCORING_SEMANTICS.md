@@ -29,10 +29,10 @@ How each benchmark is scored, what the numbers mean, and known limitations.
 - **Limitations**: Does not verify that the ordering is a valid topological sort — only compares against a single reference ordering. Near-correct orderings (single swap) now receive partial credit via Kendall tau.
 
 ### PyTorch
-- **Type**: test-ratio (pytest-based)
-- **Mechanism**: Runs targeted PyTorch test file; score = fraction passing
-- **Good score**: 1.0
-- **Limitations**: Test files may have build-time dependencies (CUDA, specific PyTorch builds). sgt-025 has a permanently broken Docker environment.
+- **Type**: diff_similarity (diff-based)
+- **Mechanism**: Compares agent's code changes against expected ground-truth diff; score = 0.35 * file_recall + 0.45 * line_recall + 0.20 * line_precision. sgt-001 uses a custom verifier (file + pattern checks).
+- **Good score**: >= 0.5 (correct files touched with matching changes)
+- **Limitations**: Diff similarity rewards matching the reference solution line-by-line; functionally equivalent but differently structured fixes may score lower. sgt-025 dropped from selection (Docker permanently broken: commit SHA unreachable).
 
 ### LoCoBench
 - **Type**: similarity (weighted multi-signal)
@@ -100,7 +100,7 @@ How each benchmark is scored, what the numbers mean, and known limitations.
 |-----------|------------------------|-------|
 | SWE-bench Pro | 0.3–0.5 | Hard real-world bugs |
 | DependEval | 0.3–0.6 | Ordering is partially correct for most |
-| PyTorch | 0.05–0.25 | Very hard, sparse instructions |
+| PyTorch | 0.05–0.25 | Diff similarity; 11 tasks (sgt-025 dropped) |
 | LoCoBench | 0.4–0.6 | Similarity-based, partial credit common |
 | RepoQA | 0.5–0.8 | Binary per-task, varies by difficulty |
 | K8s Docs | 0.5–0.8 | Documentation generation is tractable |

@@ -1,36 +1,18 @@
 #!/bin/bash
 # Reward: diff_similarity (0.0-1.0) — diff match to expected patch
-set -e
-
-# Create logs directory
+set -eo pipefail
 mkdir -p /logs/verifier
+cd /workspace
+git config --global --add safe.directory /workspace 2>/dev/null || true
 PRE_FIX_REV="863edc787f5fa7950e0f3f86d4952641e1ef9c2c"
-
-# Run actual tests with partial credit
-echo "Running test command: make test"
-make test 2>&1 | tee /logs/verifier/test_output.log
-TEST_EXIT_CODE=${PIPESTATUS[0]}
-
-if [ "$TEST_EXIT_CODE" -eq 0 ]; then
-    echo "[PASS] Tests passed"
-    echo "1.0" > /logs/verifier/reward.txt
-    exit 0
-else
-    # Attempt partial credit by parsing pytest output
-    REWARD="0.0"
-    if [ -f /logs/verifier/test_output.log ]; then
-        PYTEST_LINE=$(grep -E '[0-9]+ passed' /logs/verifier/test_output.log 2>/dev/null | tail -1)
-        if [ -n "$PYTEST_LINE" ]; then
-            PASSED=$(echo "$PYTEST_LINE" | grep -oP '\d+(?= passed)' || echo "0")
-            FAILED=$(echo "$PYTEST_LINE" | grep -oP '\d+(?= failed)' || echo "0")
-            ERRORS=$(echo "$PYTEST_LINE" | grep -oP '\d+(?= error)' || echo "0")
-            TOTAL=$((PASSED + FAILED + ERRORS))
-            if [ "$TOTAL" -gt 0 ] 2>/dev/null; then
-                REWARD=$(awk "BEGIN {printf \"%.4f\", $PASSED / $TOTAL}")
-            fi
-        fi
-    fi
-    echo "$REWARD" > /logs/verifier/reward.txt
-    echo "[PARTIAL] Tests partially passed: $REWARD"
-    exit 1
-fi
+python3 /tests/verify_diff.py \
+    --expected /tests/expected.diff \
+    --pre-fix-rev "$PRE_FIX_REV" \
+    --output /logs/verifier/reward.json \
+    2>&1 | tee /logs/verifier/verifier.log
+REWARD=$(python3 -c "import json; print(json.load(open('/logs/verifier/reward.json')).get('reward', 0.0))" 2>/dev/null || echo "0.0")
+echo "$REWARD" > /logs/verifier/reward.txt
+echo "Final reward: $REWARD"
+git diff "$PRE_FIX_REV" > /logs/verifier/agent.diff 2>/dev/null || true
+git diff "$PRE_FIX_REV" --stat > /logs/verifier/diff.stat 2>/dev/null || true
+exit 0

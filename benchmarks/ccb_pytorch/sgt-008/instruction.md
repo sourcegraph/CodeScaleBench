@@ -20,21 +20,22 @@ Tasks:
 1. Understand the release branch CI configuration pattern (see PR #162493 for the 2.9 equivalent)
 2. Update workflow files with correct branch references and Docker image tags
 3. Adjust build matrix entries for CUDA and ROCm versions
-4. Verify: run "make test" successfully
+4. Verify your changes compile and match the expected fix
 
 ## Success Criteria
 
-All tests pass: run "make test" successfully.
+Code changes match the expected ground-truth fix.
 Code follows repository conventions.
 No regressions in existing functionality.
 All 110 modified files updated correctly.
 
 ## Testing
 
-Run the test command to verify your implementation:
+Your implementation will be automatically verified:
 
-```bash
-make test
+```
+The verifier will compare your code changes against the expected ground-truth diff.
+Score = 0.35 * file_recall + 0.45 * line_recall + 0.20 * line_precision
 ```
 
 **Time Limit:** 10 minutes  
