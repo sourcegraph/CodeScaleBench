@@ -58,6 +58,7 @@ TIMEOUT_MULTIPLIER=10
 CONCURRENCY=1          # Trials per task (1 = single attempt)
 CATEGORY="${CATEGORY:-official}"
 BENCHMARK_FILTER=""    # Empty = all benchmarks
+ONLY_TASKS=""          # Empty = all tasks; space-separated list = only these
 DRY_RUN=false
 RUN_BASELINE=true
 RUN_FULL=true
@@ -95,9 +96,13 @@ while [[ $# -gt 0 ]]; do
             SKIP_TASKS="$SKIP_TASKS $2"
             shift 2
             ;;
+        --only)
+            ONLY_TASKS="$ONLY_TASKS $2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--benchmark SUITE] [--dry-run] [--parallel N] [--baseline-only] [--full-only] [--model MODEL] [--skip TASK_ID]"
+            echo "Usage: $0 [--benchmark SUITE] [--dry-run] [--parallel N] [--baseline-only] [--full-only] [--model MODEL] [--skip TASK_ID] [--only TASK_ID]"
             exit 1
             ;;
     esac
@@ -134,7 +139,7 @@ fi
 
 # Build task list with metadata using Python
 # Output format: task_id|benchmark|task_dir|sg_repo_name (one per line)
-TASK_LIST=$(BENCHMARK_FILTER="$BENCHMARK_FILTER" SKIP_TASKS="$SKIP_TASKS" python3 << 'PYEOF'
+TASK_LIST=$(BENCHMARK_FILTER="$BENCHMARK_FILTER" SKIP_TASKS="$SKIP_TASKS" ONLY_TASKS="$ONLY_TASKS" python3 << 'PYEOF'
 import json, os
 
 selection = json.load(open("configs/selected_benchmark_tasks.json"))
@@ -142,6 +147,8 @@ mirror_map = json.load(open("configs/instance_to_mirror.json"))
 
 benchmark_filter = os.environ.get("BENCHMARK_FILTER", "")
 skip_tasks = set(os.environ.get("SKIP_TASKS", "").split())
+only_tasks = set(os.environ.get("ONLY_TASKS", "").split())
+only_tasks.discard("")  # Remove empty string if ONLY_TASKS was empty
 
 # PyTorch SG repo name mapping (commit-specific mirrors)
 pytorch_sg_repos = {
@@ -203,6 +210,13 @@ def get_sg_repo(task):
             return tac_map[tid].get("mirror_name", "")
         return ""
 
+    # LinuxFLBench: commit-specific Linux kernel mirrors
+    if bench == "ccb_linuxflbench":
+        lfl_map = mirror_map.get("linuxflbench", {}).get("tasks", {})
+        if tid in lfl_map:
+            return lfl_map[tid].get("mirror_name", "")
+        return "torvalds/linux"  # Fallback to public repo
+
     # LargeRepo
     if bench == "ccb_largerepo":
         repo = task.get("repo", "")
@@ -234,12 +248,15 @@ for task in selection["tasks"]:
         continue
     if tid in skip_tasks:
         continue
+    if only_tasks and tid not in only_tasks:
+        continue
 
     task_dir = task.get("task_dir", "")
     sg_repo = get_sg_repo(task)
     sdlc_phase = task.get("sdlc_phase", "")
+    category = task.get("category", "")
 
-    print(f"{tid}|{bench}|{task_dir}|{sg_repo}|{sdlc_phase}")
+    print(f"{tid}|{bench}|{task_dir}|{sg_repo}|{sdlc_phase}|{category}")
 PYEOF
 )
 
@@ -254,14 +271,16 @@ readarray -t ALL_BENCHMARKS < <(echo "$TASK_LIST" | cut -d'|' -f2)
 readarray -t ALL_TASK_DIRS < <(echo "$TASK_LIST" | cut -d'|' -f3)
 readarray -t ALL_SG_REPOS < <(echo "$TASK_LIST" | cut -d'|' -f4)
 readarray -t ALL_SDLC_PHASES < <(echo "$TASK_LIST" | cut -d'|' -f5)
+readarray -t ALL_CATEGORIES < <(echo "$TASK_LIST" | cut -d'|' -f6)
 
 # Build associative arrays for lookup
-declare -A TASK_BENCHMARK TASK_DIR TASK_SG_REPO TASK_SDLC_PHASE
+declare -A TASK_BENCHMARK TASK_DIR TASK_SG_REPO TASK_SDLC_PHASE TASK_CATEGORY
 for i in "${!ALL_TASK_IDS[@]}"; do
     TASK_BENCHMARK["${ALL_TASK_IDS[$i]}"]="${ALL_BENCHMARKS[$i]}"
     TASK_DIR["${ALL_TASK_IDS[$i]}"]="${ALL_TASK_DIRS[$i]}"
     TASK_SG_REPO["${ALL_TASK_IDS[$i]}"]="${ALL_SG_REPOS[$i]}"
     TASK_SDLC_PHASE["${ALL_TASK_IDS[$i]}"]="${ALL_SDLC_PHASES[$i]}"
+    TASK_CATEGORY["${ALL_TASK_IDS[$i]}"]="${ALL_CATEGORIES[$i]}"
 done
 
 # ============================================
@@ -334,6 +353,7 @@ _run_paired_task() {
     local sg_repo="${TASK_SG_REPO[$task_id]}"
     local benchmark="${TASK_BENCHMARK[$task_id]}"
     local sdlc_phase="${TASK_SDLC_PHASE[$task_id]}"
+    local category="${TASK_CATEGORY[$task_id]}"
     local task_path="benchmarks/$task_dir"
 
     if [ ! -d "$task_path" ]; then
@@ -373,7 +393,7 @@ _run_paired_task() {
     # Launch SG_full
     if [ "$RUN_FULL" = true ]; then
         (
-            BASELINE_MCP_TYPE=sourcegraph_full TASK_SDLC_PHASE="$sdlc_phase" harbor run \
+            BASELINE_MCP_TYPE=sourcegraph_full TASK_SDLC_PHASE="$sdlc_phase" TASK_CATEGORY="$category" harbor run \
                 --path "$task_path" \
                 --agent-import-path "$AGENT_PATH" \
                 --model "$MODEL" \
