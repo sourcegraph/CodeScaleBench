@@ -186,7 +186,14 @@ def get_sg_repo(task):
 
     # LoCoBench: locobench-{project_id} mirrors
     if bench == "ccb_locobench":
-        return locobench_sg_repos.get(tid, "")
+        if tid in locobench_sg_repos:
+            return locobench_sg_repos[tid]
+        # Derive project_id by stripping task-type suffix
+        for suffix in ["_architectural_understanding_expert_01", "_cross_file_refactoring_expert_01", "_bug_investigation_expert_01"]:
+            if tid.endswith(suffix):
+                project_id = tid[:-len(suffix)]
+                return f"sg-benchmarks/locobench-{project_id}"
+        return ""
 
     # SWE-bench Pro: look up in mirror_map.swebenchpro.tasks
     if bench == "ccb_swebenchpro":
