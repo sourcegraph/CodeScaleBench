@@ -84,10 +84,11 @@ echo "Preamble: V3 (balanced deepsearch guidance)"
 echo "Run directory: $RUN_DIR"
 echo ""
 
-# Setup single-account mode
-setup_single_account
-
+# Create run directory
 mkdir -p "$RUN_DIR"
+
+# For single-task sequential runs, we just need to ensure tokens are fresh
+# No need for multi-account setup
 
 # Run baseline
 if [ "$RUN_BASELINE" = true ]; then
