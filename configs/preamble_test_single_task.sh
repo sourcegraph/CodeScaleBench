@@ -103,7 +103,7 @@ if [ "$RUN_BASELINE" = true ]; then
         --path "benchmarks/$TASK_DIR" \
         --agent-import-path "agents.claude_baseline_agent:BaselineClaudeCodeAgent" \
         --model "$MODEL" \
-        --runs-dir "$RUN_DIR/baseline" \
+        --jobs-dir "$RUN_DIR/baseline" \
         --timeout-multiplier 10 \
         -n 1
 fi
@@ -120,7 +120,7 @@ if [ "$RUN_FULL" = true ]; then
         --path "benchmarks/$TASK_DIR" \
         --agent-import-path "agents.claude_baseline_agent:BaselineClaudeCodeAgent" \
         --model "$MODEL" \
-        --runs-dir "$RUN_DIR/sourcegraph_full" \
+        --jobs-dir "$RUN_DIR/sourcegraph_full" \
         --timeout-multiplier 10 \
         -n 1
 fi
