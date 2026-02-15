@@ -605,10 +605,154 @@ def parse_args() -> argparse.Namespace:
         help="Output directory for reports (default: reports/)",
     )
     parser.add_argument(
+        "--profile", "-p", metavar="PROFILE",
+        help=(
+            "Generate ICP-specific report for a customer profile. "
+            "Options: legacy_modernization, platform_saas, security_compliance, "
+            "ai_forward, platform_consolidation. Supports partial match."
+        ),
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Enable verbose logging",
     )
     return parser.parse_args()
+
+
+def _run_icp_profile_analysis(
+    profile_id: str,
+    sections: dict[str, Optional[dict]],
+) -> Optional[dict]:
+    """Run ICP profile analysis against available section data."""
+    try:
+        from icp_profiles import compute_profile_metrics, get_profile
+
+        profile = get_profile(profile_id)
+        if not profile:
+            logger.warning("Unknown ICP profile: %s", profile_id)
+            return None
+
+        return compute_profile_metrics(
+            profile_id=profile["id"],
+            workflow_data=sections.get("workflow_metrics"),
+            economic_data=sections.get("economic_metrics"),
+            reliability_data=sections.get("reliability_metrics"),
+            failure_data=sections.get("failure_analysis"),
+            governance_data=sections.get("governance_report"),
+        )
+    except ImportError:
+        logger.warning("icp_profiles module not found")
+        return None
+    except Exception:
+        logger.warning("ICP profile analysis failed", exc_info=True)
+        return None
+
+
+def _generate_profile_report_md(
+    profile_data: dict,
+    sections: dict[str, Optional[dict]],
+    metadata: dict[str, Any],
+) -> str:
+    """Generate a profile-specific markdown report."""
+    try:
+        from icp_profiles import ICP_PROFILES, generate_profile_report_section
+    except ImportError:
+        return ""
+
+    pid = profile_data.get("profile_id", "unknown")
+    profile = ICP_PROFILES.get(pid, {})
+    report_title = profile_data.get("report_title", "ICP Profile Report")
+
+    lines: list[str] = []
+    lines.append(f"# {report_title}")
+    lines.append("")
+    lines.append(f"*Generated: {metadata['generated_at']}*")
+    lines.append(f"*Profile: {profile_data.get('profile_label', pid)}*")
+    lines.append(f"*Suites evaluated: {', '.join(profile_data.get('suites_evaluated', []))}*")
+    lines.append("")
+
+    # Headline
+    headline = profile_data.get("headline")
+    if headline:
+        lines.append(f"## {headline}")
+        lines.append("")
+
+    # Description
+    desc = profile.get("description", "")
+    if desc:
+        lines.append(f"> {desc}")
+        lines.append("")
+
+    # Profile section (thresholds, pain points, sales enablement)
+    lines.append(generate_profile_report_section(profile_data))
+
+    # Metrics detail
+    metrics = profile_data.get("metrics", {})
+
+    # Workflow deltas for this profile
+    if deltas := metrics.get("workflow_deltas"):
+        lines.append("### Workflow Impact (Profile-Filtered)")
+        lines.append("")
+        lines.append("| Category | Baseline (s) | SG_full (s) | Saved (s) | Change |")
+        lines.append("|----------|-------------|-------------|-----------|--------|")
+        for cat, data in sorted(deltas.items()):
+            bl_t = data.get("baseline_mean_time_seconds")
+            sg_t = data.get("sg_full_mean_time_seconds")
+            saved = data.get("estimated_time_saved_seconds")
+            pct = data.get("estimated_time_saved_pct")
+            bl_str = f"{bl_t:.0f}" if bl_t is not None else "N/A"
+            sg_str = f"{sg_t:.0f}" if sg_t is not None else "N/A"
+            saved_str = f"{saved:.0f}" if saved is not None else "N/A"
+            pct_str = f"{pct:+.1f}%" if pct is not None else "N/A"
+            lines.append(
+                f"| {cat} | {bl_str} | {sg_str} | {saved_str} | {pct_str} |"
+            )
+        lines.append("")
+
+    # Economic summary for profile suites
+    if econ_sum := metrics.get("economic_summary"):
+        lines.append("### Economic Impact (Profile-Filtered)")
+        lines.append("")
+        lines.append("| Config | Tasks | Pass Rate | Avg Cost/Task |")
+        lines.append("|--------|-------|-----------|---------------|")
+        for cfg, data in sorted(econ_sum.items()):
+            n = data.get("n_tasks", 0)
+            rate = data.get("pass_rate")
+            cost = data.get("avg_cost_usd")
+            rate_str = f"{rate:.1%}" if rate is not None else "N/A"
+            cost_str = f"${cost:.2f}" if cost is not None else "N/A"
+            lines.append(f"| {cfg} | {n} | {rate_str} | {cost_str} |")
+        lines.append("")
+
+    # Failure summary for profile suites
+    if fail_sum := metrics.get("failure_summary"):
+        n_fail = fail_sum.get("n_failures", 0)
+        if n_fail > 0:
+            lines.append(f"### Failure Analysis ({n_fail} failures in profile suites)")
+            lines.append("")
+            modes = fail_sum.get("failure_modes", {})
+            if modes:
+                lines.append("| Failure Mode | Count |")
+                lines.append("|-------------|-------|")
+                for mode, count in sorted(modes.items(), key=lambda x: -x[1]):
+                    lines.append(f"| {mode} | {count} |")
+                lines.append("")
+            ctx = fail_sum.get("context_impact", {})
+            if ctx:
+                lines.append("| Context Impact | Count |")
+                lines.append("|---------------|-------|")
+                for impact, count in sorted(ctx.items(), key=lambda x: -x[1]):
+                    lines.append(f"| {impact} | {count} |")
+                lines.append("")
+
+    lines.append("---")
+    lines.append("")
+    lines.append(
+        f"*Report generated for {profile_data.get('profile_label', 'Unknown')} profile. "
+        f"All projections marked as modeled estimates.*"
+    )
+
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -649,6 +793,17 @@ def main() -> None:
     available = sum(1 for v in sections.values() if v is not None)
     print(f"\n{available}/{len(sections)} sub-reports available.")
 
+    # ICP profile analysis (if requested)
+    profile_data: Optional[dict] = None
+    if args.profile:
+        print(f"\n  [ICP] Profile analysis: {args.profile}...", end=" ", flush=True)
+        profile_data = _run_icp_profile_analysis(args.profile, sections)
+        if profile_data:
+            sections["icp_profile"] = profile_data
+            print("OK")
+        else:
+            print("skipped")
+
     # Metadata
     metadata = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -688,6 +843,14 @@ def main() -> None:
     exec_path = output_dir / "EXECUTIVE_SUMMARY.md"
     exec_path.write_text(exec_md + "\n")
     print(f"Wrote {exec_path}")
+
+    # Write profile-specific report (if requested)
+    if profile_data:
+        profile_md = _generate_profile_report_md(profile_data, sections, metadata)
+        pid = profile_data.get("profile_id", "profile")
+        profile_path = output_dir / f"PROFILE_REPORT_{pid.upper()}.md"
+        profile_path.write_text(profile_md + "\n")
+        print(f"Wrote {profile_path}")
 
     print("\nDone.")
 
