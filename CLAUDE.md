@@ -104,7 +104,7 @@ python3 scripts/generate_report.py
 python3 scripts/select_benchmark_tasks.py
 ```
 
-## Operational Skills (14)
+## Operational Skills (17)
 
 Slash commands for the full benchmark lifecycle. Use these in Claude Code sessions.
 
@@ -117,12 +117,13 @@ PRE-RUN                DURING RUN           POST-RUN              ANALYSIS      
 /validate-tasks        (lightweight)        (full scan)           /cost-report          /score-tasks
                                             /whats-next           /generate-report
                                             /triage-failure        /evaluate-traces
-                                            /quick-rerun
+                                            /quick-rerun           /mcp-audit
 
 MAINTENANCE
 ───────────
 /sync-metadata
 /archive-run
+/reextract-metrics
 ```
 
 ### Pre-Run
@@ -144,17 +145,18 @@ MAINTENANCE
 |-------|--------|---------|
 | `/watch-benchmarks` | `scripts/aggregate_status.py` | Full scan of runs/official/ with error fingerprinting, --watch mode, per-task status.json |
 | `/whats-next` | (uses aggregate_status + compare_configs) | Analyze current state and recommend next actions |
-| `/triage-failure` | (reads logs + fingerprints) | Investigate a specific failed task: read logs, classify error, suggest fix |
+| `/triage-failure` | (reads logs + fingerprints) | Investigate a failed task OR analyze agent behavior on any task (MCP usage, tool patterns, zero-MCP investigation) |
 | `/quick-rerun` | (harbor run wrapper) | Rerun a single task with haiku model for fast verification |
 
 ### Analysis
 
 | Skill | Script | Purpose |
 |-------|--------|---------|
-| `/compare-configs` | `scripts/compare_configs.py` | Show divergent tasks across baseline/SG_full, "MCP helps" vs "MCP hurts" |
+| `/compare-configs` | `scripts/compare_configs.py` | Show divergent tasks across baseline/SG_full, "MCP helps" vs "MCP hurts". Now includes optional MCP-conditioned analysis. |
 | `/cost-report` | `scripts/cost_report.py` | Token usage and estimated cost by suite/config, most expensive tasks |
 | `/generate-report` | `scripts/generate_report.py` | Aggregate CCB evaluation report from completed runs |
-| `/evaluate-traces` | `scripts/audit_traces.py` | Comprehensive trace evaluation: data integrity, output quality, efficiency analysis |
+| `/evaluate-traces` | `scripts/audit_traces.py` | Comprehensive trace evaluation: data integrity, output quality, efficiency analysis. Includes zero-MCP vs used-MCP classification. |
+| `/mcp-audit` | `scripts/mcp_audit.py` | MCP usage patterns: used vs zero-MCP, intensity buckets, reward/time deltas conditioned on actual MCP adoption |
 
 ### QA
 
@@ -169,6 +171,7 @@ MAINTENANCE
 |-------|--------|---------|
 | `/sync-metadata` | `scripts/sync_task_metadata.py` | Reconcile task.toml vs selected_benchmark_tasks.json, `--fix` to auto-update |
 | `/archive-run` | `scripts/archive_run.py` | Move old runs to archive/, optional compression, dry-run by default |
+| `/reextract-metrics` | `scripts/reextract_all_metrics.py` | Batch re-extract task_metrics.json after extraction bug fixes or schema changes |
 
 ### Supporting Scripts
 
