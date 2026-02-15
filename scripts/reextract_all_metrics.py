@@ -29,6 +29,7 @@ SKIP_PATTERNS = ["__broken_verifier", "validation_test", "archive", "__archived"
 
 DIR_PREFIX_TO_SUITE = {
     "bigcode_mcp_": "ccb_largerepo",
+    "bigcode_sgcompare_": "ccb_largerepo",
     "codereview_": "ccb_codereview",
     "crossrepo_": "ccb_crossrepo",
     "dibench_": "ccb_dibench",
@@ -41,6 +42,10 @@ DIR_PREFIX_TO_SUITE = {
     "swebenchpro_": "ccb_swebenchpro",
     "sweperf_": "ccb_sweperf",
     "tac_": "ccb_tac",
+    "paired_rerun_dibench_": "ccb_dibench",
+    "paired_rerun_crossrepo_": "ccb_crossrepo",
+    "paired_rerun_pytorch_": "ccb_pytorch",
+    "paired_rerun_": None,  # multi-benchmark — infer per task
 }
 
 CONFIGS = ["baseline", "sourcegraph_base", "sourcegraph_full", "sourcegraph", "deepsearch"]
@@ -50,10 +55,48 @@ def should_skip(dirname: str) -> bool:
     return any(pat in dirname for pat in SKIP_PATTERNS)
 
 
+def suite_from_task_id(task_id: str) -> str | None:
+    """Infer benchmark suite from task ID patterns."""
+    if task_id.startswith("instance_"):
+        return "ccb_swebenchpro"
+    if task_id.startswith("sgt-"):
+        return "ccb_pytorch"
+    if task_id.startswith("big-code-"):
+        return "ccb_largerepo"
+    if task_id.startswith("dibench-"):
+        return "ccb_dibench"
+    if task_id.startswith("cr-"):
+        return "ccb_codereview"
+    if task_id.endswith("-doc-001"):
+        return "ccb_k8sdocs"
+    if task_id.startswith("lfl-"):
+        return "ccb_linuxflbench"
+    if task_id.startswith("bug_localization_") or task_id.startswith("refactor_rename_") or task_id.startswith("cross_file_reasoning_"):
+        return "ccb_crossrepo"
+    if "_expert_" in task_id:
+        return "ccb_locobench"
+    if task_id.startswith("multifile_editing-") or task_id.startswith("file_span_fix-") or task_id.startswith("dependency_recognition-"):
+        return "ccb_dependeval"
+    if task_id.startswith("repoqa-"):
+        return "ccb_repoqa"
+    if task_id.startswith("sweperf-"):
+        return "ccb_sweperf"
+    if task_id.startswith("tac-") or task_id.startswith("simple_test_"):
+        return "ccb_tac"
+    if task_id.startswith("api_upgrade_") or task_id.startswith("hyperloglog") or task_id.startswith("write-unit-test"):
+        return "ccb_tac"
+    if task_id.startswith("sweperf_") or task_id.startswith("django_perf_"):
+        return "ccb_sweperf"
+    if "answer_extraction" in task_id or "function_recall" in task_id or "question_answer" in task_id:
+        return "ccb_repoqa"
+    return None
+
+
 def suite_from_run_dir(name: str) -> str | None:
     for prefix, suite in DIR_PREFIX_TO_SUITE.items():
         if name.startswith(prefix):
-            return suite
+            # None means multi-benchmark — will be resolved per-task
+            return suite if suite is not None else "__multi__"
     # Gap-fill
     if name.startswith("swebenchpro_gapfill_"):
         return "ccb_swebenchpro"
@@ -121,10 +164,23 @@ def find_task_dirs(runs_dir: Path, suite_filter: str | None = None) -> list[tupl
                         if should_skip(task_dir.name):
                             continue
                         if _is_task_dir(task_dir):
-                            results.append((task_dir, suite, config_name))
+                            # Resolve multi-benchmark suite from task_id
+                            task_suite = suite
+                            if suite == "__multi__":
+                                task_name = task_dir.name.rsplit("__", 1)[0]
+                                task_suite = suite_from_task_id(task_name) or "unknown"
+                            if suite_filter and task_suite != suite_filter:
+                                continue
+                            results.append((task_dir, task_suite, config_name))
                 elif _is_task_dir(subdir):
                     # Task dir directly under config
-                    results.append((subdir, suite, config_name))
+                    task_suite = suite
+                    if suite == "__multi__":
+                        task_name = subdir.name.rsplit("__", 1)[0]
+                        task_suite = suite_from_task_id(task_name) or "unknown"
+                    if suite_filter and task_suite != suite_filter:
+                        continue
+                    results.append((subdir, task_suite, config_name))
 
     return results
 
