@@ -70,6 +70,14 @@ TASK_FILTER=""
 
 # All security task IDs — populated by task-creation Ralphs
 ALL_TASK_IDS=(
+    sec-cve-001
+    sec-cve-002
+    sec-cve-003
+    sec-reach-001
+    sec-reach-002
+    sec-reach-003
+    sec-transitive-001
+    sec-transitive-002
 )
 
 # Parse arguments
@@ -125,6 +133,14 @@ setup_dual_accounts
 # Sourcegraph repo name mapping for security tasks
 # Populated by task-creation Ralphs alongside ALL_TASK_IDS
 declare -A TASK_SG_REPO_NAMES=(
+    [sec-cve-001]="github.com/curl/curl"
+    [sec-cve-002]="github.com/envoyproxy/envoy"
+    [sec-cve-003]="go.googlesource.com/net"
+    [sec-reach-001]="github.com/curl/curl"
+    [sec-reach-002]="github.com/envoyproxy/envoy"
+    [sec-reach-003]="github.com/apache/kafka"
+    [sec-transitive-001]="github.com/charmbracelet/wish github.com/gliderlabs/ssh go.googlesource.com/crypto"
+    [sec-transitive-002]="github.com/fullstorydev/grpcurl github.com/grpc/grpc-go go.googlesource.com/net"
 )
 
 # Derive short model name for run directory
