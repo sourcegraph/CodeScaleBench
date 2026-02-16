@@ -17,6 +17,3 @@ RUN git clone --filter=blob:none --no-checkout https://github.com/apache/kafka.g
     git checkout be816b82d25370ceac697ccf7c88cea873e9b4e3 && \
     git config user.email "agent@example.com" && \
     git config user.name "Agent"
-
-# Copy tests (verifier, ground truth)
-COPY tests/ /workspace/tests/

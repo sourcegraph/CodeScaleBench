@@ -19,6 +19,3 @@ RUN git clone --filter=blob:none --no-checkout https://github.com/OpenGamma/Stra
     git checkout v2.12.65 && \
     git config user.email "agent@example.com" && \
     git config user.name "Agent"
-
-# Copy tests (verifier, ground truth)
-COPY tests/ /workspace/tests/
