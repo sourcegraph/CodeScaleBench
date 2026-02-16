@@ -76,6 +76,7 @@ ALL_TASK_IDS=(
     "docgen-api-001"
     "docgen-api-002"
     "docgen-api-003"
+    "docgen-migration-001"
 )
 
 # Parse arguments
@@ -137,6 +138,7 @@ declare -A TASK_SG_REPO_NAMES=(
     ["docgen-api-001"]="github.com/microsoft/vscode"
     ["docgen-api-002"]="github.com/cilium/cilium"
     ["docgen-api-003"]="github.com/apache/kafka"
+    ["docgen-migration-001"]="github.com/hashicorp/terraform"
 )
 
 # Derive short model name for run directory

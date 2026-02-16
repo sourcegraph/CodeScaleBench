@@ -1,0 +1,30 @@
+FROM ubuntu:22.04
+
+# Install minimal dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Clone Terraform repo with blobless clone for speed
+# Then create two worktrees for the old and new versions
+RUN git clone --filter=blob:none --no-checkout https://github.com/hashicorp/terraform.git terraform-repo && \
+    cd terraform-repo && \
+    # Create worktree for v1.9.0 (commit 7637a92)
+    git worktree add ../terraform-v1.9.0 7637a9216e68f2812887eaf0722f9d3f9804c45e && \
+    # Create worktree for v1.10.0 (commit 24236f4)
+    git worktree add ../terraform-v1.10.0 24236f4f0bd10ada71d70868abe15f9d88099747 && \
+    # Remove the main clone to save space
+    cd /workspace && \
+    rm -rf terraform-repo
+
+# Verify worktrees exist
+RUN test -d /workspace/terraform-v1.9.0 && \
+    test -d /workspace/terraform-v1.10.0 && \
+    echo "Both Terraform worktrees created successfully"
+
+# Set working directory
+WORKDIR /workspace
