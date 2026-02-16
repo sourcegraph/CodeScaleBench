@@ -70,6 +70,7 @@ TASK_FILTER=""
 
 # All onboarding task IDs — populated by task-creation Ralphs
 ALL_TASK_IDS=(
+    "onboard-orient-001"
 )
 
 # Parse arguments
@@ -125,6 +126,7 @@ setup_dual_accounts
 # Sourcegraph repo name mapping for onboarding tasks
 # Populated by task-creation Ralphs alongside ALL_TASK_IDS
 declare -A TASK_SG_REPO_NAMES=(
+    ["onboard-orient-001"]="github.com/cilium/cilium"
 )
 
 # Derive short model name for run directory
