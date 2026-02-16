@@ -119,9 +119,14 @@ for t in tasks:
 # Sourcegraph repo name mapping for code review tasks
 # Each task targets a different public GitHub repo
 declare -A TASK_SG_REPO_NAMES=(
-    ["cr-aspnetcore-001"]="github.com/sg-benchmarks/aspnetcore--87525573"
-    ["cr-calcom-001"]="github.com/sg-benchmarks/cal.com--4b99072b"
-    ["cr-ghost-001"]="github.com/sg-benchmarks/Ghost--b43bfc85"
+    ["cr-aspnetcore-001"]="github.com/dotnet/aspnetcore"
+    ["cr-calcom-001"]="github.com/calcom/cal.com"
+    ["cr-ghost-001"]="github.com/TryGhost/Ghost"
+    ["cr-envoy-001"]="github.com/envoyproxy/envoy"
+    ["cr-vscode-001"]="github.com/microsoft/vscode"
+    ["cr-terraform-001"]="github.com/hashicorp/terraform"
+    ["cr-security-001"]="github.com/curl/curl"
+    ["cr-security-002"]="github.com/apache/kafka"
 )
 
 # Derive short model name for run directory

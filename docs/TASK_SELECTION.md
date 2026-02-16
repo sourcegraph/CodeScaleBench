@@ -2,7 +2,7 @@
 
 ## Overview
 
-Selected **119 tasks** from 835 available across 11 benchmarks, stratified by SDLC phase with MCP benefit scoring.
+Selected **204 tasks** from 835 available across 11 benchmarks, stratified by SDLC phase with MCP benefit scoring.
 
 ## SDLC Phase Coverage
 
@@ -13,7 +13,7 @@ Selected **119 tasks** from 835 available across 11 benchmarks, stratified by SD
 | Implementation (feature) | 16 | ccb_largerepo, ccb_pytorch, ccb_tac, ccb_dibench |
 | Implementation (bug fix) | 51 | ccb_pytorch, ccb_locobench, ccb_swebenchpro, ccb_crossrepo |
 | Implementation (refactoring) | 15 | ccb_locobench, ccb_crossrepo |
-| Testing & QA | 8 | ccb_sweperf, ccb_tac, ccb_crossrepo, ccb_codereview |
+| Testing & QA | 12 | ccb_sweperf, ccb_tac, ccb_crossrepo, ccb_codereview |
 | Documentation | 5 | ccb_k8sdocs |
 | Maintenance | 2 | ccb_tac |
 

@@ -17,15 +17,15 @@ RUN if ! command -v node &> /dev/null; then \
 # Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
 
-# Clone calcom/cal.com at pinned commit (PR #26801 merge commit)
-RUN git clone --filter=blob:none --no-checkout https://github.com/calcom/cal.com.git /workspace && \
+# Clone microsoft/vscode at pinned 1.96.0 tag (sparse checkout for relevant files)
+RUN git clone --filter=blob:none --no-checkout https://github.com/microsoft/vscode.git /workspace && \
     cd /workspace && \
-    git checkout 4b99072bcc01e7a252df828db71248a202cb65d1 && \
+    git checkout 1.96.0 && \
     git config user.email "agent@example.com" && \
     git config user.name "Agent"
 
 # Inject defects into the codebase
-COPY environment/inject_defects.sh /tmp/inject_defects.sh
+COPY inject_defects.sh /tmp/inject_defects.sh
 RUN chmod +x /tmp/inject_defects.sh && /tmp/inject_defects.sh && rm /tmp/inject_defects.sh
 
 # Create directories for verifier (tests uploaded at runtime by Harbor verifier)
