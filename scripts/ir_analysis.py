@@ -521,6 +521,89 @@ def compute_mcp_value_scores(
     return results
 
 
+# ---------------------------------------------------------------------------
+# US-005: Cost-efficiency metrics
+# ---------------------------------------------------------------------------
+
+def compute_cost_efficiency(
+    ir_scores: list[IRScores],
+) -> dict | None:
+    """Compute cost-efficiency metrics: tokens per relevant file found.
+
+    Returns per-config and per-suite aggregates with deltas.
+    """
+    token_data = _load_task_metrics_tokens()
+    if not token_data:
+        return None
+
+    # Build per-task data
+    records: list[dict] = []
+    for s in ir_scores:
+        inp_tok = token_data.get((s.task_id, s.config_name))
+        if inp_tok is None or inp_tok == 0:
+            continue
+        tokens_per_rel = inp_tok / s.n_overlap if s.n_overlap > 0 else None
+        records.append({
+            "task_id": s.task_id,
+            "config": s.config_name,
+            "suite": _infer_suite(s.task_id) or "unknown",
+            "input_tokens": inp_tok,
+            "n_overlap": s.n_overlap,
+            "tokens_per_relevant_file": tokens_per_rel,
+            "ttfr_step": s.ttfr_step,
+            "n_steps_to_first": s.n_steps_to_first,
+        })
+
+    if not records:
+        return None
+
+    # Aggregate by (suite, config)
+    by_suite_config: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    by_config: dict[str, list[dict]] = defaultdict(list)
+    for r in records:
+        by_suite_config[(r["suite"], r["config"])].append(r)
+        by_config[r["config"]].append(r)
+
+    def _agg(recs: list[dict]) -> dict:
+        tpr_vals = [r["tokens_per_relevant_file"] for r in recs if r["tokens_per_relevant_file"] is not None]
+        tok_vals = [r["input_tokens"] for r in recs]
+        overlap_vals = [r["n_overlap"] for r in recs]
+        return {
+            "n_tasks": len(recs),
+            "mean_tokens_per_relevant_file": round(statistics.mean(tpr_vals), 0) if tpr_vals else None,
+            "median_tokens_per_relevant_file": round(statistics.median(tpr_vals), 0) if tpr_vals else None,
+            "mean_input_tokens": round(statistics.mean(tok_vals), 0) if tok_vals else None,
+            "mean_overlap": round(statistics.mean(overlap_vals), 2) if overlap_vals else None,
+        }
+
+    overall = {cfg: _agg(recs) for cfg, recs in sorted(by_config.items())}
+    per_suite = {
+        f"{suite}__{cfg}": _agg(recs)
+        for (suite, cfg), recs in sorted(by_suite_config.items())
+    }
+
+    # Compute deltas (baseline vs SG_full)
+    bl = overall.get("baseline", {})
+    sg = overall.get("sourcegraph_full", {})
+    deltas = {}
+    for metric in ("mean_tokens_per_relevant_file", "mean_input_tokens"):
+        bl_val = bl.get(metric)
+        sg_val = sg.get(metric)
+        if bl_val and sg_val and bl_val > 0:
+            deltas[metric] = {
+                "baseline": bl_val,
+                "sourcegraph_full": sg_val,
+                "delta": round(sg_val - bl_val, 0),
+                "pct_change": round((sg_val - bl_val) / bl_val * 100, 1),
+            }
+
+    return {
+        "overall": overall,
+        "per_suite": per_suite,
+        "deltas": deltas,
+    }
+
+
 def run_ir_analysis(
     suite_filter: str | None = None,
     per_task: bool = False,
@@ -701,6 +784,11 @@ def run_ir_analysis(
             "top_hurt": [v.to_dict() for v in sorted(value_scores, key=lambda v: v.composite)[:10]],
         }
 
+    # US-005: Cost-efficiency metrics
+    cost_eff = compute_cost_efficiency(all_scores)
+    if cost_eff:
+        result["cost_efficiency"] = cost_eff
+
     if per_task:
         result["per_task"] = [s.to_dict() for s in all_scores]
 
@@ -865,6 +953,38 @@ def format_table(data: dict) -> str:
                     f"{t['composite']:>+7.3f} {t['retrieval_lift']:>+7.3f} "
                     f"{t['outcome_lift']:>+7.3f} {t['efficiency_lift']:>+7.3f} "
                     f"{t['cost_ratio']:>+7.3f}"
+                )
+            lines.append("")
+
+    # Cost efficiency
+    ce = data.get("cost_efficiency", {})
+    if ce:
+        lines.append("COST EFFICIENCY:")
+        overall = ce.get("overall", {})
+        if overall:
+            header = f"  {'Config':20s} {'Tok/RelFile':>12s} {'MeanTokens':>12s} {'MeanOverlap':>12s} {'n':>5s}"
+            lines.append(header)
+            lines.append("  " + "-" * (len(header) - 2))
+            for cfg, agg in sorted(overall.items()):
+                tpr = agg.get("mean_tokens_per_relevant_file")
+                tok = agg.get("mean_input_tokens")
+                ovl = agg.get("mean_overlap")
+                n = agg.get("n_tasks", 0)
+                tpr_s = f"{tpr:>12,.0f}" if tpr else f"{'N/A':>12s}"
+                tok_s = f"{tok:>12,.0f}" if tok else f"{'N/A':>12s}"
+                ovl_s = f"{ovl:>12.1f}" if ovl else f"{'N/A':>12s}"
+                lines.append(f"  {cfg:20s} {tpr_s} {tok_s} {ovl_s} {n:>5d}")
+            lines.append("")
+
+        deltas = ce.get("deltas", {})
+        if deltas:
+            lines.append("  Baseline vs SG_full deltas:")
+            for metric, d in sorted(deltas.items()):
+                label = metric.replace("mean_", "")
+                lines.append(
+                    f"    {label:30s} BL={d['baseline']:>12,.0f}  "
+                    f"SG={d['sourcegraph_full']:>12,.0f}  "
+                    f"delta={d['delta']:>+12,.0f}  ({d['pct_change']:>+.1f}%)"
                 )
             lines.append("")
 
