@@ -49,7 +49,7 @@ docs/
 | TAC | 6 | Mixed | Tool-augmented coding | Active |
 | DIBench | 8 | Mixed | Dependency installation | Active |
 | SWE-Perf | 3 | Python | Performance optimization | Active |
-| CodeReview | 3 | TS, C#, Mixed | AI code review: find & fix injected PR defects | Active — harder variant planned |
+| CodeReview | 3 | C#, JS, TS | AI code review: find & fix injected PR defects | Active — harder variant planned |
 | LinuxFLBench | 5 | C | Linux kernel fault localization | Active — verifier needs hardening |
 | Investigation | 4 | Mixed | Codebase investigation tasks | Active — harder variant planned |
 | Enterprise | 6 | Mixed | Enterprise codebase tasks | Active |
