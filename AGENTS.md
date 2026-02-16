@@ -199,9 +199,18 @@ The **H3 bug** causes `trajectory.json` to fail when Claude Code spawns subagent
 
 When `trajectory.json` is missing, `claude-code.txt` (JSONL transcript) is always present and contains the same tool call data without per-step timestamps.
 
+### Runtime Detection
+
+Two levels of trajectory.json monitoring are built into the run pipeline:
+
+1. **Per-task**: `_check_task_trajectory()` runs automatically after each task completes in `run_tasks_parallel` (via the `_reap_one` PID reaper). Logs a WARNING immediately if trajectory.json is missing for that task.
+2. **Per-batch**: `check_trajectory_coverage()` runs after each batch in `validate_and_report()`. Summarizes missing/total counts across all tasks in the batch.
+
+Both checks are non-blocking — warnings are logged but the pipeline continues.
+
 ### Troubleshooting
 
-1. **Check coverage**: The post-run `check_trajectory_coverage()` function logs warnings for missing trajectory files
+1. **Check coverage**: Review per-task WARNING lines in run output, or the batch-level TRAJECTORY CHECK summary
 2. **Fallback**: `extract_time_to_context()` in `ir_metrics.py` automatically falls back to `synthesize_trajectory()` which estimates timestamps from the JSONL transcript using a calibrated seconds-per-step rate
 3. **Root cause**: If new runs show missing trajectories, check for heavy `Task` tool usage (subagent spawning). Ensure `claude_baseline_agent.py` has the H3 fix applied
 

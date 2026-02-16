@@ -143,13 +143,27 @@ validate_and_report() {
 
 # Check trajectory.json for a single task after it completes.
 # Non-blocking: logs WARNING but does not fail the pipeline.
-# Args: $1 = task_id, $2 = jobs_subdir
+# Args: $1 = task_id (plain or composite "task_id|config|mcp_type" from paired mode)
+#        $2 = jobs_dir (jobs_subdir for plain mode, or jobs_base for paired mode)
 # Searches for task output directories matching the task_id pattern.
 _check_task_trajectory() {
-    local task_id=$1
+    local raw_id=$1
     local jobs_dir=$2
 
     [ -n "$jobs_dir" ] && [ -d "$jobs_dir" ] || return 0
+
+    # Handle composite IDs from run_paired_configs: "task_id|config|mcp_type"
+    local task_id config_subdir
+    if [[ "$raw_id" == *"|"* ]]; then
+        task_id="${raw_id%%|*}"
+        local remainder="${raw_id#*|}"
+        config_subdir="${remainder%%|*}"
+        jobs_dir="${jobs_dir}/${config_subdir}"
+    else
+        task_id="$raw_id"
+    fi
+
+    [ -d "$jobs_dir" ] || return 0
 
     # Task output dirs match: {batch_timestamp}/{task_id}__{hash}/agent/
     local found=false
@@ -529,6 +543,9 @@ run_tasks_parallel() {
                             return
                         fi
                     fi
+                else
+                    # Task succeeded — check trajectory.json coverage
+                    _check_task_trajectory "$_task" "$_log_dir"
                 fi
 
                 unset 'pids[i]'
