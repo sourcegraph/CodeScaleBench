@@ -125,6 +125,7 @@ declare -A TASK_SG_REPO_NAMES=(
     ["cr-envoy-001"]="github.com/envoyproxy/envoy"
     ["cr-vscode-001"]="github.com/microsoft/vscode"
     ["cr-terraform-001"]="github.com/hashicorp/terraform"
+    ["cr-security-001"]="github.com/curl/curl"
 )
 
 # Derive short model name for run directory
