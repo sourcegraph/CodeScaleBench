@@ -68,7 +68,7 @@ RUN_FULL=true
 CATEGORY="${CATEGORY:-official}"
 TASK_FILTER=""
 
-# All investigation task IDs
+# All investigation task IDS
 ALL_TASK_IDS=(
     "inv-impact-001"
     "inv-regression-001"
@@ -80,6 +80,7 @@ ALL_TASK_IDS=(
     "inv-interaction-001"
     "inv-interaction-002"
     "inv-interaction-003"
+    "inv-regression-001b"
 )
 
 # Parse arguments
@@ -141,6 +142,7 @@ declare -A TASK_SG_REPO_NAMES=(
     ["inv-interaction-001"]="github.com/kubernetes/kubernetes"
     ["inv-interaction-002"]="github.com/cilium/cilium"
     ["inv-interaction-003"]="github.com/apache/kafka"
+    ["inv-regression-001b"]="github.com/prometheus/prometheus"
 )
 
 # Derive short model name for run directory
