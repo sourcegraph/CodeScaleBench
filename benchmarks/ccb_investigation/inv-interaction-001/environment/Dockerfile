@@ -7,11 +7,7 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     python3 \
-    npm \
     && rm -rf /var/lib/apt/lists/*
-
-# Install Claude Code CLI
-RUN npm install -g @anthropic-ai/claude-code
 
 # Clone Kubernetes at the target commit (before the NoExecute taint delay fix)
 # PR #120816 (commit f718096) fixes the bug where processTaintBaseEviction()

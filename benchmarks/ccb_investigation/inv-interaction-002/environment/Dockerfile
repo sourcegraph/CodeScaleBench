@@ -7,11 +7,7 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     python3 \
-    npm \
     && rm -rf /var/lib/apt/lists/*
-
-# Install Claude Code CLI
-RUN npm install -g @anthropic-ai/claude-code
 
 # Clone Cilium at the target commit (before the identity/SelectorCache race fix)
 # PR #42049 (commit 696017a) fixes the race condition where identity allocation

@@ -7,11 +7,7 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     python3 \
-    npm \
     && rm -rf /var/lib/apt/lists/*
-
-# Install Claude Code CLI
-RUN npm install -g @anthropic-ai/claude-code
 
 # Clone Istio at the pre-fix commit for the DestinationRule dependency bug.
 # PR #38088 (merge commit 9fcfe231) fixes the bug where merged DestinationRules

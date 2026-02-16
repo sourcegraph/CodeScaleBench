@@ -7,11 +7,7 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     python3 \
-    npm \
     && rm -rf /var/lib/apt/lists/*
-
-# Install Claude Code CLI
-RUN npm install -g @anthropic-ai/claude-code
 
 # Clone Envoy at the target commit (before router header mutation fix)
 # PR #40856 (commit 25f893b) fixes the bug where response_headers_to_add

@@ -7,11 +7,7 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     python3 \
-    npm \
     && rm -rf /var/lib/apt/lists/*
-
-# Install Claude Code CLI
-RUN npm install -g @anthropic-ai/claude-code
 
 # Clone Istio at v1.24.3 release (pinned SHA)
 RUN git clone --filter=blob:none --no-checkout https://github.com/istio/istio.git . && \

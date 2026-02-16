@@ -7,11 +7,7 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     python3 \
-    npm \
     && rm -rf /var/lib/apt/lists/*
-
-# Install Claude Code CLI
-RUN npm install -g @anthropic-ai/claude-code
 
 # Clone Terraform at the pre-fix commit for the sensitive marks bug.
 # PR #34567 (merge commit c4a2f74054a9) fixes the bug where provider-schema-

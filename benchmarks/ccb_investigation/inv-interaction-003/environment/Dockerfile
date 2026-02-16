@@ -7,12 +7,8 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     python3 \
-    npm \
     openjdk-11-jdk \
     && rm -rf /var/lib/apt/lists/*
-
-# Install Claude Code CLI
-RUN npm install -g @anthropic-ai/claude-code
 
 # Clone Kafka at the target commit (before the cooperative rebalance offset commit fix)
 # PR #12349 (commit d8541b20a106f22736947e0c2f293833f3c3873b) fixes KAFKA-14024, where
