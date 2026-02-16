@@ -5,7 +5,7 @@
 
 ## Context
 
-Flipt is a feature flag platform built with Go. The `ReadOnlyFlagStore` interface in `internal/storage/storage.go` defines the contract for reading flag data from storage backends. Multiple concrete types implement this interface across the codebase (filesystem snapshots, SQL backends, etc.).
+Flipt is a feature flag platform built with Go. The `ReadOnlyFlagStore` interface defines the contract for reading flag data from storage backends. Multiple concrete types implement this interface across the codebase (filesystem snapshots, SQL backends, etc.).
 
 The evaluation server needs a lightweight way to check if a flag exists without fetching the full flag object. Currently, it must call `GetFlag()` and check for errors, which is inefficient. A dedicated `FlagExists()` method would allow backends to optimize existence checks (e.g., via SQL `EXISTS` or filesystem stat).
 
@@ -17,9 +17,9 @@ Add a `FlagExists(ctx context.Context, req *flipt.GetFlagRequest) (bool, error)`
 
 ### Requirements
 
-1. **Find the interface definition** — Read `internal/storage/storage.go` to find the `ReadOnlyFlagStore` interface and understand its existing methods (e.g., `GetFlag`, `ListFlags`, `CountFlags`)
+1. **Find the interface definition** — Locate the `ReadOnlyFlagStore` interface in the storage package and understand its existing methods (e.g., `GetFlag`, `ListFlags`, `CountFlags`)
 2. **Find all implementations** — Search for all types that implement `ReadOnlyFlagStore`. These are types that have methods like `GetFlag(ctx context.Context, req *flipt.GetFlagRequest) (*flipt.Flag, error)` matching the interface
-3. **Add the method to the interface** — In `internal/storage/storage.go`, add:
+3. **Add the method to the interface** — Add `FlagExists` to the interface definition:
    ```go
    FlagExists(ctx context.Context, req *flipt.GetFlagRequest) (bool, error)
    ```
@@ -29,19 +29,7 @@ Add a `FlagExists(ctx context.Context, req *flipt.GetFlagRequest) (bool, error)`
    - Returns `true, nil` if the flag is found
    - Returns `false, nil` if the flag is not found (not-found error)
    - Returns `false, err` for other errors
-5. **Handle not-found errors** — Use the existing `errs` package or error patterns in each backend to distinguish "not found" from real errors. Look at how `GetFlag` callers handle the not-found case in each backend.
-
-### Hints
-
-- The `ReadOnlyFlagStore` interface is in `internal/storage/storage.go` — look for existing methods like `CountFlags`
-- Key implementations to find:
-  - `internal/storage/fs/store.go` — filesystem store
-  - `internal/storage/fs/snapshot.go` — filesystem snapshot
-  - `internal/storage/sql/common/flag.go` — SQL backend
-- Use `find_references("ReadOnlyFlagStore")` to instantly locate all implementations
-- The `GetFlag` method in each backend shows the error handling pattern you should follow
-- Look at `errs.ErrNotFound` or `ErrNotFoundf` for the standard not-found error type
-- The `CountFlags` method already exists in the interface — `FlagExists` is confirmed absent
+5. **Handle not-found errors** — Use the existing error patterns in each backend to distinguish "not found" from real errors. Look at how `GetFlag` callers handle the not-found case.
 
 ## Success Criteria
 

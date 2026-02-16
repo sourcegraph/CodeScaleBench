@@ -5,7 +5,7 @@
 
 ## Context
 
-Flipt is a feature flag platform built with Go. The `storage` package provides resource management primitives. The function `storage.NewResource()` in `internal/storage/resource.go` creates resource objects used throughout the codebase.
+Flipt is a feature flag platform built with Go. The `storage` package provides resource management primitives, including a `NewResource()` function that creates resource objects used throughout the codebase.
 
 The team has decided to add observability support by threading `context.Context` through all resource operations. The first step is to add `ctx context.Context` as the first parameter to `storage.NewResource()` and update every call site.
 
@@ -17,7 +17,7 @@ Add `ctx context.Context` as the first parameter to the `storage.NewResource()` 
 
 ### Requirements
 
-1. **Find the function definition** — Read `internal/storage/resource.go` to find the `NewResource()` function signature
+1. **Find the function definition** — Locate `NewResource()` in the storage package and examine its current signature
 2. **Find all call sites** — Search the codebase for every invocation of `storage.NewResource(` or `NewResource(` within the `internal/` directory
 3. **Modify the function signature** — Add `ctx context.Context` as the first parameter to `NewResource()`
 4. **Update all call sites** — At each call site, pass an appropriate `context.Context` value:
@@ -26,14 +26,6 @@ Add `ctx context.Context` as the first parameter to the `storage.NewResource()` 
    - If no context is available, use `context.TODO()`
 5. **Add import if needed** — Ensure `"context"` is imported in any file where you add `context.TODO()`
 6. **Verify compilation** — The code must compile: `go build ./...`
-
-### Hints
-
-- There are approximately 10 call sites across 8 files in `internal/`
-- Most callers already have a `ctx` parameter — check the enclosing function signatures
-- The `storage` package is imported as `"go.flipt.io/flipt/v2/internal/storage"` in most files
-- Use `find_references` on `NewResource` to get the complete call site list instantly
-- Look at related functions like `storage.NewNamespace()` which already takes a context — follow that pattern
 
 ## Success Criteria
 
