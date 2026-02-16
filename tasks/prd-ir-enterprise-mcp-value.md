@@ -204,8 +204,12 @@ This PRD covers three workstreams: (1) analysis pipeline improvements to produce
 3. **Codebase selection**: Keep existing Django/Flipt tasks. Add new tasks on capital-markets-relevant codebases (Spring, Kafka, Flink, QuantLib, NestJS) — at least 5 of 15 new tasks.
 4. **Task versioning**: Replace in-place (same task ID). Annotate prior runs as `instruction_version: "v1-hinted"` so pre-redesign data can be filtered out of analysis.
 
+## Resolved Decisions (continued)
+
+5. **Token-to-seconds calibration**: Calibrate from runs that have both claude-code.txt and trajectory.json (~85% of runs). The ~15% missing trajectory.json are due to the H3 bug (Harbor's `_get_session_dir()` fails when agent spawns subagents via Task tool — fixed now but older runs affected). Use the calibrated rate to synthesize timestamps for those runs.
+6. **QuantLib priority**: Prioritize — create sg-benchmarks mirror. C++ financial modeling is directly relevant to capital markets and exercises a language underrepresented in the benchmark.
+7. **Annotation storage**: Append `__v1_hinted` to the folder name of old run batch directories (e.g., `enterprise_selected_opus_20260215_001234__v1_hinted`). MANIFEST generation already skips annotated dirs via SKIP_PATTERNS; add `"__v1_hinted"` to the skip list.
+
 ## Open Questions
 
-- What token-to-seconds conversion rate should be used for synthetic trajectory timestamps? Options: calibrate from runs that have both claude-code.txt and trajectory.json, or use a fixed estimate (e.g., ~50 tokens/second output rate).
-- Should QuantLib (C++) be prioritized given it requires a new sg-benchmarks mirror, or defer to codebases already indexed?
-- How should the `instruction_version` annotation be stored — in result.json metadata, a sidecar file, or MANIFEST.json field?
+None — all design decisions resolved.
