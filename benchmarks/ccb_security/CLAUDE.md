@@ -4,14 +4,13 @@ This suite tests your ability to identify, classify, and triage security vulnera
 
 ## Search Strategy
 
-**This repository is large.** You MUST use Sourcegraph MCP tools for investigation:
+**This repository is large.** Use code search tools to efficiently navigate:
 
-- Use `keyword_search` to find security-sensitive patterns: user input handling, SQL queries, file operations, auth checks, crypto usage
-- Use `find_references` to trace tainted data flows from input sources to sinks
-- Use `go_to_definition` to understand validation functions, sanitizers, and auth middleware
-- Use `diff_search` to find recent changes that may have introduced vulnerabilities
-- Use `commit_search` to find security-related fixes or patches in the commit history
-- Use `deepsearch` for broad questions like "how does this service handle authentication?"
+- Search for security-sensitive patterns: user input handling, SQL queries, file operations, auth checks, crypto usage
+- Trace tainted data flows from input sources to sinks via references
+- Navigate to definitions to understand validation functions, sanitizers, and auth middleware
+- Search diffs to find recent changes that may have introduced vulnerabilities
+- Search commit history for security-related fixes or patches
 
 ## Output Requirements
 

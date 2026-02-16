@@ -13,17 +13,15 @@ RUN apt-get update -qq && apt-get install -y -qq \
 
 WORKDIR /workspace
 
-# Clone hashicorp/terraform at pinned SHA (v1.10.5 release - 2026-02-14)
-# This version includes providers.Interface with all modern provider methods
+# Clone hashicorp/terraform at v1.15.0-alpha20260204
 RUN git clone --depth 1 https://github.com/hashicorp/terraform.git terraform \
-    && cd terraform && git fetch --depth 1 origin 6b7e0f87f5a7a2c8faa83d2c7a5f2f2e7d5c4b3a \
-    && git checkout 6b7e0f87f5a7a2c8faa83d2c7a5f2f2e7d5c4b3a
+    && cd terraform && git fetch --depth 1 origin f65c52c8995a627e64c82827c75edf99a9399e4b \
+    && git checkout f65c52c8995a627e64c82827c75edf99a9399e4b
 
-# Clone hashicorp/terraform-provider-aws at pinned SHA (v5.87.0 - 2026-02-13)
-# Recent stable release with full Provider interface implementation
+# Clone hashicorp/terraform-provider-aws at v6.32.1
 RUN git clone --depth 1 https://github.com/hashicorp/terraform-provider-aws.git terraform-provider-aws \
-    && cd terraform-provider-aws && git fetch --depth 1 origin 5a2c7f3e8b9d1a4f6e2c8d7b3a9f1e5c4b8d2a6f \
-    && git checkout 5a2c7f3e8b9d1a4f6e2c8d7b3a9f1e5c4b8d2a6f
+    && cd terraform-provider-aws && git fetch --depth 1 origin e9b4629e752e76551c7bca0f317e98e43bc96a7c \
+    && git checkout e9b4629e752e76551c7bca0f317e98e43bc96a7c
 
 RUN mkdir -p /logs/verifier /logs/agent
 

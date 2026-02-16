@@ -4,14 +4,13 @@ This suite tests your ability to answer natural-language questions about large c
 
 ## Search Strategy
 
-**This repository is large.** You MUST use Sourcegraph MCP tools for investigation:
+**This repository is large.** Use code search tools to efficiently navigate:
 
-- Use `keyword_search` to locate specific symbols, constants, config keys, or error messages
-- Use `nls_search` for conceptual/semantic queries when you don't know exact identifiers (e.g., "authentication middleware", "rate limiting logic")
-- Use `find_references` to trace how a symbol is used across the codebase
-- Use `go_to_definition` to understand type hierarchies, interfaces, and function contracts
-- Use `read_file` to read full implementations once you've located the relevant file
-- Use `deepsearch` for broad "how does X work?" questions that require multi-file reasoning
+- Search for specific symbols, constants, config keys, or error messages by keyword
+- Use semantic/conceptual search when you don't know exact identifiers (e.g., "authentication middleware", "rate limiting logic")
+- Trace how a symbol is used across the codebase via references
+- Navigate to definitions to understand type hierarchies, interfaces, and function contracts
+- Read full implementations once you've located the relevant file
 
 ## Output Requirements
 

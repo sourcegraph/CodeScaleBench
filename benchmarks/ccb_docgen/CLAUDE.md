@@ -4,15 +4,14 @@ This suite tests your ability to generate accurate, comprehensive documentation 
 
 ## Search Strategy
 
-**This repository is large.** You MUST use Sourcegraph MCP tools for documentation:
+**This repository is large.** Use code search tools to efficiently navigate:
 
-- Use `keyword_search` to find exported functions, public APIs, and type definitions
-- Use `find_references` to understand how APIs are used in practice (for usage examples)
-- Use `go_to_definition` to read full function signatures, parameter types, and return types
-- Use `nls_search` for conceptual queries like "error handling patterns" or "configuration options"
-- Use `read_file` to examine existing documentation, docstrings, and comments
-- Use `list_files` to discover module structure and identify what needs documenting
-- Use `deepsearch` to understand complex subsystems before documenting them
+- Search for exported functions, public APIs, and type definitions by keyword
+- Trace how APIs are used in practice via references (for usage examples)
+- Navigate to definitions to read full function signatures, parameter types, and return types
+- Use semantic search for conceptual queries like "error handling patterns" or "configuration options"
+- Read existing documentation, docstrings, and comments for context
+- Explore module structure to identify what needs documenting
 
 ## Output Requirements
 

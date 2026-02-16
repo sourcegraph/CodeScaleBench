@@ -66,4 +66,4 @@ Write your findings to `/logs/agent/onboarding.md` using the following structure
 - Be specific. Reference actual file paths, class names, function names.
 - Focus on understanding the **system's behavior**, not just describing the code.
 - This is analysis only — do not modify any code.
-- Use MCP tools (list_files, nls_search, read_file, find_references) to explore the codebase efficiently.
+- Use code search and file exploration tools to explore the codebase efficiently.

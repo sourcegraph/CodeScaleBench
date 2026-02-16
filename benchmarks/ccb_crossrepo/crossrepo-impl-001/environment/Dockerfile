@@ -13,15 +13,15 @@ RUN apt-get update -qq && apt-get install -y -qq \
 
 WORKDIR /workspace
 
-# Clone kubernetes/api at pinned SHA (2026-02-16)
+# Clone kubernetes/api (same pinned SHA as crossrepo-chain-001)
 RUN git clone --depth 1 https://github.com/kubernetes/api.git api \
-    && cd api && git fetch --depth 1 origin c4a8a38b3ae0f0f8d6c8e0b3f7d9c8e8f9e0c8d7 \
-    && git checkout c4a8a38b3ae0f0f8d6c8e0b3f7d9c8e8f9e0c8d7
+    && cd api && git fetch --depth 1 origin f32ed1d60cf0787a512bebd6c06a4b84ae0b7cc7 \
+    && git checkout f32ed1d60cf0787a512bebd6c06a4b84ae0b7cc7
 
-# Clone kubernetes/apimachinery at pinned SHA (2026-02-16)
+# Clone kubernetes/apimachinery (same pinned SHA as crossrepo-chain-001)
 RUN git clone --depth 1 https://github.com/kubernetes/apimachinery.git apimachinery \
-    && cd apimachinery && git fetch --depth 1 origin a8e3f1c7b9d2e4f6a8b0c9d7e5f3a1b8c6d4e2f0 \
-    && git checkout a8e3f1c7b9d2e4f6a8b0c9d7e5f3a1b8c6d4e2f0
+    && cd apimachinery && git fetch --depth 1 origin b2e9f88ff6d4c50c13061a53b1239c7707354eda \
+    && git checkout b2e9f88ff6d4c50c13061a53b1239c7707354eda
 
 RUN mkdir -p /logs/verifier /logs/agent
 

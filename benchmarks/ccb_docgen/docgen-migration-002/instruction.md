@@ -50,10 +50,9 @@ Write your migration guide to `/workspace/documentation.md` in Markdown format w
 - Recommend best practices for adopting new features
 - Identify common migration pitfalls or edge cases
 
-## MCP Advantage
+## Tips
 
-This task benefits from:
-- `compare_revisions` to identify changed proto fields and implementation files
-- `diff_search` to find all API modifications in the ext_proc filter
-- `find_references` to trace configuration usage patterns
-- `nls_search` to locate related documentation updates
+- Compare the two version directories to identify changed proto fields and implementation files
+- Search for all API modifications in the ext_proc filter
+- Trace configuration usage patterns across both versions
+- Look for related documentation updates

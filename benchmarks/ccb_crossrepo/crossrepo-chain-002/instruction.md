@@ -60,6 +60,6 @@ Write your results to `/workspace/chain.json`:
 ## Notes
 
 - The go-control-plane repository contains **generated code** from protobuf definitions. The `.pb.go` files are auto-generated from `.proto` files in data-plane-api.
-- Use `go_to_definition` or import tracing to navigate from Istio's usage to the generated Go types.
+- Use definition lookup or import tracing to navigate from Istio's usage to the generated Go types.
 - The final step should identify the **source `.proto` file**, not just the generated code.
 - Line numbers are approximate; +/- 50 lines is acceptable if the symbol is in that region.

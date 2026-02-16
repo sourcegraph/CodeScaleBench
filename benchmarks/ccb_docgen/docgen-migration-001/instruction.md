@@ -59,7 +59,7 @@ Your documentation will be evaluated on:
 
 ## Tips
 
-- Use MCP tools like `compare_revisions` to identify changes in specific files
+- Compare the two version directories to identify changes in specific files
 - Look for UPGRADE notes in release documentation
 - Examine test files to understand behavioral changes
 - Check for deprecation warnings and removed features

@@ -60,6 +60,6 @@ Write your results to `/workspace/chain.json`:
 ## Notes
 
 - The kubernetes/kubernetes repository contains a staging directory (`staging/src/k8s.io/`) with code that is synced to separate repositories (kubernetes/api, kubernetes/apimachinery). For this task, treat them as separate codebases.
-- Use `go_to_definition` or cross-file search to trace imports and type references.
+- Use cross-file search or definition lookup to trace imports and type references.
 - You may encounter intermediate re-exports—document all steps.
 - Line numbers are approximate; +/- 50 lines is acceptable if the symbol is in that region.

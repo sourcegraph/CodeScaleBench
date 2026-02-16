@@ -4,15 +4,14 @@ This suite tests your ability to orient in an unfamiliar codebase — understand
 
 ## Search Strategy
 
-**This repository is large.** You MUST use Sourcegraph MCP tools for exploration:
+**This repository is large.** Use code search tools to efficiently navigate:
 
-- Use `list_files` to understand directory structure and project layout
-- Use `nls_search` to find entry points, main functions, and key abstractions
-- Use `keyword_search` to locate configuration files, dependency manifests, and build scripts
-- Use `find_references` to map how core abstractions are used across the codebase
-- Use `go_to_definition` to understand interfaces and type hierarchies that define the architecture
-- Use `read_file` to examine README, CONTRIBUTING, and config files for project conventions
-- Use `deepsearch` for high-level architecture questions
+- Explore directory structure and project layout
+- Search for entry points, main functions, and key abstractions
+- Locate configuration files, dependency manifests, and build scripts
+- Trace how core abstractions are used across the codebase via references
+- Navigate to definitions to understand interfaces and type hierarchies that define the architecture
+- Examine README, CONTRIBUTING, and config files for project conventions
 
 ## Output Requirements
 

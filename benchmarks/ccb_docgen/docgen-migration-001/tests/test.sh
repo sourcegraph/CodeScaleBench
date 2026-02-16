@@ -4,24 +4,36 @@ set -euo pipefail
 # Migration guide verifier using weighted checklist scoring
 # Validates documentation.md against ground_truth.json
 
-GROUND_TRUTH_FILE="$(dirname "$0")/ground_truth.json"
+GROUND_TRUTH_FILE="/tests/ground_truth.json"
 DOCUMENTATION_FILE="/workspace/documentation.md"
+REWARD_FILE="/logs/verifier/reward.txt"
+
+mkdir -p /logs/verifier
 
 if [[ ! -f "$DOCUMENTATION_FILE" ]]; then
     echo "FAIL: documentation.md not found at /workspace/documentation.md"
-    exit 1
+    echo "0.0" > "$REWARD_FILE"
+    exit 0
 fi
 
 if [[ ! -f "$GROUND_TRUTH_FILE" ]]; then
     echo "FAIL: ground_truth.json not found"
-    exit 1
+    echo "0.0" > "$REWARD_FILE"
+    exit 0
 fi
 
-python3 - <<'PYTHON_SCRIPT'
+REWARD_FILE="$REWARD_FILE" python3 - <<'PYTHON_SCRIPT'
 import json
+import os
 import re
 import sys
-from pathlib import Path
+
+REWARD_PATH = os.environ["REWARD_FILE"]
+
+def write_reward(score):
+    with open(REWARD_PATH, "w") as f:
+        f.write(f"{score:.2f}\n")
+    print(f"\nTests completed - Score: {score:.2f}")
 
 def load_json(path):
     with open(path, 'r') as f:
@@ -55,20 +67,23 @@ def score_category(text, category_data):
         max_score += weight
 
         # For migration guides, use OR logic (any pattern matches)
-        # This is more forgiving than architecture docs
         if check_patterns(text, patterns, check_all=False):
             total_score += weight
 
     return total_score, max_score
 
 def main():
-    ground_truth = load_json('benchmarks/ccb_docgen/docgen-migration-001/tests/ground_truth.json')
-    documentation = load_documentation('/workspace/documentation.md')
+    try:
+        ground_truth = load_json('/tests/ground_truth.json')
+        documentation = load_documentation('/workspace/documentation.md')
+    except Exception as e:
+        print(f"Error loading files: {e}")
+        write_reward(0.0)
+        return
 
     categories = ground_truth['scoring_categories']
 
     overall_score = 0.0
-    category_scores = {}
 
     print("=" * 60)
     print("Migration Guide Scoring Report")
@@ -78,22 +93,13 @@ def main():
         category_weight = category_data['weight']
         score, max_score = score_category(documentation, category_data)
 
-        # Normalize to 0-1 range for this category
         if max_score > 0:
             normalized_score = score / max_score
         else:
             normalized_score = 0.0
 
-        # Weight by category importance
         weighted_score = normalized_score * category_weight
         overall_score += weighted_score
-
-        category_scores[category_name] = {
-            'raw_score': score,
-            'max_score': max_score,
-            'normalized': normalized_score,
-            'weighted': weighted_score
-        }
 
         print(f"\n{category_name}:")
         print(f"  Raw: {score:.2f}/{max_score:.2f}")
@@ -104,13 +110,7 @@ def main():
     print(f"Overall Score: {overall_score:.3f}")
     print("=" * 60)
 
-    # Pass threshold: 0.7
-    if overall_score >= 0.7:
-        print("\nRESULT: PASS")
-        sys.exit(0)
-    else:
-        print(f"\nRESULT: FAIL (score {overall_score:.3f} < 0.7 threshold)")
-        sys.exit(1)
+    write_reward(overall_score)
 
 if __name__ == '__main__':
     main()

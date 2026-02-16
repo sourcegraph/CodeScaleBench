@@ -4,14 +4,13 @@ This suite tests your ability to investigate code-level phenomena in large codeb
 
 ## Search Strategy
 
-**This repository is large.** You MUST use Sourcegraph MCP tools for investigation:
+**This repository is large.** Use code search tools to efficiently navigate:
 
-- Use `keyword_search` to find all references to specific symbols, configs, or patterns
-- Use `find_references` to trace symbol usage across the codebase
-- Use `go_to_definition` to understand type hierarchies and function contracts
-- Use `commit_search` to find recent changes that may have caused regressions
-- Use `diff_search` to find what code was added/removed in recent changes
-- Use `deepsearch` for high-level "how does X work?" questions
+- Search for specific symbols, configs, or patterns by keyword
+- Trace symbol usage and references across the codebase
+- Navigate to definitions to understand type hierarchies and function contracts
+- Search commit history to find recent changes that may have caused regressions
+- Search diffs to find what code was added or removed in recent changes
 
 ## Output Requirements
 
