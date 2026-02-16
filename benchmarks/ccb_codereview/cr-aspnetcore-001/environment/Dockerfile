@@ -25,7 +25,7 @@ RUN git clone --filter=blob:none --no-checkout https://github.com/dotnet/aspnetc
     git config user.name "Agent"
 
 # Inject defects into the codebase
-COPY inject_defects.sh /tmp/inject_defects.sh
+COPY environment/inject_defects.sh /tmp/inject_defects.sh
 RUN chmod +x /tmp/inject_defects.sh && /tmp/inject_defects.sh && rm /tmp/inject_defects.sh
 
 # Create directories for verifier (tests uploaded at runtime by Harbor verifier)
