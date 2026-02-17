@@ -224,7 +224,12 @@ def _shorten(text: str, limit: int = 500) -> str:
     return text[: limit - 3] + "..."
 
 
-def smoke_task_runtime(task_dir: Path, timeout_sec: int = 300) -> list[dict]:
+def smoke_task_runtime(
+    task_dir: Path,
+    timeout_sec: int = 300,
+    build_timeout_sec: int | None = None,
+    verify_timeout_sec: int | None = None,
+) -> list[dict]:
     """Build task image and run verifier without an agent.
 
     This catches broken Dockerfiles and verifier script/runtime wiring before
@@ -259,18 +264,34 @@ def smoke_task_runtime(task_dir: Path, timeout_sec: int = 300) -> list[dict]:
         return issues
 
     image_tag = f"ccb-smoke-{task_name.lower().replace('_', '-')}-{uuid.uuid4().hex[:8]}"
+    build_timeout = build_timeout_sec if build_timeout_sec is not None else timeout_sec
+    verify_timeout = verify_timeout_sec if verify_timeout_sec is not None else timeout_sec
 
     try:
-        build = subprocess.run(
-            ["docker", "build", "-f", str(dockerfile), "-t", image_tag, str(dockerfile.parent)],
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
-            check=False,
-        )
-        if build.returncode != 0:
-            message = _shorten(build.stdout + "\n" + build.stderr)
-            issue("CRITICAL", "smoke_docker_build_fail", f"Docker build failed: {message}")
+        build_contexts = [task_dir, dockerfile.parent]
+        build_succeeded = False
+        build_errors: list[str] = []
+        saw_build_timeout = False
+        for ctx in build_contexts:
+            try:
+                build = subprocess.run(
+                    ["docker", "build", "-f", str(dockerfile), "-t", image_tag, str(ctx)],
+                    capture_output=True,
+                    text=True,
+                    timeout=build_timeout,
+                    check=False,
+                )
+                if build.returncode == 0:
+                    build_succeeded = True
+                    break
+                build_errors.append(f"context={ctx}: {_shorten(build.stdout + chr(10) + build.stderr)}")
+            except subprocess.TimeoutExpired:
+                saw_build_timeout = True
+                build_errors.append(f"context={ctx}: timeout ({build_timeout}s)")
+
+        if not build_succeeded:
+            check_name = "smoke_build_timeout" if saw_build_timeout else "smoke_docker_build_fail"
+            issue("CRITICAL", check_name, "Docker build failed for all contexts: " + " | ".join(build_errors))
             return issues
 
         tmp_logs = tempfile.mkdtemp(prefix=f"ccb-smoke-{task_name}-")
@@ -295,24 +316,48 @@ def smoke_task_runtime(task_dir: Path, timeout_sec: int = 300) -> list[dict]:
             run_cmd,
             capture_output=True,
             text=True,
-            timeout=timeout_sec,
+            timeout=verify_timeout,
             check=False,
         )
-        if run.returncode != 0:
-            message = _shorten(run.stdout + "\n" + run.stderr)
-            issue("CRITICAL", "smoke_verifier_exec_fail", f"Verifier execution failed: {message}")
-            return issues
-
         reward_txt = Path(tmp_logs) / "verifier" / "reward.txt"
         reward_json = Path(tmp_logs) / "verifier" / "reward.json"
-        if not reward_txt.is_file() and not reward_json.is_file():
+        has_reward = reward_txt.is_file() or reward_json.is_file()
+
+        if run.returncode != 0:
+            message = _shorten(run.stdout + "\n" + run.stderr)
+            lower = message.lower()
+            hard_failure_patterns = [
+                "syntax error",
+                "no such file or directory",
+                "command not found",
+                "traceback",
+                "module not found",
+                "modulenotfounderror",
+            ]
+            if any(p in lower for p in hard_failure_patterns):
+                issue("CRITICAL", "smoke_verifier_exec_fail", f"Verifier execution failed: {message}")
+                return issues
+            if not has_reward:
+                issue(
+                    "CRITICAL",
+                    "smoke_verifier_exec_fail",
+                    f"Verifier failed before producing reward artifact: {message}",
+                )
+                return issues
+            issue(
+                "WARNING",
+                "smoke_verifier_nonzero_with_reward",
+                "Verifier returned non-zero but produced reward artifact (likely expected with dummy solution).",
+            )
+
+        if not has_reward:
             issue(
                 "CRITICAL",
                 "smoke_reward_missing",
                 "Verifier ran but produced no reward.txt/reward.json in /logs/verifier",
             )
     except subprocess.TimeoutExpired:
-        issue("CRITICAL", "smoke_timeout", f"Smoke run exceeded timeout ({timeout_sec}s)")
+        issue("CRITICAL", "smoke_verify_timeout", f"Verifier smoke exceeded timeout ({verify_timeout}s)")
     finally:
         subprocess.run(["docker", "image", "rm", "-f", image_tag], capture_output=True, text=True)
 
@@ -414,6 +459,18 @@ def main():
         default=300,
         help="Per-task timeout for --smoke-runtime (default: 300)",
     )
+    parser.add_argument(
+        "--smoke-build-timeout-sec",
+        type=int,
+        default=None,
+        help="Docker build timeout (defaults to --smoke-timeout-sec)",
+    )
+    parser.add_argument(
+        "--smoke-verify-timeout-sec",
+        type=int,
+        default=None,
+        help="Verifier run timeout (defaults to --smoke-timeout-sec)",
+    )
     args = parser.parse_args()
 
     selected_index = load_selected_tasks()
@@ -435,7 +492,14 @@ def main():
     for td in task_dirs:
         issues = validate_task(td, selected_index)
         if args.smoke_runtime:
-            issues.extend(smoke_task_runtime(td, timeout_sec=args.smoke_timeout_sec))
+            issues.extend(
+                smoke_task_runtime(
+                    td,
+                    timeout_sec=args.smoke_timeout_sec,
+                    build_timeout_sec=args.smoke_build_timeout_sec,
+                    verify_timeout_sec=args.smoke_verify_timeout_sec,
+                )
+            )
         all_issues.extend(issues)
 
     if args.critical_only:

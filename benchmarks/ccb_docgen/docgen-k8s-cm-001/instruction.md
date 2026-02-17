@@ -9,18 +9,18 @@ Produce a subsystem architecture guide for kubelet container manager, including 
 
 ## Scope
 
-Primary focus area: `pkg/kubelet/cm`.
+Focus on the kubelet container manager subsystem.
+Your document must explain component responsibilities, end-to-end flow, and extension or operational tradeoffs.
 
-Your document must explain component responsibilities, end-to-end flow, and extension/operational tradeoffs.
+## Content Expectations
 
-## Required Sections
-
-1. **Subsystem Overview** — purpose, boundaries, and upstream/downstream dependencies
-2. **Key Components** — major types/modules and their responsibilities
-3. **End-to-End Flow** — request/control flow with concrete file-backed references
-4. **Failure Modes & Tradeoffs** — common failures, limits, and design tradeoffs
-5. **Extension Points** — where behavior can be customized and associated risks
-6. **Source File Map** — list the most relevant files/directories used in your analysis
+Address all of the following in your own structure:
+- subsystem purpose, boundaries, and upstream/downstream dependencies
+- key components and how responsibilities are split
+- end-to-end control/request flow with concrete repository evidence
+- failure modes, limits, and design tradeoffs
+- extension points, customization hooks, and associated risks
+- a concise map of the most important files/directories used in your analysis
 
 ## Quality Bar
 

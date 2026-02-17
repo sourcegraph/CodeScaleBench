@@ -13,9 +13,8 @@ requirements documentation and fixing version mismatches.
 
 ## Task
 
-You previously set up an environment to run the copilot-arena-server. The library 
-installation config for your environment is in the `myenv.txt` file located in the 
-/workspace folder. 
+You previously set up an environment to run the copilot-arena-server. The library
+installation config for your environment is in `myenv.txt` within the workspace.
 
 Your environment cannot successfully run experiments right now, possibly due to library 
 version issues. You will need to:

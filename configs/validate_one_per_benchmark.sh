@@ -27,6 +27,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 DRY_RUN=false
 SMOKE_RUNTIME=false
 SMOKE_TIMEOUT_SEC=300
+SMOKE_TIMEOUT_OVERRIDES="${SMOKE_TIMEOUT_OVERRIDES:-ccb_pytorch=900,ccb_tac=900,ccb_crossrepo=900}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -40,6 +41,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --smoke-timeout-sec)
             SMOKE_TIMEOUT_SEC="${2:-}"
+            shift 2
+            ;;
+        --smoke-timeout-overrides)
+            SMOKE_TIMEOUT_OVERRIDES="${2:-}"
             shift 2
             ;;
         *)
@@ -84,6 +89,7 @@ echo "=============================================="
 if [ "$SMOKE_RUNTIME" = true ]; then
     echo "Mode:    runtime smoke (no agent)"
     echo "Timeout: ${SMOKE_TIMEOUT_SEC}s per task"
+    echo "Overrides: ${SMOKE_TIMEOUT_OVERRIDES:-<none>}"
 else
     echo "Mode:    baseline harbor run (no MCP)"
     echo "Model:   $MODEL"
@@ -102,10 +108,22 @@ if [ "$DRY_RUN" = true ]; then
     echo "[DRY RUN] Verifying task directories..."
     for line in "${TASK_LINES[@]}"; do
         IFS=$'\t' read -r bm path <<< "$line"
+        TASK_TIMEOUT="$SMOKE_TIMEOUT_SEC"
+        if [ "$SMOKE_RUNTIME" = true ] && [ -n "${SMOKE_TIMEOUT_OVERRIDES:-}" ]; then
+            IFS=',' read -ra __OVR_ARR <<< "$SMOKE_TIMEOUT_OVERRIDES"
+            for __pair in "${__OVR_ARR[@]}"; do
+                __k="${__pair%%=*}"
+                __v="${__pair#*=}"
+                if [ "$__k" = "$bm" ] && [ -n "$__v" ]; then
+                    TASK_TIMEOUT="$__v"
+                    break
+                fi
+            done
+        fi
         if [ -d "$path" ] && [ -f "$path/task.toml" ]; then
             echo "  OK   $path"
             if [ "$SMOKE_RUNTIME" = true ]; then
-                echo "      cmd: python3 scripts/validate_tasks_preflight.py --task $path --smoke-runtime --smoke-timeout-sec $SMOKE_TIMEOUT_SEC --format json"
+                echo "      cmd: python3 scripts/validate_tasks_preflight.py --task $path --smoke-runtime --smoke-timeout-sec $TASK_TIMEOUT --format json"
             else
                 echo "      cmd: BASELINE_MCP_TYPE=none harbor run --path $path --agent-import-path $AGENT_PATH --model $MODEL ..."
             fi
@@ -133,11 +151,23 @@ for line in "${TASK_LINES[@]}"; do
     fi
 
     if [ "$SMOKE_RUNTIME" = true ]; then
+        TASK_TIMEOUT="$SMOKE_TIMEOUT_SEC"
+        if [ -n "${SMOKE_TIMEOUT_OVERRIDES:-}" ]; then
+            IFS=',' read -ra __OVR_ARR <<< "$SMOKE_TIMEOUT_OVERRIDES"
+            for __pair in "${__OVR_ARR[@]}"; do
+                __k="${__pair%%=*}"
+                __v="${__pair#*=}"
+                if [ "$__k" = "$bm" ] && [ -n "$__v" ]; then
+                    TASK_TIMEOUT="$__v"
+                    break
+                fi
+            done
+        fi
         echo "Launching runtime smoke: $bm ($path)"
         python3 scripts/validate_tasks_preflight.py \
             --task "$abs_path" \
             --smoke-runtime \
-            --smoke-timeout-sec "$SMOKE_TIMEOUT_SEC" \
+            --smoke-timeout-sec "$TASK_TIMEOUT" \
             --format json \
             > "$JOBS_DIR/${bm}.log" 2>&1 &
     else

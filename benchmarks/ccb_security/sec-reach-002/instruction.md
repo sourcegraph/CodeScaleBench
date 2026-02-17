@@ -22,12 +22,6 @@ Determine whether this function is **exploitable from external HTTP input** (i.e
 - **Repository**: envoyproxy/envoy @ v1.31.1
 - **Language**: C++
 - **Focus Area**: Admin interface architecture and access control
-- **Relevant Files**:
-  - `source/server/admin/admin.cc` (admin endpoint handlers)
-  - `source/server/admin/admin.h` (admin interface definition)
-  - `source/server/server.cc` (server initialization, admin interface binding)
-  - `envoy/server/admin.h` (admin interface API)
-  - Configuration files showing admin interface setup
 
 ## Background: Admin Interface vs Data Plane
 
@@ -45,33 +39,13 @@ Envoy has two separate network interfaces:
 
 ## Expected Deliverable
 
-Write your analysis to `/logs/agent/triage.md` with the following sections:
+Write your analysis to `/logs/agent/triage.md`.
 
-### 1. Summary
-- Function under analysis
-- Overall exploitability assessment (EXPLOITABLE / MITIGATED / UNREACHABLE)
-- Key finding (1-2 sentences)
-
-### 2. Call Path Analysis
-- Complete call chain from HTTP request reception to `parseAuthority()`
-- Entry points (HTTP/1 vs HTTP/2)
-- Any conditional branching in the call path
-
-### 3. Protection Mechanisms
-- Network interface binding configuration (which IP/port?)
-- Access control mechanisms (authentication, IP allowlisting, etc.)
-- Separation between admin interface and data plane listeners
-- How Envoy routes requests to admin handlers vs regular HTTP handlers
-
-### 4. Exploitability Assessment
-- Can an external attacker (from the internet) trigger `/drain_listeners`?
-- What network configuration would be required for an attack to succeed?
-- Is the vulnerability **EXPLOITABLE** (reachable from external traffic) or **UNREACHABLE** (admin-only)?
-
-### 5. Severity Assessment
-- If exploitable: impact (DoS, memory corruption, information disclosure, RCE)
-- If mitigated: description of the protection mechanism
-- Confidence level in your assessment
+Include enough evidence to support your exploitability conclusion, including:
+- the full call chain from request reception to the target handler
+- the boundary between data-plane and admin-plane request handling
+- the controls that prevent or permit external reachability
+- the network/configuration conditions under which the endpoint would become externally reachable
 
 ## Important Notes
 

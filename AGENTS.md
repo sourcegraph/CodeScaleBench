@@ -79,4 +79,6 @@ python3 scripts/generate_eval_report.py
 - `configs/_common.sh` - shared run infra (parallelism, token refresh, validation hooks)
 - `configs/*_2config.sh` - per-suite run launchers
 - `configs/validate_one_per_benchmark.sh --smoke-runtime` - quick no-agent runtime smoke (1 task per benchmark)
+  - Smoke interpretation: `smoke_verifier_nonzero_with_reward` is acceptable in no-agent mode; use `--smoke-timeout-overrides "ccb_pytorch=900,ccb_tac=900,ccb_crossrepo=900"` for timeout-heavy suites.
+  - Timeout diagnostics: `smoke_build_timeout` (image build phase) vs `smoke_verify_timeout` (verifier phase).
 - `scripts/promote_run.py` - staging to official promotion flow

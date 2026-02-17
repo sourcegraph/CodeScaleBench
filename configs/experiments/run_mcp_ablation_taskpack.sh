@@ -132,16 +132,35 @@ while IFS=$'\t' read -r bm tid tdir repo; do
   echo "Task: ${tid} (${bm})"
   echo "Dir:  benchmarks/${tdir}"
 
+  ensure_fresh_token_all
+
+  base_pid=""
+  full_pid=""
+
   if [ "$RUN_BASELINE" = true ]; then
-    echo "Mode: baseline"
-    ensure_fresh_token_all
-    run_one "$tdir" "baseline" "$repo"
+    echo "Mode: baseline (paired launch)"
+    run_one "$tdir" "baseline" "$repo" &
+    base_pid=$!
   fi
 
   if [ "$RUN_FULL" = true ]; then
-    echo "Mode: sourcegraph_full"
-    ensure_fresh_token_all
-    run_one "$tdir" "sourcegraph_full" "$repo"
+    echo "Mode: sourcegraph_full (paired launch)"
+    run_one "$tdir" "sourcegraph_full" "$repo" &
+    full_pid=$!
+  fi
+
+  base_rc=0
+  full_rc=0
+  if [ -n "$base_pid" ]; then
+    wait "$base_pid" || base_rc=$?
+  fi
+  if [ -n "$full_pid" ]; then
+    wait "$full_pid" || full_rc=$?
+  fi
+
+  if [ "$base_rc" -ne 0 ] || [ "$full_rc" -ne 0 ]; then
+    echo "ERROR: Paired run failed for task ${tid} (baseline_rc=${base_rc}, sourcegraph_full_rc=${full_rc})"
+    exit 1
   fi
 done < /tmp/mcp_ablation_tasks.tsv
 
