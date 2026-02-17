@@ -129,20 +129,20 @@ python3 scripts/promote_run.py --execute <run_name>      # Promote to official
 python3 scripts/aggregate_status.py --staging
 ```
 
-## Operational Skills (17)
+## Operational Skills (18)
 
 Slash commands for the full benchmark lifecycle. Use these in Claude Code sessions.
 
 ### Workflow by Phase
 
 ```
-PRE-RUN                DURING RUN           POST-RUN              ANALYSIS              QA
-───────                ──────────           ────────              ────────              ──
-/check-infra      -->  /run-status     -->  /watch-benchmarks --> /compare-configs  --> /benchmark-audit
-/validate-tasks        (lightweight)        (full scan)           /cost-report          /score-tasks
-                                            /whats-next           /generate-report
-                                            /triage-failure        /evaluate-traces
-                                            /quick-rerun           /mcp-audit
+PRE-RUN                DURING RUN           POST-RUN              PROMOTION             ANALYSIS              QA
+───────                ──────────           ────────              ─────────             ────────              ──
+/check-infra      -->  /run-status     -->  /watch-benchmarks --> /promote-run     -->  /compare-configs  --> /benchmark-audit
+/validate-tasks        (lightweight)        (staging scan)        (staging→official)    /cost-report          /score-tasks
+                                            /whats-next                                 /generate-report
+                                            /triage-failure                              /evaluate-traces
+                                            /quick-rerun                                 /mcp-audit
 
 MAINTENANCE
 ───────────
@@ -150,6 +150,8 @@ MAINTENANCE
 /archive-run
 /reextract-metrics
 ```
+
+Runs land in `runs/staging/` by default. After validation, `/promote-run` moves them to `runs/official/`.
 
 ### Pre-Run
 
@@ -168,10 +170,16 @@ MAINTENANCE
 
 | Skill | Script | Purpose |
 |-------|--------|---------|
-| `/watch-benchmarks` | `scripts/aggregate_status.py` | Full scan of runs/official/ with error fingerprinting, --watch mode, per-task status.json |
+| `/watch-benchmarks` | `scripts/aggregate_status.py` | Full scan with error fingerprinting, --watch mode. Use `--staging` to scan staging runs |
 | `/whats-next` | (uses aggregate_status + compare_configs) | Analyze current state and recommend next actions |
 | `/triage-failure` | (reads logs + fingerprints) | Investigate a failed task OR analyze agent behavior on any task (MCP usage, tool patterns, zero-MCP investigation) |
 | `/quick-rerun` | (harbor run wrapper) | Rerun a single task with haiku model for fast verification |
+
+### Promotion
+
+| Skill | Script | Purpose |
+|-------|--------|---------|
+| `/promote-run` | `scripts/promote_run.py` | Validate staging runs and promote to official. Gates: 0 criticals, all tasks completed, warnings <= threshold |
 
 ### Analysis
 
@@ -196,7 +204,6 @@ MAINTENANCE
 |-------|--------|---------|
 | `/sync-metadata` | `scripts/sync_task_metadata.py` | Reconcile task.toml vs selected_benchmark_tasks.json, `--fix` to auto-update |
 | `/archive-run` | `scripts/archive_run.py` | Move old runs to archive/, optional compression, dry-run by default |
-| `/promote-run` | `scripts/promote_run.py` | Validate and promote staging runs to official, regenerate MANIFEST |
 | `/reextract-metrics` | `scripts/reextract_all_metrics.py` | Batch re-extract task_metrics.json after extraction bug fixes or schema changes |
 
 ### Supporting Scripts
