@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-DEFAULT_SUPPORTED = ["baseline", "sourcegraph_base", "sourcegraph_full", "sourcegraph_isolated"]
+DEFAULT_SUPPORTED = ["baseline", "sourcegraph_full", "sourcegraph_isolated"]
 DEFAULT_OFFICIAL = ["baseline", "sourcegraph_full"]
 
 
@@ -65,6 +65,6 @@ def mcp_enabled_configs(project_root: Path | None = None) -> set[str]:
             if isinstance(name, str) and isinstance(meta, dict) and meta.get("mcp_enabled") is True:
                 out.add(name)
     if not out:
-        out = {"sourcegraph_base", "sourcegraph_full", "sourcegraph_isolated"}
+        out = {"sourcegraph_full", "sourcegraph_isolated"}
     return out
 

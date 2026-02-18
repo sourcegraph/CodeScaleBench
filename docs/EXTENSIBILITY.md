@@ -15,7 +15,7 @@ CodeContextBench.
    ```bash
    python3 scripts/validate_tasks_preflight.py --suite <suite>
    ```
-5. Add/update the suite runner in `configs/<suite>_2config.sh`.
+5. Add/update the phase runner in `configs/<phase>_2config.sh` (e.g. `understand_2config.sh` for suite `ccb_understand`). Runner names use the phase name without the `ccb_` prefix.
 
 ## 2) Add New Agent Variant / Harness + Model Combo
 
@@ -78,5 +78,5 @@ When adding benchmark environment variants, keep canonical task definitions inta
 2. Add variant files with explicit names (for example `Dockerfile.isolated`,
    `Dockerfile.sg_only`).
 3. Document variant intent and caveats in a per-suite `VARIANTS.md`
-   (for example under `benchmarks/ccb_docgen/`).
+   (for example under `benchmarks/ccb_document/`).
 4. Treat variant runs as separate studies in reporting and curation.

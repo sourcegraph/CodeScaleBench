@@ -72,10 +72,9 @@ DIR_PREFIX_TO_SUITE = {
     "tac_": "ccb_tac",
 }
 
-CONFIGS = ["baseline", "sourcegraph_base", "sourcegraph_full"]
+CONFIGS = ["baseline", "sourcegraph_full"]
 CONFIG_SHORT = {
     "baseline": "BL",
-    "sourcegraph_base": "SG_base",
     "sourcegraph_full": "SG_full",
 }
 
@@ -665,7 +664,7 @@ def format_delta_table(
 ) -> str:
     """Format a table showing deltas from baseline for key metrics."""
     if compare_configs is None:
-        compare_configs = ["sourcegraph_base", "sourcegraph_full"]
+        compare_configs = ["sourcegraph_full"]
 
     lines = []
     lines.append(f"\n{'=' * 90}")

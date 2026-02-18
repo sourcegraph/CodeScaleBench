@@ -162,7 +162,7 @@ Fingerprints are defined in `scripts/status_fingerprints.py` and matched in orde
 
 **Root Cause:** The agent called `sg_deepsearch` and received an async polling link, but `sg_deepsearch_read` only returned the polling message instead of actual results. The agent didn't retry enough times for Deep Search to complete.
 
-**Fix:** Deep Search did not return results within the polling window. The run may have degraded to SG_base quality. Rerun after the preamble retry fix is applied.
+**Fix:** Deep Search did not return results within the polling window. The run may have degraded quality. Rerun after the preamble retry fix is applied.
 
 **Auto-retry:** true
 

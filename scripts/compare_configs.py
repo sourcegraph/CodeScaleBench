@@ -135,16 +135,14 @@ def _build_comparison(task_matrix, suite_filter) -> dict:
 
             # Check if baseline is the only one failing
             bl = row["configs"].get("baseline", {})
-            sg_base = row["configs"].get("sourcegraph_base", {})
             sg_full = row["configs"].get("sourcegraph_full", {})
 
             bl_pass = bl.get("status") == "completed_pass"
-            sgb_pass = sg_base.get("status") == "completed_pass"
             sgf_pass = sg_full.get("status") == "completed_pass"
 
-            if not bl_pass and (sgb_pass or sgf_pass):
+            if not bl_pass and sgf_pass:
                 row["baseline_only_fail"] = True
-            if bl_pass and (not sgb_pass or not sgf_pass):
+            if bl_pass and not sgf_pass:
                 row["mcp_only_fail"] = True
 
         tasks.append(row)
@@ -182,7 +180,6 @@ def _build_comparison(task_matrix, suite_filter) -> dict:
 
 TIER_LABELS = {
     "baseline": "IDE-native",
-    "sourcegraph_base": "SG_base",
     "sourcegraph_full": "Context infra",
 }
 

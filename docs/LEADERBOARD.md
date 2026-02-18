@@ -43,29 +43,22 @@ Tasks that error (agent crash, timeout, container failure) count as **reward = 0
 
 ## Per-Benchmark Completeness
 
-To qualify for a benchmark's leaderboard, a submission must include results for **all** tasks in that benchmark. The required task counts are:
+To qualify for a suite's leaderboard, a submission must include results for **all** tasks in that suite. The 8 SDLC suites and required task counts are:
 
-| Benchmark | Tasks | Reward Type |
-|-----------|-------|-------------|
-| SWE-bench Pro | 36 | test_ratio |
-| LargeRepo | 25 | checklist |
-| DocGen | 13 | checklist |
-| CrossRepo | 12 | semantic_similarity |
-| Enterprise | 12 | checklist |
-| PyTorch | 11 | diff_similarity |
-| NavProve | 9 | checklist |
-| CodeReview | 8 | checklist |
-| DIBench | 8 | binary |
-| Governance | 8 | checklist |
-| NLQA | 8 | checklist |
-| Onboarding | 8 | checklist |
-| Security | 8 | checklist |
-| TAC | 8 | checklist |
-| LinuxFLBench | 5 | checklist |
-| Investigation | 4 | checklist |
-| SWE-Perf | 3 | test_ratio |
+| Suite | Tasks | Reward Type |
+|-------|------:|-------------|
+| ccb_understand | 20 | varies by task |
+| ccb_design | 20 | varies by task |
+| ccb_fix | 25 | varies by task |
+| ccb_build | 25 | varies by task |
+| ccb_test | 14 | varies by task |
+| ccb_document | 13 | varies by task |
+| ccb_secure | 20 | varies by task |
+| ccb_debug | 20 | varies by task |
 
-A submission with 34 of 36 SWE-bench Pro results does **not** appear on the SWE-bench Pro leaderboard. Partial results are retained in the data for analysis but excluded from rankings.
+Reward semantics (test_ratio, diff_similarity, checklist, etc.) are defined per task; see [SCORING_SEMANTICS.md](SCORING_SEMANTICS.md).
+
+A submission missing any task in a suite does **not** appear on that suite's leaderboard. Partial results are retained in the data for analysis but excluded from rankings.
 
 ## Aggregate Score
 
@@ -75,28 +68,30 @@ The **CCB Aggregate Score** is the unweighted (macro) average of per-benchmark m
 ccb_aggregate = sum(per_benchmark_mean_rewards) / N_qualifying_benchmarks
 ```
 
-All benchmarks carry equal weight regardless of task count. The aggregate score is computed over benchmarks where the submission has complete results. A submission with complete results for 10 of 17 benchmarks gets an aggregate over those 10. Submissions with more complete benchmarks are ranked higher when scores are close.
+All suites carry equal weight regardless of task count. The aggregate score is computed over suites where the submission has complete results. A submission with complete results for 7 of 8 suites gets an aggregate over those 7. Submissions with more complete suites are ranked higher when scores are close.
 
 ## Tie-Breaking
 
 When two submissions have equal mean reward (to 3 decimal places), ties are broken in order:
 
-1. **Benchmarks completed** — number of benchmarks with full task coverage (more is better)
+1. **Suites completed** — number of suites with full task coverage (more is better)
 2. **Pass rate** — fraction of tasks with reward > 0.0 (higher is better)
 3. **Median reward** — median of per-task rewards (higher is better)
 4. **Token efficiency** — total tokens used, `n_input_tokens + n_output_tokens` (lower is better)
 
 ## Interpreting Scores
 
-Reward values are always 0.0–1.0, but the semantics differ by benchmark:
+Reward values are always 0.0–1.0, but the semantics differ by task (reward type is defined per task):
 
-| Reward Type | Benchmarks | What 0.8 Means |
-|-------------|-----------|-----------------|
-| **test_ratio** | SWE-bench Pro, SWE-Perf | 80% of test cases pass |
-| **diff_similarity** | PyTorch | Patch is 80% similar to the reference diff |
-| **semantic_similarity** | CrossRepo | Agent output is 80% semantically similar to the reference answer |
-| **checklist** | DocGen, LargeRepo, CodeReview, LinuxFLBench, TAC, Enterprise, Governance, NavProve, NLQA, Onboarding, Security, Investigation | 80% of weighted checklist items satisfied |
-| **binary** | DIBench | Not applicable — reward is either 0.0 or 1.0 |
+| Reward Type | What 0.8 Means |
+|-------------|----------------|
+| **test_ratio** | 80% of test cases pass |
+| **diff_similarity** | Patch is 80% similar to the reference diff |
+| **semantic_similarity** | Agent output is 80% semantically similar to the reference answer |
+| **checklist** | 80% of weighted checklist items satisfied |
+| **binary** | Not applicable — reward is either 0.0 or 1.0 |
+
+See [SCORING_SEMANTICS.md](SCORING_SEMANTICS.md) for full definitions.
 
 ### Reward Type Details
 
@@ -108,30 +103,21 @@ Reward values are always 0.0–1.0, but the semantics differ by benchmark:
 
 ## Calculation Example
 
-An agent runs all 17 benchmarks and achieves:
+An agent runs all 8 suites (157 tasks) and achieves:
 
-| Benchmark | Mean Reward |
-|-----------|-------------|
-| SWE-bench Pro | 0.650 |
-| LargeRepo | 0.250 |
-| DocGen | 0.700 |
-| CrossRepo | 0.400 |
-| Enterprise | 0.350 |
-| PyTorch | 0.100 |
-| NavProve | 0.450 |
-| CodeReview | 0.600 |
-| DIBench | 0.500 |
-| Governance | 0.400 |
-| NLQA | 0.500 |
-| Onboarding | 0.550 |
-| Security | 0.400 |
-| TAC | 0.250 |
-| LinuxFLBench | 0.860 |
-| Investigation | 0.300 |
-| SWE-Perf | 0.600 |
+| Suite | Mean Reward |
+|-------|-------------|
+| ccb_understand | 0.550 |
+| ccb_design | 0.400 |
+| ccb_fix | 0.320 |
+| ccb_build | 0.380 |
+| ccb_test | 0.500 |
+| ccb_document | 0.620 |
+| ccb_secure | 0.450 |
+| ccb_debug | 0.410 |
 
-**CCB Aggregate Score** = sum of means / 17 = **0.462**
+**CCB Aggregate Score** = sum of means / 8 = **0.461**
 
-**Benchmarks completed** = 17/17
+**Suites completed** = 8/8
 
-**Pass rate** = tasks with reward > 0.0 / total tasks = e.g., 140 / 186 = 0.753
+**Pass rate** = tasks with reward > 0.0 / total tasks = e.g., 125 / 157 ≈ 0.796

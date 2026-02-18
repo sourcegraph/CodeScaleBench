@@ -64,7 +64,7 @@ DIR_PREFIX_TO_SUITE = {
     "tac_": "ccb_tac",
 }
 
-CONFIGS = ["baseline", "sourcegraph_base", "sourcegraph_full"]
+CONFIGS = ["baseline", "sourcegraph_full"]
 
 # Known MCP tool name patterns (the sg_ prefix is used in harbor transcripts).
 # We match "name":"mcp__sourcegraph__sg_..." to count only actual tool_use
@@ -673,7 +673,7 @@ def generate_report(tasks: list[dict]) -> dict:
     }
 
     # --- MCP availability check for SG configs ---
-    sg_tasks = [t for t in tasks if t["config"] in ("sourcegraph_base", "sourcegraph_full")]
+    sg_tasks = [t for t in tasks if t["config"] in ("sourcegraph_full",)]
     sg_no_tools = [
         {
             "suite": t["suite"],
@@ -800,7 +800,7 @@ def generate_report(tasks: list[dict]) -> dict:
                 "avg_wall_seconds": round(b["total_wall_seconds"] / b["wall_count"], 1) if b["wall_count"] else 0.0,
             }
 
-    # --- SG_base / SG_full tasks that never used MCP ---
+    # --- SG_full tasks that never used MCP ---
     sg_no_mcp_usage = [
         {
             "suite": t["suite"], "config": t["config"],
@@ -1078,7 +1078,7 @@ def parse_args():
     )
     parser.add_argument(
         "--config", default=None,
-        help="Filter to one config (baseline, sourcegraph_base, sourcegraph_full)",
+        help="Filter to one config (baseline, sourcegraph_full)",
     )
     parser.add_argument(
         "--output", default=None,

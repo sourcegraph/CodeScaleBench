@@ -74,7 +74,7 @@ DIR_PREFIX_TO_SUITE = {
     "tac_": "ccb_tac",
 }
 
-CONFIGS = ["baseline", "sourcegraph_base", "sourcegraph_full", "sourcegraph_isolated"]
+CONFIGS = ["baseline", "sourcegraph_full", "sourcegraph_isolated"]
 
 SELECTION_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "selected_benchmark_tasks.json"
 
@@ -83,7 +83,6 @@ GAP_EXCLUDED_SUITES = {"ccb_dependeval"}
 
 # Configs intentionally missing for certain suites (e.g., DIBench MCP archived)
 GAP_EXCLUDED_SUITE_CONFIGS = {
-    ("ccb_dibench", "sourcegraph_base"),
     ("ccb_dibench", "sourcegraph_full"),
 }
 
@@ -630,7 +629,7 @@ def parse_args():
     )
     parser.add_argument(
         "--config", default=None,
-        help="Filter to one config (baseline, sourcegraph_base, sourcegraph_full)",
+        help="Filter to one config (baseline, sourcegraph_full)",
     )
     parser.add_argument(
         "--timeout-hours", type=float, default=4.0,

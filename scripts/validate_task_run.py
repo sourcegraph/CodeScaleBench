@@ -38,7 +38,7 @@ SEVERITY_COLORS = {
 }
 
 # Configs that use MCP tools
-MCP_CONFIGS = {"sourcegraph_base", "sourcegraph_full"}
+MCP_CONFIGS = {"sourcegraph_full"}
 
 
 @dataclass
@@ -220,7 +220,7 @@ def main():
     group.add_argument("--jobs-dir", help="Validate all tasks in a jobs directory")
     group.add_argument("--task-dir", help="Validate a single task directory")
     parser.add_argument("--config", required=True,
-                        help="Config mode (baseline, sourcegraph_base, sourcegraph_full)")
+                        help="Config mode (baseline, sourcegraph_full)")
     args = parser.parse_args()
 
     # Discover task directories

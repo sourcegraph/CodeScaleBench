@@ -118,9 +118,9 @@ def extract_exception_text(exception_info) -> str:
 
 
 def extract_config_from_path(fpath: str) -> str:
-    """Extract config name (baseline, sourcegraph_base, sourcegraph_full) from path."""
+    """Extract config name (baseline, sourcegraph_full) from path."""
     parts = fpath.split("/")
-    for config in ("baseline", "sourcegraph_base", "sourcegraph_full"):
+    for config in ("baseline", "sourcegraph_full"):
         if config in parts:
             return config
     return "unknown"

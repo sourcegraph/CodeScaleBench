@@ -103,7 +103,7 @@ ERROR_FINGERPRINTS = [
         re.compile(r"Poll for results using sg_deepsearch_read", re.IGNORECASE),
         "Deep Search returned polling-only (no results)",
         "warning",
-        "Deep Search did not return results within polling window. Run may have degraded to SG_base quality. Consider rerunning after preamble retry fix.",
+        "Deep Search did not return results within polling window. Run may have degraded quality. Consider rerunning after preamble retry fix.",
     ),
 ]
 

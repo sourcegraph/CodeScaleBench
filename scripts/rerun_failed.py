@@ -49,7 +49,6 @@ SUITE_TO_BENCHMARK_DIR = {
 
 CONFIG_TO_MCP_TYPE = {
     "baseline": "none",
-    "sourcegraph_base": "base",
     "sourcegraph_full": "deepsearch",
 }
 
@@ -131,7 +130,7 @@ def main():
     )
     parser.add_argument(
         "--config", default=None,
-        help="Filter by config (baseline, sourcegraph_base, sourcegraph_full)",
+        help="Filter by config (baseline, sourcegraph_full)",
     )
     parser.add_argument(
         "--status", default=None,

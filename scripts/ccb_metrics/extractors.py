@@ -487,7 +487,7 @@ def extract_run_config(
                         elif has_sg and (has_ds_server or has_ds_tool):
                             result["mcp_mode"] = "sourcegraph_full"
                         elif has_sg:
-                            result["mcp_mode"] = "sourcegraph_base"
+                            result["mcp_mode"] = "sourcegraph_full"
                         elif has_ds_server or has_ds_tool:
                             result["mcp_mode"] = "deepsearch"
                         else:

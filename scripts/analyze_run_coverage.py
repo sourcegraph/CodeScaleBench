@@ -287,17 +287,17 @@ def main():
     print(f"  Tasks needing sourcegraph_full run:{grand_total['baseline_only'] + grand_total['neither']:3d}")
     print(f"  Tasks needing ANY run:               {grand_total['baseline_only'] + grand_total['hybrid_only'] + grand_total['neither']:3d}")
 
-    # Check for sourcegraph_base runs
+    # Check for legacy sourcegraph_full runs
     has_base = False
     for benchmark in completed_by_benchmark:
-        if "sourcegraph_base" in completed_by_benchmark[benchmark]:
+        if "sourcegraph_full" in completed_by_benchmark[benchmark]:
             has_base = True
             break
     if has_base:
         print(f"\n{'=' * 100}")
-        print("NOTE: sourcegraph_base runs also found:")
+        print("NOTE: additional sourcegraph_full runs also found:")
         for benchmark in sorted(completed_by_benchmark):
-            nds = completed_by_benchmark[benchmark].get("sourcegraph_base", set())
+            nds = completed_by_benchmark[benchmark].get("sourcegraph_full", set())
             if nds:
                 print(f"  {benchmark}: {len(nds)} tasks")
 

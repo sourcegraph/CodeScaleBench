@@ -78,6 +78,42 @@ Harbor produces a `result.json` for each task containing:
 
 See `schemas/result.schema.json` for the formal schema.
 
+### Trace and transcript locations
+
+Harbor writes each task trial under a **task trial directory**. The pipeline expects the agent trace and transcript in that directory’s `agent/` subdir.
+
+**Directory layout (per run):**
+
+```
+<jobs_dir>/<config>/<timestamp>/<task_id>__<trial_id>/
+├── result.json          # Harbor result (reward, exception, tokens)
+├── config.json
+├── exception.txt        # If the run raised
+├── trial.log
+└── agent/
+    ├── trajectory.json       # Primary trace (ATIF v1.2 tool/conversation steps)
+    ├── instruction.txt      # Instruction actually sent to the agent
+    ├── openhands-code.txt   # OpenHands harness transcript (fallback)
+    ├── claude-code.txt      # Claude harness transcript (fallback)
+    ├── gemini-code.txt      # Gemini harness transcript (fallback)
+    └── setup/               # Setup phase logs
+```
+
+**Where the trace is expected:**
+
+| Artifact | Path | Used by |
+|----------|------|--------|
+| **Trajectory** | `<task_trial_dir>/agent/trajectory.json` | Metrics (tool counts, TTFR/TTAR), audits, failure analysis |
+| **Transcript** | `<task_trial_dir>/agent/<harness>-code.txt` or `agent/transcript.jsonl` | Fallback when `trajectory.json` is missing; see `scripts/ccb_metrics/transcript_paths.py` |
+
+Example for one OpenHands trial:
+
+```
+runs/staging/openhands_gpt53codex_<timestamp>/baseline/<run_timestamp>/openhands-search-file-test-001__<trial_id>/agent/
+```
+
+If the run raises before or during the agent loop (e.g. setup or agent init), Harbor may not write `trajectory.json` or the transcript; validation will report “trajectory.json missing” and metrics will use transcript fallback when available.
+
 ## Agent Configurations
 
 CodeContextBench evaluates agents under three MCP (Model Context Protocol) configurations:
@@ -92,7 +128,7 @@ The agent uses only its built-in tools:
 
 No external code search tools are available. The agent relies on local tools (Grep, Glob, shell commands) for code discovery.
 
-### SG_base (Sourcegraph keyword + NLS search)
+### SG_full (Sourcegraph keyword + NLS search + Deep Search)
 
 The agent receives Sourcegraph MCP tools for code discovery:
 
@@ -112,7 +148,7 @@ Deep Search tools (`deepsearch`, `deepsearch_read`) are blocked in this config. 
 
 ### SG_full (Sourcegraph + Deep Search)
 
-Same as SG_base plus:
+Additionally includes:
 
 - `mcp__sourcegraph__deepsearch` - Asynchronous semantic code analysis
 - `mcp__sourcegraph__deepsearch_read` - Read Deep Search results

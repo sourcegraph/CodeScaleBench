@@ -59,7 +59,7 @@ DIR_PREFIX_TO_SUITE = {
     "tac_": "ccb_tac",
 }
 
-CONFIGS = ["baseline", "sourcegraph_base", "sourcegraph_full"]
+CONFIGS = ["baseline", "sourcegraph_full"]
 
 
 def should_skip(dirname: str) -> bool:

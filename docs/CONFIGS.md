@@ -118,6 +118,8 @@ Source: `agents/claude_baseline_agent.py` lines 97-480
 
 ## Multi-Harness Costing Caveat
 
+OpenHands install and Gemini model setup (including openhands-tools dependency and API key model list): see **docs/OPENHANDS_SETUP.md**.
+
 For non-Anthropic harnesses (Codex, Cursor, Gemini, Copilot, OpenHands), token
 cost extraction depends on `scripts/ccb_metrics/extractors.py` model pricing
 keys. Official Codex runs should use `gpt-5.3-codex` so pricing is explicit.

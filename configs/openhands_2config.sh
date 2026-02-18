@@ -16,6 +16,7 @@
 #   --parallel N           Max parallel task subshells (default: 1)
 #   --category CATEGORY    Run category label for jobs dir (default: staging)
 #   --benchmark BENCH      Optional benchmark filter (e.g. ccb_build, ccb_fix)
+#   --task TASK_ID         Run only this task (further filters after --benchmark)
 
 set -e
 
@@ -27,12 +28,14 @@ export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
 # Shared helpers (validation/reporting and run helpers)
 source "$SCRIPT_DIR/_common.sh"
+load_credentials
 
 SELECTION_FILE="$SCRIPT_DIR/selected_benchmark_tasks.json"
 AGENT_PATH="${AGENT_PATH:-agents.harnesses.openhands:OpenHandsHarnessAgent}"
 MODEL="${MODEL:-anthropic/claude-opus-4-6}"
 CATEGORY="${CATEGORY:-staging}"
 BENCHMARK_FILTER=""
+TASK_FILTER=""
 CONCURRENCY=2
 TIMEOUT_MULTIPLIER=10
 RUN_BASELINE=true
@@ -68,6 +71,10 @@ while [[ $# -gt 0 ]]; do
             BENCHMARK_FILTER="$2"
             shift 2
             ;;
+        --task)
+            TASK_FILTER="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -80,18 +87,21 @@ if [ ! -f "$SELECTION_FILE" ]; then
     exit 1
 fi
 
-readarray -t TASK_ROWS < <(python3 - "$SELECTION_FILE" "$BENCHMARK_FILTER" <<'PYEOF'
+readarray -t TASK_ROWS < <(python3 - "$SELECTION_FILE" "$BENCHMARK_FILTER" "$TASK_FILTER" <<'PYEOF'
 import json
 import sys
 
 selection_file = sys.argv[1]
 benchmark_filter = sys.argv[2]
+task_filter = sys.argv[3] if len(sys.argv) > 3 else ""
 
 data = json.load(open(selection_file))
 for task in data.get("tasks", []):
     if task.get("excluded", False):
         continue
     if benchmark_filter and task.get("benchmark") != benchmark_filter:
+        continue
+    if task_filter and task.get("task_id") != task_filter:
         continue
     task_id = task["task_id"]
     task_dir = task["task_dir"]

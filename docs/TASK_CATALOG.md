@@ -1,424 +1,293 @@
 # CodeContextBench Task Catalog
 
-A detailed reference for every benchmark task in CodeContextBench. This document covers all 17 active benchmark suites totaling 186 tasks.
+A detailed reference for every benchmark task in CodeContextBench. This document covers all **157 tasks** organized across **8 SDLC-phase suites**.
 
 **Selection methodology:** Tasks were chosen via stratified sampling across benchmarks, covering all SDLC phases. Each task is scored for MCP benefit using a weighted combination of context complexity (0.25), cross-file dependencies (0.30), semantic search potential (0.20), and tool-chain weight (0.25). See `docs/TASK_SELECTION.md` for full scoring methodology.
+
+**Source of truth:** `configs/selected_benchmark_tasks.json` (version 2.0, 2026-02-18).
 
 ---
 
 ## Table of Contents
 
-1. [SWE-bench Pro (36 tasks)](#1-swe-bench-pro--real-world-software-engineering)
-2. [LargeRepo (25 tasks)](#2-largerepo--large-codebase-navigation)
-3. [DocGen (13 tasks)](#3-docgen--documentation-generation)
-4. [CrossRepo (12 tasks)](#4-crossrepo--cross-repository-reasoning)
-5. [Enterprise (12 tasks)](#5-enterprise--enterprise-codebase-challenges)
-6. [PyTorch (11 tasks)](#6-pytorch--pytorch-pr-level-tasks)
-7. [NavProve (9 tasks)](#7-navprove--navigation--provenance-reasoning)
-8. [CodeReview (8 tasks)](#8-codereview--ai-code-review)
-9. [DIBench (8 tasks)](#9-dibench--dependency-installation)
-10. [Governance (8 tasks)](#10-governance--access-control--policy-enforcement)
-11. [NLQA (8 tasks)](#11-nlqa--natural-language-code-qa)
-12. [Onboarding (8 tasks)](#12-onboarding--codebase-onboarding)
-13. [Security (8 tasks)](#13-security--security-analysis)
-14. [TAC (8 tasks)](#14-tac--the-agent-company)
-15. [LinuxFLBench (5 tasks)](#15-linuxflbench--linux-kernel-fault-localization)
-16. [Investigation (4 tasks)](#16-investigation--deep-investigation)
-17. [SWE-Perf (3 tasks)](#17-swe-perf--performance-optimization)
-18. [Archived Suites](#appendix-archived-suites)
+1. [ccb_understand (20 tasks)](#1-ccb_understand--requirements--discovery)
+2. [ccb_design (20 tasks)](#2-ccb_design--architecture--design)
+3. [ccb_fix (25 tasks)](#3-ccb_fix--bug-repair)
+4. [ccb_build (25 tasks)](#4-ccb_build--feature--refactoring)
+5. [ccb_test (14 tasks)](#5-ccb_test--testing--qa)
+6. [ccb_document (13 tasks)](#6-ccb_document--documentation)
+7. [ccb_secure (20 tasks)](#7-ccb_secure--security--compliance)
+8. [ccb_debug (20 tasks)](#8-ccb_debug--debugging--investigation)
+9. [Summary Statistics](#summary-statistics)
 
 ---
 
-## 1. SWE-bench Pro -- Real-World Software Engineering
+## 1. ccb_understand -- Requirements & Discovery
 
-**Focus:** Fix real bugs from production open-source repositories. Each task corresponds to an actual GitHub issue and its resolution.
-**Difficulty:** hard (all tasks) | **SDLC Phase:** Implementation (bug fix)
+**Focus:** Codebase comprehension, natural-language Q&A, onboarding, knowledge discovery, and institutional memory recovery. Tasks require the agent to explain architecture, trace data flows, orient in unfamiliar projects, and recover fragmented knowledge.
 
-### By Repository
+**20 tasks** | Languages: C++, Go, Java, Python, TypeScript | Difficulty: hard (all tasks)
 
-| Repository | Language | Tasks | MCP Score Range |
-|------------|----------|-------|-----------------|
-| NodeBB/NodeBB | JavaScript | 3 | 0.573 - 0.938 |
-| ansible/ansible | Python | 5 | 0.476 - 0.698 |
-| element-hq/element-web | TypeScript | 2 | 0.493 - 0.805 |
-| flipt-io/flipt | Go | 4 | 0.634 - 0.819 |
-| future-architect/vuls | Go | 3 | 0.509 - 0.650 |
-| gravitational/teleport | Go | 4 | 0.439 - 0.763 |
-| internetarchive/openlibrary | Python | 4 | 0.635 - 0.719 |
-| navidrome/navidrome | Go | 2 | 0.600 - 0.671 |
-| protonmail/webclients | TypeScript | 4 | 0.779 - 0.938 |
-| qutebrowser/qutebrowser | Python | 4 | 0.403 - 0.588 |
-| tutao/tutanota | TypeScript | 1 | 0.514 |
-
----
-
-## 2. LargeRepo -- Large Codebase Navigation
-
-**Focus:** Implement features, analyze architecture, fix bugs, and review security in 1GB+ open-source repositories requiring deep navigation of distributed code patterns.
-**Difficulty:** hard (all tasks)
-
-| Task | Language | Repository | SDLC Phase |
-|------|----------|------------|------------|
-| big-code-k8s-001 | Go | kubernetes/kubernetes | Feature impl |
-| big-code-servo-001 | Rust | servo/servo | Feature impl |
-| big-code-trt-001 | Python, C++ | NVIDIA/TensorRT-LLM | Feature impl |
-| big-code-vsc-001 | TypeScript | microsoft/vscode | Feature impl |
-| big-code-camel-arch-001 | Java | apache/camel | Analysis |
-| big-code-camel-feat-001 | Java | apache/camel | Feature impl |
-| big-code-cross-capmarkets-arch-001 | Java | Strata/capital-markets | Analysis |
-| big-code-cross-k8s-arch-001 | Go | kubernetes/kubernetes | Analysis |
-| big-code-django-arch-001 | Python | django/django | Analysis |
-| big-code-django-bug-001 | Python | django/django | Debugging |
-| big-code-django-sec-001 | Python | django/django | Security |
-| big-code-flink-arch-001 | Java | apache/flink | Analysis |
-| big-code-flink-feat-001 | Java | apache/flink | Feature impl |
-| big-code-k8s-arch-001 | Go | kubernetes/kubernetes | Analysis |
-| big-code-k8s-bug-001 | Go | kubernetes/kubernetes | Debugging |
-| big-code-k8s-refac-001 | Go | kubernetes/kubernetes | Refactoring |
-| big-code-kafka-bug-001 | Java | apache/kafka | Debugging |
-| big-code-kafka-refac-001 | Java | apache/kafka | Refactoring |
-| big-code-kafka-sec-001 | Java | apache/kafka | Security |
-| big-code-pg-arch-001 | C | postgres/postgres | Analysis |
-| big-code-pg-sec-001 | C | postgres/postgres | Security |
-| big-code-quantlib-arch-001 | C++ | QuantLib/QuantLib | Analysis |
-| big-code-rust-refac-001 | Rust | servo/servo | Refactoring |
-| big-code-strata-feat-001 | Java | Strata/strata | Feature impl |
-| big-code-strata-refac-001 | Java | Strata/strata | Refactoring |
+| Task ID | Lang | Difficulty | Repository | Category |
+|---------|------|-----------|------------|----------|
+| argocd-arch-orient-001 | Go | hard | argoproj/argo-cd | Codebase orientation |
+| argocd-sync-reconcile-qa-001 | Go | hard | argoproj/argo-cd | Data flow explanation |
+| cilium-ebpf-datapath-handoff-001 | Go | hard | cilium/cilium | Team handoff |
+| cilium-ebpf-fault-qa-001 | Go | hard | cilium/cilium | Debug root cause Q&A |
+| cilium-project-orient-001 | Go | hard | cilium/cilium | Codebase orientation |
+| django-composite-field-recover-001 | Python | hard | django/django | Knowledge fragmentation recovery |
+| django-template-inherit-recall-001 | Python | hard | django/django | Institutional memory recall |
+| envoy-contributor-workflow-001 | C++ | hard | envoyproxy/envoy | Workflow discovery |
+| envoy-ext-authz-handoff-001 | C++ | hard | envoyproxy/envoy | Team handoff |
+| envoy-filter-chain-qa-001 | C++ | hard | envoyproxy/envoy | Architecture Q&A |
+| envoy-request-routing-qa-001 | C++ | hard | envoyproxy/envoy | Data flow explanation |
+| istio-xds-serving-qa-001 | Go | hard | istio/istio | Architecture Q&A |
+| k8s-cri-containerd-reason-001 | Go | hard | kubernetes, containerd | Cross-file reasoning |
+| kafka-build-orient-001 | Java | hard | apache/kafka | Codebase orientation |
+| kafka-contributor-workflow-001 | Java | hard | apache/kafka | Workflow discovery |
+| kafka-message-lifecycle-qa-001 | Java | hard | apache/kafka | Data flow explanation |
+| numpy-dtype-localize-001 | Go | hard | numpy, pandas, scikit-learn | Bug localization |
+| terraform-plan-pipeline-qa-001 | Go | hard | hashicorp/terraform | Architecture Q&A |
+| terraform-state-backend-handoff-001 | Go | hard | hashicorp/terraform | Team handoff |
+| vscode-ext-host-qa-001 | TypeScript | hard | microsoft/vscode | Debug root cause Q&A |
 
 ---
 
-## 3. DocGen -- Documentation Generation
+## 2. ccb_design -- Architecture & Design
 
-**Focus:** Generate accurate API documentation, architecture guides, and migration plans by reading and understanding source code. Supersedes the archived ccb_k8sdocs suite.
-**Difficulty:** hard (all tasks) | **SDLC Phase:** Documentation
+**Focus:** Architecture analysis, dependency mapping, cross-repo reasoning, impact analysis, symbol resolution, and design-level decision-making. Tasks require the agent to understand system structure, trace dependency chains, and resolve cross-codebase symbols.
 
-| Task | Language | Focus |
-|------|----------|-------|
-| docgen-api-001 | TypeScript | API reference documentation |
-| docgen-api-002 | Go | API reference documentation |
-| docgen-api-003 | Java | API reference documentation |
-| docgen-arch-001 | C++ | Architecture documentation |
-| docgen-arch-002 | Go | Architecture documentation |
-| docgen-arch-003 | Go | Architecture documentation |
-| docgen-k8s-apiserver-001 | Go | K8s apiserver package docs |
-| docgen-k8s-applyconfig-001 | Go | K8s apply configurations docs |
-| docgen-k8s-clientgo-001 | Go | K8s client-go library docs |
-| docgen-k8s-cm-001 | Go | K8s container manager docs |
-| docgen-k8s-fairqueuing-001 | Go | K8s fair queuing algorithm docs |
-| docgen-migration-001 | Go | Migration guide documentation |
-| docgen-migration-002 | C++ | Migration guide documentation |
+**20 tasks** | Languages: C, C++, Go, Java, Python | Difficulty: hard--very_hard
 
----
-
-## 4. CrossRepo -- Cross-Repository Reasoning
-
-**Focus:** Tasks that span multiple repositories, testing the ability to trace interactions, APIs, and data flows across codebases.
-**Languages:** Go, C++
-
-| Task | Difficulty | Description |
-|------|-----------|-------------|
-| api_upgrade_01 | hard | Migrate deprecated gRPC Dial calls across etcd, kubernetes, containerd |
-| bug_localization_01 | hard | Trace cross-library dtype bug across numpy, pandas, scikit-learn |
-| cross_file_reasoning_01 | hard | Trace Kubernetes CRI to containerd implementation |
-| crossrepo-chain-001 | very_hard | Multi-hop dependency chain analysis |
-| crossrepo-chain-002 | very_hard | Multi-hop dependency chain analysis |
-| crossrepo-impl-001 | hard | Cross-repo implementation task |
-| crossrepo-impl-002 | hard | Cross-repo implementation task |
-| crossrepo-sym-001 | hard | Cross-repo symbol tracing |
-| crossrepo-sym-002 | hard | Cross-repo symbol tracing (C++) |
-| crossrepo-sym-003 | hard | Cross-repo symbol tracing |
-| refactor_rename_01 | hard | Standardize HTTP Request class naming across Django, Flask, requests |
-| simple_test_01 | easy | Pipeline smoke test |
+| Task ID | Lang | Difficulty | Repository | Category |
+|---------|------|-----------|------------|----------|
+| camel-routing-arch-001 | Java | hard | apache/camel | Architectural understanding |
+| django-modeladmin-impact-001 | Python | hard | django/django | Dependency impact analysis |
+| django-orm-query-arch-001 | Python | hard | django/django | Architectural understanding |
+| django-pre-validate-signal-design-001 | Python | hard | django/django | Stale architecture navigation |
+| django-rate-limit-design-001 | Python | hard | django/django | Conflicting documentation resolution |
+| envoy-routeconfig-dep-chain-001 | Go | very_hard | envoyproxy/go-control-plane | Dependency chain analysis |
+| envoy-stream-aggregated-sym-001 | Go | hard | kubernetes/kubernetes | Cross-repo symbol resolution |
+| etcd-grpc-api-upgrade-001 | Go | hard | etcd, kubernetes, containerd | API upgrade planning |
+| flink-checkpoint-arch-001 | Java | hard | apache/flink | Architectural understanding |
+| flipt-protobuf-metadata-design-001 | Go | hard | flipt-io/flipt | Polyglot ecosystem analysis |
+| flipt-transitive-deps-001 | Go | hard | flipt-io/flipt | Dependency discovery |
+| k8s-crd-lifecycle-arch-001 | Go | hard | kubernetes/kubernetes | Architectural understanding |
+| k8s-dra-allocation-impact-001 | Go | hard | kubernetes/kubernetes | Impact analysis |
+| k8s-scheduler-arch-001 | Go | hard | kubernetes/kubernetes | Architectural understanding |
+| k8s-sharedinformer-sym-001 | C++ | hard | envoyproxy/envoy | Cross-repo symbol resolution |
+| k8s-typemeta-dep-chain-001 | Go | very_hard | kubernetes/kubernetes | Dependency chain analysis |
+| kafka-flink-streaming-arch-001 | Java | hard | apache/kafka | Architectural understanding |
+| postgres-query-exec-arch-001 | C | hard | postgres/postgres | Architectural understanding |
+| quantlib-barrier-pricing-arch-001 | C++ | hard | lballabio/QuantLib | Architectural understanding |
+| terraform-provider-iface-sym-001 | Go | hard | hashicorp/terraform | Cross-repo symbol resolution |
 
 ---
 
-## 5. Enterprise -- Enterprise Codebase Challenges
+## 3. ccb_fix -- Bug Repair
 
-**Focus:** Enterprise-grade challenges involving dependency discovery, impact analysis, multi-team ownership, knowledge fragmentation, and legacy dependencies.
-**Languages:** Go, Python | **Difficulty:** hard (all tasks)
+**Focus:** Fix real bugs from production open-source repositories. Includes SWE-bench Pro patches, PyTorch compiler/runtime fixes, enterprise multi-team ownership bugs, and large-codebase debugging fixes.
 
-| Task | Language | Category |
-|------|----------|----------|
-| conflicting-docs-001 | Python | Conflicting documentation resolution |
-| dep-discovery-001 | Go | Dependency discovery |
-| dep-impact-001 | Python | Dependency impact analysis |
-| dep-refactor-001 | Go | Dependency refactoring |
-| dep-refactor-002 | Go | Dependency refactoring |
-| institutional-memory-001 | Python | Institutional memory recovery |
-| knowledge-fragmentation-001 | Python | Knowledge fragmentation |
-| legacy-dependency-001 | Python | Legacy dependency management |
-| multi-team-ownership-001 | Python | Multi-team ownership |
-| multi-team-ownership-002 | Go | Multi-team ownership |
-| polyglot-ecosystem-001 | Go | Polyglot ecosystem analysis |
-| stale-architecture-001 | Python | Stale architecture assessment |
+**25 tasks** | Languages: C++, Go, Java, JavaScript, Python, TypeScript | Difficulty: medium--hard
 
----
-
-## 6. PyTorch -- PyTorch PR-Level Tasks
-
-**Focus:** Reproduce actual PyTorch pull request changes -- bug fixes and feature additions in the compiler, runtime, and distributed systems.
-**Language:** C++ (PyTorch internals) | **Repository:** pytorch/pytorch | **Time Limit:** 10 min per task
-
-| Task | Difficulty | Category | MCP Score |
-|------|-----------|----------|-----------|
-| sgt-001 | medium | bug fix | 0.553 |
-| sgt-002 | medium | bug fix | 0.568 |
-| sgt-003 | hard | bug fix | 0.583 |
-| sgt-005 | medium | feature | 0.555 |
-| sgt-008 | hard | bug fix | 0.808 |
-| sgt-009 | medium | bug fix | 0.553 |
-| sgt-010 | hard | bug fix | 0.613 |
-| sgt-012 | medium | bug fix | 0.553 |
-| sgt-014 | medium | bug fix | 0.568 |
-| sgt-016 | medium | bug fix | 0.553 |
-| sgt-021 | medium | bug fix | 0.568 |
+| Task ID | Lang | Difficulty | Repository | Category |
+|---------|------|-----------|------------|----------|
+| ansible-abc-imports-fix-001 | Python | hard | ansible/ansible | SWE-bench Pro bug fix |
+| ansible-module-respawn-fix-001 | Python | hard | ansible/ansible | SWE-bench Pro bug fix |
+| django-modelchoice-fk-fix-001 | Python | hard | django/django | Multi-team ownership bug |
+| django-select-for-update-fix-001 | Python | hard | django/django | Large-codebase bug investigation |
+| flipt-cockroachdb-backend-fix-001 | Go | hard | flipt-io/flipt | SWE-bench Pro bug fix |
+| flipt-ecr-auth-oci-fix-001 | Go | hard | flipt-io/flipt | SWE-bench Pro bug fix |
+| flipt-eval-latency-fix-001 | Go | hard | flipt-io/flipt | Multi-team ownership bug |
+| flipt-otlp-exporter-fix-001 | Go | hard | flipt-io/flipt | SWE-bench Pro bug fix |
+| flipt-trace-sampling-fix-001 | Go | hard | flipt-io/flipt | SWE-bench Pro bug fix |
+| k8s-dra-scheduler-event-fix-001 | Go | hard | kubernetes/kubernetes | Large-codebase bug investigation |
+| kafka-producer-bufpool-fix-001 | Java | hard | apache/kafka | Large-codebase bug investigation |
+| navidrome-windows-log-fix-001 | Go | hard | navidrome/navidrome | SWE-bench Pro bug fix |
+| nodebb-notif-dropdown-fix-001 | JavaScript | hard | NodeBB/NodeBB | SWE-bench Pro bug fix |
+| nodebb-plugin-validate-fix-001 | JavaScript | hard | NodeBB/NodeBB | SWE-bench Pro bug fix |
+| openlibrary-fntocli-adapter-fix-001 | Python | hard | internetarchive/openlibrary | SWE-bench Pro bug fix |
+| openlibrary-search-query-fix-001 | Python | hard | internetarchive/openlibrary | SWE-bench Pro bug fix |
+| openlibrary-solr-boolean-fix-001 | Python | hard | internetarchive/openlibrary | SWE-bench Pro bug fix |
+| protonmail-conv-testhooks-fix-001 | TypeScript | hard | protonmail/webclients | SWE-bench Pro bug fix |
+| protonmail-dropdown-sizing-fix-001 | TypeScript | hard | protonmail/webclients | SWE-bench Pro bug fix |
+| protonmail-holiday-calendar-fix-001 | TypeScript | hard | protonmail/webclients | SWE-bench Pro bug fix |
+| pytorch-cudnn-version-fix-001 | C++ | hard | pytorch/pytorch | Cross-module bug fix |
+| pytorch-dynamo-keyerror-fix-001 | C++ | medium | pytorch/pytorch | Cross-module bug fix |
+| pytorch-release-210-fix-001 | C++ | hard | pytorch/pytorch | Cross-module bug fix |
+| pytorch-relu-gelu-fusion-fix-001 | C++ | medium | pytorch/pytorch | Cross-module bug fix |
+| pytorch-tracer-graph-cleanup-fix-001 | C++ | hard | pytorch/pytorch | Cross-module bug fix |
 
 ---
 
-## 7. NavProve -- Navigation & Provenance Reasoning
+## 4. ccb_build -- Feature & Refactoring
 
-**Focus:** Navigate through complex codebases to trace provenance, locate behaviors, and prove hypotheses about code behavior. Tests deep code comprehension and navigation ability.
-**Difficulty:** hard (all tasks) | **SDLC Phase:** Debugging
+**Focus:** Feature implementation, cross-file refactoring, dependency installation, and interface implementation. Tasks span from adding missing build dependencies to implementing new features in 1GB+ codebases.
 
-| Task | Language | Repository Context |
-|------|----------|--------------------|
-| navprove-ansible-vault-001 | Python | ansible/ansible |
-| navprove-flipt-cache-001 | Go | flipt-io/flipt |
-| navprove-qb-bookmark-001 | Python | qutebrowser/qutebrowser |
-| navprove-qb-download-001 | Python | qutebrowser/qutebrowser |
-| navprove-qb-tab-001 | Python | qutebrowser/qutebrowser |
-| navprove-qb-url-001 | Python | qutebrowser/qutebrowser |
-| navprove-teleport-ssh-001 | Go | gravitational/teleport |
-| navprove-tutanota-search-001 | TypeScript | tutao/tutanota |
-| navprove-vuls-oval-001 | Go | future-architect/vuls |
+**25 tasks** | Languages: C#, C++, Go, Java, JavaScript, Python/C++, Rust, TypeScript | Difficulty: medium--hard
 
----
-
-## 8. CodeReview -- AI Code Review
-
-**Focus:** Review real pull requests with injected defects -- find bugs, compliance violations, and fix them. Tests both detection accuracy and fix quality using hybrid scoring.
-**Difficulty:** hard (all tasks) | **SDLC Phase:** Testing & QA
-
-| Task | Language | MCP Score |
-|------|----------|-----------|
-| cr-aspnetcore-001 | C# | 0.840 |
-| cr-calcom-001 | TypeScript | 0.830 |
-| cr-envoy-001 | C++ | 0.720 |
-| cr-ghost-001 | JavaScript | 0.820 |
-| cr-security-001 | C | 0.720 |
-| cr-security-002 | Java | 0.720 |
-| cr-terraform-001 | Go | 0.720 |
-| cr-vscode-001 | TypeScript | 0.720 |
-
-Each task clones a real open-source repository at a pinned PR merge commit, then injects realistic defects across multiple source files. The agent must detect defects (producing structured `review.json`) and fix them (committing corrected code).
-
-**Scoring:** `0.5 * detection_F1 + 0.5 * fix_score`
+| Task ID | Lang | Difficulty | Repository | Category |
+|---------|------|-----------|------------|----------|
+| bustub-hyperloglog-impl-001 | C++ | hard | cmu-db/bustub | Feature implementation |
+| camel-fix-protocol-feat-001 | Java | hard | apache/camel | Feature implementation |
+| cgen-deps-install-001 | Python | medium | inducer/cgen | Dependency inference |
+| codecoverage-deps-install-001 | C# | medium | irongut/CodeCoverageSummary | Dependency inference |
+| django-dep-refactor-001 | Go | hard | flipt-io/flipt | Enterprise dependency refactor |
+| dotenv-expand-deps-install-001 | JavaScript | medium | motdotla/dotenv-expand | Dependency inference |
+| dotnetkoans-deps-install-001 | C# | medium | DotNetKoans/DotNetKoans | Dependency inference |
+| envoy-grpc-server-impl-001 | Go | hard | envoyproxy/go-control-plane | Interface implementation |
+| eslint-markdown-deps-install-001 | JavaScript | medium | eslint/markdown | Dependency inference |
+| flink-pricing-window-feat-001 | Java | hard | apache/flink | Feature implementation |
+| flipt-dep-refactor-001 | Go | hard | flipt-io/flipt | Enterprise dependency refactor |
+| python-http-class-naming-refac-001 | Go | hard | django, flask, requests | Cross-repo refactoring |
+| iamactionhunter-deps-install-001 | Python | medium | RhinoSecurityLabs/IAMActionHunter | Dependency inference |
+| k8s-noschedule-taint-feat-001 | Go | hard | kubernetes/kubernetes | Large-codebase feature |
+| k8s-runtime-object-impl-001 | Go | hard | kubernetes/kubernetes | Interface implementation |
+| k8s-score-normalizer-refac-001 | Go | hard | kubernetes/kubernetes | Cross-file refactoring |
+| kafka-batch-accumulator-refac-001 | Java | hard | apache/kafka | Cross-file refactoring |
+| pcap-parser-deps-install-001 | Rust | medium | rusticata/pcap-parser | Dependency inference |
+| rust-subtype-relation-refac-001 | Rust | hard | rust-lang/rust | Cross-file refactoring |
+| servo-scrollend-event-feat-001 | Rust | hard | servo/servo | Large-codebase feature |
+| similar-asserts-deps-install-001 | Rust | medium | mitsuhiko/similar-asserts | Dependency inference |
+| strata-cds-tranche-feat-001 | Java | hard | OpenGamma/Strata | Feature implementation |
+| strata-fx-european-refac-001 | Java | hard | OpenGamma/Strata | Cross-file refactoring |
+| tensorrt-mxfp4-quant-feat-001 | Python, C++ | hard | NVIDIA/TensorRT-LLM | Large-codebase feature |
+| vscode-stale-diagnostics-feat-001 | TypeScript | hard | microsoft/vscode | Large-codebase feature |
 
 ---
 
-## 9. DIBench -- Dependency Installation
+## 5. ccb_test -- Testing & QA
 
-**Focus:** Infer and add missing dependencies to build files by analyzing source code imports. The agent must not modify source code -- only edit dependency configuration files.
-**Difficulty:** medium (all tasks)
+**Focus:** Code review with injected defects, codebase search, performance optimization profiling, and unit test writing. Tasks test the agent's ability to detect bugs, write tests, find code patterns, and optimize performance.
 
-| Task | Language | Project | Build File |
-|------|----------|---------|------------|
-| dibench-csharp-dotnetkoans | C# | DotNetKoans | `DotNetKoans.csproj` |
-| dibench-csharp-irongut-codecoveragesummary | C# | irongut/CodeCoverageSummary | `CodeCoverageSummary.csproj` |
-| dibench-js-eslint-markdown | JavaScript | eslint/markdown | `package.json` |
-| dibench-js-motdotla-dotenv-expand | JavaScript | motdotla/dotenv-expand | `package.json` |
-| dibench-python-inducer-cgen | Python | inducer/cgen | `pyproject.toml` |
-| dibench-python-rhinosec-iamactionhunter | Python | RhinoSecurityLabs/IAMActionHunter | `pyproject.toml` |
-| dibench-rust-mitsuhiko-similar-asserts | Rust | mitsuhiko/similar-asserts | `Cargo.toml` |
-| dibench-rust-rusticata-pcap-parser | Rust | rusticata/pcap-parser | `Cargo.toml` |
+**14 tasks** | Languages: C, C#, C++, Go, Java, JavaScript, Python, TypeScript | Difficulty: medium--hard
 
----
+| Task ID | Lang | Difficulty | Repository | Category |
+|---------|------|-----------|------------|----------|
+| aspnetcore-code-review-001 | C# | hard | dotnet/aspnetcore | Code review |
+| calcom-code-review-001 | TypeScript | hard | calcom/cal.com | Code review |
+| envoy-code-review-001 | C++ | hard | envoyproxy/envoy | Code review |
+| ghost-code-review-001 | JavaScript | hard | agentic-review-benchmarks/benchmark-pr-mapping | Code review |
+| llamacpp-context-window-search-001 | C++ | medium | ggerganov/llama.cpp | Codebase search |
+| llamacpp-file-modify-search-001 | C++ | medium | ggerganov/llama.cpp | Codebase search |
+| numpy-array-sum-perf-001 | Python | medium | numpy/numpy | Performance optimization |
+| openhands-search-file-test-001 | Python | medium | All-Hands-AI/OpenHands | Unit test writing |
+| pandas-groupby-perf-001 | Python | medium | pandas-dev/pandas | Performance optimization |
+| curl-security-review-001 | C | hard | curl/curl | Security code review |
+| kafka-security-review-001 | Java | hard | apache/kafka | Security code review |
+| sklearn-kmeans-perf-001 | Python | hard | scikit-learn/scikit-learn | Performance optimization |
+| terraform-code-review-001 | Go | hard | hashicorp/terraform | Code review |
+| vscode-code-review-001 | TypeScript | hard | microsoft/vscode | Code review |
 
-## 10. Governance -- Access Control & Policy Enforcement
+**Code review scoring:** `0.5 * detection_F1 + 0.5 * fix_score`. Each code review task clones a real open-source repository at a pinned commit, then injects realistic defects. The agent must detect defects (structured `review.json`) and fix them.
 
-**Focus:** Implement and enforce access control, audit trails, and policy enforcement in codebases that require security-conscious development patterns.
-**Languages:** Go, Python
-
-| Task | Language | Difficulty | Focus |
-|------|----------|-----------|-------|
-| audit-trail-001 | Python | hard | Audit trail implementation |
-| cross-team-boundary-001 | Python | hard | Cross-team boundary enforcement |
-| degraded-context-001 | Go | hard | Degraded context handling |
-| policy-enforcement-001 | Python | hard | Policy enforcement |
-| repo-scoped-access-001 | Python | medium | Repository-scoped access |
-| repo-scoped-access-002 | Go | hard | Repository-scoped access |
-| role-based-access-001 | Python | hard | Role-based access control |
-| sensitive-file-exclusion-001 | Python | medium | Sensitive file exclusion |
+**Performance scoring:** `runtime_reduction = 1 - (optimized_runtime / baseline_runtime)`.
 
 ---
 
-## 11. NLQA -- Natural-Language Code Q&A
+## 6. ccb_document -- Documentation
 
-**Focus:** Answer natural-language questions about code architecture, data flow, and debugging scenarios. Tests deep comprehension and the ability to explain code behavior.
-**Languages:** Go, C++, Java, TypeScript | **Difficulty:** hard (all tasks)
+**Focus:** Generate accurate API documentation, architecture guides, and migration plans by reading and understanding source code. Tasks require deep codebase comprehension to produce comprehensive documentation.
 
-| Task | Language | Category |
-|------|----------|----------|
-| nlqa-arch-001 | C++ | Architecture question |
-| nlqa-arch-002 | Go | Architecture question |
-| nlqa-arch-003 | Go | Architecture question |
-| nlqa-debug-001 | TypeScript | Debugging question |
-| nlqa-debug-002 | Go | Debugging question |
-| nlqa-flow-001 | Java | Data flow question |
-| nlqa-flow-002 | C++ | Data flow question |
-| nlqa-flow-003 | Go | Data flow question |
+**13 tasks** | Languages: C++, Go, Java, TypeScript | Difficulty: hard (all tasks)
 
----
-
-## 12. Onboarding -- Codebase Onboarding
-
-**Focus:** Onboarding to unfamiliar codebases: understanding team handoffs, orienting within large projects, and grasping development workflows.
-**Languages:** Go, C++, Java | **Difficulty:** hard (all tasks) | **SDLC Phase:** Requirements & Discovery
-
-| Task | Language | Category |
-|------|----------|----------|
-| onboard-handoff-001 | C++ | Team handoff comprehension |
-| onboard-handoff-002 | Go | Team handoff comprehension |
-| onboard-handoff-003 | Go | Team handoff comprehension |
-| onboard-orient-001 | Go | Codebase orientation |
-| onboard-orient-002 | Go | Codebase orientation |
-| onboard-orient-003 | Java | Codebase orientation |
-| onboard-workflow-001 | C++ | Workflow understanding |
-| onboard-workflow-002 | Java | Workflow understanding |
+| Task ID | Lang | Difficulty | Repository | Category |
+|---------|------|-----------|------------|----------|
+| vscode-api-doc-gen-001 | TypeScript | hard | microsoft/vscode | API reference |
+| cilium-api-doc-gen-001 | Go | hard | cilium/cilium | API reference |
+| kafka-api-doc-gen-001 | Java | hard | apache/kafka | API reference |
+| envoy-arch-doc-gen-001 | C++ | hard | envoyproxy/envoy | Architecture documentation |
+| istio-arch-doc-gen-001 | Go | hard | istio/istio | Architecture documentation |
+| terraform-arch-doc-gen-001 | Go | hard | hashicorp/terraform | Architecture documentation |
+| k8s-apiserver-doc-gen-001 | Go | hard | kubernetes/kubernetes | K8s package documentation |
+| k8s-applyconfig-doc-gen-001 | Go | hard | kubernetes/kubernetes | K8s package documentation |
+| k8s-clientgo-doc-gen-001 | Go | hard | kubernetes/kubernetes | K8s package documentation |
+| k8s-controller-mgr-doc-gen-001 | Go | hard | kubernetes/kubernetes | K8s package documentation |
+| k8s-fairqueuing-doc-gen-001 | Go | hard | kubernetes/kubernetes | K8s package documentation |
+| terraform-migration-doc-gen-001 | Go | hard | hashicorp/terraform | Migration guide |
+| envoy-migration-doc-gen-001 | C++ | hard | envoyproxy/envoy | Migration guide |
 
 ---
 
-## 13. Security -- Security Analysis
+## 7. ccb_secure -- Security & Compliance
 
-**Focus:** CVE analysis, reachability assessment, and transitive dependency security analysis. Tests the agent's ability to reason about security vulnerabilities in real codebases.
-**Languages:** Go, C, C++, Java | **Difficulty:** hard (all tasks) | **SDLC Phase:** Requirements & Discovery
+**Focus:** Security vulnerability triage (CVE analysis), reachability assessment, transitive dependency analysis, governance compliance (access control, audit trails, policy enforcement), and sensitive file exclusion.
 
-| Task | Language | Category |
-|------|----------|----------|
-| sec-cve-001 | C | CVE analysis |
-| sec-cve-002 | C++ | CVE analysis |
-| sec-cve-003 | Go | CVE analysis |
-| sec-reach-001 | C | Reachability assessment |
-| sec-reach-002 | C++ | Reachability assessment |
-| sec-reach-003 | Java | Reachability assessment |
-| sec-transitive-001 | Go | Transitive dependency analysis |
-| sec-transitive-002 | Go | Transitive dependency analysis |
+**20 tasks** | Languages: C, C++, Go, Java, Python | Difficulty: medium--hard
 
----
-
-## 14. TAC -- The Agent Company
-
-**Focus:** Tasks from The Agent Company (TAC) benchmark, requiring agents to use external tools, navigate unfamiliar repositories, and interact with services (GitLab, RocketChat) beyond just editing code.
-**Prerequisites:** TAC server infrastructure (GitLab, RocketChat, API server). See `benchmarks/ccb_tac/README.md` for setup.
-
-| Task | Language | Difficulty | Category | MCP Score |
-|------|----------|-----------|----------|-----------|
-| tac-buffer-pool-manager | C++ | hard | implement | 0.490 |
-| tac-dependency-change | Python | medium | dependency | 0.440 |
-| tac-find-in-codebase-1 | C++ | medium | find-in-codebase | 0.575 |
-| tac-find-in-codebase-2 | C++ | medium | find-in-codebase | 0.575 |
-| tac-implement-hyperloglog | C++ | hard | implement | 0.490 |
-| tac-write-unit-test | Python | medium | unit-test | 0.465 |
-
-**Excluded tasks (2):**
-- `tac-copilot-arena-endpoint` -- copilot-arena-server repo not present in TAC GitLab backup data
-- `tac-troubleshoot-dev-setup` -- same repo dependency; task fails at clone
+| Task ID | Lang | Difficulty | Repository | Category |
+|---------|------|-----------|------------|----------|
+| django-audit-trail-implement-001 | Python | hard | django/django | Audit trail implementation |
+| django-cross-team-boundary-001 | Python | hard | django/django | Cross-team boundary enforcement |
+| curl-cve-triage-001 | C | hard | curl/curl | CVE triage |
+| envoy-cve-triage-001 | C++ | hard | envoyproxy/envoy | CVE triage |
+| golang-net-cve-triage-001 | Go | hard | golang/net | CVE triage |
+| django-csrf-session-audit-001 | Python | hard | django/django | Security audit |
+| flipt-degraded-context-fix-001 | Go | hard | flipt-io/flipt | Degraded context handling |
+| kafka-sasl-auth-audit-001 | Java | hard | apache/kafka | Security audit |
+| django-legacy-dep-vuln-001 | Python | hard | django/django | Legacy dependency analysis |
+| django-policy-enforcement-001 | Python | hard | django/django | Policy enforcement |
+| postgres-client-auth-audit-001 | C | hard | postgres/postgres | Security audit |
+| django-repo-scoped-access-001 | Python | medium | django/django | Repository-scoped access |
+| flipt-repo-scoped-access-001 | Go | hard | flipt-io/flipt | Repository-scoped access |
+| django-role-based-access-001 | Python | hard | django/django | Role-based access control |
+| django-sensitive-file-exclusion-001 | Python | medium | django/django | Sensitive file exclusion |
+| wish-transitive-vuln-001 | Go | hard | charmbracelet/wish | Transitive dependency analysis |
+| grpcurl-transitive-vuln-001 | Go | hard | fullstorydev/grpcurl | Transitive dependency analysis |
+| curl-vuln-reachability-001 | C | hard | curl/curl | Vulnerability reachability |
+| envoy-vuln-reachability-001 | C++ | hard | envoyproxy/envoy | Vulnerability reachability |
+| kafka-vuln-reachability-001 | Java | hard | apache/kafka | Vulnerability reachability |
 
 ---
 
-## 15. LinuxFLBench -- Linux Kernel Fault Localization
+## 8. ccb_debug -- Debugging & Investigation
 
-**Focus:** Locate the root cause of real Linux kernel bugs from Bugzilla reports. The agent must identify the exact source file(s) and function(s) responsible for hardware/driver failures across kernel subsystems.
-**Language:** C | **Difficulty:** expert (all tasks) | **Time Limit:** 30 min per task
-**Repository:** linux (kernel source tree) | **Build Timeout:** 30 min (kernel partial clone ~2GB)
+**Focus:** Deep debugging, fault localization, regression hunting, causal chain tracing, and navigation-verified regression proving. Includes Linux kernel fault localization (expert difficulty) and navigation-verified tasks where the agent must both locate a bug and write a regression test.
 
-| Task | Subsystem | Description |
-|------|-----------|-------------|
-| lfl-acpi-207835 | ACPI | Backlight brightness control does not work on Acer TravelMate 5735Z |
-| lfl-nfs-117651 | NFS | Root NFS and autofs mount disappears due to inode revalidate failure |
-| lfl-sata-203475 | SATA | Samsung 860 EVO queued TRIM causes timeout errors in libata |
-| lfl-sound-53441 | Sound | HDA Intel sound stops working after suspend to RAM |
-| lfl-wifi-206661 | WiFi | iwlwifi missing PCI subdevice entries causing firmware load failure |
+**20 tasks** | Languages: C, C++, Go, Python, TypeScript | Difficulty: medium--expert
 
----
+| Task ID | Lang | Difficulty | Repository | Category |
+|---------|------|-----------|------------|----------|
+| ansible-vault-regression-prove-001 | Python | hard | ansible/ansible | Navigation-verified regression |
+| django-admins-migration-audit-001 | Python | medium | django/django | Migration audit |
+| envoy-duplicate-headers-debug-001 | C++ | hard | envoyproxy/envoy | Deep causal chain |
+| flipt-cache-regression-prove-001 | Go | hard | flipt-io/flipt | Navigation-verified regression |
+| grafana-table-panel-regression-001 | Go | hard | grafana/grafana | Regression hunt |
+| istio-xds-destrul-debug-001 | Go | hard | istio/istio | Deep causal chain |
+| linux-acpi-backlight-fault-001 | C | expert | torvalds/linux | Kernel fault localization |
+| linux-hda-intel-suspend-fault-001 | C | expert | torvalds/linux | Kernel fault localization |
+| linux-iwlwifi-subdevice-fault-001 | C | expert | torvalds/linux | Kernel fault localization |
+| linux-nfs-inode-revalidate-fault-001 | C | expert | torvalds/linux | Kernel fault localization |
+| linux-ssd-trim-timeout-fault-001 | C | expert | torvalds/linux | Kernel fault localization |
+| prometheus-queue-reshard-debug-001 | Go | hard | prometheus/prometheus | Cross-service debug |
+| qutebrowser-bookmark-regression-prove-001 | Python | hard | qutebrowser/qutebrowser | Navigation-verified regression |
+| qutebrowser-download-regression-prove-001 | Python | hard | qutebrowser/qutebrowser | Navigation-verified regression |
+| qutebrowser-tab-regression-prove-001 | Python | hard | qutebrowser/qutebrowser | Navigation-verified regression |
+| qutebrowser-url-regression-prove-001 | Python | hard | qutebrowser/qutebrowser | Navigation-verified regression |
+| teleport-ssh-regression-prove-001 | Go | hard | gravitational/teleport | Navigation-verified regression |
+| terraform-phantom-update-debug-001 | Go | hard | hashicorp/terraform | Deep causal chain |
+| tutanota-search-regression-prove-001 | TypeScript | hard | tutao/tutanota | Navigation-verified regression |
+| vuls-oval-regression-prove-001 | Go | hard | future-architect/vuls | Navigation-verified regression |
 
-## 16. Investigation -- Deep Investigation
+**Navigation-verified scoring:** Phase 1 (test fails on buggy code, 0.5 pts) + Phase 2 (test passes after patch, 0.5 pts). Majority-of-3 voting per phase.
 
-**Focus:** Deep debugging, interaction tracing, and impact analysis requiring thorough codebase investigation. Tests the agent's ability to follow complex logic paths and produce accurate analysis.
-**Languages:** Go, Python | **SDLC Phase:** Requirements & Discovery
-
-| Task | Language | Difficulty | Focus |
-|------|----------|-----------|-------|
-| inv-debug-001 | Go | hard | Deep debugging |
-| inv-impact-001 | Go | hard | Impact analysis |
-| inv-migration-001 | Python | medium | Migration investigation |
-| inv-regression-001 | Go | hard | Regression investigation |
-
----
-
-## 17. SWE-Perf -- Performance Optimization
-
-**Focus:** Optimize specific functions in major Python scientific computing libraries. Agents must profile, identify bottlenecks, and apply targeted optimizations while preserving correctness.
-**Language:** Python | **Agent Timeout:** 60 min | **Verifier Timeout:** 10 min
-
-| Task | Repository | Target Function | Difficulty | MCP Score |
-|------|-----------|----------------|-----------|-----------|
-| sweperf-001 | NumPy | `numpy.core.multiarray.array_sum` | medium | 0.458 |
-| sweperf-002 | scikit-learn | `sklearn.cluster._k_means._kmeans_single_elkan` | hard | 0.458 |
-| sweperf-003 | Pandas | `pandas.core.groupby.ops.GroupBy._aggregate_series_fast` | medium | 0.458 |
-
-**Scoring:** `runtime_reduction = 1 - (optimized_runtime / baseline_runtime)`. A score of 0.5 means 2x speedup.
-
----
-
-## Appendix: Archived Suites
-
-The following suites are archived and not included in official evaluation. Task definitions are preserved for reference in `benchmarks/archive/`.
-
-### LoCoBench (25 tasks, ARCHIVED)
-**Reason:** Removed from official evaluation.
-**Focus:** Expert-level tasks on synthetically generated codebases with 1M+ tokens across 75-85 files. Tests architectural reasoning, cross-file refactoring, and bug investigation at scale.
-**Languages:** C, C++, C#, Python, Rust, TypeScript | **Difficulty:** expert
-
-### RepoQA (10 tasks, ARCHIVED)
-**Reason:** Ceiling saturation -- scores 1.000/1.000 on both baseline and SG_full configs.
-**Focus:** Find functions by behavioral description alone. Tests semantic search capability.
-**Languages:** Python, C++, Java, Rust, TypeScript | **Difficulty:** hard
-
-### DependEval (32 tasks, ARCHIVED)
-**Reason:** Superseded by ccb_dibench and ccb_enterprise dependency tasks.
-**Focus:** Identify and correctly order dependencies in real-world repositories.
-**Languages:** Java, JavaScript, Python, TypeScript | **Difficulty:** medium
-
-### K8s Docs (5 tasks, ARCHIVED)
-**Reason:** Superseded by ccb_docgen with broader language and task-type coverage.
-**Focus:** Generate doc.go package documentation for Kubernetes packages.
-**Language:** Go
+**Kernel fault localization:** 30-minute time limit per task. Agent must identify exact source file(s) and function(s) responsible for hardware/driver failures in the ~28K-file Linux kernel.
 
 ---
 
 ## Summary Statistics
 
-| Benchmark | Tasks | Difficulty Range | Language(s) | Avg MCP Score |
-|-----------|-------|-----------------|-------------|---------------|
-| SWE-bench Pro | 36 | hard | Go, TS, Python, JS | 0.660 |
-| LargeRepo | 25 | hard | Go, Rust, Python/C++, Java, C, TS | 0.882 |
-| DocGen | 13 | hard | Go, C++, Java, TS | 0.855 |
-| CrossRepo | 12 | easy - very_hard | Go, C++ | 0.873 |
-| Enterprise | 12 | hard | Go, Python | 0.850 |
-| PyTorch | 11 | medium - hard | C++ | 0.588 |
-| NavProve | 9 | hard | Go, Python, TS | 0.824 |
-| CodeReview | 8 | hard | 7 languages | 0.761 |
-| DIBench | 8 | medium | Python, Rust, JS, C# | -- |
-| Governance | 8 | medium - hard | Go, Python | 0.805 |
-| NLQA | 8 | hard | Go, C++, Java, TS | 0.839 |
-| Onboarding | 8 | hard | Go, C++, Java | 0.826 |
-| Security | 8 | hard | Go, C, C++, Java | 0.869 |
-| TAC | 8 | medium - hard | C++, Python | 0.506 |
-| LinuxFLBench | 5 | expert | C | -- |
-| Investigation | 4 | medium - hard | Go, Python | 0.903 |
-| SWE-Perf | 3 | medium - hard | Python | 0.458 |
+| Suite | Tasks | Difficulty Range | Languages | Description |
+|-------|-------|-----------------|-----------|-------------|
+| ccb_understand | 20 | hard | C++, Go, Java, Python, TS | Comprehension, Q&A, onboarding |
+| ccb_design | 20 | hard--very_hard | C, C++, Go, Java, Python | Architecture, dependency mapping |
+| ccb_fix | 25 | medium--hard | C++, Go, Java, JS, Python, TS | Bug fixes, SWE-bench Pro patches |
+| ccb_build | 25 | medium--hard | C#, C++, Go, Java, JS, Python/C++, Rust, TS | Features, refactoring, deps |
+| ccb_test | 14 | medium--hard | C, C#, C++, Go, Java, JS, Python, TS | Code review, testing, perf |
+| ccb_document | 13 | hard | C++, Go, Java, TS | API docs, arch guides, migration |
+| ccb_secure | 20 | medium--hard | C, C++, Go, Java, Python | CVE triage, governance, access |
+| ccb_debug | 20 | medium--expert | C, C++, Go, Python, TS | Fault localization, regression |
 
-**Total active tasks:** 186
+**Total active tasks:** 157
 **Languages covered:** C, C++, C#, Go, Java, JavaScript, Python, Rust, TypeScript
-**SDLC phases covered:** Requirements & Discovery, Architecture & Design, Implementation (feature, bug fix, refactoring), Testing & QA, Documentation, Maintenance, Security review, Impact analysis, Debugging
+**SDLC phases covered:** Requirements & Discovery, Architecture & Design, Bug Repair, Feature Implementation, Refactoring, Testing & QA, Documentation, Security & Compliance, Debugging & Investigation

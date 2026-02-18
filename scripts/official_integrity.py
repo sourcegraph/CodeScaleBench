@@ -146,7 +146,7 @@ def evaluate_official_integrity(
         from audit_traces import collect_all_tasks  # local import to avoid startup overhead
 
         for task in collect_all_tasks():
-            if task.get("config") not in {"sourcegraph_base", "sourcegraph_full"}:
+            if task.get("config") not in {"sourcegraph_full"}:
                 continue
 
             if not task.get("has_mcp_tools_available", False):

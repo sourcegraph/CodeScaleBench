@@ -54,7 +54,7 @@ DIR_PREFIX_TO_SUITE = {
     "paired_rerun_": None,  # multi-benchmark — infer per task
 }
 
-CONFIGS = ["baseline", "sourcegraph_base", "sourcegraph_full", "sourcegraph", "deepsearch"]
+CONFIGS = ["baseline", "sourcegraph_full", "sourcegraph", "deepsearch"]
 
 
 def should_skip(dirname: str) -> bool:

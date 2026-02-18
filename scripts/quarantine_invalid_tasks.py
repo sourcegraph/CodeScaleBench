@@ -2,7 +2,7 @@
 """Quarantine invalid task dirs from runs/official into archive/qa_needed.
 
 Default rule:
-  - MCP-enabled configs only (sourcegraph_base/sourcegraph_full)
+  - MCP-enabled configs only (sourcegraph_full)
   - status == failed
   - mcp_total_calls == 0
 
@@ -21,7 +21,7 @@ from pathlib import Path
 
 from audit_traces import collect_all_tasks
 
-MCP_CONFIGS = {"sourcegraph_base", "sourcegraph_full"}
+MCP_CONFIGS = {"sourcegraph_full"}
 REASON = "failed_zero_mcp_calls"
 
 

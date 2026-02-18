@@ -52,7 +52,7 @@ bash configs/validate_one_per_benchmark.sh --smoke-runtime --smoke-timeout-sec 3
 
 # Override timeout-heavy suites (format: suite=seconds,suite=seconds)
 bash configs/validate_one_per_benchmark.sh --smoke-runtime --smoke-timeout-sec 300 \
-  --smoke-timeout-overrides "ccb_pytorch=1800,ccb_tac=900,ccb_crossrepo=900"
+  --smoke-timeout-overrides "ccb_build=900,ccb_fix=900,ccb_design=600"
 ```
 
 **Usage:**
@@ -61,19 +61,19 @@ bash configs/validate_one_per_benchmark.sh --smoke-runtime --smoke-timeout-sec 3
 python3 scripts/validate_tasks_preflight.py --all
 
 # Validate a specific suite
-python3 scripts/validate_tasks_preflight.py --suite ccb_pytorch
+python3 scripts/validate_tasks_preflight.py --suite ccb_build
 
 # Validate a single task
-python3 scripts/validate_tasks_preflight.py --task benchmarks/ccb_pytorch/sgt-005
+python3 scripts/validate_tasks_preflight.py --task benchmarks/ccb_build/eslint-markdown-deps-install-001
 
 # Runtime smoke for a single task (no agent)
-python3 scripts/validate_tasks_preflight.py --task benchmarks/ccb_largerepo/big-code-k8s-001 --smoke-runtime
+python3 scripts/validate_tasks_preflight.py --task benchmarks/ccb_understand/terraform-plan-pipeline-qa-001 --smoke-runtime
 
 # Runtime smoke for a suite (expensive)
-python3 scripts/validate_tasks_preflight.py --suite ccb_largerepo --smoke-runtime --smoke-timeout-sec 900
+python3 scripts/validate_tasks_preflight.py --suite ccb_fix --smoke-runtime --smoke-timeout-sec 900
 
 # Separate build/verifier timeouts (for phase-level diagnosis)
-python3 scripts/validate_tasks_preflight.py --task benchmarks/ccb_pytorch/sgt-001 \
+python3 scripts/validate_tasks_preflight.py --task benchmarks/ccb_fix/pytorch-relu-gelu-fusion-fix-001 \
   --smoke-runtime --smoke-build-timeout-sec 900 --smoke-verify-timeout-sec 900
 ```
 
@@ -247,9 +247,50 @@ Analyzes whether MCP tools are being used effectively:
 
 ---
 
+## 8. Migration Coverage Check
+
+**Purpose:** Validates that the `migration_map.json` covers 100% of pre-migration task IDs from the frozen inventory snapshot.
+
+**Command:**
+```bash
+python3 -c "
+import json, sys
+with open('docs/migration_inventory_snapshot.json') as f:
+    snapshot = json.load(f)
+with open('migration_map.json') as f:
+    mmap = json.load(f)
+snapshot_ids = {t['task_id'] for t in snapshot['tasks']}
+mapped_ids = set(mmap.get('mappings', {}).keys())
+covered = snapshot_ids & mapped_ids
+missing = snapshot_ids - mapped_ids
+extra = mapped_ids - snapshot_ids
+pct = len(covered) / len(snapshot_ids) * 100 if snapshot_ids else 0
+print(f'Snapshot tasks: {len(snapshot_ids)}')
+print(f'Mapped tasks:   {len(mapped_ids)}')
+print(f'Coverage:       {pct:.1f}%')
+if missing:
+    print(f'MISSING ({len(missing)}):')
+    for tid in sorted(missing):
+        print(f'  - {tid}')
+if extra:
+    print(f'EXTRA ({len(extra)}):')
+    for tid in sorted(extra):
+        print(f'  - {tid}')
+sys.exit(0 if pct == 100.0 else 1)
+"
+```
+
+**Pass criteria:** Coverage must be exactly `100.0%`. Any missing task IDs indicate incomplete migration planning.
+
+**Files referenced:**
+- `docs/migration_inventory_snapshot.json` -- frozen pre-migration inventory
+- `migration_map.json` -- old-suite/task-ID to new-suite/task-ID mapping
+
+---
+
 ## Related Documentation
 
 - [ERROR_CATALOG.md](ERROR_CATALOG.md) -- Known error fingerprints with root causes and fixes
-- [CONFIGS.md](CONFIGS.md) -- 3-config evaluation matrix details
-- [TASK_SELECTION.md](TASK_SELECTION.md) -- Task selection methodology and MCP benefit scoring
+- [CONFIGS.md](CONFIGS.md) -- 2-config evaluation matrix details
+- [TASK_SELECTION.md](TASK_SELECTION.md) -- Task selection methodology and MCP benefit scoring (157 tasks, 8 SDLC suites)
 - [TASK_CATALOG.md](TASK_CATALOG.md) -- Detailed per-task reference

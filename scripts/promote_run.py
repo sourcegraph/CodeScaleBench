@@ -41,7 +41,7 @@ EXTRACT_METRICS_SCRIPT = PROJECT_ROOT / "scripts" / "extract_task_metrics.py"
 SELECTED_TASKS_FILE = PROJECT_ROOT / "configs" / "selected_benchmark_tasks.json"
 
 SKIP_PATTERNS = ["__broken_verifier", "validation_test", "archive", "__v1_hinted"]
-CONFIGS = ["baseline", "sourcegraph_base", "sourcegraph_full", "sourcegraph_isolated", "sg_only_env"]
+CONFIGS = ["baseline", "sourcegraph_full", "sourcegraph_isolated", "sg_only_env"]
 
 DIR_PREFIX_TO_SUITE = {
     "bigcode_mcp_": "ccb_largerepo",

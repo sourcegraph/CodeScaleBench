@@ -442,9 +442,7 @@ def compute_context_attribution(
         # Find the same task in other configs
         baseline = task_by_key.get((task_name, "baseline"))
         sg_full = task_by_key.get((task_name, "sourcegraph_full"))
-        sg_base = task_by_key.get((task_name, "sourcegraph_base"))
-
-        context_impact = _compute_impact(t, config, baseline, sg_full, sg_base)
+        context_impact = _compute_impact(t, config, baseline, sg_full)
 
         attributed.append({
             **t,
@@ -459,7 +457,6 @@ def _compute_impact(
     config: str,
     baseline: Optional[dict],
     sg_full: Optional[dict],
-    sg_base: Optional[dict],
 ) -> str:
     """Determine context impact label for a single failed task."""
     task_name = failed_task["task_name"]
@@ -485,7 +482,7 @@ def _compute_impact(
             return "context_no_impact"
         return "no_comparison"
 
-    elif config == "sourcegraph_base":
+    elif config == "sourcegraph_full":
         if baseline and not _is_failed(baseline):
             return "context_made_worse"
         if sg_full and not _is_failed(sg_full):
@@ -735,7 +732,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--config", default=None,
-        help="Filter to one config (baseline, sourcegraph_base, sourcegraph_full)",
+        help="Filter to one config (baseline, sourcegraph_full)",
     )
     parser.add_argument(
         "--report", action="store_true",

@@ -16,11 +16,13 @@ Eight suites organized by software development lifecycle phase:
 | `ccb_design` | Architecture & Design | 20 | Architecture analysis, dependency graphs, change impact |
 | `ccb_fix` | Bug Repair | 25 | Diagnosing and fixing real bugs across production codebases |
 | `ccb_build` | Feature & Refactoring | 25 | New features, refactoring, dependency management |
-| `ccb_test` | Testing & QA | 14 | Code review, performance testing, code search validation |
-| `ccb_document` | Documentation | 13 | API references, architecture docs, migration guides |
+| `ccb_test` | Testing & QA | 20 | Code review, performance testing, code search validation |
+| `ccb_document` | Documentation | 20 | API references, architecture docs, migration guides |
 | `ccb_secure` | Security & Compliance | 20 | CVE analysis, reachability, governance, access control |
 | `ccb_debug` | Debugging & Investigation | 20 | Root cause tracing, fault localization, provenance |
-| **Total** | | **157** | |
+| **Total** | | **170** | |
+
+*ccb_test* and *ccb_document* currently have 14 and 13 tasks on disk (target 20 each); see `docs/backlog_ccb_test.json` and `docs/backlog_ccb_document.json` for the growth plan.
 
 See `docs/PRD_SDLC_SUITE_REORGANIZATION.md` for the reorganization rationale and task mapping.
 

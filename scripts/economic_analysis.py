@@ -452,7 +452,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--config", default=None,
-        help="Filter to one config (baseline, sourcegraph_base, sourcegraph_full)",
+        help="Filter to one config (baseline, sourcegraph_full)",
     )
     parser.add_argument(
         "--compare", action="store_true",
