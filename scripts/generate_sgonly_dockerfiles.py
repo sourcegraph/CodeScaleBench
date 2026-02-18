@@ -78,38 +78,33 @@ def truncate_find_expr(workdir, extra_excludes=None):
 
 
 def get_active_task_ids():
-    """Get set of active task IDs from TASK_CATALOG.md and swebenchpro MANIFEST."""
+    """Get set of active task IDs from on-disk benchmarks, TASK_CATALOG.md, and swebenchpro MANIFEST."""
     tasks = {}  # task_id -> suite_name
 
-    # SWE-bench Pro from MANIFEST
+    # Primary: scan benchmarks/ directories on disk (catches newly added tasks)
+    for suite_dir in sorted(BENCHMARKS.iterdir()):
+        if not suite_dir.is_dir() or not suite_dir.name.startswith('ccb_'):
+            continue
+        suite_name = suite_dir.name
+        for task_dir in sorted(suite_dir.iterdir()):
+            if not task_dir.is_dir():
+                continue
+            # Must have environment/Dockerfile to be a real task
+            if (task_dir / "environment" / "Dockerfile").exists():
+                tasks[task_dir.name] = suite_name
+            # Also check tasks/ subdirectory pattern
+            if task_dir.name == "tasks":
+                for sub in sorted(task_dir.iterdir()):
+                    if sub.is_dir() and (sub / "environment" / "Dockerfile").exists():
+                        tasks[sub.name] = suite_name
+
+    # SWE-bench Pro from MANIFEST (may have tasks not on disk)
     manifest_path = BENCHMARKS / "ccb_swebenchpro" / "MANIFEST.json"
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
         for tid in manifest.get("task_ids", []):
-            tasks[tid] = "SWE-bench Pro"
-
-    # Other suites from TASK_CATALOG.md
-    catalog_path = REPO_ROOT / "docs" / "TASK_CATALOG.md"
-    if catalog_path.exists():
-        catalog = catalog_path.read_text()
-        current_suite = None
-        in_archived = False
-        for line in catalog.split("\n"):
-            if "Appendix: Archived Suites" in line:
-                in_archived = True
-            if in_archived:
-                continue
-            m = re.match(r'^## \d+\.\s+(.*?)(?:\s+--|\s*$)', line)
-            if m:
-                current_suite = m.group(1).strip()
-            if current_suite == "SWE-bench Pro":
-                continue
-            m = re.match(r'^\|\s+([\w][\w-]+)\s+\|', line)
-            if m and current_suite:
-                tid = m.group(1).strip()
-                if '/' in tid or tid in {'Repository', 'Task', 'Language', 'Metric', 'Benchmark', 'Suite'}:
-                    continue
-                tasks[tid] = current_suite
+            if tid not in tasks:
+                tasks[tid] = "SWE-bench Pro"
 
     return tasks
 
@@ -258,7 +253,6 @@ def generate_build_requiring(task_dir, dockerfile_text):
     # Build the sg_only section to append
     sg_section = f"""
 # --- sg_only_env: back up full repo, then truncate source ---
-RUN apt-get update && apt-get install -y --no-install-recommends rsync && rm -rf /var/lib/apt/lists/* || true
 RUN cp -a {repo_dir} /repo_full
 RUN {truncate_find_expr(repo_dir, extra_excludes)}
 RUN touch /tmp/.sg_only_mode && echo '{repo_dir}' > /tmp/.sg_only_workdir
