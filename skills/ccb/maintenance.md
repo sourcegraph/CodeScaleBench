@@ -2,7 +2,20 @@
 
 Sync metadata, re-extract metrics, archive runs, generate reports, and plan next actions. Use when maintaining data hygiene, generating reports, or deciding what to work on next.
 
-**Relevant files:** `scripts/sync_task_metadata.py`, `scripts/reextract_all_metrics.py`, `scripts/archive_run.py`, `scripts/generate_eval_report.py`, `scripts/generate_manifest.py`
+**Relevant files:** `scripts/sync_task_metadata.py`, `scripts/reextract_all_metrics.py`, `scripts/archive_run.py`, `scripts/generate_eval_report.py`, `scripts/generate_manifest.py`, `scripts/repo_health.py`
+
+---
+
+## Repo Health (before commit or push)
+
+Run the health gate before committing or pushing to reduce doc drift and keep branches clean. **Agents: run this before every commit/push when you changed docs, configs, or task definitions.**
+
+```bash
+python3 scripts/repo_health.py --quick   # Fast: docs + selection file only
+python3 scripts/repo_health.py           # Full: adds task preflight static
+```
+
+See [repo-health/SKILL.md](../repo-health/SKILL.md) and `docs/REPO_HEALTH.md` for details.
 
 ---
 

@@ -20,6 +20,7 @@ per-task details.
 - `docs/WORKFLOW_METRICS.md` - timing/cost metric definitions
 - `docs/AGENT_INTERFACE.md` - runtime I/O contract
 - `docs/EXTENSIBILITY.md` - safe suite/task/config extension
+- `docs/REPO_HEALTH.md` - health gate and branch hygiene (reduce drift)
 - `docs/LEADERBOARD.md` - ranking policy
 - `docs/SUBMISSION.md` - submission format
 - `docs/SKILLS.md` - AI agent skill system overview
@@ -28,6 +29,7 @@ per-task details.
 ## Typical Skill Routing
 Use these defaults unless there is a task-specific reason not to.
 
+- **Before commit or push:** `repo-health` — run `python3 scripts/repo_health.py` (or `--quick` if only docs/config changed). Do not commit/push with failing health checks.
 - Pre-run readiness: `check-infra`, `validate-tasks`
 - Launch/runs: `run-benchmark`, `run-status`, `watch-benchmarks`
 - Failure investigation: `triage-failure`, `quick-rerun`
@@ -45,6 +47,7 @@ See `docs/CONFIGS.md` for the full environment model, tool lists, and how to
 add sg_only support to new tasks.
 
 ## Standard Workflow
+0. **Before commit or push:** Run `python3 scripts/repo_health.py` (or `--quick`). Fix any failures so main stays clean and drift is caught early (see `docs/REPO_HEALTH.md`).
 1. Run infrastructure checks before any batch.
 2. Validate task integrity before launch (include runtime smoke for new/changed tasks).
 3. Run the benchmark config (`configs/*_2config.sh` or equivalent).
@@ -92,6 +95,7 @@ python3 scripts/generate_eval_report.py
 python3 scripts/abc_audit.py --suite <suite>        # quality audit
 python3 scripts/abc_score_task.py --suite <suite>    # per-task quality score
 python3 scripts/docs_consistency_check.py            # documentation drift guard
+python3 scripts/repo_health.py                      # repo health gate (before push); --quick for fast check
 ```
 
 ## Script Entrypoints
@@ -126,11 +130,14 @@ python3 scripts/docs_consistency_check.py            # documentation drift guard
 - `audit_traces.py` - agent trace auditing
 - `ds_audit.py` - Deep Search usage audit
 
+### Repo health (reduce drift, clean branches)
+- `repo_health.py` - single gate: docs consistency + selection file + task preflight (see docs/REPO_HEALTH.md)
+- `docs_consistency_check.py` - documentation drift guard
+
 ### Quality Assurance
 - `abc_audit.py` - ABC benchmark quality audit (32 criteria across 3 dimensions)
 - `abc_score_task.py` - per-task quality scoring
 - `abc_criteria.py` - ABC criteria data model
-- `docs_consistency_check.py` - documentation drift guard
 - `validate_official_integrity.py` - official run integrity checks
 - `quarantine_invalid_tasks.py` - quarantine tasks with zero MCP usage
 

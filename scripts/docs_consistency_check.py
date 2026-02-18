@@ -17,6 +17,7 @@ DEFAULT_DOCS = [
     "docs/CONFIGS.md",
     "docs/QA_PROCESS.md",
     "docs/EXTENSIBILITY.md",
+    "docs/REPO_HEALTH.md",
 ]
 
 REF_PATTERNS = [
