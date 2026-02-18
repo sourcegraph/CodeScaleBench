@@ -1,0 +1,32 @@
+FROM golang:1.23-alpine AS base
+
+# Install git for cloning
+RUN apk add --no-cache git bash
+
+# Clone repos at pinned commits
+WORKDIR /workspace
+
+# Clone istio/istio
+RUN git clone https://github.com/istio/istio.git istio && \
+    cd istio && \
+    git checkout 4c1f845d839e9086ee85ad9337f2647492322eb4
+
+# Clone envoyproxy/go-control-plane
+RUN git clone https://github.com/envoyproxy/go-control-plane.git go-control-plane && \
+    cd go-control-plane && \
+    git checkout 71637ad69bbc5f51fbb2562e612a4365292804a5
+
+# Clone envoyproxy/data-plane-api (protobuf definitions)
+RUN git clone https://github.com/envoyproxy/data-plane-api.git data-plane-api && \
+    cd data-plane-api && \
+    git checkout 84e84367f2560cdb47b9bb78fd3e615feb80c3e4
+
+# Verify repos exist
+RUN ls -la /workspace/ && \
+    test -d /workspace/istio && \
+    test -d /workspace/go-control-plane && \
+    test -d /workspace/data-plane-api
+
+FROM base AS final
+WORKDIR /workspace
+CMD ["/bin/bash"]
