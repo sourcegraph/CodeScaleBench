@@ -1,31 +1,29 @@
 #!/bin/bash
 # Unified Benchmark Runner — Reads tasks from selected_benchmark_tasks.json
 #
-# Runs selected benchmark tasks across 3 MCP configurations:
+# Runs selected benchmark tasks across 2 MCP configurations:
 #   1. Baseline (no MCP)
-#   2. MCP-Base (Sourcegraph tools without Deep Search)
-#   3. MCP-Full (Sourcegraph + Deep Search)
+#   2. MCP-Full (Sourcegraph + Deep Search)
 #
-# This script replaces the per-benchmark *_3config.sh scripts by reading
-# the canonical task selection from selected_benchmark_tasks.json.
+# This script reads the canonical task selection from selected_benchmark_tasks.json
+# and runs each task through Harbor with the specified configuration(s).
 #
 # Usage:
 #   ./configs/run_selected_tasks.sh [OPTIONS]
 #
 # Options:
-#   --benchmark BENCHMARK  Run only this benchmark (e.g., ccb_swebenchpro, ccb_locobench)
+#   --benchmark BENCHMARK  Run only this benchmark (e.g., ccb_build, ccb_fix)
 #   --baseline-only        Run only baseline (no MCP)
-#   --base-only            Run only MCP-Base (sourcegraph_base)
 #   --full-only            Run only MCP-Full (sourcegraph_full)
 #   --model MODEL          Override model (default: claude-opus-4-6)
 #   --concurrency N        Concurrent tasks (default: 2)
-#   --category CATEGORY    Run category (default: official)
+#   --category CATEGORY    Run category (default: staging)
 #   --skip-completed       Skip tasks that already have result.json + task_metrics.json
 #   --dry-run              Print tasks without running
 #
 # Prerequisites:
 #   - configs/selected_benchmark_tasks.json in repo
-#   - ~/evals/.env.local with ANTHROPIC_API_KEY
+#   - ~/evals/.env.local with USE_SUBSCRIPTION=true
 #   - SOURCEGRAPH_ACCESS_TOKEN in .env.local (for MCP modes)
 
 set -e
@@ -51,7 +49,6 @@ MODEL="${MODEL:-anthropic/claude-opus-4-6}"
 CONCURRENCY=2
 TIMEOUT_MULTIPLIER=10
 RUN_BASELINE=true
-RUN_BASE=true
 RUN_FULL=true
 CATEGORY="${CATEGORY:-staging}"
 DRY_RUN=false
@@ -65,18 +62,11 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --baseline-only)
-            RUN_BASE=false
-            RUN_FULL=false
-            shift
-            ;;
-        --base-only)
-            RUN_BASELINE=false
             RUN_FULL=false
             shift
             ;;
         --full-only)
             RUN_BASELINE=false
-            RUN_BASE=false
             shift
             ;;
         --model)
@@ -116,18 +106,15 @@ if [ ! -f "$SELECTION_FILE" ]; then
 fi
 
 if [ -f ~/evals/.env.local ]; then
+    echo "Loading credentials from ~/evals/.env.local..."
     source ~/evals/.env.local
 fi
 
-if [ -z "$ANTHROPIC_API_KEY" ]; then
-    echo "ERROR: ANTHROPIC_API_KEY is not set"
-    exit 1
-fi
+enforce_subscription_mode
 
-if { [ "$RUN_BASE" = true ] || [ "$RUN_FULL" = true ]; } && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
-    echo "WARNING: MCP modes requested but SOURCEGRAPH_ACCESS_TOKEN not set"
+if [ "$RUN_FULL" = true ] && [ -z "$SOURCEGRAPH_ACCESS_TOKEN" ]; then
+    echo "WARNING: MCP mode requested but SOURCEGRAPH_ACCESS_TOKEN not set"
     echo "Skipping MCP runs."
-    RUN_BASE=false
     RUN_FULL=false
 fi
 
@@ -196,7 +183,7 @@ echo "Source:        $SELECTION_FILE"
 echo "Model:         $MODEL"
 echo "Total tasks:   $TOTAL_TASKS"
 echo "Concurrency:   $CONCURRENCY"
-echo "Configs:       baseline=$RUN_BASELINE sourcegraph_base=$RUN_BASE sourcegraph_full=$RUN_FULL"
+echo "Configs:       baseline=$RUN_BASELINE sourcegraph_full=$RUN_FULL"
 echo "Skip done:     $SKIP_COMPLETED"
 echo ""
 echo "Tasks per benchmark:"
@@ -222,42 +209,6 @@ fi
 # ============================================
 # HELPER FUNCTIONS
 # ============================================
-
-# Resolve SOURCEGRAPH_REPO_NAME for a locobench task from docker-compose.yaml
-get_sg_repo_name() {
-    local task_dir=$1
-    local dc_file="${task_dir}/environment/docker-compose.yaml"
-    if [ -f "$dc_file" ]; then
-        local proj_id
-        proj_id=$(grep 'LOCOBENCH_PROJECT_ID=' "$dc_file" | head -1 | sed 's/.*LOCOBENCH_PROJECT_ID=//')
-        if [ -n "$proj_id" ]; then
-            echo "sg-benchmarks/locobench-${proj_id}"
-            return
-        fi
-    fi
-    echo ""
-}
-
-# Resolve SOURCEGRAPH_REPO_NAME for a swebenchpro task from its task_id
-get_swebench_sg_repo() {
-    local task_id=$1
-    local sg_repo
-    sg_repo=$(python3 -c "
-import re
-tid = '$task_id'
-m = re.match(r'(?:instance_)?(.+?)__(.+?)-([a-f0-9]{7,40})', tid)
-if m:
-    org = m.group(1).replace('__','/')
-    repo = m.group(2)
-    commit = m.group(3)[:8]
-    print(f'{org}--{repo}--{commit}')
-" 2>/dev/null)
-    if [ -n "$sg_repo" ]; then
-        echo "sg-benchmarks/$sg_repo"
-    else
-        echo ""
-    fi
-}
 
 # Extract per-task metrics for Dashboard
 extract_all_metrics() {
@@ -294,7 +245,7 @@ is_task_completed() {
 }
 
 # ============================================
-# RUN FUNCTION — handles both path-based and dataset-based benchmarks
+# RUN FUNCTION — runs all tasks for a benchmark via --path mode
 # ============================================
 run_benchmark() {
     local bm=$1
@@ -326,53 +277,22 @@ run_benchmark() {
 
         local abs_path="$REPO_ROOT/$task_path"
 
-        # Set SOURCEGRAPH_REPO_NAME for MCP modes
-        if [ "$mcp_type" != "none" ]; then
-            local sg_repo=""
-            if [ "$bm" = "ccb_locobench" ]; then
-                sg_repo=$(get_sg_repo_name "$abs_path")
-            elif [ "$bm" = "ccb_swebenchpro" ]; then
-                sg_repo=$(get_swebench_sg_repo "$task_id")
-            fi
-            if [ -n "$sg_repo" ]; then
-                export SOURCEGRAPH_REPO_NAME="$sg_repo"
-                echo "  [${mcp_mode}] ($idx/${BENCHMARK_COUNTS[$bm]}) $task_id -> SG_REPO=${sg_repo}"
-            else
-                unset SOURCEGRAPH_REPO_NAME 2>/dev/null || true
-                echo "  [${mcp_mode}] ($idx/${BENCHMARK_COUNTS[$bm]}) $task_id -> no SG repo mapping"
-            fi
-        else
-            unset SOURCEGRAPH_REPO_NAME 2>/dev/null || true
-            echo "  [${mcp_mode}] ($idx/${BENCHMARK_COUNTS[$bm]}) $task_id"
-        fi
+        unset SOURCEGRAPH_REPO_NAME 2>/dev/null || true
+        echo "  [${mcp_mode}] ($idx/${BENCHMARK_COUNTS[$bm]}) $task_id"
 
-        # swebenchpro uses --dataset mode; all others use --path
-        if [ "$bm" = "ccb_swebenchpro" ]; then
-            BASELINE_MCP_TYPE=$mcp_type harbor run \
-                --dataset swebenchpro \
-                -t "$task_id" \
-                --agent-import-path "$AGENT_PATH" \
-                --model "$MODEL" \
-                --jobs-dir "$jobs_dir" \
-                -n $CONCURRENCY \
-                --timeout-multiplier $TIMEOUT_MULTIPLIER \
-                2>&1 | tee -a "${jobs_dir}.log" \
-                || echo "WARNING: Task failed: $task_id (continuing...)"
-        else
-            if [ ! -d "$abs_path" ]; then
-                echo "WARNING: Task directory not found: $abs_path"
-                continue
-            fi
-            BASELINE_MCP_TYPE=$mcp_type harbor run \
-                --path "$abs_path" \
-                --agent-import-path "$AGENT_PATH" \
-                --model "$MODEL" \
-                --jobs-dir "$jobs_dir" \
-                -n $CONCURRENCY \
-                --timeout-multiplier $TIMEOUT_MULTIPLIER \
-                2>&1 | tee -a "${jobs_dir}.log" \
-                || echo "WARNING: Task failed: $task_id (continuing...)"
+        if [ ! -d "$abs_path" ]; then
+            echo "WARNING: Task directory not found: $abs_path"
+            continue
         fi
+        BASELINE_MCP_TYPE=$mcp_type harbor run \
+            --path "$abs_path" \
+            --agent-import-path "$AGENT_PATH" \
+            --model "$MODEL" \
+            --jobs-dir "$jobs_dir" \
+            -n $CONCURRENCY \
+            --timeout-multiplier $TIMEOUT_MULTIPLIER \
+            2>&1 | tee -a "${jobs_dir}.log" \
+            || echo "WARNING: Task failed: $task_id (continuing...)"
     done <<< "$task_ids" 3<<< "$task_dirs"
 
     unset SOURCEGRAPH_REPO_NAME 2>/dev/null || true
@@ -388,9 +308,6 @@ run_benchmark() {
 for bm in $(echo "${!BENCHMARK_COUNTS[@]}" | tr ' ' '\n' | sort); do
     if [ "$RUN_BASELINE" = true ]; then
         run_benchmark "$bm" "baseline" "none"
-    fi
-    if [ "$RUN_BASE" = true ]; then
-        run_benchmark "$bm" "sourcegraph_base" "sourcegraph_base"
     fi
     if [ "$RUN_FULL" = true ]; then
         run_benchmark "$bm" "sourcegraph_full" "sourcegraph_full"

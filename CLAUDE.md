@@ -4,9 +4,10 @@ This file is the operational quick-reference for benchmark maintenance.
 `AGENTS.md` mirrors this file.
 
 ## Benchmark Overview
-17 active suites, 186 tasks. Archived suites (locobench, repoqa, dependeval,
-k8sdocs) are excluded from official evaluation. See `README.md` for the full
-suite table and `docs/TASK_CATALOG.md` for per-task details.
+8 SDLC phase suites, 157 tasks. Tasks are organized by development lifecycle
+phase: build, debug, design, document, fix, secure, test, understand.
+See `README.md` for the full suite table and `docs/TASK_CATALOG.md` for
+per-task details.
 
 ## Canonical References
 - `README.md` - repo overview and quick start
@@ -95,9 +96,11 @@ python3 scripts/docs_consistency_check.py            # documentation drift guard
 
 ## Script Entrypoints
 - `configs/_common.sh` - shared run infra (parallelism, token refresh, validation hooks)
-- `configs/*_2config.sh` - per-suite run launchers (17 active suites)
-- `configs/validate_one_per_benchmark.sh --smoke-runtime` - quick no-agent runtime smoke (1 task per benchmark)
-  - Smoke interpretation: `smoke_verifier_nonzero_with_reward` is acceptable in no-agent mode; use `--smoke-timeout-overrides "ccb_pytorch=1800,ccb_tac=900,ccb_crossrepo=900"` for timeout-heavy suites.
+- `configs/sdlc_suite_2config.sh` - generic SDLC runner (used by phase wrappers)
+- `configs/{build,debug,design,document,fix,secure,test}_2config.sh` - thin SDLC phase wrappers
+- `configs/run_selected_tasks.sh` - unified runner from `selected_benchmark_tasks.json`
+- `configs/validate_one_per_benchmark.sh --smoke-runtime` - quick no-agent runtime smoke (1 task per suite)
+  - Smoke interpretation: `smoke_verifier_nonzero_with_reward` is acceptable in no-agent mode.
   - Timeout diagnostics: `smoke_build_timeout` (image build phase) vs `smoke_verify_timeout` (verifier phase).
 - `scripts/promote_run.py` - staging to official promotion flow
 

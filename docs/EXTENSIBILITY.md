@@ -32,7 +32,7 @@ Recommended pattern:
 
 For cross-agent comparison scaffolding, see:
 
-- `configs/github_copilot_codex_compare.sh`
+- `configs/multi_harness_compare.sh`
 
 ## 3) Add New Code Intelligence Config (e.g., GitHub MCP)
 

@@ -8,6 +8,10 @@
 # Usage:
 #   bash configs/validate_one_per_benchmark.sh [--dry-run]
 #   bash configs/validate_one_per_benchmark.sh --smoke-runtime [--smoke-timeout-sec 300] [--dry-run]
+#   bash configs/validate_one_per_benchmark.sh --sg-only [--smoke-timeout-sec 600] [--dry-run]
+#
+# --sg-only: swaps Dockerfile -> Dockerfile.sg_only before each smoke, then restores.
+#            Implies --smoke-runtime. Tests that sg_only_env images build and verify.
 
 set -euo pipefail
 
@@ -26,8 +30,9 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 DRY_RUN=false
 SMOKE_RUNTIME=false
+SG_ONLY=false
 SMOKE_TIMEOUT_SEC=300
-SMOKE_TIMEOUT_OVERRIDES="${SMOKE_TIMEOUT_OVERRIDES:-ccb_pytorch=1800,ccb_tac=900,ccb_crossrepo=900}"
+SMOKE_TIMEOUT_OVERRIDES="${SMOKE_TIMEOUT_OVERRIDES:-}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -36,6 +41,11 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --smoke-runtime)
+            SMOKE_RUNTIME=true
+            shift
+            ;;
+        --sg-only)
+            SG_ONLY=true
             SMOKE_RUNTIME=true
             shift
             ;;
@@ -54,7 +64,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [ "$SMOKE_RUNTIME" = true ]; then
+if [ "$SG_ONLY" = true ]; then
+    JOBS_DIR="runs/validation/smoke_sgonly_${TIMESTAMP}"
+elif [ "$SMOKE_RUNTIME" = true ]; then
     JOBS_DIR="runs/validation/smoke_runtime_${TIMESTAMP}"
 else
     JOBS_DIR="runs/validation/smoke_${TIMESTAMP}"
@@ -65,19 +77,40 @@ if [ "$SMOKE_RUNTIME" = false ]; then
     if [ -f ~/evals/.env.local ]; then
         source ~/evals/.env.local
     fi
-    if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-        echo "ERROR: ANTHROPIC_API_KEY is not set"
-        exit 1
-    fi
+    enforce_subscription_mode
 fi
+
+# Archived suites to skip (none currently — all SDLC suites are active)
+ARCHIVED_SUITES=""
+
+# Swap/restore helpers for --sg-only mode
+swap_to_sgonly() {
+    local task_dir="$1"
+    local dockerfile="${task_dir}/environment/Dockerfile"
+    local sgonly="${task_dir}/environment/Dockerfile.sg_only"
+    local backup="${task_dir}/environment/Dockerfile.original"
+    if [ ! -f "$sgonly" ]; then return 1; fi
+    if [ ! -f "$backup" ]; then cp "$dockerfile" "$backup"; fi
+    cp "$sgonly" "$dockerfile"
+    return 0
+}
+restore_dockerfile() {
+    local task_dir="$1"
+    local dockerfile="${task_dir}/environment/Dockerfile"
+    local backup="${task_dir}/environment/Dockerfile.original"
+    if [ -f "$backup" ]; then mv "$backup" "$dockerfile"; fi
+}
 
 # Extract first task per benchmark into arrays
 readarray -t TASK_LINES < <(python3 -c "
 import json
 sel = json.load(open('$SELECTION_FILE'))
+archived = set('$ARCHIVED_SUITES'.split())
 seen = set()
 for t in sel['tasks']:
     bm = t['benchmark']
+    if bm in archived:
+        continue
     if bm not in seen:
         seen.add(bm)
         print(f'{bm}\tbenchmarks/{t[\"task_dir\"]}')
@@ -86,7 +119,11 @@ for t in sel['tasks']:
 echo "=============================================="
 echo "CodeContextBench Validation Run (parallel)"
 echo "=============================================="
-if [ "$SMOKE_RUNTIME" = true ]; then
+if [ "$SG_ONLY" = true ]; then
+    echo "Mode:    sg_only_env smoke (Dockerfile.sg_only swap)"
+    echo "Timeout: ${SMOKE_TIMEOUT_SEC}s per task"
+    echo "Overrides: ${SMOKE_TIMEOUT_OVERRIDES:-<none>}"
+elif [ "$SMOKE_RUNTIME" = true ]; then
     echo "Mode:    runtime smoke (no agent)"
     echo "Timeout: ${SMOKE_TIMEOUT_SEC}s per task"
     echo "Overrides: ${SMOKE_TIMEOUT_OVERRIDES:-<none>}"
@@ -163,13 +200,35 @@ for line in "${TASK_LINES[@]}"; do
                 fi
             done
         fi
-        echo "Launching runtime smoke: $bm ($path)"
-        python3 scripts/validate_tasks_preflight.py \
-            --task "$abs_path" \
-            --smoke-runtime \
-            --smoke-timeout-sec "$TASK_TIMEOUT" \
-            --format json \
-            > "$JOBS_DIR/${bm}.log" 2>&1 &
+
+        # --sg-only: swap Dockerfile before smoke
+        __sg_swapped=false
+        if [ "$SG_ONLY" = true ]; then
+            if swap_to_sgonly "$abs_path"; then
+                __sg_swapped=true
+                echo "Launching sg_only smoke: $bm ($path)"
+            else
+                echo "SKIP sg_only: $bm — no Dockerfile.sg_only"
+                continue
+            fi
+        else
+            echo "Launching runtime smoke: $bm ($path)"
+        fi
+
+        # Run smoke in a subshell that restores the Dockerfile on exit
+        (
+            python3 scripts/validate_tasks_preflight.py \
+                --task "$abs_path" \
+                --smoke-runtime \
+                --smoke-timeout-sec "$TASK_TIMEOUT" \
+                --format json \
+                > "$JOBS_DIR/${bm}.log" 2>&1
+            __rc=$?
+            if [ "$__sg_swapped" = true ]; then
+                restore_dockerfile "$abs_path"
+            fi
+            exit $__rc
+        ) &
     else
         echo "Launching harbor smoke: $bm ($path)"
         BASELINE_MCP_TYPE=none harbor run \

@@ -6,42 +6,34 @@ This repository contains **benchmark task definitions**, **evaluation configs**,
 
 ---
 
-## Benchmark Suites
+## Benchmark Suites (SDLC-Aligned)
 
-| Suite | Tasks | Languages | Evaluation Method | SDLC Phase |
-|-------|------:|-----------|-------------------|------------|
-| `ccb_swebenchpro` | 36 | Go, TypeScript, Python, JavaScript | LLM judge + test suite | Bug fixing |
-| `ccb_largerepo` | 25 | Go, Rust, C/C++, Java, Python, TypeScript | LLM judge + test suite | Feature impl, Analysis, Debugging, Security |
-| `ccb_docgen` | 13 | Go, C++, Java, TypeScript | LLM judge + keyword checks | Documentation |
-| `ccb_crossrepo` | 12 | Go, C++ | LLM judge + test suite | Architecture, Bug fix, Refactoring, Discovery |
-| `ccb_enterprise` | 12 | Go, Python | LLM judge + test suite | Impact analysis, Feature impl, Bug fix |
-| `ccb_pytorch` | 11 | C++ | LLM judge + test suite | Bug fixing |
-| `ccb_navprove` | 9 | Go, Python, TypeScript | LLM judge + test suite | Debugging |
-| `ccb_codereview` | 8 | C, C++, C#, Go, Java, JavaScript, TypeScript | Hybrid detection + fix scoring | Testing & QA |
-| `ccb_dibench` | 8 | Python, Rust, JavaScript, C# | LLM judge + syntax/dependency validation | Dependency inference |
-| `ccb_governance` | 8 | Go, Python | LLM judge + test suite | Feature impl, Bug fix |
-| `ccb_nlqa` | 8 | Go, C++, Java, TypeScript | LLM judge + test suite | Debugging, Discovery |
-| `ccb_onboarding` | 8 | Go, C++, Java | LLM judge + test suite | Discovery |
-| `ccb_security` | 8 | Go, C, C++, Java | LLM judge + test suite | Discovery |
-| `ccb_tac` | 8 | C++, Python | LLM judge + deterministic checks | Mixed (4 phases) |
-| `ccb_linuxflbench` | 5 | C | Test script verification | Kernel fault localization |
-| `ccb_investigation` | 4 | Go, Python | LLM judge + test suite | Discovery |
-| `ccb_sweperf` | 3 | Python | LLM judge + test suite | Testing & QA |
-| **Total** | **186** | | | |
+Eight suites organized by software development lifecycle phase:
 
-Archived suites (not included in official evaluation): `ccb_dependeval`, `ccb_locobench`, `ccb_repoqa`, and `ccb_k8sdocs` (superseded by `ccb_docgen`). Task files live under `benchmarks/archive/` or their original directories.
+| Suite | SDLC Phase | Phase 1 Tasks | Target | Description |
+|-------|-----------|------:|------:|-------------|
+| `ccb_understand` | Requirements & Discovery | 20 | 20 | Codebase comprehension, onboarding, Q&A, knowledge recovery |
+| `ccb_design` | Architecture & Design | 20 | 20 | Architecture analysis, dependency graphs, change impact |
+| `ccb_fix` | Bug Repair | 25 | 25 | Diagnosing and fixing real bugs across production codebases |
+| `ccb_build` | Feature & Refactoring | 25 | 25 | New features, refactoring, dependency management |
+| `ccb_test` | Testing & QA | 14 | 20 | Code review, performance testing, code search validation |
+| `ccb_document` | Documentation | 13 | 20 | API references, architecture docs, migration guides |
+| `ccb_secure` | Security & Compliance | 20 | 20 | CVE analysis, reachability, governance, access control |
+| `ccb_debug` | Debugging & Investigation | 20 | 20 | Root cause tracing, fault localization, provenance |
+| **Total** | | **157** | **170** | |
+
+See `docs/PRD_SDLC_SUITE_REORGANIZATION.md` for the reorganization rationale and task mapping.
 
 ---
 
-## 3-Config Evaluation Matrix
+## 2-Config Evaluation Matrix
 
-All benchmarks are evaluated across three agent configurations that vary the external context tools available via MCP:
+All benchmarks are evaluated across two agent configurations that vary the external context tools available via MCP:
 
 | Paper Config Name | `BASELINE_MCP_TYPE` | MCP Tools Available |
 |-------------------|---------------------|---------------------|
 | Baseline | `none` | None (agent uses only built-in tools) |
-| MCP-Base | `sourcegraph_base` | `sg_keyword_search`, `sg_read_file`, `sg_find_file`, `sg_nls_search`, `sg_search_suggestions`, `sg_get_context` (6 tools) |
-| MCP-Full | `sourcegraph_full` | All MCP-Base tools + `sg_deepsearch`, `sg_deepsearch_read` (8 tools) |
+| MCP-Full | `sourcegraph_full` | All 13 Sourcegraph MCP tools including `sg_deepsearch`, `sg_deepsearch_read` |
 
 See [docs/CONFIGS.md](docs/CONFIGS.md) for the full tool-by-tool breakdown.
 
@@ -50,46 +42,29 @@ See [docs/CONFIGS.md](docs/CONFIGS.md) for the full tool-by-tool breakdown.
 ## Repository Structure
 
 ```
-benchmarks/              # Task definitions organized by benchmark suite
-  archive/               #   Archived suites (ccb_dependeval, ccb_repoqa, ccb_k8sdocs, ccb_locobench)
-  ccb_codereview/        #   AI code review: PR defect detection (8 tasks)
-  ccb_crossrepo/         #   Cross-repository reasoning (12 tasks)
-  ccb_dibench/           #   Dependency inference tasks (8 tasks)
-  ccb_docgen/            #   Documentation generation (13 tasks)
-  ccb_enterprise/        #   Enterprise codebase challenges (12 tasks)
-  ccb_governance/        #   Access control and policy enforcement (8 tasks)
-  ccb_investigation/     #   Deep debugging and investigation (4 tasks)
-  ccb_largerepo/         #   Large-repo code navigation (25 tasks)
-  ccb_linuxflbench/      #   Linux kernel fault localization (5 tasks)
-  ccb_navprove/          #   Navigation and provenance reasoning (9 tasks)
-  ccb_nlqa/              #   Natural-language code Q&A (8 tasks)
-  ccb_onboarding/        #   Codebase onboarding and orientation (8 tasks)
-  ccb_pytorch/           #   PyTorch PR-level tasks (11 tasks)
-  ccb_security/          #   Security analysis and CVE reasoning (8 tasks)
-  ccb_swebenchpro/       #   SWE-Bench Pro bug-fixing tasks (36 tasks)
-  ccb_sweperf/           #   Performance testing (3 tasks)
-  ccb_tac/               #   TheAgentCompany tasks (8 tasks)
-configs/                 # 3-config comparison shell runners + task selection
+benchmarks/              # Task definitions organized by SDLC phase
+  ccb_build/             #   Feature & Refactoring (25 tasks)
+  ccb_debug/             #   Debugging & Investigation (20 tasks)
+  ccb_design/            #   Architecture & Design (20 tasks)
+  ccb_document/          #   Documentation (13 tasks)
+  ccb_fix/               #   Bug Repair (25 tasks)
+  ccb_secure/            #   Security & Compliance (20 tasks)
+  ccb_test/              #   Testing & QA (14 tasks)
+  ccb_understand/        #   Requirements & Discovery (20 tasks)
+configs/                 # Run configs and task selection
   _common.sh             #   Shared infra: token refresh, parallel execution, multi-account
-  codereview_2config.sh  #   Per-suite runner: CodeReview (8 tasks)
-  crossrepo_2config.sh   #   Per-suite runner: CrossRepo (12 tasks)
-  dibench_2config.sh     #   Per-suite runner: DIBench (8 tasks)
-  docgen_2config.sh      #   Per-suite runner: DocGen (13 tasks)
-  enterprise_2config.sh  #   Per-suite runner: Enterprise (12 tasks)
-  governance_2config.sh  #   Per-suite runner: Governance (8 tasks)
-  investigation_2config.sh # Per-suite runner: Investigation (4 tasks)
-  largerepo_2config.sh   #   Per-suite runner: LargeRepo (25 tasks)
-  linuxflbench_2config.sh #  Per-suite runner: LinuxFLBench (5 tasks)
-  navprove_2config.sh    #   Per-suite runner: NavProve (9 tasks)
-  nlqa_2config.sh        #   Per-suite runner: NLQA (8 tasks)
-  onboarding_2config.sh  #   Per-suite runner: Onboarding (8 tasks)
-  pytorch_2config.sh     #   Per-suite runner: PyTorch (11 tasks)
-  security_2config.sh    #   Per-suite runner: Security (8 tasks)
-  swebenchpro_2config.sh #   Per-suite runner: SWE-Bench Pro (36 tasks)
-  sweperf_2config.sh     #   Per-suite runner: SWE-Perf (3 tasks)
-  tac_2config.sh         #   Per-suite runner: TheAgentCompany (8 tasks)
+  sdlc_suite_2config.sh  #   Generic SDLC runner (used by phase wrappers below)
+  build_2config.sh       #   Phase wrapper: Build (25 tasks)
+  debug_2config.sh       #   Phase wrapper: Debug (20 tasks)
+  design_2config.sh      #   Phase wrapper: Design (20 tasks)
+  document_2config.sh    #   Phase wrapper: Document (13 tasks)
+  fix_2config.sh         #   Phase wrapper: Fix (25 tasks)
+  secure_2config.sh      #   Phase wrapper: Secure (20 tasks)
+  test_2config.sh        #   Phase wrapper: Test (14 tasks)
   run_selected_tasks.sh  #   Unified runner for all tasks
+  validate_one_per_benchmark.sh  # Pre-flight smoke (1 task per suite)
   selected_benchmark_tasks.json  # Canonical task selection with metadata
+  archive/               #   Pre-SDLC migration scripts (preserved for history)
 scripts/                 # Metrics extraction, evaluation, and operational tooling
   ccb_metrics/           #   Python package: models, extractors, discovery, judge context
   generate_eval_report.py  # CLI: deterministic evaluation report generator
@@ -114,7 +89,7 @@ tests/                   # Unit tests for scripts/
   test_abc_score_task.py #   Tests for task quality scorer
   test_extract_task_metrics.py # Tests for metrics extraction
 docs/                    # Operational documentation
-  CONFIGS.md             #   3-config tool breakdown
+  CONFIGS.md             #   2-config tool breakdown
   ERROR_CATALOG.md       #   Known error fingerprints, causes, fixes
   QA_PROCESS.md          #   Quality assurance and validation pipeline
   TASK_CATALOG.md        #   Detailed per-task reference
@@ -131,9 +106,7 @@ skills/                  # AI agent skill definitions (operational runbooks)
 schemas/                 # JSON schemas for MANIFEST.json, task.toml, etc.
 ```
 
-Each benchmark directory contains:
-- `MANIFEST.json` -- metadata, task IDs, evaluation config
-- Per-task subdirectories with `instruction.md`, `task.toml`, tests, and ground truth (or `solution/`)
+Each SDLC suite directory contains per-task subdirectories with `instruction.md`, `task.toml`, `tests/`, and ground truth (or `solution/`).
 
 ---
 
@@ -166,46 +139,38 @@ See `python3 scripts/generate_eval_report.py --help` for all options.
 
 ## Running with Harbor
 
-The unified runner executes all 186 tasks across the 3-config matrix:
+The unified runner executes all 157 tasks across the 2-config matrix:
 
 ```bash
-# Run all 186 tasks across 3 configs
+# Run all 157 tasks across 2 configs
 bash configs/run_selected_tasks.sh
 
 # Run only the baseline config
 bash configs/run_selected_tasks.sh --baseline-only
 
+# Run a single SDLC phase
+bash configs/run_selected_tasks.sh --benchmark ccb_fix
+
 # Dry run to list tasks without executing
 bash configs/run_selected_tasks.sh --dry-run
 ```
 
-Per-suite runners are also available for individual benchmarks:
+Per-phase runners are also available:
 
 ```bash
-bash configs/swebenchpro_2config.sh      # 36 SWE-Bench Pro tasks
-bash configs/largerepo_2config.sh        # 25 LargeRepo tasks
-bash configs/docgen_2config.sh           # 13 DocGen tasks
-bash configs/crossrepo_2config.sh        # 12 CrossRepo tasks
-bash configs/enterprise_2config.sh       # 12 Enterprise tasks
-bash configs/pytorch_2config.sh          # 11 PyTorch tasks
-bash configs/navprove_2config.sh         # 9 NavProve tasks
-bash configs/codereview_2config.sh       # 8 CodeReview tasks
-bash configs/dibench_2config.sh          # 8 DIBench tasks
-bash configs/governance_2config.sh       # 8 Governance tasks
-bash configs/nlqa_2config.sh             # 8 NLQA tasks
-bash configs/onboarding_2config.sh       # 8 Onboarding tasks
-bash configs/security_2config.sh         # 8 Security tasks
-bash configs/tac_2config.sh              # 8 TheAgentCompany tasks
-bash configs/linuxflbench_2config.sh     # 5 LinuxFLBench tasks (see note below)
-bash configs/investigation_2config.sh    # 4 Investigation tasks
-bash configs/sweperf_2config.sh          # 3 SWE-Perf tasks
+bash configs/fix_2config.sh              # 25 Bug Repair tasks
+bash configs/build_2config.sh            # 25 Feature & Refactoring tasks
+bash configs/understand_2config.sh       # 20 Requirements & Discovery tasks
+bash configs/design_2config.sh           # 20 Architecture & Design tasks
+bash configs/debug_2config.sh            # 20 Debugging & Investigation tasks
+bash configs/secure_2config.sh           # 20 Security & Compliance tasks
+bash configs/test_2config.sh             # 14 Testing & QA tasks
+bash configs/document_2config.sh         # 13 Documentation tasks
 ```
 
-All runners support `--baseline-only` and `--full-only` flags.
+All runners support `--baseline-only`, `--full-only`, `--task TASK_ID`, and `--parallel N` flags.
 
-**LinuxFLBench note:** Docker image build is slow (~10 min) due to Linux kernel partial clone (~2GB). Pre-build images before running to save time.
-
-Requires [Harbor](https://github.com/laude-institute/harbor/tree/main) installed and configured with a Claude API key.
+Requires [Harbor](https://github.com/laude-institute/harbor/tree/main) installed and configured with a Max subscription.
 
 ---
 

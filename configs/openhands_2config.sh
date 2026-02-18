@@ -15,7 +15,7 @@
 #   --agent-path PATH      Override Harbor agent import path
 #   --parallel N           Max parallel task subshells (default: 1)
 #   --category CATEGORY    Run category label for jobs dir (default: staging)
-#   --benchmark BENCH      Optional benchmark filter (e.g. ccb_crossrepo)
+#   --benchmark BENCH      Optional benchmark filter (e.g. ccb_build, ccb_fix)
 
 set -e
 
