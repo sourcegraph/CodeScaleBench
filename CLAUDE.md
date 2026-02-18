@@ -35,6 +35,14 @@ Use these defaults unless there is a task-specific reason not to.
 - Data hygiene: `sync-metadata`, `reextract-metrics`, `archive-run`
 - Planning/prioritization: `whats-next`
 
+## Evaluation Configs
+Two configs per task: **Baseline** (full local code, no MCP) and **MCP-Full**
+(local source truncated, Sourcegraph MCP enabled). MCP-Full uses
+`Dockerfile.sg_only` so the agent cannot read source locally and must discover
+code via MCP tools. The verifier restores the full repo before scoring.
+See `docs/CONFIGS.md` for the full environment model, tool lists, and how to
+add sg_only support to new tasks.
+
 ## Standard Workflow
 1. Run infrastructure checks before any batch.
 2. Validate task integrity before launch (include runtime smoke for new/changed tasks).
