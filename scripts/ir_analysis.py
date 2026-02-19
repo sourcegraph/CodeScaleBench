@@ -924,14 +924,65 @@ def compute_cost_efficiency(
     }
 
 
+def _compute_per_suite_correlation(
+    ir_scores: list[IRScores],
+    gt_registry: dict[str, TaskGroundTruth],
+) -> dict | None:
+    """Compute per-suite Spearman retrieval-outcome correlation.
+
+    Uses retrieval_outcome_correlation from ccb_metrics.statistics for the
+    heavy lifting: file_recall as IR metric, reward from MANIFEST.
+    Returns per-suite rho, p-value, and effect size.
+    """
+    manifest_rewards = _load_manifest_rewards()
+    if not manifest_rewards:
+        return None
+
+    # Build parallel lists: ir_score, reward, suite_label
+    ir_vals: list[float] = []
+    reward_vals: list[float] = []
+    suite_labels: list[str] = []
+
+    for s in ir_scores:
+        reward = manifest_rewards.get((s.task_id, s.config_name))
+        if reward is None:
+            continue
+        suite = _infer_suite(s.task_id) or "unknown"
+        ir_vals.append(s.file_recall)
+        reward_vals.append(reward)
+        suite_labels.append(suite)
+
+    if len(ir_vals) < 3:
+        return None
+
+    try:
+        from ccb_metrics.statistics import retrieval_outcome_correlation
+        return retrieval_outcome_correlation(ir_vals, reward_vals, suite_labels)
+    except ImportError:
+        return None
+
+
 def run_ir_analysis(
     suite_filter: str | None = None,
     per_task: bool = False,
     value_weights: tuple[float, ...] = (0.25, 0.25, 0.20, 0.15, 0.15),
     runs_dir: Path | None = None,
     staging: bool = False,
+    min_confidence: str = "medium",
+    correlate: bool = False,
 ) -> dict:
-    """Main analysis pipeline."""
+    """Main analysis pipeline.
+
+    Args:
+        min_confidence: Minimum GT confidence for aggregate metrics.
+            "low" includes everything (backwards compatible).
+            "medium" excludes low-confidence tasks from aggregates.
+            "high" restricts aggregates to high-confidence GT only.
+            Tasks excluded from aggregates are still included in per-task
+            output with a [low-conf] marker.
+        correlate: If True, compute per-suite Spearman retrieval-outcome
+            correlation via ccb_metrics.statistics.retrieval_outcome_correlation.
+    """
     gt_registry = _ensure_ground_truth()
     if not gt_registry:
         return {"error": "No ground truth available. Run --build-ground-truth first."}
@@ -1030,19 +1081,58 @@ def run_ir_analysis(
 
     n_flagged = n_before - len(all_scores)
 
-    # Aggregate
-    overall_by_config: dict[str, list[IRScores]] = defaultdict(list)
+    # --- Confidence gating (US-011) ---
+    # Build lookup: task_id -> confidence level from ground truth registry
+    _CONF_ORDER = {"high": 3, "medium": 2, "low": 1}
+    min_conf_level = _CONF_ORDER.get(min_confidence, 2)
+
+    # Identify tasks below the confidence threshold
+    low_conf_task_ids: set[str] = set()
     for s in all_scores:
+        gt = gt_registry.get(s.task_id)
+        if gt:
+            task_conf = _CONF_ORDER.get(gt.confidence, 1)
+            if task_conf < min_conf_level:
+                low_conf_task_ids.add(s.task_id)
+
+    # Split scores: agg_scores for aggregation, all_scores kept for per-task
+    agg_scores: list[IRScores] = [
+        s for s in all_scores if s.task_id not in low_conf_task_ids
+    ]
+    agg_by_suite_config: dict[tuple[str, str], list[IRScores]] = defaultdict(list)
+    for s in agg_scores:
+        suite_key = _infer_suite(s.task_id) or "unknown"
+        agg_by_suite_config[(suite_key, s.config_name)].append(s)
+
+    # Per-suite confidence breakdown
+    conf_breakdown: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for s in all_scores:
+        gt = gt_registry.get(s.task_id)
+        if gt:
+            suite_key = _infer_suite(s.task_id) or "unknown"
+            conf_breakdown[suite_key][gt.confidence] += 1
+
+    # Aggregate (using confidence-filtered scores)
+    overall_by_config: dict[str, list[IRScores]] = defaultdict(list)
+    for s in agg_scores:
         overall_by_config[s.config_name].append(s)
 
     result: dict = {
         "summary": {
             "total_tasks_with_gt": len(gt_registry),
             "total_runs_analyzed": len(all_scores),
+            "total_in_aggregates": len(agg_scores),
+            "excluded_low_confidence": len(all_scores) - len(agg_scores),
+            "low_confidence_task_ids": sorted(low_conf_task_ids),
+            "min_confidence": min_confidence,
             "skipped_no_ground_truth": skipped_no_gt,
             "skipped_no_transcript": skipped_no_transcript,
             "excluded_zero_mcp_sg": n_flagged,
             "excluded_zero_mcp_task_ids": sorted(flagged_ids),
+            "confidence_breakdown_by_suite": {
+                suite: dict(sorted(counts.items()))
+                for suite, counts in sorted(conf_breakdown.items())
+            },
         },
         "overall_by_config": {
             cfg: aggregate_ir_scores(scores)
@@ -1050,7 +1140,7 @@ def run_ir_analysis(
         },
         "by_suite_config": {
             f"{suite}__{cfg}": aggregate_ir_scores(scores)
-            for (suite, cfg), scores in sorted(by_suite_config.items())
+            for (suite, cfg), scores in sorted(agg_by_suite_config.items())
         },
     }
 
@@ -1204,13 +1294,13 @@ def run_ir_analysis(
         except ImportError:
             pass
 
-    # US-003: Retrieval-outcome correlation
-    corr = compute_retrieval_outcome_correlation(all_scores)
+    # US-003: Retrieval-outcome correlation (uses agg_scores for confidence gating)
+    corr = compute_retrieval_outcome_correlation(agg_scores)
     if corr:
         result["retrieval_outcome_correlation"] = corr
 
     # US-004: Composite MCP value scores
-    value_scores = compute_mcp_value_scores(all_scores, weights=value_weights)
+    value_scores = compute_mcp_value_scores(agg_scores, weights=value_weights)
     if value_scores:
         by_suite: dict[str, list[MCPValueScore]] = defaultdict(list)
         for vs in value_scores:
@@ -1233,12 +1323,27 @@ def run_ir_analysis(
         }
 
     # US-005: Cost-efficiency metrics
-    cost_eff = compute_cost_efficiency(all_scores)
+    cost_eff = compute_cost_efficiency(agg_scores)
     if cost_eff:
         result["cost_efficiency"] = cost_eff
 
+    # US-011: --correlate — per-suite Spearman retrieval-outcome correlation
+    if correlate:
+        corr_data = _compute_per_suite_correlation(agg_scores, gt_registry)
+        if corr_data:
+            result["per_suite_correlation"] = corr_data
+
     if per_task:
-        result["per_task"] = [s.to_dict() for s in all_scores]
+        # Mark low-confidence tasks in per-task output
+        per_task_list = []
+        for s in all_scores:
+            d = s.to_dict()
+            gt = gt_registry.get(s.task_id)
+            d["gt_confidence"] = gt.confidence if gt else "unknown"
+            if s.task_id in low_conf_task_ids:
+                d["confidence_excluded"] = True
+            per_task_list.append(d)
+        result["per_task"] = per_task_list
 
     return result
 
@@ -1253,12 +1358,26 @@ def format_table(data: dict) -> str:
     s = data.get("summary", {})
     lines.append(f"Tasks with ground truth: {s.get('total_tasks_with_gt', 0)}")
     lines.append(f"Runs analyzed:           {s.get('total_runs_analyzed', 0)}")
+    lines.append(f"In aggregates:           {s.get('total_in_aggregates', s.get('total_runs_analyzed', 0))}")
+    min_conf = s.get("min_confidence", "medium")
+    n_low_conf = s.get("excluded_low_confidence", 0)
+    if n_low_conf:
+        lines.append(f"Excluded (low-conf GT):  {n_low_conf}  (below --min-confidence={min_conf})")
     lines.append(f"Skipped (no GT):         {s.get('skipped_no_ground_truth', 0)}")
     lines.append(f"Skipped (no transcript): {s.get('skipped_no_transcript', 0)}")
     n_zero_mcp = s.get("excluded_zero_mcp_sg", 0)
     if n_zero_mcp:
         lines.append(f"Excluded (zero-MCP SG):  {n_zero_mcp}  (invalid: MCP available but never used)")
     lines.append("")
+
+    # Per-suite confidence breakdown
+    conf_bd = s.get("confidence_breakdown_by_suite", {})
+    if conf_bd:
+        lines.append("GT CONFIDENCE BREAKDOWN BY SUITE:")
+        for suite, counts in sorted(conf_bd.items()):
+            parts = [f"{c} {n}" for c, n in sorted(counts.items(), key=lambda x: -{"high": 3, "medium": 2, "low": 1}.get(x[0], 0))]
+            lines.append(f"  {suite:35s} {', '.join(parts)}")
+        lines.append("")
 
     # Overall by config
     overall = data.get("overall_by_config", {})
@@ -1358,6 +1477,29 @@ def format_table(data: dict) -> str:
                     f"    {row['task_id']:40s} {row['suite']:20s} "
                     f"{row.get('mrr_delta', 0):>+7.3f} {row.get('reward_delta', 0):>+7.3f}"
                 )
+        lines.append("")
+
+    # Per-suite retrieval-outcome correlation (--correlate)
+    psc = data.get("per_suite_correlation", {})
+    if psc:
+        lines.append("PER-SUITE RETRIEVAL-OUTCOME CORRELATION (--correlate):")
+        overall_c = psc.get("overall", {})
+        if overall_c:
+            lines.append(
+                f"  Overall: rho={overall_c.get('rho', 'N/A')}, "
+                f"p={overall_c.get('p_value', 'N/A')}, "
+                f"effect_size={overall_c.get('effect_size', 'N/A')}"
+            )
+        header = f"  {'Suite':30s} {'rho':>8s} {'p-value':>10s} {'effect':>8s}"
+        lines.append(header)
+        lines.append("  " + "-" * (len(header) - 2))
+        for key, vals in sorted(psc.items()):
+            if key == "overall":
+                continue
+            rho = vals.get("rho", 0.0)
+            p_val = vals.get("p_value", 1.0)
+            eff = vals.get("effect_size", 0.0)
+            lines.append(f"  {key:30s} {rho:>+8.4f} {p_val:>10.6f} {eff:>+8.4f}")
         lines.append("")
 
     # MCP Value Scores
@@ -1484,6 +1626,26 @@ def format_table(data: dict) -> str:
                         f"delta={delta_val:>+12,.0f}  ({pct:>+.1f}%)"
                     )
             lines.append("")
+
+    # Per-task scores (if present)
+    per_task_data = data.get("per_task", [])
+    if per_task_data:
+        lines.append("PER-TASK IR SCORES:")
+        header = (
+            f"  {'Task':40s} {'Config':20s} {'MRR':>7s} {'F.Rec':>7s} "
+            f"{'Conf':>6s}"
+        )
+        lines.append(header)
+        lines.append("  " + "-" * (len(header) - 2))
+        for t in per_task_data:
+            conf = t.get("gt_confidence", "?")
+            marker = " [low-conf]" if t.get("confidence_excluded") else ""
+            lines.append(
+                f"  {t.get('task_id', ''):40s} {t.get('config_name', ''):20s} "
+                f"{t.get('mrr', 0):>7.3f} {t.get('file_recall', 0):>7.3f} "
+                f"{conf:>6s}{marker}"
+            )
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -1775,6 +1937,24 @@ def parse_args():
         "--runs-dir", default=None,
         help="Custom runs directory to scan (overrides --staging)",
     )
+    parser.add_argument(
+        "--min-confidence", choices=["high", "medium", "low"], default="medium",
+        help=(
+            "Minimum GT confidence for aggregate metrics. "
+            "'medium' (default) excludes low-confidence tasks from aggregates "
+            "(still shown in per-task output with [low-conf] marker). "
+            "'low' includes everything (backwards compatible). "
+            "'high' restricts aggregates to high-confidence GT only."
+        ),
+    )
+    parser.add_argument(
+        "--correlate", action="store_true",
+        help=(
+            "Compute per-suite Spearman retrieval-outcome correlation "
+            "using retrieval_outcome_correlation from ccb_metrics.statistics. "
+            "Outputs rho, p-value, and effect size per suite."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1816,6 +1996,8 @@ def main():
         value_weights=vw,
         runs_dir=custom_runs_dir,
         staging=args.staging,
+        min_confidence=args.min_confidence,
+        correlate=args.correlate,
     )
 
     if args.report:
