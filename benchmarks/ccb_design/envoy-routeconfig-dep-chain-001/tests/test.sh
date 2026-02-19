@@ -95,8 +95,8 @@ try:
     if not isinstance(reported_steps, list):
         print("Agent output is not a JSON array — scoring as empty.")
         reported_steps = []
-except (json.JSONDecodeError, ValueError) as e:
-    print(f"Malformed JSON in agent output: {e}")
+except (json.JSONDecodeError, ValueError, FileNotFoundError, OSError) as e:
+    print(f"Could not read/parse agent output: {e}")
     reported_steps = []
 
 num_reported = len(reported_steps)

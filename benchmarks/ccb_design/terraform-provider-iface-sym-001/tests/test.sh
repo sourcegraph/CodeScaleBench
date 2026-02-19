@@ -85,8 +85,8 @@ try:
     if not isinstance(reported, list):
         print("Agent output is not a JSON array — scoring as empty.")
         reported = []
-except (json.JSONDecodeError, ValueError) as e:
-    print(f"Malformed JSON in agent output: {e}")
+except (json.JSONDecodeError, ValueError, FileNotFoundError, OSError) as e:
+    print(f"Could not read/parse agent output: {e}")
     reported = []
 
 num_reported = len(reported)

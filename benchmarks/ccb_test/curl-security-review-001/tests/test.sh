@@ -89,7 +89,7 @@ if os.path.isfile(review_path):
         reported = json.loads(raw)
         if not isinstance(reported, list):
             reported = []
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, FileNotFoundError, OSError):
         reported = []
 
 # Build set of expected file paths for matching
