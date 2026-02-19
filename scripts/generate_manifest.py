@@ -24,6 +24,16 @@ SKIP_PATTERNS = ["__broken_verifier", "validation_test", "archive", "__v1_hinted
 
 # Map on-disk dir prefixes to MANIFEST suite names
 DIR_PREFIX_TO_SUITE = {
+    # SDLC phase suite prefixes (new naming: {phase}_{model}_{timestamp})
+    "build_": "ccb_build",
+    "debug_": "ccb_debug",
+    "design_": "ccb_design",
+    "document_": "ccb_document",
+    "fix_": "ccb_fix",
+    "secure_": "ccb_secure",
+    "test_": "ccb_test",
+    "understand_": "ccb_understand",
+    # Legacy benchmark prefixes
     "bigcode_mcp_": "ccb_largerepo",
     "codereview_": "ccb_codereview",
     "crossrepo_": "ccb_crossrepo",
@@ -287,9 +297,13 @@ def extract_task_info(task_entry: dict) -> dict:
         "reward": round(reward_val, 4),
         "has_trajectory": has_trajectory,
         "has_cost": has_cost,
+        "judge_score": None,
+        "judge_model": None,
+        "judge_dimensions": None,
+        "judge_confidence": None,
     }
 
-    # LLM Judge score from judge_result.json alongside result.json
+    # LLM Judge fields from judge_result.json alongside result.json
     judge_path = trial_dir / "judge_result.json"
     if judge_path.is_file():
         try:
@@ -297,6 +311,17 @@ def extract_task_info(task_entry: dict) -> dict:
             js = jdata.get("judge_score")
             if js is not None:
                 info["judge_score"] = round(float(js), 4)
+            jm = jdata.get("judge_model")
+            if jm is not None:
+                info["judge_model"] = str(jm)
+            rubric = jdata.get("rubric")
+            if isinstance(rubric, dict):
+                info["judge_dimensions"] = rubric
+            # Voting confidence is stored in provenance.confidence (ensemble runs only)
+            prov = jdata.get("provenance") or {}
+            jc = prov.get("confidence")
+            if jc is not None:
+                info["judge_confidence"] = round(float(jc), 4)
         except (json.JSONDecodeError, OSError, TypeError, ValueError):
             pass
 
@@ -602,12 +627,23 @@ def main():
         for task_name in sorted(tasks.keys()):
             info = extract_task_info(tasks[task_name])
 
-            # Merge judge score from centralized index (if not already from judge_result.json)
-            if "judge_score" not in info:
+            # Merge judge fields from centralized index (if not already from judge_result.json)
+            if info.get("judge_score") is None:
                 judge_key = f"{suite}/{config}/{task_name}"
                 judge_entry = judge_scores.get(judge_key)
-                if judge_entry and "judge_score" in judge_entry:
-                    info["judge_score"] = round(float(judge_entry["judge_score"]), 4)
+                if judge_entry:
+                    js = judge_entry.get("judge_score")
+                    if js is not None:
+                        info["judge_score"] = round(float(js), 4)
+                    jm = judge_entry.get("judge_model")
+                    if jm is not None:
+                        info["judge_model"] = str(jm)
+                    rubric = judge_entry.get("rubric")
+                    if isinstance(rubric, dict):
+                        info["judge_dimensions"] = rubric
+                    jc = judge_entry.get("judge_confidence")
+                    if jc is not None:
+                        info["judge_confidence"] = round(float(jc), 4)
 
             task_infos[task_name] = info
             if info["status"] == "passed":
