@@ -41,13 +41,9 @@ from .ablation_config import (
     create_example_config,
 )
 
-from .harnesses import (
-    CodexHarnessAgent,
-    CopilotHarnessAgent,
-    CursorHarnessAgent,
-    GeminiHarnessAgent,
-    OpenHandsHarnessAgent,
-)
+# Harness agents require the ``harbor`` package (only available inside
+# Docker containers).  They are re-exported via __getattr__ so the rest
+# of this package works without harbor installed.
 
 __all__ = [
     # Metrics extraction
@@ -78,10 +74,26 @@ __all__ = [
     "parse_ablation_config",
     "create_example_config",
 
-    # Harness agents
+    # Harness agents (lazy-imported, require harbor)
     "CodexHarnessAgent",
     "CopilotHarnessAgent",
     "CursorHarnessAgent",
     "GeminiHarnessAgent",
     "OpenHandsHarnessAgent",
 ]
+
+
+_HARNESS_AGENTS = {
+    "CodexHarnessAgent",
+    "CopilotHarnessAgent",
+    "CursorHarnessAgent",
+    "GeminiHarnessAgent",
+    "OpenHandsHarnessAgent",
+}
+
+
+def __getattr__(name):
+    if name in _HARNESS_AGENTS:
+        from . import harnesses
+        return getattr(harnesses, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
