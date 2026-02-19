@@ -2,7 +2,7 @@ FROM gcc:14-bookworm
 
 WORKDIR /workspace
 
-# Install dependencies
+# Install dependencies (libboost-dev = headers only; avoids MPI/gfortran conflicts on gcc:14)
 RUN apt-get update && apt-get install -y \
     git \
     curl \
@@ -10,7 +10,8 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     npm \
     cmake \
-    libboost-all-dev
+    libboost-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
