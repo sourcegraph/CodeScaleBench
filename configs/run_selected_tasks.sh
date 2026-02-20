@@ -312,6 +312,9 @@ done
 
 print_validation_summary
 
+# Post-batch Docker cleanup
+cleanup_docker_resources
+
 echo ""
 echo "=============================================="
 echo "All Benchmarks Complete!"

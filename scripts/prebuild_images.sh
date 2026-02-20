@@ -46,6 +46,18 @@ if [ ${#SUITES[@]} -eq 0 ]; then
 fi
 
 # ============================================
+# Step 0: Lightweight pre-build cleanup
+# ============================================
+# Remove stopped containers and orphan volumes from previous runs.
+# Does NOT prune images (we need the layer cache for fast builds).
+if [ "$DRY_RUN" = false ]; then
+    echo "=== Pre-build cleanup ==="
+    docker container prune -f 2>/dev/null | tail -1 || true
+    docker volume prune -f 2>/dev/null | tail -1 || true
+    echo ""
+fi
+
+# ============================================
 # Step 1: Ensure base images are built
 # ============================================
 BASE_BUILD="$REPO_ROOT/base_images/build.sh"
