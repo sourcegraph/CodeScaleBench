@@ -952,17 +952,18 @@ run_paired_configs() {
     echo "Paired execution: $num_tasks tasks x 2 configs"
     echo "========================================"
     echo ""
-    echo "Each task launches baseline + sourcegraph_full simultaneously."
+    local full_config="${FULL_CONFIG:-sourcegraph_full}"
+    echo "Each task launches baseline + ${full_config} simultaneously."
     echo "Total concurrent containers: up to $((num_tasks * 2)) (limited by PARALLEL_JOBS=$PARALLEL_JOBS)"
     echo ""
 
-    mkdir -p "${jobs_base}/baseline" "${jobs_base}/sourcegraph_full"
+    mkdir -p "${jobs_base}/baseline" "${jobs_base}/${full_config}"
 
     # Build paired task list: each task gets two entries
     local paired_ids=()
     for task_id in "${_paired_task_ids[@]}"; do
         paired_ids+=("${task_id}|baseline|none")
-        paired_ids+=("${task_id}|sourcegraph_full|sourcegraph_full")
+        paired_ids+=("${task_id}|${full_config}|${full_config}")
     done
 
     # Wrapper command function that splits the paired ID
@@ -978,6 +979,77 @@ run_paired_configs() {
     }
 
     run_tasks_parallel paired_ids _paired_dispatch || true
+}
+
+# ============================================
+# DOCKER RESOURCE CLEANUP
+# ============================================
+# Clean up accumulated Docker resources after a batch completes.
+# Harbor's per-trial `docker compose down --rmi local` handles individual
+# containers, but BuildKit cache, dangling images, and orphan volumes
+# accumulate across trials. Call this after run_paired_configs / run_task_batch.
+#
+# Safety: skips if any hb__* containers are still running (parallel batch).
+# Only removes dangling (untagged) images — tagged base images (ccb-repo-*)
+# and pre-built task images (hb__*) are preserved.
+cleanup_docker_resources() {
+    echo ""
+    echo "========================================"
+    echo "Docker resource cleanup"
+    echo "========================================"
+
+    # Safety check: abort if benchmark containers are still running
+    local active_containers
+    active_containers=$(docker ps --filter "name=hb__" --format '{{.Names}}' 2>/dev/null | wc -l)
+    if [ "$active_containers" -gt 0 ]; then
+        echo "SKIP: $active_containers hb__* containers still running. Cleanup deferred."
+        return 0
+    fi
+
+    local before_df
+    before_df=$(docker system df --format '{{.Type}}\t{{.Reclaimable}}' 2>/dev/null || true)
+    echo "Before cleanup:"
+    echo "$before_df" | sed 's/^/  /'
+
+    # 1. Stopped containers (safe — Harbor already removed its own)
+    echo "Pruning stopped containers..."
+    docker container prune -f 2>/dev/null | tail -1 || true
+
+    # 2. Orphan anonymous volumes (from compose down race conditions)
+    echo "Pruning orphan volumes..."
+    docker volume prune -f 2>/dev/null | tail -1 || true
+
+    # 3. Dangling images only (untagged — won't touch ccb-repo-* or hb__*)
+    echo "Pruning dangling images..."
+    docker image prune -f 2>/dev/null | tail -1 || true
+
+    # 4. Harbor trial images — Harbor names per-trial images hb__sdlc_*_<hash>
+    #    and hb__rerun_*_<hash>. These are trial-specific copies of our
+    #    pre-built images (hb__<task_id>, hb__sgonly_<task_id>) and are safe
+    #    to remove after the trial completes. Pre-built images lack the
+    #    random suffix so the pattern does not match them.
+    local trial_images
+    trial_images=$(docker images --format '{{.Repository}}' 2>/dev/null \
+        | grep -E '^hb__(sdlc|rerun)_' || true)
+    if [ -n "$trial_images" ]; then
+        local count
+        count=$(echo "$trial_images" | wc -l)
+        echo "Removing $count Harbor trial images (hb__sdlc_*/hb__rerun_*)..."
+        echo "$trial_images" | xargs -r docker rmi -f 2>/dev/null | tail -1 || true
+    fi
+
+    # 5. BuildKit cache — reserve 20 GB for hot layers, trim the rest
+    # --reserved-space replaced --keep-storage in Docker 27+
+    echo "Trimming BuildKit cache (reserving 20GB)..."
+    docker builder prune --reserved-space=20GB -f 2>/dev/null | tail -1 \
+        || docker builder prune --keep-storage=20GB -f 2>/dev/null | tail -1 \
+        || true
+
+    local after_df
+    after_df=$(docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2>/dev/null || true)
+    echo "After cleanup:"
+    echo "$after_df" | sed 's/^/  /'
+    echo ""
 }
 
 # ============================================

@@ -37,3 +37,4 @@ Use Go's `testing` package. Each test function must start with `Test`. Use test 
 - Cover at least 3 pipeline stages (file discovery, metadata extraction, DB persistence)
 - Include at least one negative case (deleted file, corrupt metadata)
 - Do not fabricate package names or function signatures — inspect the actual codebase first
+- Do NOT run the tests yourself — write the test file and the evaluation system validates independently

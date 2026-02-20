@@ -3,6 +3,7 @@ FROM ubuntu:22.04
 # Install common tools (python3 needed for inject_defects.sh)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
+    ca-certificates \
     curl \
     python3 \
     ripgrep \

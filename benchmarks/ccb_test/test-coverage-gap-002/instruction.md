@@ -52,3 +52,4 @@ Write to `/workspace/coverage_analysis.md`:
 ## Anti-Requirements
 - Do not fabricate class or method names — read the actual source first
 - Each gap must reference a specific file and approximate location
+- Do NOT run the tests yourself — write the test file and the evaluation system validates independently

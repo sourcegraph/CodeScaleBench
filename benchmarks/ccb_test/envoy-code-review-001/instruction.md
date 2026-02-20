@@ -9,7 +9,7 @@
 
 You are reviewing a recently merged pull request that modifies Envoy's HTTP filter chain. The PR touches the fault injection filter, external authorization filter, header utility functions, and the core filter manager. The stated goal was to add observability improvements and fix edge cases in filter chain iteration, but several defects were introduced during the merge — both functional bugs and cross-component interaction errors.
 
-Your task is to **find the defects, fix them in the code, and produce a structured review report**.
+Your task is to **find the defects and produce a structured review report with proposed fixes**.
 
 ## Context
 
@@ -25,8 +25,6 @@ The changes span four core areas of Envoy's HTTP filter infrastructure:
 
 ## Task
 
-YOU MUST IMPLEMENT CODE CHANGES to complete this task.
-
 Review the files listed above for the following types of defects:
 
 - **Functional bugs**: Logic errors that cause incorrect behavior (e.g., inverted conditions, wrong return values, missing state updates).
@@ -35,8 +33,10 @@ Review the files listed above for the following types of defects:
 
 For each defect you find:
 
-1. **Fix the code** by editing the affected file in `/workspace/`.
-2. **Record the defect** in your review report.
+1. **Describe the defect** in your review report.
+2. **Write a fix** as a unified diff in the `fix_patch` field.
+
+**Do NOT edit source files directly.** Express all fixes as unified diffs in your review report. The evaluation system will apply your patches and verify correctness.
 
 ### Expected Output
 
@@ -49,7 +49,7 @@ After completing your review, write a JSON file at `/workspace/review.json` cont
     "line": 155,
     "severity": "critical",
     "description": "Brief description of what is wrong and why",
-    "fix_applied": true
+    "fix_patch": "--- a/source/extensions/filters/http/fault/fault_filter.cc\n+++ b/source/extensions/filters/http/fault/fault_filter.cc\n@@ -153,5 +153,5 @@\n-    old line\n+    new line\n"
   }
 ]
 ```
@@ -59,13 +59,16 @@ Each entry must include:
 - `line` — Approximate line number where the defect occurs
 - `severity` — One of: `critical`, `high`, `medium`, `low`
 - `description` — What the defect is and what impact it has
-- `fix_applied` — Boolean indicating whether you committed a fix
+- `fix_patch` — Unified diff showing the proposed fix (use `--- a/` and `+++ b/` prefix format)
 
 ## Evaluation
 
-Your review will be evaluated on detection accuracy and fix quality.
+Your review will be evaluated on:
+- **Detection accuracy** (50%): Precision and recall of reported defects
+- **Fix quality** (50%): Whether your proposed patches correctly resolve the defects
 
-## Testing
+## Constraints
 
 - **Time limit**: 1200 seconds
-- Run `bash /workspace/tests/test.sh` to verify your changes
+- Do NOT edit source files directly — express fixes only in `fix_patch`
+- Do NOT run tests — the evaluation system handles verification

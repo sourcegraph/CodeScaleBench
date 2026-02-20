@@ -56,18 +56,18 @@ from run_judge import (
 BL_TASK_DIR = Path(
     "/home/stephanie_jarmak/CodeContextBench/runs/staging/"
     "test_sonnet_20260219_015458_to_20260219_213932/"
-    "baseline/ccb_test_aspnetcore-code-review-001_baseline/"
-    "aspnetcore-code-review-001__oQaYJCo"
+    "baseline/ccb_test_test-unitgen-go-001_baseline/"
+    "test-unitgen-go-001__7SxXhsF"
 )
 
 SG_TASK_DIR = Path(
     "/home/stephanie_jarmak/CodeContextBench/runs/staging/"
     "test_sonnet_20260219_015458_to_20260219_213932/"
-    "sourcegraph_full/ccb_test_aspnetcore-code-review-001_sourcegraph_full/"
-    "rerun_aspnetcore-code-review-001__sqVcQmi"
+    "sourcegraph_full/ccb_test_test-unitgen-go-001_sourcegraph_full/"
+    "sdlc_test_test-unitgen-go-001_TJ__VwAEJTL"
 )
 
-TASK_ID = "aspnetcore-code-review-001"
+TASK_ID = "test-unitgen-go-001"
 BENCHMARK = "ccb_test"
 MODEL = "gpt-4o"
 
