@@ -138,3 +138,58 @@ fail-fast if that model is unavailable in the configured Codex environment.
 
 For this rollout, Codex MCP policy is sourcegraph_full-only for MCP-enabled
 runs, with baseline comparisons using `none`. No other MCP modes are allowed.
+
+## Running MCP-Unique Tasks
+
+MCP-unique tasks use a separate selection file and support category filtering.
+
+### Selection File
+
+```bash
+# Run all 14 MCP-unique starter tasks (both configs)
+configs/run_selected_tasks.sh \
+  --selection-file configs/selected_mcp_unique_tasks.json
+
+# Dry run to preview
+configs/run_selected_tasks.sh \
+  --selection-file configs/selected_mcp_unique_tasks.json \
+  --dry-run
+```
+
+The `--selection-file` flag accepts any path to a selection JSON file. The
+file format is compatible with `configs/selected_benchmark_tasks.json` but
+uses `mcp_suite` instead of `benchmark` for suite identification.
+
+### Category Filter
+
+```bash
+# Run only category A (cross-repo tracing)
+configs/run_selected_tasks.sh \
+  --selection-file configs/selected_mcp_unique_tasks.json \
+  --use-case-category A
+
+# Run only Deep Search relevant tasks (E and J categories)
+configs/run_selected_tasks.sh \
+  --selection-file configs/selected_mcp_unique_tasks.json \
+  --use-case-category E
+configs/run_selected_tasks.sh \
+  --selection-file configs/selected_mcp_unique_tasks.json \
+  --use-case-category J
+```
+
+The `--use-case-category` flag filters tasks by the `use_case_category` field in
+the selection file (values: A through J, corresponding to the 10 ccb_mcp_* suites).
+This flag is only meaningful when used with `--selection-file`.
+
+### MCP-Unique vs Standard Suites
+
+| Feature | Standard suites | MCP-unique suites |
+|---------|----------------|-------------------|
+| Selection file | `selected_benchmark_tasks.json` | `selected_mcp_unique_tasks.json` |
+| Suite prefix | `ccb_<phase>` | `ccb_mcp_<category>` |
+| Verifier script | `tests/test.sh` | `tests/eval.sh` |
+| Oracle format | task-specific | `oracle_answer.json` + `oracle_checks.py` |
+| Local repo | full workspace | 1 local_checkout repo only |
+| MCP-Full behavior | truncated source | no source clone |
+
+See `docs/MCP_UNIQUE_TASKS.md` for full task authoring and evaluation details.

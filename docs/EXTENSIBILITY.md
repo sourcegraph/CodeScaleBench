@@ -80,3 +80,50 @@ When adding benchmark environment variants, keep canonical task definitions inta
 3. Document variant intent and caveats in a per-suite `VARIANTS.md`
    (for example under `benchmarks/ccb_document/`).
 4. Treat variant runs as separate studies in reporting and curation.
+
+## 7) Add MCP-Unique Tasks (ccb_mcp_* suites)
+
+MCP-unique tasks measure org-scale cross-repo discovery — what local-only agents
+cannot do. See `docs/MCP_UNIQUE_TASKS.md` for the full authoring guide.
+
+**Quick start:**
+
+```bash
+# 1. Generate from use case registry
+python3 scripts/generate_mcp_unique_tasks.py --use-case-ids <N> --curate-oracle --validate
+
+# 2. Register in selection file
+#    configs/selected_mcp_unique_tasks.json
+
+# 3. Validate
+python3 scripts/validate_mcp_task_instance.py --task-dir benchmarks/ccb_mcp_<suite>/<task>
+python3 scripts/validate_tasks_preflight.py --suite ccb_mcp_<suite>
+```
+
+**Key constraints:**
+- `task.toml` verification type must be `"test"` (Harbor standard)
+- `tests/eval.sh` must be executable (`chmod +x`)
+- Use `/tests/` paths inside eval.sh (Harbor uploads `tests/` to `/tests/`)
+- All repos in fixtures must be indexed in Sourcegraph
+- `scripts/ccb_metrics/oracle_checks.py` must be stdlib-only Python
+
+**Directory structure:**
+```
+benchmarks/ccb_mcp_<suite>/<task>/
+├── task.toml
+├── instruction.md
+├── environment/
+│   ├── Dockerfile           (baseline: clones local_checkout_repo)
+│   └── Dockerfile.sg_only   (MCP-full: no clone, marks /tmp/.sg_only_mode)
+└── tests/
+    ├── eval.sh              (exit-code-first evaluator)
+    ├── task_spec.json       (PRD-centered spec)
+    ├── oracle_answer.json   (gold agent answer)
+    ├── oracle_checks.py     (stdlib eval library)
+    └── criteria.json        (optional: rubric for Deep Search tasks)
+```
+
+When adding a new ccb_mcp_* suite, add the prefix to `DIR_PREFIX_TO_SUITE` in:
+- `scripts/aggregate_status.py`
+- `scripts/generate_manifest.py`
+- `scripts/run_judge.py`

@@ -193,6 +193,105 @@ Tasks without `defect_type` fields produce an empty annotations list.  The
 serialized registry (`configs/ground_truth_files.json`) includes annotations
 only when non-empty.
 
+## MCP-Unique Suite Scoring (ccb_mcp_* suites)
+
+MCP-unique tasks use a unified oracle check library for deterministic scoring,
+with optional rubric judge for Deep Search synthesis tasks.
+
+### Oracle Checks (scripts/ccb_metrics/oracle_checks.py)
+
+All MCP-unique tasks are scored by `oracle_checks.py`, a stdlib-only Python
+library invoked by `eval.sh`. There are 7 check types:
+
+| Check Type | Task Spec Field | Primary Score | Description |
+|-----------|----------------|---------------|-------------|
+| `file_set_match` | `required_files` | F1 (harmonic mean of recall + precision) | Files found vs oracle file list |
+| `symbol_resolution` | `required_symbols` | Recall | Symbols found vs oracle symbol list |
+| `dependency_chain` | `dependency_chains` | Chain recall | Chain steps found, order verified |
+| `provenance` | `must_cite_paths` / `must_cite_repos` | Provenance score | Agent text cites required paths/repos |
+| `keyword_presence` | `required_keywords` | Keyword recall | Required keywords in agent's answer text |
+| `json_schema_match` | `schema_path` | 1.0 if valid, 0.0 if invalid | Answer JSON validates against schema |
+| `test_ratio` | `test_command` | Pass ratio (passed / total) | For Category I: generated code passes tests |
+
+**Composite score** = mean of primary scores across all configured checks.
+
+```
+composite_score = mean([check_1_primary_score, check_2_primary_score, ...])
+```
+
+**Exit code**: `eval.sh` exits 0 if composite > 0 (agent found something), 1 if
+composite == 0 (total failure). Harbor reads the score from `/logs/verifier/reward.txt`.
+
+**No hardcoded thresholds**: Raw scores enable post-run calibration. See
+`docs/MCP_UNIQUE_CALIBRATION.md` for threshold guidance after first runs complete.
+
+### Agent Answer Format
+
+Agents write `/workspace/answer.json`:
+
+```json
+{
+  "files": [{"repo": "org/name", "path": "path/to/file.go"}],
+  "symbols": [{"repo": "org/name", "path": "path/to/file.go", "name": "SymbolName"}],
+  "chain": [
+    {"repo": "org/name", "path": "path/to/file.go", "symbol": "FirstStep"},
+    {"repo": "org2/name2", "path": "path/to/file2.go", "symbol": "SecondStep"}
+  ],
+  "text": "Narrative explanation with citations to repos and file paths..."
+}
+```
+
+The `text` field is required for `provenance` and `keyword_presence` checks
+(the oracle checks match substrings against it). The `files`, `symbols`, and
+`chain` fields are required for their respective check types.
+
+### Hybrid Scoring (Deep Search tasks)
+
+Three tasks (marked `deepsearch_relevant=true`) additionally use rubric judge scoring:
+- `CCX-onboard-050-ds`, `CCX-explore-042-ds`, `CCX-explore-091-ds`
+
+These tasks include `tests/criteria.json` with AAA criteria:
+
+```json
+[
+  {
+    "metric": "cross_repo_synthesis",
+    "description": "Accurate: correctly traces flow across repos. Attributed: cites specific files/repos. Actionable: identifies specific code entry points.",
+    "max_score": 4
+  }
+]
+```
+
+**Hybrid composite** (configurable, default 60/40):
+```
+hybrid_score = 0.6 × verifier_reward + 0.4 × rubric_score
+```
+
+Run hybrid scoring:
+```bash
+python3 scripts/run_judge.py --hybrid --task CCX-onboard-050-ds
+```
+
+The `judge_result.json` output includes `criteria_scores`, `rubric_score`, and
+`hybrid_composite` when criteria.json is present.
+
+### Retrieval KPIs (scripts/ccb_metrics/retrieval.py)
+
+In addition to reward, retrieval metrics are extracted from agent transcripts:
+
+| Metric | Description |
+|--------|-------------|
+| `oracle_coverage` | Fraction of oracle items found via any tool (local or MCP) |
+| `time_to_first_oracle_hit_ms` | Time from task start to first oracle item found |
+| `unique_repos_touched` | Number of distinct repos accessed during the task |
+| `unique_orgs_touched` | Number of distinct GitHub orgs accessed |
+| `mcp_tool_counts` | Count of each MCP tool used |
+| `local_tool_counts` | Count of each local tool used |
+
+**Key principle (Q10)**: `oracle_coverage` counts items found via any tool — both
+local grep and MCP. Baseline agents can score non-zero if oracle items happen to be
+in their local checkout. MCP advantage shows up in coverage of MCP-only repos.
+
 ## Archived Suite Scoring (for reference)
 
 The following suites are archived and not included in official evaluation:
