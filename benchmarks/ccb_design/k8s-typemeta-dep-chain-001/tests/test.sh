@@ -74,120 +74,132 @@ def lines_match(line1, line2, tolerance):
         return True  # Don't penalize if line number not provided
     return abs(int(line1) - int(line2)) <= tolerance
 
-# ── Load ground truth ────────────────────────────────────────────────────
-with open(GT_PATH) as f:
-    gt = json.load(f)
-
-expected_steps = gt.get("steps", [])
-if not expected_steps:
-    print("ERROR: ground_truth.json must have a 'steps' array")
-    write_reward(0.0)
-    sys.exit(0)
-
-num_expected = len(expected_steps)
-
-# ── Load agent output ────────────────────────────────────────────────────
+# ── Main scoring logic (wrapped in try/except for reward safety) ─────────
 try:
-    with open(OUTPUT_PATH) as f:
-        raw = f.read()
-    raw = strip_code_fences(raw)
-    reported_steps = json.loads(raw)
-    if not isinstance(reported_steps, list):
-        print("Agent output is not a JSON array — scoring as empty.")
+    # ── Load ground truth ────────────────────────────────────────────────
+    with open(GT_PATH) as f:
+        gt = json.load(f)
+
+    expected_steps = gt.get("steps", [])
+    if not expected_steps:
+        print("ERROR: ground_truth.json must have a 'steps' array")
+        write_reward(0.0)
+        sys.exit(0)
+
+    num_expected = len(expected_steps)
+
+    # ── Load agent output ────────────────────────────────────────────────
+    try:
+        with open(OUTPUT_PATH) as f:
+            raw = f.read()
+        raw = strip_code_fences(raw)
+        reported_steps = json.loads(raw)
+        if not isinstance(reported_steps, list):
+            print("Agent output is not a JSON array — scoring as empty.")
+            reported_steps = []
+    except (json.JSONDecodeError, ValueError, FileNotFoundError, OSError) as e:
+        print(f"Could not read/parse agent output: {e}")
         reported_steps = []
-except (json.JSONDecodeError, ValueError, FileNotFoundError, OSError) as e:
-    print(f"Could not read/parse agent output: {e}")
-    reported_steps = []
 
-num_reported = len(reported_steps)
+    num_reported = len(reported_steps)
 
-if num_reported == 0:
-    print("Agent output is empty — no chain steps to score.")
-    print(f"Expected {num_expected} steps.")
-    write_reward(0.0)
-    sys.exit(0)
+    if num_reported == 0:
+        print("Agent output is empty — no chain steps to score.")
+        print(f"Expected {num_expected} steps.")
+        write_reward(0.0)
+        sys.exit(0)
 
-# ── Score each step ──────────────────────────────────────────────────────
-print(f"=== Dependency Chain Scoring ===")
-print(f"  Expected steps: {num_expected}")
-print(f"  Reported steps: {num_reported}")
-print(f"  Line tolerance: +/- {LINE_TOLERANCE}")
-print()
+    # ── Score each step ──────────────────────────────────────────────────
+    correct_steps = 0
+    step_details = []
 
-correct_steps = 0
-step_details = []
+    for i, expected in enumerate(expected_steps, start=1):
+        # Find matching reported step by step number or position
+        reported = None
+        for r in reported_steps:
+            if r.get("step") == expected.get("step", i):
+                reported = r
+                break
 
-for i, expected in enumerate(expected_steps, start=1):
-    # Find matching reported step by step number or position
-    reported = None
-    for r in reported_steps:
-        if r.get("step") == expected.get("step", i):
-            reported = r
-            break
+        if not reported and i <= num_reported:
+            # Fallback: match by position if step field missing
+            reported = reported_steps[i-1]
 
-    if not reported and i <= num_reported:
-        # Fallback: match by position if step field missing
-        reported = reported_steps[i-1]
+        if not reported:
+            step_details.append({
+                "step": i,
+                "status": "MISSING",
+                "expected": expected
+            })
+            continue
 
-    if not reported:
+        # Check each field
+        repo_match = expected.get("repo", "").strip() == reported.get("repo", "").strip()
+        file_match = normalize_path(expected.get("file", "")) == normalize_path(reported.get("file", ""))
+        line_match = lines_match(expected.get("line"), reported.get("line"), LINE_TOLERANCE)
+
+        all_match = repo_match and file_match and line_match
+
+        if all_match:
+            correct_steps += 1
+            status = "CORRECT"
+        else:
+            status = "PARTIAL" if (repo_match or file_match) else "WRONG"
+
         step_details.append({
             "step": i,
-            "status": "MISSING",
-            "expected": expected
+            "status": status,
+            "repo_match": repo_match,
+            "file_match": file_match,
+            "line_match": line_match,
+            "expected": expected,
+            "reported": reported
         })
-        continue
 
-    # Check each field
-    repo_match = expected.get("repo", "").strip() == reported.get("repo", "").strip()
-    file_match = normalize_path(expected.get("file", "")) == normalize_path(reported.get("file", ""))
-    line_match = lines_match(expected.get("line"), reported.get("line"), LINE_TOLERANCE)
+    # ── Compute score ────────────────────────────────────────────────────
+    # Each step is worth equal credit
+    score = correct_steps / num_expected if num_expected > 0 else 0.0
 
-    all_match = repo_match and file_match and line_match
+    # Write reward BEFORE verbose printing (ensures reward even if printing fails)
+    write_reward(score)
 
-    if all_match:
-        correct_steps += 1
-        status = "CORRECT"
-    else:
-        status = "PARTIAL" if (repo_match or file_match) else "WRONG"
+    # ── Print detailed results ───────────────────────────────────────────
+    print(f"\n=== Dependency Chain Scoring ===")
+    print(f"  Expected steps: {num_expected}")
+    print(f"  Reported steps: {num_reported}")
+    print(f"  Line tolerance: +/- {LINE_TOLERANCE}")
+    print()
+    print("=== Step-by-Step Results ===")
+    for detail in step_details:
+        status = detail["status"]
+        symbol = "[+]" if status == "CORRECT" else "[-]" if status == "WRONG" else "[~]"
+        print(f"\nStep {detail['step']}: {symbol} {status}")
 
-    step_details.append({
-        "step": i,
-        "status": status,
-        "repo_match": repo_match,
-        "file_match": file_match,
-        "line_match": line_match,
-        "expected": expected,
-        "reported": reported
-    })
+        exp = detail["expected"]
+        print(f"  Expected: {exp.get('repo')} / {exp.get('file')} : {exp.get('line')}")
+        print(f"            {exp.get('context', 'N/A')}")
 
-# ── Compute score ────────────────────────────────────────────────────────
-# Each step is worth equal credit
-score = correct_steps / num_expected if num_expected > 0 else 0.0
+        if "reported" in detail:
+            rep = detail["reported"]
+            print(f"  Reported: {rep.get('repo')} / {rep.get('file')} : {rep.get('line')}")
+            print(f"            {rep.get('context', 'N/A')}")
 
-# ── Print detailed results ───────────────────────────────────────────────
-print("=== Step-by-Step Results ===")
-for detail in step_details:
-    status = detail["status"]
-    symbol = "✓" if status == "CORRECT" else "✗" if status == "WRONG" else "~"
-    print(f"\nStep {detail['step']}: [{symbol}] {status}")
+            if status != "MISSING":
+                print(f"  Match: repo={detail['repo_match']}, file={detail['file_match']}, line={detail['line_match']}")
+        else:
+            print(f"  Reported: (missing)")
 
-    exp = detail["expected"]
-    print(f"  Expected: {exp.get('repo')} / {exp.get('file')} : {exp.get('line')}")
-    print(f"            {exp.get('context', 'N/A')}")
+    print(f"\n=== Summary ===")
+    print(f"  Correct steps: {correct_steps}/{num_expected}")
+    print(f"  Score: {score:.2f}")
 
-    if "reported" in detail:
-        rep = detail["reported"]
-        print(f"  Reported: {rep.get('repo')} / {rep.get('file')} : {rep.get('line')}")
-        print(f"            {rep.get('context', 'N/A')}")
-
-        if status != "MISSING":
-            print(f"  Match: repo={detail['repo_match']}, file={detail['file_match']}, line={detail['line_match']}")
-    else:
-        print(f"  Reported: (missing)")
-
-print(f"\n=== Summary ===")
-print(f"  Correct steps: {correct_steps}/{num_expected}")
-print(f"  Score: {score:.2f}")
-
-write_reward(score)
+except Exception as exc:
+    print(f"ERROR: Scoring failed with exception: {exc}", file=sys.stderr)
+    # Safety net: always write a reward file
+    try:
+        write_reward(0.0)
+    except Exception:
+        # Last resort: direct write
+        with open(REWARD_PATH, "w") as f:
+            f.write("0.00\n")
 PYEOF
