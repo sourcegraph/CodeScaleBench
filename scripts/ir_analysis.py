@@ -938,10 +938,11 @@ def _compute_per_suite_correlation(
     if not manifest_rewards:
         return None
 
-    # Build parallel lists: ir_score, reward, suite_label
+    # Build parallel lists: ir_score, reward, suite_label, task_id
     ir_vals: list[float] = []
     reward_vals: list[float] = []
     suite_labels: list[str] = []
+    task_ids: list[str] = []
 
     for s in ir_scores:
         reward = manifest_rewards.get((s.task_id, s.config_name))
@@ -951,13 +952,20 @@ def _compute_per_suite_correlation(
         ir_vals.append(s.file_recall)
         reward_vals.append(reward)
         suite_labels.append(suite)
+        task_ids.append(s.task_id)
 
     if len(ir_vals) < 3:
         return None
 
     try:
         from ccb_metrics.statistics import retrieval_outcome_correlation
-        return retrieval_outcome_correlation(ir_vals, reward_vals, suite_labels)
+        result = retrieval_outcome_correlation(ir_vals, reward_vals, suite_labels)
+        # Add scatter data for JSON output (US-011 criterion 7)
+        result["scatter"] = [
+            {"task_id": task_ids[i], "file_recall": ir_vals[i], "reward": reward_vals[i]}
+            for i in range(len(ir_vals))
+        ]
+        return result
     except ImportError:
         return None
 
