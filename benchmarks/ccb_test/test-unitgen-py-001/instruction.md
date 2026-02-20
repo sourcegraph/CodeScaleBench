@@ -25,6 +25,7 @@ Your test file must:
 - Include at least 8 test methods with `test_` prefix
 - Cover at least 3 distinct failure/edge cases (e.g., non-cacheable status codes, missing Vary headers)
 - Import and use Django's test client or mock request factories
+- Do NOT run the tests yourself — write the test file and the evaluation system validates independently
 
 ## Output
 

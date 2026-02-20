@@ -31,6 +31,7 @@ Your test file must include:
 - Test names must be descriptive (e.g., `TestTransformerRoundTrip`, `TestPrefixTransformerMismatch`)
 - Do not fabricate function signatures — inspect the actual source before writing tests
 - Tests must be syntactically valid Go
+- Do NOT run the tests yourself — write the test file and the evaluation system validates independently
 
 ## Output
 

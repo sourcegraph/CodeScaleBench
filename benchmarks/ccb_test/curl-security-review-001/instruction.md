@@ -9,7 +9,7 @@
 
 You are reviewing a recently merged pull request that touched several core library files in curl. The changes span TLS certificate verification, cookie domain matching, password handling, transfer shutdown, and base64 encoding. During the merge, several security-relevant defects were introduced — missing validation checks, buffer boundary errors, and logic flaws that could lead to exploitable vulnerabilities.
 
-Your task is to **find the defects, fix them in the code, and produce a structured review report**.
+Your task is to **find the defects and produce a structured review report with proposed fixes**.
 
 ## Context
 
@@ -22,8 +22,6 @@ The defects span five source files in curl's `lib/` directory:
 
 ## Task
 
-YOU MUST IMPLEMENT CODE CHANGES to complete this task.
-
 Review the files listed above for the following types of defects:
 
 - **Security vulnerabilities**: Missing validation that could lead to crashes, buffer overflows, or security bypasses (e.g., certificate verification bypass, cookie scope escape, heap overflow).
@@ -31,8 +29,10 @@ Review the files listed above for the following types of defects:
 
 For each defect you find:
 
-1. **Fix the code** by editing the affected file in `/workspace/`.
-2. **Record the defect** in your review report.
+1. **Describe the defect** in your review report.
+2. **Write a fix** as a unified diff in the `fix_patch` field.
+
+**Do NOT edit source files directly.** Express all fixes as unified diffs in your review report. The evaluation system will apply your patches and verify correctness.
 
 ### Expected Output
 
@@ -45,7 +45,7 @@ After completing your review, write a JSON file at `/workspace/review.json` cont
     "line": 2366,
     "severity": "critical",
     "description": "Brief description of what is wrong and why",
-    "fix_applied": true
+    "fix_patch": "--- a/lib/vtls/openssl.c\n+++ b/lib/vtls/openssl.c\n@@ -2364,5 +2364,5 @@\n-    old line\n+    new line\n"
   }
 ]
 ```
@@ -55,13 +55,16 @@ Each entry must include:
 - `line` — Approximate line number where the defect occurs
 - `severity` — One of: `critical`, `high`, `medium`, `low`
 - `description` — What the defect is and what impact it has
-- `fix_applied` — Boolean indicating whether you committed a fix
+- `fix_patch` — Unified diff showing the proposed fix (use `--- a/` and `+++ b/` prefix format)
 
 ## Evaluation
 
-Your review will be evaluated on detection accuracy and fix quality.
+Your review will be evaluated on:
+- **Detection accuracy** (50%): Precision and recall of reported defects
+- **Fix quality** (50%): Whether your proposed patches correctly resolve the defects
 
-## Testing
+## Constraints
 
 - **Time limit**: 1200 seconds
-- Run `bash /workspace/tests/test.sh` to verify your changes
+- Do NOT edit source files directly — express fixes only in `fix_patch`
+- Do NOT run tests — the evaluation system handles verification

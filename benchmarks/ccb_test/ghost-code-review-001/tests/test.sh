@@ -4,9 +4,13 @@
 
 set -e
 
-# sg_only_env: restore full repo before verification (no-op for regular runs)
+# Legacy sg_only_env: restore full repo before verification (no-op for regular runs)
 [ -f /tmp/.sg_only_mode ] && [ -f /tests/sgonly_verifier_wrapper.sh ] && source /tests/sgonly_verifier_wrapper.sh
 
+# Artifact-only mode: sets VERIFY_REPO, provides apply_patches_from_review_json()
+# Defaults VERIFY_REPO=/workspace when not in artifact mode
+[ -f /tests/artifact_verifier_lib.sh ] && source /tests/artifact_verifier_lib.sh
+VERIFY_REPO="${VERIFY_REPO:-/workspace}"
 
 cd /workspace
 
@@ -15,36 +19,51 @@ mkdir -p /logs/verifier
 
 # Fix git safe.directory
 git config --global --add safe.directory /workspace 2>/dev/null || true
+git config --global --add safe.directory "${VERIFY_REPO}" 2>/dev/null || true
 
-# Guard: if no code changes were made, the agent didn't execute successfully
-UNSTAGED_COUNT=$(git diff --stat 2>/dev/null | wc -l)
-STAGED_COUNT=$(git diff --cached --stat 2>/dev/null | wc -l)
-UNTRACKED_COUNT=$(git ls-files --others --exclude-standard 2>/dev/null | wc -l)
-COMMIT_COUNT=0
-ORIGIN_REF=""
-for ref in origin/master origin/main origin/HEAD; do
-    if git rev-parse "$ref" >/dev/null 2>&1; then
-        ORIGIN_REF="$ref"
-        break
+# Guard: check agent produced output
+if [ "${ARTIFACT_ONLY:-false}" = "true" ]; then
+    # Artifact mode: check for review.json
+    if [ ! -f /workspace/review.json ]; then
+        echo "No review.json found — agent did not produce artifact"
+        echo "0.0" > /logs/verifier/reward.txt
+        echo ""
+        echo "Tests completed - Score: 0.0 (no artifact)"
+        exit 0
     fi
-done
-if [ -n "$ORIGIN_REF" ]; then
-    COMMIT_COUNT=$(git log --oneline "$ORIGIN_REF..HEAD" 2>/dev/null | wc -l)
-elif git rev-parse FETCH_HEAD >/dev/null 2>&1; then
-    COMMIT_COUNT=$(git log --oneline FETCH_HEAD..HEAD 2>/dev/null | wc -l)
+    echo "Artifact mode: review.json found, applying patches to ${VERIFY_REPO}"
+    apply_patches_from_review_json /workspace/review.json
 else
-    TOTAL_COMMITS=$(git log --oneline 2>/dev/null | wc -l)
-    if [ "$TOTAL_COMMITS" -gt 1 ]; then
-        COMMIT_COUNT=$((TOTAL_COMMITS - 1))
+    # Legacy mode: check git changes in workspace
+    UNSTAGED_COUNT=$(git diff --stat 2>/dev/null | wc -l)
+    STAGED_COUNT=$(git diff --cached --stat 2>/dev/null | wc -l)
+    UNTRACKED_COUNT=$(git ls-files --others --exclude-standard 2>/dev/null | wc -l)
+    COMMIT_COUNT=0
+    ORIGIN_REF=""
+    for ref in origin/master origin/main origin/HEAD; do
+        if git rev-parse "$ref" >/dev/null 2>&1; then
+            ORIGIN_REF="$ref"
+            break
+        fi
+    done
+    if [ -n "$ORIGIN_REF" ]; then
+        COMMIT_COUNT=$(git log --oneline "$ORIGIN_REF..HEAD" 2>/dev/null | wc -l)
+    elif git rev-parse FETCH_HEAD >/dev/null 2>&1; then
+        COMMIT_COUNT=$(git log --oneline FETCH_HEAD..HEAD 2>/dev/null | wc -l)
+    else
+        TOTAL_COMMITS=$(git log --oneline 2>/dev/null | wc -l)
+        if [ "$TOTAL_COMMITS" -gt 1 ]; then
+            COMMIT_COUNT=$((TOTAL_COMMITS - 1))
+        fi
     fi
-fi
-echo "Change detection: unstaged=$UNSTAGED_COUNT staged=$STAGED_COUNT untracked=$UNTRACKED_COUNT commits=$COMMIT_COUNT"
-if [ "$UNSTAGED_COUNT" -eq 0 ] && [ "$STAGED_COUNT" -eq 0 ] && [ "$UNTRACKED_COUNT" -eq 0 ] && [ "$COMMIT_COUNT" -eq 0 ]; then
-    echo "No code changes detected - agent did not execute successfully"
-    echo "0.0" > /logs/verifier/reward.txt
-    echo ""
-    echo "Tests completed - Score: 0.0 (no changes)"
-    exit 0
+    echo "Change detection: unstaged=$UNSTAGED_COUNT staged=$STAGED_COUNT untracked=$UNTRACKED_COUNT commits=$COMMIT_COUNT"
+    if [ "$UNSTAGED_COUNT" -eq 0 ] && [ "$STAGED_COUNT" -eq 0 ] && [ "$UNTRACKED_COUNT" -eq 0 ] && [ "$COMMIT_COUNT" -eq 0 ]; then
+        echo "No code changes detected - agent did not execute successfully"
+        echo "0.0" > /logs/verifier/reward.txt
+        echo ""
+        echo "Tests completed - Score: 0.0 (no changes)"
+        exit 0
+    fi
 fi
 
 # ── Hybrid Scoring ───────────────────────────────────────
@@ -54,11 +73,12 @@ fi
 EXPECTED_DEFECTS="/tests/expected_defects.json"
 REVIEW_JSON="/workspace/review.json"
 
-FINAL_SCORE=$(python3 - "$EXPECTED_DEFECTS" "$REVIEW_JSON" <<'PYEOF'
+FINAL_SCORE=$(python3 - "$EXPECTED_DEFECTS" "$REVIEW_JSON" "$VERIFY_REPO" <<'PYEOF'
 import json, sys, os
 
 expected_path = sys.argv[1]
 review_path = sys.argv[2]
+verify_repo = sys.argv[3] if len(sys.argv) > 3 else "/workspace"
 
 with open(expected_path) as f:
     expected = json.load(f)
@@ -81,7 +101,23 @@ if os.path.isfile(review_path):
         raw = strip_code_fences(raw)
         reported = json.loads(raw)
         if not isinstance(reported, list):
-            reported = []
+            # Fallback: agent may wrap defects in a nested object
+            if isinstance(reported, dict):
+                for key in ("defects", "findings", "issues", "review"):
+                    val = reported.get(key, None)
+                    if isinstance(val, list):
+                        reported = val
+                        break
+                    elif isinstance(val, dict):
+                        for k2 in ("defects", "findings", "issues"):
+                            v2 = val.get(k2, None)
+                            if isinstance(v2, list):
+                                reported = v2
+                                break
+                        if isinstance(reported, list):
+                            break
+            if not isinstance(reported, list):
+                reported = []
     except (json.JSONDecodeError, ValueError, FileNotFoundError, OSError):
         reported = []
 
@@ -119,6 +155,9 @@ print(f"Detection: precision={precision:.3f} recall={recall:.3f} F1={f1:.3f}", f
 
 # ── Fix scoring ──────────────────────────────────────────
 # Check if agent's code changes contain the expected fix patterns
+# In artifact-only mode, patches were already applied to verify_repo
+os.chdir(verify_repo)
+print(f"Fix scoring: checking files in {verify_repo}", file=sys.stderr)
 fix_hits = 0
 
 # Defect 1: NotFoundError guard restored in comments-service.js

@@ -49,6 +49,7 @@ TIMEOUT_MULTIPLIER=10
 RUN_BASELINE=true
 RUN_FULL=true
 CATEGORY="${CATEGORY:-staging}"
+FULL_CONFIG="${FULL_CONFIG:-sourcegraph_full}"
 TASK_FILTERS=()
 
 if [ ! -d "${BENCHMARK_DIR}/${SUITE}" ]; then
@@ -166,7 +167,7 @@ echo "Concurrency: ${CONCURRENCY}"
 echo "Parallel jobs: ${PARALLEL_JOBS}"
 echo "Jobs directory: ${JOBS_BASE}"
 echo "Run baseline: ${RUN_BASELINE}"
-echo "Run MCP-Full: ${RUN_FULL}"
+echo "Run MCP-Full: ${RUN_FULL} (${FULL_CONFIG})"
 echo ""
 
 mkdir -p "${JOBS_BASE}"
@@ -229,6 +230,20 @@ _sdlc_run_single() {
         cp -a "${task_path}/." "${temp_task_dir}/"
         cp "${temp_task_dir}/environment/Dockerfile.sg_only" "${temp_task_dir}/environment/Dockerfile"
         run_task_path="$temp_task_dir"
+
+    elif [ "$config" = "artifact_full" ]; then
+        local artifact="${task_path}/environment/Dockerfile.artifact_only"
+        if [ ! -f "$artifact" ]; then
+            echo "ERROR: Missing Dockerfile.artifact_only for $task_id at $artifact"
+            return 1
+        fi
+
+        temp_task_dir="/tmp/artifact_${task_id}"
+        rm -rf "$temp_task_dir"
+        mkdir -p "$temp_task_dir"
+        cp -a "${task_path}/." "${temp_task_dir}/"
+        cp "${temp_task_dir}/environment/Dockerfile.artifact_only" "${temp_task_dir}/environment/Dockerfile"
+        run_task_path="$temp_task_dir"
     fi
 
     echo "Running task: $task_id ($config) [HOME=$task_home]"
@@ -282,7 +297,7 @@ fi
 if [ "$RUN_BASELINE" = true ] && [ "$RUN_FULL" = true ]; then
     run_paired_configs TASK_IDS _sdlc_run_single "$JOBS_BASE"
 
-    for config in baseline sourcegraph_full; do
+    for config in baseline "$FULL_CONFIG"; do
         if [ -d "${JOBS_BASE}/${config}" ]; then
             extract_all_metrics "${JOBS_BASE}/${config}" "${SUITE}" "$config"
             validate_and_report "${JOBS_BASE}/${config}" "$config"
@@ -291,10 +306,13 @@ if [ "$RUN_BASELINE" = true ] && [ "$RUN_FULL" = true ]; then
 elif [ "$RUN_BASELINE" = true ]; then
     run_task_batch "baseline" "none"
 elif [ "$RUN_FULL" = true ]; then
-    run_task_batch "sourcegraph_full" "sourcegraph_full"
+    run_task_batch "$FULL_CONFIG" "$FULL_CONFIG"
 fi
 
 print_validation_summary "$JOBS_BASE"
+
+# Post-batch Docker cleanup — reclaim dangling images, orphan volumes, BuildKit cache
+cleanup_docker_resources
 
 echo ""
 echo "=============================================="

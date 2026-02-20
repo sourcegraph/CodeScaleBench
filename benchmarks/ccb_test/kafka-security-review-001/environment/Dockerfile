@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openjdk-17-jdk \
     python3 \
     python3-pip \
+    ca-certificates \
     curl \
     jq \
     && rm -rf /var/lib/apt/lists/*

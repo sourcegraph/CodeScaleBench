@@ -9,7 +9,7 @@
 
 You are reviewing a recently merged pull request that modifies VS Code's editor core. The PR touches the Range and Position geometry classes, the text search engine, the language feature provider registry, and shared string utilities. The stated goal was to improve search boundary handling and optimize provider sorting, but several defects were introduced during the merge — both functional bugs and cross-component interaction errors.
 
-Your task is to **find the defects, fix them in the code, and produce a structured review report**.
+Your task is to **find the defects and produce a structured review report with proposed fixes**.
 
 ## Context
 
@@ -27,8 +27,6 @@ The changes span five core areas of VS Code's editor infrastructure:
 
 ## Task
 
-YOU MUST IMPLEMENT CODE CHANGES to complete this task.
-
 Review the files listed above for the following types of defects:
 
 - **Functional bugs**: Logic errors that cause incorrect behavior (e.g., inverted conditions, wrong operators, missing checks).
@@ -37,8 +35,10 @@ Review the files listed above for the following types of defects:
 
 For each defect you find:
 
-1. **Fix the code** by editing the affected file in `/workspace/`.
-2. **Record the defect** in your review report.
+1. **Describe the defect** in your review report.
+2. **Write a fix** as a unified diff in the `fix_patch` field.
+
+**Do NOT edit source files directly.** Express all fixes as unified diffs in your review report. The evaluation system will apply your patches and verify correctness.
 
 ### Expected Output
 
@@ -51,7 +51,7 @@ After completing your review, write a JSON file at `/workspace/review.json` cont
     "line": 97,
     "severity": "critical",
     "description": "Brief description of what is wrong and why",
-    "fix_applied": true
+    "fix_patch": "--- a/src/vs/editor/common/core/range.ts\n+++ b/src/vs/editor/common/core/range.ts\n@@ -94,5 +94,5 @@\n-    old line\n+    new line\n"
   }
 ]
 ```
@@ -61,13 +61,16 @@ Each entry must include:
 - `line` — Approximate line number where the defect occurs
 - `severity` — One of: `critical`, `high`, `medium`, `low`
 - `description` — What the defect is and what impact it has
-- `fix_applied` — Boolean indicating whether you committed a fix
+- `fix_patch` — Unified diff showing the proposed fix (use `--- a/` and `+++ b/` prefix format)
 
 ## Evaluation
 
-Your review will be evaluated on detection accuracy and fix quality.
+Your review will be evaluated on:
+- **Detection accuracy** (50%): Precision and recall of reported defects
+- **Fix quality** (50%): Whether your proposed patches correctly resolve the defects
 
-## Testing
+## Constraints
 
 - **Time limit**: 1200 seconds
-- Run `bash /workspace/tests/test.sh` to verify your changes
+- Do NOT edit source files directly — express fixes only in `fix_patch`
+- Do NOT run tests — the evaluation system handles verification

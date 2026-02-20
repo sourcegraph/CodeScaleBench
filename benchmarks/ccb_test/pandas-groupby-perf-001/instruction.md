@@ -43,53 +43,24 @@ Replaced Python dictionary-based aggregation with Cython-optimized hash table lo
 ## Instructions
 
 1. Analyze the target function and understand its purpose
-2. Profile the code to identify bottlenecks
-3. Apply optimizations (algorithmic improvements, vectorization, caching, etc.)
-4. Ensure all existing tests pass
-5. Benchmark your optimized solution
+2. Identify bottlenecks in the code
+3. Design optimizations (algorithmic improvements, vectorization, caching, etc.)
+4. Write your optimization as a unified diff
 
-## Testing
-
-Run the benchmarks with:
-```bash
-python -m pytest pandas/tests/groupby/test_aggregate.py -v -k series
-```
-
-## Output
-
-Your optimized code should be in `/workspace/optimized/`.
-The verifier will measure runtime improvement relative to the baseline. Greater speedups yield higher scores.
-
-## Workspace Structure
-
-```
-/workspace/
-├── original/          # Original code (read-only reference)
-├── optimized/         # Your optimized implementation
-├── tests/             # Test suite
-└── benchmark_results.json  # Your benchmark output
-```
+Do NOT modify source files directly. Write your optimization as a unified diff.
+The evaluation system applies your patch and benchmarks independently.
 
 ## Deliverable
 
-After optimizing the code, write benchmark results to `/workspace/benchmark_results.json`:
+Write a unified diff to `/workspace/solution.patch` that applies cleanly against
+the repository source tree. The patch should contain all changes needed to
+optimize the target function.
 
-```json
-{
-    "task_id": "ccb_sweperf-003",
-    "optimized_runtime": 0.05,
-    "baseline_runtime": 0.095000,
-    "tests_passed": true,
-    "tests_total": 10,
-    "optimization_notes": "Applied vectorization to inner loop"
-}
-```
-
-The verifier will use the `optimized_runtime` field to compute your score.
+The verifier will measure runtime improvement relative to the baseline. Greater
+speedups yield higher scores.
 
 ## Tips
 
-- Profile before optimizing to find the real bottlenecks
 - Ensure correctness - optimization at the cost of correctness scores 0
 - Consider algorithmic complexity first, then micro-optimizations
 - Use NumPy/vectorization for numerical code where applicable

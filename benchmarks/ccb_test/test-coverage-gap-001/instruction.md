@@ -50,3 +50,4 @@ Write your analysis to `/workspace/coverage_analysis.md` with this structure:
 ## Anti-Requirements
 - Do not fabricate file paths or function names — inspect the actual codebase
 - Do not list gaps without proposing concrete test cases
+- Do NOT run the tests yourself — write the test file and the evaluation system validates independently

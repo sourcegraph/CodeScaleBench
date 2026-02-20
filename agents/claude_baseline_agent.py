@@ -390,7 +390,7 @@ class BaselineClaudeCodeAgent(ClaudeCode):
         repo_display = self._get_repo_display()
 
         # For hybrid MCP modes, prepend V4 preamble to the instruction text.
-        if mcp_type in ("sourcegraph_full", "sourcegraph_base"):
+        if mcp_type in ("sourcegraph_full", "sourcegraph_base", "artifact_full"):
             # --- V4 Preamble ---
             # Skill-style guidance: tool selection, scoping, context-aware behavior.
             # No mandatory workflow mandates — teaches effective MCP usage by example.
@@ -410,6 +410,20 @@ class BaselineClaudeCodeAgent(ClaudeCode):
 
             mcp_preamble = V4_PREAMBLE_TEMPLATE.format(repo_scope=repo_scope)
             instruction = mcp_preamble + instruction
+
+            # Artifact-full: append guidance about expressing changes as diffs
+            if mcp_type == "artifact_full":
+                artifact_guidance = """
+
+## Artifact-Only Evaluation
+
+You are in **artifact-only mode**. Your workspace is empty — all code discovery
+must go through Sourcegraph MCP tools. Express all code changes as **unified
+diffs** in your output artifact (e.g., `fix_patch` fields in review.json, or a
+standalone `solution.patch` file). Do NOT attempt to edit source files directly
+— there are no source files in your workspace.
+"""
+                instruction = instruction + artifact_guidance
 
         elif mcp_type == "sourcegraph_isolated":
             # Isolated mode: agent has only the target package locally (via sparse checkout).
@@ -543,7 +557,7 @@ from what you expect. Use `mcp__sourcegraph__sg_list_repos` (if available) to di
 before retrying."""
             system_prompt_append = EVALUATION_CONTEXT_PROMPT + "\n\n---\n\n" + mcp_system_prompt
 
-        elif mcp_type in ("sourcegraph_full", "sourcegraph_base", "sourcegraph_isolated"):
+        elif mcp_type in ("sourcegraph_full", "sourcegraph_base", "sourcegraph_isolated", "artifact_full"):
             # V4 system prompt: lightweight reinforcement (detailed guidance is in the instruction preamble).
             if repo_display != "the codebase":
                 repo_filter_system = f"Sourcegraph repository: github.com/{repo_display}\nFor keyword_search: repo:^github.com/{repo_display}$ YourSearchTerm"
@@ -672,7 +686,7 @@ Local source files may be truncated or unavailable. Use Sourcegraph to read and 
                 
                 # For hybrid mode and pure baseline: no tool restrictions
                 # For forced MCP modes (sourcegraph, deepsearch): apply tool restrictions
-                if mcp_type in ["sourcegraph_full", "sourcegraph_isolated", "deepsearch_hybrid", "none"]:
+                if mcp_type in ["sourcegraph_full", "sourcegraph_isolated", "artifact_full", "deepsearch_hybrid", "none"]:
                     # Hybrid mode and pure baseline: No tool restrictions
                     # Don't add --tools flag at all - let Claude use all available tools
                     # Skip debug flag - it causes massive bundled JS output to stdout
@@ -966,7 +980,7 @@ Local source files may be truncated or unavailable. Use Sourcegraph to read and 
 
         if mcp_type == "sourcegraph":
             await self._setup_sourcegraph_mcp(environment)
-        elif mcp_type in ("sourcegraph_full", "sourcegraph_base", "sourcegraph_isolated"):
+        elif mcp_type in ("sourcegraph_full", "sourcegraph_base", "sourcegraph_isolated", "artifact_full"):
             await self._setup_sourcegraph_full_mcp(environment, mcp_type=mcp_type)
         elif mcp_type == "deepsearch":
             await self._setup_deepsearch_mcp(environment)

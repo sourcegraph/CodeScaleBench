@@ -37,3 +37,4 @@ The file should use Go's `testing` package and the `net/http/httptest` package (
 - Each function has at least one `t.Fatal` / `t.Error` assertion
 - Cover both success and error paths
 - Do not fabricate API paths — inspect the actual codebase first
+- Do NOT run the tests yourself — write the test file and the evaluation system validates independently
