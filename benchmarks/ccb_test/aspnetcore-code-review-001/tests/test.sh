@@ -32,7 +32,7 @@ if [ "${ARTIFACT_ONLY:-false}" = "true" ]; then
         exit 0
     fi
     echo "Artifact mode: review.json found, applying patches to ${VERIFY_REPO}"
-    apply_patches_from_review_json /workspace/review.json
+    apply_patches_from_review_json /workspace/review.json || echo "[verifier] Patch application returned non-zero (non-fatal, scoring continues)"
 else
     # Legacy mode: check git changes in workspace
     UNSTAGED_COUNT=$(git diff --stat 2>/dev/null | wc -l)

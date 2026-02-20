@@ -158,34 +158,43 @@ for entry in reported:
         pf_path = pf.name
 
     # Try git apply
-    result = subprocess.run(
-        ["git", "apply", "--allow-empty", pf_path],
-        cwd=verify_repo, capture_output=True, text=True
-    )
-    if result.returncode == 0:
-        applied += 1
-        os.unlink(pf_path)
-        continue
+    try:
+        result = subprocess.run(
+            ["git", "apply", "--allow-empty", pf_path],
+            cwd=verify_repo, capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            applied += 1
+            os.unlink(pf_path)
+            continue
+    except FileNotFoundError:
+        pass
 
     # Fallback: patch -p1 --fuzz=3
-    result = subprocess.run(
-        ["patch", "-p1", "--fuzz=3", "-i", pf_path],
-        cwd=verify_repo, capture_output=True, text=True
-    )
-    if result.returncode == 0:
-        applied += 1
-        os.unlink(pf_path)
-        continue
+    try:
+        result = subprocess.run(
+            ["patch", "-p1", "--fuzz=3", "-i", pf_path],
+            cwd=verify_repo, capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            applied += 1
+            os.unlink(pf_path)
+            continue
+    except FileNotFoundError:
+        print("[artifact_verifier] 'patch' not installed, skipping fallback", file=sys.stderr)
 
     # Fallback: git apply with 3way
-    result = subprocess.run(
-        ["git", "apply", "--allow-empty", "--3way", pf_path],
-        cwd=verify_repo, capture_output=True, text=True
-    )
-    if result.returncode == 0:
-        applied += 1
-        os.unlink(pf_path)
-        continue
+    try:
+        result = subprocess.run(
+            ["git", "apply", "--allow-empty", "--3way", pf_path],
+            cwd=verify_repo, capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            applied += 1
+            os.unlink(pf_path)
+            continue
+    except FileNotFoundError:
+        pass
 
     failed += 1
     file_name = entry.get("file", "unknown")
