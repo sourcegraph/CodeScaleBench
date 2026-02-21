@@ -4,10 +4,11 @@ This file is the operational quick-reference for benchmark maintenance.
 `CLAUDE.md` mirrors this file.
 
 ## Benchmark Overview
-8 SDLC phase suites, 157 tasks. Tasks are organized by development lifecycle
-phase: build, debug, design, document, fix, secure, test, understand.
+8 SDLC phase suites + 6 MCP-unique suites. SDLC tasks measure code quality
+across phases: build, debug, design, document, fix, secure, test, understand.
+MCP-unique tasks measure org-scale cross-repo discovery and retrieval.
 See `README.md` for the full suite table and `docs/TASK_CATALOG.md` for
-per-task details.
+per-task details. See `docs/MCP_UNIQUE_TASKS.md` for the MCP-unique extension.
 
 ## Canonical References
 - `README.md` - repo overview and quick start
@@ -16,7 +17,10 @@ per-task details.
 - `docs/ERROR_CATALOG.md` - known failures and remediation
 - `docs/TASK_SELECTION.md` - curation/difficulty policy
 - `docs/TASK_CATALOG.md` - current task inventory
-- `docs/SCORING_SEMANTICS.md` - reward/pass interpretation
+- `docs/SCORING_SEMANTICS.md` - reward/pass interpretation (incl. oracle checks + hybrid scoring)
+- `docs/EVALUATION_PIPELINE.md` - unified eval: verifier → LLM judge → statistics → report
+- `docs/MCP_UNIQUE_TASKS.md` - MCP-unique task system (suites, authoring, oracle, DS tasks)
+- `docs/MCP_UNIQUE_CALIBRATION.md` - oracle coverage analysis and threshold calibration data
 - `docs/WORKFLOW_METRICS.md` - timing/cost metric definitions
 - `docs/AGENT_INTERFACE.md` - runtime I/O contract
 - `docs/EXTENSIBILITY.md` - safe suite/task/config extension

@@ -26,6 +26,24 @@ Eight suites organized by software development lifecycle phase:
 
 See `docs/PRD_SDLC_SUITE_REORGANIZATION.md` for the reorganization rationale and task mapping.
 
+## MCP-Unique Suites (Org-Scale Context Retrieval)
+
+Six additional suites measure what local-only agents *cannot* do: cross-repo discovery, symbol resolution, dependency tracing, and deep-search-driven investigation in polyrepo environments.
+
+| Suite | Category | Tasks | Description |
+|-------|----------|------:|-------------|
+| `ccb_mcp_crossrepo_tracing` | A: Dependency Tracing | 3 | Cross-repo dependency chains, blast radius, symbol resolution |
+| `ccb_mcp_security` | B: Vulnerability Remediation | 2 | CVE mapping, missing auth middleware across repos |
+| `ccb_mcp_incident` | D: Incident Debugging | 1 | Error-to-code-path tracing across microservices |
+| `ccb_mcp_onboarding` | E: Onboarding & Comprehension | 3 | API consumption mapping, end-to-end flow, architecture maps |
+| `ccb_mcp_crossorg` | G: Cross-Org Discovery | 2 | Interface implementations and authoritative repo identification across orgs |
+| `ccb_mcp_platform` | J: Platform Knowledge | 1 | Service template discovery and tribal knowledge |
+| **Total** | | **12** | |
+
+Each task restricts the baseline agent to **one local repo** while placing oracle-relevant files in **MCP-only repos** — repos only Sourcegraph can reach. This creates a clean measurement of MCP's unique capability.
+
+See [docs/MCP_UNIQUE_TASKS.md](docs/MCP_UNIQUE_TASKS.md) for the full task system, authoring guide, and oracle evaluation framework. See [docs/MCP_UNIQUE_CALIBRATION.md](docs/MCP_UNIQUE_CALIBRATION.md) for oracle coverage analysis.
+
 ---
 
 ## 2-Config Evaluation Matrix
@@ -44,7 +62,7 @@ See [docs/CONFIGS.md](docs/CONFIGS.md) for the full tool-by-tool breakdown.
 ## Repository Structure
 
 ```
-benchmarks/              # Task definitions organized by SDLC phase
+benchmarks/              # Task definitions organized by SDLC phase + MCP-unique
   ccb_build/             #   Feature & Refactoring (25 tasks)
   ccb_debug/             #   Debugging & Investigation (20 tasks)
   ccb_design/            #   Architecture & Design (20 tasks)
@@ -53,6 +71,14 @@ benchmarks/              # Task definitions organized by SDLC phase
   ccb_secure/            #   Security & Compliance (20 tasks)
   ccb_test/              #   Testing & QA (14 tasks)
   ccb_understand/        #   Requirements & Discovery (20 tasks)
+  ccb_mcp_crossrepo_tracing/  #   MCP-unique: cross-repo dependency tracing (3 tasks)
+  ccb_mcp_security/      #   MCP-unique: vulnerability remediation (2 tasks)
+  ccb_mcp_incident/      #   MCP-unique: incident debugging (1 task)
+  ccb_mcp_onboarding/    #   MCP-unique: onboarding & comprehension (3 tasks)
+  ccb_mcp_crossorg/      #   MCP-unique: cross-org discovery (2 tasks)
+  ccb_mcp_platform/      #   MCP-unique: platform knowledge (1 task)
+fixtures/                # Repo-set fixtures for MCP-unique tasks
+  repo_sets/             #   Polyrepo definitions (local vs MCP-only access)
 configs/                 # Run configs and task selection
   _common.sh             #   Shared infra: token refresh, parallel execution, multi-account
   sdlc_suite_2config.sh  #   Generic SDLC runner (used by phase wrappers below)
@@ -65,7 +91,9 @@ configs/                 # Run configs and task selection
   test_2config.sh        #   Phase wrapper: Test (14 tasks)
   run_selected_tasks.sh  #   Unified runner for all tasks
   validate_one_per_benchmark.sh  # Pre-flight smoke (1 task per suite)
-  selected_benchmark_tasks.json  # Canonical task selection with metadata
+  selected_benchmark_tasks.json  # Canonical SDLC task selection with metadata
+  selected_mcp_unique_tasks.json # MCP-unique task selection with metadata
+  use_case_registry.json #   100 GTM use cases (MCP-unique task source)
   archive/               #   Pre-SDLC migration scripts (preserved for history)
 scripts/                 # Metrics extraction, evaluation, and operational tooling
   ccb_metrics/           #   Python package: models, extractors, discovery, judge context
@@ -94,9 +122,12 @@ docs/                    # Operational documentation
   CONFIGS.md             #   2-config tool breakdown
   ERROR_CATALOG.md       #   Known error fingerprints, causes, fixes
   QA_PROCESS.md          #   Quality assurance and validation pipeline
+  EVALUATION_PIPELINE.md #   Unified eval: verifier → judge → statistics → report
   TASK_CATALOG.md        #   Detailed per-task reference
   TASK_SELECTION.md      #   Selection criteria, difficulty calibration, MCP scoring
   SCORING_SEMANTICS.md   #   Reward and pass interpretation per benchmark
+  MCP_UNIQUE_TASKS.md    #   MCP-unique task system, authoring, oracle evaluation
+  MCP_UNIQUE_CALIBRATION.md # Oracle coverage analysis and threshold calibration
   WORKFLOW_METRICS.md    #   Timing/cost metric definitions
   AGENT_INTERFACE.md     #   Runtime I/O contract for agents
   EXTENSIBILITY.md       #   Safe suite/task/config extension guide
@@ -108,7 +139,7 @@ skills/                  # AI agent skill definitions (operational runbooks)
 schemas/                 # JSON schemas for MANIFEST.json, task.toml, etc.
 ```
 
-Each SDLC suite directory contains per-task subdirectories with `instruction.md`, `task.toml`, `tests/`, and ground truth (or `solution/`).
+Each suite directory contains per-task subdirectories with `instruction.md`, `task.toml`, `tests/`, and ground truth (or `solution/`). MCP-unique tasks additionally include `task_spec.json`, `oracle_answer.json`, and Dockerfile variants for baseline/MCP-only execution.
 
 ---
 
@@ -137,14 +168,18 @@ The report generator produces:
 
 See `python3 scripts/generate_eval_report.py --help` for all options.
 
+For the full multi-layer evaluation pipeline (verifier, LLM judge, statistical analysis, dual-score reporting), see [docs/EVALUATION_PIPELINE.md](docs/EVALUATION_PIPELINE.md).
+
 ---
 
 ## Running with Harbor
 
-The unified runner executes all 157 tasks across the 2-config matrix:
+### SDLC Tasks
+
+The unified runner executes all 157 SDLC tasks across the 2-config matrix:
 
 ```bash
-# Run all 157 tasks across 2 configs
+# Run all 157 SDLC tasks across 2 configs
 bash configs/run_selected_tasks.sh
 
 # Run only the baseline config
@@ -168,6 +203,21 @@ bash configs/debug_2config.sh            # 20 Debugging & Investigation tasks
 bash configs/secure_2config.sh           # 20 Security & Compliance tasks
 bash configs/test_2config.sh             # 14 Testing & QA tasks
 bash configs/document_2config.sh         # 13 Documentation tasks
+```
+
+### MCP-Unique Tasks
+
+MCP-unique tasks use a separate selection file:
+
+```bash
+# Run all 12 MCP-unique tasks across 2 configs
+bash configs/run_selected_tasks.sh --selection-file configs/selected_mcp_unique_tasks.json
+
+# Filter by use-case category
+bash configs/run_selected_tasks.sh --selection-file configs/selected_mcp_unique_tasks.json --benchmark ccb_mcp_security
+
+# Dry run
+bash configs/run_selected_tasks.sh --selection-file configs/selected_mcp_unique_tasks.json --dry-run
 ```
 
 All runners support `--baseline-only`, `--full-only`, `--task TASK_ID`, and `--parallel N` flags.

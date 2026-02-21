@@ -18,6 +18,7 @@ per-task details. See `docs/MCP_UNIQUE_TASKS.md` for the MCP-unique extension.
 - `docs/TASK_SELECTION.md` - curation/difficulty policy
 - `docs/TASK_CATALOG.md` - current task inventory
 - `docs/SCORING_SEMANTICS.md` - reward/pass interpretation (incl. oracle checks + hybrid scoring)
+- `docs/EVALUATION_PIPELINE.md` - unified eval: verifier → LLM judge → statistics → report
 - `docs/MCP_UNIQUE_TASKS.md` - MCP-unique task system (suites, authoring, oracle, DS tasks)
 - `docs/MCP_UNIQUE_CALIBRATION.md` - oracle coverage analysis and threshold calibration data
 - `docs/WORKFLOW_METRICS.md` - timing/cost metric definitions
