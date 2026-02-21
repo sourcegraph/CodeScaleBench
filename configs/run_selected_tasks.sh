@@ -370,6 +370,8 @@ _launch_task() {
     ) &
     _PIDS+=("$!")
     echo "  [${mcp_mode}] Started $task_id (PID ${_PIDS[-1]}, ${#_PIDS[@]}/${PARALLEL_TASKS} slots used)"
+    # Stagger launches by 2s to avoid Harbor timestamp-based job directory collisions
+    sleep 2
 }
 
 # ============================================
