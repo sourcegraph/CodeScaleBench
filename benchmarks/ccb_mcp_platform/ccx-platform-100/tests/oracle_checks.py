@@ -42,6 +42,10 @@ _SG_MIRROR_ALIASES = {
     "sg-benchmarks/grafana-mimir": "grafana/mimir",
     "sg-benchmarks/prisma-prisma": "prisma/prisma",
     "sg-benchmarks/lodash": "lodash/lodash",
+    "sg-benchmarks/numpy": "numpy/numpy",
+    "sg-benchmarks/scipy": "scipy/scipy",
+    "sg-benchmarks/grafana": "grafana/grafana",
+    "sg-benchmarks/prometheus": "prometheus/prometheus",
 }
 
 
