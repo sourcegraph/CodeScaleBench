@@ -337,13 +337,21 @@ _wait_for_slot() {
     done
 }
 
-# Wait for all pending jobs to complete
+# Temp dirs created for MCP Dockerfile swap — cleaned up in _drain_pool
+_MCP_TEMP_DIRS=()
+
+# Wait for all pending jobs to complete, then clean up temp dirs
 _drain_pool() {
     local p
     for p in "${_PIDS[@]}"; do
         wait "$p" 2>/dev/null || true
     done
     _PIDS=()
+    # Clean up MCP temp dirs now that all harbor processes are done
+    for d in "${_MCP_TEMP_DIRS[@]}"; do
+        rm -rf "$d" 2>/dev/null || true
+    done
+    _MCP_TEMP_DIRS=()
 }
 
 # Launch a task PAIR: baseline + full simultaneously for the same task.
@@ -431,15 +439,10 @@ _launch_task_pair() {
         sleep 2
     fi
 
-    # Background watcher: clean up temp dir after MCP config completes.
-    # Not counted in _PIDS (it's cleanup, not a work slot).
-    if [ -n "$_mcp_temp_dir" ] && [ "${#pair_pids[@]}" -gt 0 ]; then
-        (
-            for p in "${pair_pids[@]}"; do
-                wait "$p" 2>/dev/null || true
-            done
-            rm -rf "$_mcp_temp_dir" 2>/dev/null || true
-        ) &
+    # Track temp dir for cleanup in _drain_pool (after all harbor processes finish).
+    # Cannot use background watcher because wait() only works for child processes.
+    if [ -n "$_mcp_temp_dir" ]; then
+        _MCP_TEMP_DIRS+=("$_mcp_temp_dir")
     fi
 }
 
