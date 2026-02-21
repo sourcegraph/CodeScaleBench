@@ -307,15 +307,19 @@ is_task_completed() {
 # ============================================
 declare -a _PIDS=()
 
-# Block until fewer than PARALLEL_TASKS jobs are running
+# Block until fewer than PARALLEL_TASKS jobs are running.
+# Uses wait -n to reap zombies (kill -0 sees zombies as alive; without reaping,
+# slots never free even after child processes complete).
 _wait_for_slot() {
     while [ "${#_PIDS[@]}" -ge "${PARALLEL_TASKS}" ]; do
+        # Reap any completed child (non-blocking: wait for exactly one child to finish)
+        wait -n "${_PIDS[@]}" 2>/dev/null || true
+        # Rebuild PID list, excluding any that are no longer alive
         local new_pids=() p
         for p in "${_PIDS[@]}"; do
             kill -0 "$p" 2>/dev/null && new_pids+=("$p")
         done
         _PIDS=("${new_pids[@]}")
-        [ "${#_PIDS[@]}" -ge "${PARALLEL_TASKS}" ] && sleep 2
     done
 }
 
