@@ -14,8 +14,7 @@ WORKDIR /workspace
 
 # Clone local checkout repos (baseline config: agent has local access to these)
 RUN git clone --depth 1 --branch v11.4.0 https://github.com/grafana/grafana /workspace/grafana
-RUN git clone https://github.com/grafana/loki /workspace/loki && \
-    cd /workspace/loki && git checkout a3af38d4da899032d3ee46a30932d072d37e1b9c
+RUN git clone --depth 1 --branch v3.3.4 https://github.com/grafana/loki /workspace/loki
 
 # Initialize git identity for agent commits
 RUN git config --global user.email "agent@example.com" && \
