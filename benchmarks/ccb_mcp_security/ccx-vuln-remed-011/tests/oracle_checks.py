@@ -400,10 +400,16 @@ def run_all_checks(
     oracle = spec.get("artifacts", {}).get("oracle", {})
     eval_checks = spec.get("evaluation", {}).get("checks", [])
 
-    # If answer is a dict with "text" key, extract the text for text-based checks
+    # If answer is a dict with "text" key, extract the text for text-based checks.
+    # Also include the full JSON serialization so that provenance citations in
+    # structured fields (e.g. chain[].repo) are found by substring matching.
+    # This prevents penalizing agents that correctly cite repos in structured
+    # data but use natural language (e.g. "Loki") in the narrative text.
     answer_text = ""
     if isinstance(answer_data, dict):
-        answer_text = answer_data.get("text", answer_data.get("answer", json.dumps(answer_data)))
+        narrative = answer_data.get("text", answer_data.get("answer", ""))
+        full_json = json.dumps(answer_data)
+        answer_text = f"{narrative}\n{full_json}" if narrative else full_json
     elif isinstance(answer_data, str):
         answer_text = answer_data
 
