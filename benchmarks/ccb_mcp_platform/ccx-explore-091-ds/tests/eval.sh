@@ -52,7 +52,7 @@ if [ ! -f "$ORACLE_CHECKS" ]; then
 fi
 
 echo "Running oracle checks..."
-SCORE=$(python3 "$ORACLE_CHECKS" --answer "$ANSWER_PATH" --spec "$TASK_SPEC_PATH" --verbose 2>&1 | tee /dev/stderr | tail -1)
+SCORE=$(python3 "$ORACLE_CHECKS" --answer "$ANSWER_PATH" --spec "$TASK_SPEC_PATH" --verbose 2>&1 | tee /dev/stderr | tail -1) || true
 
 # Validate score is a number
 if ! echo "$SCORE" | python3 -c "import sys; float(sys.stdin.read().strip())" 2>/dev/null; then
