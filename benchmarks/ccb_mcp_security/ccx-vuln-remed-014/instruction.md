@@ -58,6 +58,7 @@ Create a file at `/workspace/answer.json` with your findings:
 ```
 
 **Important**: Use exact repo identifiers as they appear in Sourcegraph. The MCP-only repos to audit are `sg-benchmarks/grafana-loki` and `sg-benchmarks/grafana-mimir`. Note: the local `/workspace/loki` directory maps to `sg-benchmarks/grafana-loki` in Sourcegraph — use `sg-benchmarks/grafana-loki` as the `repo` value in your answer. The oracle checks for `pkg/dataobj/explorer/service.go` in `sg-benchmarks/grafana-loki`.
+**Note**: Sourcegraph MCP tools return repo names with a `github.com/` prefix (e.g., `github.com/sg-benchmarks/kubernetes-client-go`). Strip this prefix in your answer — use `sg-benchmarks/kubernetes-client-go`, NOT `github.com/sg-benchmarks/kubernetes-client-go`.
 
 Your answer is evaluated against a closed-world oracle — completeness matters.
 

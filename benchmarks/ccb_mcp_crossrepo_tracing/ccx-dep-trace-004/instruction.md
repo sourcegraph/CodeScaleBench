@@ -42,6 +42,7 @@ Create a file at `/workspace/answer.json` with your findings in the following st
 **Important**: Use exact repo identifiers as they appear in the oracle:
 - For Grafana: `"repo": "grafana/grafana"`
 - For Loki: `"repo": "sg-benchmarks/grafana-loki"`
+**Note**: Sourcegraph MCP tools return repo names with a `github.com/` prefix (e.g., `github.com/sg-benchmarks/kubernetes-client-go`). Strip this prefix in your answer — use `sg-benchmarks/kubernetes-client-go`, NOT `github.com/sg-benchmarks/kubernetes-client-go`.
 
 The local checkout at `/workspace/loki` corresponds to `sg-benchmarks/grafana-loki`.
 

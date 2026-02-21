@@ -48,6 +48,7 @@ Create a file at `/workspace/answer.json` with your findings:
 ```
 
 **Important**: Use exact repo identifiers as they appear in Sourcegraph. The repos to search are `nodejs/node`, `sg-benchmarks/expressjs-express`, `sg-benchmarks/lodash`, and `sg-benchmarks/prisma-prisma`. Note: the local `/workspace/express` directory maps to `sg-benchmarks/expressjs-express` in Sourcegraph — use `sg-benchmarks/expressjs-express` as the `repo` value in your answer.
+**Note**: Sourcegraph MCP tools return repo names with a `github.com/` prefix (e.g., `github.com/sg-benchmarks/kubernetes-client-go`). Strip this prefix in your answer — use `sg-benchmarks/kubernetes-client-go`, NOT `github.com/sg-benchmarks/kubernetes-client-go`.
 
 Include only entries where `cookie` appears under `"dependencies"` (not `"devDependencies"`
 or `"scripts"`). Your answer is evaluated against a closed-world oracle — completeness matters.

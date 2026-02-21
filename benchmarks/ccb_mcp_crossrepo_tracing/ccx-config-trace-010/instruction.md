@@ -46,6 +46,7 @@ Create a file at `/workspace/answer.json` with your findings in the following st
 ```
 
 **Important**: The local `/workspace/client-go` directory contains the `kubernetes/client-go` source, but in Sourcegraph it is indexed as `sg-benchmarks/kubernetes-client-go`. Use `sg-benchmarks/kubernetes-client-go` as the `repo` value in your answer — the oracle checks for this exact identifier.
+**Note**: Sourcegraph MCP tools return repo names with a `github.com/` prefix (e.g., `github.com/sg-benchmarks/kubernetes-client-go`). Strip this prefix in your answer — use `sg-benchmarks/kubernetes-client-go`, NOT `github.com/sg-benchmarks/kubernetes-client-go`.
 
 Your answer is evaluated against a closed-world oracle — the exact repo, path, and symbol name matter.
 

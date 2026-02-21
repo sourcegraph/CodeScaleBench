@@ -38,6 +38,7 @@ Create a file at `/workspace/answer.json` with your findings in the following st
 ```
 
 **Important**: Use `"repo": "sg-benchmarks/kubernetes-client-go"` exactly — this is the canonical repo identifier used by the evaluation oracle. The local checkout at `/workspace/client-go` corresponds to this repo.
+**Note**: Sourcegraph MCP tools return repo names with a `github.com/` prefix (e.g., `github.com/sg-benchmarks/kubernetes-client-go`). Strip this prefix in your answer — use `sg-benchmarks/kubernetes-client-go`, NOT `github.com/sg-benchmarks/kubernetes-client-go`.
 
 Include only the `files` field. Your answer is evaluated against a closed-world oracle — completeness matters.
 

@@ -60,6 +60,7 @@ Create a file at `/workspace/answer.json` with your findings:
 ```
 
 **Important**: Use `etcd-io/etcd` as the exact `repo` identifier in your answer. The oracle checks for files `server/storage/mvcc/kvstore.go` and `server/storage/mvcc/kvstore_txn.go` in `etcd-io/etcd`. Do not cite vendored copies in `kubernetes/kubernetes`.
+**Note**: Sourcegraph MCP tools return repo names with a `github.com/` prefix (e.g., `github.com/sg-benchmarks/kubernetes-client-go`). Strip this prefix in your answer — use `sg-benchmarks/kubernetes-client-go`, NOT `github.com/sg-benchmarks/kubernetes-client-go`.
 
 ## Evaluation
 
