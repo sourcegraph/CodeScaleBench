@@ -3,10 +3,14 @@
 
 # sg_only_env: restore full repo before verification (no-op for regular runs)
 [ -f /tmp/.sg_only_mode ] && [ -f /tests/sgonly_verifier_wrapper.sh ] && source /tests/sgonly_verifier_wrapper.sh
+# Artifact mode: parse answer.json, extract analysis text, apply diffs
+if [ -f /tmp/.artifact_only_mode ] && [ -f /tests/answer_json_verifier_lib.sh ]; then
+    source /tests/answer_json_verifier_lib.sh
+fi
 
 set -eo pipefail
 mkdir -p /logs/verifier
-cd /workspace
+cd "${VERIFY_REPO:-/workspace}"
 git config --global --add safe.directory /workspace 2>/dev/null || true
 PRE_FIX_REV="cbe1a35dbdfdc9b7490212bdd812f3e2f4ce9e2d"
 python3 /tests/verify_diff.py \

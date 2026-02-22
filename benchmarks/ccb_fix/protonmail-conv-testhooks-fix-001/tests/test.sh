@@ -4,6 +4,10 @@
 
 # sg_only_env: restore full repo before verification (no-op for regular runs)
 [ -f /tmp/.sg_only_mode ] && [ -f /tests/sgonly_verifier_wrapper.sh ] && source /tests/sgonly_verifier_wrapper.sh
+# Artifact mode: parse answer.json, extract analysis text, apply diffs
+if [ -f /tmp/.artifact_only_mode ] && [ -f /tests/answer_json_verifier_lib.sh ]; then
+    source /tests/answer_json_verifier_lib.sh
+fi
 
 set -uo pipefail
 
@@ -15,7 +19,7 @@ trap 'if [ ! -f /logs/verifier/reward.txt ]; then echo "0.0" > /logs/verifier/re
 echo "=== SWE-bench Pro Evaluation ==="
 
 # SWE-bench Pro images have the repository at /app
-cd /app || cd /testbed || cd /workspace
+cd "${VERIFY_REPO:-/app}" || cd /testbed || cd /workspace
 echo "Working directory: $(pwd)"
 
 # Check if config.json exists in /tests

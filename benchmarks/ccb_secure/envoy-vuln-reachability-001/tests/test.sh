@@ -3,8 +3,18 @@
 # Shared checklist verifier with soft length scaling and optional canonical-SHA bypass.
 
 set -e
+# Artifact mode: parse answer.json, extract analysis text, apply diffs
+if [ -f /tmp/.artifact_only_mode ] && [ -f /tests/answer_json_verifier_lib.sh ]; then
+    source /tests/answer_json_verifier_lib.sh
+fi
 
 REPORT_PATH="${REPORT_PATH:-/logs/agent/triage.md}"
+# In artifact mode, populate expected output from answer.json analysis
+if [ "${ARTIFACT_ONLY:-false}" = "true" ] && [ -f "${ANALYSIS_TEXT_FILE:-}" ]; then
+    mkdir -p "/logs/agent"
+    cp "$ANALYSIS_TEXT_FILE" "/logs/agent/triage.md"
+    echo "[answer_json] Copied analysis text to /logs/agent/triage.md"
+fi
 GROUND_TRUTH="${GROUND_TRUTH:-/tests/ground_truth.json}"
 REWARD_FILE="/logs/verifier/reward.txt"
 MIN_REPORT_BYTES="${MIN_REPORT_BYTES:-100}"

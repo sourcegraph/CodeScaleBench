@@ -7,8 +7,12 @@ set -e
 
 # sg_only_env: restore full repo before verification (no-op for regular runs)
 [ -f /tmp/.sg_only_mode ] && [ -f /tests/sgonly_verifier_wrapper.sh ] && source /tests/sgonly_verifier_wrapper.sh
+# Artifact mode: parse answer.json, extract analysis text, apply diffs
+if [ -f /tmp/.artifact_only_mode ] && [ -f /tests/answer_json_verifier_lib.sh ]; then
+    source /tests/answer_json_verifier_lib.sh
+fi
 
-cd /workspace
+cd "${VERIFY_REPO:-/workspace}"
 mkdir -p /logs/verifier
 
 git config --global --add safe.directory /workspace 2>/dev/null || true
@@ -39,6 +43,12 @@ fi
 echo "Change detection: unstaged=$UNSTAGED_COUNT staged=$STAGED_COUNT untracked=$UNTRACKED_COUNT commits=$COMMIT_COUNT"
 
 SOLUTION_FILE="/logs/agent/solution.md"
+# In artifact mode, populate expected output from answer.json analysis
+if [ "${ARTIFACT_ONLY:-false}" = "true" ] && [ -f "${ANALYSIS_TEXT_FILE:-}" ]; then
+    mkdir -p "/logs/agent"
+    cp "$ANALYSIS_TEXT_FILE" "/logs/agent/solution.md"
+    echo "[answer_json] Copied analysis text to /logs/agent/solution.md"
+fi
 HAS_CHANGES=0
 if [ "$UNSTAGED_COUNT" -gt 0 ] || [ "$STAGED_COUNT" -gt 0 ] || [ "$UNTRACKED_COUNT" -gt 0 ] || [ "$COMMIT_COUNT" -gt 0 ]; then
     HAS_CHANGES=1

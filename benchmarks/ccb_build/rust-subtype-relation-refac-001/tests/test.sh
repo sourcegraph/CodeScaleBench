@@ -6,8 +6,12 @@ set -e
 
 # sg_only_env: restore full repo before verification (no-op for regular runs)
 [ -f /tmp/.sg_only_mode ] && [ -f /tests/sgonly_verifier_wrapper.sh ] && source /tests/sgonly_verifier_wrapper.sh
+# Artifact mode: parse answer.json, extract analysis text, apply diffs
+if [ -f /tmp/.artifact_only_mode ] && [ -f /tests/answer_json_verifier_lib.sh ]; then
+    source /tests/answer_json_verifier_lib.sh
+fi
 
-cd /workspace
+cd "${VERIFY_REPO:-/workspace}"
 mkdir -p /logs/verifier
 
 git config --global --add safe.directory /workspace 2>/dev/null || true
@@ -18,6 +22,12 @@ source /tests/verifier_lib.sh
 # ── Change detection guard ────────────────────────────────────────────────
 # Refactoring tasks require actual code changes OR a detailed solution.md
 SOLUTION_FILE="/logs/agent/solution.md"
+# In artifact mode, populate expected output from answer.json analysis
+if [ "${ARTIFACT_ONLY:-false}" = "true" ] && [ -f "${ANALYSIS_TEXT_FILE:-}" ]; then
+    mkdir -p "/logs/agent"
+    cp "$ANALYSIS_TEXT_FILE" "/logs/agent/solution.md"
+    echo "[answer_json] Copied analysis text to /logs/agent/solution.md"
+fi
 UNSTAGED_COUNT=$(git diff --stat 2>/dev/null | wc -l)
 STAGED_COUNT=$(git diff --cached --stat 2>/dev/null | wc -l)
 UNTRACKED_COUNT=$(git ls-files --others --exclude-standard 2>/dev/null | wc -l)
