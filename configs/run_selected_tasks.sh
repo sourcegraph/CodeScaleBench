@@ -357,11 +357,10 @@ _drain_pool() {
 # Follows _common.sh's run_paired_configs pattern: both configs run in parallel
 # per task so timing is comparable and resource utilization is maximized.
 #
-# Key design: baseline uses the ORIGINAL Dockerfile (full local repos).
-# MCP uses a TEMP COPY of the task dir with Dockerfile.sg_only swapped in
-# so the agent has NO local source code and must use Sourcegraph MCP tools.
-# The verifier's tests/ dir (uploaded by Harbor at runtime) still works
-# because oracle_checks.py scores answer.json content, not compiled code.
+# Dockerfile swap logic (determined by VERIFIER_MODE):
+#   direct mode:  baseline=original Dockerfile, MCP=Dockerfile.sg_only
+#   artifact mode: BOTH configs use Dockerfile.artifact_only (sets /tmp/.artifact_only_mode
+#                  sentinel so verifier parses answer.json and applies diffs)
 #
 # Args: bm task_id task_path bl_jobs_dir full_jobs_dir
 _launch_task_pair() {
@@ -375,16 +374,38 @@ _launch_task_pair() {
 
     local pair_pids=()
     local _mcp_temp_dir=""
+    local _bl_temp_dir=""
 
-    # Launch baseline config — uses original Dockerfile (full local repos)
+    # Determine which Dockerfile variant to use for each config
+    local _is_artifact=false
+    [[ "$VERIFIER_MODE" == "artifact" ]] && _is_artifact=true
+
+    # Launch baseline config
     if [ "$RUN_BASELINE" = true ]; then
+        local _bl_task_path="$abs_path"
+
+        # Artifact mode: baseline also needs Dockerfile.artifact_only
+        # (sets /tmp/.artifact_only_mode so verifier parses answer.json)
+        if [ "$_is_artifact" = true ]; then
+            local _df_artifact="${abs_path}/environment/Dockerfile.artifact_only"
+            if [ -f "$_df_artifact" ]; then
+                _bl_temp_dir=$(mktemp -d "/tmp/bl_${task_id}_XXXXXX")
+                cp -a "${abs_path}/." "${_bl_temp_dir}/"
+                cp "${_bl_temp_dir}/environment/Dockerfile.artifact_only" "${_bl_temp_dir}/environment/Dockerfile"
+                _bl_task_path="$_bl_temp_dir"
+                echo "  [artifact] Using artifact Dockerfile for baseline: $task_id"
+            else
+                echo "  WARNING: No Dockerfile.artifact_only for $task_id — baseline verifier won't parse answer.json"
+            fi
+        fi
+
         _wait_for_slot
         _pick_next_account
         local _bl_home="$_PICKED_HOME"
         (
             export HOME="$_bl_home"
             BASELINE_MCP_TYPE=$BL_MCP_TYPE harbor run \
-                --path "$abs_path" \
+                --path "$_bl_task_path" \
                 --agent-import-path "$AGENT_PATH" \
                 --model "$MODEL" \
                 --jobs-dir "$bl_jobs_dir" \
@@ -400,21 +421,34 @@ _launch_task_pair() {
         sleep 2
     fi
 
-    # Launch full/MCP config — uses Dockerfile.sg_only (no local source code)
+    # Launch full/MCP config
     if [ "$RUN_FULL" = true ]; then
         local _mcp_task_path="$abs_path"
-        local _df_sgonly="${abs_path}/environment/Dockerfile.sg_only"
 
-        # Create temp copy with Dockerfile.sg_only swapped in.
-        # This ensures baseline sees the original Dockerfile while MCP sees sg_only.
-        if [ -f "$_df_sgonly" ]; then
-            _mcp_temp_dir=$(mktemp -d "/tmp/mcp_${task_id}_XXXXXX")
-            cp -a "${abs_path}/." "${_mcp_temp_dir}/"
-            cp "${_mcp_temp_dir}/environment/Dockerfile.sg_only" "${_mcp_temp_dir}/environment/Dockerfile"
-            _mcp_task_path="$_mcp_temp_dir"
-            echo "  [sg_only] Using empty-workspace Dockerfile for MCP config: $task_id"
+        if [ "$_is_artifact" = true ]; then
+            # Artifact mode: use Dockerfile.artifact_only (full repo + artifact sentinel)
+            local _df_artifact="${abs_path}/environment/Dockerfile.artifact_only"
+            if [ -f "$_df_artifact" ]; then
+                _mcp_temp_dir=$(mktemp -d "/tmp/mcp_${task_id}_XXXXXX")
+                cp -a "${abs_path}/." "${_mcp_temp_dir}/"
+                cp "${_mcp_temp_dir}/environment/Dockerfile.artifact_only" "${_mcp_temp_dir}/environment/Dockerfile"
+                _mcp_task_path="$_mcp_temp_dir"
+                echo "  [artifact] Using artifact Dockerfile for MCP config: $task_id"
+            else
+                echo "  WARNING: No Dockerfile.artifact_only for $task_id — MCP verifier won't parse answer.json"
+            fi
         else
-            echo "  WARNING: No Dockerfile.sg_only for $task_id — MCP will have local source access"
+            # Direct mode: use Dockerfile.sg_only (empty workspace, agent uses MCP)
+            local _df_sgonly="${abs_path}/environment/Dockerfile.sg_only"
+            if [ -f "$_df_sgonly" ]; then
+                _mcp_temp_dir=$(mktemp -d "/tmp/mcp_${task_id}_XXXXXX")
+                cp -a "${abs_path}/." "${_mcp_temp_dir}/"
+                cp "${_mcp_temp_dir}/environment/Dockerfile.sg_only" "${_mcp_temp_dir}/environment/Dockerfile"
+                _mcp_task_path="$_mcp_temp_dir"
+                echo "  [sg_only] Using empty-workspace Dockerfile for MCP config: $task_id"
+            else
+                echo "  WARNING: No Dockerfile.sg_only for $task_id — MCP will have local source access"
+            fi
         fi
 
         _wait_for_slot
@@ -438,10 +472,13 @@ _launch_task_pair() {
         sleep 2
     fi
 
-    # Track temp dir for cleanup in _drain_pool (after all harbor processes finish).
+    # Track temp dirs for cleanup in _drain_pool (after all harbor processes finish).
     # Cannot use background watcher because wait() only works for child processes.
     if [ -n "$_mcp_temp_dir" ]; then
         _MCP_TEMP_DIRS+=("$_mcp_temp_dir")
+    fi
+    if [ -n "$_bl_temp_dir" ]; then
+        _MCP_TEMP_DIRS+=("$_bl_temp_dir")
     fi
 }
 
