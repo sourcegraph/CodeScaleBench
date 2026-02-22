@@ -3,7 +3,7 @@
 #
 # Source this at the TOP of test.sh for artifact-only mode. It detects
 # /tmp/.artifact_only_mode and:
-#   1. Copies /repo_full to /tmp/verify_repo (clean scoring copy)
+#   1. Uses /repo_full directly for scoring (zero-copy, container is ephemeral)
 #   2. Exports VERIFY_REPO for downstream fix-pattern checks
 #   3. Provides apply_patches_from_review_json() to apply fix_patch fields
 #   4. Provides apply_patch_file() to apply standalone .patch files
@@ -29,16 +29,13 @@ fi
 echo "[artifact_verifier] Detected artifact-only mode"
 export ARTIFACT_ONLY=true
 
-# Create clean scoring copy from /repo_full
+# Use /repo_full directly — container is ephemeral, no need to preserve pristine copy
 if [ -d /repo_full ]; then
-    echo "[artifact_verifier] Copying /repo_full -> /tmp/verify_repo..."
-    rm -rf /tmp/verify_repo
-    cp -a /repo_full /tmp/verify_repo
-    export VERIFY_REPO="/tmp/verify_repo"
-    # Ensure git works in the copy
-    cd /tmp/verify_repo
-    git config --global --add safe.directory /tmp/verify_repo 2>/dev/null || true
-    echo "[artifact_verifier] Clean scoring repo ready at $VERIFY_REPO"
+    chmod -R u+w /repo_full 2>/dev/null || true
+    export VERIFY_REPO="/repo_full"
+    cd /repo_full
+    git config --global --add safe.directory /repo_full 2>/dev/null || true
+    echo "[artifact_verifier] Scoring repo ready at $VERIFY_REPO (zero-copy)"
 else
     echo "[artifact_verifier] WARNING: /repo_full not found. Using /workspace as fallback."
     export VERIFY_REPO="/workspace"
@@ -158,43 +155,34 @@ for entry in reported:
         pf_path = pf.name
 
     # Try git apply
-    try:
-        result = subprocess.run(
-            ["git", "apply", "--allow-empty", pf_path],
-            cwd=verify_repo, capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            applied += 1
-            os.unlink(pf_path)
-            continue
-    except FileNotFoundError:
-        pass
+    result = subprocess.run(
+        ["git", "apply", "--allow-empty", pf_path],
+        cwd=verify_repo, capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        applied += 1
+        os.unlink(pf_path)
+        continue
 
     # Fallback: patch -p1 --fuzz=3
-    try:
-        result = subprocess.run(
-            ["patch", "-p1", "--fuzz=3", "-i", pf_path],
-            cwd=verify_repo, capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            applied += 1
-            os.unlink(pf_path)
-            continue
-    except FileNotFoundError:
-        print("[artifact_verifier] 'patch' not installed, skipping fallback", file=sys.stderr)
+    result = subprocess.run(
+        ["patch", "-p1", "--fuzz=3", "-i", pf_path],
+        cwd=verify_repo, capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        applied += 1
+        os.unlink(pf_path)
+        continue
 
     # Fallback: git apply with 3way
-    try:
-        result = subprocess.run(
-            ["git", "apply", "--allow-empty", "--3way", pf_path],
-            cwd=verify_repo, capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            applied += 1
-            os.unlink(pf_path)
-            continue
-    except FileNotFoundError:
-        pass
+    result = subprocess.run(
+        ["git", "apply", "--allow-empty", "--3way", pf_path],
+        cwd=verify_repo, capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        applied += 1
+        os.unlink(pf_path)
+        continue
 
     failed += 1
     file_name = entry.get("file", "unknown")

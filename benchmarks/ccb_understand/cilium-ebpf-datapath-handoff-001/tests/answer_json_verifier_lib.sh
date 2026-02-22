@@ -5,7 +5,7 @@
 #   1. Validates /workspace/answer.json exists and is valid JSON
 #   2. Extracts analysis.reasoning → $ANALYSIS_TEXT_FILE (for keyword/pattern scoring)
 #   3. Extracts analysis.files_examined → $ANALYSIS_FILES_FILE (for IR metrics)
-#   4. If changes[] has diffs: copies /repo_full → /tmp/verify_repo, applies all diffs
+#   4. If changes[] has diffs: applies diffs directly to /repo_full (zero-copy, container is ephemeral)
 #   5. Exports VERIFY_REPO, ARTIFACT_ONLY, ANALYSIS_TEXT_FILE, etc.
 #
 # For non-artifact-only runs, this script is a no-op that sets safe defaults.
@@ -201,13 +201,13 @@ if analysis:
             json.dump(fl_result, f, indent=2)
         print(f"[answer_json_verifier] Generated fault_localization_result.json")
 
-# ── Apply diffs to verify_repo (for code-change verification) ─────────────
+# ── Apply diffs directly to /repo_full (zero-copy) ───────────────────────
 if not changes:
     sys.exit(0)
 
-# We have diffs to apply — need /repo_full
-verify_repo = "/tmp/verify_repo"
+# Apply diffs in-place — container is ephemeral, no need to preserve /repo_full
 repo_full = "/repo_full"
+verify_repo = repo_full
 
 if not os.path.isdir(repo_full):
     print(f"[answer_json_verifier] WARNING: {repo_full} not found. Cannot apply diffs.")
@@ -215,12 +215,11 @@ if not os.path.isdir(repo_full):
         f.write("1")
     sys.exit(0)
 
-# Copy /repo_full to /tmp/verify_repo
-print(f"[answer_json_verifier] Copying {repo_full} -> {verify_repo}...")
-subprocess.run(["rm", "-rf", verify_repo], check=True)
-subprocess.run(["cp", "-a", repo_full, verify_repo], check=True)
+# Ensure verifier (root) can write to repo_full
+subprocess.run(["chmod", "-R", "u+w", repo_full], capture_output=True)
+print(f"[answer_json_verifier] Applying diffs to {repo_full} (in-place, zero-copy)...")
 subprocess.run(
-    ["git", "config", "--global", "--add", "safe.directory", verify_repo],
+    ["git", "config", "--global", "--add", "safe.directory", repo_full],
     capture_output=True
 )
 
