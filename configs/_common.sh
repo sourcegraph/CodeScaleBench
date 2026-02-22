@@ -88,6 +88,95 @@ baseline_config_for() {
     esac
 }
 
+# Validate a config name against the known whitelist.
+# Exits 1 with error message if unknown. Call before config_to_mcp_type().
+validate_config_name() {
+    local config_name="$1"
+    case "$config_name" in
+        baseline-local-direct|mcp-remote-direct|\
+        baseline-local-artifact|mcp-remote-artifact|\
+        baseline|sourcegraph_full|artifact_full|none)
+            return 0 ;;
+        *)
+            echo "ERROR: Unknown config name: '$config_name'" >&2
+            echo "  Valid: baseline-local-direct, mcp-remote-direct, baseline-local-artifact, mcp-remote-artifact" >&2
+            echo "  Legacy: baseline, sourcegraph_full, artifact_full, none" >&2
+            exit 1 ;;
+    esac
+}
+
+# ============================================
+# PRE-FLIGHT CONFIRMATION GATE
+# ============================================
+# Shared pre-flight check for any script that launches harbor runs.
+# Shows config, Docker status, disk, and tokens, then requires interactive
+# confirmation. MUST be called before any harbor run invocation.
+#
+# Usage: confirm_launch "description" "config_name" [n_tasks]
+#   $1 = short description (e.g., "MCP rerun: 3 SWE-Perf tasks")
+#   $2 = config name (e.g., "mcp-remote-artifact")
+#   $3 = number of tasks (default: 1)
+#
+# Exits 1 on Docker failure or low disk. Always requires Enter to proceed.
+confirm_launch() {
+    local description="${1:-Harbor run}"
+    local config_name="${2:-unknown}"
+    local n_tasks="${3:-1}"
+
+    echo "----------------------------------------------"
+    echo "PRE-FLIGHT: $description"
+    echo "----------------------------------------------"
+    echo "Config:       $config_name"
+    echo "Tasks:        $n_tasks"
+
+    # Docker daemon
+    if timeout 10 docker info >/dev/null 2>&1; then
+        echo "Docker:       OK"
+    else
+        echo "Docker:       FAIL — daemon not responding"
+        exit 1
+    fi
+
+    # Disk space
+    local _repo_root
+    _repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    local _disk_free
+    _disk_free=$(df -BG --output=avail "$_repo_root" 2>/dev/null | tail -1 | tr -d ' G')
+    if [ -n "$_disk_free" ] && [ "$_disk_free" -lt 5 ]; then
+        echo "Disk space:   FAIL — only ${_disk_free}GB free"
+        exit 1
+    elif [ -n "$_disk_free" ] && [ "$_disk_free" -lt 20 ]; then
+        echo "Disk space:   WARN — ${_disk_free}GB free"
+    else
+        echo "Disk space:   OK (${_disk_free:-?}GB free)"
+    fi
+
+    # Token freshness (if multi-account is set up)
+    if [ "${#CLAUDE_HOMES[@]}" -gt 0 ] 2>/dev/null; then
+        echo "Accounts:     ${#CLAUDE_HOMES[@]} active"
+        for _home_dir in "${CLAUDE_HOMES[@]}"; do
+            local _creds="${_home_dir}/.claude/.credentials.json"
+            if [ -f "$_creds" ]; then
+                local _remaining
+                _remaining=$(python3 -c "
+import json, time, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    exp = d.get('claudeAiOauth',{}).get('expiresAt',0)
+    rem = int((exp - time.time()*1000) / 60000)
+    print(f'{rem} min remaining')
+except: print('unknown')
+" "$_creds" 2>/dev/null)
+                echo "  $(basename "$_home_dir"): $_remaining"
+            fi
+        done
+    fi
+
+    echo "----------------------------------------------"
+    read -r -p "Press Enter to proceed, Ctrl+C to abort... " _
+    echo ""
+}
+
 # ============================================
 # VERIFIER DEBUG MODE
 # ============================================

@@ -35,6 +35,15 @@ per-task details. See `docs/MCP_UNIQUE_TASKS.md` for the MCP-unique extension.
 - Never run `git checkout -b` or `git switch -c`.
 - Commit directly to `main`. This avoids cross-session branch confusion when multiple agents work on the repo.
 
+## Run Launch Policy
+- **Every `harbor run` invocation MUST be gated by interactive confirmation.**
+  The user must see a pre-flight summary and press Enter before any benchmark
+  task launches. There is no `--yes` or unattended mode.
+- Use `confirm_launch "description" "config" N` from `_common.sh` in one-off
+  scripts. `run_selected_tasks.sh` has its own built-in pre-flight gate.
+- **Never write a script that calls `harbor run` without a confirmation gate.**
+- **Never pass `--yes` to `run_selected_tasks.sh`** — the flag has been removed.
+
 ## Typical Skill Routing
 Use these defaults unless there is a task-specific reason not to.
 
@@ -109,7 +118,7 @@ python3 scripts/repo_health.py                      # repo health gate (before p
 ```
 
 ## Script Entrypoints
-- `configs/_common.sh` - shared run infra (parallelism, token refresh, validation hooks)
+- `configs/_common.sh` - shared run infra (parallelism, token refresh, validation hooks, `confirm_launch()`, `validate_config_name()`)
 - `configs/sdlc_suite_2config.sh` - generic SDLC runner (used by phase wrappers)
 - `configs/{build,debug,design,document,fix,secure,test}_2config.sh` - thin SDLC phase wrappers
 - `configs/run_selected_tasks.sh` - unified runner from `selected_benchmark_tasks.json`

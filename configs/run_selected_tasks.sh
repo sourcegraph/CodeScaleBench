@@ -25,7 +25,7 @@
 #   --category CATEGORY             Run category (default: staging)
 #   --skip-completed                Skip tasks that already have result.json + task_metrics.json
 #   --dry-run                       Print tasks without running
-#   --yes                           Skip confirmation prompt (non-interactive mode)
+#   --skip-prebuild                 Skip Docker image pre-build (use when images already cached)
 #
 # Prerequisites:
 #   - configs/selected_benchmark_tasks.json in repo (or --selection-file path)
@@ -61,7 +61,7 @@ CATEGORY="${CATEGORY:-staging}"
 FULL_CONFIG="${FULL_CONFIG:-mcp-remote-direct}"
 DRY_RUN=false
 SKIP_COMPLETED=false
-YES=false
+SKIP_PREBUILD=false
 AGENT_PATH="agents.claude_baseline_agent:BaselineClaudeCodeAgent"
 
 while [[ $# -gt 0 ]]; do
@@ -114,8 +114,8 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=true
             shift
             ;;
-        --yes)
-            YES=true
+        --skip-prebuild)
+            SKIP_PREBUILD=true
             shift
             ;;
         *)
@@ -150,6 +150,10 @@ ensure_fresh_token_all  # also populates CLAUDE_HOMES[] via setup_multi_accounts
 BASELINE_CONFIG=$(baseline_config_for "$FULL_CONFIG")
 BL_MCP_TYPE=$(config_to_mcp_type "$BASELINE_CONFIG")
 FULL_MCP_TYPE=$(config_to_mcp_type "$FULL_CONFIG")
+
+# Strict validation — exit immediately on unknown config names
+validate_config_name "$BASELINE_CONFIG"
+validate_config_name "$FULL_CONFIG"
 
 # ============================================
 # EXTRACT TASKS FROM SELECTION FILE
@@ -250,17 +254,164 @@ if [ "$DRY_RUN" = true ]; then
             echo "  ... and $(( count - 5 )) more"
         fi
     done
+    if [ "$SKIP_PREBUILD" = false ]; then
+        echo ""
+        echo "[DRY RUN] Would pre-build Docker images for: ${!BENCHMARK_COUNTS[*]}"
+    fi
     exit 0
 fi
 
 # ============================================
-# CONFIRMATION GATE
+# DOCKERFILE VARIANT CHECK
 # ============================================
-if [ "$YES" != true ]; then
-    echo "----------------------------------------------"
-    echo "Ready to launch $TOTAL_AGENT_RUNS agent runs ($PARALLEL_TASKS parallel)."
+# Verify all tasks have the required Dockerfile variant for the chosen config
+# BEFORE asking the user to confirm.
+check_dockerfile_variants() {
+    DOCKERFILE_MISSING_COUNT=0
+    DOCKERFILE_READY_COUNT=0
+    DOCKERFILE_WARNINGS=""
+
+    local _is_artifact=false
+    [[ "$FULL_CONFIG" == *artifact* ]] && _is_artifact=true
+
+    for bm in $(echo "${!BENCHMARK_TASK_DIRS[@]}" | tr ' ' '\n' | sort); do
+        while IFS= read -r task_path; do
+            [ -z "$task_path" ] && continue
+            local abs_path="$REPO_ROOT/$task_path"
+            local task_id
+            task_id=$(basename "$task_path")
+
+            # Baseline: needs environment/Dockerfile
+            if [ "$RUN_BASELINE" = true ] && [ ! -f "${abs_path}/environment/Dockerfile" ]; then
+                DOCKERFILE_WARNINGS+="  MISSING: ${task_id} — Dockerfile (baseline)"$'\n'
+                DOCKERFILE_MISSING_COUNT=$(( DOCKERFILE_MISSING_COUNT + 1 ))
+            fi
+
+            # Full/MCP: needs the variant Dockerfile
+            if [ "$RUN_FULL" = true ]; then
+                if [ "$_is_artifact" = true ]; then
+                    if [ ! -f "${abs_path}/environment/Dockerfile.artifact_only" ]; then
+                        DOCKERFILE_WARNINGS+="  MISSING: ${task_id} — Dockerfile.artifact_only"$'\n'
+                        DOCKERFILE_MISSING_COUNT=$(( DOCKERFILE_MISSING_COUNT + 1 ))
+                    else
+                        DOCKERFILE_READY_COUNT=$(( DOCKERFILE_READY_COUNT + 1 ))
+                    fi
+                else
+                    if [ ! -f "${abs_path}/environment/Dockerfile.sg_only" ]; then
+                        DOCKERFILE_WARNINGS+="  MISSING: ${task_id} — Dockerfile.sg_only"$'\n'
+                        DOCKERFILE_MISSING_COUNT=$(( DOCKERFILE_MISSING_COUNT + 1 ))
+                    else
+                        DOCKERFILE_READY_COUNT=$(( DOCKERFILE_READY_COUNT + 1 ))
+                    fi
+                fi
+            fi
+        done <<< "$(echo "${BENCHMARK_TASK_DIRS[$bm]}" | grep -v '^$')"
+    done
+}
+
+# ============================================
+# PRE-FLIGHT VERIFICATION
+# ============================================
+echo "----------------------------------------------"
+echo "PRE-FLIGHT VERIFICATION"
+echo "----------------------------------------------"
+echo ""
+
+# 1. Config pair
+echo "Config pair:"
+if [ "$RUN_BASELINE" = true ]; then
+    echo "  Baseline: $BASELINE_CONFIG (mcp_type=$BL_MCP_TYPE)"
+fi
+if [ "$RUN_FULL" = true ]; then
+    echo "  Full:     $FULL_CONFIG (mcp_type=$FULL_MCP_TYPE)"
+fi
+echo ""
+
+# 2. Dockerfile variant readiness
+check_dockerfile_variants
+if [ "$RUN_FULL" = true ]; then
+    _variant_name="Dockerfile.sg_only"
+    [[ "$FULL_CONFIG" == *artifact* ]] && _variant_name="Dockerfile.artifact_only"
+    echo "Dockerfile variants ($_variant_name):"
+    echo "  Ready:   $DOCKERFILE_READY_COUNT / $TOTAL_TASKS"
+    if [ "$DOCKERFILE_MISSING_COUNT" -gt 0 ]; then
+        echo "  MISSING: $DOCKERFILE_MISSING_COUNT"
+        echo -e "$DOCKERFILE_WARNINGS"
+    fi
     echo ""
-    read -r -p "Press Enter to proceed, Ctrl+C to abort... " _
+fi
+
+# 3. Docker daemon
+if timeout 10 docker info >/dev/null 2>&1; then
+    echo "Docker:       OK"
+else
+    echo "Docker:       FAIL — daemon not responding"
+    exit 1
+fi
+
+# 4. Account token freshness
+if [ "${#CLAUDE_HOMES[@]}" -gt 0 ]; then
+    echo "Accounts:     ${#CLAUDE_HOMES[@]} active"
+    for _home_dir in "${CLAUDE_HOMES[@]}"; do
+        _creds="${_home_dir}/.claude/.credentials.json"
+        if [ -f "$_creds" ]; then
+            _remaining=$(python3 -c "
+import json, time, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    exp = d.get('claudeAiOauth',{}).get('expiresAt',0)
+    rem = int((exp - time.time()*1000) / 60000)
+    print(f'{rem} min remaining')
+except: print('unknown')
+" "$_creds" 2>/dev/null)
+            echo "  $(basename "$_home_dir"): $_remaining"
+        fi
+    done
+else
+    echo "Accounts:     default (single account)"
+fi
+
+# 5. Disk space
+_disk_free=$(df -BG --output=avail "$REPO_ROOT" 2>/dev/null | tail -1 | tr -d ' G')
+if [ -n "$_disk_free" ] && [ "$_disk_free" -lt 5 ]; then
+    echo "Disk space:   FAIL — only ${_disk_free}GB free"
+    exit 1
+elif [ -n "$_disk_free" ] && [ "$_disk_free" -lt 20 ]; then
+    echo "Disk space:   WARN — ${_disk_free}GB free (may run low)"
+else
+    echo "Disk space:   OK (${_disk_free:-?}GB free)"
+fi
+
+# 6. Prebuild status
+if [ "$SKIP_PREBUILD" = false ]; then
+    echo "Prebuild:     enabled (${!BENCHMARK_COUNTS[*]})"
+else
+    echo "Prebuild:     SKIPPED (--skip-prebuild)"
+fi
+echo ""
+
+# 7. Critical blockers — exit before confirmation
+if [ "$DOCKERFILE_MISSING_COUNT" -gt 0 ]; then
+    echo "BLOCKED: $DOCKERFILE_MISSING_COUNT task(s) missing required Dockerfile variant."
+    echo "Fix: Run python3 scripts/generate_sgonly_dockerfiles.py for affected tasks."
+    exit 1
+fi
+
+echo "----------------------------------------------"
+echo "Ready to launch $TOTAL_AGENT_RUNS agent runs ($PARALLEL_TASKS parallel)."
+echo ""
+read -r -p "Press Enter to proceed, Ctrl+C to abort... " _
+echo ""
+
+# ============================================
+# DOCKER IMAGE PRE-BUILD
+# ============================================
+if [ "$SKIP_PREBUILD" = false ]; then
+    echo "=== Pre-building Docker images ==="
+    ensure_base_images
+    for bm in $(echo "${!BENCHMARK_COUNTS[@]}" | tr ' ' '\n' | sort); do
+        prebuild_images "$bm"
+    done
     echo ""
 fi
 
