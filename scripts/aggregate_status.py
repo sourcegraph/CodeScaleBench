@@ -49,7 +49,7 @@ RUNS_DIR = RUNS_DIR_OFFICIAL  # default; overridden by --staging flag
 
 # __v1_hinted: old run dirs from before enterprise task de-hinting (US-001..US-003).
 # Appended to batch dir names after reruns complete so pre-redesign data is excluded.
-SKIP_PATTERNS = ["__broken_verifier", "validation_test", "archive", "__v1_hinted"]
+SKIP_PATTERNS = ["__broken_verifier", "validation_test", "archive", "__v1_hinted", "__aborted"]
 
 DIR_PREFIX_TO_SUITE = {
     # SDLC phase suite prefixes (new naming: {phase}_{model}_{timestamp})
