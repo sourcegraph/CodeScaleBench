@@ -6,10 +6,13 @@
 # Usage:
 #   ./scripts/prebuild_images.sh [SUITE...] [OPTIONS]
 #   ./scripts/prebuild_images.sh ccb_build ccb_fix
+#   ./scripts/prebuild_images.sh ccb_build --tasks task1,task2,task3
+#   ./scripts/prebuild_images.sh --tasks @/tmp/task_list.txt
 #   ./scripts/prebuild_images.sh                     # all 8 suites
 #   PREBUILD_JOBS=12 ./scripts/prebuild_images.sh
 #
 # Options:
+#   --tasks TASKS     Comma-separated task IDs or @/path/to/file (one ID per line)
 #   --baseline-only   Skip SG_only images
 #   --sgonly-only     Skip baseline images
 #   --dry-run         Print what would be built without building
@@ -28,6 +31,7 @@ FORCE=false
 SKIP_BASELINE=false
 SKIP_SGONLY=false
 SUITES=()
+TASKS_FILTER=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -36,10 +40,36 @@ while [[ $# -gt 0 ]]; do
         --dry-run)       DRY_RUN=true; shift ;;
         --force)         FORCE=true; shift ;;
         --jobs)          PREBUILD_JOBS="$2"; shift 2 ;;
+        --tasks)         TASKS_FILTER="$2"; shift 2 ;;
         ccb_*)           SUITES+=("$1"); shift ;;
         *)               echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# Parse --tasks filter into an associative array for O(1) lookup
+declare -A TASK_FILTER_SET
+if [ -n "$TASKS_FILTER" ]; then
+    if [[ "$TASKS_FILTER" == @* ]]; then
+        # Format: @/path/to/file (one task ID per line)
+        _tasks_file="${TASKS_FILTER:1}"
+        if [ ! -f "$_tasks_file" ]; then
+            echo "ERROR: Task file not found: $_tasks_file"
+            exit 1
+        fi
+        while IFS= read -r _line; do
+            [[ "$_line" =~ ^#.*$ || -z "$_line" ]] && continue
+            TASK_FILTER_SET["$_line"]=1
+        done < "$_tasks_file"
+    else
+        # Format: comma-separated task IDs
+        IFS=',' read -ra _tasks <<< "$TASKS_FILTER"
+        for _tid in "${_tasks[@]}"; do
+            _tid=$(echo "$_tid" | xargs)  # trim whitespace
+            [ -n "$_tid" ] && TASK_FILTER_SET["$_tid"]=1
+        done
+    fi
+    echo "Task filter: ${#TASK_FILTER_SET[@]} task(s)"
+fi
 
 if [ ${#SUITES[@]} -eq 0 ]; then
     SUITES=(ccb_build ccb_debug ccb_design ccb_document ccb_fix ccb_secure ccb_test ccb_understand)
@@ -84,6 +114,12 @@ for suite in "${SUITES[@]}"; do
     for task_dir in "$suite_dir"/*/; do
         [ -d "$task_dir" ] || continue
         task_id=$(basename "$task_dir")
+
+        # Apply --tasks filter if specified
+        if [ ${#TASK_FILTER_SET[@]} -gt 0 ] && [ -z "${TASK_FILTER_SET[$task_id]:-}" ]; then
+            continue
+        fi
+
         env_dir="${task_dir}environment"
 
         # Baseline image

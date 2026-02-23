@@ -206,14 +206,16 @@ ensure_base_images() {
 
 # Pre-build all Docker images for a suite to warm the layer cache.
 # Call before run_paired_configs so Harbor's docker compose build is instant.
-# Args: $1 = suite name (e.g., ccb_build), or empty for all suites
+# Args: $1 = suite name (e.g., ccb_build), remaining args passed through
+#   Example: prebuild_images "ccb_build" --tasks "task1,task2"
 prebuild_images() {
     local suite="${1:-}"
+    shift || true
     local repo_root
     repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     local script="${repo_root}/scripts/prebuild_images.sh"
     if [ -x "$script" ]; then
-        bash "$script" ${suite:+"$suite"}
+        bash "$script" ${suite:+"$suite"} "$@"
     fi
 }
 

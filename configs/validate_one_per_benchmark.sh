@@ -170,6 +170,16 @@ fi
 
 mkdir -p "$JOBS_DIR"
 
+# Ensure ccb-repo-* base images are built before Docker builds.
+# Without this, tasks using FROM ccb-repo-* fail with "pull access denied"
+# because Docker tries to pull the local-only image from Docker Hub.
+BASE_BUILD="$REPO_ROOT/base_images/build.sh"
+if [ -x "$BASE_BUILD" ]; then
+    echo "=== Ensuring base images ==="
+    bash "$BASE_BUILD" --parallel 2>&1 | tail -3 || true
+    echo ""
+fi
+
 PIDS=()
 BMS=()
 declare -A PATH_BY_BM
