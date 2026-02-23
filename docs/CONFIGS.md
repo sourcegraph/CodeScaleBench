@@ -103,40 +103,63 @@ discovery. This is the standard execution model for all `*_2config.sh` runs.
 1. Each task provides a `Dockerfile.sg_only` alongside its regular `Dockerfile`.
 2. The config script copies `Dockerfile.sg_only` over `Dockerfile` before the
    MCP-Full run (baseline uses the original `Dockerfile`).
-3. `Dockerfile.sg_only` clones the repo, backs up the full workspace to
-   `/repo_full/`, then **truncates all source files** in `/workspace/`
-   (zero-byte files preserve directory structure but contain no code).
+3. `Dockerfile.sg_only` creates an empty or truncated workspace (no usable
+   source code) and writes a **clone manifest** to
+   `/tmp/.sg_only_clone_manifest.json` telling the verifier which sg-benchmarks
+   mirror(s) to clone at verification time.
 4. A sentinel file `/tmp/.sg_only_mode` is written at build time.
-5. The agent runs with truncated source — local `Read`, `Grep`, `Glob` return
-   empty/useless results, forcing reliance on MCP tools.
+5. The agent runs with empty/truncated source — local `Read`, `Grep`, `Glob`
+   return empty/useless results, forcing reliance on MCP tools.
 6. At verification time, `test.sh` detects `/tmp/.sg_only_mode` and sources
-   `sgonly_verifier_wrapper.sh`, which restores the full repo from `/repo_full/`
-   and overlays any files the agent wrote, so the verifier runs against the
-   correct codebase.
+   `sgonly_verifier_wrapper.sh`, which clones the mirror repo(s) from the
+   manifest, optionally re-runs defect injection, overlays agent-written files,
+   and then hands off to the verifier.
+
+**Clone manifest format** (`/tmp/.sg_only_clone_manifest.json`):
+
+```json
+{"workdir":"/workspace","repos":[{"mirror":"sg-benchmarks/django--674eda1c","target_dir":"."}]}
+```
+
+Multi-repo tasks list multiple entries; code-review tasks add `"inject_defects"`.
 
 **Key paths inside the container:**
 
 | Path | Contents |
 |---|---|
-| `/workspace/` | Truncated source (agent sees this) |
-| `/repo_full/` | Full repo backup (verifier restores from here) |
-| `/tests/` | Harbor-uploaded test harness (verifier scripts, ground truth) |
+| `/workspace/` (or `/app/`) | Empty or truncated source (agent sees this) |
+| `/tmp/.sg_only_clone_manifest.json` | Clone manifest — verifier clones mirrors from here |
 | `/tmp/.sg_only_mode` | Sentinel that activates verifier restoration |
+| `/tests/` | Harbor-uploaded test harness (verifier scripts, ground truth) |
 | `/logs/agent/` | Agent output (solution.md, patches) |
 
-**Write-only suites** (docgen, nlqa, onboarding, investigation, linuxflbench)
+**Write-only tasks** (docgen, nlqa, onboarding, investigation, linuxflbench)
 have verifiers that only check agent-written output files, not compiled code.
-Their `Dockerfile.sg_only` typically omits the repo clone entirely.
+Their `Dockerfile.sg_only` provides an empty workspace with no clone manifest.
 
-**Build-requiring suites** (largerepo, codereview, swebenchpro, pytorch,
+**Build-requiring tasks** (largerepo, codereview, swebenchpro, pytorch,
 enterprise, etc.) need the full repo for compilation/test execution.
-`sgonly_verifier_wrapper.sh` handles the restore-and-overlay cycle.
+`sgonly_verifier_wrapper.sh` reads the clone manifest, clones mirrors with
+`--depth 1`, and overlays agent changes before the verifier runs.
+
+### Build-requiring subcategories
+
+| Type | FROM base | Clone strategy |
+|---|---|---|
+| ccb-repo-* tasks | Underlying base (e.g. `golang:1.23-bookworm`) | Empty workspace + clone manifest |
+| SWE-bench tasks | `jefzda/sweap-images:*` (preserves test venv) | Truncate source + clone manifest (restores `.py` files) |
+| Code-review tasks | `ubuntu:22.04` | Empty workspace + manifest + `inject_defects` |
+| Multi-repo tasks | `ubuntu:22.04` or language base | Multiple repos in manifest with `target_dir` |
+| Inline-clone tasks | Various | Empty workspace + clone manifest |
 
 ### Adding sg_only support to a new task
 
-1. Create `environment/Dockerfile.sg_only` — clone repo, `cp -a /workspace /repo_full`,
-   truncate source, write sentinel.
-2. Create `tests/sgonly_verifier_wrapper.sh` (or use the standard template).
+Prefer using the generator: `python3 scripts/generate_sgonly_dockerfiles.py`.
+To add manually:
+
+1. Create `environment/Dockerfile.sg_only` — write sentinel, write clone
+   manifest JSON, and leave workspace empty or truncated.
+2. The generator automatically copies `tests/sgonly_verifier_wrapper.sh`.
 3. Add the sg_only hook at the top of `tests/test.sh`:
    ```bash
    [ -f /tmp/.sg_only_mode ] && [ -f /tests/sgonly_verifier_wrapper.sh ] && source /tests/sgonly_verifier_wrapper.sh
@@ -149,7 +172,7 @@ enterprise, etc.) need the full repo for compilation/test execution.
 The configuration is controlled by the `BASELINE_MCP_TYPE` environment variable in `claude_baseline_agent.py`:
 
 - **Baseline (`none`):** No MCP config is loaded. Uses the task's regular `Dockerfile`. The system prompt contains only the evaluation context. No `--tools` or `--disallowedTools` flags are applied.
-- **MCP-Full (`sourcegraph_full`):** Uses `Dockerfile.sg_only` (truncated local source). The Sourcegraph MCP config is loaded (`.api/mcp/v1` endpoint). All local tools remain available but return empty results for source files. The system prompt instructs MCP-first usage with all 13 Sourcegraph MCP tools.
+- **MCP-Full (`sourcegraph_full`):** Uses `Dockerfile.sg_only` (empty or truncated local source). The Sourcegraph MCP config is loaded (`.api/mcp/v1` endpoint). All local tools remain available but return empty results for source files. The verifier clones mirrors at verification time via clone manifest. The system prompt instructs MCP-first usage with all 13 Sourcegraph MCP tools.
 
 Both configs use `--dangerously-skip-permissions` for autonomous operation and deliver evaluation context via `--append-system-prompt`.
 

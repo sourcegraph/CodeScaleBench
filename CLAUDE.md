@@ -62,8 +62,9 @@ Standard pairing: **baseline-local-direct** (full local code, no MCP) and
 **mcp-remote-direct** (source deleted, Sourcegraph MCP). Artifact evaluation
 uses **baseline-local-artifact** + **mcp-remote-artifact** (review.json output).
 MCP configs use `Dockerfile.sg_only` or `Dockerfile.artifact_only` so the
-agent must discover code via MCP tools. The verifier restores the full repo
-before scoring. See `docs/CONFIGS.md` for the full config matrix.
+agent must discover code via MCP tools. The verifier clones the mirror repo
+at verification time and overlays agent changes before scoring.
+See `docs/CONFIGS.md` for the full config matrix.
 
 ## Standard Workflow
 0. **Before commit or push:** Run `python3 scripts/repo_health.py` (or `--quick`). Fix any failures so main stays clean and drift is caught early (see `docs/REPO_HEALTH.md`).
