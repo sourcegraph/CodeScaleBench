@@ -122,6 +122,7 @@ def _build_comparison(task_matrix, suite_filter) -> dict:
                 "reward": reward,
                 "wall_clock_seconds": rec.get("wall_clock_seconds"),
                 "error_fingerprint": rec.get("error_fingerprint"),
+                "timed_out": rec.get("timed_out", False),
             }
 
             is_pass = status == "completed_pass"

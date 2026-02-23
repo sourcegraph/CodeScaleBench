@@ -234,6 +234,7 @@ def classify_task(task_dir: Path, timeout_hours: float) -> dict:
         record["error_fingerprint"] = None
         record["metrics"] = {}
         record["wall_clock_seconds"] = None
+        record["timed_out"] = False
         return record
 
     # Parse result.json
@@ -251,6 +252,7 @@ def classify_task(task_dir: Path, timeout_hours: float) -> dict:
         }
         record["metrics"] = {}
         record["wall_clock_seconds"] = None
+        record["timed_out"] = False
         return record
 
     # Check for exception
@@ -276,14 +278,35 @@ def classify_task(task_dir: Path, timeout_hours: float) -> dict:
     record["started_at"] = data.get("started_at", "")
     record["finished_at"] = data.get("finished_at", "")
 
-    if exception_info is not None:
+    # Determine exception type for timeout-vs-error classification
+    exception_type = ""
+    if isinstance(exception_info, dict):
+        exception_type = exception_info.get(
+            "exception_type", exception_info.get("type", "")
+        )
+
+    if (
+        exception_info is not None
+        and exception_type == "AgentTimeoutError"
+        and reward is not None
+    ):
+        # Agent timed out but verifier scored partial work — treat as scored result
+        record["timed_out"] = True
+        record["error_fingerprint"] = fingerprint_error(exception_info)
+        if reward > 0:
+            record["status"] = "completed_pass"
+        else:
+            record["status"] = "completed_fail"
+    elif exception_info is not None:
         record["status"] = "errored"
         record["error_fingerprint"] = fingerprint_error(exception_info)
-    elif reward is not None and reward > 0:
-        record["status"] = "completed_pass"
-        record["error_fingerprint"] = None
+        record["timed_out"] = False
     else:
-        record["status"] = "completed_fail"
+        record["timed_out"] = False
+        if reward is not None and reward > 0:
+            record["status"] = "completed_pass"
+        else:
+            record["status"] = "completed_fail"
         record["error_fingerprint"] = None
 
     return record
@@ -355,6 +378,8 @@ def scan_all_tasks(
 
                 tasks.append(record)
                 totals[record["status"]] += 1
+                if record.get("timed_out"):
+                    totals["timed_out"] += 1
                 by_suite[suite][config][record["status"]] += 1
 
                 # Accumulate error summary
@@ -592,12 +617,16 @@ def format_table(output: dict) -> str:
 
     # Totals
     totals = output["totals"]
+    timed_out_count = totals.pop("timed_out", 0)
     total_all = sum(totals.values())
     lines.append(f"TOTALS: {total_all} tasks")
     for status in ("running", "completed_pass", "completed_fail", "errored", "timeout"):
         count = totals.get(status, 0)
         if count:
             lines.append(f"  {status:20s} {count:>5d}")
+    if timed_out_count:
+        lines.append(f"  {'timed_out (scored)':20s} {timed_out_count:>5d}")
+    totals["timed_out"] = timed_out_count  # restore for JSON output
     lines.append("")
 
     # By suite/config breakdown
@@ -658,14 +687,18 @@ def format_table(output: dict) -> str:
 
     # Task details (only non-pass or if few tasks)
     non_pass = [t for t in output["tasks"] if t["status"] != "completed_pass"]
-    if non_pass:
-        lines.append(f"NON-PASSING TASKS ({len(non_pass)}):")
-        for t in non_pass:
+    timed_out_pass = [t for t in output["tasks"]
+                      if t["status"] == "completed_pass" and t.get("timed_out")]
+    notable = non_pass + timed_out_pass
+    if notable:
+        lines.append(f"NON-PASSING / TIMED-OUT TASKS ({len(notable)}):")
+        for t in notable:
             fp_str = ""
             if t.get("error_fingerprint"):
                 fp_str = f" [{t['error_fingerprint']['fingerprint_id']}]"
             reward_str = f" reward={t['reward']:.2f}" if t["reward"] is not None else ""
-            lines.append(f"  {t['status']:16s}  {t.get('suite',''):20s}  {t.get('config',''):18s}  {t['task_name']}{reward_str}{fp_str}")
+            timeout_str = " [timed_out]" if t.get("timed_out") else ""
+            lines.append(f"  {t['status']:16s}  {t.get('suite',''):20s}  {t.get('config',''):18s}  {t['task_name']}{reward_str}{fp_str}{timeout_str}")
 
     return "\n".join(lines)
 

@@ -83,6 +83,9 @@ class TaskMetrics:
     input_output_ratio: Optional[float] = None
     cache_hit_rate: Optional[float] = None
 
+    # Agent timeout flag (verifier still scored partial work)
+    timed_out: bool = False
+
     # Tier 1: error & environment
     error_fingerprint: Optional[dict] = None
     verifier_test_summary: Optional[dict] = None

@@ -97,8 +97,11 @@ def extract_task_from_result_json(
                 continue
             break
 
-    # Status
-    if data.get("exception_info"):
+    # Status — agent timeouts are scored normally (verifier runs on partial work)
+    exc = data.get("exception_info") or {}
+    exc_type = exc.get("exception_type", exc.get("type", "")) if isinstance(exc, dict) else ""
+    timed_out = bool(exc and exc_type == "AgentTimeoutError")
+    if exc and not timed_out:
         status = "error"
     elif reward is not None:
         status = "passed" if reward > 0 else "failed"
@@ -160,6 +163,7 @@ def extract_task_from_result_json(
         config_name=config_name,
         reward=reward,
         status=status,
+        timed_out=timed_out,
         wall_clock_seconds=wall_clock,
         agent_execution_seconds=agent_execution_seconds,
         environment_setup_seconds=environment_setup_seconds,
