@@ -138,15 +138,32 @@ fi
 
 # Auto-detect artifact config for MCP-unique selection files
 # MCP-unique tasks use mcp_suite (not benchmark) and REQUIRE artifact configs.
+# Only triggers when ALL filtered tasks are MCP-unique (have mcp_suite, not benchmark).
 if [ "$_FULL_CONFIG_EXPLICIT" = false ]; then
     if python3 -c "
 import json, sys
 data = json.load(open('$SELECTION_FILE'))
-has_mcp_suite = any('mcp_suite' in t for t in data.get('tasks', []))
-sys.exit(0 if has_mcp_suite else 1)
+bm_filter = '$BENCHMARK_FILTER'
+cat_filter = '$USE_CASE_CATEGORY_FILTER'
+tasks = data.get('tasks', [])
+# Apply same filters as extract_tasks()
+filtered = []
+for t in tasks:
+    suite = t.get('benchmark') or t.get('mcp_suite', '')
+    if not suite:
+        continue
+    if bm_filter and suite != bm_filter:
+        continue
+    if cat_filter and t.get('use_case_category', '') != cat_filter:
+        continue
+    filtered.append(t)
+if not filtered:
+    sys.exit(1)
+all_mcp = all('mcp_suite' in t and 'benchmark' not in t for t in filtered)
+sys.exit(0 if all_mcp else 1)
 " 2>/dev/null; then
         FULL_CONFIG="mcp-remote-artifact"
-        echo "Auto-detected MCP-unique selection file → using artifact configs ($FULL_CONFIG)"
+        echo "Auto-detected MCP-unique tasks → using artifact configs ($FULL_CONFIG)"
     fi
 fi
 
