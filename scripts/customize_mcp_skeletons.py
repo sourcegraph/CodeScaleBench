@@ -387,24 +387,30 @@ def copy_parent_verifier(task_dir, parent_rel_path):
         # (the dual-mode test.sh dispatcher handles those before calling us)
         lines = content.split("\n")
         filtered = []
+        in_artifact_block = False
         for line in lines:
             stripped = line.strip()
             # Skip wrapper sourcing (handled by dispatcher)
             if "sgonly_verifier_wrapper.sh" in stripped:
                 continue
-            # Skip artifact_only_mode sourcing (handled by dispatcher)
+            # Detect start of artifact_only_mode if/source/fi block
             if ".artifact_only_mode" in stripped and "answer_json_verifier_lib" in stripped:
+                in_artifact_block = True
                 continue
-            if stripped == "if [ -f /tmp/.artifact_only_mode ] && [ -f /tests/answer_json_verifier_lib.sh ]; then":
+            if stripped.startswith("if") and ".artifact_only_mode" in stripped:
+                in_artifact_block = True
                 continue
-            if stripped == "source /tests/answer_json_verifier_lib.sh":
-                continue
-            if stripped == "fi" and filtered and filtered[-1].strip() == "":
-                # Skip trailing fi from the artifact block (heuristic)
-                # Only skip if the previous non-empty line was the source line
-                prev_content = [l for l in filtered if l.strip()]
-                if prev_content and "answer_json_verifier_lib" in prev_content[-1]:
+            if in_artifact_block:
+                if stripped == "source /tests/answer_json_verifier_lib.sh":
                     continue
+                if stripped == "fi":
+                    in_artifact_block = False
+                    continue
+                # Any other line inside the block — also skip
+                continue
+            # Also skip the "# Artifact mode:" comment that precedes the block
+            if stripped == "# Artifact mode: parse answer.json, extract analysis text, apply diffs":
+                continue
             filtered.append(line)
         direct_content = "\n".join(filtered)
 
@@ -608,9 +614,14 @@ def main():
                 actions.append("created test.sh")
 
         # 3b. Copy parent verifier for dual-mode adapted tasks
+        # Overwrite placeholder direct_verifier.sh with actual parent verifier
         if is_dual_mode and uc_id in PARENT_TASK_MAP:
             direct_path = os.path.join(task_dir, "tests", "direct_verifier.sh")
-            if not os.path.exists(direct_path):
+            is_placeholder = False
+            if os.path.exists(direct_path):
+                with open(direct_path) as f:
+                    is_placeholder = "PLACEHOLDER" in f.read()
+            if not os.path.exists(direct_path) or is_placeholder:
                 copied_files = copy_parent_verifier(task_dir, PARENT_TASK_MAP[uc_id])
                 if copied_files:
                     actions.append(f"copied parent verifier: {', '.join(copied_files)}")
