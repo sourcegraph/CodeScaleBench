@@ -14,10 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /workspace
 
 # Clone local checkout repos (baseline config: agent has local access to these)
-RUN git clone --depth 1 https://github.com/sg-evals/kubernetes--v1.32.0 /workspace/kubernetes
-RUN git clone --depth 1 https://github.com/sg-evals/client-go--v0.32.0 /workspace/client-go
-RUN git clone --depth 1 https://github.com/sg-evals/api--v0.32.0 /workspace/api
-RUN git clone --depth 1 https://github.com/sg-evals/etcd-io-etcd /workspace/etcd
+RUN git clone --depth 1 --branch v1.32.0 https://github.com/sg-evals/kubernetes--v1.32.0 /workspace/kubernetes--v1.32.0
+RUN git clone --depth 1 --branch v0.32.0 https://github.com/sg-evals/client-go--v0.32.0 /workspace/client-go--v0.32.0
+RUN git clone --depth 1 --branch v0.32.0 https://github.com/sg-evals/api--v0.32.0 /workspace/api--v0.32.0
+RUN git clone --depth 1 --branch HEAD https://github.com/sg-evals/etcd-io-etcd /workspace/etcd-io-etcd
 
 # Initialize git identity for agent commits
 RUN git config --global user.email "agent@example.com" && \

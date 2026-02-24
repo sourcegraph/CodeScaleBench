@@ -557,8 +557,9 @@ _drain_pool() {
 #
 # Dockerfile swap logic (determined by VERIFIER_MODE):
 #   direct mode:  baseline=original Dockerfile, MCP=Dockerfile.sg_only
-#   artifact mode: BOTH configs use Dockerfile.artifact_only (sets /tmp/.artifact_only_mode
-#                  sentinel so verifier parses answer.json and applies diffs)
+#   artifact mode: baseline=Dockerfile.artifact_baseline (local code + sentinel),
+#                  MCP=Dockerfile.artifact_only (empty workspace + sentinel).
+#                  Both set /tmp/.artifact_only_mode so verifier parses answer.json.
 #
 # Args: bm task_id task_path bl_jobs_dir full_jobs_dir
 _launch_task_pair() {
@@ -584,18 +585,25 @@ _launch_task_pair() {
     if [ "$RUN_BASELINE" = true ]; then
         local _bl_task_path="$abs_path"
 
-        # Artifact mode: baseline also needs Dockerfile.artifact_only
-        # (sets /tmp/.artifact_only_mode so verifier parses answer.json)
+        # Artifact mode: baseline uses Dockerfile.artifact_baseline (local code + artifact sentinel)
+        # Falls back to Dockerfile.artifact_only if artifact_baseline doesn't exist.
         if [ "$_is_artifact" = true ]; then
+            local _df_artifact_bl="${abs_path}/environment/Dockerfile.artifact_baseline"
             local _df_artifact="${abs_path}/environment/Dockerfile.artifact_only"
-            if [ -f "$_df_artifact" ]; then
+            if [ -f "$_df_artifact_bl" ]; then
                 _bl_temp_dir=$(mktemp -d "/tmp/bl_${task_id}_XXXXXX")
                 cp -a "${abs_path}/." "${_bl_temp_dir}/"
-                cp "${_bl_temp_dir}/environment/Dockerfile.artifact_only" "${_bl_temp_dir}/environment/Dockerfile"
+                cp "$_df_artifact_bl" "${_bl_temp_dir}/environment/Dockerfile"
                 _bl_task_path="$_bl_temp_dir"
-                echo "  [artifact] Using artifact Dockerfile for baseline: $task_id"
+                echo "  [artifact-baseline] Using local-code artifact Dockerfile for baseline: $task_id"
+            elif [ -f "$_df_artifact" ]; then
+                _bl_temp_dir=$(mktemp -d "/tmp/bl_${task_id}_XXXXXX")
+                cp -a "${abs_path}/." "${_bl_temp_dir}/"
+                cp "$_df_artifact" "${_bl_temp_dir}/environment/Dockerfile"
+                _bl_task_path="$_bl_temp_dir"
+                echo "  [artifact] Fallback: using artifact_only Dockerfile for baseline: $task_id"
             else
-                echo "  WARNING: No Dockerfile.artifact_only for $task_id — baseline verifier won't parse answer.json"
+                echo "  WARNING: No Dockerfile.artifact_baseline or artifact_only for $task_id"
             fi
         fi
 

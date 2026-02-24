@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /workspace
 
 # Clone local checkout repos (baseline config: agent has local access to these)
-# No local checkout repos specified for this fixture
+RUN git clone --depth 1 --branch a5cca0b856ce2f85064d0afeb32e40b06cb2c323 https://github.com/sg-evals/arangodb--a5cca0b8 /workspace/arangodb--a5cca0b8
 
 # Initialize git identity for agent commits
 RUN git config --global user.email "agent@example.com" && \

@@ -952,6 +952,50 @@ ENTRYPOINT []
 """
 
 
+def generate_artifact_baseline(task_dir, dockerfile_text):
+    """Generate a Dockerfile.artifact_baseline for MCP-unique tasks.
+
+    Uses the original baseline Dockerfile (with local repo clones if any) but adds
+    the .artifact_only_mode sentinel so the verifier parses answer.json instead of
+    checking git diffs.  This is the correct Dockerfile for baseline-local-artifact:
+    the agent has local code access but produces an artifact.
+    """
+    task_name = task_dir.name
+    # Strip any trailing whitespace/newlines, then append the sentinel
+    content = dockerfile_text.rstrip()
+
+    # Inject the sentinel before the final ENTRYPOINT if present
+    if 'ENTRYPOINT' in content:
+        content = content.replace(
+            'ENTRYPOINT []',
+            '# Mark artifact-only mode — verifier parses answer.json\n'
+            'RUN touch /tmp/.artifact_only_mode\n\n'
+            'ENTRYPOINT []'
+        )
+    else:
+        content += '\n\n# Mark artifact-only mode — verifier parses answer.json\n'
+        content += 'RUN touch /tmp/.artifact_only_mode\n'
+
+    # Add header comment
+    header = (
+        f"# {task_name} — artifact_baseline variant\n"
+        f"# Baseline with local code + artifact mode (verifier parses answer.json).\n"
+    )
+    # Replace first line if it's a comment, otherwise prepend
+    lines = content.split('\n')
+    if lines[0].startswith('#'):
+        # Find first non-comment line
+        idx = 0
+        while idx < len(lines) and lines[idx].startswith('#'):
+            idx += 1
+        lines = header.rstrip().split('\n') + [''] + lines[idx:]
+        content = '\n'.join(lines)
+    else:
+        content = header + '\n' + content
+
+    return content + '\n'
+
+
 def inject_test_guard(task_dir):
     """Add the verifier wrapper guard to test.sh if not already present."""
     test_sh = task_dir / "tests" / "test.sh"
@@ -1020,6 +1064,7 @@ def main():
     wrappers_copied = 0
     wrappers_updated = 0
     artifact_generated = 0
+    artifact_baseline_generated = 0
     errors = []
     write_only_count = 0
     build_count = 0
@@ -1035,22 +1080,33 @@ def main():
         dockerfile = env_dir / "Dockerfile"
         sgonly = env_dir / "Dockerfile.sg_only"
         artifact_only = env_dir / "Dockerfile.artifact_only"
+        artifact_baseline = env_dir / "Dockerfile.artifact_baseline"
 
         if sgonly.exists() and not force:
             skipped += 1
-            # Even if sg_only exists, check if artifact_only needs generation
+            # Even if sg_only exists, check if artifact variants need generation
             # for MCP-unique suites (ccb_mcp_*)
-            if suite.startswith("ccb_mcp") and not artifact_only.exists() and dockerfile.exists():
+            if suite.startswith("ccb_mcp") and dockerfile.exists():
                 try:
                     dockerfile_text = dockerfile.read_text()
-                    art_content = generate_artifact_only_mcp(task_dir, dockerfile_text)
-                    if not dry_run:
-                        artifact_only.write_text(art_content)
-                        artifact_generated += 1
-                        if verbose:
-                            print(f"  GENERATED {task_id} (artifact_only)")
-                    else:
-                        print(f"  {'ARTIFACT-ONLY':>18} {suite:<25} {task_id}")
+                    if not artifact_only.exists():
+                        art_content = generate_artifact_only_mcp(task_dir, dockerfile_text)
+                        if not dry_run:
+                            artifact_only.write_text(art_content)
+                            artifact_generated += 1
+                            if verbose:
+                                print(f"  GENERATED {task_id} (artifact_only)")
+                        else:
+                            print(f"  {'ARTIFACT-ONLY':>18} {suite:<25} {task_id}")
+                    if not artifact_baseline.exists() or force:
+                        abl_content = generate_artifact_baseline(task_dir, dockerfile_text)
+                        if not dry_run:
+                            artifact_baseline.write_text(abl_content)
+                            artifact_baseline_generated += 1
+                            if verbose:
+                                print(f"  GENERATED {task_id} (artifact_baseline)")
+                        else:
+                            print(f"  {'ARTIFACT-BL':>18} {suite:<25} {task_id}")
                 except Exception as e:
                     errors.append((task_id, f"artifact_only: {e}"))
             else:
@@ -1114,16 +1170,26 @@ def main():
                     if copy_wrapper(task_dir, force=force):
                         wrappers_copied += 1
 
-            # For MCP-unique suites, also generate Dockerfile.artifact_only
-            if suite.startswith("ccb_mcp") and not artifact_only.exists():
-                art_content = generate_artifact_only_mcp(task_dir, dockerfile_text)
-                if dry_run:
-                    print(f"  {'ARTIFACT-ONLY':>18} {suite:<25} {task_id}")
-                else:
-                    artifact_only.write_text(art_content)
-                    artifact_generated += 1
-                    if verbose:
-                        print(f"  GENERATED {task_id} (artifact_only)")
+            # For MCP-unique suites, also generate Dockerfile.artifact_only + artifact_baseline
+            if suite.startswith("ccb_mcp"):
+                if not artifact_only.exists() or force:
+                    art_content = generate_artifact_only_mcp(task_dir, dockerfile_text)
+                    if dry_run:
+                        print(f"  {'ARTIFACT-ONLY':>18} {suite:<25} {task_id}")
+                    else:
+                        artifact_only.write_text(art_content)
+                        artifact_generated += 1
+                        if verbose:
+                            print(f"  GENERATED {task_id} (artifact_only)")
+                if not artifact_baseline.exists() or force:
+                    abl_content = generate_artifact_baseline(task_dir, dockerfile_text)
+                    if dry_run:
+                        print(f"  {'ARTIFACT-BL':>18} {suite:<25} {task_id}")
+                    else:
+                        artifact_baseline.write_text(abl_content)
+                        artifact_baseline_generated += 1
+                        if verbose:
+                            print(f"  GENERATED {task_id} (artifact_baseline)")
 
         except Exception as e:
             errors.append((task_id, str(e)))
@@ -1133,6 +1199,7 @@ def main():
     print(f"  Already had sg_only: {skipped}")
     print(f"  Generated sg_only: {generated} ({write_only_count} write-only, {build_count} build-requiring)")
     print(f"  Generated artifact_only: {artifact_generated}")
+    print(f"  Generated artifact_baseline: {artifact_baseline_generated}")
     print(f"  test.sh guards added: {guards_added}")
     print(f"  Wrappers copied: {wrappers_copied}")
     if wrappers_updated:

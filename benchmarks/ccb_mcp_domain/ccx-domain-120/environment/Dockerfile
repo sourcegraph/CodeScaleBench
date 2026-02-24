@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     python3 \
-    default-jdk \
+    default-jdk maven \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace

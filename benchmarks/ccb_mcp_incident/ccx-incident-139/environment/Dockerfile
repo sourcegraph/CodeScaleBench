@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /workspace
 
 # Clone local checkout repos (baseline config: agent has local access to these)
-# No local checkout repos specified for this fixture
+RUN git clone --depth 1 --branch 9c8b85f387cc00a89945a79c9e6239f32e450ac2 https://github.com/sg-evals/libreoffice-core--9c8b85f3 /workspace/libreoffice-core--9c8b85f3
 
 # Initialize git identity for agent commits
 RUN git config --global user.email "agent@example.com" && \

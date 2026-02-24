@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /workspace
 
 # Clone local checkout repos (baseline config: agent has local access to these)
-# No local checkout repos specified for this fixture
+RUN git clone --depth 1 --branch 871325b8460362073cb2069874bef7dde3170cb2 https://github.com/sg-evals/firefox--871325b8 /workspace/firefox--871325b8
 
 # Initialize git identity for agent commits
 RUN git config --global user.email "agent@example.com" && \

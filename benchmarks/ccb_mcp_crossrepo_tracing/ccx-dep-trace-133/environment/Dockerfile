@@ -8,13 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     python3 \
-     \
+    default-jdk maven g++ make gcc make \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
 
 # Clone local checkout repos (baseline config: agent has local access to these)
-# No local checkout repos specified for this fixture
+RUN git clone --depth 1 --branch 2d05e31515360f4da764174f7c448b33e36da871 https://github.com/sg-evals/chromium--2d05e315 /workspace/chromium--2d05e315
 
 # Initialize git identity for agent commits
 RUN git config --global user.email "agent@example.com" && \

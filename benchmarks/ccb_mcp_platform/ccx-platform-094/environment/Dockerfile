@@ -13,8 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /workspace
 
-# Clone fixture repo (baseline has full local access)
-RUN git clone --depth 1 https://github.com/sg-evals/grafana--v11.4.0.git /workspace/grafana
+# Clone local checkout repos (baseline config: agent has local access to these)
+RUN git clone --depth 1 --branch 26d36ec https://github.com/sg-evals/grafana--26d36ec /workspace/grafana--26d36ec
 
 # Initialize git identity for agent commits
 RUN git config --global user.email "agent@example.com" && \
