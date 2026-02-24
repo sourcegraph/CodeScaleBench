@@ -6,7 +6,10 @@ and statistical modules provide confidence intervals and correlation analysis.
 
 This document covers the pipeline architecture. For per-benchmark scoring
 details, see [SCORING_SEMANTICS.md](SCORING_SEMANTICS.md). For MCP-unique
-oracle checks, see [MCP_UNIQUE_TASKS.md](MCP_UNIQUE_TASKS.md).
+oracle checks, see [MCP_UNIQUE_TASKS.md](MCP_UNIQUE_TASKS.md). For the full
+retrieval/IR evaluation pipeline (normalized retrieval events, file/chunk IR
+metrics, utilization probes, taxonomy, and emitted artifacts), see
+[RETRIEVAL_EVAL_SPEC.md](RETRIEVAL_EVAL_SPEC.md).
 
 ---
 
