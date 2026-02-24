@@ -31,7 +31,7 @@ fi
 # Get diff of new code
 DIFF=$(git diff HEAD~1..HEAD -- django/db/models/ 2>/dev/null || git diff -- django/db/models/ 2>/dev/null)
 ALL_CHANGED=$(git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
-ALL_CHANGED=$(echo "$ALL_CHANGED" | sort -u | grep -v '^$')
+ALL_CHANGED=$(echo "$ALL_CHANGED" | sort -u | grep -v '^$' || true)
 
 FUNC_SCORE=0
 POLICY_SCORE=0

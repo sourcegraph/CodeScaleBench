@@ -74,7 +74,7 @@ ALL_CHANGED="$ALL_CHANGED
 $(git diff --name-only 2>/dev/null)
 $(git diff --cached --name-only 2>/dev/null)
 $(git ls-files --others --exclude-standard 2>/dev/null)"
-ALL_CHANGED=$(echo "$ALL_CHANGED" | sort -u | grep -v '^$')
+ALL_CHANGED=$(echo "$ALL_CHANGED" | sort -u | grep -v '^$' || true)
 
 OUTSIDE_SESSIONS=0
 if [ -n "$ALL_CHANGED" ]; then

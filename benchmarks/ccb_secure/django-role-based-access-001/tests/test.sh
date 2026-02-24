@@ -51,10 +51,10 @@ for ref in origin/master origin/main origin/HEAD; do
     fi
 done
 ALL_CHANGED="$ALL_CHANGED
-$(git diff --name-only 2>/dev/null)
-$(git diff --cached --name-only 2>/dev/null)
-$(git ls-files --others --exclude-standard 2>/dev/null)"
-ALL_CHANGED=$(echo "$ALL_CHANGED" | sort -u | grep -v '^$')
+$(git diff --name-only 2>/dev/null || true)
+$(git diff --cached --name-only 2>/dev/null || true)
+$(git ls-files --others --exclude-standard 2>/dev/null || true)"
+ALL_CHANGED=$(echo "$ALL_CHANGED" | sort -u | grep -v '^$' || true)
 
 OUTSIDE=0
 if [ -n "$ALL_CHANGED" ]; then
