@@ -74,14 +74,48 @@ DEFECT_TYPE_ENUM = frozenset({
 
 @dataclass
 class TaskGroundTruth:
-    """Ground truth files for a single benchmark task."""
+    """Ground truth files for a single benchmark task.
+
+    Fields:
+        files: Flat list of all relevant repo-relative paths (backward compat).
+               When output_files or evidence_files are populated, ``files`` is
+               their union; otherwise it is set directly by legacy extractors.
+        output_files: Files the agent must CREATE or MODIFY (the deliverable).
+        evidence_files: Files the agent must READ to produce the output
+                        (the retrieval targets for IR evaluation).
+        gt_type: Classification of the ground-truth mode:
+            - "edit"     — standard SWE-bench style (output_files are edits)
+            - "generate" — agent creates new files (output_files are new)
+            - "evidence" — agent reads files to produce non-file output (e.g. doc gen)
+            - "answer"   — factual answer task, no meaningful file GT
+            - "mixed"    — both output and evidence files matter
+    """
 
     task_id: str
     benchmark: str
-    files: list[str]        # repo-relative paths needing modification
+    files: list[str]        # union of output + evidence (backward compat)
     source: str             # "patch" | "diff" | "ground_truth_dir" | "test_script" | "instruction"
     confidence: str         # "high" | "medium" | "low"
     defect_annotations: list[DefectAnnotation] = field(default_factory=list)
+    output_files: list[str] = field(default_factory=list)
+    evidence_files: list[str] = field(default_factory=list)
+    gt_type: str = "edit"
+
+    @property
+    def all_files(self) -> list[str]:
+        """Union of output + evidence files (deduped, ordered).
+
+        Falls back to ``files`` when neither output nor evidence is populated.
+        """
+        if not self.output_files and not self.evidence_files:
+            return self.files
+        seen: set[str] = set()
+        result: list[str] = []
+        for f in self.output_files + self.evidence_files:
+            if f not in seen:
+                seen.add(f)
+                result.append(f)
+        return result
 
     def to_dict(self) -> dict:
         d = {
@@ -93,6 +127,12 @@ class TaskGroundTruth:
         }
         if self.defect_annotations:
             d["defect_annotations"] = [a.to_dict() for a in self.defect_annotations]
+        if self.output_files:
+            d["output_files"] = self.output_files
+        if self.evidence_files:
+            d["evidence_files"] = self.evidence_files
+        if self.gt_type != "edit":
+            d["gt_type"] = self.gt_type
         return d
 
     @classmethod
@@ -107,6 +147,9 @@ class TaskGroundTruth:
             source=d["source"],
             confidence=d["confidence"],
             defect_annotations=annotations,
+            output_files=d.get("output_files", []),
+            evidence_files=d.get("evidence_files", []),
+            gt_type=d.get("gt_type", "edit"),
         )
 
 

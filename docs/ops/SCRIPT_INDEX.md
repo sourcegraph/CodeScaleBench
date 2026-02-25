@@ -36,6 +36,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/analyze_run_coverage.py` - Analysis/comparison script for analyze run coverage.
 - `scripts/audit_traces.py` - Analysis/comparison script for audit traces.
 - `scripts/compare_configs.py` - Compares benchmark outcomes across configs on matched task sets.
+- `scripts/comprehensive_analysis.py` - Analysis/comparison script for comprehensive analysis.
 - `scripts/compute_retrieval_metrics.py` - Analysis/comparison script for compute retrieval metrics.
 - `scripts/cost_breakdown_analysis.py` - Analysis/comparison script for cost breakdown analysis.
 - `scripts/cost_report.py` - Aggregates token and cost metrics per run, suite, and config.
@@ -153,6 +154,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 ## Misc
 
 - `scripts/add_verification_metadata.py` - Utility script for add verification metadata.
+- `scripts/audit_official_scores.py` - Utility script for audit official scores.
 - `scripts/audit_unpinned_repos.py` - Utility script for audit unpinned repos.
 - `scripts/backfill_instruction_artifacts.py` [one_off] - Historical one-off script: backfill instruction artifacts.
 - `scripts/backfill_size_metadata.py` [one_off] - Historical one-off script: backfill size metadata.
