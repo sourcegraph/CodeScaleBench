@@ -86,6 +86,9 @@ SINGLE_REPO_TASKS = {
     "curl-cve-triage-001": "sg-evals/curl--09e25b9d",
     "curl-security-review-001": "sg-evals/curl--09e25b9d",
     "curl-vuln-reachability-001": "sg-evals/curl--09e25b9d",
+    # --- envoy ---
+    "envoy-udp-proxy-cds-fix-001": "sg-evals/envoy--1ae957c1",
+    "envoy-dfp-host-leak-fix-001": "sg-evals/envoy--5160151e",
     # --- django ---
     "django-admins-migration-audit-001": "sg-evals/django--e295033",
     "django-audit-trail-implement-001": "sg-evals/django--674eda1c",
@@ -246,6 +249,7 @@ SINGLE_REPO_TASKS = {
     "terraform-phantom-update-debug-001": "sg-evals/terraform--9658f9df",
     "terraform-plan-pipeline-qa-001": "sg-evals/terraform--24236f4f",
     "terraform-state-backend-handoff-001": "sg-evals/terraform--v1.9.0",
+    "terraform-plan-null-unknown-fix-001": "sg-evals/terraform--abd6b9ef",
     # --- test suites ---
     "test-coverage-gap-001": "sg-evals/envoy--1d0ba73a",
     "test-coverage-gap-002": "sg-evals/kafka--e678b4b",
