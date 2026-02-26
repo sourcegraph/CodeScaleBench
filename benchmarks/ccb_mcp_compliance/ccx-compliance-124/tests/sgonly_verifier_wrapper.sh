@@ -113,6 +113,13 @@ if [ -f "$MANIFEST" ]; then
                 # Copy cloned files (except .git)
                 cd "$TMPCLONE"
                 find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec cp -a {} "$CLONE_TARGET/" \;
+                # If workspace has no HEAD (bare git init), use mirror .git
+                # so that git diff HEAD works for diff-based verifiers.
+                if ! git -C "$CLONE_TARGET" rev-parse HEAD >/dev/null 2>&1; then
+                    rm -rf "$CLONE_TARGET/.git"
+                    cp -a "$TMPCLONE/.git" "$CLONE_TARGET/.git"
+                    echo "[sg_only_verifier] Replaced empty .git with mirror .git for diff baseline"
+                fi
                 cd /
                 rm -rf "$TMPCLONE"
                 echo "[sg_only_verifier] Restored $MIRROR to $CLONE_TARGET"
