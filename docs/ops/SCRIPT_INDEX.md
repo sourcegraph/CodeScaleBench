@@ -142,6 +142,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/generate_artifact_dockerfiles.py` - Generation script for generate artifact dockerfiles.
 - `scripts/generate_artifact_only_dockerfiles.py` - Generation script for generate artifact only dockerfiles.
 - `scripts/generate_instruction_mcp.py` - Generation script for generate instruction mcp.
+- `scripts/generate_repoqa_largerepo_tasks.py` - Generation script for generate repoqa largerepo tasks.
 - `scripts/generate_sgonly_dockerfiles.py` - Generation script for generate sgonly dockerfiles.
 - `scripts/generate_start_here_by_task.py` - Generation script for generate start here by task.
 
