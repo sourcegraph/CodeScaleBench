@@ -1,12 +1,12 @@
 # CodeContextBench Benchmarks
 
-170 tasks organized into 8 suites aligned with the software development lifecycle (SDLC). Each suite targets a distinct phase of engineering work. The canonical task selection is in [`selected_benchmark_tasks.json`](../configs/selected_benchmark_tasks.json).
+This directory contains SDLC-aligned suites plus MCP-unique org-scale retrieval suites. The canonical selected task catalog is in [`selected_benchmark_tasks.json`](../configs/selected_benchmark_tasks.json) (currently 251 selected tasks across 19 suites).
 
 See [`docs/TASK_SELECTION.md`](../docs/TASK_SELECTION.md) for selection methodology.
 
 ---
 
-## Suite Overview
+## SDLC Suite Overview
 
 | Suite | SDLC Phase | Tasks | Description |
 |-------|-----------|------:|-------------|
@@ -19,6 +19,29 @@ See [`docs/TASK_SELECTION.md`](../docs/TASK_SELECTION.md) for selection methodol
 | `ccb_secure` | Security & Compliance | 20 | CVE analysis, reachability, governance, access control |
 | `ccb_debug` | Debugging & Investigation | 20 | Root cause tracing, fault localization, provenance |
 | **Total** | | **170** | |
+
+---
+
+## MCP-Unique Suite Overview (Selected Catalog)
+
+These suites measure cross-repo discovery, tracing, and org-scale code intelligence use cases. Counts below reflect the current selected catalog in [`selected_benchmark_tasks.json`](../configs/selected_benchmark_tasks.json) (some suite directories may contain additional draft/deferred tasks that are not selected).
+
+| Suite | Tasks | Description |
+|-------|------:|-------------|
+| `ccb_mcp_compliance` | 7 | Compliance, audit, and provenance workflows |
+| `ccb_mcp_crossorg` | 5 | Cross-org discovery and authoritative repo identification |
+| `ccb_mcp_crossrepo` | 1 | Legacy cross-repo discovery/tracing task (compatibility) |
+| `ccb_mcp_crossrepo_tracing` | 9 | Cross-repo dependency tracing and symbol resolution |
+| `ccb_mcp_domain` | 10 | Domain-specific lineage and analysis workflows |
+| `ccb_mcp_incident` | 11 | Incident debugging across services and repos |
+| `ccb_mcp_migration` | 7 | Framework and platform migrations across repos |
+| `ccb_mcp_onboarding` | 11 | Onboarding, architecture comprehension, API discovery |
+| `ccb_mcp_org` | 5 | Org-wide coding correctness tasks requiring broad context |
+| `ccb_mcp_platform` | 5 | Platform/devtools and tribal-knowledge discovery |
+| `ccb_mcp_security` | 10 | Vulnerability remediation and security analysis at org scale |
+| **Total MCP-Unique (selected)** | **81** | |
+
+For suite taxonomy, authoring, and oracle evaluation details, see [`docs/MCP_UNIQUE_TASKS.md`](../docs/MCP_UNIQUE_TASKS.md).
 
 ---
 
@@ -166,6 +189,12 @@ Code review with injected defects, performance testing, and code search validati
 | `curl-security-review-001` | Code review: curl security |
 | `kafka-security-review-001` | Code review: Kafka security |
 | `sklearn-kmeans-perf-001` | Speed up K-means clustering |
+| `test-coverage-gap-001` | Analyze test coverage gaps: Envoy HTTP connection manager |
+| `test-coverage-gap-002` | Map test coverage gaps: Kafka consumer group coordinator |
+| `test-integration-001` | Write integration tests: Flipt evaluation API |
+| `test-integration-002` | Write integration tests: Navidrome media scanner |
+| `test-unitgen-go-001` | Generate unit tests: Kubernetes storage value package |
+| `test-unitgen-py-001` | Generate unit tests: Django cache middleware |
 | `terraform-code-review-001` | Code review: Terraform |
 | `vscode-code-review-001` | Code review: VS Code |
 
@@ -178,6 +207,13 @@ API reference generation, architecture documentation, and migration guide creati
 | Task | Focus |
 |------|-------|
 | `cilium-api-doc-gen-001` | Cilium API reference generation |
+| `docgen-changelog-001` | Generate Terraform changelog |
+| `docgen-changelog-002` | Generate Flipt release notes |
+| `docgen-inline-001` | Generate Python docstrings for Django cache middleware |
+| `docgen-inline-002` | Generate Javadoc for Kafka record batch serialization |
+| `docgen-onboard-001` | Generate onboarding guide for Istio control plane |
+| `docgen-runbook-001` | Generate operational runbook for Prometheus TSDB compaction |
+| `docgen-runbook-002` | Generate troubleshooting runbook for Envoy connection pools |
 | `envoy-arch-doc-gen-001` | Envoy architecture documentation |
 | `envoy-migration-doc-gen-001` | Envoy migration guide generation |
 | `istio-arch-doc-gen-001` | Istio architecture documentation |
@@ -269,7 +305,7 @@ Each task follows this layout:
 ## Running Benchmarks
 
 ```bash
-# Run all 170 tasks across 2 configs (Baseline + MCP-Full)
+# Run all selected tasks across 2 configs (currently 251 entries in selected_benchmark_tasks.json)
 bash configs/run_selected_tasks.sh
 
 # Run a single SDLC phase

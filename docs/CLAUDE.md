@@ -6,6 +6,7 @@ Use this file when editing documentation or improving agent navigation.
 - `docs/START_HERE_BY_TASK.md` - task-based routing (first stop for operations)
 - `docs/ops/` - runbooks, indexes, troubleshooting, handoff templates
 - `docs/reference/` - stable specs and policies (indexes/pointers first; migration can be gradual)
+- `docs/technical_reports/` - versioned white papers and technical report snapshots
 - `docs/explanations/` - design rationale and context
 - `docs/archive/` - historical artifacts and non-canonical docs
 
