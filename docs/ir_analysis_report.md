@@ -4,94 +4,33 @@
 
 ## Executive Summary
 
-- Context infrastructure improves retrieval quality (MRR) by **-9%** (IDE-native: 0.360 vs Context infrastructure: 0.329), p=0.437357.
-- Cost per relevant file found increases **12%** (IDE-native: 1,125,582 tokens vs Context infrastructure: 1,254,786 tokens).
-- Retrieval-outcome correlation: Spearman r=0.172 (p=0.0074).
-- Analysis covers **276** task runs across 16 suite-config pairs.
+- Context infrastructure improves retrieval quality (MRR) by **+0%** (IDE-native: 0.000 vs Context infrastructure: 0.000), p=N/A.
+- Retrieval-outcome correlation: Spearman r=0.078 (p=0.7367).
+- Analysis covers **32** task runs across 1 suite-config pairs.
 
 ## Retrieval Quality
 
 | Config | MRR | MAP | File Recall | Context Efficiency | n |
 |--------|-----|-----|-------------|-------------------|---|
-| IDE-native | 0.360 | 0.217 | 0.339 | 0.187 | 115 |
-| Context infrastructure | 0.329 | 0.191 | 0.438 | 0.160 | 126 |
+| IDE-native | 0.482 | 0.431 | 0.494 | 0.432 | 26 |
 
 ### Per-Suite Breakdown
 
 | Suite | Config | MRR | File Recall | n |
 |-------|--------|-----|-------------|---|
-| ccb_build | IDE-native | 0.600 | 0.304 | 10 |
-| ccb_build | Context infrastructure | 0.548 | 0.436 | 16 |
-| ccb_debug | IDE-native | 0.269 | 0.361 | 20 |
-| ccb_debug | Context infrastructure | 0.597 | 0.543 | 20 |
-| ccb_design | IDE-native | 0.521 | 0.481 | 12 |
-| ccb_design | Context infrastructure | 0.318 | 0.572 | 18 |
-| ccb_document | IDE-native | 0.000 | 0.000 | 5 |
-| ccb_document | Context infrastructure | 0.000 | 0.000 | 5 |
-| ccb_fix | IDE-native | 0.260 | 0.206 | 25 |
-| ccb_fix | Context infrastructure | 0.229 | 0.358 | 24 |
-| ccb_secure | IDE-native | 0.513 | 0.614 | 17 |
-| ccb_secure | Context infrastructure | 0.175 | 0.664 | 17 |
-| ccb_test | IDE-native | 0.750 | 0.750 | 8 |
-| ccb_test | Context infrastructure | 0.625 | 0.625 | 8 |
-| ccb_understand | IDE-native | 0.140 | 0.077 | 18 |
-| ccb_understand | Context infrastructure | 0.085 | 0.118 | 18 |
+| unknown | IDE-native | 0.482 | 0.494 | 26 |
 
 ## Time-to-Context
 
 | Config | TTFR (s) | TTAR (s) | Steps to First |
 |--------|----------|----------|----------------|
-| IDE-native | 12.7 | 22.2 | 3 |
-| Context infrastructure | 7.9 | 9.6 | 2 |
+| IDE-native | 11.1 | 4.8 | 4 |
 
 ## Cost Efficiency
 
 | Config | Tokens/Relevant File | Tokens Before 1st Relevant | Mean Input Tokens | Mean Files Found | n |
 |--------|---------------------|---------------------------|-------------------|-----------------|---|
-| IDE-native | 1,125,582 | 273,361 | 1,686,056 | 2.0 | 105 |
-| Context infrastructure | 1,254,786 | 419,544 | 2,421,572 | 3.3 | 117 |
-
-**Delta summary:**
-
-- Agent Time To First Relevant: Context infrastructure uses **-59.3%** vs IDE-native
-- Cost Before First Relevant: Context infrastructure uses **+68.1%** vs IDE-native
-- Input Tokens: Context infrastructure uses **+43.6%** vs IDE-native
-- Output Tokens Before First Relevant: Context infrastructure uses **-17.6%** vs IDE-native
-- Tokens Before First Relevant: Context infrastructure uses **+53.5%** vs IDE-native
-- Tokens Per Relevant File: Context infrastructure uses **+11.5%** vs IDE-native
-- Total Cost Usd: Context infrastructure uses **+5.8%** vs IDE-native
-
-## MCP Value Rankings
-
-*Composite score: weighted z-score of retrieval lift (0.25), outcome lift (0.25), time efficiency (0.2), cost efficiency (0.15), token efficiency (0.15)*
-
-### Per-Suite Mean Composite
-
-| Suite | Mean Composite |
-|-------|---------------|
-| ccb_debug | +0.079 |
-| ccb_secure | +0.074 |
-| ccb_fix | +0.053 |
-| ccb_understand | +0.035 |
-| ccb_design | +0.002 |
-| ccb_document | -0.040 |
-| ccb_test | -0.089 |
-| ccb_build | -0.384 |
-
-### Top 10 Tasks Where Context Infrastructure Helps Most
-
-| Task | Suite | Composite | Retrieval | Outcome | Efficiency | Cost |
-|------|-------|-----------|-----------|---------|------------|------|
-| envoy-ext-authz-handoff-001 | ccb_understand | +1.082 | +1.000 | +0.830 | +0.000 | +0.000 |
-| kafka-producer-bufpool-fix-001 | ccb_fix | +1.049 | +1.000 | +0.780 | +0.000 | +0.000 |
-| ghost-code-review-001 | ccb_test | +0.944 | +1.000 | +0.620 | +0.000 | +0.000 |
-| aspnetcore-code-review-001 | ccb_test | +0.839 | +1.000 | +0.460 | +0.000 | +0.000 |
-| openlibrary-fntocli-adapter-fix-001 | ccb_fix | +0.745 | +1.000 | +0.333 | +0.000 | -0.547 |
-| numpy-dtype-localize-001 | ccb_understand | +0.689 | +0.000 | +0.933 | +0.000 | +0.000 |
-| linux-ssd-trim-timeout-fault-001 | ccb_debug | +0.661 | +0.833 | +0.000 | +0.668 | -0.377 |
-| prometheus-queue-reshard-debug-001 | ccb_debug | +0.621 | +0.960 | +0.180 | -0.067 | -0.578 |
-| django-audit-trail-implement-001 | ccb_secure | +0.543 | +0.667 | +0.000 | +0.546 | +0.338 |
-| grpcurl-transitive-vuln-001 | ccb_secure | +0.531 | +0.000 | +0.670 | +0.000 | +0.664 |
+| IDE-native | 527,124 | 250,937 | 1,819,451 | 4.6 | 22 |
 
 ## Statistical Methodology
 
@@ -101,18 +40,3 @@
 - **Correlation**: Spearman rank correlation between MRR and task reward
 - **MCP value composite**: Z-score normalized weighted sum across retrieval, outcome, efficiency, cost
 - **Cost efficiency**: Input tokens per relevant file found from task_metrics.json
-
-### Statistical Test Results
-
-Paired tasks: 114
-
-| Metric | t-stat | p-value | Cohen's d | Magnitude | Significant |
-|--------|--------|---------|-----------|-----------|-------------|
-| file_recall | 1.9414 | 0.052206 | 0.2571 | small | No |
-| mrr | -0.7767 | 0.437357 | -0.1029 | negligible | No |
-| ttfr | -2.1513 | 0.031453 | -0.4108 | small | Yes |
-| tt_all_r | -0.7346 | 0.46261 | -0.2449 | small | No |
-| total_cost_usd | 0.7753 | 0.438168 | 0.1102 | negligible | No |
-| cost_before_first_relevant | 1.2541 | 0.209792 | 0.256 | small | No |
-| output_tokens_before_first_relevant | 0.1449 | 0.884828 | 0.0296 | negligible | No |
-| agent_time_to_first_relevant | -3.2421 | 0.001187 | -0.676 | medium | Yes |
