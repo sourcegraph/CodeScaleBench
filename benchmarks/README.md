@@ -126,9 +126,9 @@ Diagnosing and fixing real bugs across production codebases (SWE-bench Pro, PyTo
 | `openlibrary-fntocli-adapter-fix-001` | FnToCLI adapter list inputs paths |
 | `openlibrary-search-query-fix-001` | Work search query parsing normalization |
 | `openlibrary-solr-boolean-fix-001` | Solr boolean clause limit alignment |
-| `protonmail-conv-testhooks-fix-001` | Conversation message view test hooks |
-| `protonmail-dropdown-sizing-fix-001` | Dropdown unified sizing configuration |
-| `protonmail-holiday-calendar-fix-001` | Public holiday calendar management |
+| `envoy-dfp-host-leak-fix-001` | Dynamic forward proxy host header memory leak |
+| `envoy-udp-proxy-cds-fix-001` | UDP proxy crash on dynamic CDS/EDS cluster update |
+| `terraform-plan-null-unknown-fix-001` | Terraform plan null/unknown value rendering |
 | `pytorch-cudnn-version-fix-001` | Expose cuDNN runtime version |
 | `pytorch-dynamo-keyerror-fix-001` | Fix dynamo keyerror and attribute |
 | `pytorch-release-210-fix-001` | Release 2.10 bug fix changes |

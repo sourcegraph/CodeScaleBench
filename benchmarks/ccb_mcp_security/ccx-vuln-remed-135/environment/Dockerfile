@@ -11,8 +11,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
      \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /workspace
+# Create claude user BEFORE cloning so files are owned correctly from the
+# start.  This avoids a post-clone chown -R layer that doubles image size
+# and takes 15-30 min on overlay2 (copy-on-write duplicates every inode).
+RUN adduser --disabled-password --gecos '' claude 2>/dev/null || true
+RUN mkdir -p /workspace /logs/agent /logs/verifier && \
+    chown -R claude:claude /workspace /logs
 
+# Clone as claude — files land claude-owned, no separate chown layer needed.
+USER claude
+WORKDIR /workspace
 # Clone local checkout repos (baseline config: agent has local access to these)
 RUN git clone --depth 1 https://github.com/sg-evals/chromium--2d05e315 /workspace/chromium--2d05e315
 
@@ -21,12 +29,7 @@ RUN git config --global user.email "agent@example.com" && \
     git config --global user.name "Agent" && \
     git config --global safe.directory '*'
 
-# Create log directories
-RUN mkdir -p /logs/agent /logs/verifier
-
-# Pre-create claude user and set ownership at build time so Harbor's
-# runtime chown is a no-op (avoids 15-30 min delay on large repos).
-RUN (adduser --disabled-password --gecos '' claude 2>/dev/null || true) && \
-    for d in /workspace /app /testbed /logs; do [ -d "$d" ] && chown -R claude:claude "$d"; done || true
+# Switch back to root for Harbor's runtime setup
+USER root
 
 ENTRYPOINT []

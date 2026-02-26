@@ -81,19 +81,24 @@ Eight suites organized by software development lifecycle phase:
 
 ## MCP-Unique Suites (Org-Scale Context Retrieval)
 
-Six additional suites measure cross-repo discovery, symbol resolution, dependency tracing, and deep-search-driven investigation in polyrepo environments.
+Eleven additional suites measure cross-repo discovery, symbol resolution, dependency tracing, and deep-search-driven investigation in polyrepo environments.
 
 | Suite | Category | Tasks | Description |
 |-------|----------|------:|-------------|
-| `ccb_mcp_crossrepo_tracing` | A: Dependency Tracing | 3 | Cross-repo dependency chains, blast radius, symbol resolution |
-| `ccb_mcp_security` | B: Vulnerability Remediation | 2 | CVE mapping, missing auth middleware across repos |
-| `ccb_mcp_incident` | D: Incident Debugging | 1 | Error-to-code-path tracing across microservices |
-| `ccb_mcp_onboarding` | E: Onboarding & Comprehension | 3 | API consumption mapping, end-to-end flow, architecture maps |
-| `ccb_mcp_crossorg` | G: Cross-Org Discovery | 2 | Interface implementations and authoritative repo identification across orgs |
-| `ccb_mcp_platform` | J: Platform Knowledge | 1 | Service template discovery and tribal knowledge |
-| **Total** | | **12** | |
+| `ccb_mcp_crossrepo_tracing` | A: Dependency Tracing | 9 | Cross-repo dependency chains, blast radius, symbol resolution |
+| `ccb_mcp_security` | B: Vulnerability Remediation | 10 | CVE mapping, missing auth middleware across repos |
+| `ccb_mcp_migration` | C: Framework Migration | 7 | API migrations, breaking changes across repos |
+| `ccb_mcp_incident` | D: Incident Debugging | 11 | Error-to-code-path tracing across microservices |
+| `ccb_mcp_onboarding` | E: Onboarding & Comprehension | 11 | API consumption mapping, end-to-end flow, architecture maps |
+| `ccb_mcp_compliance` | F: Compliance | 7 | Standards adherence, audit, and provenance workflows |
+| `ccb_mcp_crossorg` | G: Cross-Org Discovery | 5 | Interface implementations and authoritative repo identification across orgs |
+| `ccb_mcp_domain` | H: Domain Lineage | 10 | Config propagation, architecture patterns, domain analysis |
+| `ccb_mcp_org` | I: Organizational Context | 5 | Agentic discovery, org-wide coding correctness |
+| `ccb_mcp_platform` | J: Platform Knowledge | 5 | Service template discovery and tribal knowledge |
+| `ccb_mcp_crossrepo` | Legacy | 1 | Cross-repo discovery (compatibility) |
+| **Total** | | **81** | |
 
-The table above shows the 12 tasks evaluated in official runs. The full MCP-unique catalog has 20 tasks across 8 suites (including compliance and migration, pending first runs). **Combined catalog total: 190 tasks** (170 SDLC + 20 MCP-unique).
+**Combined catalog total: 251 tasks** (170 SDLC + 81 MCP-unique). Of these, 212 are fully paired (baseline + MCP results) in official runs; the remaining 39 MCP-unique tasks have MCP results but are missing baselines.
 
 Both baseline and MCP-Full agents have access to **all repos** in each task's fixture. The only difference is the method: baseline reads code locally, MCP-Full uses Sourcegraph MCP tools (local code is truncated). This ensures we measure whether MCP tools help agents work better — not whether MCP can access repos the baseline can't.
 
@@ -133,12 +138,17 @@ benchmarks/              # Task definitions organized by SDLC phase + MCP-unique
   ccb_secure/            #   Security & Compliance (20 tasks)
   ccb_test/              #   Testing & QA (20 tasks)
   ccb_understand/        #   Requirements & Discovery (20 tasks)
-  ccb_mcp_crossrepo_tracing/  #   MCP-unique: cross-repo dependency tracing (3 tasks)
-  ccb_mcp_security/      #   MCP-unique: vulnerability remediation (2 tasks)
-  ccb_mcp_incident/      #   MCP-unique: incident debugging (1 task)
-  ccb_mcp_onboarding/    #   MCP-unique: onboarding & comprehension (3 tasks)
-  ccb_mcp_crossorg/      #   MCP-unique: cross-org discovery (2 tasks)
-  ccb_mcp_platform/      #   MCP-unique: platform knowledge (1 task)
+  ccb_mcp_compliance/    #   MCP-unique: compliance & audit (7 tasks)
+  ccb_mcp_crossorg/      #   MCP-unique: cross-org discovery (5 tasks)
+  ccb_mcp_crossrepo/     #   MCP-unique: legacy cross-repo (1 task)
+  ccb_mcp_crossrepo_tracing/  #   MCP-unique: dependency tracing (9 tasks)
+  ccb_mcp_domain/        #   MCP-unique: domain lineage (10 tasks)
+  ccb_mcp_incident/      #   MCP-unique: incident debugging (11 tasks)
+  ccb_mcp_migration/     #   MCP-unique: framework migration (7 tasks)
+  ccb_mcp_onboarding/    #   MCP-unique: onboarding (11 tasks)
+  ccb_mcp_org/           #   MCP-unique: org context (5 tasks)
+  ccb_mcp_platform/      #   MCP-unique: platform knowledge (5 tasks)
+  ccb_mcp_security/      #   MCP-unique: vulnerability remediation (10 tasks)
 configs/                 # Run configs and task selection
   _common.sh             #   Shared infra: token refresh, parallel execution, multi-account
   sdlc_suite_2config.sh  #   Generic SDLC runner (used by phase wrappers below)

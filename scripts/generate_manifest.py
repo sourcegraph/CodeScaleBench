@@ -70,6 +70,7 @@ DIR_PREFIX_TO_SUITE = {
     "tac_": "ccb_tac",
     # MCP-unique org-scale retrieval suites
     "ccb_mcp_crossrepo_tracing_": "ccb_mcp_crossrepo_tracing",
+    "ccb_mcp_crossrepo_": "ccb_mcp_crossrepo",
     "ccb_mcp_security_": "ccb_mcp_security",
     "ccb_mcp_migration_": "ccb_mcp_migration",
     "ccb_mcp_incident_": "ccb_mcp_incident",
@@ -418,7 +419,7 @@ def _normalize_task_name(name: str) -> str:
     Strategy: for 'instance_ORG__REPO-HASH' pattern, normalize ORG__REPO to ORG__REPO
     by replacing the first single-dash separator after 'instance_' with '__'.
     """
-    # MCP config runs are often wrapped with an "mcp_" or "sgonly_" prefix in
+    # MCP config runs are often wrapped with an "mcp_", "bl_", or "sgonly_" prefix in
     # result/task_metrics task IDs and trial dirs. Canonical selected task IDs do
     # not include these prefixes.
     if name.startswith("mcp_"):
@@ -426,8 +427,17 @@ def _normalize_task_name(name: str) -> str:
         # Harbor's MCP wrapper often appends a random 6-char suffix to tmp task IDs
         # (e.g. django-role-based-access-001_2ERzmK). Strip it for canonical matching.
         name = re.sub(r"_[A-Za-z0-9]{6}$", "", name)
+    elif name.startswith("bl_"):
+        name = name[3:]
+        # Baseline wrappers for MCP-unique tasks use the same tmp suffix scheme.
+        name = re.sub(r"_[A-Za-z0-9]{6}$", "", name)
     elif name.startswith("sgonly_"):
         name = name[7:]
+
+    # MCP-unique task IDs sometimes appear with lowercase "ccx-" in direct baseline
+    # runs and uppercase "CCX-" in MCP runs. Canonicalize to uppercase prefix.
+    if name.startswith("ccx-"):
+        name = "CCX-" + name[4:]
 
     if not name.startswith("instance_"):
         return name

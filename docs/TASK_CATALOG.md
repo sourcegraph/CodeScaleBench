@@ -107,9 +107,9 @@ A detailed reference for benchmark tasks in CodeContextBench. This document cata
 | openlibrary-fntocli-adapter-fix-001 | Python | hard | internetarchive/openlibrary | SWE-bench Pro bug fix |
 | openlibrary-search-query-fix-001 | Python | hard | internetarchive/openlibrary | SWE-bench Pro bug fix |
 | openlibrary-solr-boolean-fix-001 | Python | hard | internetarchive/openlibrary | SWE-bench Pro bug fix |
-| protonmail-conv-testhooks-fix-001 | TypeScript | hard | protonmail/webclients | SWE-bench Pro bug fix |
-| protonmail-dropdown-sizing-fix-001 | TypeScript | hard | protonmail/webclients | SWE-bench Pro bug fix |
-| protonmail-holiday-calendar-fix-001 | TypeScript | hard | protonmail/webclients | SWE-bench Pro bug fix |
+| envoy-dfp-host-leak-fix-001 | C++ | hard | envoyproxy/envoy | Dynamic forward proxy host header memory leak |
+| envoy-udp-proxy-cds-fix-001 | C++ | hard | envoyproxy/envoy | UDP proxy crash on dynamic CDS/EDS update |
+| terraform-plan-null-unknown-fix-001 | Go | hard | hashicorp/terraform | Plan null/unknown value rendering |
 | pytorch-cudnn-version-fix-001 | C++ | hard | pytorch/pytorch | Cross-module bug fix |
 | pytorch-dynamo-keyerror-fix-001 | C++ | medium | pytorch/pytorch | Cross-module bug fix |
 | pytorch-release-210-fix-001 | C++ | hard | pytorch/pytorch | Cross-module bug fix |
