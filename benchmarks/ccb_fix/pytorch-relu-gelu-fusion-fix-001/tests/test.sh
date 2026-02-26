@@ -12,7 +12,8 @@ set -eo pipefail
 mkdir -p /logs/verifier
 cd "${VERIFY_REPO:-/workspace}"
 git config --global --add safe.directory /workspace 2>/dev/null || true
-PRE_FIX_REV="ca2466126a00ba8fd877f5a185e40e36ddaceb87"
+# Resolve initial commit — mirrors use orphan commits with different SHAs than upstream
+PRE_FIX_REV=$(git rev-parse HEAD 2>/dev/null || echo "HEAD")
 python3 /tests/verify_diff.py \
     --expected /tests/expected.diff \
     --pre-fix-rev "$PRE_FIX_REV" \
