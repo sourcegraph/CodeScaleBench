@@ -1,0 +1,118 @@
+# IMPORTANT: Source Code Access
+
+**Local source files are not present.** Your workspace does not contain source code. You **MUST** use Sourcegraph MCP tools to discover, read, and understand code before making any changes.
+
+**Target Repository:** `github.com/sg-benchmarks/prometheus--v2.52.0`
+- Use `repo:^github.com/sg-benchmarks/prometheus--v2.52.0$` filter in keyword_search
+- Use `github.com/sg-benchmarks/prometheus--v2.52.0` as the `repo` parameter for go_to_definition/find_references/read_file
+
+
+## Required Workflow
+
+1. **Search first** — Use MCP tools to find relevant files and understand existing patterns
+2. **Read remotely** — Use `sg_read_file` to read full file contents from Sourcegraph
+3. **Edit locally** — Use Edit, Write, and Bash to create or modify files in your working directory
+4. **Verify locally** — Run tests with Bash to check your changes
+
+## Tool Selection
+
+| Goal | Tool |
+|------|------|
+| Exact symbol/string | `sg_keyword_search` |
+| Concepts/semantic search | `sg_nls_search` |
+| Trace usage/callers | `sg_find_references` |
+| See implementation | `sg_go_to_definition` |
+| Read full file | `sg_read_file` |
+| Browse structure | `sg_list_files` |
+| Find repos | `sg_list_repos` |
+| Search commits | `sg_commit_search` |
+| Track changes | `sg_diff_search` |
+| Compare versions | `sg_compare_revisions` |
+
+**Decision logic:**
+1. Know the exact symbol? → `sg_keyword_search`
+2. Know the concept, not the name? → `sg_nls_search`
+3. Need definition of a symbol? → `sg_go_to_definition`
+4. Need all callers/references? → `sg_find_references`
+5. Need full file content? → `sg_read_file`
+
+## Scoping (Always Do This)
+
+```
+repo:^github.com/ORG/REPO$           # Exact repo (preferred)
+repo:github.com/ORG/                 # All repos in org
+file:.*\.ts$                         # TypeScript only
+file:src/api/                        # Specific directory
+```
+
+Start narrow. Expand only if results are empty.
+
+## Efficiency Rules
+
+- Chain searches logically: search → read → references → definition
+- Don't re-search for the same pattern; use results from prior calls
+- Prefer `sg_keyword_search` over `sg_nls_search` when you have exact terms
+- Read 2-3 related files before synthesising, rather than one at a time
+- Don't read 20+ remote files without writing code — once you understand the pattern, start implementing
+
+## If Stuck
+
+If MCP search returns no results:
+1. Broaden the search query (synonyms, partial identifiers)
+2. Try `sg_nls_search` for semantic matching
+3. Use `sg_list_files` to browse the directory structure
+4. Use `sg_list_repos` to verify the repository name
+
+---
+
+# Task: Generate Operational Runbook for Prometheus TSDB Compaction
+
+**Repository:** github.com/sg-benchmarks/prometheus--v2.52.0 (mirror of prometheus/prometheus)
+**Output:** Write your runbook to `/workspace/documentation.md`
+
+## Objective
+
+Produce an operational runbook for Prometheus's TSDB (Time Series Database) compaction process. TSDB compaction merges overlapping time blocks, removes tombstoned series, and maintains query performance over time.
+
+## Scope
+
+Explore the TSDB compaction implementation in:
+- `tsdb/compact.go` — core compaction logic
+- `tsdb/head_read.go` and `tsdb/head.go` — head block behavior
+- `tsdb/db.go` — database lifecycle and compaction triggering
+
+## Required Sections
+
+Your runbook at `/workspace/documentation.md` must include:
+
+### 1. Overview
+- What compaction does and why it is needed
+- Compaction levels and block structure
+- When compaction is triggered (time-based, size-based)
+
+### 2. Monitoring Indicators
+- Key Prometheus metrics to watch during compaction (e.g., `prometheus_tsdb_compactions_total`, `prometheus_tsdb_compaction_duration_seconds`)
+- Alert thresholds and what they indicate
+- How to distinguish healthy vs. stuck compaction
+
+### 3. Failure Modes
+- At least 4 failure modes with symptoms and causes:
+  - Disk space exhaustion
+  - Compaction stuck / not progressing
+  - Block corruption
+  - OOM during compaction
+- For each: symptom, likely cause, and diagnostic steps
+
+### 4. Recovery Procedures
+- Step-by-step recovery for each failure mode
+- When to restart Prometheus vs. manual block manipulation
+- How to use `promtool tsdb` commands for inspection/repair
+
+### 5. Code Reference
+- Key functions in the codebase relevant to each failure mode
+
+## Quality Bar
+
+- Metric names must be real (verify in the codebase)
+- Recovery steps must be numbered and actionable
+- Each failure mode must link to a specific code location
