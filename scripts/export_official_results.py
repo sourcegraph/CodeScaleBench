@@ -1174,6 +1174,13 @@ def _build_index_html() -> str:
       suites.forEach(s => suiteFilter.add(new Option(s, s)));
       resetOptions(runFilter, 'All runs', uniqueSorted(allTasks.map(t => t.run_dir)));
       resetOptions(configFilter, 'All configs', uniqueSorted(allTasks.map(t => t.config)));
+      // Avoid browser form-state restoration narrowing results unexpectedly.
+      suiteFilter.value = '';
+      datasetFilter.value = 'all';
+      runFilter.value = '';
+      configFilter.value = '';
+      statusFilter.value = '';
+      taskSearch.value = '';
 
       const render = () => {
         const dataset = datasetFilter.value || 'all';
