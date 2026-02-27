@@ -1,13 +1,13 @@
 # CodeContextBench: A Systematic Evaluation Framework for Assessing the Impact of Enhanced Code Intelligence on AI Coding Agent Performance
 
 **White Paper Technical Report**
-**Date:** February 25, 2026
+**Date:** February 27, 2026
 
 ---
 
 ## Abstract
 
-CodeContextBench (CCB) is a benchmark suite of 243 software engineering tasks spanning the full Software Development Lifecycle (SDLC) designed to measure whether external code intelligence tools -- specifically Sourcegraph's Model Context Protocol (MCP) tools -- improve AI coding agent performance. The benchmark evaluates agents under two controlled conditions: a baseline with full local source code and no external tools, and an MCP-augmented configuration where source code is unavailable locally and the agent must use remote code intelligence tools (semantic search, symbol resolution, dependency tracing, etc.) to navigate codebases. This report documents the complete design, construction, information retrieval evaluation pipeline, task curation methodology, ground truth and verifier architecture, and preliminary findings from the benchmark's development and execution.
+CodeContextBench (CCB) is a benchmark suite of 251 software engineering tasks spanning the full Software Development Lifecycle (SDLC) designed to measure whether external code intelligence tools -- specifically Sourcegraph's Model Context Protocol (MCP) tools -- improve AI coding agent performance. The benchmark evaluates agents under two controlled conditions: a baseline with full local source code and no external tools, and an MCP-augmented configuration where source code is unavailable locally and the agent must use remote code intelligence tools (semantic search, symbol resolution, dependency tracing, etc.) to navigate codebases. Across 250 valid paired task evaluations using Claude Haiku 4.5 (1 baseline infrastructure error excluded from 251 registered tasks), the overall MCP effect is +0.047 (95% bootstrap CI: [+0.007, +0.085]) — a small but statistically significant positive. The effect is strongly task-dependent: MCP-unique cross-repository discovery tasks show +0.183, while SDLC tasks with full local code show -0.019 (not significant). This report documents the complete design, construction, information retrieval evaluation pipeline, task curation methodology, ground truth and verifier architecture, and findings from the benchmark's execution.
 
 ---
 
@@ -16,8 +16,8 @@ CodeContextBench (CCB) is a benchmark suite of 243 software engineering tasks sp
 1. [Introduction and Motivation](#1-introduction-and-motivation)
 2. [Research Questions](#2-research-questions)
 3. [Benchmark Architecture](#3-benchmark-architecture)
-4. [Task Taxonomy and SDLC Alignment](#4-taxonomy-and-sdlc-alignment)
-5. [Task Curation Methodology](#5-curation-methodology)
+4. [Task Taxonomy and SDLC Alignment](#4-4-taxonomy-and-sdlc-alignment)
+5. [Task Curation Methodology](#5-5-curation-methodology)
 6. [Ground Truth and Oracle System](#6-ground-truth-and-oracle-system)
 7. [Verification and Scoring Pipeline](#7-verification-and-scoring-pipeline)
 8. [Information Retrieval Evaluation Pipeline](#8-information-retrieval-evaluation-pipeline)
@@ -84,7 +84,7 @@ CodeContextBench is built on three core principles:
  │  ├── ccb_document/    (20 tasks)    ├── ccb_mcp_crossorg/          │
  │  ├── ccb_secure/      (20 tasks)    ├── ccb_mcp_domain/            │
  │  └── ccb_debug/       (20 tasks)    ├── ccb_mcp_migration/         │
- │       167 SDLC tasks                ├── ccb_mcp_org/               │
+ │       170 SDLC tasks                ├── ccb_mcp_org/               │
  │                                     ├── ccb_mcp_platform/          │
  │                                     └── 81 MCP-unique tasks        │
  └───────────────────┬─────────────────────────────────────────────────┘
@@ -157,10 +157,9 @@ For MCP-unique tasks, an additional artifact variant is used:
 
 ---
 
-<a id="4-taxonomy-and-sdlc-alignment"></a>
 ## 4. Task Taxonomy and SDLC Alignment
 
-### 4.1 SDLC Phase Suites (167 tasks)
+### 4.1 SDLC Phase Suites (170 tasks)
 
 Tasks are drawn from established benchmarks and custom-authored challenges, then organized by their primary SDLC phase:
 
@@ -168,7 +167,7 @@ Tasks are drawn from established benchmarks and custom-authored challenges, then
 | ---------------- | ------------------------- | ----: | ---------------- | ------------------------------------ |
 | `ccb_understand` | Requirements & Discovery  |    20 | hard             | C++, Go, Java, Python, TS            |
 | `ccb_design`     | Architecture & Design     |    20 | hard--very_hard  | C, C++, Go, Java, Python             |
-| `ccb_fix`        | Bug Repair                |    22 | medium--hard     | C++, Go, Java, JS, Python, TS        |
+| `ccb_fix`        | Bug Repair                |    25 | medium--hard     | C++, Go, Java, JS, Python, TS        |
 | `ccb_build`      | Feature & Refactoring     |    25 | medium--hard     | C#, C++, Go, Java, JS, Rust, TS      |
 | `ccb_test`       | Testing & QA              |    20 | medium--hard     | C, C#, C++, Go, Java, JS, Python, TS |
 | `ccb_document`   | Documentation             |    20 | hard             | C++, Go, Java, Python, TS            |
@@ -227,14 +226,13 @@ Repository Scale:
 
 ---
 
-<a id="5-curation-methodology"></a>
 ## 5. Task Curation Methodology
 
 ### 5.1 Task Provenance
 
-The 248 tasks in CodeContextBench fall into two broad provenance categories:
+The 251 tasks in CodeContextBench fall into two broad provenance categories:
 
-**SDLC tasks (167 tasks):** The majority (~155) are fully original tasks authored for CodeContextBench, each grounded in a real repository at a pinned commit and targeting a genuine development scenario (a real bug, a real missing feature, a real documentation gap) identified through analysis of repository issues, PRs, and codebases on GitHub. A smaller number of tasks are adapted from or inspired by existing benchmarks while retaining CCB-specific instructions and verifiers:
+**SDLC tasks (170 tasks):** The majority (~158) are fully original tasks authored for CodeContextBench, each grounded in a real repository at a pinned commit and targeting a genuine development scenario (a real bug, a real missing feature, a real documentation gap) identified through analysis of repository issues, PRs, and codebases on GitHub. A smaller number of tasks are adapted from or inspired by existing benchmarks while retaining CCB-specific instructions and verifiers:
 
 - 8 dependency-installation tasks adapted from DIBench patterns
 - 5 Linux kernel fault-localization tasks with a custom 10-point rubric from the LinuxFL benchmark
@@ -328,7 +326,7 @@ Priority Chain for Ground Truth Discovery:
 
 Ground truth extraction uses task-type-specific strategies that match how each task category defines its expected outcomes:
 
-**SDLC tasks (167 tasks)** use a unified extractor (`_gt_sdlc()`) that walks the 6-level priority chain described above. For most tasks, ground truth files come from `ground_truth.json` or are extracted from `instruction.md` via regex patterns matching file path references. Specialized handling exists for specific task patterns:
+**SDLC tasks (170 tasks)** use a unified extractor (`_gt_sdlc()`) that walks the 6-level priority chain described above. For most tasks, ground truth files come from `ground_truth.json` or are extracted from `instruction.md` via regex patterns matching file path references. Specialized handling exists for specific task patterns:
 
 - **Bug-fix tasks** (ccb_fix): Ground truth extracted from `solution/solve.sh` patches or `expected_changes.json`, identifying which files should be modified
 - **Code-review tasks** (ccb_test): `expected_defects.json` provides structured defect annotations (file, line range, defect type)
@@ -459,7 +457,7 @@ Harbor uploads each task's `tests/` directory to `/tests/` inside the container 
 
 ### 7.3 SDLC Task Verifiers (test.sh)
 
-Each SDLC task has a custom `test.sh` tailored to its evaluation needs. Four major patterns cover the 167 tasks:
+Each SDLC task has a custom `test.sh` tailored to its evaluation needs. Four major patterns cover the 170 tasks:
 
 **Build/feature tasks** detect agent code changes (via `git diff`, staged changes, new commits, and untracked files), then score a weighted composite:
 
@@ -859,29 +857,46 @@ Major verifier bugs discovered through QA audit (Feb 6):
 
 ### 11.1 Data Availability
 
-Of 248 registered tasks, **230** are fully paired (both baseline and MCP results): **170 SDLC** tasks and **60 of 81 MCP-unique** tasks. The remaining **21 MCP-unique tasks** are pending MCP runs.
+All 251 registered tasks have both baseline and MCP results. One SDLC task (`openlibrary-solr-boolean-fix-001`) errored on the baseline side due to an infrastructure failure (agent never executed), leaving **250 valid paired evaluations**: **169 SDLC** tasks across 8 suites and **81 MCP-unique** tasks across 11 suites. All results use the Claude Haiku 4.5 model. The SDLC tasks use `baseline-local-direct` (full source, no MCP) versus `mcp-remote-direct` (truncated source, Sourcegraph MCP enabled). MCP-unique tasks use the corresponding artifact or direct config variant depending on verifier requirements. All confidence intervals reported below use the percentile bootstrap method (10,000 resamples, seed=42) on paired deltas (see Appendix A).
 
 ### 11.2 SDLC Suite Results (Paired Comparison)
 
-Paired baseline vs. MCP results across all 8 SDLC suites plus MCP-unique tasks (230 paired tasks total):
+Paired baseline vs. MCP results across all 8 SDLC suites (169 valid paired tasks):
 
-| Suite | n | Baseline Mean | MCP Mean | Delta | Baseline Time (s) | MCP Time (s) | Time Delta |
-|-------|---|--------------|----------|-------|-------------------|-------------|-----------|
-| build | 25 | 0.494 | 0.372 | -0.121 | 2,217 | 470 | -78.8% |
-| debug | 20 | 0.670 | 0.487 | -0.183 | 995 | 308 | -69.0% |
-| design | 20 | 0.753 | 0.718 | -0.036 | 3,141 | 176 | -94.4% |
-| document | 20 | 0.847 | 0.895 | +0.048 | 439 | 155 | -64.6% |
-| fix | 25 | 0.479 | 0.491 | +0.012 | 1,768 | 854 | -51.7% |
-| secure | 20 | 0.669 | 0.659 | -0.010 | 314 | 212 | -32.5% |
-| test | 20 | 0.480 | 0.480 | +0.000 | 253 | 180 | -29.0% |
-| understand | 20 | 0.660 | 0.851 | **+0.191** | 668 | 166 | -75.1% |
-| mcp_unique | 60 | 0.652 | 0.702 | **+0.050** | 1,662 | 428 | -74.3% |
+| Suite | n | Baseline Mean | MCP Mean | Delta | 95% Bootstrap CI |
+|-------|---|--------------|----------|-------|--------|
+| understand | 20 | 0.660 | 0.851 | **+0.190** | [+0.043, +0.361] |
+| document | 20 | 0.847 | 0.895 | **+0.048** | [+0.015, +0.088] |
+| test | 20 | 0.480 | 0.480 | +0.000 | [-0.098, +0.104] |
+| secure | 20 | 0.669 | 0.659 | -0.010 | [-0.096, +0.091] |
+| fix | 24 | 0.499 | 0.484 | -0.015 | [-0.092, +0.051] |
+| design | 20 | 0.753 | 0.718 | -0.036 | [-0.157, +0.086] |
+| build | 25 | 0.494 | 0.372 | **-0.121** | [-0.288, +0.025] |
+| debug | 20 | 0.670 | 0.487 | **-0.183** | [-0.301, -0.067] |
 
-**Overall**: Baseline mean 0.567 (n=209), MCP mean 0.621 (n=209), delta **+0.053**.
+**SDLC total**: Baseline mean 0.627 (n=169), MCP mean 0.608 (n=169), delta **-0.019** (95% CI: [-0.064, +0.025]). The CI spans zero, indicating no statistically significant MCP effect on SDLC tasks with full local source code.
 
-MCP improves reward on 4 of 9 suite categories. The largest gain is on **mcp_unique** (+0.331), where tasks are specifically designed around cross-repo information retrieval. In the cleaned paired Haiku-only official corpus, **understand** is also strongly positive (+0.191), while **document** is modestly positive (+0.048). The clearest negative suites are **debug** (-0.183) and **build** (-0.121), with smaller negatives on **design** (-0.036) and **secure** (-0.010).
+MCP-unique tasks (81 paired, cross-repository discovery):
 
-MCP is consistently **faster** across all suites, with time reductions ranging from -29.0% (test) to -94.4% (design). This is largely because the truncated-source environment has less code to read locally, allowing the agent to reach conclusions faster — though the reward impact depends strongly on task type.
+| Suite | n | Baseline Mean | MCP Mean | Delta | 95% Bootstrap CI |
+|-------|---|--------------|----------|-------|--------|
+| security | 10 | 0.341 | 0.782 | **+0.440** | [+0.256, +0.636] |
+| onboarding | 11 | 0.365 | 0.702 | **+0.337** | [+0.102, +0.598] |
+| org | 5 | 0.443 | 0.640 | **+0.197** | [+0.046, +0.382] |
+| incident | 11 | 0.545 | 0.722 | **+0.177** | [-0.019, +0.390] |
+| domain | 10 | 0.442 | 0.606 | **+0.163** | [+0.017, +0.333] |
+| crossorg | 5 | 0.457 | 0.611 | +0.154 | [-0.039, +0.369] |
+| crossrepo_tracing | 9 | 0.618 | 0.707 | +0.089 | [-0.011, +0.194] |
+| compliance | 7 | 0.626 | 0.709 | +0.082 | [-0.154, +0.290] |
+| migration | 7 | 0.815 | 0.866 | +0.051 | [-0.011, +0.144] |
+| platform | 5 | 0.726 | 0.678 | -0.049 | [-0.133, +0.018] |
+| crossrepo | 1 | 0.867 | 0.767 | -0.100 | — |
+
+**MCP-unique total**: Baseline mean 0.525 (n=81), MCP mean 0.708 (n=81), delta **+0.183** (95% CI: [+0.116, +0.255]). MCP wins on 47 of 81 tasks.
+
+**Overall**: Baseline mean 0.594 (n=250), MCP mean 0.640 (n=250), delta **+0.047** (95% CI: [+0.007, +0.085]). The overall confidence interval excludes zero, indicating a statistically significant positive MCP effect across the full benchmark.
+
+The results show a clear bifurcation by task category. For **SDLC tasks** where the agent already has full local source code, MCP provides marginal or negative value (SDLC delta -0.019, CI spans zero). The strongest SDLC gains are on retrieval-heavy tasks: **understand** (+0.190, CI excludes zero) and **document** (+0.048, CI excludes zero). The clearest SDLC negative is **debug** (-0.183, CI excludes zero), where MCP adds overhead without compensating retrieval benefit. **Build** (-0.121) also shows a meaningful negative, though the CI narrowly includes zero. For **MCP-unique tasks** requiring cross-repository discovery across 3-20 repos, MCP provides substantial value (+0.183, CI excludes zero), with the strongest effects on **security** (+0.440), **onboarding** (+0.337), and **org** (+0.197) tasks — all with CIs excluding zero. **Domain** (+0.163) also shows a significant positive effect under bootstrap.
 
 ### 11.3 Reward by Language
 
@@ -913,7 +928,7 @@ The counterintuitive result that "hard" tasks outperform "medium" tasks reflects
 
 ### 11.5 Reward by Codebase Size
 
-This analysis uses the size proxies in `selected_benchmark_tasks.json` (`context_length`, `files_count`) and reports the paired subset of selected SDLC tasks where those fields are available (**n=109** of 167 paired SDLC tasks).
+This analysis uses the size proxies in `selected_benchmark_tasks.json` (`context_length`, `files_count`) and reports the paired subset of selected SDLC tasks where those fields are available (**n=109** of 170 paired SDLC tasks).
 
 | Context Length | n | Baseline Mean | MCP Mean | Delta | Baseline Pass | MCP Pass |
 |---------------|---|--------------|----------|-------|---------------|----------|
@@ -929,35 +944,49 @@ The strongest pattern in this paired slice is by `context_length`: the larger pr
 
 ### 11.6 Information Retrieval Metrics
 
-The IR evaluation pipeline (Section 8) produces file-level precision, recall, F1, MRR, and dependency accuracy for tasks with ground truth file sets. Results from the subset of tasks with IR metrics computed (n=41):
+The IR evaluation pipeline (Section 8) produces file-level recall, MRR, MAP, nDCG, context efficiency, and utilization probes for tasks with ground truth file sets. Results from the full pipeline run (n=594 computable tasks out of 1,005 event files):
 
-**Baseline IR Metrics by Suite:**
+**Aggregate File-Level IR Metrics:**
 
-| Suite | n | Precision | Recall | F1 | MRR | Dep. Accuracy |
-|-------|---|-----------|--------|-----|-----|--------------|
-| build | 6 | 0.119 | 0.265 | 0.080 | 0.000 | 0.265 |
-| design | 3 | 0.567 | 0.915 | 0.677 | 0.000 | 0.783 |
-| fix | 3 | 0.767 | 0.384 | 0.511 | 0.833 | 0.159 |
-| secure | 6 | 0.615 | 0.731 | 0.616 | 0.000 | 0.602 |
+| Metric | Mean | Median | Std | n |
+|--------|------|--------|-----|---|
+| File Recall | 0.375 | 0.111 | 0.424 | 594 |
+| MRR | 0.347 | 0.007 | 0.443 | 594 |
+| MAP | 0.232 | 0.008 | 0.340 | 594 |
+| Context Efficiency | 0.190 | 0.013 | 0.280 | 594 |
+| Precision@1 | 0.298 | 0.000 | 0.458 | 594 |
+| Recall@5 | 0.223 | 0.000 | 0.345 | 594 |
+| nDCG@10 | 0.275 | 0.000 | 0.371 | 594 |
 
-**MCP IR Metrics by Suite:**
+**High-Confidence Subset** (medium/high-confidence ground truth, n=26):
 
-| Suite | n | Precision | Recall | F1 | MRR | Dep. Accuracy |
-|-------|---|-----------|--------|-----|-----|--------------|
-| build | 7 | 0.593 | 0.638 | 0.602 | 0.000 | 0.357 |
-| design | 8 | 0.554 | 0.690 | 0.597 | 0.000 | 0.303 |
-| fix | 3 | 0.867 | 0.500 | 0.634 | 1.000 | 0.337 |
-| secure | 5 | 0.634 | 0.688 | 0.625 | 0.000 | 0.561 |
+| Metric | Mean | Median |
+|--------|------|--------|
+| File Recall | 0.494 | 0.590 |
+| MRR | 0.482 | 0.417 |
+| MAP | 0.431 | 0.366 |
+| Context Efficiency | 0.432 | 0.287 |
+| TTFR | 24.9s | 11.1s |
 
-**Aggregate IR comparison:**
+**Utilization Probes** (n=594):
 
-| Config | n | Precision | Recall | F1 | MRR |
-|--------|---|-----------|--------|-----|-----|
-| Baseline | 18 | 0.467 | 0.549 | 0.430 | 0.139 |
-| MCP | 23 | 0.624 | 0.649 | 0.609 | 0.130 |
-| **Delta** | | **+0.157** | **+0.100** | **+0.179** | -0.009 |
+| Probe | Mean | Median |
+|-------|------|--------|
+| Read Overlap with Relevant Files | 0.337 | 0.093 |
+| Write Overlap with Relevant Files | 0.056 | 0.000 |
+| Read-Before-Write Ratio | 0.195 | 0.000 |
 
-MCP shows meaningfully higher file-level precision (+0.157) and F1 (+0.179) compared to baseline, indicating that MCP tools help agents identify the *right* files more accurately. The largest improvement is in the **build** suite (F1: 0.080 → 0.602), where baseline agents examine many irrelevant files while MCP agents use targeted search. Recall also improves (+0.100), though the gap is smaller — both configs find a reasonable fraction of relevant files, but MCP finds them with less noise. MRR is comparable across configs, suggesting both find root-cause files at similar ranking positions when they find them at all.
+**Error Taxonomy** (n=594):
+
+| Error Type | Mean Count | Median |
+|------------|-----------|--------|
+| Irrelevant Retrieval | 39.7 | 7.0 |
+| Missed Key Evidence | 5.8 | 3.0 |
+| Wrong Evidence Used | 2.2 | 1.0 |
+| Unused Correct Retrieval | 2.2 | 0.0 |
+| Ambiguity Near Miss | 17.2 | 0.0 |
+
+**Retrieval-Outcome Correlation:** Spearman rho = 0.078 (p=0.737, n=26 high-confidence tasks), indicating negligible correlation between retrieval quality (MRR) and task outcome (reward) in the current sample. The wide median-mean gaps across all IR metrics reflect a bimodal distribution: agents either find the right files early (high MRR) or miss them entirely (MRR=0). The dominant retrieval strategy is file reads (364 tasks), followed by code search (115 tasks), with MCP-based retrieval accounting for 229 of 594 evidence traces.
 
 ### 11.7 MCP Tool Usage Patterns
 
@@ -983,13 +1012,13 @@ Analysis of tool call patterns across 213 MCP task runs:
 | debug | 20 | 21.1 | 20.2 | 0.602 | 9.5 | 0.5 |
 | design | 20 | 26.1 | 10.6 | 0.782 | 6.5 | 0.8 |
 | document | 20 | 23.8 | 4.8 | 0.839 | 4.3 | 0.4 |
-| fix | 24 | 20.1 | 39.8 | 0.350 | 5.3 | 0.2 |
+| fix | 25 | 20.1 | 39.8 | 0.350 | 5.3 | 0.2 |
 | secure | 26 | 22.7 | 16.5 | 0.662 | 6.8 | 0.5 |
 | test | 20 | 10.9 | 13.8 | 0.532 | 2.6 | 0.8 |
 | understand | 21 | 25.7 | 8.6 | 0.718 | 6.9 | 0.1 |
 | mcp_unique | 37 | 20.7 | 1.6 | 0.918 | 9.2 | 1.0 |
 
-The **fix** suite has the lowest MCP ratio (0.350) and highest local call count (39.8), reflecting that bug-fixing tasks require extensive local code editing after initial search. **Document** and **mcp_unique** suites have the highest MCP ratios (0.839 and 0.918 respectively), as these tasks are primarily about information retrieval rather than code modification. The near-total absence of Deep Search calls across all suites confirms that agents default to keyword search and rarely invoke the more expensive semantic analysis tools without explicit preamble guidance.
+The **fix** suite has the lowest MCP ratio (0.350) and highest local call count (39.8), reflecting that bug-fixing tasks require extensive local code editing after initial search. **Document** and **mcp_unique** suites have the highest MCP ratios (0.839 and 0.918 respectively), as these tasks are primarily about information retrieval rather than code modification. The near-total absence of Deep Search calls across all suites confirms that agents default to keyword search and rarely invoke the more expensive semantic analysis tools without explicit preamble guidance. Note: MCP tool usage statistics are drawn from the subset of MCP runs with extractable transcripts (n=213) and may not cover all 250 valid paired tasks.
 
 **Reward--MCP correlation:** Spearman rho between MCP ratio and reward is **+0.293** in the analyzed paired slice, indicating a weak positive correlation — higher MCP tool usage is modestly associated with better outcomes, but the relationship is not strong enough to imply causation.
 
@@ -1027,9 +1056,8 @@ MCP runs cost **37% less** on average ($0.47 vs $0.75 per task). This is driven 
 | Output tokens vs. reward | -0.187 | 193 | Weak negative: more output does not mean better results |
 | Elapsed time vs. reward | -0.139 | 211 | Weak negative: longer runs slightly associated with lower reward |
 | MCP ratio vs. reward | +0.293 | 206 | Weak positive: more MCP usage modestly associated with better outcomes |
-| Retrieval quality vs. reward | +0.395 | 35 | Moderate positive (p=0.041): better retrieval significantly predicts better outcomes |
 
-The negative correlation between output tokens and reward (-0.187) suggests that agents generating more code are not necessarily producing better solutions — verbose output may indicate the agent is struggling. The MCP-reward correlation (+0.293) implies MCP tools are helpful but not deterministic. The retrieval-outcome correlation (+0.395, p=0.041) is the strongest and only statistically significant relationship — better file retrieval quality (MRR, file recall) is a meaningful predictor of task success, though the relationship is moderate rather than strong.
+The negative correlation between output tokens and reward (-0.187) suggests that agents generating more code are not necessarily producing better solutions — verbose output may indicate the agent is struggling. The weak MCP-reward correlation (+0.293) implies MCP tools are helpful but not deterministic: the agent's ability to formulate effective queries and interpret results matters more than simply using the tools.
 
 ---
 
@@ -1062,6 +1090,7 @@ The negative correlation between output tokens and reward (-0.187) suggests that
 | **Time limits**                          | Fixed limits may disadvantage MCP when remote API latency adds overhead                     |
 | **Oracle completeness**                  | Closed-world oracles may miss valid alternative solutions                                   |
 | **Scoring normalization**                | Different verifier types (test-ratio, checklist, similarity) may not be directly comparable |
+| **Single-trial CIs**                     | Bootstrap CIs capture cross-task variability but not within-task variance; multi-trial data would enable two-level resampling |
 
 ---
 
@@ -1094,23 +1123,23 @@ CodeContextBench was itself primarily developed using Claude Code, creating a me
 ### 14.2 Development Timeline
 
 ```
- Jan 30 ─── Feb 3 ─── Feb 6 ─── Feb 10 ─── Feb 15 ─── Feb 20 ─── Feb 25
-    │          │         │          │           │           │          │
-    ▼          ▼         ▼          ▼           ▼           ▼          ▼
-  Paper     Task      QA Audit   Trace      Enterprise  V5 Preamble  Oracle
-  draft +   selection  (28       audit,     expansion,  sg_only      curation
-  initial   pipeline,  issues),  SG_base    governance  Dockerfile   complete
-  PRD       SDLC       verifier  dropped,   simulation  redesign     for 73
-            taxonomy,  bugs,     Opus 4.6                             MCP tasks
-            5→3 cfg    mirrors   reruns
+ Jan 30 ─── Feb 3 ─── Feb 6 ─── Feb 10 ─── Feb 15 ─── Feb 20 ─── Feb 25 ─── Feb 26
+    │          │         │          │           │           │          │          │
+    ▼          ▼         ▼          ▼           ▼           ▼          ▼          ▼
+  Paper     Task      QA Audit   Trace      Enterprise  V5 Preamble  Oracle    Fix suite
+  draft +   selection  (28       audit,     expansion,  sg_only      curation  expanded
+  initial   pipeline,  issues),  SG_base    governance  Dockerfile   complete  (22→25),
+  PRD       SDLC       verifier  dropped,   simulation  redesign     for 73    verifier
+            taxonomy,  bugs,     Opus 4.6                             MCP tasks bug fix,
+            5→3 cfg    mirrors   reruns                                         IR refresh
 ```
 
 ### 14.3 Scale of Claude Code Usage
 
-The development produced **580+ conversation sessions** (JSONL transcripts) spanning January 30 -- February 25, 2026. Claude Code was used to:
+The development produced **590+ conversation sessions** (JSONL transcripts) spanning January 30 -- February 26, 2026. Claude Code was used to:
 
 - **Design and implement** the task selection algorithm and MCP scoring formula
-- **Generate** all 190+ `Dockerfile.sg_only` variants and 40 `Dockerfile.artifact_only` files
+- **Generate** all 255 `Dockerfile.sg_only` variants and 85 `Dockerfile.artifact_only` files
 - **Build** the IR evaluation pipeline (5 stages, ~3,500 lines of Python)
 - **Create** the oracle evaluation system (7 check functions, 3-pass repo normalization)
 - **Develop** the agent preamble through 5 iterations (V1→V5)
@@ -1167,6 +1196,8 @@ Major architectural decisions emerged through iterative dialogue:
 | **McNemar's test** | Paired nominal outcomes (pass/fail per task)   | `statistics.py:mcnemar_test()`      |
 | **Bootstrap CI**   | Non-parametric confidence intervals            | Percentile method, 10,000 resamples |
 | **Spearman rank**  | IR metric → reward correlation                 | `retrieval_impact_analysis.py`      |
+
+**Bootstrap CI methodology**: All confidence intervals reported in Section 11 use the percentile bootstrap method on paired deltas. For each task pair, the delta is computed as `reward_mcp - reward_baseline`. The vector of deltas is resampled with replacement 10,000 times (seed=42 for reproducibility), the mean is computed for each resample, and the 2.5th and 97.5th percentiles of the bootstrap distribution define the 95% CI bounds. This non-parametric approach makes no normality assumption, which is appropriate for bounded [0, 1] reward data that often exhibits bimodal distributions. Tasks with infrastructure errors (agent never executed) are excluded from paired analysis. The computation is implemented in `scripts/compute_bootstrap_cis.py` and the core bootstrap function in `scripts/ccb_metrics/statistics.py:bootstrap_ci()`.
 
 ### Appendix B: Task ID Naming Conventions
 
