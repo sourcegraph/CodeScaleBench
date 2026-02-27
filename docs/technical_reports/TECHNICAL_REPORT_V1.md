@@ -193,20 +193,12 @@ These tasks specifically measure org-scale cross-repository discovery capabiliti
 
 ### 4.3 Repository and Language Coverage
 
-Tasks span **10 programming languages** across **40+ open-source repositories**:
+Tasks span **9 primary programming languages** (C, C++, C#, Go, Java, JavaScript, Python, Rust, TypeScript) plus multi-language tasks, across **40+ open-source repositories**:
 
 ```
-Language Distribution (by task count):
-  Python     ████████████████████████  65
-  Go         ███████████████████       50
-  Java       ██████████████            38
-  C++        █████████████             35
-  TypeScript ██████████                25
-  JavaScript ████████                  18
-  C          ████                       8
-  Rust       ██                         5
-  C#         ██                         4
-  Other      █                          3
+Language Coverage:
+  Primary single-language labels: C, C++, C#, Go, Java, JavaScript, Python, Rust, TypeScript
+  Multi-language tasks: explicitly labeled combinations (e.g., `java,cpp`, `go,protobuf`, `cpp,c,javascript`)
 
 Repository Scale:
   Large monorepos:    kubernetes/kubernetes, pytorch/pytorch, torvalds/linux
@@ -783,7 +775,7 @@ git push --force origin orphan-main:main
 
 **Why mirrors are needed**: Sourcegraph Deep Search indexes only HEAD. Mirrors pin HEAD to the exact commit the task targets, ensuring the agent searches the correct version.
 
-**Scale**: 200+ mirrors in the `sg-evals` organization covering all benchmark repos.
+**Scale**: ~180 mirrors in the `sg-evals` organization (inventory evolves over time) covering benchmark repo/version needs.
 
 ### 9.6 Execution Infrastructure
 
