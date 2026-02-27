@@ -1,12 +1,7 @@
 # CodeContextBench: A Systematic Evaluation Framework for Assessing the Impact of Enhanced Code Intelligence on AI Coding Agent Performance
 
-**Canonical Technical Report (Source of Truth)**
+**White Paper Technical Report**
 **Date:** February 27, 2026
-
-> Canonical source policy: This document (`docs/technical_reports/TECHNICAL_REPORT_V1.md`)
-> is the authoritative source for technical report updates. Any white-paper or
-> presentation variants (including `docs/WHITE_PAPER_REPORT_V2.md`) should be
-> treated as derived artifacts synchronized from this report.
 
 ---
 
@@ -224,10 +219,9 @@ Repository Scale:
 
 | Difficulty | Tasks | Percentage | Description                                                |
 | ---------- | ----: | ---------- | ---------------------------------------------------------- |
-| medium     |   ~30 | 12%        | Dependency installation, straightforward fixes, unit tests |
-| hard       |  ~140 | 58%        | Multi-file changes, cross-repo reasoning, runbooks         |
-| very_hard  |   ~10 | 4%         | Deep dependency chain analysis, architectural refactoring  |
-| expert     |     5 | 2%         | Linux kernel fault localization                            |
+| medium     |    21 | 7.5%       | Dependency installation, straightforward fixes, unit tests |
+| hard       |   245 | 87.8%      | Multi-file changes, cross-repo reasoning, runbooks         |
+| expert     |    13 | 4.7%       | Kernel/debug fault localization and highest-complexity tasks |
 
 ---
 
