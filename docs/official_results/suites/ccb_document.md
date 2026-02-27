@@ -6,8 +6,7 @@
 | [ccb_document_haiku_022326](../runs/ccb_document_haiku_022326.md) | `mcp` | 15 | 0.953 | 1.000 |
 | [ccb_document_haiku_20260224_174311](../runs/ccb_document_haiku_20260224_174311.md) | `baseline-local-direct` | 5 | 0.658 | 1.000 |
 | [ccb_document_haiku_20260224_174311](../runs/ccb_document_haiku_20260224_174311.md) | `mcp-remote-direct` | 5 | 0.720 | 1.000 |
-| [ccb_document_haiku_20260226_015500_backfill](../runs/ccb_document_haiku_20260226_015500_backfill.md) | `baseline-local-direct` | 1 | 1.000 | 1.000 |
-| [document_haiku_20260223_164240](../runs/document_haiku_20260223_164240.md) | `baseline-local-direct` | 19 | 0.851 | 1.000 |
+| [document_haiku_20260223_164240](../runs/document_haiku_20260223_164240.md) | `baseline-local-direct` | 14 | 0.904 | 1.000 |
 | [document_haiku_20260223_164240](../runs/document_haiku_20260223_164240.md) | `mcp-remote-direct` | 20 | 0.822 | 1.000 |
 | [document_haiku_20260226_013910](../runs/document_haiku_20260226_013910.md) | `baseline-local-direct` | 1 | 1.000 | 1.000 |
 
@@ -54,7 +53,6 @@
 | `ccb_document_haiku_20260224_174311` | `mcp-remote-direct` | [mcp_k8s-clientgo-doc-gen-001_uV7Ssw](../tasks/ccb_document_haiku_20260224_174311--mcp-remote-direct--mcp_k8s-clientgo-doc-gen-001_uV7Ssw.md) | `passed` | 0.650 | 0.868 |
 | `ccb_document_haiku_20260224_174311` | `mcp-remote-direct` | [mcp_k8s-fairqueuing-doc-gen-001_eRPJdR](../tasks/ccb_document_haiku_20260224_174311--mcp-remote-direct--mcp_k8s-fairqueuing-doc-gen-001_eRPJdR.md) | `passed` | 0.650 | 0.957 |
 | `ccb_document_haiku_20260224_174311` | `mcp-remote-direct` | [mcp_k8s-kubelet-cm-doc-gen-001_mVr2Xz](../tasks/ccb_document_haiku_20260224_174311--mcp-remote-direct--mcp_k8s-kubelet-cm-doc-gen-001_mVr2Xz.md) | `passed` | 0.650 | 0.968 |
-| `ccb_document_haiku_20260226_015500_backfill` | `baseline-local-direct` | [docgen-inline-001](../tasks/ccb_document_haiku_20260226_015500_backfill--baseline-local-direct--docgen-inline-001.md) | `passed` | 1.000 | 0.000 |
 | `document_haiku_20260223_164240` | `baseline-local-direct` | [cilium-api-doc-gen-001](../tasks/document_haiku_20260223_164240--baseline-local-direct--cilium-api-doc-gen-001.md) | `passed` | 0.960 | 0.000 |
 | `document_haiku_20260223_164240` | `baseline-local-direct` | [docgen-changelog-001](../tasks/document_haiku_20260223_164240--baseline-local-direct--docgen-changelog-001.md) | `passed` | 1.000 | 0.000 |
 | `document_haiku_20260223_164240` | `baseline-local-direct` | [docgen-changelog-002](../tasks/document_haiku_20260223_164240--baseline-local-direct--docgen-changelog-002.md) | `passed` | 0.700 | 0.000 |
@@ -65,11 +63,6 @@
 | `document_haiku_20260223_164240` | `baseline-local-direct` | [envoy-arch-doc-gen-001](../tasks/document_haiku_20260223_164240--baseline-local-direct--envoy-arch-doc-gen-001.md) | `passed` | 1.000 | 0.000 |
 | `document_haiku_20260223_164240` | `baseline-local-direct` | [envoy-migration-doc-gen-001](../tasks/document_haiku_20260223_164240--baseline-local-direct--envoy-migration-doc-gen-001.md) | `passed` | 0.650 | 0.000 |
 | `document_haiku_20260223_164240` | `baseline-local-direct` | [istio-arch-doc-gen-001](../tasks/document_haiku_20260223_164240--baseline-local-direct--istio-arch-doc-gen-001.md) | `passed` | 1.000 | 0.000 |
-| `document_haiku_20260223_164240` | `baseline-local-direct` | [k8s-apiserver-doc-gen-001](../tasks/document_haiku_20260223_164240--baseline-local-direct--k8s-apiserver-doc-gen-001.md) | `passed` | 0.650 | 0.000 |
-| `document_haiku_20260223_164240` | `baseline-local-direct` | [k8s-applyconfig-doc-gen-001](../tasks/document_haiku_20260223_164240--baseline-local-direct--k8s-applyconfig-doc-gen-001.md) | `passed` | 0.900 | 0.000 |
-| `document_haiku_20260223_164240` | `baseline-local-direct` | [k8s-clientgo-doc-gen-001](../tasks/document_haiku_20260223_164240--baseline-local-direct--k8s-clientgo-doc-gen-001.md) | `passed` | 1.000 | 0.000 |
-| `document_haiku_20260223_164240` | `baseline-local-direct` | [k8s-fairqueuing-doc-gen-001](../tasks/document_haiku_20260223_164240--baseline-local-direct--k8s-fairqueuing-doc-gen-001.md) | `passed` | 0.240 | 0.000 |
-| `document_haiku_20260223_164240` | `baseline-local-direct` | [k8s-kubelet-cm-doc-gen-001](../tasks/document_haiku_20260223_164240--baseline-local-direct--k8s-kubelet-cm-doc-gen-001.md) | `passed` | 0.730 | 0.000 |
 | `document_haiku_20260223_164240` | `baseline-local-direct` | [kafka-api-doc-gen-001](../tasks/document_haiku_20260223_164240--baseline-local-direct--kafka-api-doc-gen-001.md) | `passed` | 0.940 | 0.000 |
 | `document_haiku_20260223_164240` | `baseline-local-direct` | [terraform-arch-doc-gen-001](../tasks/document_haiku_20260223_164240--baseline-local-direct--terraform-arch-doc-gen-001.md) | `passed` | 0.420 | 0.000 |
 | `document_haiku_20260223_164240` | `baseline-local-direct` | [terraform-migration-doc-gen-001](../tasks/document_haiku_20260223_164240--baseline-local-direct--terraform-migration-doc-gen-001.md) | `passed` | 1.000 | 0.000 |

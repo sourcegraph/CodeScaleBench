@@ -75,6 +75,7 @@ class TaskRecord:
     search_calls_deepsearch: int | None
     tool_calls_by_name: dict[str, int] | None
     sample_tool_calls: list[dict[str, str]]
+    started_at: str | None
     trace_available: dict[str, bool]
     trace_paths: dict[str, str | None]
     bundled_trace_paths: dict[str, str | None]
@@ -352,6 +353,8 @@ def _extract_task_record(
         return None
 
     task_name = str(result_payload.get("task_name") or _task_name_from_dir(task_dir))
+    started_at_raw = result_payload.get("started_at")
+    started_at = started_at_raw if isinstance(started_at_raw, str) else None
 
     agent_result = result_payload.get("agent_result") or {}
     if not isinstance(agent_result, dict):
@@ -455,6 +458,7 @@ def _extract_task_record(
         search_calls_deepsearch=search_calls_deepsearch,
         tool_calls_by_name=tool_calls_by_name,
         sample_tool_calls=sample_tool_calls,
+        started_at=started_at,
         trace_available={
             "trajectory": trace_paths["trajectory"] is not None,
             "transcript": trace_paths["transcript"] is not None,
@@ -546,6 +550,7 @@ def _to_task_dict(record: TaskRecord, task_page: str) -> dict[str, Any]:
         "run_dir": record.run_dir,
         "config": record.config,
         "task_name": record.task_name,
+        "started_at": record.started_at,
         "task_dir": record.task_dir,
         "status": record.status,
         "reward": record.reward,
@@ -732,6 +737,9 @@ def _build_root_readme(suite_summaries: list[dict[str, Any]], run_summaries: lis
     lines.append("python3 scripts/export_official_results.py --serve")
     lines.append("```")
     lines.append("")
+    lines.append("Suite-level views are deduplicated to the latest row per `suite + config + task_name`.")
+    lines.append("Historical reruns/backfills remain available in `data/official_results.json` under `all_tasks`.")
+    lines.append("")
     lines.append("## Suite/Config Summary")
     lines.append("")
     lines.append("| Suite | Config | Valid Tasks | Mean Reward | Pass Rate |")
@@ -758,6 +766,25 @@ def _build_root_readme(suite_summaries: list[dict[str, Any]], run_summaries: lis
     lines.append("")
     lines.append("`index.html`, `data/official_results.json`, and `audits/*.json` provide GitHub-auditable artifacts.")
     return "\n".join(lines)
+
+
+def _task_sort_key(task: dict[str, Any]) -> tuple[datetime, str, str]:
+    started_at = task.get("started_at")
+    started_dt = _parse_iso_timestamp(started_at)
+    if started_dt is None:
+        started_dt = datetime.fromtimestamp(0, tz=timezone.utc)
+    return (started_dt, str(task.get("run_dir", "")), str(task.get("task_dir", "")))
+
+
+def _dedupe_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep latest task result per suite+config+task_name for suite-level views."""
+    best: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for task in tasks:
+        key = (str(task["suite"]), str(task["config"]), str(task["task_name"]))
+        prev = best.get(key)
+        if prev is None or _task_sort_key(task) > _task_sort_key(prev):
+            best[key] = task
+    return sorted(best.values(), key=lambda t: (t["suite"], t["config"], t["task_name"]))
 
 
 def _build_index_html() -> str:
@@ -974,9 +1001,10 @@ def build_export(
             )
 
     run_summaries.sort(key=lambda x: (x["run_dir"], x["config"]))
+    deduped_tasks = _dedupe_tasks(tasks_out)
 
     by_suite: dict[str, dict[tuple[str, str], list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
-    for task in tasks_out:
+    for task in deduped_tasks:
         by_suite[task["suite"]][(task["run_dir"], task["config"])].append(task)
 
     for suite, run_config_tasks in sorted(by_suite.items()):
@@ -1005,10 +1033,12 @@ def build_export(
         "runs_dir": str(runs_dir),
         "suite_count": len(by_suite),
         "run_count": len({r["run_dir"] for r in run_summaries}),
-        "task_count": len(tasks_out),
+        "task_count": len(deduped_tasks),
+        "all_task_count": len(tasks_out),
         "suite_summaries": suite_summaries,
         "run_summaries": run_summaries,
-        "tasks": sorted(tasks_out, key=lambda t: (t["run_dir"], t["config"], t["task_name"])),
+        "tasks": deduped_tasks,
+        "all_tasks": sorted(tasks_out, key=lambda t: (t["run_dir"], t["config"], t["task_name"])),
     }
 
     (output_dir / "data").mkdir(parents=True, exist_ok=True)

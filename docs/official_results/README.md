@@ -2,7 +2,7 @@
 
 This bundle is generated from `runs/official/` and includes only valid scored tasks (`passed`/`failed` with numeric reward).
 
-Generated: `2026-02-27T02:17:25.254680+00:00`
+Generated: `2026-02-27T02:23:03.814992+00:00`
 
 ## Local Browse
 
@@ -10,12 +10,15 @@ Generated: `2026-02-27T02:17:25.254680+00:00`
 python3 scripts/export_official_results.py --serve
 ```
 
+Suite-level views are deduplicated to the latest row per `suite + config + task_name`.
+Historical reruns/backfills remain available in `data/official_results.json` under `all_tasks`.
+
 ## Suite/Config Summary
 
 | Suite | Config | Valid Tasks | Mean Reward | Pass Rate |
 |---|---|---:|---:|---:|
 | [ccb_build](suites/ccb_build.md) | `baseline` | 19 | 0.511 | 0.789 |
-| [ccb_build](suites/ccb_build.md) | `baseline-local-direct` | 21 | 0.541 | 0.810 |
+| [ccb_build](suites/ccb_build.md) | `baseline-local-direct` | 20 | 0.527 | 0.800 |
 | [ccb_build](suites/ccb_build.md) | `mcp` | 25 | 0.372 | 0.640 |
 | [ccb_build](suites/ccb_build.md) | `mcp-remote-direct` | 25 | 0.372 | 0.640 |
 | [ccb_debug](suites/ccb_debug.md) | `baseline` | 20 | 0.670 | 1.000 |
@@ -23,19 +26,19 @@ python3 scripts/export_official_results.py --serve
 | [ccb_debug](suites/ccb_debug.md) | `mcp` | 20 | 0.487 | 0.600 |
 | [ccb_debug](suites/ccb_debug.md) | `mcp-remote-direct` | 20 | 0.487 | 0.600 |
 | [ccb_design](suites/ccb_design.md) | `baseline` | 13 | 0.770 | 1.000 |
-| [ccb_design](suites/ccb_design.md) | `baseline-local-direct` | 27 | 0.745 | 0.926 |
+| [ccb_design](suites/ccb_design.md) | `baseline-local-direct` | 20 | 0.753 | 0.950 |
 | [ccb_design](suites/ccb_design.md) | `mcp` | 20 | 0.718 | 1.000 |
 | [ccb_design](suites/ccb_design.md) | `mcp-remote-direct` | 20 | 0.718 | 1.000 |
 | [ccb_document](suites/ccb_document.md) | `baseline` | 14 | 0.904 | 1.000 |
-| [ccb_document](suites/ccb_document.md) | `baseline-local-direct` | 26 | 0.825 | 1.000 |
+| [ccb_document](suites/ccb_document.md) | `baseline-local-direct` | 20 | 0.847 | 1.000 |
 | [ccb_document](suites/ccb_document.md) | `mcp` | 15 | 0.953 | 1.000 |
 | [ccb_document](suites/ccb_document.md) | `mcp-remote-direct` | 25 | 0.802 | 1.000 |
 | [ccb_fix](suites/ccb_fix.md) | `baseline` | 17 | 0.535 | 0.706 |
-| [ccb_fix](suites/ccb_fix.md) | `baseline-local-direct` | 36 | 0.346 | 0.472 |
+| [ccb_fix](suites/ccb_fix.md) | `baseline-local-direct` | 28 | 0.428 | 0.571 |
 | [ccb_fix](suites/ccb_fix.md) | `mcp` | 17 | 0.538 | 0.647 |
-| [ccb_fix](suites/ccb_fix.md) | `mcp-remote-direct` | 33 | 0.440 | 0.545 |
+| [ccb_fix](suites/ccb_fix.md) | `mcp-remote-direct` | 28 | 0.467 | 0.571 |
 | [ccb_mcp_compliance](suites/ccb_mcp_compliance.md) | `baseline-local-artifact` | 1 | 0.375 | 1.000 |
-| [ccb_mcp_compliance](suites/ccb_mcp_compliance.md) | `baseline-local-direct` | 12 | 0.450 | 0.833 |
+| [ccb_mcp_compliance](suites/ccb_mcp_compliance.md) | `baseline-local-direct` | 6 | 0.668 | 1.000 |
 | [ccb_mcp_compliance](suites/ccb_mcp_compliance.md) | `mcp-remote-artifact` | 1 | 0.742 | 1.000 |
 | [ccb_mcp_compliance](suites/ccb_mcp_compliance.md) | `mcp-remote-direct` | 29 | 0.420 | 0.724 |
 | [ccb_mcp_crossorg](suites/ccb_mcp_crossorg.md) | `baseline` | 2 | 0.750 | 1.000 |
@@ -46,21 +49,21 @@ python3 scripts/export_official_results.py --serve
 | [ccb_mcp_crossorg](suites/ccb_mcp_crossorg.md) | `mcp-remote-direct` | 4 | 0.718 | 1.000 |
 | [ccb_mcp_crossrepo](suites/ccb_mcp_crossrepo.md) | `baseline` | 3 | 0.941 | 1.000 |
 | [ccb_mcp_crossrepo](suites/ccb_mcp_crossrepo.md) | `baseline-local-artifact` | 2 | 0.000 | 0.000 |
-| [ccb_mcp_crossrepo](suites/ccb_mcp_crossrepo.md) | `baseline-local-direct` | 6 | 0.601 | 0.833 |
+| [ccb_mcp_crossrepo](suites/ccb_mcp_crossrepo.md) | `baseline-local-direct` | 5 | 0.721 | 1.000 |
 | [ccb_mcp_crossrepo](suites/ccb_mcp_crossrepo.md) | `mcp` | 3 | 0.899 | 1.000 |
 | [ccb_mcp_crossrepo](suites/ccb_mcp_crossrepo.md) | `mcp-remote-artifact` | 2 | 0.287 | 1.000 |
 | [ccb_mcp_crossrepo](suites/ccb_mcp_crossrepo.md) | `mcp-remote-direct` | 21 | 0.580 | 0.810 |
 | [ccb_mcp_domain](suites/ccb_mcp_domain.md) | `baseline-local-artifact` | 3 | 0.000 | 0.000 |
-| [ccb_mcp_domain](suites/ccb_mcp_domain.md) | `baseline-local-direct` | 12 | 0.435 | 0.667 |
+| [ccb_mcp_domain](suites/ccb_mcp_domain.md) | `baseline-local-direct` | 7 | 0.632 | 1.000 |
 | [ccb_mcp_domain](suites/ccb_mcp_domain.md) | `mcp-remote-artifact` | 3 | 0.529 | 1.000 |
 | [ccb_mcp_domain](suites/ccb_mcp_domain.md) | `mcp-remote-direct` | 30 | 0.501 | 0.867 |
 | [ccb_mcp_incident](suites/ccb_mcp_incident.md) | `baseline` | 1 | 0.500 | 1.000 |
 | [ccb_mcp_incident](suites/ccb_mcp_incident.md) | `baseline-local-artifact` | 3 | 0.167 | 0.333 |
-| [ccb_mcp_incident](suites/ccb_mcp_incident.md) | `baseline-local-direct` | 10 | 0.500 | 0.700 |
+| [ccb_mcp_incident](suites/ccb_mcp_incident.md) | `baseline-local-direct` | 7 | 0.714 | 1.000 |
 | [ccb_mcp_incident](suites/ccb_mcp_incident.md) | `mcp` | 1 | 1.000 | 1.000 |
 | [ccb_mcp_incident](suites/ccb_mcp_incident.md) | `mcp-remote-artifact` | 3 | 0.782 | 1.000 |
 | [ccb_mcp_incident](suites/ccb_mcp_incident.md) | `mcp-remote-direct` | 29 | 0.589 | 0.862 |
-| [ccb_mcp_migration](suites/ccb_mcp_migration.md) | `baseline-local-direct` | 19 | 0.658 | 0.842 |
+| [ccb_mcp_migration](suites/ccb_mcp_migration.md) | `baseline-local-direct` | 7 | 0.815 | 1.000 |
 | [ccb_mcp_migration](suites/ccb_mcp_migration.md) | `mcp-remote-direct` | 34 | 0.342 | 0.647 |
 | [ccb_mcp_onboarding](suites/ccb_mcp_onboarding.md) | `baseline` | 3 | 0.639 | 1.000 |
 | [ccb_mcp_onboarding](suites/ccb_mcp_onboarding.md) | `baseline-local-artifact` | 4 | 0.000 | 0.000 |
@@ -73,27 +76,27 @@ python3 scripts/export_official_results.py --serve
 | [ccb_mcp_org](suites/ccb_mcp_org.md) | `mcp-remote-artifact` | 2 | 0.705 | 1.000 |
 | [ccb_mcp_org](suites/ccb_mcp_org.md) | `mcp-remote-direct` | 12 | 0.518 | 1.000 |
 | [ccb_mcp_platform](suites/ccb_mcp_platform.md) | `baseline` | 1 | 0.928 | 1.000 |
-| [ccb_mcp_platform](suites/ccb_mcp_platform.md) | `baseline-local-direct` | 11 | 0.644 | 0.909 |
+| [ccb_mcp_platform](suites/ccb_mcp_platform.md) | `baseline-local-direct` | 4 | 0.676 | 1.000 |
 | [ccb_mcp_platform](suites/ccb_mcp_platform.md) | `mcp` | 1 | 0.928 | 1.000 |
 | [ccb_mcp_platform](suites/ccb_mcp_platform.md) | `mcp-remote-direct` | 17 | 0.439 | 0.765 |
 | [ccb_mcp_security](suites/ccb_mcp_security.md) | `baseline` | 2 | 0.500 | 1.000 |
 | [ccb_mcp_security](suites/ccb_mcp_security.md) | `baseline-local-artifact` | 4 | 0.000 | 0.000 |
-| [ccb_mcp_security](suites/ccb_mcp_security.md) | `baseline-local-direct` | 7 | 0.564 | 1.000 |
+| [ccb_mcp_security](suites/ccb_mcp_security.md) | `baseline-local-direct` | 4 | 0.603 | 1.000 |
 | [ccb_mcp_security](suites/ccb_mcp_security.md) | `mcp` | 2 | 0.821 | 1.000 |
 | [ccb_mcp_security](suites/ccb_mcp_security.md) | `mcp-remote-artifact` | 4 | 0.777 | 1.000 |
 | [ccb_mcp_security](suites/ccb_mcp_security.md) | `mcp-remote-direct` | 16 | 0.705 | 1.000 |
 | [ccb_secure](suites/ccb_secure.md) | `baseline` | 18 | 0.688 | 0.944 |
-| [ccb_secure](suites/ccb_secure.md) | `baseline-local-direct` | 22 | 0.654 | 0.955 |
+| [ccb_secure](suites/ccb_secure.md) | `baseline-local-direct` | 20 | 0.669 | 0.950 |
 | [ccb_secure](suites/ccb_secure.md) | `mcp` | 18 | 0.705 | 1.000 |
 | [ccb_secure](suites/ccb_secure.md) | `mcp-remote-direct` | 22 | 0.645 | 0.909 |
 | [ccb_test](suites/ccb_test.md) | `baseline` | 9 | 0.472 | 0.778 |
-| [ccb_test](suites/ccb_test.md) | `baseline-local-direct` | 33 | 0.421 | 0.697 |
+| [ccb_test](suites/ccb_test.md) | `baseline-local-direct` | 20 | 0.480 | 0.750 |
 | [ccb_test](suites/ccb_test.md) | `mcp` | 8 | 0.555 | 0.625 |
-| [ccb_test](suites/ccb_test.md) | `mcp-remote-direct` | 42 | 0.415 | 0.643 |
+| [ccb_test](suites/ccb_test.md) | `mcp-remote-direct` | 31 | 0.403 | 0.613 |
 | [ccb_understand](suites/ccb_understand.md) | `baseline` | 13 | 0.592 | 0.692 |
-| [ccb_understand](suites/ccb_understand.md) | `baseline-local-direct` | 27 | 0.599 | 0.741 |
+| [ccb_understand](suites/ccb_understand.md) | `baseline-local-direct` | 20 | 0.660 | 0.800 |
 | [ccb_understand](suites/ccb_understand.md) | `mcp` | 13 | 0.841 | 1.000 |
-| [ccb_understand](suites/ccb_understand.md) | `mcp-remote-direct` | 27 | 0.728 | 0.889 |
+| [ccb_understand](suites/ccb_understand.md) | `mcp-remote-direct` | 20 | 0.851 | 1.000 |
 
 <details>
 <summary>Run/Config Summary</summary>

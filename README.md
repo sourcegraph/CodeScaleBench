@@ -258,6 +258,10 @@ This writes:
 - `docs/official_results/traces/*/trajectory.json` -- bundled raw trajectory traces for GitHub audit
 - `docs/official_results/index.html` -- interactive local browser
 
+Suite summaries are deduplicated to the latest result per
+`suite + config + task_name`; full historical rows remain in
+`official_results.json` under `all_tasks`.
+
 Serve locally:
 
 ```bash

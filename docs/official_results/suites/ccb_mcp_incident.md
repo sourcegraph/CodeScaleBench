@@ -7,11 +7,8 @@
 | [ccb_mcp_incident_haiku_20260224_181919](../runs/ccb_mcp_incident_haiku_20260224_181919.md) | `mcp-remote-artifact` | 3 | 0.782 | 1.000 |
 | [ccb_mcp_incident_haiku_20260225_011700](../runs/ccb_mcp_incident_haiku_20260225_011700.md) | `baseline-local-artifact` | 3 | 0.167 | 0.333 |
 | [ccb_mcp_incident_haiku_20260226_035617](../runs/ccb_mcp_incident_haiku_20260226_035617.md) | `mcp-remote-direct` | 7 | 0.646 | 0.857 |
-| [ccb_mcp_incident_haiku_20260226_035622_variance](../runs/ccb_mcp_incident_haiku_20260226_035622_variance.md) | `baseline-local-direct` | 1 | 0.000 | 0.000 |
 | [ccb_mcp_incident_haiku_20260226_035622_variance](../runs/ccb_mcp_incident_haiku_20260226_035622_variance.md) | `mcp-remote-direct` | 7 | 0.542 | 0.857 |
-| [ccb_mcp_incident_haiku_20260226_035628_variance](../runs/ccb_mcp_incident_haiku_20260226_035628_variance.md) | `baseline-local-direct` | 1 | 0.000 | 0.000 |
 | [ccb_mcp_incident_haiku_20260226_035628_variance](../runs/ccb_mcp_incident_haiku_20260226_035628_variance.md) | `mcp-remote-direct` | 7 | 0.567 | 0.857 |
-| [ccb_mcp_incident_haiku_20260226_035633_variance](../runs/ccb_mcp_incident_haiku_20260226_035633_variance.md) | `baseline-local-direct` | 1 | 0.000 | 0.000 |
 | [ccb_mcp_incident_haiku_20260226_035633_variance](../runs/ccb_mcp_incident_haiku_20260226_035633_variance.md) | `mcp-remote-direct` | 7 | 0.573 | 0.857 |
 | [ccb_mcp_incident_haiku_20260226_205845](../runs/ccb_mcp_incident_haiku_20260226_205845.md) | `baseline-local-direct` | 6 | 0.722 | 1.000 |
 | [ccb_mcp_incident_haiku_20260226_224414](../runs/ccb_mcp_incident_haiku_20260226_224414.md) | `baseline-local-direct` | 1 | 0.667 | 1.000 |
@@ -36,7 +33,6 @@
 | `ccb_mcp_incident_haiku_20260226_035617` | `mcp-remote-direct` | [mcp_CCX-incident-113_T5onXy](../tasks/ccb_mcp_incident_haiku_20260226_035617--mcp-remote-direct--mcp_CCX-incident-113_T5onXy.md) | `failed` | 0.000 | 0.824 |
 | `ccb_mcp_incident_haiku_20260226_035617` | `mcp-remote-direct` | [mcp_ccx-incident-034_89DyXl](../tasks/ccb_mcp_incident_haiku_20260226_035617--mcp-remote-direct--mcp_ccx-incident-034_89DyXl.md) | `passed` | 1.000 | 0.867 |
 | `ccb_mcp_incident_haiku_20260226_035617` | `mcp-remote-direct` | [mcp_ccx-incident-037_JmTj6j](../tasks/ccb_mcp_incident_haiku_20260226_035617--mcp-remote-direct--mcp_ccx-incident-037_JmTj6j.md) | `passed` | 0.933 | 0.857 |
-| `ccb_mcp_incident_haiku_20260226_035622_variance` | `baseline-local-direct` | [ccx-incident-113](../tasks/ccb_mcp_incident_haiku_20260226_035622_variance--baseline-local-direct--ccx-incident-113.md) | `failed` | 0.000 | 0.000 |
 | `ccb_mcp_incident_haiku_20260226_035622_variance` | `mcp-remote-direct` | [mcp_CCX-incident-032_UtUNt4](../tasks/ccb_mcp_incident_haiku_20260226_035622_variance--mcp-remote-direct--mcp_CCX-incident-032_UtUNt4.md) | `passed` | 0.411 | 0.938 |
 | `ccb_mcp_incident_haiku_20260226_035622_variance` | `mcp-remote-direct` | [mcp_CCX-incident-033_5HJK5V](../tasks/ccb_mcp_incident_haiku_20260226_035622_variance--mcp-remote-direct--mcp_CCX-incident-033_5HJK5V.md) | `passed` | 0.359 | 0.875 |
 | `ccb_mcp_incident_haiku_20260226_035622_variance` | `mcp-remote-direct` | [mcp_CCX-incident-108_e9YZkb](../tasks/ccb_mcp_incident_haiku_20260226_035622_variance--mcp-remote-direct--mcp_CCX-incident-108_e9YZkb.md) | `passed` | 0.367 | 0.953 |
@@ -44,7 +40,6 @@
 | `ccb_mcp_incident_haiku_20260226_035622_variance` | `mcp-remote-direct` | [mcp_CCX-incident-113_M4JBwB](../tasks/ccb_mcp_incident_haiku_20260226_035622_variance--mcp-remote-direct--mcp_CCX-incident-113_M4JBwB.md) | `failed` | 0.000 | 0.938 |
 | `ccb_mcp_incident_haiku_20260226_035622_variance` | `mcp-remote-direct` | [mcp_ccx-incident-034_z8JpXN](../tasks/ccb_mcp_incident_haiku_20260226_035622_variance--mcp-remote-direct--mcp_ccx-incident-034_z8JpXN.md) | `passed` | 1.000 | 0.941 |
 | `ccb_mcp_incident_haiku_20260226_035622_variance` | `mcp-remote-direct` | [mcp_ccx-incident-037_4C20SX](../tasks/ccb_mcp_incident_haiku_20260226_035622_variance--mcp-remote-direct--mcp_ccx-incident-037_4C20SX.md) | `passed` | 0.733 | 0.923 |
-| `ccb_mcp_incident_haiku_20260226_035628_variance` | `baseline-local-direct` | [ccx-incident-113](../tasks/ccb_mcp_incident_haiku_20260226_035628_variance--baseline-local-direct--ccx-incident-113.md) | `failed` | 0.000 | 0.000 |
 | `ccb_mcp_incident_haiku_20260226_035628_variance` | `mcp-remote-direct` | [mcp_CCX-incident-032_zv1cD1](../tasks/ccb_mcp_incident_haiku_20260226_035628_variance--mcp-remote-direct--mcp_CCX-incident-032_zv1cD1.md) | `passed` | 0.415 | 0.941 |
 | `ccb_mcp_incident_haiku_20260226_035628_variance` | `mcp-remote-direct` | [mcp_CCX-incident-033_MF5qfV](../tasks/ccb_mcp_incident_haiku_20260226_035628_variance--mcp-remote-direct--mcp_CCX-incident-033_MF5qfV.md) | `passed` | 0.274 | 0.833 |
 | `ccb_mcp_incident_haiku_20260226_035628_variance` | `mcp-remote-direct` | [mcp_CCX-incident-108_J2t0WK](../tasks/ccb_mcp_incident_haiku_20260226_035628_variance--mcp-remote-direct--mcp_CCX-incident-108_J2t0WK.md) | `passed` | 0.833 | 0.975 |
@@ -52,7 +47,6 @@
 | `ccb_mcp_incident_haiku_20260226_035628_variance` | `mcp-remote-direct` | [mcp_CCX-incident-113_s92YIv](../tasks/ccb_mcp_incident_haiku_20260226_035628_variance--mcp-remote-direct--mcp_CCX-incident-113_s92YIv.md) | `failed` | 0.000 | 0.909 |
 | `ccb_mcp_incident_haiku_20260226_035628_variance` | `mcp-remote-direct` | [mcp_ccx-incident-034_mAJmrM](../tasks/ccb_mcp_incident_haiku_20260226_035628_variance--mcp-remote-direct--mcp_ccx-incident-034_mAJmrM.md) | `passed` | 1.000 | 0.875 |
 | `ccb_mcp_incident_haiku_20260226_035628_variance` | `mcp-remote-direct` | [mcp_ccx-incident-037_2kxTW3](../tasks/ccb_mcp_incident_haiku_20260226_035628_variance--mcp-remote-direct--mcp_ccx-incident-037_2kxTW3.md) | `passed` | 0.500 | 0.917 |
-| `ccb_mcp_incident_haiku_20260226_035633_variance` | `baseline-local-direct` | [ccx-incident-113](../tasks/ccb_mcp_incident_haiku_20260226_035633_variance--baseline-local-direct--ccx-incident-113.md) | `failed` | 0.000 | 0.000 |
 | `ccb_mcp_incident_haiku_20260226_035633_variance` | `mcp-remote-direct` | [mcp_CCX-incident-032_3wlI0S](../tasks/ccb_mcp_incident_haiku_20260226_035633_variance--mcp-remote-direct--mcp_CCX-incident-032_3wlI0S.md) | `passed` | 0.361 | 0.938 |
 | `ccb_mcp_incident_haiku_20260226_035633_variance` | `mcp-remote-direct` | [mcp_CCX-incident-033_O4gECf](../tasks/ccb_mcp_incident_haiku_20260226_035633_variance--mcp-remote-direct--mcp_CCX-incident-033_O4gECf.md) | `passed` | 0.305 | 0.923 |
 | `ccb_mcp_incident_haiku_20260226_035633_variance` | `mcp-remote-direct` | [mcp_CCX-incident-108_Zcemvf](../tasks/ccb_mcp_incident_haiku_20260226_035633_variance--mcp-remote-direct--mcp_CCX-incident-108_Zcemvf.md) | `passed` | 0.815 | 0.952 |

@@ -6,13 +6,10 @@
 | [ccb_mcp_security_haiku_022126](../runs/ccb_mcp_security_haiku_022126.md) | `mcp` | 2 | 0.821 | 1.000 |
 | [ccb_mcp_security_haiku_20260224_181919](../runs/ccb_mcp_security_haiku_20260224_181919.md) | `mcp-remote-artifact` | 4 | 0.777 | 1.000 |
 | [ccb_mcp_security_haiku_20260225_011700](../runs/ccb_mcp_security_haiku_20260225_011700.md) | `baseline-local-artifact` | 4 | 0.000 | 0.000 |
-| [ccb_mcp_security_haiku_20260226_035617](../runs/ccb_mcp_security_haiku_20260226_035617.md) | `baseline-local-direct` | 1 | 0.433 | 1.000 |
 | [ccb_mcp_security_haiku_20260226_035617](../runs/ccb_mcp_security_haiku_20260226_035617.md) | `mcp-remote-direct` | 4 | 0.744 | 1.000 |
-| [ccb_mcp_security_haiku_20260226_035622_variance](../runs/ccb_mcp_security_haiku_20260226_035622_variance.md) | `baseline-local-direct` | 1 | 0.514 | 1.000 |
 | [ccb_mcp_security_haiku_20260226_035622_variance](../runs/ccb_mcp_security_haiku_20260226_035622_variance.md) | `mcp-remote-direct` | 4 | 0.578 | 1.000 |
 | [ccb_mcp_security_haiku_20260226_035628_variance](../runs/ccb_mcp_security_haiku_20260226_035628_variance.md) | `baseline-local-direct` | 1 | 0.367 | 1.000 |
 | [ccb_mcp_security_haiku_20260226_035628_variance](../runs/ccb_mcp_security_haiku_20260226_035628_variance.md) | `mcp-remote-direct` | 4 | 0.767 | 1.000 |
-| [ccb_mcp_security_haiku_20260226_035633_variance](../runs/ccb_mcp_security_haiku_20260226_035633_variance.md) | `baseline-local-direct` | 1 | 0.586 | 1.000 |
 | [ccb_mcp_security_haiku_20260226_035633_variance](../runs/ccb_mcp_security_haiku_20260226_035633_variance.md) | `mcp-remote-direct` | 4 | 0.731 | 1.000 |
 | [ccb_mcp_security_haiku_20260226_205845](../runs/ccb_mcp_security_haiku_20260226_205845.md) | `baseline-local-direct` | 3 | 0.682 | 1.000 |
 
@@ -32,12 +29,10 @@
 | `ccb_mcp_security_haiku_20260225_011700` | `baseline-local-artifact` | [bl_CCX-vuln-remed-130_Zk4x7i](../tasks/ccb_mcp_security_haiku_20260225_011700--baseline-local-artifact--bl_CCX-vuln-remed-130_Zk4x7i.md) | `failed` | 0.000 | 0.000 |
 | `ccb_mcp_security_haiku_20260225_011700` | `baseline-local-artifact` | [bl_CCX-vuln-remed-135_UVjwY5](../tasks/ccb_mcp_security_haiku_20260225_011700--baseline-local-artifact--bl_CCX-vuln-remed-135_UVjwY5.md) | `failed` | 0.000 | 0.000 |
 | `ccb_mcp_security_haiku_20260225_011700` | `baseline-local-artifact` | [bl_CCX-vuln-remed-141_Hv3FTI](../tasks/ccb_mcp_security_haiku_20260225_011700--baseline-local-artifact--bl_CCX-vuln-remed-141_Hv3FTI.md) | `failed` | 0.000 | 0.000 |
-| `ccb_mcp_security_haiku_20260226_035617` | `baseline-local-direct` | [ccx-vuln-remed-012](../tasks/ccb_mcp_security_haiku_20260226_035617--baseline-local-direct--ccx-vuln-remed-012.md) | `passed` | 0.433 | 0.000 |
 | `ccb_mcp_security_haiku_20260226_035617` | `mcp-remote-direct` | [mcp_CCX-vuln-remed-012_lrLTYc](../tasks/ccb_mcp_security_haiku_20260226_035617--mcp-remote-direct--mcp_CCX-vuln-remed-012_lrLTYc.md) | `passed` | 0.463 | 0.923 |
 | `ccb_mcp_security_haiku_20260226_035617` | `mcp-remote-direct` | [mcp_CCX-vuln-remed-013_WOkHxn](../tasks/ccb_mcp_security_haiku_20260226_035617--mcp-remote-direct--mcp_CCX-vuln-remed-013_WOkHxn.md) | `passed` | 0.705 | 0.926 |
 | `ccb_mcp_security_haiku_20260226_035617` | `mcp-remote-direct` | [mcp_CCX-vuln-remed-105_1RoC5v](../tasks/ccb_mcp_security_haiku_20260226_035617--mcp-remote-direct--mcp_CCX-vuln-remed-105_1RoC5v.md) | `passed` | 0.809 | 0.958 |
 | `ccb_mcp_security_haiku_20260226_035617` | `mcp-remote-direct` | [mcp_CCX-vuln-remed-111_7hdRBX](../tasks/ccb_mcp_security_haiku_20260226_035617--mcp-remote-direct--mcp_CCX-vuln-remed-111_7hdRBX.md) | `passed` | 1.000 | 0.966 |
-| `ccb_mcp_security_haiku_20260226_035622_variance` | `baseline-local-direct` | [ccx-vuln-remed-012](../tasks/ccb_mcp_security_haiku_20260226_035622_variance--baseline-local-direct--ccx-vuln-remed-012.md) | `passed` | 0.514 | 0.000 |
 | `ccb_mcp_security_haiku_20260226_035622_variance` | `mcp-remote-direct` | [mcp_CCX-vuln-remed-012_9JwGrW](../tasks/ccb_mcp_security_haiku_20260226_035622_variance--mcp-remote-direct--mcp_CCX-vuln-remed-012_9JwGrW.md) | `passed` | 0.397 | 0.889 |
 | `ccb_mcp_security_haiku_20260226_035622_variance` | `mcp-remote-direct` | [mcp_CCX-vuln-remed-013_Kmqlzc](../tasks/ccb_mcp_security_haiku_20260226_035622_variance--mcp-remote-direct--mcp_CCX-vuln-remed-013_Kmqlzc.md) | `passed` | 0.105 | 0.971 |
 | `ccb_mcp_security_haiku_20260226_035622_variance` | `mcp-remote-direct` | [mcp_CCX-vuln-remed-105_79Rpkl](../tasks/ccb_mcp_security_haiku_20260226_035622_variance--mcp-remote-direct--mcp_CCX-vuln-remed-105_79Rpkl.md) | `passed` | 0.809 | 0.952 |
@@ -47,7 +42,6 @@
 | `ccb_mcp_security_haiku_20260226_035628_variance` | `mcp-remote-direct` | [mcp_CCX-vuln-remed-013_LoBHLI](../tasks/ccb_mcp_security_haiku_20260226_035628_variance--mcp-remote-direct--mcp_CCX-vuln-remed-013_LoBHLI.md) | `passed` | 0.749 | 0.963 |
 | `ccb_mcp_security_haiku_20260226_035628_variance` | `mcp-remote-direct` | [mcp_CCX-vuln-remed-105_aQMP88](../tasks/ccb_mcp_security_haiku_20260226_035628_variance--mcp-remote-direct--mcp_CCX-vuln-remed-105_aQMP88.md) | `passed` | 0.784 | 0.971 |
 | `ccb_mcp_security_haiku_20260226_035628_variance` | `mcp-remote-direct` | [mcp_CCX-vuln-remed-111_AFyYzp](../tasks/ccb_mcp_security_haiku_20260226_035628_variance--mcp-remote-direct--mcp_CCX-vuln-remed-111_AFyYzp.md) | `passed` | 1.000 | 0.909 |
-| `ccb_mcp_security_haiku_20260226_035633_variance` | `baseline-local-direct` | [ccx-vuln-remed-012](../tasks/ccb_mcp_security_haiku_20260226_035633_variance--baseline-local-direct--ccx-vuln-remed-012.md) | `passed` | 0.586 | 0.000 |
 | `ccb_mcp_security_haiku_20260226_035633_variance` | `mcp-remote-direct` | [mcp_CCX-vuln-remed-012_6P8wqO](../tasks/ccb_mcp_security_haiku_20260226_035633_variance--mcp-remote-direct--mcp_CCX-vuln-remed-012_6P8wqO.md) | `passed` | 0.563 | 0.973 |
 | `ccb_mcp_security_haiku_20260226_035633_variance` | `mcp-remote-direct` | [mcp_CCX-vuln-remed-013_JtNIGY](../tasks/ccb_mcp_security_haiku_20260226_035633_variance--mcp-remote-direct--mcp_CCX-vuln-remed-013_JtNIGY.md) | `passed` | 0.624 | 0.958 |
 | `ccb_mcp_security_haiku_20260226_035633_variance` | `mcp-remote-direct` | [mcp_CCX-vuln-remed-105_JZsxbp](../tasks/ccb_mcp_security_haiku_20260226_035633_variance--mcp-remote-direct--mcp_CCX-vuln-remed-105_JZsxbp.md) | `passed` | 0.737 | 0.909 |

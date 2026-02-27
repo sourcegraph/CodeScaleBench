@@ -4,7 +4,6 @@
 |---|---|---:|---:|---:|
 | [ccb_design_haiku_022326](../runs/ccb_design_haiku_022326.md) | `baseline` | 13 | 0.770 | 1.000 |
 | [ccb_design_haiku_022326](../runs/ccb_design_haiku_022326.md) | `mcp` | 20 | 0.718 | 1.000 |
-| [ccb_design_haiku_20260225_234223](../runs/ccb_design_haiku_20260225_234223.md) | `baseline-local-direct` | 7 | 0.723 | 0.857 |
 | [ccb_design_haiku_20260226_015500_backfill](../runs/ccb_design_haiku_20260226_015500_backfill.md) | `baseline-local-direct` | 7 | 0.723 | 0.857 |
 | [design_haiku_20260223_124652](../runs/design_haiku_20260223_124652.md) | `baseline-local-direct` | 13 | 0.770 | 1.000 |
 | [design_haiku_20260223_124652](../runs/design_haiku_20260223_124652.md) | `mcp-remote-direct` | 20 | 0.718 | 1.000 |
@@ -46,13 +45,6 @@
 | `ccb_design_haiku_022326` | `mcp` | [sgonly_postgres-query-exec-arch-001](../tasks/ccb_design_haiku_022326--mcp--sgonly_postgres-query-exec-arch-001.md) | `passed` | 0.830 | 0.976 |
 | `ccb_design_haiku_022326` | `mcp` | [sgonly_quantlib-barrier-pricing-arch-001](../tasks/ccb_design_haiku_022326--mcp--sgonly_quantlib-barrier-pricing-arch-001.md) | `passed` | 0.830 | 0.968 |
 | `ccb_design_haiku_022326` | `mcp` | [sgonly_terraform-provider-iface-sym-001](../tasks/ccb_design_haiku_022326--mcp--sgonly_terraform-provider-iface-sym-001.md) | `passed` | 0.090 | 0.929 |
-| `ccb_design_haiku_20260225_234223` | `baseline-local-direct` | [camel-routing-arch-001](../tasks/ccb_design_haiku_20260225_234223--baseline-local-direct--camel-routing-arch-001.md) | `passed` | 0.870 | 0.000 |
-| `ccb_design_haiku_20260225_234223` | `baseline-local-direct` | [etcd-grpc-api-upgrade-001](../tasks/ccb_design_haiku_20260225_234223--baseline-local-direct--etcd-grpc-api-upgrade-001.md) | `failed` | 0.000 | 0.000 |
-| `ccb_design_haiku_20260225_234223` | `baseline-local-direct` | [flink-checkpoint-arch-001](../tasks/ccb_design_haiku_20260225_234223--baseline-local-direct--flink-checkpoint-arch-001.md) | `passed` | 0.800 | 0.000 |
-| `ccb_design_haiku_20260225_234223` | `baseline-local-direct` | [k8s-crd-lifecycle-arch-001](../tasks/ccb_design_haiku_20260225_234223--baseline-local-direct--k8s-crd-lifecycle-arch-001.md) | `passed` | 0.690 | 0.000 |
-| `ccb_design_haiku_20260225_234223` | `baseline-local-direct` | [k8s-dra-allocation-impact-001](../tasks/ccb_design_haiku_20260225_234223--baseline-local-direct--k8s-dra-allocation-impact-001.md) | `passed` | 1.000 | 0.000 |
-| `ccb_design_haiku_20260225_234223` | `baseline-local-direct` | [k8s-scheduler-arch-001](../tasks/ccb_design_haiku_20260225_234223--baseline-local-direct--k8s-scheduler-arch-001.md) | `passed` | 0.730 | 0.000 |
-| `ccb_design_haiku_20260225_234223` | `baseline-local-direct` | [kafka-flink-streaming-arch-001](../tasks/ccb_design_haiku_20260225_234223--baseline-local-direct--kafka-flink-streaming-arch-001.md) | `passed` | 0.970 | 0.000 |
 | `ccb_design_haiku_20260226_015500_backfill` | `baseline-local-direct` | [camel-routing-arch-001](../tasks/ccb_design_haiku_20260226_015500_backfill--baseline-local-direct--camel-routing-arch-001.md) | `passed` | 0.870 | 0.000 |
 | `ccb_design_haiku_20260226_015500_backfill` | `baseline-local-direct` | [etcd-grpc-api-upgrade-001](../tasks/ccb_design_haiku_20260226_015500_backfill--baseline-local-direct--etcd-grpc-api-upgrade-001.md) | `failed` | 0.000 | 0.000 |
 | `ccb_design_haiku_20260226_015500_backfill` | `baseline-local-direct` | [flink-checkpoint-arch-001](../tasks/ccb_design_haiku_20260226_015500_backfill--baseline-local-direct--flink-checkpoint-arch-001.md) | `passed` | 0.800 | 0.000 |

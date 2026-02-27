@@ -15,7 +15,7 @@
 | [ccb_mcp_crossrepo_tracing_haiku_20260226_035622_variance](../runs/ccb_mcp_crossrepo_tracing_haiku_20260226_035622_variance.md) | `mcp-remote-direct` | 4 | 0.572 | 0.750 |
 | [ccb_mcp_crossrepo_tracing_haiku_20260226_035628_variance](../runs/ccb_mcp_crossrepo_tracing_haiku_20260226_035628_variance.md) | `mcp-remote-direct` | 4 | 0.567 | 0.750 |
 | [ccb_mcp_crossrepo_tracing_haiku_20260226_035633_variance](../runs/ccb_mcp_crossrepo_tracing_haiku_20260226_035633_variance.md) | `mcp-remote-direct` | 4 | 0.446 | 0.750 |
-| [ccb_mcp_crossrepo_tracing_haiku_20260226_205845](../runs/ccb_mcp_crossrepo_tracing_haiku_20260226_205845.md) | `baseline-local-direct` | 4 | 0.542 | 0.750 |
+| [ccb_mcp_crossrepo_tracing_haiku_20260226_205845](../runs/ccb_mcp_crossrepo_tracing_haiku_20260226_205845.md) | `baseline-local-direct` | 3 | 0.722 | 1.000 |
 | [ccb_mcp_crossrepo_tracing_haiku_20260226_214446](../runs/ccb_mcp_crossrepo_tracing_haiku_20260226_214446.md) | `baseline-local-direct` | 1 | 0.571 | 1.000 |
 | [ccb_mcp_crossrepo_tracing_haiku_20260226_221038](../runs/ccb_mcp_crossrepo_tracing_haiku_20260226_221038.md) | `mcp-remote-direct` | 1 | 0.800 | 1.000 |
 
@@ -57,6 +57,5 @@
 | `ccb_mcp_crossrepo_tracing_haiku_20260226_205845` | `baseline-local-direct` | [ccx-config-trace-003](../tasks/ccb_mcp_crossrepo_tracing_haiku_20260226_205845--baseline-local-direct--ccx-config-trace-003.md) | `passed` | 0.500 | 0.000 |
 | `ccb_mcp_crossrepo_tracing_haiku_20260226_205845` | `baseline-local-direct` | [ccx-dep-trace-002](../tasks/ccb_mcp_crossrepo_tracing_haiku_20260226_205845--baseline-local-direct--ccx-dep-trace-002.md) | `passed` | 1.000 | 0.000 |
 | `ccb_mcp_crossrepo_tracing_haiku_20260226_205845` | `baseline-local-direct` | [ccx-dep-trace-102](../tasks/ccb_mcp_crossrepo_tracing_haiku_20260226_205845--baseline-local-direct--ccx-dep-trace-102.md) | `passed` | 0.667 | 0.000 |
-| `ccb_mcp_crossrepo_tracing_haiku_20260226_205845` | `baseline-local-direct` | [ccx-dep-trace-116](../tasks/ccb_mcp_crossrepo_tracing_haiku_20260226_205845--baseline-local-direct--ccx-dep-trace-116.md) | `failed` | 0.000 | 0.000 |
 | `ccb_mcp_crossrepo_tracing_haiku_20260226_214446` | `baseline-local-direct` | [ccx-dep-trace-116](../tasks/ccb_mcp_crossrepo_tracing_haiku_20260226_214446--baseline-local-direct--ccx-dep-trace-116.md) | `passed` | 0.571 | 0.000 |
 | `ccb_mcp_crossrepo_tracing_haiku_20260226_221038` | `mcp-remote-direct` | [mcp_CCX-dep-trace-116_hutEUF](../tasks/ccb_mcp_crossrepo_tracing_haiku_20260226_221038--mcp-remote-direct--mcp_CCX-dep-trace-116_hutEUF.md) | `passed` | 0.800 | 0.950 |

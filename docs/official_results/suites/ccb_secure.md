@@ -6,7 +6,7 @@
 | [ccb_secure_haiku_022326](../runs/ccb_secure_haiku_022326.md) | `mcp` | 18 | 0.705 | 1.000 |
 | [ccb_secure_haiku_20260224_213146](../runs/ccb_secure_haiku_20260224_213146.md) | `baseline-local-direct` | 2 | 0.500 | 1.000 |
 | [ccb_secure_haiku_20260224_213146](../runs/ccb_secure_haiku_20260224_213146.md) | `mcp-remote-direct` | 2 | 0.250 | 0.500 |
-| [secure_haiku_20260223_232545](../runs/secure_haiku_20260223_232545.md) | `baseline-local-direct` | 20 | 0.669 | 0.950 |
+| [secure_haiku_20260223_232545](../runs/secure_haiku_20260223_232545.md) | `baseline-local-direct` | 18 | 0.688 | 0.944 |
 | [secure_haiku_20260223_232545](../runs/secure_haiku_20260223_232545.md) | `mcp-remote-direct` | 18 | 0.705 | 1.000 |
 | [secure_haiku_20260224_011825](../runs/secure_haiku_20260224_011825.md) | `mcp-remote-direct` | 2 | 0.500 | 0.500 |
 
@@ -62,8 +62,6 @@
 | `secure_haiku_20260223_232545` | `baseline-local-direct` | [django-legacy-dep-vuln-001](../tasks/secure_haiku_20260223_232545--baseline-local-direct--django-legacy-dep-vuln-001.md) | `passed` | 0.900 | 0.000 |
 | `secure_haiku_20260223_232545` | `baseline-local-direct` | [django-policy-enforcement-001](../tasks/secure_haiku_20260223_232545--baseline-local-direct--django-policy-enforcement-001.md) | `passed` | 0.750 | 0.000 |
 | `secure_haiku_20260223_232545` | `baseline-local-direct` | [django-repo-scoped-access-001](../tasks/secure_haiku_20260223_232545--baseline-local-direct--django-repo-scoped-access-001.md) | `passed` | 0.500 | 0.000 |
-| `secure_haiku_20260223_232545` | `baseline-local-direct` | [django-role-based-access-001](../tasks/secure_haiku_20260223_232545--baseline-local-direct--django-role-based-access-001.md) | `passed` | 0.200 | 0.000 |
-| `secure_haiku_20260223_232545` | `baseline-local-direct` | [django-sensitive-file-exclusion-001](../tasks/secure_haiku_20260223_232545--baseline-local-direct--django-sensitive-file-exclusion-001.md) | `passed` | 0.800 | 0.000 |
 | `secure_haiku_20260223_232545` | `baseline-local-direct` | [envoy-cve-triage-001](../tasks/secure_haiku_20260223_232545--baseline-local-direct--envoy-cve-triage-001.md) | `passed` | 0.900 | 0.000 |
 | `secure_haiku_20260223_232545` | `baseline-local-direct` | [envoy-vuln-reachability-001](../tasks/secure_haiku_20260223_232545--baseline-local-direct--envoy-vuln-reachability-001.md) | `passed` | 0.620 | 0.000 |
 | `secure_haiku_20260223_232545` | `baseline-local-direct` | [flipt-degraded-context-fix-001](../tasks/secure_haiku_20260223_232545--baseline-local-direct--flipt-degraded-context-fix-001.md) | `passed` | 0.600 | 0.000 |

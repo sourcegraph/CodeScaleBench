@@ -14,6 +14,10 @@ Use this workflow to publish valid official scores with easy-to-view parsed trac
 - `docs/official_results/traces/*/trajectory.json` - bundled raw trajectory traces
 - `docs/official_results/index.html` - local interactive browser
 
+Suite-level views and top-level summaries are deduplicated to one canonical row
+per `suite + config + task_name` (latest by task `started_at`). Full historical
+rows are preserved in `data/official_results.json` as `all_tasks`.
+
 ## Usage
 
 ```bash

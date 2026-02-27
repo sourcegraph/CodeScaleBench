@@ -6,7 +6,6 @@
 | [build_haiku_20260223_124805](../runs/build_haiku_20260223_124805.md) | `mcp-remote-direct` | 25 | 0.372 | 0.640 |
 | [ccb_build_haiku_022326](../runs/ccb_build_haiku_022326.md) | `baseline` | 19 | 0.511 | 0.789 |
 | [ccb_build_haiku_022326](../runs/ccb_build_haiku_022326.md) | `mcp` | 25 | 0.372 | 0.640 |
-| [ccb_build_haiku_20260225_234223](../runs/ccb_build_haiku_20260225_234223.md) | `baseline-local-direct` | 1 | 0.820 | 1.000 |
 | [ccb_build_haiku_20260226_015500_backfill](../runs/ccb_build_haiku_20260226_015500_backfill.md) | `baseline-local-direct` | 1 | 0.820 | 1.000 |
 
 ## Tasks
@@ -101,5 +100,4 @@
 | `ccb_build_haiku_022326` | `mcp` | [sgonly_strata-fx-european-refac-001](../tasks/ccb_build_haiku_022326--mcp--sgonly_strata-fx-european-refac-001.md) | `passed` | 0.800 | 0.312 |
 | `ccb_build_haiku_022326` | `mcp` | [sgonly_tensorrt-mxfp4-quant-feat-001](../tasks/ccb_build_haiku_022326--mcp--sgonly_tensorrt-mxfp4-quant-feat-001.md) | `passed` | 0.700 | 0.537 |
 | `ccb_build_haiku_022326` | `mcp` | [sgonly_vscode-stale-diagnostics-feat-001](../tasks/ccb_build_haiku_022326--mcp--sgonly_vscode-stale-diagnostics-feat-001.md) | `failed` | 0.000 | 0.625 |
-| `ccb_build_haiku_20260225_234223` | `baseline-local-direct` | [rust-subtype-relation-refac-001](../tasks/ccb_build_haiku_20260225_234223--baseline-local-direct--rust-subtype-relation-refac-001.md) | `passed` | 0.820 | 0.000 |
 | `ccb_build_haiku_20260226_015500_backfill` | `baseline-local-direct` | [rust-subtype-relation-refac-001](../tasks/ccb_build_haiku_20260226_015500_backfill--baseline-local-direct--rust-subtype-relation-refac-001.md) | `passed` | 0.820 | 0.000 |
