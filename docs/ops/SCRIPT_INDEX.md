@@ -162,10 +162,12 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/backfill_size_metadata.py` [one_off] - Historical one-off script: backfill size metadata.
 - `scripts/backfill_triage_from_manifest.py` [one_off] - Historical one-off script: backfill triage from manifest.
 - `scripts/check_harness_readiness.py` - Utility script for check harness readiness.
+- `scripts/compute_bootstrap_cis.py` - Utility script for compute bootstrap cis.
 - `scripts/control_plane.py` - Utility script for control plane.
 - `scripts/dependeval_eval_dr.py` - Utility script for dependeval eval dr.
 - `scripts/dependeval_eval_me.py` - Utility script for dependeval eval me.
 - `scripts/docgen_quality_sweep.py` - Utility script for docgen quality sweep.
+- `scripts/export_official_results.py` - Utility script for export official results.
 - `scripts/extract_analysis_metrics.py` - Utility script for extract analysis metrics.
 - `scripts/find_mcp_distracted.py` - Utility script for find mcp distracted.
 - `scripts/fix_h3_tokens.py` [one_off] - Historical one-off script: fix h3 tokens.

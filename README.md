@@ -238,6 +238,31 @@ The report generator produces:
 
 See `python3 scripts/generate_eval_report.py --help` for all options.
 
+### Publishable Official Results + Trace Browser
+
+To export GitHub-friendly official results (valid scored tasks only) with parsed
+trace summaries and local browsing UI:
+
+```bash
+python3 scripts/export_official_results.py \
+  --runs-dir ./runs/official/ \
+  --output-dir ./docs/official_results/
+```
+
+This writes:
+- `docs/official_results/README.md` -- run/config score summary
+- `docs/official_results/runs/*.md` -- per-run task tables
+- `docs/official_results/tasks/*.md` -- per-task metrics + parsed tool/trace view
+- `docs/official_results/data/official_results.json` -- machine-readable dataset
+- `docs/official_results/audits/*.json` -- per-task audit artifacts (checksums + parsed trace events)
+- `docs/official_results/index.html` -- interactive local browser
+
+Serve locally:
+
+```bash
+python3 scripts/export_official_results.py --serve
+```
+
 For the full multi-layer evaluation pipeline (verifier, LLM judge, statistical analysis, dual-score reporting), see [docs/EVALUATION_PIPELINE.md](docs/EVALUATION_PIPELINE.md).
 
 ---
