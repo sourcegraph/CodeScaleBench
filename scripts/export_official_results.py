@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import re
@@ -28,6 +29,11 @@ from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    tomllib = None
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_REPO_BLOB_BASE = "https://github.com/sjarmak/CodeContextBench/blob/main"
@@ -52,6 +58,7 @@ TRANSCRIPT_CANDIDATES = (
 )
 AUDIT_EVENT_LIMIT = 200
 CONVERSATION_PREVIEW_LIMIT = 80
+TASK_PAGE_EVENT_LIMIT = 400
 SDLC_SUITES = {
     "ccb_build",
     "ccb_debug",
@@ -104,6 +111,17 @@ class TaskRecord:
     trace_paths: dict[str, str | None]
     bundled_trace_paths: dict[str, str | None]
     checksums: dict[str, str | None]
+    repositories: list[str]
+    benchmark_task_path: str | None
+    instruction_text: str | None
+    agent_name: str | None
+    model_name: str | None
+    context_metrics: dict[str, Any]
+    ir_metrics: dict[str, Any]
+    trace_events: list[dict[str, Any]]
+    trace_tool_calls: list[dict[str, Any]]
+    trace_code_changes: list[dict[str, Any]]
+    trace_bash_commands: list[dict[str, Any]]
     audit_page: str | None = None
 
 
@@ -251,6 +269,63 @@ def _load_task_metrics(task_dir: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _load_ir_metrics(task_dir: Path) -> dict[str, Any]:
+    path = task_dir / "verifier" / "ir_metrics.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _extract_task_instruction(task_dir: Path, task_path_from_result: str | None) -> str | None:
+    candidates = [
+        task_dir / "instruction.txt",
+        task_dir / "agent" / "instruction.txt",
+    ]
+    if task_path_from_result:
+        benchmark_path = Path(task_path_from_result)
+        candidates.extend([benchmark_path / "instruction.md", benchmark_path / "instruction.txt"])
+    for path in candidates:
+        if path.is_file():
+            try:
+                text = path.read_text(errors="replace").strip()
+            except Exception:
+                continue
+            if text:
+                return text
+    return None
+
+
+def _extract_repo_metadata(task_metrics: dict[str, Any] | None, task_path_from_result: str | None) -> tuple[list[str], str | None]:
+    repos: list[str] = []
+    benchmark_task_path: str | None = None
+    if task_metrics and isinstance(task_metrics.get("repo"), str) and task_metrics.get("repo"):
+        repos.append(task_metrics["repo"])
+
+    task_path = Path(task_path_from_result) if isinstance(task_path_from_result, str) and task_path_from_result else None
+    if task_path and task_path.is_dir():
+        try:
+            benchmark_task_path = str(task_path.relative_to(PROJECT_ROOT))
+        except ValueError:
+            benchmark_task_path = str(task_path)
+        if tomllib is not None:
+            task_toml = task_path / "task.toml"
+            if task_toml.is_file():
+                try:
+                    payload = tomllib.loads(task_toml.read_text())
+                    task_section = payload.get("task", {})
+                    repo_val = task_section.get("repo")
+                    if isinstance(repo_val, str) and repo_val:
+                        repos.append(repo_val)
+                except Exception:
+                    pass
+    deduped = sorted({r for r in repos if r})
+    return deduped, benchmark_task_path
+
+
 def _find_trace_paths(task_dir: Path) -> dict[str, str | None]:
     agent_dir = task_dir / "agent"
     trajectory = agent_dir / "trajectory.json"
@@ -274,12 +349,21 @@ def _find_trace_paths(task_dir: Path) -> dict[str, str | None]:
 def _parse_transcript(
     transcript_path: Path,
     max_examples: int,
-) -> tuple[dict[str, int], list[dict[str, str]], dict[str, Any]]:
+) -> tuple[dict[str, int], list[dict[str, str]], dict[str, Any], dict[str, Any]]:
     counts: Counter[str] = Counter()
     examples: list[dict[str, str]] = []
     events: list[dict[str, Any]] = []
     line_count = 0
     json_line_count = 0
+    tool_use_id_to_name: dict[str, str] = {}
+    detailed_events: list[dict[str, Any]] = []
+    detailed_tool_calls: list[dict[str, Any]] = []
+    detailed_code_changes: list[dict[str, Any]] = []
+    detailed_bash_commands: list[dict[str, Any]] = []
+    token_input = 0
+    token_output = 0
+    token_cache_read = 0
+    model_name: str | None = None
     if not transcript_path.is_file():
         return {}, examples, {
             "line_count": 0,
@@ -288,7 +372,7 @@ def _parse_transcript(
             "message_event_count": 0,
             "messages": [],
             "tool_events": [],
-        }
+        }, {}
 
     try:
         lines = transcript_path.read_text(errors="replace").splitlines()
@@ -300,14 +384,34 @@ def _parse_transcript(
             "message_event_count": 0,
             "messages": [],
             "tool_events": [],
-        }
+        }, {}
 
     message_events: list[dict[str, Any]] = []
     sequence = 0
 
-    def _append_message(msg_type: str, subtype: str, text: str | None = None, tool: str | None = None) -> None:
+    def _append_message(
+        msg_type: str,
+        subtype: str,
+        text: str | None = None,
+        tool: str | None = None,
+        payload: dict[str, Any] | None = None,
+        timestamp: str | None = None,
+    ) -> None:
         nonlocal sequence
+        event_payload: dict[str, Any] = payload or {}
+        detail = {
+            "sequence": sequence,
+            "timestamp": timestamp,
+            "type": msg_type,
+            "subtype": subtype,
+            "tool": tool,
+            "text": text or "",
+            "payload": event_payload,
+        }
+        if len(detailed_events) < TASK_PAGE_EVENT_LIMIT:
+            detailed_events.append(detail)
         if len(message_events) >= AUDIT_EVENT_LIMIT:
+            sequence += 1
             return
         preview = (text or "").replace("\n", " ").strip()
         if len(preview) > 220:
@@ -336,14 +440,23 @@ def _parse_transcript(
 
         msg_type = str(payload.get("type") or "")
         ts = payload.get("timestamp")
+        if not isinstance(ts, str):
+            ts = None
 
         if msg_type == "assistant":
             message = payload.get("message")
             if not isinstance(message, dict):
                 continue
+            if model_name is None and isinstance(message.get("model"), str):
+                model_name = message["model"]
+            usage = message.get("usage")
+            if isinstance(usage, dict):
+                token_input += _safe_int(usage.get("input_tokens")) or 0
+                token_output += _safe_int(usage.get("output_tokens")) or 0
+                token_cache_read += _safe_int(usage.get("cache_read_input_tokens")) or 0
             content = message.get("content")
             if isinstance(content, str):
-                _append_message("assistant", "text", content)
+                _append_message("assistant", "text", content, timestamp=ts)
                 continue
             if not isinstance(content, list):
                 continue
@@ -352,13 +465,24 @@ def _parse_transcript(
                     continue
                 item_type = str(item.get("type") or "")
                 if item_type == "text":
-                    _append_message("assistant", "text", str(item.get("text") or ""))
+                    _append_message("assistant", "text", str(item.get("text") or ""), timestamp=ts)
                     continue
                 if item_type != "tool_use":
                     continue
                 tool_name = str(item.get("name") or "unknown")
+                tool_input = item.get("input")
+                tool_input_payload = tool_input if isinstance(tool_input, dict) else {}
+                tool_call_id = str(item.get("id") or "")
+                if tool_call_id:
+                    tool_use_id_to_name[tool_call_id] = tool_name
                 counts[tool_name] += 1
-                _append_message("assistant", "tool_use", tool=tool_name)
+                _append_message(
+                    "assistant",
+                    "tool_use",
+                    tool=tool_name,
+                    payload=tool_input_payload,
+                    timestamp=ts,
+                )
                 if len(events) < AUDIT_EVENT_LIMIT:
                     events.append(
                         {
@@ -366,6 +490,46 @@ def _parse_transcript(
                             "tool": tool_name,
                         }
                     )
+                if len(detailed_tool_calls) < TASK_PAGE_EVENT_LIMIT:
+                    detailed_tool_calls.append(
+                        {
+                            "sequence": sequence - 1,
+                            "timestamp": ts,
+                            "tool": tool_name,
+                            "tool_use_id": tool_call_id or None,
+                            "input": tool_input_payload,
+                        }
+                    )
+                if tool_name == "Edit":
+                    if len(detailed_code_changes) < TASK_PAGE_EVENT_LIMIT:
+                        detailed_code_changes.append(
+                            {
+                                "sequence": sequence - 1,
+                                "type": "edit",
+                                "file_path": str(tool_input_payload.get("file_path") or ""),
+                                "old_string": str(tool_input_payload.get("old_string") or ""),
+                                "new_string": str(tool_input_payload.get("new_string") or ""),
+                            }
+                        )
+                elif tool_name == "Write":
+                    if len(detailed_code_changes) < TASK_PAGE_EVENT_LIMIT:
+                        detailed_code_changes.append(
+                            {
+                                "sequence": sequence - 1,
+                                "type": "write",
+                                "file_path": str(tool_input_payload.get("file_path") or ""),
+                                "content": str(tool_input_payload.get("content") or ""),
+                            }
+                        )
+                elif tool_name == "Bash":
+                    command = str(tool_input_payload.get("command") or "")
+                    if command and len(detailed_bash_commands) < TASK_PAGE_EVENT_LIMIT:
+                        detailed_bash_commands.append(
+                            {
+                                "sequence": sequence - 1,
+                                "command": command,
+                            }
+                        )
                 if len(examples) < max_examples:
                     examples.append({"tool": tool_name})
             continue
@@ -374,8 +538,10 @@ def _parse_transcript(
             tool_use_result = payload.get("toolUseResult")
             if isinstance(tool_use_result, dict):
                 result_content = tool_use_result.get("content")
+                tool_use_id = str(tool_use_result.get("tool_use_id") or tool_use_result.get("toolUseId") or "")
+                mapped_tool = tool_use_id_to_name.get(tool_use_id)
                 if isinstance(result_content, str):
-                    _append_message("user", "tool_result", result_content)
+                    _append_message("user", "tool_result", result_content, tool=mapped_tool, timestamp=ts)
                 elif isinstance(result_content, list):
                     text_parts: list[str] = []
                     for block in result_content:
@@ -386,9 +552,9 @@ def _parse_transcript(
                                 text_parts.append(str(block.get("content") or ""))
                         elif isinstance(block, str):
                             text_parts.append(block)
-                    _append_message("user", "tool_result", "\n".join(text_parts))
+                    _append_message("user", "tool_result", "\n".join(text_parts), tool=mapped_tool, timestamp=ts)
                 else:
-                    _append_message("user", "tool_result")
+                    _append_message("user", "tool_result", tool=mapped_tool, timestamp=ts)
                 continue
 
             message = payload.get("message")
@@ -396,19 +562,19 @@ def _parse_transcript(
                 continue
             content = message.get("content")
             if isinstance(content, str):
-                _append_message("user", "text", content)
+                _append_message("user", "text", content, timestamp=ts)
             elif isinstance(content, list):
                 text_parts = [
                     str(block.get("text") or "")
                     for block in content
                     if isinstance(block, dict) and block.get("type") == "text"
                 ]
-                _append_message("user", "text", "\n".join(text_parts))
+                _append_message("user", "text", "\n".join(text_parts), timestamp=ts)
             continue
 
         if msg_type == "system":
             subtype = str(payload.get("subtype") or "init")
-            _append_message("system", subtype)
+            _append_message("system", subtype, timestamp=ts)
 
     return dict(counts), examples, {
         "line_count": line_count,
@@ -417,6 +583,15 @@ def _parse_transcript(
         "message_event_count": len(message_events),
         "messages": message_events,
         "tool_events": events,
+    }, {
+        "model_name": model_name,
+        "token_input": token_input,
+        "token_output": token_output,
+        "token_cache_read": token_cache_read,
+        "events": detailed_events,
+        "tool_calls": detailed_tool_calls,
+        "code_changes": detailed_code_changes,
+        "bash_commands": detailed_bash_commands,
     }
 
 
@@ -443,18 +618,42 @@ def _parse_trajectory(trajectory_path: Path) -> dict[str, Any]:
 
     counts: Counter[str] = Counter()
     events: list[dict[str, Any]] = []
+    code_changes: list[dict[str, Any]] = []
+    bash_commands: list[dict[str, Any]] = []
+    conversation_events: list[dict[str, Any]] = []
     for step in steps:
         if not isinstance(step, dict):
             continue
         step_id = step.get("step_id")
         timestamp = step.get("timestamp")
+        source = str(step.get("source") or "")
+        message = str(step.get("message") or "")
+        if message and len(conversation_events) < TASK_PAGE_EVENT_LIMIT:
+            conversation_events.append(
+                {
+                    "sequence": step_id if isinstance(step_id, int) else len(conversation_events) + 1,
+                    "timestamp": timestamp if isinstance(timestamp, str) else None,
+                    "type": source or "unknown",
+                    "subtype": "message",
+                    "tool": None,
+                    "text": message,
+                    "payload": {},
+                }
+            )
         tool_calls = step.get("tool_calls")
         if not isinstance(tool_calls, list):
             continue
         for call in tool_calls:
             if not isinstance(call, dict):
                 continue
-            tool_name = str(call.get("tool_name") or call.get("name") or "unknown")
+            tool_name = str(
+                call.get("function_name")
+                or call.get("tool_name")
+                or call.get("name")
+                or "unknown"
+            )
+            arguments = call.get("arguments")
+            arguments_payload = arguments if isinstance(arguments, dict) else {}
             counts[tool_name] += 1
             if len(events) < AUDIT_EVENT_LIMIT:
                 events.append(
@@ -462,13 +661,45 @@ def _parse_trajectory(trajectory_path: Path) -> dict[str, Any]:
                         "step_id": step_id if isinstance(step_id, int) else None,
                         "timestamp": timestamp if isinstance(timestamp, str) else None,
                         "tool": tool_name,
+                        "arguments": arguments_payload,
                     }
                 )
+            if tool_name == "Edit" and len(code_changes) < TASK_PAGE_EVENT_LIMIT:
+                code_changes.append(
+                    {
+                        "sequence": step_id if isinstance(step_id, int) else None,
+                        "type": "edit",
+                        "file_path": str(arguments_payload.get("file_path") or ""),
+                        "old_string": str(arguments_payload.get("old_string") or ""),
+                        "new_string": str(arguments_payload.get("new_string") or ""),
+                    }
+                )
+            if tool_name == "Write" and len(code_changes) < TASK_PAGE_EVENT_LIMIT:
+                code_changes.append(
+                    {
+                        "sequence": step_id if isinstance(step_id, int) else None,
+                        "type": "write",
+                        "file_path": str(arguments_payload.get("file_path") or ""),
+                        "content": str(arguments_payload.get("content") or ""),
+                    }
+                )
+            if tool_name == "Bash":
+                command = str(arguments_payload.get("command") or "")
+                if command and len(bash_commands) < TASK_PAGE_EVENT_LIMIT:
+                    bash_commands.append(
+                        {
+                            "sequence": step_id if isinstance(step_id, int) else None,
+                            "command": command,
+                        }
+                    )
     return {
         "step_count": len(steps),
         "tool_event_count": sum(counts.values()),
         "tool_counts_by_name": dict(counts),
         "tool_events": events,
+        "conversation_events": conversation_events,
+        "code_changes": code_changes,
+        "bash_commands": bash_commands,
     }
 
 
@@ -545,16 +776,19 @@ def _extract_task_record(
     trace_paths = _find_trace_paths(task_dir)
     trajectory_path = PROJECT_ROOT / trace_paths["trajectory"] if trace_paths["trajectory"] else None
     transcript_path = PROJECT_ROOT / trace_paths["transcript"] if trace_paths["transcript"] else None
-    parsed_counts, sample_tool_calls, transcript_audit = (
+    parsed_counts, sample_tool_calls, transcript_audit, transcript_detail = (
         _parse_transcript(transcript_path, max_examples)
         if transcript_path
-        else ({}, [], {"line_count": 0, "json_line_count": 0, "tool_event_count": 0, "tool_events": []})
+        else ({}, [], {"line_count": 0, "json_line_count": 0, "tool_event_count": 0, "tool_events": []}, {})
     )
     trajectory_audit = _parse_trajectory(trajectory_path) if trajectory_path else {
         "step_count": 0,
         "tool_event_count": 0,
         "tool_counts_by_name": {},
         "tool_events": [],
+        "conversation_events": [],
+        "code_changes": [],
+        "bash_commands": [],
     }
 
     # Fallback to transcript-derived tool counts when task_metrics is missing.
@@ -570,6 +804,54 @@ def _extract_task_record(
         mcp_ratio = tool_calls_mcp / tool_calls_total
 
     rel_task_dir = str(task_dir.relative_to(PROJECT_ROOT))
+    task_id = result_payload.get("task_id") if isinstance(result_payload.get("task_id"), dict) else {}
+    task_path_from_result = task_id.get("path") if isinstance(task_id, dict) else None
+    instruction_text = _extract_task_instruction(task_dir, task_path_from_result)
+    repositories, benchmark_task_path = _extract_repo_metadata(task_metrics, task_path_from_result)
+    ir_metrics = _load_ir_metrics(task_dir)
+
+    agent_info = result_payload.get("agent_info") if isinstance(result_payload.get("agent_info"), dict) else {}
+    agent_name = None
+    if isinstance(agent_info.get("name"), str):
+        agent_name = agent_info.get("name")
+
+    config_payload = result_payload.get("config") if isinstance(result_payload.get("config"), dict) else {}
+    config_agent = config_payload.get("agent") if isinstance(config_payload.get("agent"), dict) else {}
+    model_name = None
+    model_info = agent_info.get("model_info") if isinstance(agent_info.get("model_info"), dict) else {}
+    if isinstance(model_info.get("name"), str) and model_info.get("name"):
+        model_name = model_info.get("name")
+    elif isinstance(config_agent.get("model_name"), str) and config_agent.get("model_name"):
+        model_name = config_agent.get("model_name")
+    elif isinstance(transcript_detail.get("model_name"), str) and transcript_detail.get("model_name"):
+        model_name = transcript_detail.get("model_name")
+
+    context_metrics: dict[str, Any] = {}
+    if task_metrics:
+        for key in (
+            "task_context_length",
+            "context_window_peak_pct",
+            "environment_setup_seconds",
+            "verifier_seconds",
+            "files_modified",
+            "lines_added",
+            "lines_removed",
+        ):
+            if key in task_metrics:
+                context_metrics[key] = task_metrics.get(key)
+
+    trace_events = transcript_detail.get("events") if isinstance(transcript_detail.get("events"), list) else []
+    trace_tool_calls = transcript_detail.get("tool_calls") if isinstance(transcript_detail.get("tool_calls"), list) else []
+    trace_code_changes = transcript_detail.get("code_changes") if isinstance(transcript_detail.get("code_changes"), list) else []
+    trace_bash_commands = transcript_detail.get("bash_commands") if isinstance(transcript_detail.get("bash_commands"), list) else []
+    if not trace_events:
+        trace_events = trajectory_audit.get("conversation_events") if isinstance(trajectory_audit.get("conversation_events"), list) else []
+    if not trace_tool_calls:
+        trace_tool_calls = trajectory_audit.get("tool_events") if isinstance(trajectory_audit.get("tool_events"), list) else []
+    if not trace_code_changes:
+        trace_code_changes = trajectory_audit.get("code_changes") if isinstance(trajectory_audit.get("code_changes"), list) else []
+    if not trace_bash_commands:
+        trace_bash_commands = trajectory_audit.get("bash_commands") if isinstance(trajectory_audit.get("bash_commands"), list) else []
 
     result_sha = _sha256_file(result_path)
     traj_sha = _sha256_file(trajectory_path) if trajectory_path else None
@@ -620,6 +902,17 @@ def _extract_task_record(
             "trajectory_sha256": traj_sha,
             "transcript_sha256": tx_sha,
         },
+        repositories=repositories,
+        benchmark_task_path=benchmark_task_path,
+        instruction_text=instruction_text,
+        agent_name=agent_name,
+        model_name=model_name,
+        context_metrics=context_metrics,
+        ir_metrics=ir_metrics,
+        trace_events=trace_events[:TASK_PAGE_EVENT_LIMIT],
+        trace_tool_calls=trace_tool_calls[:TASK_PAGE_EVENT_LIMIT],
+        trace_code_changes=trace_code_changes[:TASK_PAGE_EVENT_LIMIT],
+        trace_bash_commands=trace_bash_commands[:TASK_PAGE_EVENT_LIMIT],
     )
 
     audit_payload = {
@@ -652,6 +945,8 @@ def _extract_task_record(
             "search_calls_nls": search_calls_nls,
             "search_calls_deepsearch": search_calls_deepsearch,
             "tool_calls_by_name": tool_calls_by_name,
+            "context_metrics": context_metrics,
+            "ir_metrics": ir_metrics,
         },
         "parsed_trace": {
             "transcript": transcript_audit,
@@ -746,6 +1041,10 @@ def _to_task_dict(
         "run_dir": record.run_dir,
         "config": record.config,
         "task_name": record.task_name,
+        "agent_name": record.agent_name,
+        "model_name": record.model_name,
+        "repositories": record.repositories,
+        "benchmark_task_path": record.benchmark_task_path,
         "started_at": record.started_at,
         "task_dir": record.task_dir,
         "status": record.status,
@@ -785,78 +1084,211 @@ def _write_text(path: Path, content: str) -> None:
 
 
 def _build_task_page(record: TaskRecord) -> str:
-    lines: list[str] = []
-    lines.append(f"# {record.task_name} ({record.config})")
-    lines.append("")
-    lines.append(f"- Run: `{record.run_dir}`")
-    lines.append(f"- Status: `{record.status}`")
-    lines.append(f"- Reward: `{_fmt_float(record.reward, 4)}`")
-    if record.audit_page:
-        lines.append(f"- Audit JSON: [link](../{record.audit_page})")
-    lines.append(f"- Trajectory available: `{record.trace_available['trajectory']}`")
-    lines.append(f"- Transcript available: `{record.trace_available['transcript']}`")
-    if record.bundled_trace_paths.get("trajectory"):
-        lines.append(f"- Bundled trajectory: [link](../{record.bundled_trace_paths['trajectory']})")
-    if record.bundled_trace_paths.get("transcript"):
-        lines.append(f"- Bundled transcript: [link](../{record.bundled_trace_paths['transcript']})")
-    lines.append("")
+    def esc(value: Any) -> str:
+        return html.escape(str(value if value is not None else "-"))
 
-    lines.append("## Metrics")
-    lines.append("")
-    lines.append("| Field | Value |")
-    lines.append("|---|---:|")
-    lines.append(f"| Wall clock seconds | {_fmt_float(record.wall_clock_seconds, 1)} |")
-    lines.append(f"| Agent execution seconds | {_fmt_float(record.agent_execution_seconds, 1)} |")
-    lines.append(f"| Input tokens | {_fmt_int(record.input_tokens)} |")
-    lines.append(f"| Output tokens | {_fmt_int(record.output_tokens)} |")
-    lines.append(f"| Cache tokens | {_fmt_int(record.cache_tokens)} |")
-    lines.append(f"| Tool calls (total) | {_fmt_int(record.tool_calls_total)} |")
-    lines.append(f"| Tool calls (MCP) | {_fmt_int(record.tool_calls_mcp)} |")
-    lines.append(f"| Tool calls (local) | {_fmt_int(record.tool_calls_local)} |")
-    lines.append(f"| MCP ratio | {_fmt_float(record.mcp_ratio, 3)} |")
-    lines.append(f"| keyword_search calls | {_fmt_int(record.search_calls_keyword)} |")
-    lines.append(f"| nls_search calls | {_fmt_int(record.search_calls_nls)} |")
-    lines.append(f"| deepsearch calls | {_fmt_int(record.search_calls_deepsearch)} |")
-    lines.append(f"| `result.json` SHA256 | `{record.checksums.get('result_json_sha256') or '-'}` |")
-    lines.append(f"| `trajectory.json` SHA256 | `{record.checksums.get('trajectory_sha256') or '-'}` |")
-    lines.append(f"| transcript SHA256 | `{record.checksums.get('transcript_sha256') or '-'}` |")
-    lines.append("")
+    def fmt_json(value: Any) -> str:
+        try:
+            return esc(json.dumps(value, indent=2, sort_keys=True))
+        except Exception:
+            return esc(str(value))
 
-    if record.tool_calls_by_name:
-        lines.append("## Tool Breakdown")
-        lines.append("")
-        lines.append("| Tool | Calls |")
-        lines.append("|---|---:|")
-        for tool, count in sorted(record.tool_calls_by_name.items(), key=lambda kv: (-kv[1], kv[0])):
-            lines.append(f"| `{tool}` | {count} |")
-        lines.append("")
+    def truncate_text(text: str, limit: int = 1800) -> str:
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "\n... (truncated)"
 
-    if record.sample_tool_calls:
-        lines.append("## Parsed Trace Samples")
-        lines.append("")
-        lines.append("| Tool |")
-        lines.append("|---|")
-        for sample in record.sample_tool_calls:
-            tool = sample["tool"].replace("|", "\\|")
-            lines.append(f"| `{tool}` |")
-        lines.append("")
+    repo_text = ", ".join(record.repositories) if record.repositories else "-"
+    benchmark_text = record.benchmark_task_path or "-"
+    instruction_text = record.instruction_text or "No instruction found."
+    audit_href = f"../{record.audit_page}" if record.audit_page else None
+    trajectory_href = f"../{record.bundled_trace_paths['trajectory']}" if record.bundled_trace_paths.get("trajectory") else None
+    transcript_href = f"../{record.bundled_trace_paths['transcript']}" if record.bundled_trace_paths.get("transcript") else None
 
-    if record.conversation_preview:
-        lines.append("## Conversation Preview")
-        lines.append("")
-        lines.append("Parsed from transcript using the same message categories as the dashboard trace parser.")
-        lines.append("")
-        lines.append("| Seq | Type | Subtype | Tool | Text |")
-        lines.append("|---:|---|---|---|---|")
-        for idx, event in enumerate(record.conversation_preview, start=1):
-            kind = event.get("type", "").replace("|", "\\|")
-            subtype = event.get("subtype", "").replace("|", "\\|")
-            tool = event.get("tool", "").replace("|", "\\|")
-            text = event.get("text", "").replace("|", "\\|")
-            lines.append(f"| {idx} | `{kind}` | `{subtype}` | `{tool or '-'}` | {text or '-'} |")
-        lines.append("")
+    tool_rows = []
+    for tool, count in sorted((record.tool_calls_by_name or {}).items(), key=lambda kv: (-kv[1], kv[0])):
+        tool_rows.append(f"<tr><td><code>{esc(tool)}</code></td><td>{int(count)}</td></tr>")
+    tool_rows_html = "".join(tool_rows) or "<tr><td colspan='2'>No tool counts available</td></tr>"
 
-    return "\n".join(lines)
+    context_rows = []
+    for key, value in sorted(record.context_metrics.items()):
+        context_rows.append(f"<tr><td>{esc(key)}</td><td>{esc(value)}</td></tr>")
+    context_rows_html = "".join(context_rows) or "<tr><td colspan='2'>No context metrics available</td></tr>"
+
+    ir_rows = []
+    for key, value in sorted(record.ir_metrics.items()):
+        ir_rows.append(f"<tr><td>{esc(key)}</td><td>{esc(value)}</td></tr>")
+    ir_rows_html = "".join(ir_rows) or "<tr><td colspan='2'>No IR metrics available</td></tr>"
+
+    trace_rows = []
+    for idx, event in enumerate(record.trace_events[:TASK_PAGE_EVENT_LIMIT], start=1):
+        text = truncate_text(str(event.get("text") or ""))
+        tool = event.get("tool") or "-"
+        trace_rows.append(
+            "<tr>"
+            f"<td>{idx}</td>"
+            f"<td>{esc(event.get('timestamp') or '-')}</td>"
+            f"<td>{esc(event.get('type') or '-')}</td>"
+            f"<td>{esc(event.get('subtype') or '-')}</td>"
+            f"<td><code>{esc(tool)}</code></td>"
+            f"<td><pre>{esc(text)}</pre></td>"
+            "</tr>"
+        )
+    trace_rows_html = "".join(trace_rows) or "<tr><td colspan='6'>No conversation events parsed</td></tr>"
+
+    tool_call_blocks = []
+    for idx, call in enumerate(record.trace_tool_calls[:TASK_PAGE_EVENT_LIMIT], start=1):
+        tool_name = call.get("tool") or "unknown"
+        call_input = call.get("input", call.get("arguments", {}))
+        tool_call_blocks.append(
+            "<details>"
+            f"<summary>{idx}. <code>{esc(tool_name)}</code> @ {esc(call.get('timestamp') or '-')}</summary>"
+            f"<pre>{fmt_json(call_input)}</pre>"
+            "</details>"
+        )
+    tool_call_html = "".join(tool_call_blocks) or "<p>No tool call payloads parsed.</p>"
+
+    change_blocks = []
+    for idx, change in enumerate(record.trace_code_changes[:TASK_PAGE_EVENT_LIMIT], start=1):
+        change_type = str(change.get("type") or "change")
+        file_path = str(change.get("file_path") or "")
+        if change_type == "edit":
+            before = truncate_text(str(change.get("old_string") or ""))
+            after = truncate_text(str(change.get("new_string") or ""))
+            body = (
+                "<div class='split'>"
+                f"<div><h4>Before</h4><pre>{esc(before)}</pre></div>"
+                f"<div><h4>After</h4><pre>{esc(after)}</pre></div>"
+                "</div>"
+            )
+        else:
+            content = truncate_text(str(change.get("content") or ""))
+            body = f"<pre>{esc(content)}</pre>"
+        change_blocks.append(
+            "<details>"
+            f"<summary>{idx}. {esc(change_type.upper())} <code>{esc(file_path)}</code></summary>"
+            f"{body}"
+            "</details>"
+        )
+    change_html = "".join(change_blocks) or "<p>No code changes parsed.</p>"
+
+    bash_blocks = []
+    for idx, item in enumerate(record.trace_bash_commands[:TASK_PAGE_EVENT_LIMIT], start=1):
+        command = str(item.get("command") or "")
+        bash_blocks.append(f"<pre>{idx}. $ {esc(command)}</pre>")
+    bash_html = "".join(bash_blocks) or "<p>No bash commands parsed.</p>"
+
+    links = []
+    if audit_href:
+        links.append(f"<a href='{esc(audit_href)}'>audit.json</a>")
+    if trajectory_href:
+        links.append(f"<a href='{esc(trajectory_href)}'>trajectory.json</a>")
+    if transcript_href:
+        links.append(f"<a href='{esc(transcript_href)}'>transcript</a>")
+    links_html = " | ".join(links) if links else "-"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{esc(record.task_name)} - Official Results</title>
+  <style>
+    :root {{ --bg:#0b1117; --panel:#131d27; --border:#2a3a4a; --text:#e9f0f6; --muted:#9fb1c2; --accent:#4fd39b; }}
+    body {{ margin:0; font-family: ui-sans-serif,system-ui,-apple-system,sans-serif; background:linear-gradient(180deg,#0b1117,#0f1720); color:var(--text); }}
+    .wrap {{ max-width:1200px; margin:0 auto; padding:20px; }}
+    h1,h2,h3,h4 {{ margin:0 0 10px; }}
+    .panel {{ background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px; margin-bottom:14px; }}
+    .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; }}
+    .metric {{ background:#0f1821; border:1px solid var(--border); border-radius:10px; padding:10px; }}
+    .metric .k {{ color:var(--muted); font-size:12px; }}
+    .metric .v {{ font-size:20px; margin-top:4px; }}
+    .meta {{ color:var(--muted); font-size:13px; }}
+    table {{ width:100%; border-collapse:collapse; }}
+    th,td {{ border-bottom:1px solid var(--border); padding:8px; text-align:left; vertical-align:top; font-size:13px; }}
+    th {{ color:var(--muted); }}
+    code,pre {{ font-family: ui-monospace,SFMono-Regular,Menlo,monospace; }}
+    pre {{ white-space:pre-wrap; overflow-wrap:anywhere; background:#0d151d; border:1px solid var(--border); border-radius:8px; padding:8px; margin:8px 0; }}
+    details {{ border:1px solid var(--border); border-radius:10px; padding:8px 10px; margin:8px 0; background:#0f1821; }}
+    summary {{ cursor:pointer; color:var(--accent); }}
+    a {{ color:var(--accent); text-decoration:none; }}
+    .split {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }}
+    @media (max-width: 900px) {{ .split {{ grid-template-columns:1fr; }} }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>{esc(record.task_name)}</h1>
+    <p class="meta">Suite <code>{esc(record.suite)}</code> | Run <code>{esc(record.run_dir)}</code> | Config <code>{esc(record.config)}</code></p>
+
+    <div class="panel">
+      <h2>Task Information</h2>
+      <div class="grid">
+        <div class="metric"><div class="k">Repositories</div><div class="v" style="font-size:14px">{esc(repo_text)}</div></div>
+        <div class="metric"><div class="k">Task ID</div><div class="v" style="font-size:14px">{esc(record.task_name)}</div></div>
+        <div class="metric"><div class="k">Agent</div><div class="v" style="font-size:16px">{esc(record.agent_name or "-")}</div></div>
+        <div class="metric"><div class="k">Model</div><div class="v" style="font-size:16px">{esc(record.model_name or "-")}</div></div>
+      </div>
+      <p class="meta" style="margin-top:10px">Benchmark path: <code>{esc(benchmark_text)}</code></p>
+      <details>
+        <summary>Task instruction sent to agent</summary>
+        <pre>{esc(instruction_text)}</pre>
+      </details>
+    </div>
+
+    <div class="panel">
+      <h2>Execution Metrics</h2>
+      <div class="grid">
+        <div class="metric"><div class="k">Reward</div><div class="v">{_fmt_float(record.reward, 4)}</div></div>
+        <div class="metric"><div class="k">Status</div><div class="v">{esc(record.status)}</div></div>
+        <div class="metric"><div class="k">Total Time</div><div class="v">{_fmt_float(record.wall_clock_seconds, 1)}s</div></div>
+        <div class="metric"><div class="k">Agent Time</div><div class="v">{_fmt_float(record.agent_execution_seconds, 1)}s</div></div>
+        <div class="metric"><div class="k">Input Tokens</div><div class="v">{_fmt_int(record.input_tokens)}</div></div>
+        <div class="metric"><div class="k">Output Tokens</div><div class="v">{_fmt_int(record.output_tokens)}</div></div>
+        <div class="metric"><div class="k">Cache Tokens</div><div class="v">{_fmt_int(record.cache_tokens)}</div></div>
+        <div class="metric"><div class="k">Tool Calls</div><div class="v">{_fmt_int(record.tool_calls_total)}</div></div>
+        <div class="metric"><div class="k">MCP Ratio</div><div class="v">{_fmt_float(record.mcp_ratio, 3)}</div></div>
+      </div>
+      <p class="meta">Raw traces: {links_html}</p>
+      <details>
+        <summary>Tool Breakdown</summary>
+        <table><thead><tr><th>Tool</th><th>Calls</th></tr></thead><tbody>{tool_rows_html}</tbody></table>
+      </details>
+      <details>
+        <summary>Context Metrics (task_metrics / IR analysis)</summary>
+        <h3>Context</h3>
+        <table><tbody>{context_rows_html}</tbody></table>
+        <h3 style="margin-top:10px">IR</h3>
+        <table><tbody>{ir_rows_html}</tbody></table>
+      </details>
+    </div>
+
+    <div class="panel">
+      <h2>Agent Trace</h2>
+      <details open>
+        <summary>Conversation History ({len(record.trace_events)})</summary>
+        <table>
+          <thead><tr><th>#</th><th>Timestamp</th><th>Type</th><th>Subtype</th><th>Tool</th><th>Text</th></tr></thead>
+          <tbody>{trace_rows_html}</tbody>
+        </table>
+      </details>
+      <details>
+        <summary>Tool Calls ({len(record.trace_tool_calls)})</summary>
+        {tool_call_html}
+      </details>
+      <details>
+        <summary>Code Changes ({len(record.trace_code_changes)})</summary>
+        {change_html}
+      </details>
+      <details>
+        <summary>Bash Commands ({len(record.trace_bash_commands)})</summary>
+        {bash_html}
+      </details>
+    </div>
+  </div>
+</body>
+</html>
+"""
 
 
 def _build_run_page(run_dir: str, config_tasks: dict[str, list[dict[str, Any]]]) -> str:
@@ -1339,8 +1771,8 @@ def build_export(
                 audit_page_rel = f"audits/{task_slug}.json"
                 record.audit_page = audit_page_rel
                 _write_text(audits_dir / f"{task_slug}.json", json.dumps(audit_payload, indent=2, sort_keys=True))
-                task_page_rel = f"tasks/{task_slug}.md"
-                task_page_path = tasks_dir / f"{task_slug}.md"
+                task_page_rel = f"tasks/{task_slug}.html"
+                task_page_path = tasks_dir / f"{task_slug}.html"
                 _write_text(task_page_path, _build_task_page(record))
 
                 task_dict = _to_task_dict(
