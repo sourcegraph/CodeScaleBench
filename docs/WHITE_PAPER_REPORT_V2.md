@@ -1032,30 +1032,26 @@ The **fix** suite has the lowest MCP ratio (0.350) and highest local call count 
 
 ### 11.8 Cost Analysis
 
-At Haiku pricing ($1/Mtok input, $5/Mtok output):
+Costs below are recomputed on the same **251 paired tasks** used in Section 11.2, using a single method: `task_metrics.json` `cost_usd` (model-aware pricing including cache read/write tokens).
 
-**Per-suite cost (baseline):**
-
-| Suite | n | Mean Input Tokens | Mean Output Tokens | Est. Cost/Task |
-|-------|---|------------------|-------------------|---------------|
-| build | 19 | 5,940,659 | 722 | $5.94 |
-| debug | 20 | 3,866,034 | 186 | $3.87 |
-| design | 13 | 2,045,816 | 213 | $2.05 |
-| document | 14 | 1,533,600 | 81 | $1.53 |
-| fix | 20 | 8,321,921 | 400 | $8.32 |
-| secure | 37 | 3,200,342 | 367 | $3.20 |
-| test | 17 | 3,928,643 | 543 | $3.93 |
-| understand | 37 | 1,916,541 | 262 | $1.92 |
-| mcp_unique | 12 | 1,402,706 | 104 | $1.40 |
-
-**Aggregate cost comparison:**
+| Suite | n | Baseline Mean Cost/Task | MCP Mean Cost/Task |
+|-------|---|-------------------------|--------------------|
+| build | 25 | $0.457 | $0.552 |
+| debug | 20 | $0.381 | $0.480 |
+| design | 20 | $0.342 | $0.312 |
+| document | 20 | $0.302 | $0.279 |
+| fix | 25 | $0.619 | $0.686 |
+| secure | 20 | $0.409 | $0.430 |
+| test | 20 | $0.280 | $0.293 |
+| understand | 20 | $0.436 | $0.365 |
+| mcp_unique | 81 | $0.188 | $0.175 |
 
 | Config | n | Mean Cost/Task | Total Cost |
-|--------|---|---------------|-----------|
-| Baseline | 234 | $0.75 | $175.68 |
-| MCP | 206 | $0.47 | $97.01 |
+|--------|---|----------------|------------|
+| Baseline | 251 | $0.339 | $85.12 |
+| MCP | 251 | $0.352 | $88.35 |
 
-MCP runs cost **37% less** on average ($0.47 vs $0.75 per task). This is driven by the truncated-source environment: with less local code to read, the agent processes fewer input tokens. The **fix** suite is the most expensive ($8.32/task baseline) due to large codebases and extensive multi-file editing. The **mcp_unique** suite is cheapest ($1.40/task) because artifact-mode tasks produce a short JSON answer rather than extensive code changes.
+On this paired slice, MCP is **~3.8% higher cost** on average (+$0.013/task), not lower. Cost impact is suite-dependent: MCP is cheaper in `design`, `document`, `understand`, and `mcp_unique`, and more expensive in `build`, `debug`, `fix`, `secure`, and `test`.
 
 ### 11.9 Correlation Analysis
 
