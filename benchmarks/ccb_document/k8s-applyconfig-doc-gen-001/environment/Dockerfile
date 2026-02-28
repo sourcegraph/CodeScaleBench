@@ -1,4 +1,4 @@
-FROM ghcr.io/sourcegraph/ccb-repo-k8s-8c9c67c0
+FROM ccb-repo-k8s-8c9c67c0
 
 # SURGICAL: Remove ONLY the target doc.go (not recursive!)
 RUN rm -f staging/src/k8s.io/client-go/applyconfigurations/doc.go

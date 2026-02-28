@@ -1,1 +1,1 @@
-FROM ghcr.io/sourcegraph/ccb-repo-flink-0cc95fcc
+FROM ccb-repo-flink-0cc95fcc

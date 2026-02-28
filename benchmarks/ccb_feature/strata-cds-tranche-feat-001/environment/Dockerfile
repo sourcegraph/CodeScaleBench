@@ -1,1 +1,1 @@
-FROM ghcr.io/sourcegraph/ccb-repo-strata-66225ca9
+FROM ccb-repo-strata-66225ca9

@@ -1,1 +1,1 @@
-FROM ghcr.io/sourcegraph/ccb-repo-kafka-0753c489
+FROM ccb-repo-kafka-0753c489

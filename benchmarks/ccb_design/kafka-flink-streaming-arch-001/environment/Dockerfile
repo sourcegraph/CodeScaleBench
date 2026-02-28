@@ -1,7 +1,7 @@
 # kafka-flink-streaming-arch-001 — multi-repo baseline
 # Uses pre-built ccb-repo images to avoid git clone during Docker build.
-FROM ghcr.io/sourcegraph/ccb-repo-kafka-0753c489 AS kafka-src
-FROM ghcr.io/sourcegraph/ccb-repo-flink-0cc95fcc AS flink-src
+FROM ccb-repo-kafka-0753c489 AS kafka-src
+FROM ccb-repo-flink-0cc95fcc AS flink-src
 
 FROM eclipse-temurin:17-jdk
 
