@@ -77,7 +77,7 @@ python3 scripts/daytona_runner.py --task cgen-deps-install-001
 # 4. Run a full suite
 python3 scripts/daytona_runner.py --suite ccb_build --parallel 4
 
-# 5. Run all 249 ready tasks
+# 5. Run all 283 tasks
 python3 scripts/daytona_runner.py --all --parallel 8
 ```
 
@@ -213,15 +213,13 @@ With `--parallel N`, steps 1-9 run concurrently across N sandboxes using a threa
 
 ## Task Readiness
 
-Not all 283 tasks can run on Daytona today. The task registry classifies each task:
+All 283 tasks across 19 suites are Daytona-ready. Base images are sourced from:
 
-| Status | Count | Description |
-|--------|-------|-------------|
-| `ready` | 249 | Standard Docker Hub images or pre-built ccb-repo images on GHCR |
-| `needs_registry` | 25 | Require SWEAP/TAC/dotnet images not yet in a container registry |
-| `needs_custom_build` | 9 | Require kernel builds or other non-standard Docker setups |
-
-The runner automatically filters to ready tasks when using `--suite` or `--all`. Attempting to run a non-ready task individually will raise an error.
+- **Standard public images** (197 tasks): `python:*`, `golang:*`, `gcc:*`, `ubuntu:*`, etc. from Docker Hub
+- **Pre-built repo images** (70 tasks): `ghcr.io/sourcegraph/ccb-repo-*` on GitHub Container Registry
+- **SWEAP images** (21 tasks): `jefzda/sweap-images:*` on Docker Hub
+- **TAC images** (4 tasks): `ghcr.io/theagentcompany/*` on GitHub Container Registry
+- **Linux kernel tasks** (5 tasks): Build from `gcc:13` with inline kernel source clone
 
 ## Environment Variable Reference
 

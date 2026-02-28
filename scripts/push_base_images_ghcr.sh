@@ -12,7 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BASE_DIR="$REPO_ROOT/base_images"
-GHCR_PREFIX="ghcr.io/sjarmak"
+GHCR_PREFIX="ghcr.io/sourcegraph"
 
 SKIP_EXISTING=false
 if [ "${1:-}" = "--skip-existing" ]; then

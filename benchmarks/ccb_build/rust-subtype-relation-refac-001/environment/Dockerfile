@@ -1,4 +1,4 @@
-FROM ghcr.io/sjarmak/ccb-repo-rust-01f6ddf7 AS rust-src
+FROM ghcr.io/sourcegraph/ccb-repo-rust-01f6ddf7 AS rust-src
 
 FROM rust:1.82-bookworm
 

@@ -1,1 +1,1 @@
-FROM ghcr.io/sjarmak/ccb-repo-envoy-1d0ba73a
+FROM ghcr.io/sourcegraph/ccb-repo-envoy-1d0ba73a

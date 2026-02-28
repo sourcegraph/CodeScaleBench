@@ -1,7 +1,7 @@
 # k8s-cri-containerd-reason-001 — multi-repo baseline
 # Repos cloned into /ccb_crossrepo/src/ to match verifier expectations.
-FROM ghcr.io/sjarmak/ccb-repo-k8s-8c9c67c0 AS k8s-src
-FROM ghcr.io/sjarmak/ccb-repo-containerd-317286ac AS containerd-src
+FROM ghcr.io/sourcegraph/ccb-repo-k8s-8c9c67c0 AS k8s-src
+FROM ghcr.io/sourcegraph/ccb-repo-containerd-317286ac AS containerd-src
 
 FROM golang:1.23-bookworm
 

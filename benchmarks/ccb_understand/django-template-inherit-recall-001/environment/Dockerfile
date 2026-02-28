@@ -1,4 +1,4 @@
-FROM ghcr.io/sjarmak/ccb-repo-django-674eda1c
+FROM ghcr.io/sourcegraph/ccb-repo-django-674eda1c
 
 # Inject sparse HISTORY.md to simulate institutional memory loss
 RUN cat > HISTORY.md << 'HISTORY'

@@ -213,7 +213,7 @@ def extract_task_specific_lines(lines: list[str], base: dict) -> list[str]:
     return result
 
 
-GHCR_PREFIX = "ghcr.io/sjarmak"
+GHCR_PREFIX = "ghcr.io/sourcegraph"
 
 
 def rewrite_dockerfile(path: Path, base: dict, task_lines: list[str], dry_run: bool) -> bool:

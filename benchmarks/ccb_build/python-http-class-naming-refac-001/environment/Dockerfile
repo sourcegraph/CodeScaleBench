@@ -1,8 +1,8 @@
 # python-http-class-naming-refac-001 — multi-repo baseline
 # Repos cloned into /ccb_crossrepo/src/ to match verifier expectations.
-FROM ghcr.io/sjarmak/ccb-repo-django-674eda1c AS django-src
-FROM ghcr.io/sjarmak/ccb-repo-flask-798e006f AS flask-src
-FROM ghcr.io/sjarmak/ccb-repo-requests-421b8733 AS requests-src
+FROM ghcr.io/sourcegraph/ccb-repo-django-674eda1c AS django-src
+FROM ghcr.io/sourcegraph/ccb-repo-flask-798e006f AS flask-src
+FROM ghcr.io/sourcegraph/ccb-repo-requests-421b8733 AS requests-src
 
 FROM python:3.11-slim
 

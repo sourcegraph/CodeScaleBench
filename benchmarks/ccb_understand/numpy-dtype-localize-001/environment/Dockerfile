@@ -1,8 +1,8 @@
 # numpy-dtype-localize-001 — multi-repo baseline
 # Repos cloned into /ccb_crossrepo/src/ to match verifier expectations.
-FROM ghcr.io/sjarmak/ccb-repo-numpy-a639fbf5 AS numpy-src
-FROM ghcr.io/sjarmak/ccb-repo-scikit-learn-cb7e82dd AS sklearn-src
-FROM ghcr.io/sjarmak/ccb-repo-pandas-41968da5 AS pandas-src
+FROM ghcr.io/sourcegraph/ccb-repo-numpy-a639fbf5 AS numpy-src
+FROM ghcr.io/sourcegraph/ccb-repo-scikit-learn-cb7e82dd AS sklearn-src
+FROM ghcr.io/sourcegraph/ccb-repo-pandas-41968da5 AS pandas-src
 
 FROM python:3.11-slim
 

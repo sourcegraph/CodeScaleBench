@@ -1,4 +1,4 @@
-FROM ghcr.io/sjarmak/ccb-repo-django-674eda1c
+FROM ghcr.io/sourcegraph/ccb-repo-django-674eda1c
 
 # Inject stale architecture doc describing deprecated SignalRegistry pattern
 RUN mkdir -p docs && cat > docs/signals_architecture.md << 'STALE_DOC'
