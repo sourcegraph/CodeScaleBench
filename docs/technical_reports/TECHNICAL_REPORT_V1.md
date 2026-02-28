@@ -1100,6 +1100,8 @@ The negative correlation between output tokens and reward (-0.187) suggests that
 | **Infrastructure confounds**  | Error fingerprinting (12 patterns) separates infra failures from task failures                                 |
 | **Preamble effects**          | V5 preamble isolated: leads with truncation constraint, avoids prescriptive workflow                           |
 
+In addition to the six-dimension QA framework, we run an explicit ABC audit via `scripts/abc_audit.py` that scores criteria across three dimensions: **Task Validity**, **Outcome Validity**, and **Reporting**. The ABC audit is used as a structured benchmark-quality gate and complements pre-flight/runtime task validation.
+
 ### 12.2 External Validity
 
 | Threat                  | Mitigation                                                                                    |
@@ -1256,6 +1258,8 @@ Major architectural decisions emerged through iterative dialogue:
 | Oracle        | oracle-checks | `mean(check_scores)`                                                        | MCP-unique tasks          |
 
 ### Appendix E: QA Audit Framework (6 Dimensions)
+
+This report uses two complementary audit layers: (1) the operational six-dimension QA audit below, and (2) an explicit ABC audit (`scripts/abc_audit.py`) across Task Validity, Outcome Validity, and Reporting.
 
 | Dimension                               | Focus                                         | Example Finding                           |
 | --------------------------------------- | --------------------------------------------- | ----------------------------------------- |
