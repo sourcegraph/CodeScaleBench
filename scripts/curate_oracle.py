@@ -50,7 +50,7 @@ class SourcegraphClient:
         self.verbose = verbose
         self.queries_made = 0
         self._request_log: List[Dict] = []
-        self._rate_limit_delay = 0.25  # seconds between requests
+        self._rate_limit_delay = 1.0  # seconds between requests
 
     def graphql(
         self,
@@ -80,7 +80,7 @@ class SourcegraphClient:
         }
 
         last_exc: Optional[Exception] = None
-        for attempt in range(3):
+        for attempt in range(6):
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     data = json.loads(resp.read())
@@ -95,7 +95,7 @@ class SourcegraphClient:
             except urllib.error.HTTPError as exc:
                 last_exc = exc
                 if exc.code == 429:
-                    wait = 2 ** (attempt + 1)
+                    wait = min(2 ** (attempt + 1), 120)  # cap at 120s
                     logging.warning("Rate limited (429), waiting %ds", wait)
                     time.sleep(wait)
                 else:
