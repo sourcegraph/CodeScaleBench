@@ -10,17 +10,17 @@ Usage:
   python3 scripts/daytona_runner.py --task cgen-deps-install-001
 
   # Run a full suite
-  python3 scripts/daytona_runner.py --suite ccb_build --config baseline-local-direct
+  python3 scripts/daytona_runner.py --suite ccb_feature --config baseline-local-direct
 
   # Run all ready tasks in parallel
   python3 scripts/daytona_runner.py --all --parallel 4
 
   # List suites and tasks
   python3 scripts/daytona_runner.py --list-suites
-  python3 scripts/daytona_runner.py --list-tasks --suite ccb_build
+  python3 scripts/daytona_runner.py --list-tasks --suite ccb_feature
 
   # Dry run (no sandboxes created)
-  python3 scripts/daytona_runner.py --suite ccb_build --dry-run
+  python3 scripts/daytona_runner.py --suite ccb_feature --dry-run
 """
 
 import argparse
@@ -830,9 +830,9 @@ def build_cli() -> argparse.ArgumentParser:
         epilog="""
 Examples:
   python3 scripts/daytona_runner.py --task cgen-deps-install-001
-  python3 scripts/daytona_runner.py --suite ccb_build --config mcp-remote-direct
+  python3 scripts/daytona_runner.py --suite ccb_feature --config mcp-remote-direct
   python3 scripts/daytona_runner.py --all --parallel 4
-  python3 scripts/daytona_runner.py --suite ccb_build --dry-run
+  python3 scripts/daytona_runner.py --suite ccb_feature --dry-run
   python3 scripts/daytona_runner.py --list-suites
 """,
     )
