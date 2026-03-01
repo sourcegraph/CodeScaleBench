@@ -169,6 +169,40 @@ class SourcegraphClient:
         )
         if not self.token:
             log.warning("No Sourcegraph token — deepsearch/hybrid backends unavailable")
+        else:
+            # Validate token at init
+            self._validate_token()
+
+    def _validate_token(self) -> None:
+        """Check that the token is valid by running a simple query."""
+        import urllib.request
+        import urllib.error
+
+        gql = 'query { currentUser { username } }'
+        body = json.dumps({"query": gql}).encode()
+        req = urllib.request.Request(
+            f"{self.url.rstrip('/')}/.api/graphql",
+            data=body,
+            headers={
+                "Authorization": f"token {self.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+                user = data.get("data", {}).get("currentUser", {})
+                if user:
+                    log.info("SG auth OK (user: %s)", user.get("username", "?"))
+                else:
+                    log.warning(
+                        "SG token may be invalid — currentUser returned null. "
+                        "SG search tools will fail with 403."
+                    )
+                    self.token = ""  # Disable SG tools
+        except (urllib.error.URLError, Exception) as e:
+            log.warning("SG token validation failed: %s. SG search tools disabled.", e)
+            self.token = ""  # Disable SG tools
 
     def keyword_search(self, query: str, max_results: int = 50) -> str:
         """Run a keyword search and return formatted results."""
@@ -924,13 +958,20 @@ Sourcegraph tools:
 
 ## Strategy
 1. Read the task carefully. Identify key entities and concepts.
-2. Use deep_search for broad semantic exploration and discovery.
+2. ALWAYS start with sourcegraph_search or deep_search to discover relevant \
+   files and repos — even if local repos are available. The local repo set \
+   may be INCOMPLETE (not all repos mentioned in the task are cloned locally).
 3. Use local grep/rg to verify and refine findings against actual files.
 4. Use search_imports and find_symbols for precise dependency tracing.
 5. Cross-check: anything found by search should be verified locally, and \
    local findings should be checked for completeness via search.
-6. Be THOROUGH — recall matters more than precision for oracle generation.
-7. For multi-repo tasks, search ALL repos.
+6. If local search finds nothing, ALWAYS try Sourcegraph search before \
+   concluding a file doesn't exist. The file may be in a repo not cloned locally.
+7. Be THOROUGH — recall matters more than precision for oracle generation.
+8. For multi-repo tasks, search ALL repos — including repos you might not \
+   have locally. Use sourcegraph_search to find files across ALL indexed repos.
+9. Stay FOCUSED on the specific task question. Include only files directly \
+   relevant to answering the task. Do not include every tangentially related file.
 """,
 }
 
@@ -979,8 +1020,17 @@ def build_user_message(
 
     # Available repos
     parts.append("\n## Available Local Repositories")
-    for name, path in sorted(repo_paths.items()):
-        parts.append(f"- **{name}**: `{path}`")
+    if repo_paths:
+        for name, path in sorted(repo_paths.items()):
+            parts.append(f"- **{name}**: `{path}`")
+    else:
+        parts.append("- *(none cloned locally)*")
+    parts.append(
+        "\n**IMPORTANT**: The repos listed above may NOT be complete. "
+        "The task may involve additional repositories not cloned locally. "
+        "You MUST use sourcegraph_search or deep_search to discover files "
+        "in repositories beyond the local set. Do not assume local repos are exhaustive."
+    )
 
     # Suite context
     suite = ctx.get("suite_name", "")
