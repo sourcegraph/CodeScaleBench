@@ -2,22 +2,22 @@
 
 ## Overview
 
-The benchmark uses **199 tasks** across **9 SDLC-phase suites**. The canonical task list is in `configs/selected_benchmark_tasks.json` (version 2.0, last updated 2026-02-28). Tasks were selected and reorganized from legacy suites via the SDLC migration. The original `ccb_build` suite was split into `ccb_feature` (feature implementation) and `ccb_refactor` (cross-file refactoring) for finer-grained capability analysis. See `docs/TASK_CATALOG.md` for the per-task reference.
+The benchmark uses **180 tasks** across **9 SDLC-phase suites** (plus 220 MCP-unique tasks across 11 suites = **400 total**). The canonical task list is in `configs/selected_benchmark_tasks.json` (version 2.0, last updated 2026-03-01). Tasks were selected and reorganized from legacy suites via the SDLC migration. The original `ccb_build` suite was split into `ccb_feature` (feature implementation) and `ccb_refactor` (cross-file refactoring) for finer-grained capability analysis. See `docs/TASK_CATALOG.md` for the per-task reference.
 
 ## SDLC Suite Coverage
 
 | Suite | SDLC Phase | Tasks |
 |-------|------------|------:|
-| ccb_understand | Requirements & Discovery | 34 |
+| ccb_understand | Requirements & Discovery | 20 |
 | ccb_design | Architecture & Design | 20 |
-| ccb_fix | Bug Repair | 25 |
+| ccb_fix | Bug Repair | 20 |
 | ccb_feature | Feature Implementation | 20 |
 | ccb_refactor | Cross-File Refactoring | 20 |
 | ccb_test | Testing & QA | 20 |
 | ccb_document | Documentation | 20 |
 | ccb_secure | Security & Compliance | 20 |
 | ccb_debug | Debugging & Investigation | 20 |
-| **Total** | | **199** |
+| **Total** | | **180** |
 
 ## MCP Benefit Scoring
 

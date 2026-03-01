@@ -189,8 +189,8 @@ ensure_fresh_token_all  # also populates CLAUDE_HOMES[] via setup_multi_accounts
 # local Docker is limited by account sessions.
 if [ "$PARALLEL_TASKS" -eq 0 ]; then
     if [ "${HARBOR_ENV:-}" = "daytona" ]; then
-        PARALLEL_TASKS=125
-        echo "Parallel tasks auto-set to $PARALLEL_TASKS (Daytona mode, 125 concurrent sandboxes)"
+        PARALLEL_TASKS=124   # 62 task pairs x 2 runs each = 124 sandboxes (Tier 3 limit: 125)
+        echo "Parallel tasks auto-set to $PARALLEL_TASKS (Daytona mode, 62 task pairs x 2 configs, 1 sandbox headroom)"
     else
         PARALLEL_TASKS=$PARALLEL_JOBS  # inherits SESSIONS_PER_ACCOUNT * num_accounts from _common.sh
         echo "Parallel tasks auto-set to $PARALLEL_TASKS (local Docker, $SESSIONS_PER_ACCOUNT sessions x ${#CLAUDE_HOMES[@]} accounts)"

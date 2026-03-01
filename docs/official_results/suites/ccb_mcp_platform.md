@@ -4,8 +4,6 @@
 
 | Run | Config | Valid Tasks | Mean Reward | Pass Rate |
 |---|---|---:|---:|---:|
-| [ccb_mcp_platform_haiku_022126](../runs/ccb_mcp_platform_haiku_022126.md) | `baseline-local-artifact` | 1 | 0.928 | 1.000 |
-| [ccb_mcp_platform_haiku_022126](../runs/ccb_mcp_platform_haiku_022126.md) | `mcp-remote-artifact` | 1 | 0.928 | 1.000 |
 | [ccb_mcp_platform_haiku_20260226_035617](../runs/ccb_mcp_platform_haiku_20260226_035617.md) | `mcp-remote-direct` | 3 | 0.544 | 1.000 |
 | [ccb_mcp_platform_haiku_20260226_035622_variance](../runs/ccb_mcp_platform_haiku_20260226_035622_variance.md) | `mcp-remote-direct` | 3 | 0.572 | 1.000 |
 | [ccb_mcp_platform_haiku_20260226_035628_variance](../runs/ccb_mcp_platform_haiku_20260226_035628_variance.md) | `mcp-remote-direct` | 3 | 0.635 | 1.000 |
@@ -18,10 +16,8 @@
 
 | Task | Benchmark | Config | Status | Reward | Runs | MCP Ratio |
 |---|---|---|---|---:|---:|---:|
-| [ccx-explore-091-ds](../tasks/ccb_mcp_platform_haiku_022126--baseline--ccx-explore-091-ds.html) | [source](../../../benchmarks/ccb_mcp_platform/ccx-explore-091-ds) | `baseline-local-artifact` | `passed` | 0.928 | 1 | 0.000 |
-| [ccx-explore-091-ds](../tasks/ccb_mcp_platform_haiku_20260228_010919--baseline-local-direct--ccx-explore-091-ds.html) | [source](../../../benchmarks/ccb_mcp_platform/ccx-explore-091-ds) | `baseline-local-direct` | `passed` | 0.786 | 1 | 0.000 |
-| [ccx-explore-091-ds](../tasks/ccb_mcp_platform_haiku_022126--mcp--ccx-explore-091-ds.html) | [source](../../../benchmarks/ccb_mcp_platform/ccx-explore-091-ds) | `mcp-remote-artifact` | `passed` | 0.928 | 1 | 0.933 |
-| [mcp_ccx-explore-091-ds_ozODhA](../tasks/ccb_mcp_platform_haiku_20260228_010919--mcp-remote-direct--mcp_ccx-explore-091-ds_ozODhA.html) | [source](../../../benchmarks/ccb_mcp_platform/ccx-explore-091-ds) | `mcp-remote-direct` | `passed` | 0.833 | 1 | 0.923 |
+| [ccx-explore-091-ds](../tasks/ccb_mcp_platform_haiku_20260228_010919--baseline-local-direct--ccx-explore-091-ds.html) | — | `baseline-local-direct` | `passed` | 0.786 | 1 | 0.000 |
+| [mcp_ccx-explore-091-ds_ozODhA](../tasks/ccb_mcp_platform_haiku_20260228_010919--mcp-remote-direct--mcp_ccx-explore-091-ds_ozODhA.html) | — | `mcp-remote-direct` | `passed` | 0.833 | 1 | 0.923 |
 | [ccx-platform-094](../tasks/ccb_mcp_platform_haiku_20260228_010919--baseline-local-direct--ccx-platform-094.html) | [source](../../../benchmarks/ccb_mcp_platform/ccx-platform-094) | `baseline-local-direct` | `passed` | 0.762 | 5 | 0.000 |
 | [mcp_ccx-platform-094_pEvf1w](../tasks/ccb_mcp_platform_haiku_20260226_035622_variance--mcp-remote-direct--mcp_ccx-platform-094_pEvf1w.html) | [source](../../../benchmarks/ccb_mcp_platform/ccx-platform-094) | `mcp-remote-direct` | `passed` | 0.333 | 5 | 0.967 |
 | [mcp_ccx-platform-094_UoFTi7](../tasks/ccb_mcp_platform_haiku_20260226_035633_variance--mcp-remote-direct--mcp_ccx-platform-094_UoFTi7.html) | [source](../../../benchmarks/ccb_mcp_platform/ccx-platform-094) | `mcp-remote-direct` | `passed` | 0.235 | 5 | 0.938 |

@@ -9,7 +9,7 @@ Use this page first for operational work. Each path is intentionally short to mi
 ### Read Order
 1. `docs/ops/WORKFLOWS.md`
 2. `docs/reference/CONFIGS.md`
-3. `docs/DAYTONA.md (if using Daytona cloud)`
+3. `docs/DAYTONA.md (Daytona is default)`
 4. `docs/ops/QA_PROCESS.md`
 
 ### Key Commands
@@ -17,14 +17,12 @@ Use this page first for operational work. Each path is intentionally short to mi
 python3 scripts/check_infra.py
 python3 scripts/validate_tasks_preflight.py --all
 
-# Local Docker (needs Docker daemon)
-# use configs/* runner with interactive confirmation gate
+# Daytona Cloud (default — up to 125 concurrent sandboxes, no local Docker needed)
+export HARBOR_ENV=daytona DAYTONA_OVERRIDE_STORAGE=10240
+# use configs/*_2config.sh wrappers for paired baseline/MCP runs
 
-# Daytona Cloud (no Docker needed, up to 125 concurrent sandboxes)
-harbor run --path benchmarks/<suite>/<task> \
-    --agent-import-path agents/claude_baseline_agent.py \
-    --environment-type daytona \
-    --model claude-haiku-4-5-20251001
+# Local Docker (only for 21 sweap-images tasks incompatible with Daytona)
+# use configs/* runner with interactive confirmation gate, unset HARBOR_ENV
 ```
 
 ## Monitor Active Runs

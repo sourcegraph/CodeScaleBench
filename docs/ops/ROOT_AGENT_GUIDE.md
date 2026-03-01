@@ -9,7 +9,7 @@ full operations manual.
 - Every `harbor run` must be gated by interactive confirmation.
 - Before commit/push, run `python3 scripts/repo_health.py` (or `--quick` for docs/config-only changes).
 - **Daytona is the default execution environment.** Do not use local Docker unless a task is Daytona-incompatible (18 sweap-images tasks). See `docs/DAYTONA.md`.
-- **Parallelism**: Daytona runs at 125 concurrent sandboxes (auto-detected when `HARBOR_ENV=daytona`). Local Docker runs at 12 slots (3 accounts x 4 sessions). Never artificially cap Daytona parallelism below 125.
+- **Parallelism**: Daytona runs 62 task pairs (124 sandboxes, 1 headroom from Tier 3 limit of 125). Local Docker runs at 12 slots (3 accounts x 4 sessions). Never artificially cap Daytona parallelism below these values.
 
 ## Minimal Loading Policy
 - Default load order: this file + one relevant skill + one relevant doc.

@@ -37,7 +37,8 @@ ls benchmarks
 Running benchmark tasks requires:
 
 - [Harbor](https://github.com/laude-institute/harbor/tree/main) installed and configured
-- Docker
+- **Daytona** account and API key (preferred — no local Docker needed, up to 125 concurrent sandboxes). See `docs/DAYTONA.md`
+- OR Docker (only needed for 21 sweap-images tasks incompatible with Daytona)
 - Valid agent/runtime credentials used by your Harbor setup
 - A Max subscription (for the default harness path documented in this repo)
 
@@ -71,14 +72,14 @@ Nine suites organized by software development lifecycle phase:
 |-------|-----------|------:|-------------|
 | `ccb_understand` | Requirements & Discovery | 20 | Codebase comprehension, onboarding, Q&A, knowledge recovery |
 | `ccb_design` | Architecture & Design | 20 | Architecture analysis, dependency graphs, change impact |
-| `ccb_fix` | Bug Repair | 25 | Diagnosing and fixing real bugs across production codebases |
+| `ccb_fix` | Bug Repair | 20 | Diagnosing and fixing real bugs across production codebases |
 | `ccb_feature` | Feature Implementation | 20 | New features, interface implementation, big-code features |
 | `ccb_refactor` | Cross-File Refactoring | 20 | Cross-file refactoring, enterprise dependency refactoring, rename refactoring |
 | `ccb_test` | Testing & QA | 20 | Code review, performance testing, code search validation, test generation |
 | `ccb_document` | Documentation | 20 | API references, architecture docs, migration guides, runbooks |
 | `ccb_secure` | Security & Compliance | 20 | CVE analysis, reachability, governance, access control |
 | `ccb_debug` | Debugging & Investigation | 20 | Root cause tracing, fault localization, provenance |
-| **Total** | | **199** | |
+| **Total** | | **180** | |
 
 ## MCP-Unique Suites (Org-Scale Context Retrieval)
 
@@ -86,20 +87,20 @@ Eleven additional suites measure cross-repo discovery, symbol resolution, depend
 
 | Suite | Category | Tasks | Description |
 |-------|----------|------:|-------------|
-| `ccb_mcp_crossrepo_tracing` | A: Dependency Tracing | 9 | Cross-repo dependency chains, blast radius, symbol resolution |
-| `ccb_mcp_security` | B: Vulnerability Remediation | 10 | CVE mapping, missing auth middleware across repos |
-| `ccb_mcp_migration` | C: Framework Migration | 7 | API migrations, breaking changes across repos |
-| `ccb_mcp_incident` | D: Incident Debugging | 11 | Error-to-code-path tracing across microservices |
-| `ccb_mcp_onboarding` | E: Onboarding & Comprehension | 25 | API consumption mapping, end-to-end flow, architecture maps |
-| `ccb_mcp_compliance` | F: Compliance | 7 | Standards adherence, audit, and provenance workflows |
-| `ccb_mcp_crossorg` | G: Cross-Org Discovery | 5 | Interface implementations and authoritative repo identification across orgs |
-| `ccb_mcp_domain` | H: Domain Lineage | 10 | Config propagation, architecture patterns, domain analysis |
-| `ccb_mcp_org` | I: Organizational Context | 5 | Agentic discovery, org-wide coding correctness |
-| `ccb_mcp_platform` | J: Platform Knowledge | 5 | Service template discovery and tribal knowledge |
-| `ccb_mcp_crossrepo` | Legacy | 1 | Cross-repo discovery (compatibility) |
-| **Total** | | **95** | |
+| `ccb_mcp_crossrepo_tracing` | A: Dependency Tracing | 20 | Cross-repo dependency chains, blast radius, symbol resolution |
+| `ccb_mcp_security` | B: Vulnerability Remediation | 20 | CVE mapping, missing auth middleware across repos |
+| `ccb_mcp_migration` | C: Framework Migration | 20 | API migrations, breaking changes across repos |
+| `ccb_mcp_incident` | D: Incident Debugging | 20 | Error-to-code-path tracing across microservices |
+| `ccb_mcp_onboarding` | E: Onboarding & Comprehension | 20 | API consumption mapping, end-to-end flow, architecture maps |
+| `ccb_mcp_compliance` | F: Compliance | 20 | Standards adherence, audit, and provenance workflows |
+| `ccb_mcp_crossorg` | G: Cross-Org Discovery | 20 | Interface implementations and authoritative repo identification across orgs |
+| `ccb_mcp_domain` | H: Domain Lineage | 20 | Config propagation, architecture patterns, domain analysis |
+| `ccb_mcp_org` | I: Organizational Context | 20 | Agentic discovery, org-wide coding correctness |
+| `ccb_mcp_platform` | J: Platform Knowledge | 20 | Service template discovery and tribal knowledge |
+| `ccb_mcp_crossrepo` | K: Cross-Repo Discovery | 20 | Cross-repo search, dependency discovery, impact analysis |
+| **Total** | | **220** | |
 
-**Combined catalog total: 294 tasks** (199 SDLC across 9 suites + 95 MCP-unique across 11 suites).
+**Combined catalog total: 400 tasks** (180 SDLC across 9 suites + 220 MCP-unique across 11 suites). An additional 28 backup tasks are archived in `benchmarks/backups/`.
 
 Both baseline and MCP-Full agents have access to **all repos** in each task's fixture. The only difference is the method: baseline reads code locally, MCP-Full uses Sourcegraph MCP tools (local code is truncated). This ensures we measure whether MCP tools help agents work better — not whether MCP can access repos the baseline can't.
 
@@ -136,21 +137,22 @@ benchmarks/              # Task definitions organized by SDLC phase + MCP-unique
   ccb_debug/             #   Debugging & Investigation (20 tasks)
   ccb_design/            #   Architecture & Design (20 tasks)
   ccb_document/          #   Documentation (20 tasks)
-  ccb_fix/               #   Bug Repair (25 tasks)
+  ccb_fix/               #   Bug Repair (20 tasks)
   ccb_secure/            #   Security & Compliance (20 tasks)
   ccb_test/              #   Testing & QA (20 tasks)
   ccb_understand/        #   Requirements & Discovery (20 tasks)
-  ccb_mcp_compliance/    #   MCP-unique: compliance & audit (7 tasks)
-  ccb_mcp_crossorg/      #   MCP-unique: cross-org discovery (5 tasks)
-  ccb_mcp_crossrepo/     #   MCP-unique: legacy cross-repo (1 task)
-  ccb_mcp_crossrepo_tracing/  #   MCP-unique: dependency tracing (9 tasks)
-  ccb_mcp_domain/        #   MCP-unique: domain lineage (10 tasks)
-  ccb_mcp_incident/      #   MCP-unique: incident debugging (11 tasks)
-  ccb_mcp_migration/     #   MCP-unique: framework migration (7 tasks)
-  ccb_mcp_onboarding/    #   MCP-unique: onboarding (11 tasks)
-  ccb_mcp_org/           #   MCP-unique: org context (5 tasks)
-  ccb_mcp_platform/      #   MCP-unique: platform knowledge (5 tasks)
-  ccb_mcp_security/      #   MCP-unique: vulnerability remediation (10 tasks)
+  backups/               #   Archived backup tasks (28 total)
+  ccb_mcp_compliance/    #   MCP-unique: compliance & audit (20 tasks)
+  ccb_mcp_crossorg/      #   MCP-unique: cross-org discovery (20 tasks)
+  ccb_mcp_crossrepo/     #   MCP-unique: cross-repo discovery (20 tasks)
+  ccb_mcp_crossrepo_tracing/  #   MCP-unique: dependency tracing (20 tasks)
+  ccb_mcp_domain/        #   MCP-unique: domain lineage (20 tasks)
+  ccb_mcp_incident/      #   MCP-unique: incident debugging (20 tasks)
+  ccb_mcp_migration/     #   MCP-unique: framework migration (20 tasks)
+  ccb_mcp_onboarding/    #   MCP-unique: onboarding (20 tasks)
+  ccb_mcp_org/           #   MCP-unique: org context (20 tasks)
+  ccb_mcp_platform/      #   MCP-unique: platform knowledge (20 tasks)
+  ccb_mcp_security/      #   MCP-unique: vulnerability remediation (20 tasks)
 configs/                 # Run configs and task selection
   _common.sh             #   Shared infra: token refresh, parallel execution, multi-account
   sdlc_suite_2config.sh  #   Generic SDLC runner (used by phase wrappers below)
@@ -283,10 +285,10 @@ This section assumes Harbor is already installed and configured. If not, start w
 
 ### SDLC Tasks
 
-The unified runner executes all 199 SDLC tasks across the 2-config matrix:
+The unified runner executes all 180 SDLC tasks across the 2-config matrix:
 
 ```bash
-# Run all 199 SDLC tasks across 2 configs
+# Run all 180 SDLC tasks across 2 configs
 bash configs/run_selected_tasks.sh
 
 # Run only the baseline config
@@ -302,7 +304,7 @@ bash configs/run_selected_tasks.sh --dry-run
 Per-phase runners are also available:
 
 ```bash
-bash configs/fix_2config.sh              # 25 Bug Repair tasks
+bash configs/fix_2config.sh              # 20 Bug Repair tasks
 bash configs/feature_2config.sh          # 20 Feature Implementation tasks
 bash configs/refactor_2config.sh         # 20 Cross-File Refactoring tasks
 bash configs/understand_2config.sh       # 20 Requirements & Discovery tasks

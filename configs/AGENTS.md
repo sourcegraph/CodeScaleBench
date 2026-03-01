@@ -8,7 +8,7 @@ Use this file when working in `configs/` launchers and run orchestration wrapper
 - Validate config naming and paired-run semantics via shared helpers in `configs/_common.sh`.
 
 ## Parallelism Policy
-- **Daytona (default)**: 125 concurrent sandboxes. `run_selected_tasks.sh` auto-detects `HARBOR_ENV=daytona` and sets `--parallel 125`. Daytona's Tier 3 limit is 125 concurrent sandboxes (250 vCPU / 2 per sandbox). The job pool queue (`_wait_for_slot`) ensures we never exceed 125 in-flight processes.
+- **Daytona (default)**: 62 task pairs (124 concurrent sandboxes, 1 headroom). `run_selected_tasks.sh` auto-detects `HARBOR_ENV=daytona` and sets 124 parallel slots. Daytona's Tier 3 limit is 125 concurrent sandboxes (250 vCPU / 2 per sandbox). Each task pair = 2 sandboxes (baseline + MCP). The job pool queue (`_wait_for_slot`) ensures we never exceed 124 in-flight processes.
 - **Local Docker**: 12 concurrent slots (3 accounts x 4 sessions). Only for sweap-images tasks (9 ccb_debug + 9 ccb_fix) that cannot run on Daytona.
 - **Do NOT hardcode `--parallel`** unless you have a specific reason. Let `run_selected_tasks.sh` auto-detect from the environment.
 

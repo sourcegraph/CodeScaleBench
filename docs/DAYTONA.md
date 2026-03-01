@@ -286,7 +286,7 @@ python3 scripts/build_daytona_registry.py
 
 **MCP config errors**: Verify `SRC_ACCESS_TOKEN` is valid: `curl -H "Authorization: token $SRC_ACCESS_TOKEN" https://sourcegraph.com/.api/graphql`.
 
-**Harbor + Daytona: sandbox not found**: Ensure `daytona-sdk` is installed in the same Python environment as Harbor. The `DaytonaEnvironment` imports from `daytona`.
+**Harbor + Daytona: "Sandbox not found"**: Usually a transient resource-contention error — Daytona could not allocate a sandbox when all slots were occupied. The retry logic in `_common.sh` will automatically re-queue these tasks with exponential backoff (up to 3 attempts). If it persists, check your Daytona tier limits or ensure `daytona-sdk` is installed in the same Python environment as Harbor.
 
 **Docker Hub images fail with "unauthorized"**: Daytona's remote builder cannot pull `jefzda/sweap-images:*` from Docker Hub. This affects 21 SWE-bench Pro tasks (9 ccb_debug + 12 ccb_fix). Run these locally or re-host images to GHCR using `scripts/rehost_sweap_images.py`.
 

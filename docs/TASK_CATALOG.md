@@ -1,6 +1,6 @@
 # CodeContextBench Task Catalog
 
-A detailed reference for benchmark tasks in CodeContextBench. This document catalogs the **199 tasks** organized across **9 SDLC-phase suites**. The selection file (`configs/selected_benchmark_tasks.json`, version 2.0, last updated 2026-02-28) contains all 199 SDLC tasks (294 total including MCP-unique suites).
+A detailed reference for benchmark tasks in CodeContextBench. This document catalogs the **180 SDLC tasks** organized across **9 SDLC-phase suites** (plus 220 MCP-unique tasks across 11 suites = **400 total**). The selection file (`configs/selected_benchmark_tasks.json`, version 2.0, last updated 2026-03-01) contains all 400 active tasks.
 
 **Selection methodology:** Tasks were chosen via stratified sampling across benchmarks, covering all SDLC phases. Each task is scored for MCP benefit using a weighted combination of context complexity (0.25), cross-file dependencies (0.30), semantic search potential (0.20), and tool-chain weight (0.25). See `docs/TASK_SELECTION.md` for full scoring methodology.
 
@@ -8,9 +8,9 @@ A detailed reference for benchmark tasks in CodeContextBench. This document cata
 
 ## Table of Contents
 
-1. [ccb_understand (34 tasks)](#1-ccb_understand--requirements--discovery)
+1. [ccb_understand (20 tasks)](#1-ccb_understand--requirements--discovery)
 2. [ccb_design (20 tasks)](#2-ccb_design--architecture--design)
-3. [ccb_fix (25 tasks)](#3-ccb_fix--bug-repair)
+3. [ccb_fix (20 tasks)](#3-ccb_fix--bug-repair)
 4. [ccb_feature (20 tasks)](#4-ccb_feature--feature-implementation)
 5. [ccb_refactor (20 tasks)](#5-ccb_refactor--cross-file-refactoring)
 6. [ccb_test (20 tasks)](#6-ccb_test--testing--qa)
@@ -87,7 +87,7 @@ A detailed reference for benchmark tasks in CodeContextBench. This document cata
 
 **Focus:** Fix real bugs from production open-source repositories. Includes SWE-bench Pro patches, PyTorch compiler/runtime fixes, enterprise multi-team ownership bugs, and large-codebase debugging fixes.
 
-**25 tasks** | Languages: C++, Go, Java, JavaScript, Python, TypeScript | Difficulty: medium--hard
+**20 tasks** | Languages: C++, Go, Java, JavaScript, Python, TypeScript | Difficulty: medium--hard
 
 | Task ID | Lang | Difficulty | Repository | Category |
 |---------|------|-----------|------------|----------|
@@ -327,6 +327,6 @@ A detailed reference for benchmark tasks in CodeContextBench. This document cata
 | ccb_secure | 20 | medium--hard | C, C++, Go, Java, Python | CVE triage, governance, access |
 | ccb_debug | 20 | medium--expert | C, C++, Go, Python, TS | Fault localization, regression |
 
-**Total active tasks:** 199 (SDLC) + 95 (MCP-unique) = 294
+**Total active tasks:** 180 (SDLC) + 220 (MCP-unique) = 400
 **Languages covered:** C, C++, C#, Go, Java, JavaScript, Python, Rust, TypeScript
 **SDLC phases covered:** Requirements & Discovery, Architecture & Design, Bug Repair, Feature Implementation, Refactoring, Testing & QA, Documentation, Security & Compliance, Debugging & Investigation

@@ -40,13 +40,13 @@
 | [mcp_CCX-compliance-053_vbmTER](../tasks/ccb_mcp_compliance_haiku_20260228_011250--mcp-remote-direct--mcp_CCX-compliance-053_vbmTER.html) | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-053) | `mcp-remote-direct` | `passed` | 0.556 | 5 | 0.944 |
 | [mcp_CCX-compliance-053_QYb1jb](../tasks/ccb_mcp_compliance_haiku_20260226_035622_variance--mcp-remote-direct--mcp_CCX-compliance-053_QYb1jb.html) | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-053) | `mcp-remote-direct` | `passed` | 0.381 | 5 | 0.926 |
 | [mcp_CCX-compliance-053_p3juY2](../tasks/ccb_mcp_compliance_haiku_20260226_035617--mcp-remote-direct--mcp_CCX-compliance-053_p3juY2.html) | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-053) | `mcp-remote-direct` | `passed` | 0.467 | 5 | 0.962 |
-| [ccx-compliance-057-ds](../tasks/ccb_mcp_compliance_haiku_20260228_011250--baseline-local-direct--ccx-compliance-057-ds.html) | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-057-ds) | `baseline-local-direct` | `passed` | 0.806 | 3 | 0.000 |
-| [mcp_ccx-compliance-057-ds_o2fJgI](../tasks/ccb_mcp_compliance_haiku_20260226_035628_variance--mcp-remote-direct--mcp_ccx-compliance-057-ds_o2fJgI.html) | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-057-ds) | `mcp-remote-direct` | `passed` | 0.730 | 6 | 0.964 |
-| [mcp_ccx-compliance-057-ds_UoO29X](../tasks/ccb_mcp_compliance_haiku_20260226_035633_variance--mcp-remote-direct--mcp_ccx-compliance-057-ds_UoO29X.html) | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-057-ds) | `mcp-remote-direct` | `passed` | 0.844 | 6 | 0.957 |
-| [mcp_ccx-compliance-057-ds_ZnL56k](../tasks/ccb_mcp_compliance_haiku_20260228_011250--mcp-remote-direct--mcp_ccx-compliance-057-ds_ZnL56k.html) | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-057-ds) | `mcp-remote-direct` | `passed` | 0.732 | 6 | 0.960 |
-| [mcp_ccx-compliance-057-ds_TnIkYV](../tasks/ccb_mcp_compliance_haiku_20260226_035622_variance--mcp-remote-direct--mcp_ccx-compliance-057-ds_TnIkYV.html) | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-057-ds) | `mcp-remote-direct` | `passed` | 0.901 | 6 | 0.981 |
-| [mcp_ccx-compliance-057-ds_re3utI](../tasks/ccb_mcp_compliance_haiku_20260226_035515_variance--mcp-remote-direct--mcp_ccx-compliance-057-ds_re3utI.html) | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-057-ds) | `mcp-remote-direct` | `passed` | 0.741 | 6 | 0.962 |
-| [mcp_ccx-compliance-057-ds_5qgneX](../tasks/ccb_mcp_compliance_haiku_20260226_035617--mcp-remote-direct--mcp_ccx-compliance-057-ds_5qgneX.html) | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-057-ds) | `mcp-remote-direct` | `passed` | 0.763 | 6 | 0.960 |
+| [ccx-compliance-057-ds](../tasks/ccb_mcp_compliance_haiku_20260228_011250--baseline-local-direct--ccx-compliance-057-ds.html) | — | `baseline-local-direct` | `passed` | 0.806 | 3 | 0.000 |
+| [mcp_ccx-compliance-057-ds_o2fJgI](../tasks/ccb_mcp_compliance_haiku_20260226_035628_variance--mcp-remote-direct--mcp_ccx-compliance-057-ds_o2fJgI.html) | — | `mcp-remote-direct` | `passed` | 0.730 | 6 | 0.964 |
+| [mcp_ccx-compliance-057-ds_UoO29X](../tasks/ccb_mcp_compliance_haiku_20260226_035633_variance--mcp-remote-direct--mcp_ccx-compliance-057-ds_UoO29X.html) | — | `mcp-remote-direct` | `passed` | 0.844 | 6 | 0.957 |
+| [mcp_ccx-compliance-057-ds_ZnL56k](../tasks/ccb_mcp_compliance_haiku_20260228_011250--mcp-remote-direct--mcp_ccx-compliance-057-ds_ZnL56k.html) | — | `mcp-remote-direct` | `passed` | 0.732 | 6 | 0.960 |
+| [mcp_ccx-compliance-057-ds_TnIkYV](../tasks/ccb_mcp_compliance_haiku_20260226_035622_variance--mcp-remote-direct--mcp_ccx-compliance-057-ds_TnIkYV.html) | — | `mcp-remote-direct` | `passed` | 0.901 | 6 | 0.981 |
+| [mcp_ccx-compliance-057-ds_re3utI](../tasks/ccb_mcp_compliance_haiku_20260226_035515_variance--mcp-remote-direct--mcp_ccx-compliance-057-ds_re3utI.html) | — | `mcp-remote-direct` | `passed` | 0.741 | 6 | 0.962 |
+| [mcp_ccx-compliance-057-ds_5qgneX](../tasks/ccb_mcp_compliance_haiku_20260226_035617--mcp-remote-direct--mcp_ccx-compliance-057-ds_5qgneX.html) | — | `mcp-remote-direct` | `passed` | 0.763 | 6 | 0.960 |
 | [ccx-compliance-115](../tasks/ccb_mcp_compliance_haiku_20260228_011250--baseline-local-direct--ccx-compliance-115.html) | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-115) | `baseline-local-direct` | `passed` | 0.667 | 3 | 0.000 |
 | [mcp_CCX-compliance-115_ovonzs](../tasks/ccb_mcp_compliance_haiku_20260228_011250--mcp-remote-direct--mcp_CCX-compliance-115_ovonzs.html) | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-115) | `mcp-remote-direct` | `passed` | 0.571 | 2 | 0.875 |
 | [mcp_CCX-compliance-115_UoXV03](../tasks/ccb_mcp_compliance_haiku_20260226_221038--mcp-remote-direct--mcp_CCX-compliance-115_UoXV03.html) | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-115) | `mcp-remote-direct` | `passed` | 0.667 | 2 | 0.900 |
@@ -60,7 +60,7 @@
 
 ## Multi-Run Variance
 
-Tasks with multiple valid runs (12 task/config pairs).
+Tasks with multiple valid runs (11 task/config pairs).
 
 | Task | Benchmark | Config | Runs | Mean | Std | Individual Rewards |
 |---|---|---|---:|---:|---:|---|
@@ -70,7 +70,6 @@ Tasks with multiple valid runs (12 task/config pairs).
 | CCX-compliance-052 | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-052) | `mcp-remote-direct` | 6 | 0.304 | 0.195 | 0.263, 0.197, 0.663, 0.181, 0.137, 0.383 |
 | CCX-compliance-053 | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-053) | `baseline-local-direct` | 3 | 0.613 | 0.065 | 0.651, 0.651, 0.538 |
 | CCX-compliance-053 | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-053) | `mcp-remote-direct` | 5 | 0.556 | 0.138 | 0.467, 0.381, 0.651, 0.726, 0.556 |
-| CCX-compliance-057-ds | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-057-ds) | `baseline-local-direct` | 3 | 0.800 | 0.034 | 0.830, 0.763, 0.806 |
 | CCX-compliance-115 | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-115) | `baseline-local-direct` | 3 | 0.445 | 0.385 | 0.000, 0.667, 0.667 |
 | CCX-compliance-115 | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-115) | `mcp-remote-direct` | 2 | 0.619 | 0.067 | 0.667, 0.571 |
 | CCX-compliance-118 | [source](../../../benchmarks/ccb_mcp_compliance/ccx-compliance-118) | `baseline-local-direct` | 3 | 0.593 | 0.513 | 0.000, 0.889, 0.889 |

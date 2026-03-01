@@ -29,18 +29,18 @@ augmented with Sourcegraph MCP (Model Context Protocol) tools.
 
 ### 2.1 Task Taxonomy
 
-CodeContextBench organizes **294 tasks** into two task families:
+CodeContextBench organizes **400 tasks** into two task families:
 
-**SDLC-Phase Suites (199 tasks):** Nine suites aligned to software
+**SDLC-Phase Suites (180 tasks):** Nine suites aligned to software
 development lifecycle phases. Tasks are drawn from established benchmarks
 (SWE-bench Pro, DIBench, TheAgentCompany) and custom-authored challenges
 targeting specific SDLC activities.
 
 | Suite | Phase | Tasks | Difficulty | Languages |
 |-------|-------|------:|------------|-----------|
-| `ccb_understand` | Requirements & Discovery | 34 | hard | C++, Go, Java, Python, TS |
+| `ccb_understand` | Requirements & Discovery | 20 | hard | C++, Go, Java, Python, TS |
 | `ccb_design` | Architecture & Design | 20 | hard--very_hard | C, C++, Go, Java, Python |
-| `ccb_fix` | Bug Repair | 25 | medium--hard | C++, Go, Java, JS, Python, TS |
+| `ccb_fix` | Bug Repair | 20 | medium--hard | C++, Go, Java, JS, Python, TS |
 | `ccb_feature` | Feature Implementation | 20 | medium--hard | C, C++, Go, Java, Python, Rust, TS |
 | `ccb_refactor` | Cross-File Refactoring | 20 | hard--expert | C, C++, Go, Java, Python, Rust |
 | `ccb_test` | Testing & QA | 20 | medium--hard | C, C#, C++, Go, Java, JS, Python, TS |
@@ -48,18 +48,23 @@ targeting specific SDLC activities.
 | `ccb_secure` | Security & Compliance | 20 | medium--hard | C, C++, Go, Java, Python |
 | `ccb_debug` | Debugging & Investigation | 20 | medium--expert | C, C++, Go, Python, TS |
 
-**MCP-Unique Suites (12 tasks):** Six suites measuring org-scale cross-repo
+**MCP-Unique Suites (220 tasks):** Eleven suites measuring org-scale cross-repo
 discovery tasks where the agent must find information distributed across 3-20
 repositories.
 
 | Suite | Category | Tasks |
 |-------|----------|------:|
-| `ccb_mcp_crossrepo_tracing` | Dependency Tracing | 3 |
-| `ccb_mcp_security` | Vulnerability Remediation | 2 |
-| `ccb_mcp_incident` | Incident Debugging | 1 |
-| `ccb_mcp_onboarding` | Onboarding & Comprehension | 3 |
-| `ccb_mcp_crossorg` | Cross-Org Discovery | 2 |
-| `ccb_mcp_platform` | Platform Knowledge | 1 |
+| `ccb_mcp_crossrepo_tracing` | Dependency Tracing | 20 |
+| `ccb_mcp_security` | Vulnerability Remediation | 20 |
+| `ccb_mcp_migration` | Framework Migration | 20 |
+| `ccb_mcp_incident` | Incident Debugging | 20 |
+| `ccb_mcp_onboarding` | Onboarding & Comprehension | 20 |
+| `ccb_mcp_compliance` | Compliance | 20 |
+| `ccb_mcp_crossorg` | Cross-Org Discovery | 20 |
+| `ccb_mcp_domain` | Domain Lineage | 20 |
+| `ccb_mcp_org` | Organizational Context | 20 |
+| `ccb_mcp_platform` | Platform Knowledge | 20 |
+| `ccb_mcp_crossrepo` | Cross-Repo Discovery | 20 |
 
 ### 2.2 Task Sources
 
@@ -74,7 +79,7 @@ Tasks are curated from multiple sources to ensure diversity:
 | **PyTorch compiler fixes** | 5 | Fix |
 | **Linux kernel faults** | 5 | Debug |
 | **Code review (injected defects)** | 8 | Test |
-| **MCP-unique (GTM use cases)** | 12 | Cross-repo discovery |
+| **MCP-unique (GTM use cases)** | 220 | Cross-repo discovery |
 
 ### 2.3 Language and Repository Coverage
 
