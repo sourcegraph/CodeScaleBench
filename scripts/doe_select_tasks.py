@@ -38,6 +38,13 @@ SDLC_SUITES = [
     "ccb_fix", "ccb_secure", "ccb_test", "ccb_understand",
 ]
 
+MCP_UNIQUE_SUITES = [
+    "ccb_mcp_compliance", "ccb_mcp_crossorg", "ccb_mcp_crossrepo",
+    "ccb_mcp_crossrepo_tracing", "ccb_mcp_domain", "ccb_mcp_incident",
+    "ccb_mcp_migration", "ccb_mcp_onboarding", "ccb_mcp_org",
+    "ccb_mcp_platform", "ccb_mcp_security",
+]
+
 BASELINE_CONFIGS = {"baseline", "baseline-local-direct", "baseline-local-artifact"}
 MCP_CONFIGS = {"mcp", "mcp-remote-direct", "mcp-remote-artifact"}
 
@@ -206,29 +213,51 @@ def check_language_diversity(kept_tasks: list, lang_map: dict, suite: str) -> di
     return dict(langs)
 
 
-def compute_neyman_allocation(manifest: dict, budget: int) -> dict:
-    """Compute Neyman-optimal allocation using the validated DOE variance decomposition.
-
-    Delegates to doe_variance_analysis.py's ANOVA-based variance decomposition and
-    Neyman allocation, which uses effective_var = sigma2_task + sigma2_rep/n_reps.
-    Returns {suite: target_n}.
-    """
+def _load_doe_module():
+    """Import doe_variance_analysis.py dynamically."""
     import importlib.util
-
-    # Import the DOE variance analysis module
     doe_spec = importlib.util.spec_from_file_location(
         "doe_variance_analysis",
         PROJECT_ROOT / "scripts" / "doe_variance_analysis.py"
     )
     doe_mod = importlib.util.module_from_spec(doe_spec)
     doe_spec.loader.exec_module(doe_mod)
+    return doe_mod
+
+
+def compute_neyman_allocation(manifest: dict, budget: int,
+                              target_suites: list = None,
+                              include_staging: bool = False) -> dict:
+    """Compute Neyman-optimal allocation using the validated DOE variance decomposition.
+
+    Delegates to doe_variance_analysis.py's ANOVA-based variance decomposition and
+    Neyman allocation, which uses effective_var = sigma2_task + sigma2_rep/n_reps.
+
+    Args:
+        manifest: loaded MANIFEST.json dict
+        budget: total task budget across all target_suites
+        target_suites: list of suite names to allocate across (default: SDLC_SUITES)
+        include_staging: also load results from runs/staging/
+
+    Returns {suite: target_n}.
+    """
+    doe_mod = _load_doe_module()
+
+    if target_suites is None:
+        target_suites = SDLC_SUITES
 
     run_data = doe_mod.load_run_history(manifest)
+
+    # Merge staging data if requested
+    if include_staging:
+        staging_data = doe_mod.load_staging_results(target_suites)
+        run_data = doe_mod.merge_run_data(run_data, staging_data)
+
     config_arms = ["baseline", "mcp"]
 
     # Combined decomposition (same method as doe_variance_analysis main)
     combined_decomps = {}
-    for suite in SDLC_SUITES:
+    for suite in target_suites:
         suite_data = run_data.get(suite, {})
         if not suite_data:
             continue
@@ -245,7 +274,7 @@ def compute_neyman_allocation(manifest: dict, budget: int) -> dict:
     # Effective variance for Neyman allocation: sigma2_task + sigma2_rep/n_reps
     n_reps = 3  # planned replicates
     effective_vars = {}
-    for suite in SDLC_SUITES:
+    for suite in target_suites:
         decomp = combined_decomps.get(suite)
         if decomp:
             effective_vars[suite] = decomp["sigma2_task"] + decomp["sigma2_rep"] / n_reps
@@ -284,13 +313,32 @@ def get_backup_tasks(suite: str) -> dict:
     return backups
 
 
-def generate_rebalance_plan(manifest: dict, budget: int, min_reps: int = 2) -> dict:
+def generate_rebalance_plan(manifest: dict, budget: int, min_reps: int = 2,
+                            target_suites: list = None,
+                            include_staging: bool = False) -> dict:
     """Generate the full rebalance plan.
 
     Returns dict with per-suite keep/move/promote lists and summary.
+
+    Args:
+        target_suites: which suites to rebalance (default: SDLC_SUITES)
+        include_staging: merge runs/staging/ data (needed for MCP-unique suites)
     """
+    if target_suites is None:
+        target_suites = SDLC_SUITES
+
+    doe_mod = _load_doe_module()
     run_data = load_run_history(manifest)
-    allocation = compute_neyman_allocation(manifest, budget)
+
+    if include_staging:
+        staging_data = doe_mod.load_staging_results(target_suites)
+        run_data = doe_mod.merge_run_data(run_data, staging_data)
+
+    allocation = compute_neyman_allocation(
+        manifest, budget,
+        target_suites=target_suites,
+        include_staging=include_staging,
+    )
     lang_map = load_task_languages()
 
     plan = {
@@ -299,7 +347,7 @@ def generate_rebalance_plan(manifest: dict, budget: int, min_reps: int = 2) -> d
         "suites": {},
     }
 
-    for suite in SDLC_SUITES:
+    for suite in target_suites:
         target_n = allocation.get(suite, 20)
         on_disk = get_existing_tasks_on_disk(suite)
         current_n = len(on_disk)
@@ -317,6 +365,14 @@ def generate_rebalance_plan(manifest: dict, budget: int, min_reps: int = 2) -> d
             ranked = rank_tasks_in_suite(suite, run_data[suite], min_reps)
         else:
             ranked = []
+
+        # Build case-insensitive mapping: lowercase(run_name) -> on_disk_name
+        # Handles MANIFEST names like CCX-compliance-118 vs on-disk ccx-compliance-118
+        on_disk_lower = {name.lower(): name for name in on_disk}
+        for t in ranked:
+            disk_name = on_disk_lower.get(t["task_name"].lower())
+            if disk_name and disk_name != t["task_name"]:
+                t["task_name"] = disk_name  # normalize to on-disk name
 
         # Map ranked tasks to on-disk tasks
         ranked_names = {t["task_name"] for t in ranked}
@@ -420,26 +476,28 @@ def generate_rebalance_plan(manifest: dict, budget: int, min_reps: int = 2) -> d
 
 def print_plan(plan: dict):
     """Pretty-print the rebalance plan."""
+    suite_list = sorted(plan["suites"].keys())
+
     print("=" * 80)
     print(f"DOE TASK REBALANCE PLAN (budget={plan['budget']})")
     print("=" * 80)
     print()
 
     # Allocation table
-    print(f"{'Suite':<18} {'Current':>8} {'Target':>8} {'Delta':>8} {'Action':<12}")
-    print("-" * 60)
-    for suite in SDLC_SUITES:
+    print(f"{'Suite':<30} {'Current':>8} {'Target':>8} {'Delta':>8} {'Action':<12}")
+    print("-" * 70)
+    for suite in suite_list:
         sp = plan["suites"].get(suite, {})
-        print(f"{suite:<18} {sp.get('current_n',0):>8} {sp.get('target_n',0):>8} "
+        print(f"{suite:<30} {sp.get('current_n',0):>8} {sp.get('target_n',0):>8} "
               f"{sp.get('delta',0):>+8} {sp.get('action','?'):<12}")
-    print("-" * 60)
+    print("-" * 70)
     s = plan["summary"]
     print(f"Total: keep={s['total_keep']}, move={s['total_move_to_backup']}, "
           f"promote={s['total_promote_from_backup']}, scaffold={s['total_scaffold_needed']}")
     print()
 
     # Per-suite details
-    for suite in SDLC_SUITES:
+    for suite in suite_list:
         sp = plan["suites"].get(suite, {})
         if sp.get("action") == "unchanged":
             continue
@@ -482,8 +540,9 @@ def execute_rebalance(plan: dict, dry_run: bool = True):
     """Execute the rebalance plan by moving task directories."""
     import shutil
 
+    suite_list = sorted(plan["suites"].keys())
     actions = []
-    for suite in SDLC_SUITES:
+    for suite in suite_list:
         sp = plan["suites"].get(suite, {})
 
         # Move tasks to backup
@@ -533,19 +592,36 @@ def main():
 
     parser = argparse.ArgumentParser(description="DOE-driven task rebalance")
     parser.add_argument("--budget", type=int, default=150,
-                        help="Total task budget (default: 150)")
+                        help="Total task budget (default: 150 for SDLC, 220 for MCP-unique)")
     parser.add_argument("--min-reps", type=int, default=2,
                         help="Minimum replicates for a task to be ranked (default: 2)")
     parser.add_argument("--json", action="store_true",
                         help="Output machine-readable JSON")
     parser.add_argument("--execute", action="store_true",
                         help="Actually move directories (default: dry run preview)")
+    parser.add_argument("--mcp-unique-only", action="store_true",
+                        help="Rebalance MCP-unique suites instead of SDLC (budget default: 220)")
+    parser.add_argument("--include-staging", action="store_true",
+                        help="Also load results from runs/staging/")
     args = parser.parse_args()
 
     with open(MANIFEST_PATH) as f:
         manifest = json.load(f)
 
-    plan = generate_rebalance_plan(manifest, args.budget, args.min_reps)
+    if args.mcp_unique_only:
+        target_suites = MCP_UNIQUE_SUITES
+        budget = args.budget if args.budget != 150 else 220  # default to 220 for MCP-unique
+        include_staging = True  # always needed for MCP-unique
+    else:
+        target_suites = SDLC_SUITES
+        budget = args.budget
+        include_staging = args.include_staging
+
+    plan = generate_rebalance_plan(
+        manifest, budget, args.min_reps,
+        target_suites=target_suites,
+        include_staging=include_staging,
+    )
 
     if args.json:
         print(json.dumps(plan, indent=2))

@@ -18,6 +18,7 @@ Usage:
 
 import json
 import math
+import re
 import statistics
 import sys
 from collections import defaultdict
@@ -25,6 +26,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = PROJECT_ROOT / "runs" / "official" / "MANIFEST.json"
+STAGING_DIR = PROJECT_ROOT / "runs" / "staging"
 
 SDLC_SUITES = [
     "ccb_feature", "ccb_refactor", "ccb_debug", "ccb_design", "ccb_document",
@@ -79,6 +81,85 @@ def load_run_history(manifest: dict) -> dict:
                 data[suite][config_type][task_name] = rewards
 
     return dict(data)
+
+
+def load_staging_results(suites: list) -> dict:
+    """Load task-level results from runs/staging/ for the given suites.
+
+    Scans batch directories matching {suite}_haiku_YYYYMMDD_HHMMSS or
+    {suite}_sonnet_YYYYMMDD_HHMMSS.  Parses nested result.json files,
+    skipping batch-level summaries.
+
+    Returns same shape as load_run_history:
+      {suite: {config_type: {task_name: [reward1, reward2, ...]}}}
+    """
+    data = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+
+    if not STAGING_DIR.is_dir():
+        return dict(data)
+
+    suite_set = set(suites)
+    for batch_dir in sorted(STAGING_DIR.iterdir()):
+        if not batch_dir.is_dir():
+            continue
+        m = re.match(r'(ccb_\w+?)_(?:haiku|sonnet)_\d{8}_\d{6}', batch_dir.name)
+        if not m:
+            continue
+        suite = m.group(1)
+        if suite not in suite_set:
+            continue
+
+        for rj in batch_dir.rglob('result.json'):
+            try:
+                rdata = json.loads(rj.read_text())
+            except Exception:
+                continue
+            if 'stats' in rdata:
+                continue  # batch-level summary
+            task_name = rdata.get('task_name', '')
+            if not task_name:
+                continue
+
+            rel = str(rj.relative_to(batch_dir))
+            if rel.startswith('baseline'):
+                config_type = 'baseline'
+            elif rel.startswith('mcp'):
+                config_type = 'mcp'
+            else:
+                continue
+
+            # Normalize task name: strip prefixes and Harbor random suffix
+            tn = task_name
+            for pfx in ('sgonly_', 'mcp_', 'bl_'):
+                if tn.startswith(pfx):
+                    tn = tn[len(pfx):]
+            tn = re.sub(r'_[a-z0-9]{4,8}$', '', tn)
+
+            vr = rdata.get('verifier_result')
+            if vr is None:
+                continue
+            rewards_dict = vr.get('rewards')
+            if rewards_dict is None:
+                continue
+            reward = rewards_dict.get('reward')
+            if reward is not None:
+                data[suite][config_type][tn].append(reward)
+
+    return dict(data)
+
+
+def merge_run_data(*datasets) -> dict:
+    """Merge multiple run-data dicts (same shape as load_run_history output).
+
+    Concatenates reward lists per (suite, config, task).
+    """
+    merged = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for ds in datasets:
+        for suite, configs in ds.items():
+            for ct, tasks in configs.items():
+                for task, rewards in tasks.items():
+                    merged[suite][ct][task].extend(rewards)
+    return dict(merged)
 
 
 def variance_decomposition_per_suite(
@@ -263,6 +344,10 @@ def main():
                         help="Output JSON instead of formatted tables")
     parser.add_argument("--include-mcp-unique", action="store_true",
                         help="Include MCP-unique suites in analysis")
+    parser.add_argument("--mcp-unique-only", action="store_true",
+                        help="Analyze ONLY MCP-unique suites (excludes SDLC)")
+    parser.add_argument("--include-staging", action="store_true",
+                        help="Also load results from runs/staging/ (needed for MCP-unique)")
     parser.add_argument("--config", choices=["baseline", "mcp", "both"],
                         default="both",
                         help="Which config arm(s) to analyze (default: both)")
@@ -271,9 +356,17 @@ def main():
     manifest = json.loads(MANIFEST_PATH.read_text())
     data = load_run_history(manifest)
 
-    suites = list(SDLC_SUITES)
-    if args.include_mcp_unique:
-        suites.extend(MCP_UNIQUE_SUITES)
+    if args.mcp_unique_only:
+        suites = list(MCP_UNIQUE_SUITES)
+    else:
+        suites = list(SDLC_SUITES)
+        if args.include_mcp_unique:
+            suites.extend(MCP_UNIQUE_SUITES)
+
+    # Auto-enable staging loading when MCP-unique suites are requested
+    if args.include_staging or args.include_mcp_unique or args.mcp_unique_only:
+        staging_data = load_staging_results(suites)
+        data = merge_run_data(data, staging_data)
 
     config_arms = []
     if args.config in ("baseline", "both"):
