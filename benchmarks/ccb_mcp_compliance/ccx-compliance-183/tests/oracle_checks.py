@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional
 # upstream names like "mozilla-firefox/firefox" or "openjdk/jdk".  Normalise
 # both sides so that matching works regardless of which convention is used.
 
-_MIRROR_HASH_RE = re.compile(r"--[0-9a-f]{6,}$")
+_MIRROR_HASH_RE = re.compile(r"--(v[\d.]+|[0-9a-f]{6,})$")
 
 
 def _coerce_file_entry(entry) -> Dict[str, str]:
@@ -43,16 +43,22 @@ def _coerce_file_entry(entry) -> Dict[str, str]:
 
     Handles string entries like "sg-evals/kubernetes--v1.32.0/pkg/file.go"
     where the first two path components are the repo.
+
+    Also handles "github.com/sg-evals/repo--hash/path" by stripping the
+    "github.com/" prefix first so the repo is "sg-evals/repo--hash".
     """
     if isinstance(entry, dict):
         return entry
     if isinstance(entry, str):
-        parts = entry.split("/", 2)
+        s = entry
+        if s.startswith("github.com/"):
+            s = s[len("github.com/"):]
+        parts = s.split("/", 2)
         if len(parts) >= 3:
             return {"repo": f"{parts[0]}/{parts[1]}", "path": parts[2]}
         elif len(parts) == 2:
             return {"repo": parts[0], "path": parts[1]}
-        return {"repo": "", "path": entry}
+        return {"repo": "", "path": s}
     return {"repo": "", "path": str(entry)}
 
 

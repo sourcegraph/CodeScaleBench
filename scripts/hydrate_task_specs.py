@@ -46,17 +46,24 @@ def _normalize_file_entry(entry) -> Dict[str, str]:
     Handles both dict entries (already correct) and string entries like
     "sg-evals/kubernetes--v1.32.0/pkg/apis/rbac/v1alpha1/file.go" where
     the first two path components are the repo and the rest is the file path.
+
+    Also handles "github.com/sg-evals/repo--hash/path" by stripping the
+    "github.com/" prefix first so the repo is "sg-evals/repo--hash".
     """
     if isinstance(entry, dict):
         return entry
     if isinstance(entry, str):
-        parts = entry.split("/", 2)
+        # Strip github.com/ prefix — oracle entries sometimes include it
+        s = entry
+        if s.startswith("github.com/"):
+            s = s[len("github.com/"):]
+        parts = s.split("/", 2)
         if len(parts) >= 3:
             return {"repo": f"{parts[0]}/{parts[1]}", "path": parts[2]}
         elif len(parts) == 2:
             return {"repo": parts[0], "path": parts[1]}
         else:
-            return {"repo": "", "path": entry}
+            return {"repo": "", "path": s}
     return {"repo": "", "path": str(entry)}
 
 
