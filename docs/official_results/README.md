@@ -2,7 +2,7 @@
 
 This bundle is generated from `runs/official/` and includes only valid scored tasks (`passed`/`failed` with numeric reward).
 
-Generated: `2026-03-01T19:12:02.665318+00:00`
+Generated: `2026-03-01T19:45:06.820720+00:00`
 
 ## Local Browse
 
@@ -69,7 +69,7 @@ Historical reruns/backfills remain available in `data/official_results.json` und
 | [ccb_refactor](suites/ccb_refactor.md) | `mcp-remote-direct` | 20 | 20 | 0.703 | 1.000 | ok |
 | [ccb_secure](suites/ccb_secure.md) | `baseline-local-direct` | 20 | 20 | 0.712 | 1.000 | ok |
 | [ccb_secure](suites/ccb_secure.md) | `mcp-remote-direct` | 24 | 20 | 0.707 | 0.958 | ok |
-| [ccb_test](suites/ccb_test.md) | `baseline-local-direct` | 20 | 20 | 0.484 | 0.700 | ok |
+| [ccb_test](suites/ccb_test.md) | `baseline-local-direct` | 20 | 20 | 0.473 | 0.700 | ok |
 | [ccb_test](suites/ccb_test.md) | `mcp-remote-direct` | 35 | 20 | 0.468 | 0.686 | ok |
 | [ccb_understand](suites/ccb_understand.md) | `baseline-local-direct` | 34 | 20 | 0.902 | 0.971 | ok |
 | [ccb_understand](suites/ccb_understand.md) | `mcp-remote-direct` | 48 | 20 | 0.873 | 0.979 | ok |
@@ -398,6 +398,8 @@ Historical reruns/backfills remain available in `data/official_results.json` und
 | [test_haiku_20260301_031851](runs/test_haiku_20260301_031851.md) | `ccb_test` | `mcp-remote-direct` | 8 | 0.769 | 1.000 |
 | [test_haiku_20260301_071232](runs/test_haiku_20260301_071232.md) | `ccb_test` | `baseline-local-direct` | 17 | 0.569 | 0.824 |
 | [test_haiku_20260301_071232](runs/test_haiku_20260301_071232.md) | `ccb_test` | `mcp-remote-direct` | 8 | 0.780 | 1.000 |
+| [test_haiku_20260301_192246](runs/test_haiku_20260301_192246.md) | `ccb_test` | `baseline-local-direct` | 4 | 0.128 | 0.250 |
+| [test_haiku_20260301_192246](runs/test_haiku_20260301_192246.md) | `ccb_test` | `mcp-remote-direct` | 3 | 0.000 | 0.000 |
 | [understand_haiku_20260224_001815](runs/understand_haiku_20260224_001815.md) | `ccb_understand` | `baseline-local-direct` | 20 | 0.533 | 0.650 |
 | [understand_haiku_20260224_001815](runs/understand_haiku_20260224_001815.md) | `ccb_understand` | `mcp-remote-direct` | 20 | 0.679 | 0.850 |
 | [understand_haiku_20260225_211346](runs/understand_haiku_20260225_211346.md) | `ccb_understand` | `baseline-local-direct` | 7 | 0.789 | 1.000 |
