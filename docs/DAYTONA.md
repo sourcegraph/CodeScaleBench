@@ -271,6 +271,7 @@ python3 scripts/build_daytona_registry.py
 | `SRC_ACCESS_TOKEN` | For MCP configs | Sourcegraph access token |
 | `DAYTONA_API_URL` | No | Override API endpoint (default: `https://app.daytona.io/api`) |
 | `DAYTONA_TARGET` | No | Override target region (default: `us`) |
+| `DAYTONA_OVERRIDE_STORAGE` | No | Override per-sandbox storage (MB). Set to `10240` to cap at Daytona's 10GB limit when tasks specify larger values in task.toml |
 
 ## Troubleshooting
 
@@ -285,3 +286,5 @@ python3 scripts/build_daytona_registry.py
 **MCP config errors**: Verify `SRC_ACCESS_TOKEN` is valid: `curl -H "Authorization: token $SRC_ACCESS_TOKEN" https://sourcegraph.com/.api/graphql`.
 
 **Harbor + Daytona: sandbox not found**: Ensure `daytona-sdk` is installed in the same Python environment as Harbor. The `DaytonaEnvironment` imports from `daytona`.
+
+**Sandbox creation fails for tasks with `storage = "20G"` in task.toml**: Daytona has a hard 10GB per-sandbox storage limit. 39 tasks specify `storage = "20G"` and 1 specifies `"15G"`, exceeding this limit. Set `export DAYTONA_OVERRIDE_STORAGE=10240` before launching runs. This passes `--override-storage-mb 10240` to all `harbor run` commands, capping storage at 10GB. The actual Docker images are 1.5-5GB so 10GB is sufficient.

@@ -2,7 +2,7 @@
 
 This bundle is generated from `runs/official/` and includes only valid scored tasks (`passed`/`failed` with numeric reward).
 
-Generated: `2026-03-01T00:38:37.640286+00:00`
+Generated: `2026-03-01T02:13:03.266350+00:00`
 
 ## Local Browse
 
@@ -61,6 +61,8 @@ Historical reruns/backfills remain available in `data/official_results.json` und
 | [ccb_mcp_security](suites/ccb_mcp_security.md) | `baseline-local-direct` | 4 | 16 | 0.603 | 1.000 | FLAG: below minimum |
 | [ccb_mcp_security](suites/ccb_mcp_security.md) | `mcp-remote-artifact` | 6 | 16 | 0.792 | 1.000 | FLAG: below minimum |
 | [ccb_mcp_security](suites/ccb_mcp_security.md) | `mcp-remote-direct` | 16 | 16 | 0.705 | 1.000 | ok |
+| [ccb_refactor](suites/ccb_refactor.md) | `baseline-local-direct` | 20 | 20 | 0.791 | 0.950 | ok |
+| [ccb_refactor](suites/ccb_refactor.md) | `mcp-remote-direct` | 20 | 20 | 0.737 | 0.950 | ok |
 | [ccb_secure](suites/ccb_secure.md) | `baseline-local-direct` | 20 | 20 | 0.669 | 0.950 | ok |
 | [ccb_secure](suites/ccb_secure.md) | `mcp-remote-direct` | 22 | 20 | 0.645 | 0.909 | ok |
 | [ccb_test](suites/ccb_test.md) | `baseline-local-direct` | 20 | 20 | 0.480 | 0.750 | ok |
@@ -237,6 +239,8 @@ Historical reruns/backfills remain available in `data/official_results.json` und
 | [fix_haiku_20260226_024454](runs/fix_haiku_20260226_024454.md) | `ccb_fix` | `mcp-remote-direct` | 3 | 0.000 | 0.000 |
 | [fix_haiku_20260226_new3tasks](runs/fix_haiku_20260226_new3tasks.md) | `ccb_fix` | `baseline-local-direct` | 3 | 0.727 | 1.000 |
 | [fix_haiku_20260226_new3tasks](runs/fix_haiku_20260226_new3tasks.md) | `ccb_fix` | `mcp-remote-direct` | 3 | 0.801 | 1.000 |
+| [refactor_haiku_20260301_010758](runs/refactor_haiku_20260301_010758.md) | `ccb_refactor` | `baseline-local-direct` | 20 | 0.791 | 0.950 |
+| [refactor_haiku_20260301_010758](runs/refactor_haiku_20260301_010758.md) | `ccb_refactor` | `mcp-remote-direct` | 20 | 0.737 | 0.950 |
 | [secure_haiku_20260223_232545](runs/secure_haiku_20260223_232545.md) | `ccb_secure` | `baseline-local-direct` | 20 | 0.669 | 0.950 |
 | [secure_haiku_20260223_232545](runs/secure_haiku_20260223_232545.md) | `ccb_secure` | `mcp-remote-direct` | 18 | 0.705 | 1.000 |
 | [secure_haiku_20260224_011825](runs/secure_haiku_20260224_011825.md) | `ccb_secure` | `mcp-remote-direct` | 2 | 0.500 | 0.500 |
