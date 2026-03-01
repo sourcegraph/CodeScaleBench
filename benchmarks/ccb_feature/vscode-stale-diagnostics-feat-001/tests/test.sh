@@ -91,18 +91,12 @@ if [ -f "extensions/typescript-language-features/tsconfig.json" ]; then
     fi
 fi
 
-# Also check src/ if a tsconfig exists there
-if [ -f "src/tsconfig.json" ]; then
-    ./node_modules/.bin/tsc --noEmit -p src/tsconfig.json 2>>/logs/verifier/typecheck_errors.txt && TSC_RC=0 || TSC_RC=$?
-    if [ "$TSC_RC" -ne 0 ]; then
-        echo "FAIL: TypeScript type-check failed for src/"
-        TYPE_CHECK_OK=0
-    fi
-fi
+# Note: src/tsconfig.json covers all of VS Code (>300k TS lines) and OOMs in
+# the container; we only need the extension-level check for this task.
 
 # Fallback: if no specific tsconfig was found, do a syntax-only check on
 # modified .ts files using tsc --noEmit --isolatedModules
-if [ "$TYPE_CHECK_OK" -eq 1 ] && [ ! -f "extensions/typescript-language-features/tsconfig.json" ] && [ ! -f "src/tsconfig.json" ]; then
+if [ "$TYPE_CHECK_OK" -eq 1 ] && [ ! -f "extensions/typescript-language-features/tsconfig.json" ]; then
     # Collect modified .ts files (committed + unstaged + staged)
     MODIFIED_TS=""
     if [ -n "$ORIGIN_REF" ]; then
@@ -174,8 +168,8 @@ CHANGED_FILES="$CHANGED_FILES
 $(git diff --name-only 2>/dev/null)
 $(git diff --cached --name-only 2>/dev/null)"
 
-RELEVANT_FILES=$(echo "$CHANGED_FILES" | grep -E "(diagnostics|extension)" | sort -u)
-RELEVANT_COUNT=$(echo "$RELEVANT_FILES" | grep -c . 2>/dev/null || echo 0)
+RELEVANT_FILES=$(echo "$CHANGED_FILES" | grep -E "(diagnostics|extension)" | sort -u || true)
+RELEVANT_COUNT=$(echo "$RELEVANT_FILES" | grep -v '^$' | wc -l)
 if [ "$RELEVANT_COUNT" -ge 2 ]; then
     echo "[x] Diagnostics-related files modified ($RELEVANT_COUNT files)"
     echo "$RELEVANT_FILES" | head -5
