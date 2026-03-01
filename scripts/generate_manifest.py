@@ -180,7 +180,7 @@ def scan_config_dir(config_path: Path) -> dict[str, dict]:
         # or could be task dirs directly (task_name__hash)
         if "__" in batch_dir.name and not batch_dir.name.startswith("20"):
             # This looks like a direct task dir (task_name__hash)
-            if (batch_dir / "__broken_verifier").exists():
+            if _has_invalid_marker(batch_dir):
                 continue
             result_file = batch_dir / "result.json"
             if result_file.exists():
@@ -205,7 +205,7 @@ def scan_config_dir(config_path: Path) -> dict[str, dict]:
                 # Skip dirs that look like timestamps (batch metadata)
                 if trial_dir.name.startswith("20"):
                     continue
-                if (trial_dir / "__broken_verifier").exists():
+                if _has_invalid_marker(trial_dir):
                     continue
                 result_file = trial_dir / "result.json"
                 if result_file.exists():
@@ -240,7 +240,7 @@ def scan_config_dir_all_runs(config_path: Path) -> dict[str, list[dict]]:
         if not batch_dir.is_dir():
             continue
         if "__" in batch_dir.name and not batch_dir.name.startswith("20"):
-            if (batch_dir / "__broken_verifier").exists():
+            if _has_invalid_marker(batch_dir):
                 continue
             result_file = batch_dir / "result.json"
             if result_file.exists():
@@ -263,7 +263,7 @@ def scan_config_dir_all_runs(config_path: Path) -> dict[str, list[dict]]:
                     continue
                 if trial_dir.name.startswith("20"):
                     continue
-                if (trial_dir / "__broken_verifier").exists():
+                if _has_invalid_marker(trial_dir):
                     continue
                 result_file = trial_dir / "result.json"
                 if result_file.exists():
@@ -502,17 +502,30 @@ def load_selected_tasks(path: Path) -> dict[str, set[str]]:
         return {}
 
 
-def _has_broken_verifier(entry: dict) -> bool:
-    """Check if a trial directory contains a __broken_verifier marker.
+def _has_invalid_marker(trial_dir: Path) -> bool:
+    """Check if a trial directory contains any invalidation marker.
 
-    These trials had verifier bugs (e.g., missing dependencies, bad test
-    scripts) that produced 0.0 rewards regardless of agent output quality.
-    They should be excluded from both dedup and run_history.
+    Markers:
+    - __broken_verifier: verifier bugs that produced 0.0 rewards
+    - __invalid_*: results invalidated for methodological reasons
+      (e.g., unscoped Deep Search querying upstream instead of mirror)
+
+    Marked trials are excluded from both dedup and run_history.
+    """
+    if (trial_dir / "__broken_verifier").exists():
+        return True
+    return any(f.name.startswith("__invalid") for f in trial_dir.iterdir() if f.is_file())
+
+
+def _has_broken_verifier(entry: dict) -> bool:
+    """Check if a trial directory contains any invalidation marker.
+
+    Kept for backward compatibility; delegates to _has_invalid_marker.
     """
     trial_dir = entry.get("trial_dir")
     if trial_dir is None:
         return False
-    return (Path(trial_dir) / "__broken_verifier").exists()
+    return _has_invalid_marker(Path(trial_dir))
 
 
 def _is_valid_run(entry: dict) -> bool:

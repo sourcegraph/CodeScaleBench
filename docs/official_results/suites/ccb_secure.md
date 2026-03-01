@@ -6,6 +6,7 @@
 |---|---|---:|---:|---:|
 | [ccb_secure_haiku_20260224_213146](../runs/ccb_secure_haiku_20260224_213146.md) | `baseline-local-direct` | 2 | 0.500 | 1.000 |
 | [ccb_secure_haiku_20260224_213146](../runs/ccb_secure_haiku_20260224_213146.md) | `mcp-remote-direct` | 2 | 0.250 | 0.500 |
+| [ccb_secure_haiku_20260228_124521](../runs/ccb_secure_haiku_20260228_124521.md) | `mcp-remote-direct` | 2 | 0.555 | 1.000 |
 | [secure_haiku_20260223_232545](../runs/secure_haiku_20260223_232545.md) | `baseline-local-direct` | 18 | 0.688 | 0.944 |
 | [secure_haiku_20260223_232545](../runs/secure_haiku_20260223_232545.md) | `mcp-remote-direct` | 18 | 0.705 | 1.000 |
 | [secure_haiku_20260224_011825](../runs/secure_haiku_20260224_011825.md) | `mcp-remote-direct` | 2 | 0.500 | 0.500 |
@@ -39,9 +40,11 @@
 | [envoy-cve-triage-001](../tasks/secure_haiku_20260223_232545--baseline-local-direct--envoy-cve-triage-001.html) | [source](../../../benchmarks/ccb_secure/envoy-cve-triage-001) | `baseline-local-direct` | `passed` | 0.900 | 2 | 0.000 |
 | [sgonly_envoy-cve-triage-001](../tasks/secure_haiku_20260223_232545--mcp-remote-direct--sgonly_envoy-cve-triage-001.html) | [source](../../../benchmarks/ccb_secure/envoy-cve-triage-001) | `mcp-remote-direct` | `passed` | 1.000 | 2 | 0.963 |
 | [envoy-vuln-reachability-001](../tasks/secure_haiku_20260223_232545--baseline-local-direct--envoy-vuln-reachability-001.html) | [source](../../../benchmarks/ccb_secure/envoy-vuln-reachability-001) | `baseline-local-direct` | `passed` | 0.620 | 2 | 0.000 |
-| [sgonly_envoy-vuln-reachability-001](../tasks/secure_haiku_20260223_232545--mcp-remote-direct--sgonly_envoy-vuln-reachability-001.html) | [source](../../../benchmarks/ccb_secure/envoy-vuln-reachability-001) | `mcp-remote-direct` | `passed` | 0.560 | 2 | 0.923 |
+| [mcp_envoy-vuln-reachability-001_xNDUVv](../tasks/ccb_secure_haiku_20260228_124521--mcp-remote-direct--mcp_envoy-vuln-reachability-001_xNDUVv.html) | [source](../../../benchmarks/ccb_secure/envoy-vuln-reachability-001) | `mcp-remote-direct` | `passed` | 0.660 | 3 | 0.944 |
+| [sgonly_envoy-vuln-reachability-001](../tasks/secure_haiku_20260223_232545--mcp-remote-direct--sgonly_envoy-vuln-reachability-001.html) | [source](../../../benchmarks/ccb_secure/envoy-vuln-reachability-001) | `mcp-remote-direct` | `passed` | 0.560 | 3 | 0.923 |
 | [flipt-degraded-context-fix-001](../tasks/secure_haiku_20260223_232545--baseline-local-direct--flipt-degraded-context-fix-001.html) | [source](../../../benchmarks/ccb_secure/flipt-degraded-context-fix-001) | `baseline-local-direct` | `passed` | 0.600 | 2 | 0.000 |
-| [sgonly_flipt-degraded-context-fix-001](../tasks/secure_haiku_20260223_232545--mcp-remote-direct--sgonly_flipt-degraded-context-fix-001.html) | [source](../../../benchmarks/ccb_secure/flipt-degraded-context-fix-001) | `mcp-remote-direct` | `passed` | 0.250 | 2 | 0.333 |
+| [mcp_flipt-degraded-context-fix-001_glgbpu](../tasks/ccb_secure_haiku_20260228_124521--mcp-remote-direct--mcp_flipt-degraded-context-fix-001_glgbpu.html) | [source](../../../benchmarks/ccb_secure/flipt-degraded-context-fix-001) | `mcp-remote-direct` | `passed` | 0.450 | 3 | 0.271 |
+| [sgonly_flipt-degraded-context-fix-001](../tasks/secure_haiku_20260223_232545--mcp-remote-direct--sgonly_flipt-degraded-context-fix-001.html) | [source](../../../benchmarks/ccb_secure/flipt-degraded-context-fix-001) | `mcp-remote-direct` | `passed` | 0.250 | 3 | 0.333 |
 | [flipt-repo-scoped-access-001](../tasks/secure_haiku_20260223_232545--baseline-local-direct--flipt-repo-scoped-access-001.html) | [source](../../../benchmarks/ccb_secure/flipt-repo-scoped-access-001) | `baseline-local-direct` | `passed` | 0.600 | 2 | 0.000 |
 | [sgonly_flipt-repo-scoped-access-001](../tasks/secure_haiku_20260223_232545--mcp-remote-direct--sgonly_flipt-repo-scoped-access-001.html) | [source](../../../benchmarks/ccb_secure/flipt-repo-scoped-access-001) | `mcp-remote-direct` | `passed` | 0.600 | 2 | 0.184 |
 | [golang-net-cve-triage-001](../tasks/secure_haiku_20260223_232545--baseline-local-direct--golang-net-cve-triage-001.html) | [source](../../../benchmarks/ccb_secure/golang-net-cve-triage-001) | `baseline-local-direct` | `passed` | 0.800 | 2 | 0.000 |
@@ -59,10 +62,12 @@
 
 ## Multi-Run Variance
 
-Tasks with multiple valid runs (3 task/config pairs).
+Tasks with multiple valid runs (5 task/config pairs).
 
 | Task | Benchmark | Config | Runs | Mean | Std | Individual Rewards |
 |---|---|---|---:|---:|---:|---|
 | django-role-based-access-001 | [source](../../../benchmarks/ccb_secure/django-role-based-access-001) | `baseline-local-direct` | 2 | 0.200 | 0.000 | 0.200, 0.200 |
 | django-sensitive-file-exclusion-001 | [source](../../../benchmarks/ccb_secure/django-sensitive-file-exclusion-001) | `baseline-local-direct` | 2 | 0.800 | 0.000 | 0.800, 0.800 |
 | django-sensitive-file-exclusion-001 | [source](../../../benchmarks/ccb_secure/django-sensitive-file-exclusion-001) | `mcp-remote-direct` | 2 | 0.750 | 0.354 | 1.000, 0.500 |
+| envoy-vuln-reachability-001 | [source](../../../benchmarks/ccb_secure/envoy-vuln-reachability-001) | `mcp-remote-direct` | 2 | 0.610 | 0.071 | 0.560, 0.660 |
+| flipt-degraded-context-fix-001 | [source](../../../benchmarks/ccb_secure/flipt-degraded-context-fix-001) | `mcp-remote-direct` | 2 | 0.350 | 0.141 | 0.250, 0.450 |
