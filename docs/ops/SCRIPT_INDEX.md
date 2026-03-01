@@ -188,6 +188,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/plan_variance_runs.py` - Utility script for plan variance runs.
 - `scripts/push_base_images_ghcr.sh` - Utility script for push base images ghcr.
 - `scripts/regenerate_artifact_dockerfiles.py` - Utility script for regenerate artifact dockerfiles.
+- `scripts/rehost_sweap_images.py` - Utility script for rehost sweap images.
 - `scripts/remirror_mcp_unique_repos.sh` - Utility script for remirror mcp unique repos.
 - `scripts/repair_h3_trajectories.py` [one_off] - Historical one-off script: repair h3 trajectories.
 - `scripts/rerun_crossrepo_2tasks.sh` [one_off] - Historical one-off script: rerun crossrepo 2tasks.

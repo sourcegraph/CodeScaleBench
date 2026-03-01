@@ -249,13 +249,14 @@ runs/daytona/{run_id}/
 
 ## Task Readiness
 
-All 294 tasks across 20 suites are Daytona-ready. Base images are sourced from:
+273 of 294 tasks are Daytona-ready. Base images are sourced from:
 
 - **Standard public images** (197 tasks): `python:*`, `golang:*`, `gcc:*`, `ubuntu:*`, etc.
 - **Pre-built repo images** (70 tasks): `ghcr.io/sourcegraph/ccb-repo-*` on GHCR
-- **SWEAP images** (21 tasks): `jefzda/sweap-images:*` on Docker Hub
 - **TAC images** (4 tasks): `ghcr.io/theagentcompany/*` on GHCR
 - **Linux kernel tasks** (5 tasks): Build from `gcc:13` with inline kernel source clone
+
+**Not Daytona-compatible** (21 tasks): Tasks using `jefzda/sweap-images:*` from Docker Hub (9 ccb_debug + 12 ccb_fix) fail because Daytona's remote builder cannot pull from Docker Hub (returns `unauthorized` error even for public images). Run these tasks locally with Docker instead. To re-host them to GHCR, use `scripts/rehost_sweap_images.py` with a GITHUB_TOKEN that has `write:packages` scope.
 
 Regenerate the task registry after adding new tasks:
 ```bash
@@ -286,5 +287,7 @@ python3 scripts/build_daytona_registry.py
 **MCP config errors**: Verify `SRC_ACCESS_TOKEN` is valid: `curl -H "Authorization: token $SRC_ACCESS_TOKEN" https://sourcegraph.com/.api/graphql`.
 
 **Harbor + Daytona: sandbox not found**: Ensure `daytona-sdk` is installed in the same Python environment as Harbor. The `DaytonaEnvironment` imports from `daytona`.
+
+**Docker Hub images fail with "unauthorized"**: Daytona's remote builder cannot pull `jefzda/sweap-images:*` from Docker Hub. This affects 21 SWE-bench Pro tasks (9 ccb_debug + 12 ccb_fix). Run these locally or re-host images to GHCR using `scripts/rehost_sweap_images.py`.
 
 **Sandbox creation fails for tasks with `storage = "20G"` in task.toml**: Daytona has a hard 10GB per-sandbox storage limit. 39 tasks specify `storage = "20G"` and 1 specifies `"15G"`, exceeding this limit. Set `export DAYTONA_OVERRIDE_STORAGE=10240` before launching runs. This passes `--override-storage-mb 10240` to all `harbor run` commands, capping storage at 10GB. The actual Docker images are 1.5-5GB so 10GB is sufficient.
