@@ -591,13 +591,13 @@ _launch_task_pair() {
             local _df_artifact_bl="${abs_path}/environment/Dockerfile.artifact_baseline"
             local _df_artifact="${abs_path}/environment/Dockerfile.artifact_only"
             if [ -f "$_df_artifact_bl" ]; then
-                _bl_temp_dir=$(mktemp -d "/tmp/bl_${task_id}_XXXXXX")
+                _bl_temp_dir=$(_td=$(mktemp -d "/tmp/bl_${task_id}_XXXXXX") && _td_lower=$(echo "$_td" | tr '[:upper:]' '[:lower:]') && [ "$_td" != "$_td_lower" ] && mv "$_td" "$_td_lower"; echo "${_td_lower:-$_td}")
                 cp -a "${abs_path}/." "${_bl_temp_dir}/"
                 cp "$_df_artifact_bl" "${_bl_temp_dir}/environment/Dockerfile"
                 _bl_task_path="$_bl_temp_dir"
                 echo "  [artifact-baseline] Using local-code artifact Dockerfile for baseline: $task_id"
             elif [ -f "$_df_artifact" ]; then
-                _bl_temp_dir=$(mktemp -d "/tmp/bl_${task_id}_XXXXXX")
+                _bl_temp_dir=$(_td=$(mktemp -d "/tmp/bl_${task_id}_XXXXXX") && _td_lower=$(echo "$_td" | tr '[:upper:]' '[:lower:]') && [ "$_td" != "$_td_lower" ] && mv "$_td" "$_td_lower"; echo "${_td_lower:-$_td}")
                 cp -a "${abs_path}/." "${_bl_temp_dir}/"
                 cp "$_df_artifact" "${_bl_temp_dir}/environment/Dockerfile"
                 _bl_task_path="$_bl_temp_dir"
@@ -621,6 +621,8 @@ _launch_task_pair() {
                 --jobs-dir "$bl_jobs_dir" \
                 -n "$CONCURRENCY" \
                 --timeout-multiplier "$TIMEOUT_MULTIPLIER" \
+                ${HARBOR_ENV:+--env "$HARBOR_ENV"} \
+                ${DAYTONA_OVERRIDE_STORAGE:+--override-storage-mb "$DAYTONA_OVERRIDE_STORAGE"} \
                 2>&1 | tee -a "${bl_jobs_dir}.log" \
                 || echo "WARNING: $BASELINE_CONFIG failed: $task_id"
         ) &
@@ -639,7 +641,7 @@ _launch_task_pair() {
             # Artifact mode: use Dockerfile.artifact_only (full repo + artifact sentinel)
             local _df_artifact="${abs_path}/environment/Dockerfile.artifact_only"
             if [ -f "$_df_artifact" ]; then
-                _mcp_temp_dir=$(mktemp -d "/tmp/mcp_${task_id}_XXXXXX")
+                _mcp_temp_dir=$(_td=$(mktemp -d "/tmp/mcp_${task_id}_XXXXXX") && _td_lower=$(echo "$_td" | tr '[:upper:]' '[:lower:]') && [ "$_td" != "$_td_lower" ] && mv "$_td" "$_td_lower"; echo "${_td_lower:-$_td}")
                 cp -a "${abs_path}/." "${_mcp_temp_dir}/"
                 cp "${_mcp_temp_dir}/environment/Dockerfile.artifact_only" "${_mcp_temp_dir}/environment/Dockerfile"
                 _mcp_task_path="$_mcp_temp_dir"
@@ -651,7 +653,7 @@ _launch_task_pair() {
             # Direct mode: use Dockerfile.sg_only (empty workspace, agent uses MCP)
             local _df_sgonly="${abs_path}/environment/Dockerfile.sg_only"
             if [ -f "$_df_sgonly" ]; then
-                _mcp_temp_dir=$(mktemp -d "/tmp/mcp_${task_id}_XXXXXX")
+                _mcp_temp_dir=$(_td=$(mktemp -d "/tmp/mcp_${task_id}_XXXXXX") && _td_lower=$(echo "$_td" | tr '[:upper:]' '[:lower:]') && [ "$_td" != "$_td_lower" ] && mv "$_td" "$_td_lower"; echo "${_td_lower:-$_td}")
                 cp -a "${abs_path}/." "${_mcp_temp_dir}/"
                 cp "${_mcp_temp_dir}/environment/Dockerfile.sg_only" "${_mcp_temp_dir}/environment/Dockerfile"
                 _mcp_task_path="$_mcp_temp_dir"
@@ -688,6 +690,8 @@ _launch_task_pair() {
                 --jobs-dir "$full_jobs_dir" \
                 -n "$CONCURRENCY" \
                 --timeout-multiplier "$TIMEOUT_MULTIPLIER" \
+                ${HARBOR_ENV:+--env "$HARBOR_ENV"} \
+                ${DAYTONA_OVERRIDE_STORAGE:+--override-storage-mb "$DAYTONA_OVERRIDE_STORAGE"} \
                 2>&1 | tee -a "${full_jobs_dir}.log" \
                 || echo "WARNING: $FULL_CONFIG failed: $task_id"
         ) &
