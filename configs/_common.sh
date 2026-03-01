@@ -300,7 +300,7 @@ payload = json.dumps({
 req = urllib.request.Request(
     "https://console.anthropic.com/api/oauth/token",
     data=payload,
-    headers={"Content-Type": "application/json"},
+    headers={"Content-Type": "application/json", "User-Agent": "ccb-token-refresh/1.0"},
     method="POST"
 )
 
@@ -525,7 +525,11 @@ TOKCHK
         expiring)
             # Token is expired or expiring soon — try refresh
             echo "    Token expiring soon — attempting refresh..."
-            if HOME="$account_home" refresh_claude_token 2>&1 | sed 's/^/    /'; then
+            local _refresh_out
+            _refresh_out=$(HOME="$account_home" refresh_claude_token 2>&1)
+            local _refresh_rc=$?
+            echo "$_refresh_out" | sed 's/^/    /'
+            if [ "$_refresh_rc" -eq 0 ]; then
                 echo "    Token refreshed successfully"
                 return 0
             else
@@ -656,6 +660,13 @@ ensure_fresh_token_all() {
 # If a failed task's log matches any of these, it's eligible for retry on a different account.
 RATE_LIMIT_PATTERNS="rate.limit|429|too many requests|throttl|overloaded|token.*refresh.*fail|credentials.*expired|403.*Forbidden|capacity|resource_exhausted"
 
+# Daytona-specific transient error patterns (sandbox resource contention).
+# These are retried on the SAME account (not an auth issue) with backoff.
+DAYTONA_TRANSIENT_PATTERNS="[Ss]andbox not found|[Ss]andbox.*missing|[Ss]andbox.*does not exist|DaytonaError"
+
+# Maximum number of Daytona retry attempts per task (with exponential backoff).
+DAYTONA_MAX_RETRIES=${DAYTONA_MAX_RETRIES:-3}
+
 # Check if a task failure looks like a rate-limit / account-exhaustion error.
 # Args: $1 = task_id, $2 = log directory (where ${task_id}.log might be)
 # Returns 0 if rate-limited, 1 otherwise.
@@ -676,6 +687,32 @@ _is_rate_limited() {
     result_files=$(find "$log_dir" -name "result.json" -newer "$log_dir" -path "*${task_id}*" 2>/dev/null || true)
     for rf in $result_files; do
         if grep -qEi "$RATE_LIMIT_PATTERNS" "$rf" 2>/dev/null; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Check if a task failure looks like a transient Daytona sandbox error.
+# These are NOT account-related — retry on the same account after a delay.
+# Args: $1 = task_id, $2 = log directory
+# Returns 0 if Daytona transient error, 1 otherwise.
+_is_daytona_transient() {
+    local task_id=$1
+    local log_dir=$2
+
+    local log_file="${log_dir}/${task_id}.log"
+    if [ -f "$log_file" ]; then
+        if grep -qEi "$DAYTONA_TRANSIENT_PATTERNS" "$log_file" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    local result_files
+    result_files=$(find "$log_dir" -name "result.json" -newer "$log_dir" -path "*${task_id}*" 2>/dev/null || true)
+    for rf in $result_files; do
+        if grep -qEi "$DAYTONA_TRANSIENT_PATTERNS" "$rf" 2>/dev/null; then
             return 0
         fi
     done
@@ -715,11 +752,16 @@ run_tasks_parallel() {
     local account_idx=0
     local num_accounts=${#CLAUDE_HOMES[@]}
 
-    # Retry queue: tasks to retry on a different account
+    # Retry queue: tasks to retry on a different account (rate-limit)
     local retry_tasks=()
     local retry_homes=()
     # Track which tasks already retried (prevent infinite loops)
     declare -A _retried
+    # Daytona retry queue: tasks to retry on same account after backoff
+    local daytona_retry_tasks=()
+    local daytona_retry_homes=()
+    # Track Daytona retry counts per task (up to DAYTONA_MAX_RETRIES)
+    declare -A _daytona_retry_count
 
     # Infer log directory from the calling script's jobs_subdir variable (if set)
     local _log_dir="${jobs_subdir:-}"
@@ -770,6 +812,21 @@ run_tasks_parallel() {
                             _retried[$_task]=1
                         else
                             echo "WARNING: Task $_task rate-limited but no alternate account available"
+                            failed=1
+                        fi
+                    # Check if this is a Daytona transient error (sandbox not found)
+                    elif [ -n "$_log_dir" ] && \
+                         _is_daytona_transient "$_task" "$_log_dir"; then
+                        local _count="${_daytona_retry_count[$_task]:-0}"
+                        _count=$((_count + 1))
+                        if [ "$_count" -le "$DAYTONA_MAX_RETRIES" ]; then
+                            local _backoff=$(( 15 * _count ))  # 15s, 30s, 45s
+                            echo "DAYTONA RETRY ($_count/$DAYTONA_MAX_RETRIES): Task $_task sandbox error, retrying in ${_backoff}s on same account"
+                            _daytona_retry_count[$_task]=$_count
+                            daytona_retry_tasks+=("$_task")
+                            daytona_retry_homes+=("$_home")
+                        else
+                            echo "DAYTONA EXHAUSTED: Task $_task failed after $DAYTONA_MAX_RETRIES retries"
                             failed=1
                         fi
                     else
@@ -833,8 +890,8 @@ run_tasks_parallel() {
         _launch "$task_id" "$task_home"
     done
 
-    # Wait for remaining tasks, then process retry queue
-    while [ ${#pids[@]} -gt 0 ] || [ ${#retry_tasks[@]} -gt 0 ]; do
+    # Wait for remaining tasks, then process retry queues
+    while [ ${#pids[@]} -gt 0 ] || [ ${#retry_tasks[@]} -gt 0 ] || [ ${#daytona_retry_tasks[@]} -gt 0 ]; do
         if [ "$abort" = true ]; then break; fi
 
         # Drain running PIDs
@@ -846,7 +903,7 @@ run_tasks_parallel() {
             fi
         done
 
-        # Launch any queued retries
+        # Launch any queued rate-limit retries (different account)
         if [ ${#retry_tasks[@]} -gt 0 ]; then
             echo "Processing ${#retry_tasks[@]} rate-limit retry task(s)..."
             for ri in "${!retry_tasks[@]}"; do
@@ -862,6 +919,29 @@ run_tasks_parallel() {
             done
             retry_tasks=()
             retry_homes=()
+        fi
+
+        # Launch any queued Daytona retries (same account, with backoff)
+        if [ ${#daytona_retry_tasks[@]} -gt 0 ]; then
+            local _dt_count=${#daytona_retry_tasks[@]}
+            echo "Processing $_dt_count Daytona retry task(s) with backoff..."
+            for ri in "${!daytona_retry_tasks[@]}"; do
+                if [ "$abort" = true ]; then break; fi
+                local _task="${daytona_retry_tasks[$ri]}"
+                local _backoff=$(( 15 * ${_daytona_retry_count[$_task]:-1} ))
+                echo "  Waiting ${_backoff}s before retrying $_task..."
+                sleep "$_backoff"
+                while [ ${#pids[@]} -ge $PARALLEL_JOBS ]; do
+                    _reap_one
+                    if [ "$abort" = true ]; then break 2; fi
+                    if [ -z "$done_pid" ]; then
+                        sleep 2
+                    fi
+                done
+                _launch "${daytona_retry_tasks[$ri]}" "${daytona_retry_homes[$ri]}"
+            done
+            daytona_retry_tasks=()
+            daytona_retry_homes=()
         fi
     done
 

@@ -185,10 +185,16 @@ fi
 
 ensure_fresh_token_all  # also populates CLAUDE_HOMES[] via setup_multi_accounts
 
-# Auto-detect PARALLEL_TASKS from account count when not explicitly set via --parallel
+# Auto-detect PARALLEL_TASKS: Daytona supports 125 concurrent sandboxes,
+# local Docker is limited by account sessions.
 if [ "$PARALLEL_TASKS" -eq 0 ]; then
-    PARALLEL_TASKS=$PARALLEL_JOBS  # inherits SESSIONS_PER_ACCOUNT * num_accounts from _common.sh
-    echo "Parallel tasks auto-set to $PARALLEL_TASKS (from $SESSIONS_PER_ACCOUNT sessions x ${#CLAUDE_HOMES[@]} accounts)"
+    if [ "${HARBOR_ENV:-}" = "daytona" ]; then
+        PARALLEL_TASKS=125
+        echo "Parallel tasks auto-set to $PARALLEL_TASKS (Daytona mode, 125 concurrent sandboxes)"
+    else
+        PARALLEL_TASKS=$PARALLEL_JOBS  # inherits SESSIONS_PER_ACCOUNT * num_accounts from _common.sh
+        echo "Parallel tasks auto-set to $PARALLEL_TASKS (local Docker, $SESSIONS_PER_ACCOUNT sessions x ${#CLAUDE_HOMES[@]} accounts)"
+    fi
 fi
 
 # Derive baseline config and mcp_type values from FULL_CONFIG

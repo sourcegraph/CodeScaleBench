@@ -8,6 +8,8 @@ full operations manual.
 - All work happens on `main`. Do not create feature branches.
 - Every `harbor run` must be gated by interactive confirmation.
 - Before commit/push, run `python3 scripts/repo_health.py` (or `--quick` for docs/config-only changes).
+- **Daytona is the default execution environment.** Do not use local Docker unless a task is Daytona-incompatible (18 sweap-images tasks). See `docs/DAYTONA.md`.
+- **Parallelism**: Daytona runs at 125 concurrent sandboxes (auto-detected when `HARBOR_ENV=daytona`). Local Docker runs at 12 slots (3 accounts x 4 sessions). Never artificially cap Daytona parallelism below 125.
 
 ## Minimal Loading Policy
 - Default load order: this file + one relevant skill + one relevant doc.
@@ -15,8 +17,7 @@ full operations manual.
 - Prefer directory-local `AGENTS.md` / `CLAUDE.md` when working under `scripts/`, `configs/`, `tasks/`, or `docs/`.
 
 ## Fast Routing By Intent
-- Launch or rerun benchmarks: `docs/START_HERE_BY_TASK.md` -> "Launch / Rerun Benchmarks"
-- Run benchmarks on Daytona (cloud, no Docker needed): `docs/DAYTONA.md`
+- Launch or rerun benchmarks: `docs/DAYTONA.md` (Daytona, preferred) or `docs/START_HERE_BY_TASK.md`
 - Monitor / status: `docs/START_HERE_BY_TASK.md` -> "Monitor Active Runs"
 - Triage failures: `docs/START_HERE_BY_TASK.md` -> "Triage Failed Tasks"
 - Compare configs / MCP impact / IR: `docs/START_HERE_BY_TASK.md` -> "Analyze Results"
