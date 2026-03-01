@@ -149,18 +149,38 @@ def _has_agent_output(data: dict) -> bool:
 
 
 def _extract_model_from_config(trial_dir: Path) -> str | None:
-    """Extract model name from config.json.
+    """Extract model name from config.json, falling back to result.json.
 
-    Returns model name (e.g., 'anthropic/claude-opus-4-6') or None if not found.
+    Returns model name (e.g., 'anthropic/claude-haiku-4-5-20251001') or None if not found.
     """
+    # Primary: config.json (written by Harbor at launch)
     config_file = trial_dir / "config.json"
-    if not config_file.exists():
-        return None
-    try:
-        config_data = json.loads(config_file.read_text())
-        return config_data.get("agent", {}).get("model_name")
-    except (json.JSONDecodeError, OSError):
-        return None
+    if config_file.exists():
+        try:
+            config_data = json.loads(config_file.read_text())
+            model = config_data.get("agent", {}).get("model_name")
+            if model:
+                return model
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Fallback: result.json has the model embedded in two locations
+    result_file = trial_dir / "result.json"
+    if result_file.exists():
+        try:
+            result_data = json.loads(result_file.read_text())
+            # Try config.agent.model_name inside result.json
+            model = result_data.get("config", {}).get("agent", {}).get("model_name")
+            if model:
+                return model
+            # Try agent_info.model_info.name
+            model = result_data.get("agent_info", {}).get("model_info", {}).get("name")
+            if model:
+                return model
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return None
 
 
 def scan_config_dir(config_path: Path) -> dict[str, dict]:
@@ -825,7 +845,15 @@ def main():
                 pass
 
         # Extract model from first task (all tasks in a run should use same model)
-        model = first_task.get("model") or "anthropic/claude-opus-4-5-20251101"
+        # Try all tasks if first has no model (config.json may be missing for errored tasks)
+        model = first_task.get("model")
+        if not model:
+            for task_entry in tasks.values():
+                model = task_entry.get("model")
+                if model:
+                    break
+        if not model:
+            model = "unknown"
 
         run_entry = {
             "run_id": manifest_key.replace("/", "_"),

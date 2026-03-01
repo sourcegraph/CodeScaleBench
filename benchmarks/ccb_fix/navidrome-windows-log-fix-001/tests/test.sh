@@ -112,11 +112,11 @@ else
     echo "WARNING: Test patch failed to apply."
 fi
 
-echo "Running specific pytest tests..."
-echo "Tests: "TestLog""
+echo "Running Go tests..."
+echo "Tests: TestLog"
 
-# Run only the specific tests from fail_to_pass and pass_to_pass
-python -m pytest "TestLog" -v 2>&1 | tee test_output.log
+# Navidrome is a Go project using Ginkgo. Run the log package tests.
+go test -v -run "TestLog" ./log/... 2>&1 | tee test_output.log
 TEST_EXIT_CODE=$?
 
 # Write reward for Harbor with partial credit
