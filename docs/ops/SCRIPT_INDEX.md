@@ -40,6 +40,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/compute_retrieval_metrics.py` - Analysis/comparison script for compute retrieval metrics.
 - `scripts/cost_breakdown_analysis.py` - Analysis/comparison script for cost breakdown analysis.
 - `scripts/cost_report.py` - Aggregates token and cost metrics per run, suite, and config.
+- `scripts/doe_variance_analysis.py` - Analysis/comparison script for doe variance analysis.
 - `scripts/ds_audit.py` - Analysis/comparison script for ds audit.
 - `scripts/economic_analysis.py` - Analysis/comparison script for economic analysis.
 - `scripts/failure_analysis.py` - Analysis/comparison script for failure analysis.
