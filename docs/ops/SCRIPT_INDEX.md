@@ -173,6 +173,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/dependeval_eval_me.py` - Utility script for dependeval eval me.
 - `scripts/docgen_quality_sweep.py` - Utility script for docgen quality sweep.
 - `scripts/doe_power_curves.py` - Utility script for doe power curves.
+- `scripts/doe_select_tasks.py` - Utility script for doe select tasks.
 - `scripts/export_official_results.py` - Utility script for export official results.
 - `scripts/extract_analysis_metrics.py` - Utility script for extract analysis metrics.
 - `scripts/find_mcp_distracted.py` - Utility script for find mcp distracted.

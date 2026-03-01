@@ -2,22 +2,37 @@
 
 ## Overview
 
-The benchmark uses **180 tasks** across **9 SDLC-phase suites** (plus 220 MCP-unique tasks across 11 suites = **400 total**). The canonical task list is in `configs/selected_benchmark_tasks.json` (version 2.0, last updated 2026-03-01). Tasks were selected and reorganized from legacy suites via the SDLC migration. The original `ccb_build` suite was split into `ccb_feature` (feature implementation) and `ccb_refactor` (cross-file refactoring) for finer-grained capability analysis. See `docs/TASK_CATALOG.md` for the per-task reference.
+Selected **0 tasks** from 0 available across 7 benchmarks, stratified by SDLC phase with MCP benefit scoring.
 
-## SDLC Suite Coverage
+## SDLC Phase Coverage
 
-| Suite | SDLC Phase | Tasks |
-|-------|------------|------:|
-| ccb_understand | Requirements & Discovery | 20 |
-| ccb_design | Architecture & Design | 20 |
-| ccb_fix | Bug Repair | 20 |
-| ccb_feature | Feature Implementation | 20 |
-| ccb_refactor | Cross-File Refactoring | 20 |
-| ccb_test | Testing & QA | 20 |
-| ccb_document | Documentation | 20 |
-| ccb_secure | Security & Compliance | 20 |
-| ccb_debug | Debugging & Investigation | 20 |
-| **Total** | | **180** |
+| SDLC Phase | Tasks | Benchmarks |
+|------------|-------|------------|
+| Requirements & Discovery | 0 |  |
+| Architecture & Design | 0 |  |
+| Implementation (feature) | 0 |  |
+| Implementation (bug fix) | 0 |  |
+| Implementation (refactoring) | 0 |  |
+| Testing & QA | 0 |  |
+| Documentation | 0 |  |
+| Maintenance | 0 |  |
+
+## Benchmark Coverage
+
+| Benchmark | Available | Selected | Strategy |
+|-----------|-----------|----------|----------|
+| ccb_k8sdocs | — | 0 | All selected (small benchmark) |
+| ccb_largerepo | — | 0 | All selected (small benchmark) |
+| ccb_locobench | — | 0 | Priority: arch > refactoring > bug, by MCP score |
+| ccb_pytorch | — | 0 | Prefer hard difficulty, then most files modified |
+| ccb_swebenchpro | — | 0 | Proportional by repo, prefer most files changed |
+| ccb_sweperf | — | 0 | All selected (small benchmark) |
+| ccb_tac | — | 0 | All selected (small benchmark) |
+
+## Language Distribution
+
+| Language | Tasks |
+|----------|-------|
 
 ## MCP Benefit Scoring
 
@@ -30,49 +45,26 @@ score = 0.25 * context_complexity
       + 0.25 * task_category_weight
 ```
 
+**Average MCP benefit score:** 0.0000
+
 ### Component Definitions
 
-- **context_complexity**: Derived from codebase token count or benchmark-level proxy. Normalized: 1M+ tokens = 1.0
+- **context_complexity**: Derived from codebase token count (LoCoBench `context_length`) or benchmark-level proxy. Normalized: 1M+ tokens = 1.0
 - **cross_file_deps**: From `files_count`, `solution_files_changed`, or parsed from instruction.md. Normalized: 20+ files = 1.0
-- **semantic_search_potential**: High for large-repo tasks, find-in-codebase tasks, and tasks with large context
+- **semantic_search_potential**: High for large repos (ccb_largerepo=0.9), find-in-codebase tasks (0.8), large context (0.7)
 - **task_category_weight**: Per-category MCP affinity (architectural_understanding=1.0, cross_file_refactoring=0.9, etc.)
 
-Scoring is used for monitoring and curation; it does not gate inclusion. Suite-level MCP usage is reported and reviewed.
+## Per-Benchmark Selection Strategies
 
-## Difficulty Rescoring Formula
+### SWE-Bench Pro (~35 tasks)
+Proportional allocation by repository, ensuring at least 1 task per repo. Within each repo, tasks with the most files changed in their solution patch are preferred. Language corrections applied (e.g., NodeBB -> javascript, navidrome -> go). Diversity check ensures >=3 tasks each for Go, TypeScript, and JavaScript language families.
 
-Difficulty labels are now recomputed deterministically from task metadata in
-`configs/selected_benchmark_tasks.json` using `scripts/rescore_difficulty.py`.
+### LoCoBench Agent (~25 tasks)
+All bug_investigation tasks (3) selected first, then all cross_file_refactoring (13), then top architectural_understanding tasks by MCP score to fill remaining budget. All tasks have >700K token context and 70+ files.
 
-### Score Definition
+### GitHub Mined (~12 tasks)
+All PyTorch cross-module tasks. Selection prioritizes hard difficulty, then tasks with the most files modified in the ground truth PR.
 
-```
-difficulty_score =
-    0.40 * size_score
-  + 0.35 * complexity_score
-  + 0.25 * ground_truth_depth_score
-```
+### Small Benchmarks (all selected)
+ccb_largerepo (4), ccb_k8sdocs (5), ccb_tac (8), ccb_sweperf (3) — all tasks selected due to small size.
 
-Where:
-- `size_score` is derived from `context_length` and `files_count` bucketed norms
-- `complexity_score` is derived from cross-file dependency and semantic-reasoning
-  proxies (`mcp_breakdown` where available), with category fallback heuristics
-- `ground_truth_depth_score` is derived from verifier `reward_type` plus
-  ground-truth artifact richness (`tests/ground_truth.json`, `tests/criteria.json`,
-  `oracle_answer.json`)
-
-### Label Thresholds
-
-- `expert`: score >= 0.86
-- `hard`: score >= 0.62 and < 0.86
-- `medium`: score < 0.62
-
-Override:
-- `ccb_debug` tasks with `task_id` prefixed by `linux-` are forced to `expert`
-  (kernel fault-localization set).
-
-## Source of Truth
-
-- **Task list:** `configs/selected_benchmark_tasks.json`
-- **Per-task catalog:** `docs/TASK_CATALOG.md`
-- **Archived suites:** Retired or pre-migration suites remain under `benchmarks/archive/` for reproducibility.
