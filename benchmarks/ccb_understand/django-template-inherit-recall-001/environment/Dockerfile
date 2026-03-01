@@ -1,18 +1,23 @@
-FROM ccb-repo-django-674eda1c
+FROM python:3.11-slim
 
-# Inject sparse HISTORY.md to simulate institutional memory loss
-RUN cat > HISTORY.md << 'HISTORY'
-# Template Engine Changes
+ENV DEBIAN_FRONTEND=noninteractive
 
-## Recent Updates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-- 2024-01: Refactored block handling (Alex - no longer with team)
-- 2023-11: Fixed minor rendering issue
-- 2023-09: Updated template loader
-- 2023-06: Various fixes
+RUN (adduser --disabled-password --gecos '' claude 2>/dev/null || true)
 
-No detailed documentation available for template internals.
-Contact: Template team Slack channel (archived)
-HISTORY
+USER claude
+WORKDIR /workspace
+RUN git clone --depth 1 https://github.com/sg-evals/django--674eda1c.git . && \
+    git config user.email "agent@example.com" && \
+    git config user.name "Agent"
+USER root
 
-RUN git add HISTORY.md && git commit -m "update notes" --quiet
+RUN mkdir -p /logs/agent /logs/verifier && \
+    chown -R claude:claude /logs
+
+ENTRYPOINT []

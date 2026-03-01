@@ -1,21 +1,27 @@
-# kafka-flink-streaming-arch-001 — multi-repo baseline
-# Uses pre-built ccb-repo images to avoid git clone during Docker build.
-FROM ccb-repo-kafka-0753c489 AS kafka-src
-FROM ccb-repo-flink-0cc95fcc AS flink-src
-
 FROM eclipse-temurin:17-jdk
 
-WORKDIR /workspace
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
+    ca-certificates \
     curl \
     python3 \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=kafka-src /workspace /workspace/kafka
-COPY --from=flink-src /workspace /workspace/flink
+RUN (adduser --disabled-password --gecos '' claude 2>/dev/null || true)
 
-RUN cd /workspace/kafka && git config user.email "agent@example.com" && git config user.name "Agent" && \
+WORKDIR /workspace
+
+USER claude
+RUN git clone --depth 1 https://github.com/sg-evals/kafka--0753c489.git kafka && \
+    git clone --depth 1 https://github.com/sg-evals/flink--0cc95fcc.git flink && \
+    cd kafka && git config user.email "agent@example.com" && git config user.name "Agent" && \
     cd /workspace/flink && git config user.email "agent@example.com" && git config user.name "Agent"
+USER root
+
+RUN mkdir -p /logs/agent /logs/verifier && \
+    chown -R claude:claude /logs
+
+ENTRYPOINT []

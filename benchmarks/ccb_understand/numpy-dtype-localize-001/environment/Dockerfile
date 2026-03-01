@@ -1,21 +1,20 @@
-# numpy-dtype-localize-001 — multi-repo baseline
-# Repos cloned into /ccb_crossrepo/src/ to match verifier expectations.
-FROM ccb-repo-numpy-a639fbf5 AS numpy-src
-FROM ccb-repo-scikit-learn-cb7e82dd AS sklearn-src
-FROM ccb-repo-pandas-41968da5 AS pandas-src
+FROM ubuntu:22.04
 
-FROM python:3.11-slim
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
-    curl \
     ca-certificates \
+    python3 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /ccb_crossrepo/src
-COPY --from=numpy-src /workspace /ccb_crossrepo/src/numpy
-COPY --from=sklearn-src /workspace /ccb_crossrepo/src/scikit-learn
-COPY --from=pandas-src /workspace /ccb_crossrepo/src/pandas
+
+RUN git clone --depth 1 https://github.com/sg-evals/numpy--a639fbf5.git /ccb_crossrepo/src/numpy
+RUN git clone --depth 1 https://github.com/sg-evals/pandas--41968da5.git /ccb_crossrepo/src/pandas
+
+RUN (adduser --disabled-password --gecos '' claude 2>/dev/null || true)
 
 WORKDIR /workspace
 
@@ -23,3 +22,8 @@ RUN git init && \
     git config user.email "agent@example.com" && \
     git config user.name "Agent" && \
     git config --global safe.directory '*'
+
+RUN mkdir -p /logs/agent /logs/verifier && \
+    chown -R claude:claude /workspace /logs /ccb_crossrepo
+
+ENTRYPOINT []

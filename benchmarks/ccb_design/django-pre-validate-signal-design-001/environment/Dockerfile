@@ -1,53 +1,23 @@
-FROM ccb-repo-django-674eda1c
+FROM python:3.11-slim
 
-# Inject stale architecture doc describing deprecated SignalRegistry pattern
-RUN mkdir -p docs && cat > docs/signals_architecture.md << 'STALE_DOC'
-# Django Signal Dispatch Architecture
+ENV DEBIAN_FRONTEND=noninteractive
 
-## Signal Registration Pattern
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-Django uses a **centralized SignalRegistry** for all signal dispatch. Signals are NOT standalone
-objects — they must be registered through the registry with explicit priority ordering.
+RUN (adduser --disabled-password --gecos '' claude 2>/dev/null || true)
 
-### How to Add a New Signal
+USER claude
+WORKDIR /workspace
+RUN git clone --depth 1 https://github.com/sg-evals/django--674eda1c.git . && \
+    git config user.email "agent@example.com" && \
+    git config user.name "Agent"
+USER root
 
-1. Import `SignalRegistry` from `django.dispatch.registry`
-2. Create a signal definition dict with `name`, `providing_args`, and `priority`
-3. Register it: `SignalRegistry.register("signal_name", handler, priority=100)`
-4. Dispatch it: `SignalRegistry.dispatch("signal_name", sender=MyModel)`
+RUN mkdir -p /logs/agent /logs/verifier && \
+    chown -R claude:claude /logs
 
-### Example
-
-```python
-from django.dispatch.registry import SignalRegistry
-
-# Define and register a signal
-def my_handler(sender, **kwargs):
-    print(f"Signal from {sender}")
-
-SignalRegistry.register("pre_validate", my_handler, priority=50)
-
-# Dispatch the signal
-SignalRegistry.dispatch("pre_validate", sender=MyModel, instance=obj)
-```
-
-### Important Notes
-
-- Do NOT create `Signal()` objects directly — the registry manages all signal instances
-- Do NOT use `signal.connect()` — use `SignalRegistry.register()` instead
-- Always specify `priority` for handler ordering (lower = earlier)
-- Use `SignalRegistry.unregister("signal_name", handler)` to remove handlers
-- `providing_args` is required for all signals (list of argument names)
-
-### Common Model Signals (Pre-registered)
-
-All model signals are pre-registered in `SignalRegistry` with these priorities:
-- pre_save: priority=10
-- post_save: priority=20
-- pre_delete: priority=30
-- post_delete: priority=40
-
-To add a new model signal, register it with the appropriate priority in the model signals module.
-STALE_DOC
-
-RUN git add docs/signals_architecture.md && git commit -m "Add signals architecture documentation" --quiet
+ENTRYPOINT []

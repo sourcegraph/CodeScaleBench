@@ -15,10 +15,9 @@ RUN if ! command -v node &> /dev/null; then \
     apt-get install -y --no-install-recommends nodejs; \
     fi
 
-# Clone curl/curl at pinned curl-8_12_0 tag
-RUN git clone --filter=blob:none --no-checkout https://github.com/curl/curl.git /workspace && \
+# Clone curl at pinned commit via sg-evals mirror
+RUN git clone --depth 1 https://github.com/sg-evals/curl--09e25b9d.git /workspace && \
     cd /workspace && \
-    git checkout curl-8_12_0 && \
     git config user.email "agent@example.com" && \
     git config user.name "Agent"
 

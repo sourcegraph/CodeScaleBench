@@ -1,22 +1,21 @@
-# etcd-grpc-api-upgrade-001 — multi-repo baseline
-# Repos cloned into /ccb_crossrepo/src/ to match verifier expectations.
-FROM ccb-repo-etcd-d89978e8 AS etcd-src
-FROM ccb-repo-k8s-8c9c67c0 AS k8s-src
-FROM ccb-repo-containerd-317286ac AS containerd-src
+FROM ubuntu:22.04
 
-FROM golang:1.23-bookworm
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
-    curl \
-    python3 \
     ca-certificates \
+    python3 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /ccb_crossrepo/src
-COPY --from=etcd-src /workspace /ccb_crossrepo/src/etcd
-COPY --from=k8s-src /workspace /ccb_crossrepo/src/kubernetes
-COPY --from=containerd-src /workspace /ccb_crossrepo/src/containerd
+
+RUN git clone --depth 1 https://github.com/sg-evals/etcd--d89978e8.git /ccb_crossrepo/src/etcd
+RUN git clone --depth 1 https://github.com/sg-evals/kubernetes--8c9c67c0.git /ccb_crossrepo/src/kubernetes
+RUN git clone --depth 1 https://github.com/sg-evals/containerd--317286ac.git /ccb_crossrepo/src/containerd
+
+RUN (adduser --disabled-password --gecos '' claude 2>/dev/null || true)
 
 WORKDIR /workspace
 
@@ -24,3 +23,8 @@ RUN git init && \
     git config user.email "agent@example.com" && \
     git config user.name "Agent" && \
     git config --global safe.directory '*'
+
+RUN mkdir -p /logs/agent /logs/verifier && \
+    chown -R claude:claude /workspace /logs /ccb_crossrepo
+
+ENTRYPOINT []

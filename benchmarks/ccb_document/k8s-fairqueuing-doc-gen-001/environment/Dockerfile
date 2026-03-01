@@ -1,12 +1,25 @@
-FROM ccb-repo-k8s-8c9c67c0
+FROM golang:1.23-bookworm
 
-# SURGICAL: Remove ONLY the target doc.go (not recursive!)
-RUN rm -f staging/src/k8s.io/apiserver/pkg/util/flowcontrol/fairqueuing/queueset/doc.go
-# Strip "// Package ..." line from files in the immediate directory only
-RUN find staging/src/k8s.io/apiserver/pkg/util/flowcontrol/fairqueuing/queueset -maxdepth 1 -name "*.go" -exec sed -i '/^\/\/ Package/d' {} +
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Create test directory for verifier
-RUN mkdir -p /workspace/tests
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    python3 \
+    python3-pip \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Create /app directory for MCP config upload compatibility
-RUN mkdir -p /app
+RUN (adduser --disabled-password --gecos '' claude 2>/dev/null || true)
+
+USER claude
+WORKDIR /workspace
+RUN git clone --depth 1 https://github.com/sg-evals/kubernetes--8c9c67c0.git . && \
+    git config user.email "agent@example.com" && \
+    git config user.name "Agent"
+USER root
+
+RUN mkdir -p /logs/agent /logs/verifier && \
+    chown -R claude:claude /logs
+
+ENTRYPOINT []
