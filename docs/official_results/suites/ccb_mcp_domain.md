@@ -15,6 +15,11 @@
 | [ccb_mcp_domain_haiku_20260228_021254](../runs/ccb_mcp_domain_haiku_20260228_021254.md) | `baseline-local-direct` | 7 | 0.621 | 1.000 |
 | [ccb_mcp_domain_haiku_20260228_025547](../runs/ccb_mcp_domain_haiku_20260228_025547.md) | `mcp-remote-direct` | 3 | 0.444 | 1.000 |
 | [ccb_mcp_domain_haiku_20260228_123206](../runs/ccb_mcp_domain_haiku_20260228_123206.md) | `baseline-local-direct` | 3 | 0.424 | 1.000 |
+| [ccb_mcp_domain_haiku_20260301_191250](../runs/ccb_mcp_domain_haiku_20260301_191250.md) | `mcp-remote-direct` | 8 | 0.184 | 0.875 |
+| [ccb_mcp_domain_haiku_20260301_195739](../runs/ccb_mcp_domain_haiku_20260301_195739.md) | `baseline-local-direct` | 8 | 0.154 | 0.875 |
+| [ccb_mcp_domain_haiku_20260301_195739](../runs/ccb_mcp_domain_haiku_20260301_195739.md) | `mcp-remote-direct` | 10 | 0.159 | 0.800 |
+| [ccb_mcp_domain_haiku_20260302_014939](../runs/ccb_mcp_domain_haiku_20260302_014939.md) | `baseline-local-direct` | 2 | 0.080 | 0.500 |
+| [ccb_mcp_domain_haiku_20260302_014939](../runs/ccb_mcp_domain_haiku_20260302_014939.md) | `mcp-remote-direct` | 2 | 0.000 | 0.000 |
 
 ## Tasks
 
@@ -65,10 +70,40 @@
 | [ccx-domain-140](../tasks/ccb_mcp_domain_haiku_20260228_123206--baseline-local-direct--ccx-domain-140.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-140) | `baseline-local-direct` | `passed` | 0.300 | 3 | 0.000 |
 | [mcp_CCX-domain-140_7elUX2](../tasks/ccb_mcp_domain_haiku_20260224_181919--mcp-remote-artifact--mcp_CCX-domain-140_7elUX2.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-140) | `mcp-remote-artifact` | `passed` | 0.417 | 1 | 0.950 |
 | [mcp_CCX-domain-140_HN58OK](../tasks/ccb_mcp_domain_haiku_20260228_025547--mcp-remote-direct--mcp_CCX-domain-140_HN58OK.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-140) | `mcp-remote-direct` | `passed` | 0.300 | 1 | 0.900 |
+| [ccx-domain-151](../tasks/ccb_mcp_domain_haiku_20260301_195739--baseline-local-direct--ccx-domain-151.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-151) | `baseline-local-direct` | `passed` | 0.381 | 2 | 0.000 |
+| [mcp_ccx-domain-151_5dybdy](../tasks/ccb_mcp_domain_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-domain-151_5dybdy.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-151) | `mcp-remote-direct` | `passed` | 0.444 | 2 | 0.952 |
+| [mcp_ccx-domain-151_afvmdi](../tasks/ccb_mcp_domain_haiku_20260301_195739--mcp-remote-direct--mcp_ccx-domain-151_afvmdi.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-151) | `mcp-remote-direct` | `passed` | 0.435 | 2 | 0.958 |
+| [ccx-domain-152](../tasks/ccb_mcp_domain_haiku_20260301_195739--baseline-local-direct--ccx-domain-152.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-152) | `baseline-local-direct` | `passed` | 0.065 | 2 | 0.000 |
+| [mcp_ccx-domain-152_9ysagd](../tasks/ccb_mcp_domain_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-domain-152_9ysagd.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-152) | `mcp-remote-direct` | `passed` | 0.105 | 2 | 0.966 |
+| [mcp_ccx-domain-152_1vrp4a](../tasks/ccb_mcp_domain_haiku_20260301_195739--mcp-remote-direct--mcp_ccx-domain-152_1vrp4a.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-152) | `mcp-remote-direct` | `passed` | 0.077 | 2 | 0.939 |
+| [ccx-domain-153](../tasks/ccb_mcp_domain_haiku_20260301_195739--baseline-local-direct--ccx-domain-153.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-153) | `baseline-local-direct` | `passed` | 0.087 | 2 | 0.000 |
+| [mcp_ccx-domain-153_zamarf](../tasks/ccb_mcp_domain_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-domain-153_zamarf.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-153) | `mcp-remote-direct` | `passed` | 0.091 | 2 | 0.947 |
+| [mcp_ccx-domain-153_k03ddi](../tasks/ccb_mcp_domain_haiku_20260301_195739--mcp-remote-direct--mcp_ccx-domain-153_k03ddi.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-153) | `mcp-remote-direct` | `passed` | 0.067 | 2 | 0.926 |
+| [ccx-domain-154](../tasks/ccb_mcp_domain_haiku_20260302_014939--baseline-local-direct--ccx-domain-154.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-154) | `baseline-local-direct` | `passed` | 0.160 | 2 | 0.000 |
+| [mcp_ccx-domain-154_6yqb4h](../tasks/ccb_mcp_domain_haiku_20260301_195739--mcp-remote-direct--mcp_ccx-domain-154_6yqb4h.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-154) | `mcp-remote-direct` | `failed` | 0.000 | 2 | 0.971 |
+| [mcp_ccx-domain-154_n9wxac](../tasks/ccb_mcp_domain_haiku_20260302_014939--mcp-remote-direct--mcp_ccx-domain-154_n9wxac.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-154) | `mcp-remote-direct` | `failed` | 0.000 | 2 | 0.967 |
+| [ccx-domain-155](../tasks/ccb_mcp_domain_haiku_20260302_014939--baseline-local-direct--ccx-domain-155.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-155) | `baseline-local-direct` | `failed` | 0.000 | 2 | 0.000 |
+| [mcp_ccx-domain-155_dyywsa](../tasks/ccb_mcp_domain_haiku_20260301_195739--mcp-remote-direct--mcp_ccx-domain-155_dyywsa.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-155) | `mcp-remote-direct` | `failed` | 0.000 | 2 | 0.926 |
+| [mcp_ccx-domain-155_uyskpn](../tasks/ccb_mcp_domain_haiku_20260302_014939--mcp-remote-direct--mcp_ccx-domain-155_uyskpn.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-155) | `mcp-remote-direct` | `failed` | 0.000 | 2 | 0.970 |
+| [ccx-domain-156](../tasks/ccb_mcp_domain_haiku_20260301_195739--baseline-local-direct--ccx-domain-156.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-156) | `baseline-local-direct` | `passed` | 0.143 | 2 | 0.000 |
+| [mcp_ccx-domain-156_yqt4i1](../tasks/ccb_mcp_domain_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-domain-156_yqt4i1.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-156) | `mcp-remote-direct` | `passed` | 0.111 | 2 | 0.969 |
+| [mcp_ccx-domain-156_iz2ywr](../tasks/ccb_mcp_domain_haiku_20260301_195739--mcp-remote-direct--mcp_ccx-domain-156_iz2ywr.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-156) | `mcp-remote-direct` | `passed` | 0.210 | 2 | 0.905 |
+| [ccx-domain-157](../tasks/ccb_mcp_domain_haiku_20260301_195739--baseline-local-direct--ccx-domain-157.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-157) | `baseline-local-direct` | `failed` | 0.000 | 2 | 0.000 |
+| [mcp_ccx-domain-157_aultj1](../tasks/ccb_mcp_domain_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-domain-157_aultj1.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-157) | `mcp-remote-direct` | `passed` | 0.108 | 2 | 0.969 |
+| [mcp_ccx-domain-157_tade4f](../tasks/ccb_mcp_domain_haiku_20260301_195739--mcp-remote-direct--mcp_ccx-domain-157_tade4f.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-157) | `mcp-remote-direct` | `passed` | 0.061 | 2 | 0.974 |
+| [ccx-domain-158](../tasks/ccb_mcp_domain_haiku_20260301_195739--baseline-local-direct--ccx-domain-158.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-158) | `baseline-local-direct` | `passed` | 0.300 | 2 | 0.000 |
+| [mcp_ccx-domain-158_j4nusg](../tasks/ccb_mcp_domain_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-domain-158_j4nusg.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-158) | `mcp-remote-direct` | `passed` | 0.429 | 2 | 0.875 |
+| [mcp_ccx-domain-158_njabw1](../tasks/ccb_mcp_domain_haiku_20260301_195739--mcp-remote-direct--mcp_ccx-domain-158_njabw1.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-158) | `mcp-remote-direct` | `passed` | 0.429 | 2 | 0.929 |
+| [ccx-domain-159](../tasks/ccb_mcp_domain_haiku_20260301_195739--baseline-local-direct--ccx-domain-159.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-159) | `baseline-local-direct` | `passed` | 0.233 | 2 | 0.000 |
+| [mcp_ccx-domain-159_l9qsj3](../tasks/ccb_mcp_domain_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-domain-159_l9qsj3.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-159) | `mcp-remote-direct` | `passed` | 0.185 | 2 | 0.944 |
+| [mcp_ccx-domain-159_6rusau](../tasks/ccb_mcp_domain_haiku_20260301_195739--mcp-remote-direct--mcp_ccx-domain-159_6rusau.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-159) | `mcp-remote-direct` | `passed` | 0.250 | 2 | 0.955 |
+| [ccx-domain-160](../tasks/ccb_mcp_domain_haiku_20260301_195739--baseline-local-direct--ccx-domain-160.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-160) | `baseline-local-direct` | `passed` | 0.027 | 2 | 0.000 |
+| [mcp_ccx-domain-160_qncmgi](../tasks/ccb_mcp_domain_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-domain-160_qncmgi.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-160) | `mcp-remote-direct` | `failed` | 0.000 | 2 | 0.957 |
+| [mcp_ccx-domain-160_iz208h](../tasks/ccb_mcp_domain_haiku_20260301_195739--mcp-remote-direct--mcp_ccx-domain-160_iz208h.html) | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-160) | `mcp-remote-direct` | `passed` | 0.067 | 2 | 0.960 |
 
 ## Multi-Run Variance
 
-Tasks with multiple valid runs (17 task/config pairs).
+Tasks with multiple valid runs (37 task/config pairs).
 
 | Task | Benchmark | Config | Runs | Mean | Std | Individual Rewards |
 |---|---|---|---:|---:|---:|---|
@@ -89,3 +124,23 @@ Tasks with multiple valid runs (17 task/config pairs).
 | CCX-domain-129 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-129) | `baseline-local-direct` | 3 | 0.485 | 0.088 | 0.455, 0.585, 0.417 |
 | CCX-domain-137 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-137) | `baseline-local-direct` | 3 | 0.488 | 0.058 | 0.455, 0.455, 0.554 |
 | CCX-domain-140 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-140) | `baseline-local-direct` | 3 | 0.310 | 0.102 | 0.417, 0.214, 0.300 |
+| CCX-domain-151 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-151) | `baseline-local-direct` | 2 | 0.391 | 0.013 | 0.400, 0.381 |
+| CCX-domain-151 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-151) | `mcp-remote-direct` | 2 | 0.440 | 0.007 | 0.444, 0.435 |
+| CCX-domain-152 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-152) | `baseline-local-direct` | 2 | 0.080 | 0.022 | 0.095, 0.065 |
+| CCX-domain-152 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-152) | `mcp-remote-direct` | 2 | 0.091 | 0.020 | 0.105, 0.077 |
+| CCX-domain-153 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-153) | `baseline-local-direct` | 2 | 0.068 | 0.027 | 0.049, 0.087 |
+| CCX-domain-153 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-153) | `mcp-remote-direct` | 2 | 0.079 | 0.017 | 0.091, 0.067 |
+| CCX-domain-154 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-154) | `baseline-local-direct` | 2 | 0.123 | 0.052 | 0.087, 0.160 |
+| CCX-domain-154 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-154) | `mcp-remote-direct` | 2 | 0.000 | 0.000 | 0.000, 0.000 |
+| CCX-domain-155 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-155) | `baseline-local-direct` | 2 | 0.000 | 0.000 | 0.000, 0.000 |
+| CCX-domain-155 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-155) | `mcp-remote-direct` | 2 | 0.000 | 0.000 | 0.000, 0.000 |
+| CCX-domain-156 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-156) | `baseline-local-direct` | 2 | 0.157 | 0.020 | 0.171, 0.143 |
+| CCX-domain-156 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-156) | `mcp-remote-direct` | 2 | 0.161 | 0.070 | 0.111, 0.210 |
+| CCX-domain-157 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-157) | `baseline-local-direct` | 2 | 0.036 | 0.051 | 0.071, 0.000 |
+| CCX-domain-157 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-157) | `mcp-remote-direct` | 2 | 0.084 | 0.034 | 0.108, 0.061 |
+| CCX-domain-158 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-158) | `baseline-local-direct` | 2 | 0.400 | 0.141 | 0.500, 0.300 |
+| CCX-domain-158 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-158) | `mcp-remote-direct` | 2 | 0.429 | 0.000 | 0.429, 0.429 |
+| CCX-domain-159 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-159) | `baseline-local-direct` | 2 | 0.218 | 0.020 | 0.204, 0.233 |
+| CCX-domain-159 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-159) | `mcp-remote-direct` | 2 | 0.218 | 0.046 | 0.185, 0.250 |
+| CCX-domain-160 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-160) | `baseline-local-direct` | 2 | 0.014 | 0.019 | 0.000, 0.027 |
+| CCX-domain-160 | [source](../../../benchmarks/ccb_mcp_domain/ccx-domain-160) | `mcp-remote-direct` | 2 | 0.033 | 0.047 | 0.000, 0.067 |

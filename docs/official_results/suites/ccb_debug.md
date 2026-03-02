@@ -5,7 +5,13 @@
 | Run | Config | Valid Tasks | Mean Reward | Pass Rate |
 |---|---|---:|---:|---:|
 | [ccb_debug_haiku_20260228_025547](../runs/ccb_debug_haiku_20260228_025547.md) | `mcp-remote-direct` | 5 | 0.000 | 0.000 |
-| [debug_haiku_20260301_040300](../runs/debug_haiku_20260301_040300.md) | `baseline-local-direct` | 9 | 0.500 | 1.000 |
+| [ccb_debug_haiku_20260301_230240](../runs/ccb_debug_haiku_20260301_230240.md) | `mcp-remote-direct` | 2 | 0.500 | 1.000 |
+| [ccb_debug_haiku_20260302_004746](../runs/ccb_debug_haiku_20260302_004746.md) | `baseline-local-direct` | 1 | 0.500 | 1.000 |
+| [ccb_debug_haiku_20260302_004746](../runs/ccb_debug_haiku_20260302_004746.md) | `mcp-remote-direct` | 2 | 0.500 | 1.000 |
+| [ccb_debug_haiku_20260302_013713](../runs/ccb_debug_haiku_20260302_013713.md) | `mcp-remote-direct` | 1 | 0.500 | 1.000 |
+| [ccb_debug_haiku_20260302_022552](../runs/ccb_debug_haiku_20260302_022552.md) | `baseline-local-direct` | 1 | 0.500 | 1.000 |
+| [ccb_debug_haiku_20260302_022553](../runs/ccb_debug_haiku_20260302_022553.md) | `mcp-remote-direct` | 1 | 0.500 | 1.000 |
+| [debug_haiku_20260301_040300](../runs/debug_haiku_20260301_040300.md) | `baseline-local-direct` | 7 | 0.500 | 1.000 |
 | [debug_haiku_20260301_040300](../runs/debug_haiku_20260301_040300.md) | `mcp-remote-direct` | 9 | 0.389 | 0.778 |
 | [debug_haiku_20260301_071226](../runs/debug_haiku_20260301_071226.md) | `baseline-local-direct` | 11 | 0.842 | 1.000 |
 | [debug_haiku_20260301_071226](../runs/debug_haiku_20260301_071226.md) | `mcp-remote-direct` | 11 | 0.841 | 1.000 |
@@ -17,8 +23,8 @@
 | [ansible-galaxy-tar-regression-prove-001](../tasks/debug_haiku_20260301_040300--baseline-local-direct--ansible-galaxy-tar-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/ansible-galaxy-tar-regression-prove-001) | `baseline-local-direct` | `passed` | 0.500 | 4 | 0.000 |
 | [mcp_ansible-galaxy-tar-regression-prove-001_eJLVHH](../tasks/ccb_debug_haiku_20260228_025547--mcp-remote-direct--mcp_ansible-galaxy-tar-regression-prove-001_eJLVHH.html) | [source](../../../benchmarks/ccb_debug/ansible-galaxy-tar-regression-prove-001) | `mcp-remote-direct` | `failed` | 0.000 | 4 | 0.289 |
 | [sgonly_ansible-galaxy-tar-regression-prove-001](../tasks/debug_haiku_20260301_040300--mcp-remote-direct--sgonly_ansible-galaxy-tar-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/ansible-galaxy-tar-regression-prove-001) | `mcp-remote-direct` | `passed` | 0.500 | 4 | 0.459 |
-| [django-admins-migration-audit-001](../tasks/debug_haiku_20260301_071226--baseline-local-direct--django-admins-migration-audit-001.html) | [source](../../../benchmarks/ccb_debug/django-admins-migration-audit-001) | `baseline-local-direct` | `passed` | 1.000 | 6 | 0.000 |
-| [sgonly_django-admins-migration-audit-001](../tasks/debug_haiku_20260301_071226--mcp-remote-direct--sgonly_django-admins-migration-audit-001.html) | [source](../../../benchmarks/ccb_debug/django-admins-migration-audit-001) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.963 |
+| [django-admins-migration-audit-001](../tasks/debug_haiku_20260301_071226--baseline-local-direct--django-admins-migration-audit-001.html) | — | `baseline-local-direct` | `passed` | 1.000 | 6 | 0.000 |
+| [sgonly_django-admins-migration-audit-001](../tasks/debug_haiku_20260301_071226--mcp-remote-direct--sgonly_django-admins-migration-audit-001.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.963 |
 | [envoy-duplicate-headers-debug-001](../tasks/debug_haiku_20260301_071226--baseline-local-direct--envoy-duplicate-headers-debug-001.html) | [source](../../../benchmarks/ccb_debug/envoy-duplicate-headers-debug-001) | `baseline-local-direct` | `passed` | 0.950 | 7 | 0.000 |
 | [sgonly_envoy-duplicate-headers-debug-001](../tasks/debug_haiku_20260301_071226--mcp-remote-direct--sgonly_envoy-duplicate-headers-debug-001.html) | [source](../../../benchmarks/ccb_debug/envoy-duplicate-headers-debug-001) | `mcp-remote-direct` | `passed` | 0.920 | 6 | 0.962 |
 | [flipt-auth-cookie-regression-prove-001](../tasks/debug_haiku_20260301_040300--baseline-local-direct--flipt-auth-cookie-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/flipt-auth-cookie-regression-prove-001) | `baseline-local-direct` | `passed` | 0.500 | 4 | 0.000 |
@@ -36,8 +42,8 @@
 | [sgonly_linux-iwlwifi-subdevice-fault-001](../tasks/debug_haiku_20260301_071226--mcp-remote-direct--sgonly_linux-iwlwifi-subdevice-fault-001.html) | [source](../../../benchmarks/ccb_debug/linux-iwlwifi-subdevice-fault-001) | `mcp-remote-direct` | `passed` | 1.000 | 6 | 0.704 |
 | [linux-nfs-inode-revalidate-fault-001](../tasks/debug_haiku_20260301_071226--baseline-local-direct--linux-nfs-inode-revalidate-fault-001.html) | [source](../../../benchmarks/ccb_debug/linux-nfs-inode-revalidate-fault-001) | `baseline-local-direct` | `passed` | 0.300 | 8 | 0.000 |
 | [sgonly_linux-nfs-inode-revalidate-fault-001](../tasks/debug_haiku_20260301_071226--mcp-remote-direct--sgonly_linux-nfs-inode-revalidate-fault-001.html) | [source](../../../benchmarks/ccb_debug/linux-nfs-inode-revalidate-fault-001) | `mcp-remote-direct` | `passed` | 0.300 | 6 | 0.895 |
-| [linux-ssd-trim-timeout-fault-001](../tasks/debug_haiku_20260301_071226--baseline-local-direct--linux-ssd-trim-timeout-fault-001.html) | [source](../../../benchmarks/ccb_debug/linux-ssd-trim-timeout-fault-001) | `baseline-local-direct` | `passed` | 1.000 | 8 | 0.000 |
-| [sgonly_linux-ssd-trim-timeout-fault-001](../tasks/debug_haiku_20260301_071226--mcp-remote-direct--sgonly_linux-ssd-trim-timeout-fault-001.html) | [source](../../../benchmarks/ccb_debug/linux-ssd-trim-timeout-fault-001) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.800 |
+| [linux-ssd-trim-timeout-fault-001](../tasks/debug_haiku_20260301_071226--baseline-local-direct--linux-ssd-trim-timeout-fault-001.html) | — | `baseline-local-direct` | `passed` | 1.000 | 8 | 0.000 |
+| [sgonly_linux-ssd-trim-timeout-fault-001](../tasks/debug_haiku_20260301_071226--mcp-remote-direct--sgonly_linux-ssd-trim-timeout-fault-001.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.800 |
 | [prometheus-queue-reshard-debug-001](../tasks/debug_haiku_20260301_071226--baseline-local-direct--prometheus-queue-reshard-debug-001.html) | [source](../../../benchmarks/ccb_debug/prometheus-queue-reshard-debug-001) | `baseline-local-direct` | `passed` | 0.420 | 7 | 0.000 |
 | [sgonly_prometheus-queue-reshard-debug-001](../tasks/debug_haiku_20260301_071226--mcp-remote-direct--sgonly_prometheus-queue-reshard-debug-001.html) | [source](../../../benchmarks/ccb_debug/prometheus-queue-reshard-debug-001) | `mcp-remote-direct` | `passed` | 0.480 | 6 | 0.865 |
 | [qutebrowser-adblock-cache-regression-prove-001](../tasks/debug_haiku_20260301_040300--baseline-local-direct--qutebrowser-adblock-cache-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/qutebrowser-adblock-cache-regression-prove-001) | `baseline-local-direct` | `passed` | 0.500 | 4 | 0.000 |
@@ -51,25 +57,29 @@
 | [sgonly_qutebrowser-hsv-color-regression-prove-001](../tasks/debug_haiku_20260301_040300--mcp-remote-direct--sgonly_qutebrowser-hsv-color-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/qutebrowser-hsv-color-regression-prove-001) | `mcp-remote-direct` | `passed` | 0.500 | 4 | 0.319 |
 | [qutebrowser-url-regression-prove-001](../tasks/debug_haiku_20260301_040300--baseline-local-direct--qutebrowser-url-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/qutebrowser-url-regression-prove-001) | `baseline-local-direct` | `passed` | 0.500 | 3 | 0.000 |
 | [sgonly_qutebrowser-url-regression-prove-001](../tasks/debug_haiku_20260301_040300--mcp-remote-direct--sgonly_qutebrowser-url-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/qutebrowser-url-regression-prove-001) | `mcp-remote-direct` | `passed` | 0.500 | 3 | 0.119 |
-| [teleport-ssh-regression-prove-001](../tasks/debug_haiku_20260301_040300--baseline-local-direct--teleport-ssh-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/teleport-ssh-regression-prove-001) | `baseline-local-direct` | `passed` | 0.500 | 3 | 0.000 |
-| [sgonly_teleport-ssh-regression-prove-001](../tasks/debug_haiku_20260301_040300--mcp-remote-direct--sgonly_teleport-ssh-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/teleport-ssh-regression-prove-001) | `mcp-remote-direct` | `passed` | 0.500 | 3 | 0.565 |
+| [teleport-ssh-regression-prove-001](../tasks/ccb_debug_haiku_20260302_022552--baseline-local-direct--teleport-ssh-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/teleport-ssh-regression-prove-001) | `baseline-local-direct` | `passed` | 0.500 | 7 | 0.000 |
+| [mcp_teleport-ssh-regression-prove-001_fzxnag](../tasks/ccb_debug_haiku_20260302_004746--mcp-remote-direct--mcp_teleport-ssh-regression-prove-001_fzxnag.html) | [source](../../../benchmarks/ccb_debug/teleport-ssh-regression-prove-001) | `mcp-remote-direct` | `passed` | 0.500 | 5 | 0.800 |
+| [mcp_teleport-ssh-regression-prove-001_pyxplw](../tasks/ccb_debug_haiku_20260301_230240--mcp-remote-direct--mcp_teleport-ssh-regression-prove-001_pyxplw.html) | [source](../../../benchmarks/ccb_debug/teleport-ssh-regression-prove-001) | `mcp-remote-direct` | `passed` | 0.500 | 5 | 0.575 |
+| [sgonly_teleport-ssh-regression-prove-001](../tasks/debug_haiku_20260301_040300--mcp-remote-direct--sgonly_teleport-ssh-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/teleport-ssh-regression-prove-001) | `mcp-remote-direct` | `passed` | 0.500 | 5 | 0.565 |
 | [terraform-phantom-update-debug-001](../tasks/debug_haiku_20260301_071226--baseline-local-direct--terraform-phantom-update-debug-001.html) | [source](../../../benchmarks/ccb_debug/terraform-phantom-update-debug-001) | `baseline-local-direct` | `passed` | 0.950 | 7 | 0.000 |
 | [sgonly_terraform-phantom-update-debug-001](../tasks/debug_haiku_20260301_071226--mcp-remote-direct--sgonly_terraform-phantom-update-debug-001.html) | [source](../../../benchmarks/ccb_debug/terraform-phantom-update-debug-001) | `mcp-remote-direct` | `passed` | 1.000 | 6 | 0.897 |
-| [tutanota-search-regression-prove-001](../tasks/debug_haiku_20260301_040300--baseline-local-direct--tutanota-search-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/tutanota-search-regression-prove-001) | `baseline-local-direct` | `passed` | 0.500 | 3 | 0.000 |
-| [sgonly_tutanota-search-regression-prove-001](../tasks/debug_haiku_20260301_040300--mcp-remote-direct--sgonly_tutanota-search-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/tutanota-search-regression-prove-001) | `mcp-remote-direct` | `passed` | 0.500 | 3 | 0.512 |
+| [tutanota-search-regression-prove-001](../tasks/ccb_debug_haiku_20260302_004746--baseline-local-direct--tutanota-search-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/tutanota-search-regression-prove-001) | `baseline-local-direct` | `passed` | 0.500 | 5 | 0.000 |
+| [mcp_tutanota-search-regression-prove-001_s03ep4](../tasks/ccb_debug_haiku_20260302_004746--mcp-remote-direct--mcp_tutanota-search-regression-prove-001_s03ep4.html) | [source](../../../benchmarks/ccb_debug/tutanota-search-regression-prove-001) | `mcp-remote-direct` | `passed` | 0.500 | 7 | 0.455 |
+| [mcp_tutanota-search-regression-prove-001_yb9gom](../tasks/ccb_debug_haiku_20260301_230240--mcp-remote-direct--mcp_tutanota-search-regression-prove-001_yb9gom.html) | [source](../../../benchmarks/ccb_debug/tutanota-search-regression-prove-001) | `mcp-remote-direct` | `passed` | 0.500 | 7 | 0.647 |
+| [mcp_tutanota-search-regression-prove-001_idklps](../tasks/ccb_debug_haiku_20260302_013713--mcp-remote-direct--mcp_tutanota-search-regression-prove-001_idklps.html) | [source](../../../benchmarks/ccb_debug/tutanota-search-regression-prove-001) | `mcp-remote-direct` | `passed` | 0.500 | 7 | 0.404 |
+| [mcp_tutanota-search-regression-prove-001_qu1zvz](../tasks/ccb_debug_haiku_20260302_022553--mcp-remote-direct--mcp_tutanota-search-regression-prove-001_qu1zvz.html) | [source](../../../benchmarks/ccb_debug/tutanota-search-regression-prove-001) | `mcp-remote-direct` | `passed` | 0.500 | 7 | 0.538 |
+| [sgonly_tutanota-search-regression-prove-001](../tasks/debug_haiku_20260301_040300--mcp-remote-direct--sgonly_tutanota-search-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/tutanota-search-regression-prove-001) | `mcp-remote-direct` | `passed` | 0.500 | 7 | 0.512 |
 | [vuls-oval-regression-prove-001](../tasks/debug_haiku_20260301_040300--baseline-local-direct--vuls-oval-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/vuls-oval-regression-prove-001) | `baseline-local-direct` | `passed` | 0.500 | 3 | 0.000 |
 | [sgonly_vuls-oval-regression-prove-001](../tasks/debug_haiku_20260301_040300--mcp-remote-direct--sgonly_vuls-oval-regression-prove-001.html) | [source](../../../benchmarks/ccb_debug/vuls-oval-regression-prove-001) | `mcp-remote-direct` | `failed` | 0.000 | 3 | 0.413 |
 
 ## Multi-Run Variance
 
-Tasks with multiple valid runs (38 task/config pairs).
+Tasks with multiple valid runs (36 task/config pairs).
 
 | Task | Benchmark | Config | Runs | Mean | Std | Individual Rewards |
 |---|---|---|---:|---:|---:|---|
 | ansible-galaxy-tar-regression-prove-001 | [source](../../../benchmarks/ccb_debug/ansible-galaxy-tar-regression-prove-001) | `baseline-local-direct` | 3 | 0.500 | 0.000 | 0.500, 0.500, 0.500 |
 | ansible-galaxy-tar-regression-prove-001 | [source](../../../benchmarks/ccb_debug/ansible-galaxy-tar-regression-prove-001) | `mcp-remote-direct` | 4 | 0.375 | 0.250 | 0.000, 0.500, 0.500, 0.500 |
-| django-admins-migration-audit-001 | [source](../../../benchmarks/ccb_debug/django-admins-migration-audit-001) | `baseline-local-direct` | 6 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000, 1.000, 1.000 |
-| django-admins-migration-audit-001 | [source](../../../benchmarks/ccb_debug/django-admins-migration-audit-001) | `mcp-remote-direct` | 5 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000, 1.000 |
 | envoy-duplicate-headers-debug-001 | [source](../../../benchmarks/ccb_debug/envoy-duplicate-headers-debug-001) | `baseline-local-direct` | 7 | 0.917 | 0.040 | 0.860, 0.950, 0.920, 0.940, 0.860, 0.940, 0.950 |
 | envoy-duplicate-headers-debug-001 | [source](../../../benchmarks/ccb_debug/envoy-duplicate-headers-debug-001) | `mcp-remote-direct` | 6 | 0.878 | 0.055 | 0.890, 0.910, 0.770, 0.890, 0.890, 0.920 |
 | flipt-auth-cookie-regression-prove-001 | [source](../../../benchmarks/ccb_debug/flipt-auth-cookie-regression-prove-001) | `baseline-local-direct` | 4 | 0.500 | 0.000 | 0.500, 0.500, 0.500, 0.500 |
@@ -86,8 +96,6 @@ Tasks with multiple valid runs (38 task/config pairs).
 | linux-iwlwifi-subdevice-fault-001 | [source](../../../benchmarks/ccb_debug/linux-iwlwifi-subdevice-fault-001) | `mcp-remote-direct` | 6 | 0.950 | 0.122 | 0.700, 1.000, 1.000, 1.000, 1.000, 1.000 |
 | linux-nfs-inode-revalidate-fault-001 | [source](../../../benchmarks/ccb_debug/linux-nfs-inode-revalidate-fault-001) | `baseline-local-direct` | 8 | 0.300 | 0.000 | 0.300, 0.300, 0.300, 0.300, 0.300, 0.300, 0.300, 0.300 |
 | linux-nfs-inode-revalidate-fault-001 | [source](../../../benchmarks/ccb_debug/linux-nfs-inode-revalidate-fault-001) | `mcp-remote-direct` | 6 | 0.300 | 0.000 | 0.300, 0.300, 0.300, 0.300, 0.300, 0.300 |
-| linux-ssd-trim-timeout-fault-001 | [source](../../../benchmarks/ccb_debug/linux-ssd-trim-timeout-fault-001) | `baseline-local-direct` | 8 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000, 1.000, 1.000, 1.000, 1.000 |
-| linux-ssd-trim-timeout-fault-001 | [source](../../../benchmarks/ccb_debug/linux-ssd-trim-timeout-fault-001) | `mcp-remote-direct` | 5 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000, 1.000 |
 | prometheus-queue-reshard-debug-001 | [source](../../../benchmarks/ccb_debug/prometheus-queue-reshard-debug-001) | `baseline-local-direct` | 7 | 0.506 | 0.101 | 0.520, 0.620, 0.640, 0.480, 0.500, 0.360, 0.420 |
 | prometheus-queue-reshard-debug-001 | [source](../../../benchmarks/ccb_debug/prometheus-queue-reshard-debug-001) | `mcp-remote-direct` | 6 | 0.487 | 0.045 | 0.480, 0.560, 0.480, 0.420, 0.500, 0.480 |
 | qutebrowser-adblock-cache-regression-prove-001 | [source](../../../benchmarks/ccb_debug/qutebrowser-adblock-cache-regression-prove-001) | `baseline-local-direct` | 4 | 0.500 | 0.000 | 0.500, 0.500, 0.500, 0.500 |
@@ -98,9 +106,11 @@ Tasks with multiple valid runs (38 task/config pairs).
 | qutebrowser-hsv-color-regression-prove-001 | [source](../../../benchmarks/ccb_debug/qutebrowser-hsv-color-regression-prove-001) | `mcp-remote-direct` | 3 | 0.333 | 0.289 | 0.000, 0.500, 0.500 |
 | qutebrowser-url-regression-prove-001 | [source](../../../benchmarks/ccb_debug/qutebrowser-url-regression-prove-001) | `baseline-local-direct` | 3 | 0.500 | 0.000 | 0.500, 0.500, 0.500 |
 | qutebrowser-url-regression-prove-001 | [source](../../../benchmarks/ccb_debug/qutebrowser-url-regression-prove-001) | `mcp-remote-direct` | 3 | 0.500 | 0.000 | 0.500, 0.500, 0.500 |
-| teleport-ssh-regression-prove-001 | [source](../../../benchmarks/ccb_debug/teleport-ssh-regression-prove-001) | `mcp-remote-direct` | 3 | 0.333 | 0.289 | 0.500, 0.000, 0.500 |
+| teleport-ssh-regression-prove-001 | [source](../../../benchmarks/ccb_debug/teleport-ssh-regression-prove-001) | `baseline-local-direct` | 5 | 0.600 | 0.224 | 0.500, 0.500, 1.000, 0.500, 0.500 |
+| teleport-ssh-regression-prove-001 | [source](../../../benchmarks/ccb_debug/teleport-ssh-regression-prove-001) | `mcp-remote-direct` | 5 | 0.400 | 0.224 | 0.500, 0.000, 0.500, 0.500, 0.500 |
 | terraform-phantom-update-debug-001 | [source](../../../benchmarks/ccb_debug/terraform-phantom-update-debug-001) | `baseline-local-direct` | 7 | 0.961 | 0.029 | 1.000, 0.960, 0.950, 0.950, 1.000, 0.920, 0.950 |
 | terraform-phantom-update-debug-001 | [source](../../../benchmarks/ccb_debug/terraform-phantom-update-debug-001) | `mcp-remote-direct` | 6 | 0.960 | 0.032 | 0.950, 1.000, 0.950, 0.930, 0.930, 1.000 |
-| tutanota-search-regression-prove-001 | [source](../../../benchmarks/ccb_debug/tutanota-search-regression-prove-001) | `baseline-local-direct` | 3 | 0.500 | 0.000 | 0.500, 0.500, 0.500 |
+| tutanota-search-regression-prove-001 | [source](../../../benchmarks/ccb_debug/tutanota-search-regression-prove-001) | `baseline-local-direct` | 5 | 0.500 | 0.000 | 0.500, 0.500, 0.500, 0.500, 0.500 |
+| tutanota-search-regression-prove-001 | [source](../../../benchmarks/ccb_debug/tutanota-search-regression-prove-001) | `mcp-remote-direct` | 5 | 0.500 | 0.000 | 0.500, 0.500, 0.500, 0.500, 0.500 |
 | vuls-oval-regression-prove-001 | [source](../../../benchmarks/ccb_debug/vuls-oval-regression-prove-001) | `baseline-local-direct` | 3 | 0.500 | 0.000 | 0.500, 0.500, 0.500 |
 | vuls-oval-regression-prove-001 | [source](../../../benchmarks/ccb_debug/vuls-oval-regression-prove-001) | `mcp-remote-direct` | 3 | 0.167 | 0.289 | 0.000, 0.500, 0.000 |

@@ -14,30 +14,30 @@
 
 | Task | Benchmark | Config | Status | Reward | Runs | MCP Ratio |
 |---|---|---|---|---:|---:|---:|
-| [cilium-api-doc-gen-001](../tasks/document_haiku_20260301_071228--baseline-local-direct--cilium-api-doc-gen-001.html) | [source](../../../benchmarks/ccb_document/cilium-api-doc-gen-001) | `baseline-local-direct` | `passed` | 0.980 | 5 | 0.000 |
-| [mcp_cilium-api-doc-gen-001_091CkA](../tasks/ccb_document_haiku_20260228_025547--mcp-remote-direct--mcp_cilium-api-doc-gen-001_091CkA.html) | [source](../../../benchmarks/ccb_document/cilium-api-doc-gen-001) | `mcp-remote-direct` | `passed` | 0.970 | 5 | 0.958 |
-| [sgonly_cilium-api-doc-gen-001](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_cilium-api-doc-gen-001.html) | [source](../../../benchmarks/ccb_document/cilium-api-doc-gen-001) | `mcp-remote-direct` | `passed` | 0.960 | 5 | 0.950 |
-| [docgen-changelog-001](../tasks/document_haiku_20260301_071228--baseline-local-direct--docgen-changelog-001.html) | [source](../../../benchmarks/ccb_document/docgen-changelog-001) | `baseline-local-direct` | `passed` | 1.000 | 5 | 0.000 |
-| [mcp_docgen-changelog-001_dAdbQw](../tasks/ccb_document_haiku_20260228_025547--mcp-remote-direct--mcp_docgen-changelog-001_dAdbQw.html) | [source](../../../benchmarks/ccb_document/docgen-changelog-001) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.970 |
-| [sgonly_docgen-changelog-001](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_docgen-changelog-001.html) | [source](../../../benchmarks/ccb_document/docgen-changelog-001) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.935 |
+| [cilium-api-doc-gen-001](../tasks/document_haiku_20260301_071228--baseline-local-direct--cilium-api-doc-gen-001.html) | — | `baseline-local-direct` | `passed` | 0.980 | 5 | 0.000 |
+| [mcp_cilium-api-doc-gen-001_091CkA](../tasks/ccb_document_haiku_20260228_025547--mcp-remote-direct--mcp_cilium-api-doc-gen-001_091CkA.html) | — | `mcp-remote-direct` | `passed` | 0.970 | 5 | 0.958 |
+| [sgonly_cilium-api-doc-gen-001](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_cilium-api-doc-gen-001.html) | — | `mcp-remote-direct` | `passed` | 0.960 | 5 | 0.950 |
+| [docgen-changelog-001](../tasks/document_haiku_20260301_071228--baseline-local-direct--docgen-changelog-001.html) | — | `baseline-local-direct` | `passed` | 1.000 | 5 | 0.000 |
+| [mcp_docgen-changelog-001_dAdbQw](../tasks/ccb_document_haiku_20260228_025547--mcp-remote-direct--mcp_docgen-changelog-001_dAdbQw.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.970 |
+| [sgonly_docgen-changelog-001](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_docgen-changelog-001.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.935 |
 | [docgen-changelog-002](../tasks/document_haiku_20260301_071228--baseline-local-direct--docgen-changelog-002.html) | [source](../../../benchmarks/ccb_document/docgen-changelog-002) | `baseline-local-direct` | `passed` | 0.700 | 5 | 0.000 |
 | [mcp_docgen-changelog-002_FL0OCX](../tasks/ccb_document_haiku_20260228_025547--mcp-remote-direct--mcp_docgen-changelog-002_FL0OCX.html) | [source](../../../benchmarks/ccb_document/docgen-changelog-002) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.704 |
 | [sgonly_docgen-changelog-002](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_docgen-changelog-002.html) | [source](../../../benchmarks/ccb_document/docgen-changelog-002) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.913 |
-| [docgen-inline-001](../tasks/document_haiku_20260301_071228--baseline-local-direct--docgen-inline-001.html) | [source](../../../benchmarks/ccb_document/docgen-inline-001) | `baseline-local-direct` | `passed` | 1.000 | 4 | 0.000 |
-| [mcp_docgen-inline-001_Iah13n](../tasks/ccb_document_haiku_20260228_124521--mcp-remote-direct--mcp_docgen-inline-001_Iah13n.html) | [source](../../../benchmarks/ccb_document/docgen-inline-001) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.100 |
-| [sgonly_docgen-inline-001](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_docgen-inline-001.html) | [source](../../../benchmarks/ccb_document/docgen-inline-001) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.500 |
+| [docgen-inline-001](../tasks/document_haiku_20260301_071228--baseline-local-direct--docgen-inline-001.html) | — | `baseline-local-direct` | `passed` | 1.000 | 4 | 0.000 |
+| [mcp_docgen-inline-001_Iah13n](../tasks/ccb_document_haiku_20260228_124521--mcp-remote-direct--mcp_docgen-inline-001_Iah13n.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.100 |
+| [sgonly_docgen-inline-001](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_docgen-inline-001.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.500 |
 | [docgen-inline-002](../tasks/document_haiku_20260301_071228--baseline-local-direct--docgen-inline-002.html) | [source](../../../benchmarks/ccb_document/docgen-inline-002) | `baseline-local-direct` | `passed` | 1.000 | 5 | 0.000 |
 | [mcp_docgen-inline-002_5i12ae](../tasks/ccb_document_haiku_20260228_025547--mcp-remote-direct--mcp_docgen-inline-002_5i12ae.html) | [source](../../../benchmarks/ccb_document/docgen-inline-002) | `mcp-remote-direct` | `passed` | 0.880 | 5 | 0.261 |
 | [sgonly_docgen-inline-002](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_docgen-inline-002.html) | [source](../../../benchmarks/ccb_document/docgen-inline-002) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.353 |
-| [docgen-onboard-001](../tasks/document_haiku_20260301_071228--baseline-local-direct--docgen-onboard-001.html) | [source](../../../benchmarks/ccb_document/docgen-onboard-001) | `baseline-local-direct` | `passed` | 1.000 | 5 | 0.000 |
-| [mcp_docgen-onboard-001_hukfPp](../tasks/ccb_document_haiku_20260228_025547--mcp-remote-direct--mcp_docgen-onboard-001_hukfPp.html) | [source](../../../benchmarks/ccb_document/docgen-onboard-001) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.958 |
-| [sgonly_docgen-onboard-001](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_docgen-onboard-001.html) | [source](../../../benchmarks/ccb_document/docgen-onboard-001) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.947 |
+| [docgen-onboard-001](../tasks/document_haiku_20260301_071228--baseline-local-direct--docgen-onboard-001.html) | — | `baseline-local-direct` | `passed` | 1.000 | 5 | 0.000 |
+| [mcp_docgen-onboard-001_hukfPp](../tasks/ccb_document_haiku_20260228_025547--mcp-remote-direct--mcp_docgen-onboard-001_hukfPp.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.958 |
+| [sgonly_docgen-onboard-001](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_docgen-onboard-001.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.947 |
 | [docgen-runbook-001](../tasks/document_haiku_20260301_071228--baseline-local-direct--docgen-runbook-001.html) | [source](../../../benchmarks/ccb_document/docgen-runbook-001) | `baseline-local-direct` | `passed` | 0.880 | 5 | 0.000 |
 | [mcp_docgen-runbook-001_jYeNEv](../tasks/ccb_document_haiku_20260228_025547--mcp-remote-direct--mcp_docgen-runbook-001_jYeNEv.html) | [source](../../../benchmarks/ccb_document/docgen-runbook-001) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.941 |
 | [sgonly_docgen-runbook-001](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_docgen-runbook-001.html) | [source](../../../benchmarks/ccb_document/docgen-runbook-001) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.680 |
-| [docgen-runbook-002](../tasks/document_haiku_20260301_071228--baseline-local-direct--docgen-runbook-002.html) | [source](../../../benchmarks/ccb_document/docgen-runbook-002) | `baseline-local-direct` | `passed` | 1.000 | 5 | 0.000 |
-| [mcp_docgen-runbook-002_DNuQLB](../tasks/ccb_document_haiku_20260228_025547--mcp-remote-direct--mcp_docgen-runbook-002_DNuQLB.html) | [source](../../../benchmarks/ccb_document/docgen-runbook-002) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.944 |
-| [sgonly_docgen-runbook-002](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_docgen-runbook-002.html) | [source](../../../benchmarks/ccb_document/docgen-runbook-002) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.889 |
+| [docgen-runbook-002](../tasks/document_haiku_20260301_071228--baseline-local-direct--docgen-runbook-002.html) | — | `baseline-local-direct` | `passed` | 1.000 | 5 | 0.000 |
+| [mcp_docgen-runbook-002_DNuQLB](../tasks/ccb_document_haiku_20260228_025547--mcp-remote-direct--mcp_docgen-runbook-002_DNuQLB.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.944 |
+| [sgonly_docgen-runbook-002](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_docgen-runbook-002.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.889 |
 | [envoy-arch-doc-gen-001](../tasks/document_haiku_20260301_071228--baseline-local-direct--envoy-arch-doc-gen-001.html) | [source](../../../benchmarks/ccb_document/envoy-arch-doc-gen-001) | `baseline-local-direct` | `passed` | 0.970 | 5 | 0.000 |
 | [mcp_envoy-arch-doc-gen-001_uEBdoF](../tasks/ccb_document_haiku_20260228_025547--mcp-remote-direct--mcp_envoy-arch-doc-gen-001_uEBdoF.html) | [source](../../../benchmarks/ccb_document/envoy-arch-doc-gen-001) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.955 |
 | [sgonly_envoy-arch-doc-gen-001](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_envoy-arch-doc-gen-001.html) | [source](../../../benchmarks/ccb_document/envoy-arch-doc-gen-001) | `mcp-remote-direct` | `passed` | 0.960 | 5 | 0.900 |
@@ -73,34 +73,24 @@
 | [terraform-arch-doc-gen-001](../tasks/document_haiku_20260301_071228--baseline-local-direct--terraform-arch-doc-gen-001.html) | [source](../../../benchmarks/ccb_document/terraform-arch-doc-gen-001) | `baseline-local-direct` | `passed` | 0.270 | 5 | 0.000 |
 | [mcp_terraform-arch-doc-gen-001_4HxL3B](../tasks/ccb_document_haiku_20260228_025547--mcp-remote-direct--mcp_terraform-arch-doc-gen-001_4HxL3B.html) | [source](../../../benchmarks/ccb_document/terraform-arch-doc-gen-001) | `mcp-remote-direct` | `passed` | 0.590 | 5 | 0.920 |
 | [sgonly_terraform-arch-doc-gen-001](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_terraform-arch-doc-gen-001.html) | [source](../../../benchmarks/ccb_document/terraform-arch-doc-gen-001) | `mcp-remote-direct` | `passed` | 0.770 | 5 | 0.967 |
-| [terraform-migration-doc-gen-001](../tasks/document_haiku_20260301_071228--baseline-local-direct--terraform-migration-doc-gen-001.html) | [source](../../../benchmarks/ccb_document/terraform-migration-doc-gen-001) | `baseline-local-direct` | `passed` | 1.000 | 5 | 0.000 |
-| [mcp_terraform-migration-doc-gen-001_XjPeYr](../tasks/ccb_document_haiku_20260228_025547--mcp-remote-direct--mcp_terraform-migration-doc-gen-001_XjPeYr.html) | [source](../../../benchmarks/ccb_document/terraform-migration-doc-gen-001) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.857 |
-| [sgonly_terraform-migration-doc-gen-001](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_terraform-migration-doc-gen-001.html) | [source](../../../benchmarks/ccb_document/terraform-migration-doc-gen-001) | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.963 |
-| [vscode-api-doc-gen-001](../tasks/document_haiku_20260301_071228--baseline-local-direct--vscode-api-doc-gen-001.html) | [source](../../../benchmarks/ccb_document/vscode-api-doc-gen-001) | `baseline-local-direct` | `passed` | 1.000 | 4 | 0.000 |
-| [sgonly_vscode-api-doc-gen-001](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_vscode-api-doc-gen-001.html) | [source](../../../benchmarks/ccb_document/vscode-api-doc-gen-001) | `mcp-remote-direct` | `passed` | 1.000 | 4 | 0.941 |
+| [terraform-migration-doc-gen-001](../tasks/document_haiku_20260301_071228--baseline-local-direct--terraform-migration-doc-gen-001.html) | — | `baseline-local-direct` | `passed` | 1.000 | 5 | 0.000 |
+| [mcp_terraform-migration-doc-gen-001_XjPeYr](../tasks/ccb_document_haiku_20260228_025547--mcp-remote-direct--mcp_terraform-migration-doc-gen-001_XjPeYr.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.857 |
+| [sgonly_terraform-migration-doc-gen-001](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_terraform-migration-doc-gen-001.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 5 | 0.963 |
+| [vscode-api-doc-gen-001](../tasks/document_haiku_20260301_071228--baseline-local-direct--vscode-api-doc-gen-001.html) | — | `baseline-local-direct` | `passed` | 1.000 | 4 | 0.000 |
+| [sgonly_vscode-api-doc-gen-001](../tasks/document_haiku_20260301_071228--mcp-remote-direct--sgonly_vscode-api-doc-gen-001.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 4 | 0.941 |
 
 ## Multi-Run Variance
 
-Tasks with multiple valid runs (40 task/config pairs).
+Tasks with multiple valid runs (26 task/config pairs).
 
 | Task | Benchmark | Config | Runs | Mean | Std | Individual Rewards |
 |---|---|---|---:|---:|---:|---|
-| cilium-api-doc-gen-001 | [source](../../../benchmarks/ccb_document/cilium-api-doc-gen-001) | `baseline-local-direct` | 4 | 0.975 | 0.013 | 0.960, 0.990, 0.970, 0.980 |
-| cilium-api-doc-gen-001 | [source](../../../benchmarks/ccb_document/cilium-api-doc-gen-001) | `mcp-remote-direct` | 4 | 0.973 | 0.010 | 0.980, 0.970, 0.980, 0.960 |
-| docgen-changelog-001 | [source](../../../benchmarks/ccb_document/docgen-changelog-001) | `baseline-local-direct` | 4 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000 |
-| docgen-changelog-001 | [source](../../../benchmarks/ccb_document/docgen-changelog-001) | `mcp-remote-direct` | 4 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000 |
 | docgen-changelog-002 | [source](../../../benchmarks/ccb_document/docgen-changelog-002) | `baseline-local-direct` | 4 | 0.850 | 0.173 | 0.700, 1.000, 1.000, 0.700 |
 | docgen-changelog-002 | [source](../../../benchmarks/ccb_document/docgen-changelog-002) | `mcp-remote-direct` | 4 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000 |
-| docgen-inline-001 | [source](../../../benchmarks/ccb_document/docgen-inline-001) | `baseline-local-direct` | 4 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000 |
-| docgen-inline-001 | [source](../../../benchmarks/ccb_document/docgen-inline-001) | `mcp-remote-direct` | 4 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000 |
 | docgen-inline-002 | [source](../../../benchmarks/ccb_document/docgen-inline-002) | `baseline-local-direct` | 4 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000 |
 | docgen-inline-002 | [source](../../../benchmarks/ccb_document/docgen-inline-002) | `mcp-remote-direct` | 4 | 0.970 | 0.060 | 1.000, 0.880, 1.000, 1.000 |
-| docgen-onboard-001 | [source](../../../benchmarks/ccb_document/docgen-onboard-001) | `baseline-local-direct` | 4 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000 |
-| docgen-onboard-001 | [source](../../../benchmarks/ccb_document/docgen-onboard-001) | `mcp-remote-direct` | 4 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000 |
 | docgen-runbook-001 | [source](../../../benchmarks/ccb_document/docgen-runbook-001) | `baseline-local-direct` | 4 | 0.970 | 0.060 | 1.000, 1.000, 1.000, 0.880 |
 | docgen-runbook-001 | [source](../../../benchmarks/ccb_document/docgen-runbook-001) | `mcp-remote-direct` | 4 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000 |
-| docgen-runbook-002 | [source](../../../benchmarks/ccb_document/docgen-runbook-002) | `baseline-local-direct` | 4 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000 |
-| docgen-runbook-002 | [source](../../../benchmarks/ccb_document/docgen-runbook-002) | `mcp-remote-direct` | 4 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000 |
 | envoy-arch-doc-gen-001 | [source](../../../benchmarks/ccb_document/envoy-arch-doc-gen-001) | `baseline-local-direct` | 4 | 0.968 | 0.029 | 1.000, 0.930, 0.970, 0.970 |
 | envoy-arch-doc-gen-001 | [source](../../../benchmarks/ccb_document/envoy-arch-doc-gen-001) | `mcp-remote-direct` | 4 | 0.983 | 0.021 | 1.000, 1.000, 0.970, 0.960 |
 | envoy-migration-doc-gen-001 | [source](../../../benchmarks/ccb_document/envoy-migration-doc-gen-001) | `baseline-local-direct` | 4 | 0.738 | 0.154 | 0.650, 0.960, 0.620, 0.720 |
@@ -121,7 +111,3 @@ Tasks with multiple valid runs (40 task/config pairs).
 | kafka-api-doc-gen-001 | [source](../../../benchmarks/ccb_document/kafka-api-doc-gen-001) | `mcp-remote-direct` | 4 | 0.945 | 0.033 | 0.940, 0.990, 0.940, 0.910 |
 | terraform-arch-doc-gen-001 | [source](../../../benchmarks/ccb_document/terraform-arch-doc-gen-001) | `baseline-local-direct` | 4 | 0.365 | 0.075 | 0.420, 0.430, 0.340, 0.270 |
 | terraform-arch-doc-gen-001 | [source](../../../benchmarks/ccb_document/terraform-arch-doc-gen-001) | `mcp-remote-direct` | 4 | 0.635 | 0.090 | 0.590, 0.590, 0.590, 0.770 |
-| terraform-migration-doc-gen-001 | [source](../../../benchmarks/ccb_document/terraform-migration-doc-gen-001) | `baseline-local-direct` | 4 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000 |
-| terraform-migration-doc-gen-001 | [source](../../../benchmarks/ccb_document/terraform-migration-doc-gen-001) | `mcp-remote-direct` | 4 | 1.000 | 0.000 | 1.000, 1.000, 1.000, 1.000 |
-| vscode-api-doc-gen-001 | [source](../../../benchmarks/ccb_document/vscode-api-doc-gen-001) | `baseline-local-direct` | 3 | 0.993 | 0.011 | 0.980, 1.000, 1.000 |
-| vscode-api-doc-gen-001 | [source](../../../benchmarks/ccb_document/vscode-api-doc-gen-001) | `mcp-remote-direct` | 3 | 1.000 | 0.000 | 1.000, 1.000, 1.000 |

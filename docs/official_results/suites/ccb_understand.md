@@ -18,10 +18,10 @@
 |---|---|---|---|---:|---:|---:|
 | [argocd-arch-orient-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--argocd-arch-orient-001.html) | [source](../../../benchmarks/ccb_understand/argocd-arch-orient-001) | `baseline-local-direct` | `passed` | 0.750 | 4 | 0.000 |
 | [sgonly_argocd-arch-orient-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_argocd-arch-orient-001.html) | [source](../../../benchmarks/ccb_understand/argocd-arch-orient-001) | `mcp-remote-direct` | `passed` | 0.770 | 4 | 0.973 |
-| [argocd-sync-reconcile-qa-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--argocd-sync-reconcile-qa-001.html) | [source](../../../benchmarks/ccb_understand/argocd-sync-reconcile-qa-001) | `baseline-local-direct` | `passed` | 0.820 | 4 | 0.000 |
-| [sgonly_argocd-sync-reconcile-qa-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_argocd-sync-reconcile-qa-001.html) | [source](../../../benchmarks/ccb_understand/argocd-sync-reconcile-qa-001) | `mcp-remote-direct` | `passed` | 0.870 | 4 | 0.969 |
-| [cilium-ebpf-datapath-handoff-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--cilium-ebpf-datapath-handoff-001.html) | [source](../../../benchmarks/ccb_understand/cilium-ebpf-datapath-handoff-001) | `baseline-local-direct` | `passed` | 0.830 | 4 | 0.000 |
-| [sgonly_cilium-ebpf-datapath-handoff-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_cilium-ebpf-datapath-handoff-001.html) | [source](../../../benchmarks/ccb_understand/cilium-ebpf-datapath-handoff-001) | `mcp-remote-direct` | `passed` | 0.900 | 4 | 0.935 |
+| [argocd-sync-reconcile-qa-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--argocd-sync-reconcile-qa-001.html) | — | `baseline-local-direct` | `passed` | 0.820 | 4 | 0.000 |
+| [sgonly_argocd-sync-reconcile-qa-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_argocd-sync-reconcile-qa-001.html) | — | `mcp-remote-direct` | `passed` | 0.870 | 4 | 0.969 |
+| [cilium-ebpf-datapath-handoff-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--cilium-ebpf-datapath-handoff-001.html) | — | `baseline-local-direct` | `passed` | 0.830 | 4 | 0.000 |
+| [sgonly_cilium-ebpf-datapath-handoff-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_cilium-ebpf-datapath-handoff-001.html) | — | `mcp-remote-direct` | `passed` | 0.900 | 4 | 0.935 |
 | [cilium-ebpf-fault-qa-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--cilium-ebpf-fault-qa-001.html) | [source](../../../benchmarks/ccb_understand/cilium-ebpf-fault-qa-001) | `baseline-local-direct` | `passed` | 0.800 | 4 | 0.000 |
 | [sgonly_cilium-ebpf-fault-qa-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_cilium-ebpf-fault-qa-001.html) | [source](../../../benchmarks/ccb_understand/cilium-ebpf-fault-qa-001) | `mcp-remote-direct` | `passed` | 0.850 | 4 | 0.963 |
 | [cilium-project-orient-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--cilium-project-orient-001.html) | [source](../../../benchmarks/ccb_understand/cilium-project-orient-001) | `baseline-local-direct` | `passed` | 0.960 | 4 | 0.000 |
@@ -31,12 +31,12 @@
 | [sgonly_django-composite-field-recover-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_django-composite-field-recover-001.html) | [source](../../../benchmarks/ccb_understand/django-composite-field-recover-001) | `mcp-remote-direct` | `passed` | 0.400 | 5 | 0.279 |
 | [django-template-inherit-recall-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--django-template-inherit-recall-001.html) | [source](../../../benchmarks/ccb_understand/django-template-inherit-recall-001) | `baseline-local-direct` | `passed` | 0.800 | 4 | 0.000 |
 | [sgonly_django-template-inherit-recall-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_django-template-inherit-recall-001.html) | [source](../../../benchmarks/ccb_understand/django-template-inherit-recall-001) | `mcp-remote-direct` | `passed` | 0.800 | 4 | 0.309 |
-| [envoy-contributor-workflow-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--envoy-contributor-workflow-001.html) | [source](../../../benchmarks/ccb_understand/envoy-contributor-workflow-001) | `baseline-local-direct` | `passed` | 0.940 | 4 | 0.000 |
-| [sgonly_envoy-contributor-workflow-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_envoy-contributor-workflow-001.html) | [source](../../../benchmarks/ccb_understand/envoy-contributor-workflow-001) | `mcp-remote-direct` | `passed` | 0.940 | 4 | 0.900 |
-| [envoy-ext-authz-handoff-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--envoy-ext-authz-handoff-001.html) | [source](../../../benchmarks/ccb_understand/envoy-ext-authz-handoff-001) | `baseline-local-direct` | `passed` | 0.890 | 4 | 0.000 |
-| [sgonly_envoy-ext-authz-handoff-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_envoy-ext-authz-handoff-001.html) | [source](../../../benchmarks/ccb_understand/envoy-ext-authz-handoff-001) | `mcp-remote-direct` | `passed` | 0.830 | 4 | 0.950 |
-| [envoy-filter-chain-qa-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--envoy-filter-chain-qa-001.html) | [source](../../../benchmarks/ccb_understand/envoy-filter-chain-qa-001) | `baseline-local-direct` | `passed` | 1.000 | 4 | 0.000 |
-| [sgonly_envoy-filter-chain-qa-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_envoy-filter-chain-qa-001.html) | [source](../../../benchmarks/ccb_understand/envoy-filter-chain-qa-001) | `mcp-remote-direct` | `passed` | 0.960 | 4 | 0.973 |
+| [envoy-contributor-workflow-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--envoy-contributor-workflow-001.html) | — | `baseline-local-direct` | `passed` | 0.940 | 4 | 0.000 |
+| [sgonly_envoy-contributor-workflow-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_envoy-contributor-workflow-001.html) | — | `mcp-remote-direct` | `passed` | 0.940 | 4 | 0.900 |
+| [envoy-ext-authz-handoff-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--envoy-ext-authz-handoff-001.html) | — | `baseline-local-direct` | `passed` | 0.890 | 4 | 0.000 |
+| [sgonly_envoy-ext-authz-handoff-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_envoy-ext-authz-handoff-001.html) | — | `mcp-remote-direct` | `passed` | 0.830 | 4 | 0.950 |
+| [envoy-filter-chain-qa-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--envoy-filter-chain-qa-001.html) | — | `baseline-local-direct` | `passed` | 1.000 | 4 | 0.000 |
+| [sgonly_envoy-filter-chain-qa-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_envoy-filter-chain-qa-001.html) | — | `mcp-remote-direct` | `passed` | 0.960 | 4 | 0.973 |
 | [envoy-pool-ready-search-001](../tasks/ccb_understand_haiku_20260227_132300--baseline-local-direct--envoy-pool-ready-search-001.html) | — | `baseline-local-direct` | `passed` | 1.000 | 2 | 0.000 |
 | [mcp_envoy-pool-ready-search-001_EwEb4o](../tasks/ccb_understand_haiku_20260227_132300--mcp-remote-direct--mcp_envoy-pool-ready-search-001_EwEb4o.html) | — | `mcp-remote-direct` | `passed` | 0.300 | 2 | 0.000 |
 | [mcp_envoy-pool-ready-search-001_HxPKch](../tasks/ccb_understand_haiku_20260227_132304--mcp-remote-direct--mcp_envoy-pool-ready-search-001_HxPKch.html) | — | `mcp-remote-direct` | `passed` | 0.300 | 2 | 0.000 |
@@ -52,10 +52,10 @@
 | [grafana-field-calcs-search-001](../tasks/ccb_understand_haiku_20260227_132300--baseline-local-direct--grafana-field-calcs-search-001.html) | — | `baseline-local-direct` | `passed` | 1.000 | 2 | 0.000 |
 | [mcp_grafana-field-calcs-search-001_B5oEI1](../tasks/ccb_understand_haiku_20260227_132300--mcp-remote-direct--mcp_grafana-field-calcs-search-001_B5oEI1.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 2 | 0.000 |
 | [mcp_grafana-field-calcs-search-001_LFZ6hQ](../tasks/ccb_understand_haiku_20260227_132304--mcp-remote-direct--mcp_grafana-field-calcs-search-001_LFZ6hQ.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 2 | 0.000 |
-| [istio-xds-serving-qa-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--istio-xds-serving-qa-001.html) | [source](../../../benchmarks/ccb_understand/istio-xds-serving-qa-001) | `baseline-local-direct` | `passed` | 1.000 | 4 | 0.000 |
-| [sgonly_istio-xds-serving-qa-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_istio-xds-serving-qa-001.html) | [source](../../../benchmarks/ccb_understand/istio-xds-serving-qa-001) | `mcp-remote-direct` | `passed` | 1.000 | 4 | 0.968 |
-| [k8s-cri-containerd-reason-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--k8s-cri-containerd-reason-001.html) | [source](../../../benchmarks/ccb_understand/k8s-cri-containerd-reason-001) | `baseline-local-direct` | `passed` | 0.850 | 4 | 0.000 |
-| [sgonly_k8s-cri-containerd-reason-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_k8s-cri-containerd-reason-001.html) | [source](../../../benchmarks/ccb_understand/k8s-cri-containerd-reason-001) | `mcp-remote-direct` | `passed` | 0.850 | 4 | 0.846 |
+| [istio-xds-serving-qa-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--istio-xds-serving-qa-001.html) | — | `baseline-local-direct` | `passed` | 1.000 | 4 | 0.000 |
+| [sgonly_istio-xds-serving-qa-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_istio-xds-serving-qa-001.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 4 | 0.968 |
+| [k8s-cri-containerd-reason-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--k8s-cri-containerd-reason-001.html) | — | `baseline-local-direct` | `passed` | 0.850 | 4 | 0.000 |
+| [sgonly_k8s-cri-containerd-reason-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_k8s-cri-containerd-reason-001.html) | — | `mcp-remote-direct` | `passed` | 0.850 | 4 | 0.846 |
 | [k8s-eviction-sync-search-001](../tasks/ccb_understand_haiku_20260227_132304--baseline-local-direct--k8s-eviction-sync-search-001.html) | — | `baseline-local-direct` | `passed` | 1.000 | 2 | 0.000 |
 | [mcp_k8s-eviction-sync-search-001_KmypBE](../tasks/ccb_understand_haiku_20260227_132300--mcp-remote-direct--mcp_k8s-eviction-sync-search-001_KmypBE.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 2 | 0.714 |
 | [mcp_k8s-eviction-sync-search-001_auPFDM](../tasks/ccb_understand_haiku_20260227_132304--mcp-remote-direct--mcp_k8s-eviction-sync-search-001_auPFDM.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 2 | 0.625 |
@@ -73,8 +73,8 @@
 | [kafka-contributor-workflow-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--kafka-contributor-workflow-001.html) | [source](../../../benchmarks/ccb_understand/kafka-contributor-workflow-001) | `baseline-local-direct` | `passed` | 0.950 | 4 | 0.000 |
 | [mcp_kafka-contributor-workflow-001_M1NQMf](../tasks/ccb_understand_haiku_20260228_124521--mcp-remote-direct--mcp_kafka-contributor-workflow-001_M1NQMf.html) | [source](../../../benchmarks/ccb_understand/kafka-contributor-workflow-001) | `mcp-remote-direct` | `passed` | 0.890 | 5 | 0.944 |
 | [sgonly_kafka-contributor-workflow-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_kafka-contributor-workflow-001.html) | [source](../../../benchmarks/ccb_understand/kafka-contributor-workflow-001) | `mcp-remote-direct` | `passed` | 0.820 | 5 | 0.944 |
-| [kafka-message-lifecycle-qa-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--kafka-message-lifecycle-qa-001.html) | [source](../../../benchmarks/ccb_understand/kafka-message-lifecycle-qa-001) | `baseline-local-direct` | `passed` | 1.000 | 4 | 0.000 |
-| [sgonly_kafka-message-lifecycle-qa-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_kafka-message-lifecycle-qa-001.html) | [source](../../../benchmarks/ccb_understand/kafka-message-lifecycle-qa-001) | `mcp-remote-direct` | `passed` | 0.890 | 4 | 0.967 |
+| [kafka-message-lifecycle-qa-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--kafka-message-lifecycle-qa-001.html) | — | `baseline-local-direct` | `passed` | 1.000 | 4 | 0.000 |
+| [sgonly_kafka-message-lifecycle-qa-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_kafka-message-lifecycle-qa-001.html) | — | `mcp-remote-direct` | `passed` | 0.890 | 4 | 0.967 |
 | [numpy-dtype-localize-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--numpy-dtype-localize-001.html) | [source](../../../benchmarks/ccb_understand/numpy-dtype-localize-001) | `baseline-local-direct` | `passed` | 0.783 | 4 | 0.000 |
 | [sgonly_numpy-dtype-localize-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_numpy-dtype-localize-001.html) | [source](../../../benchmarks/ccb_understand/numpy-dtype-localize-001) | `mcp-remote-direct` | `passed` | 0.850 | 4 | 0.939 |
 | [pandas-pivot-internal-search-001](../tasks/ccb_understand_haiku_20260227_132300--baseline-local-direct--pandas-pivot-internal-search-001.html) | — | `baseline-local-direct` | `passed` | 1.000 | 2 | 0.000 |
@@ -91,26 +91,22 @@
 | [mcp_sklearn-fastica-fit-search-001_unhAKu](../tasks/ccb_understand_haiku_20260227_132304--mcp-remote-direct--mcp_sklearn-fastica-fit-search-001_unhAKu.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 2 | 0.000 |
 | [terraform-plan-pipeline-qa-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--terraform-plan-pipeline-qa-001.html) | [source](../../../benchmarks/ccb_understand/terraform-plan-pipeline-qa-001) | `baseline-local-direct` | `passed` | 1.000 | 4 | 0.000 |
 | [sgonly_terraform-plan-pipeline-qa-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_terraform-plan-pipeline-qa-001.html) | [source](../../../benchmarks/ccb_understand/terraform-plan-pipeline-qa-001) | `mcp-remote-direct` | `passed` | 0.950 | 4 | 0.935 |
-| [terraform-state-backend-handoff-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--terraform-state-backend-handoff-001.html) | [source](../../../benchmarks/ccb_understand/terraform-state-backend-handoff-001) | `baseline-local-direct` | `passed` | 0.660 | 4 | 0.000 |
-| [sgonly_terraform-state-backend-handoff-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_terraform-state-backend-handoff-001.html) | [source](../../../benchmarks/ccb_understand/terraform-state-backend-handoff-001) | `mcp-remote-direct` | `passed` | 0.730 | 4 | 0.903 |
-| [vscode-ext-host-qa-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--vscode-ext-host-qa-001.html) | [source](../../../benchmarks/ccb_understand/vscode-ext-host-qa-001) | `baseline-local-direct` | `passed` | 0.950 | 4 | 0.000 |
-| [sgonly_vscode-ext-host-qa-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_vscode-ext-host-qa-001.html) | [source](../../../benchmarks/ccb_understand/vscode-ext-host-qa-001) | `mcp-remote-direct` | `passed` | 1.000 | 4 | 0.957 |
+| [terraform-state-backend-handoff-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--terraform-state-backend-handoff-001.html) | — | `baseline-local-direct` | `passed` | 0.660 | 4 | 0.000 |
+| [sgonly_terraform-state-backend-handoff-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_terraform-state-backend-handoff-001.html) | — | `mcp-remote-direct` | `passed` | 0.730 | 4 | 0.903 |
+| [vscode-ext-host-qa-001](../tasks/understand_haiku_20260301_071233--baseline-local-direct--vscode-ext-host-qa-001.html) | — | `baseline-local-direct` | `passed` | 0.950 | 4 | 0.000 |
+| [sgonly_vscode-ext-host-qa-001](../tasks/understand_haiku_20260301_071233--mcp-remote-direct--sgonly_vscode-ext-host-qa-001.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 4 | 0.957 |
 | [vscode-keybinding-merge-search-001](../tasks/ccb_understand_haiku_20260227_132304--baseline-local-direct--vscode-keybinding-merge-search-001.html) | — | `baseline-local-direct` | `failed` | 0.000 | 2 | 0.000 |
 | [mcp_vscode-keybinding-merge-search-001_yI3kCw](../tasks/ccb_understand_haiku_20260227_132300--mcp-remote-direct--mcp_vscode-keybinding-merge-search-001_yI3kCw.html) | — | `mcp-remote-direct` | `failed` | 0.000 | 2 | 0.000 |
 | [mcp_vscode-keybinding-merge-search-001_ZZiuGd](../tasks/ccb_understand_haiku_20260227_132304--mcp-remote-direct--mcp_vscode-keybinding-merge-search-001_ZZiuGd.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 2 | 0.000 |
 
 ## Multi-Run Variance
 
-Tasks with multiple valid runs (40 task/config pairs).
+Tasks with multiple valid runs (20 task/config pairs).
 
 | Task | Benchmark | Config | Runs | Mean | Std | Individual Rewards |
 |---|---|---|---:|---:|---:|---|
 | argocd-arch-orient-001 | [source](../../../benchmarks/ccb_understand/argocd-arch-orient-001) | `baseline-local-direct` | 3 | 0.487 | 0.422 | 0.000, 0.710, 0.750 |
 | argocd-arch-orient-001 | [source](../../../benchmarks/ccb_understand/argocd-arch-orient-001) | `mcp-remote-direct` | 3 | 0.783 | 0.023 | 0.810, 0.770, 0.770 |
-| argocd-sync-reconcile-qa-001 | [source](../../../benchmarks/ccb_understand/argocd-sync-reconcile-qa-001) | `baseline-local-direct` | 3 | 0.870 | 0.050 | 0.920, 0.870, 0.820 |
-| argocd-sync-reconcile-qa-001 | [source](../../../benchmarks/ccb_understand/argocd-sync-reconcile-qa-001) | `mcp-remote-direct` | 3 | 0.860 | 0.026 | 0.830, 0.880, 0.870 |
-| cilium-ebpf-datapath-handoff-001 | [source](../../../benchmarks/ccb_understand/cilium-ebpf-datapath-handoff-001) | `baseline-local-direct` | 3 | 0.870 | 0.115 | 1.000, 0.780, 0.830 |
-| cilium-ebpf-datapath-handoff-001 | [source](../../../benchmarks/ccb_understand/cilium-ebpf-datapath-handoff-001) | `mcp-remote-direct` | 3 | 0.887 | 0.051 | 0.830, 0.930, 0.900 |
 | cilium-ebpf-fault-qa-001 | [source](../../../benchmarks/ccb_understand/cilium-ebpf-fault-qa-001) | `baseline-local-direct` | 3 | 0.813 | 0.051 | 0.770, 0.870, 0.800 |
 | cilium-ebpf-fault-qa-001 | [source](../../../benchmarks/ccb_understand/cilium-ebpf-fault-qa-001) | `mcp-remote-direct` | 3 | 0.890 | 0.096 | 0.820, 1.000, 0.850 |
 | cilium-project-orient-001 | [source](../../../benchmarks/ccb_understand/cilium-project-orient-001) | `baseline-local-direct` | 3 | 0.623 | 0.540 | 0.000, 0.910, 0.960 |
@@ -119,29 +115,13 @@ Tasks with multiple valid runs (40 task/config pairs).
 | django-composite-field-recover-001 | [source](../../../benchmarks/ccb_understand/django-composite-field-recover-001) | `mcp-remote-direct` | 4 | 0.487 | 0.175 | 0.750, 0.400, 0.400, 0.400 |
 | django-template-inherit-recall-001 | [source](../../../benchmarks/ccb_understand/django-template-inherit-recall-001) | `baseline-local-direct` | 3 | 0.617 | 0.318 | 0.250, 0.800, 0.800 |
 | django-template-inherit-recall-001 | [source](../../../benchmarks/ccb_understand/django-template-inherit-recall-001) | `mcp-remote-direct` | 2 | 0.525 | 0.389 | 0.250, 0.800 |
-| envoy-contributor-workflow-001 | [source](../../../benchmarks/ccb_understand/envoy-contributor-workflow-001) | `baseline-local-direct` | 3 | 0.963 | 0.021 | 0.970, 0.980, 0.940 |
-| envoy-contributor-workflow-001 | [source](../../../benchmarks/ccb_understand/envoy-contributor-workflow-001) | `mcp-remote-direct` | 3 | 0.937 | 0.025 | 0.910, 0.960, 0.940 |
-| envoy-ext-authz-handoff-001 | [source](../../../benchmarks/ccb_understand/envoy-ext-authz-handoff-001) | `baseline-local-direct` | 3 | 0.850 | 0.069 | 0.770, 0.890, 0.890 |
-| envoy-ext-authz-handoff-001 | [source](../../../benchmarks/ccb_understand/envoy-ext-authz-handoff-001) | `mcp-remote-direct` | 4 | 0.830 | 0.000 | 0.830, 0.830, 0.830, 0.830 |
-| envoy-filter-chain-qa-001 | [source](../../../benchmarks/ccb_understand/envoy-filter-chain-qa-001) | `baseline-local-direct` | 3 | 0.967 | 0.035 | 0.970, 0.930, 1.000 |
-| envoy-filter-chain-qa-001 | [source](../../../benchmarks/ccb_understand/envoy-filter-chain-qa-001) | `mcp-remote-direct` | 3 | 0.947 | 0.061 | 0.880, 1.000, 0.960 |
 | envoy-request-routing-qa-001 | [source](../../../benchmarks/ccb_understand/envoy-request-routing-qa-001) | `baseline-local-direct` | 3 | 0.623 | 0.540 | 0.000, 0.910, 0.960 |
 | envoy-request-routing-qa-001 | [source](../../../benchmarks/ccb_understand/envoy-request-routing-qa-001) | `mcp-remote-direct` | 3 | 0.897 | 0.023 | 0.870, 0.910, 0.910 |
-| istio-xds-serving-qa-001 | [source](../../../benchmarks/ccb_understand/istio-xds-serving-qa-001) | `baseline-local-direct` | 3 | 1.000 | 0.000 | 1.000, 1.000, 1.000 |
-| istio-xds-serving-qa-001 | [source](../../../benchmarks/ccb_understand/istio-xds-serving-qa-001) | `mcp-remote-direct` | 3 | 1.000 | 0.000 | 1.000, 1.000, 1.000 |
-| k8s-cri-containerd-reason-001 | [source](../../../benchmarks/ccb_understand/k8s-cri-containerd-reason-001) | `baseline-local-direct` | 3 | 0.850 | 0.000 | 0.850, 0.850, 0.850 |
-| k8s-cri-containerd-reason-001 | [source](../../../benchmarks/ccb_understand/k8s-cri-containerd-reason-001) | `mcp-remote-direct` | 3 | 0.850 | 0.000 | 0.850, 0.850, 0.850 |
 | kafka-build-orient-001 | [source](../../../benchmarks/ccb_understand/kafka-build-orient-001) | `baseline-local-direct` | 4 | 0.600 | 0.404 | 0.720, 0.840, 0.000, 0.840 |
 | kafka-build-orient-001 | [source](../../../benchmarks/ccb_understand/kafka-build-orient-001) | `mcp-remote-direct` | 3 | 0.850 | 0.072 | 0.870, 0.910, 0.770 |
 | kafka-contributor-workflow-001 | [source](../../../benchmarks/ccb_understand/kafka-contributor-workflow-001) | `baseline-local-direct` | 3 | 0.940 | 0.017 | 0.950, 0.920, 0.950 |
 | kafka-contributor-workflow-001 | [source](../../../benchmarks/ccb_understand/kafka-contributor-workflow-001) | `mcp-remote-direct` | 4 | 0.838 | 0.035 | 0.820, 0.890, 0.820, 0.820 |
-| kafka-message-lifecycle-qa-001 | [source](../../../benchmarks/ccb_understand/kafka-message-lifecycle-qa-001) | `baseline-local-direct` | 3 | 0.953 | 0.081 | 0.860, 1.000, 1.000 |
-| kafka-message-lifecycle-qa-001 | [source](../../../benchmarks/ccb_understand/kafka-message-lifecycle-qa-001) | `mcp-remote-direct` | 3 | 0.933 | 0.059 | 1.000, 0.910, 0.890 |
 | numpy-dtype-localize-001 | [source](../../../benchmarks/ccb_understand/numpy-dtype-localize-001) | `baseline-local-direct` | 3 | 0.733 | 0.295 | 1.000, 0.417, 0.783 |
 | numpy-dtype-localize-001 | [source](../../../benchmarks/ccb_understand/numpy-dtype-localize-001) | `mcp-remote-direct` | 4 | 0.946 | 0.071 | 0.933, 1.000, 1.000, 0.850 |
 | terraform-plan-pipeline-qa-001 | [source](../../../benchmarks/ccb_understand/terraform-plan-pipeline-qa-001) | `baseline-local-direct` | 3 | 0.650 | 0.564 | 0.000, 0.950, 1.000 |
 | terraform-plan-pipeline-qa-001 | [source](../../../benchmarks/ccb_understand/terraform-plan-pipeline-qa-001) | `mcp-remote-direct` | 3 | 0.950 | 0.000 | 0.950, 0.950, 0.950 |
-| terraform-state-backend-handoff-001 | [source](../../../benchmarks/ccb_understand/terraform-state-backend-handoff-001) | `baseline-local-direct` | 3 | 0.667 | 0.040 | 0.710, 0.630, 0.660 |
-| terraform-state-backend-handoff-001 | [source](../../../benchmarks/ccb_understand/terraform-state-backend-handoff-001) | `mcp-remote-direct` | 4 | 0.725 | 0.082 | 0.630, 0.830, 0.710, 0.730 |
-| vscode-ext-host-qa-001 | [source](../../../benchmarks/ccb_understand/vscode-ext-host-qa-001) | `baseline-local-direct` | 4 | 0.975 | 0.029 | 1.000, 0.950, 1.000, 0.950 |
-| vscode-ext-host-qa-001 | [source](../../../benchmarks/ccb_understand/vscode-ext-host-qa-001) | `mcp-remote-direct` | 3 | 0.950 | 0.056 | 0.960, 0.890, 1.000 |

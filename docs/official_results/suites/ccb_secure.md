@@ -21,12 +21,12 @@
 | [sgonly_django-audit-trail-implement-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_django-audit-trail-implement-001.html) | [source](../../../benchmarks/ccb_secure/django-audit-trail-implement-001) | `mcp-remote-direct` | `passed` | 0.550 | 4 | 0.358 |
 | [django-cross-team-boundary-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--django-cross-team-boundary-001.html) | [source](../../../benchmarks/ccb_secure/django-cross-team-boundary-001) | `baseline-local-direct` | `passed` | 0.300 | 4 | 0.000 |
 | [sgonly_django-cross-team-boundary-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_django-cross-team-boundary-001.html) | [source](../../../benchmarks/ccb_secure/django-cross-team-boundary-001) | `mcp-remote-direct` | `passed` | 0.300 | 4 | 0.361 |
-| [django-csrf-session-audit-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--django-csrf-session-audit-001.html) | [source](../../../benchmarks/ccb_secure/django-csrf-session-audit-001) | `baseline-local-direct` | `passed` | 0.800 | 4 | 0.000 |
-| [sgonly_django-csrf-session-audit-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_django-csrf-session-audit-001.html) | [source](../../../benchmarks/ccb_secure/django-csrf-session-audit-001) | `mcp-remote-direct` | `passed` | 0.810 | 4 | 0.957 |
+| [django-csrf-session-audit-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--django-csrf-session-audit-001.html) | — | `baseline-local-direct` | `passed` | 0.800 | 4 | 0.000 |
+| [sgonly_django-csrf-session-audit-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_django-csrf-session-audit-001.html) | — | `mcp-remote-direct` | `passed` | 0.810 | 4 | 0.957 |
 | [django-legacy-dep-vuln-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--django-legacy-dep-vuln-001.html) | [source](../../../benchmarks/ccb_secure/django-legacy-dep-vuln-001) | `baseline-local-direct` | `passed` | 1.000 | 4 | 0.000 |
 | [sgonly_django-legacy-dep-vuln-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_django-legacy-dep-vuln-001.html) | [source](../../../benchmarks/ccb_secure/django-legacy-dep-vuln-001) | `mcp-remote-direct` | `passed` | 1.000 | 4 | 0.279 |
-| [django-policy-enforcement-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--django-policy-enforcement-001.html) | [source](../../../benchmarks/ccb_secure/django-policy-enforcement-001) | `baseline-local-direct` | `passed` | 0.850 | 4 | 0.000 |
-| [sgonly_django-policy-enforcement-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_django-policy-enforcement-001.html) | [source](../../../benchmarks/ccb_secure/django-policy-enforcement-001) | `mcp-remote-direct` | `passed` | 0.900 | 4 | 0.169 |
+| [django-policy-enforcement-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--django-policy-enforcement-001.html) | — | `baseline-local-direct` | `passed` | 0.850 | 4 | 0.000 |
+| [sgonly_django-policy-enforcement-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_django-policy-enforcement-001.html) | — | `mcp-remote-direct` | `passed` | 0.900 | 4 | 0.169 |
 | [django-repo-scoped-access-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--django-repo-scoped-access-001.html) | [source](../../../benchmarks/ccb_secure/django-repo-scoped-access-001) | `baseline-local-direct` | `passed` | 1.000 | 4 | 0.000 |
 | [sgonly_django-repo-scoped-access-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_django-repo-scoped-access-001.html) | [source](../../../benchmarks/ccb_secure/django-repo-scoped-access-001) | `mcp-remote-direct` | `passed` | 1.000 | 4 | 0.570 |
 | [django-role-based-access-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--django-role-based-access-001.html) | [source](../../../benchmarks/ccb_secure/django-role-based-access-001) | `baseline-local-direct` | `passed` | 0.800 | 4 | 0.000 |
@@ -35,32 +35,32 @@
 | [django-sensitive-file-exclusion-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--django-sensitive-file-exclusion-001.html) | [source](../../../benchmarks/ccb_secure/django-sensitive-file-exclusion-001) | `baseline-local-direct` | `passed` | 1.000 | 4 | 0.000 |
 | [mcp_django-sensitive-file-exclusion-001_I216lD](../tasks/ccb_secure_haiku_20260224_213146--mcp-remote-direct--mcp_django-sensitive-file-exclusion-001_I216lD.html) | [source](../../../benchmarks/ccb_secure/django-sensitive-file-exclusion-001) | `mcp-remote-direct` | `passed` | 0.500 | 4 | 0.352 |
 | [sgonly_django-sensitive-file-exclusion-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_django-sensitive-file-exclusion-001.html) | [source](../../../benchmarks/ccb_secure/django-sensitive-file-exclusion-001) | `mcp-remote-direct` | `passed` | 1.000 | 4 | 0.254 |
-| [envoy-cve-triage-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--envoy-cve-triage-001.html) | [source](../../../benchmarks/ccb_secure/envoy-cve-triage-001) | `baseline-local-direct` | `passed` | 0.900 | 4 | 0.000 |
-| [sgonly_envoy-cve-triage-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_envoy-cve-triage-001.html) | [source](../../../benchmarks/ccb_secure/envoy-cve-triage-001) | `mcp-remote-direct` | `passed` | 0.940 | 4 | 0.913 |
-| [envoy-vuln-reachability-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--envoy-vuln-reachability-001.html) | [source](../../../benchmarks/ccb_secure/envoy-vuln-reachability-001) | `baseline-local-direct` | `passed` | 0.500 | 4 | 0.000 |
-| [mcp_envoy-vuln-reachability-001_xNDUVv](../tasks/ccb_secure_haiku_20260228_124521--mcp-remote-direct--mcp_envoy-vuln-reachability-001_xNDUVv.html) | [source](../../../benchmarks/ccb_secure/envoy-vuln-reachability-001) | `mcp-remote-direct` | `passed` | 0.660 | 5 | 0.944 |
-| [sgonly_envoy-vuln-reachability-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_envoy-vuln-reachability-001.html) | [source](../../../benchmarks/ccb_secure/envoy-vuln-reachability-001) | `mcp-remote-direct` | `passed` | 0.660 | 5 | 0.889 |
+| [envoy-cve-triage-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--envoy-cve-triage-001.html) | — | `baseline-local-direct` | `passed` | 0.900 | 4 | 0.000 |
+| [sgonly_envoy-cve-triage-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_envoy-cve-triage-001.html) | — | `mcp-remote-direct` | `passed` | 0.940 | 4 | 0.913 |
+| [envoy-vuln-reachability-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--envoy-vuln-reachability-001.html) | — | `baseline-local-direct` | `passed` | 0.500 | 4 | 0.000 |
+| [mcp_envoy-vuln-reachability-001_xNDUVv](../tasks/ccb_secure_haiku_20260228_124521--mcp-remote-direct--mcp_envoy-vuln-reachability-001_xNDUVv.html) | — | `mcp-remote-direct` | `passed` | 0.660 | 5 | 0.944 |
+| [sgonly_envoy-vuln-reachability-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_envoy-vuln-reachability-001.html) | — | `mcp-remote-direct` | `passed` | 0.660 | 5 | 0.889 |
 | [flipt-degraded-context-fix-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--flipt-degraded-context-fix-001.html) | [source](../../../benchmarks/ccb_secure/flipt-degraded-context-fix-001) | `baseline-local-direct` | `passed` | 0.250 | 4 | 0.000 |
 | [mcp_flipt-degraded-context-fix-001_glgbpu](../tasks/ccb_secure_haiku_20260228_124521--mcp-remote-direct--mcp_flipt-degraded-context-fix-001_glgbpu.html) | [source](../../../benchmarks/ccb_secure/flipt-degraded-context-fix-001) | `mcp-remote-direct` | `passed` | 0.450 | 5 | 0.271 |
 | [sgonly_flipt-degraded-context-fix-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_flipt-degraded-context-fix-001.html) | [source](../../../benchmarks/ccb_secure/flipt-degraded-context-fix-001) | `mcp-remote-direct` | `passed` | 0.600 | 5 | 0.468 |
 | [flipt-repo-scoped-access-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--flipt-repo-scoped-access-001.html) | [source](../../../benchmarks/ccb_secure/flipt-repo-scoped-access-001) | `baseline-local-direct` | `passed` | 0.250 | 4 | 0.000 |
 | [sgonly_flipt-repo-scoped-access-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_flipt-repo-scoped-access-001.html) | [source](../../../benchmarks/ccb_secure/flipt-repo-scoped-access-001) | `mcp-remote-direct` | `passed` | 0.500 | 4 | 0.118 |
-| [golang-net-cve-triage-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--golang-net-cve-triage-001.html) | [source](../../../benchmarks/ccb_secure/golang-net-cve-triage-001) | `baseline-local-direct` | `passed` | 0.800 | 4 | 0.000 |
-| [sgonly_golang-net-cve-triage-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_golang-net-cve-triage-001.html) | [source](../../../benchmarks/ccb_secure/golang-net-cve-triage-001) | `mcp-remote-direct` | `passed` | 0.800 | 4 | 0.917 |
+| [golang-net-cve-triage-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--golang-net-cve-triage-001.html) | — | `baseline-local-direct` | `passed` | 0.800 | 4 | 0.000 |
+| [sgonly_golang-net-cve-triage-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_golang-net-cve-triage-001.html) | — | `mcp-remote-direct` | `passed` | 0.800 | 4 | 0.917 |
 | [grpcurl-transitive-vuln-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--grpcurl-transitive-vuln-001.html) | [source](../../../benchmarks/ccb_secure/grpcurl-transitive-vuln-001) | `baseline-local-direct` | `passed` | 0.670 | 4 | 0.000 |
 | [sgonly_grpcurl-transitive-vuln-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_grpcurl-transitive-vuln-001.html) | [source](../../../benchmarks/ccb_secure/grpcurl-transitive-vuln-001) | `mcp-remote-direct` | `passed` | 0.670 | 4 | 0.889 |
 | [kafka-sasl-auth-audit-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--kafka-sasl-auth-audit-001.html) | [source](../../../benchmarks/ccb_secure/kafka-sasl-auth-audit-001) | `baseline-local-direct` | `passed` | 0.400 | 4 | 0.000 |
 | [sgonly_kafka-sasl-auth-audit-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_kafka-sasl-auth-audit-001.html) | [source](../../../benchmarks/ccb_secure/kafka-sasl-auth-audit-001) | `mcp-remote-direct` | `passed` | 0.860 | 4 | 0.960 |
-| [kafka-vuln-reachability-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--kafka-vuln-reachability-001.html) | [source](../../../benchmarks/ccb_secure/kafka-vuln-reachability-001) | `baseline-local-direct` | `passed` | 0.880 | 4 | 0.000 |
-| [sgonly_kafka-vuln-reachability-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_kafka-vuln-reachability-001.html) | [source](../../../benchmarks/ccb_secure/kafka-vuln-reachability-001) | `mcp-remote-direct` | `passed` | 0.900 | 4 | 0.955 |
-| [postgres-client-auth-audit-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--postgres-client-auth-audit-001.html) | [source](../../../benchmarks/ccb_secure/postgres-client-auth-audit-001) | `baseline-local-direct` | `passed` | 0.730 | 4 | 0.000 |
-| [sgonly_postgres-client-auth-audit-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_postgres-client-auth-audit-001.html) | [source](../../../benchmarks/ccb_secure/postgres-client-auth-audit-001) | `mcp-remote-direct` | `passed` | 0.790 | 4 | 0.925 |
-| [wish-transitive-vuln-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--wish-transitive-vuln-001.html) | [source](../../../benchmarks/ccb_secure/wish-transitive-vuln-001) | `baseline-local-direct` | `passed` | 0.760 | 4 | 0.000 |
-| [sgonly_wish-transitive-vuln-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_wish-transitive-vuln-001.html) | [source](../../../benchmarks/ccb_secure/wish-transitive-vuln-001) | `mcp-remote-direct` | `passed` | 0.670 | 4 | 0.923 |
+| [kafka-vuln-reachability-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--kafka-vuln-reachability-001.html) | — | `baseline-local-direct` | `passed` | 0.880 | 4 | 0.000 |
+| [sgonly_kafka-vuln-reachability-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_kafka-vuln-reachability-001.html) | — | `mcp-remote-direct` | `passed` | 0.900 | 4 | 0.955 |
+| [postgres-client-auth-audit-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--postgres-client-auth-audit-001.html) | — | `baseline-local-direct` | `passed` | 0.730 | 4 | 0.000 |
+| [sgonly_postgres-client-auth-audit-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_postgres-client-auth-audit-001.html) | — | `mcp-remote-direct` | `passed` | 0.790 | 4 | 0.925 |
+| [wish-transitive-vuln-001](../tasks/secure_haiku_20260301_071231--baseline-local-direct--wish-transitive-vuln-001.html) | — | `baseline-local-direct` | `passed` | 0.760 | 4 | 0.000 |
+| [sgonly_wish-transitive-vuln-001](../tasks/secure_haiku_20260301_071231--mcp-remote-direct--sgonly_wish-transitive-vuln-001.html) | — | `mcp-remote-direct` | `passed` | 0.670 | 4 | 0.923 |
 
 ## Multi-Run Variance
 
-Tasks with multiple valid runs (40 task/config pairs).
+Tasks with multiple valid runs (24 task/config pairs).
 
 | Task | Benchmark | Config | Runs | Mean | Std | Individual Rewards |
 |---|---|---|---:|---:|---:|---|
@@ -72,35 +72,19 @@ Tasks with multiple valid runs (40 task/config pairs).
 | django-audit-trail-implement-001 | [source](../../../benchmarks/ccb_secure/django-audit-trail-implement-001) | `mcp-remote-direct` | 3 | 0.550 | 0.000 | 0.550, 0.550, 0.550 |
 | django-cross-team-boundary-001 | [source](../../../benchmarks/ccb_secure/django-cross-team-boundary-001) | `baseline-local-direct` | 3 | 0.533 | 0.404 | 0.300, 1.000, 0.300 |
 | django-cross-team-boundary-001 | [source](../../../benchmarks/ccb_secure/django-cross-team-boundary-001) | `mcp-remote-direct` | 3 | 0.367 | 0.116 | 0.500, 0.300, 0.300 |
-| django-csrf-session-audit-001 | [source](../../../benchmarks/ccb_secure/django-csrf-session-audit-001) | `baseline-local-direct` | 3 | 0.820 | 0.035 | 0.800, 0.860, 0.800 |
-| django-csrf-session-audit-001 | [source](../../../benchmarks/ccb_secure/django-csrf-session-audit-001) | `mcp-remote-direct` | 3 | 0.800 | 0.036 | 0.760, 0.830, 0.810 |
 | django-legacy-dep-vuln-001 | [source](../../../benchmarks/ccb_secure/django-legacy-dep-vuln-001) | `baseline-local-direct` | 3 | 0.967 | 0.058 | 0.900, 1.000, 1.000 |
 | django-legacy-dep-vuln-001 | [source](../../../benchmarks/ccb_secure/django-legacy-dep-vuln-001) | `mcp-remote-direct` | 3 | 0.883 | 0.202 | 0.650, 1.000, 1.000 |
-| django-policy-enforcement-001 | [source](../../../benchmarks/ccb_secure/django-policy-enforcement-001) | `baseline-local-direct` | 3 | 0.817 | 0.058 | 0.750, 0.850, 0.850 |
-| django-policy-enforcement-001 | [source](../../../benchmarks/ccb_secure/django-policy-enforcement-001) | `mcp-remote-direct` | 3 | 0.800 | 0.087 | 0.750, 0.750, 0.900 |
 | django-repo-scoped-access-001 | [source](../../../benchmarks/ccb_secure/django-repo-scoped-access-001) | `baseline-local-direct` | 3 | 0.833 | 0.289 | 0.500, 1.000, 1.000 |
 | django-repo-scoped-access-001 | [source](../../../benchmarks/ccb_secure/django-repo-scoped-access-001) | `mcp-remote-direct` | 3 | 0.800 | 0.173 | 0.700, 0.700, 1.000 |
 | django-role-based-access-001 | [source](../../../benchmarks/ccb_secure/django-role-based-access-001) | `baseline-local-direct` | 4 | 0.425 | 0.287 | 0.200, 0.200, 0.500, 0.800 |
 | django-role-based-access-001 | [source](../../../benchmarks/ccb_secure/django-role-based-access-001) | `mcp-remote-direct` | 3 | 0.567 | 0.513 | 0.000, 1.000, 0.700 |
 | django-sensitive-file-exclusion-001 | [source](../../../benchmarks/ccb_secure/django-sensitive-file-exclusion-001) | `baseline-local-direct` | 4 | 0.900 | 0.116 | 0.800, 0.800, 1.000, 1.000 |
 | django-sensitive-file-exclusion-001 | [source](../../../benchmarks/ccb_secure/django-sensitive-file-exclusion-001) | `mcp-remote-direct` | 4 | 0.750 | 0.289 | 1.000, 0.500, 0.500, 1.000 |
-| envoy-cve-triage-001 | [source](../../../benchmarks/ccb_secure/envoy-cve-triage-001) | `baseline-local-direct` | 3 | 0.900 | 0.000 | 0.900, 0.900, 0.900 |
-| envoy-cve-triage-001 | [source](../../../benchmarks/ccb_secure/envoy-cve-triage-001) | `mcp-remote-direct` | 3 | 0.960 | 0.035 | 1.000, 0.940, 0.940 |
-| envoy-vuln-reachability-001 | [source](../../../benchmarks/ccb_secure/envoy-vuln-reachability-001) | `baseline-local-direct` | 3 | 0.540 | 0.069 | 0.620, 0.500, 0.500 |
-| envoy-vuln-reachability-001 | [source](../../../benchmarks/ccb_secure/envoy-vuln-reachability-001) | `mcp-remote-direct` | 4 | 0.595 | 0.079 | 0.560, 0.660, 0.500, 0.660 |
 | flipt-degraded-context-fix-001 | [source](../../../benchmarks/ccb_secure/flipt-degraded-context-fix-001) | `baseline-local-direct` | 3 | 0.367 | 0.202 | 0.600, 0.250, 0.250 |
 | flipt-degraded-context-fix-001 | [source](../../../benchmarks/ccb_secure/flipt-degraded-context-fix-001) | `mcp-remote-direct` | 4 | 0.438 | 0.144 | 0.250, 0.450, 0.450, 0.600 |
 | flipt-repo-scoped-access-001 | [source](../../../benchmarks/ccb_secure/flipt-repo-scoped-access-001) | `baseline-local-direct` | 3 | 0.450 | 0.180 | 0.600, 0.500, 0.250 |
 | flipt-repo-scoped-access-001 | [source](../../../benchmarks/ccb_secure/flipt-repo-scoped-access-001) | `mcp-remote-direct` | 3 | 0.567 | 0.058 | 0.600, 0.600, 0.500 |
-| golang-net-cve-triage-001 | [source](../../../benchmarks/ccb_secure/golang-net-cve-triage-001) | `baseline-local-direct` | 3 | 0.800 | 0.000 | 0.800, 0.800, 0.800 |
-| golang-net-cve-triage-001 | [source](../../../benchmarks/ccb_secure/golang-net-cve-triage-001) | `mcp-remote-direct` | 3 | 0.800 | 0.000 | 0.800, 0.800, 0.800 |
 | grpcurl-transitive-vuln-001 | [source](../../../benchmarks/ccb_secure/grpcurl-transitive-vuln-001) | `baseline-local-direct` | 3 | 0.447 | 0.387 | 0.000, 0.670, 0.670 |
 | grpcurl-transitive-vuln-001 | [source](../../../benchmarks/ccb_secure/grpcurl-transitive-vuln-001) | `mcp-remote-direct` | 3 | 0.670 | 0.000 | 0.670, 0.670, 0.670 |
 | kafka-sasl-auth-audit-001 | [source](../../../benchmarks/ccb_secure/kafka-sasl-auth-audit-001) | `baseline-local-direct` | 3 | 0.687 | 0.250 | 0.860, 0.800, 0.400 |
 | kafka-sasl-auth-audit-001 | [source](../../../benchmarks/ccb_secure/kafka-sasl-auth-audit-001) | `mcp-remote-direct` | 3 | 0.827 | 0.058 | 0.760, 0.860, 0.860 |
-| kafka-vuln-reachability-001 | [source](../../../benchmarks/ccb_secure/kafka-vuln-reachability-001) | `baseline-local-direct` | 3 | 0.867 | 0.011 | 0.860, 0.860, 0.880 |
-| kafka-vuln-reachability-001 | [source](../../../benchmarks/ccb_secure/kafka-vuln-reachability-001) | `mcp-remote-direct` | 3 | 0.907 | 0.011 | 0.920, 0.900, 0.900 |
-| postgres-client-auth-audit-001 | [source](../../../benchmarks/ccb_secure/postgres-client-auth-audit-001) | `baseline-local-direct` | 3 | 0.730 | 0.010 | 0.740, 0.720, 0.730 |
-| postgres-client-auth-audit-001 | [source](../../../benchmarks/ccb_secure/postgres-client-auth-audit-001) | `mcp-remote-direct` | 3 | 0.787 | 0.015 | 0.770, 0.800, 0.790 |
-| wish-transitive-vuln-001 | [source](../../../benchmarks/ccb_secure/wish-transitive-vuln-001) | `baseline-local-direct` | 3 | 0.730 | 0.052 | 0.760, 0.670, 0.760 |
-| wish-transitive-vuln-001 | [source](../../../benchmarks/ccb_secure/wish-transitive-vuln-001) | `mcp-remote-direct` | 3 | 0.727 | 0.107 | 0.660, 0.850, 0.670 |

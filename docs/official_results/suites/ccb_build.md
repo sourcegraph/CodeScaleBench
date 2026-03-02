@@ -4,7 +4,7 @@
 
 | Run | Config | Valid Tasks | Mean Reward | Pass Rate |
 |---|---|---:|---:|---:|
-| [ccb_build_haiku_20260227_034711](../runs/ccb_build_haiku_20260227_034711.md) | `baseline-local-direct` | 1 | 0.000 | 0.000 |
+| [ccb_build_haiku_20260227_034711](../runs/ccb_build_haiku_20260227_034711.md) | `baseline-local-direct` | 1 | 0.500 | 1.000 |
 | [ccb_build_haiku_20260227_123839](../runs/ccb_build_haiku_20260227_123839.md) | `baseline-local-direct` | 8 | 0.641 | 1.000 |
 | [ccb_build_haiku_20260227_123839](../runs/ccb_build_haiku_20260227_123839.md) | `mcp-remote-direct` | 7 | 0.571 | 1.000 |
 | [ccb_build_haiku_20260228_025547](../runs/ccb_build_haiku_20260228_025547.md) | `baseline-local-direct` | 13 | 0.554 | 0.692 |
@@ -50,7 +50,7 @@
 | [mcp_python-http-class-naming-refac-001_Z74daj](../tasks/ccb_build_haiku_20260228_025547--mcp-remote-direct--mcp_python-http-class-naming-refac-001_Z74daj.html) | — | `mcp-remote-direct` | `passed` | 0.880 | 1 | 0.173 |
 | [rust-subtype-relation-refac-001](../tasks/ccb_build_haiku_20260227_123839--baseline-local-direct--rust-subtype-relation-refac-001.html) | — | `baseline-local-direct` | `passed` | 0.760 | 1 | 0.000 |
 | [mcp_rust-subtype-relation-refac-001_cwbXwY](../tasks/ccb_build_haiku_20260227_123839--mcp-remote-direct--mcp_rust-subtype-relation-refac-001_cwbXwY.html) | — | `mcp-remote-direct` | `passed` | 0.890 | 1 | 0.151 |
-| [servo-scrollend-event-feat-001](../tasks/ccb_build_haiku_20260227_034711--baseline-local-direct--servo-scrollend-event-feat-001.html) | — | `baseline-local-direct` | `failed` | 0.000 | 1 | 0.000 |
+| [servo-scrollend-event-feat-001](../tasks/ccb_build_haiku_20260227_034711--baseline-local-direct--servo-scrollend-event-feat-001.html) | — | `baseline-local-direct` | `passed` | 0.500 | 1 | 0.000 |
 | [similar-asserts-deps-install-001](../tasks/ccb_build_haiku_20260228_025547--baseline-local-direct--similar-asserts-deps-install-001.html) | — | `baseline-local-direct` | `passed` | 1.000 | 1 | 0.000 |
 | [mcp_similar-asserts-deps-install-001_udUva4](../tasks/ccb_build_haiku_20260228_025547--mcp-remote-direct--mcp_similar-asserts-deps-install-001_udUva4.html) | — | `mcp-remote-direct` | `passed` | 1.000 | 1 | 0.333 |
 | [strata-cds-tranche-feat-001](../tasks/ccb_build_haiku_20260227_123839--baseline-local-direct--strata-cds-tranche-feat-001.html) | — | `baseline-local-direct` | `passed` | 0.590 | 1 | 0.000 |
@@ -64,7 +64,7 @@
 
 ## Multi-Run Variance
 
-Tasks with multiple valid runs (5 task/config pairs).
+Tasks with multiple valid runs (6 task/config pairs).
 
 | Task | Benchmark | Config | Runs | Mean | Std | Individual Rewards |
 |---|---|---|---:|---:|---:|---|
@@ -73,3 +73,4 @@ Tasks with multiple valid runs (5 task/config pairs).
 | cgen-deps-install-001 | — | `mcp-remote-direct` | 2 | 0.500 | 0.707 | 1.000, 0.000 |
 | k8s-noschedule-taint-feat-001 | — | `baseline-local-direct` | 2 | 0.700 | 0.000 | 0.700, 0.700 |
 | k8s-score-normalizer-refac-001 | — | `baseline-local-direct` | 2 | 0.800 | 0.113 | 0.720, 0.880 |
+| servo-scrollend-event-feat-001 | — | `baseline-local-direct` | 2 | 0.500 | 0.000 | 0.500, 0.500 |
