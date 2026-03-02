@@ -173,6 +173,14 @@ class SourcegraphClient:
             # Validate token at init
             self._validate_token()
 
+    def _headers(self) -> dict:
+        """Standard headers for SG API requests (includes User-Agent to avoid Cloudflare 1010)."""
+        return {
+            "Authorization": f"token {self.token}",
+            "Content-Type": "application/json",
+            "User-Agent": "ccb-context-retrieval-agent/1.0",
+        }
+
     def _validate_token(self) -> None:
         """Check that the token is valid by running a simple query."""
         import urllib.request
@@ -183,10 +191,7 @@ class SourcegraphClient:
         req = urllib.request.Request(
             f"{self.url.rstrip('/')}/.api/graphql",
             data=body,
-            headers={
-                "Authorization": f"token {self.token}",
-                "Content-Type": "application/json",
-            },
+            headers=self._headers(),
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -227,10 +232,7 @@ class SourcegraphClient:
         req = urllib.request.Request(
             f"{self.url.rstrip('/')}/.api/graphql",
             data=body,
-            headers={
-                "Authorization": f"token {self.token}",
-                "Content-Type": "application/json",
-            },
+            headers=self._headers(),
         )
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
