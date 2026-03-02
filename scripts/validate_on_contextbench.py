@@ -39,6 +39,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
@@ -732,6 +733,14 @@ def main() -> int:
         "--max-tasks", type=int, default=0,
         help="Process at most N tasks (0 = all)",
     )
+    parser.add_argument(
+        "--parallel", type=int, default=1,
+        help="Number of tasks to run in parallel (default: 1)",
+    )
+    parser.add_argument(
+        "--prune", action="store_true",
+        help="Run a pruning pass with haiku to remove irrelevant files",
+    )
     args = parser.parse_args()
     use_cli = not args.use_sdk
 
@@ -844,46 +853,33 @@ def main() -> int:
             from context_retrieval_agent import SourcegraphClient
             sg = SourcegraphClient()
 
-    total_cost = 0.0
-    trajectories = []
-    evaluated_tasks = []
-
-    for i, task in enumerate(tasks):
-        if args.max_tasks > 0 and i >= args.max_tasks:
-            log.info("Max tasks limit reached (%d)", args.max_tasks)
-            break
-        if args.max_cost > 0 and total_cost >= args.max_cost:
-            log.warning("Cost limit reached ($%.2f)", total_cost)
-            break
-
-        instance_id = task.get("instance_id", f"task_{i}")
+    # -- Per-task worker function (can run in parallel) --
+    def process_one_task(task_tuple):
+        idx, task = task_tuple
+        instance_id = task.get("instance_id", f"task_{idx}")
         repo_url = task.get("repo_url", "")
         if not repo_url:
-            # Construct from repo field (org/repo -> full URL)
             repo_slug = task.get("repo", "")
             if repo_slug and "/" in repo_slug:
                 repo_url = f"https://github.com/{repo_slug}"
         commit = task.get("base_commit", task.get("commit", "HEAD"))
 
-        log.info("[%d/%d] %s", i + 1, len(tasks), instance_id)
-
         if not repo_url:
-            # Try to reconstruct from instance_id
             parts = instance_id.rsplit("-", 1)
             org_repo = parts[0].replace("__", "/") if parts else ""
             repo_url = f"https://github.com/{org_repo}" if org_repo else ""
 
         if not repo_url:
-            log.warning("  No repo URL, skipping")
-            continue
+            log.warning("[%d] No repo URL, skipping %s", idx + 1, instance_id)
+            return None
 
-        # Clone repo
+        log.info("[%d/%d] %s", idx + 1, len(tasks), instance_id)
+
         repo_path = clone_for_contextbench(repo_url, commit)
         if not repo_path:
-            log.warning("  Clone failed, skipping")
-            continue
+            log.warning("[%d] Clone failed, skipping %s", idx + 1, instance_id)
+            return None
 
-        # Run agent
         try:
             result = run_retrieval_agent_on_cb_task(
                 task, repo_path, client,
@@ -892,24 +888,75 @@ def main() -> int:
                 use_cli=use_cli,
             )
         except Exception as e:
-            log.error("  Agent failed: %s", e)
-            continue
+            log.error("[%d] Agent failed for %s: %s", idx + 1, instance_id, e)
+            return None
 
-        total_cost += result["metadata"].get("cost_usd", 0)
+        # Optional pruning pass
+        if args.prune:
+            from context_retrieval_agent import prune_oracle_cli
+            ctx_for_prune = {
+                "seed_prompt": task.get("problem_statement", ""),
+                "instruction": task.get("problem_statement", ""),
+            }
+            result["oracle"] = prune_oracle_cli(
+                result["oracle"], ctx_for_prune, verbose=args.verbose,
+            )
+            prune_meta = result["oracle"].get("_prune_metadata", {})
+            result["metadata"]["prune_cost_usd"] = prune_meta.get("prune_cost_usd", 0)
+            result["metadata"]["cost_usd"] = (
+                result["metadata"].get("cost_usd", 0) + prune_meta.get("prune_cost_usd", 0)
+            )
 
-        # Convert to trajectory
+        n_files = len(result["oracle"].get("files", []))
+        log.info("[%d] %s -> %d files, $%.4f",
+                 idx + 1, instance_id, n_files, result["metadata"]["cost_usd"])
+
         traj = convert_to_trajectory(
             instance_id, result["oracle"],
             model_patch=task.get("patch", ""),
         )
-        trajectories.append(traj)
-        evaluated_tasks.append(task)
+        return {"task": task, "traj": traj, "result": result}
 
-        n_files = len(result["oracle"].get("files", []))
-        log.info(
-            "  -> %d files, $%.4f",
-            n_files, result["metadata"]["cost_usd"],
-        )
+    # -- Apply limits --
+    run_tasks = tasks
+    if args.max_tasks > 0:
+        run_tasks = tasks[:args.max_tasks]
+
+    # -- Execute tasks (parallel or sequential) --
+    total_cost = 0.0
+    trajectories = []
+    evaluated_tasks = []
+
+    task_tuples = list(enumerate(run_tasks))
+    n_parallel = max(1, args.parallel)
+
+    if n_parallel > 1 and len(task_tuples) > 1:
+        log.info("Running %d tasks with %d workers", len(task_tuples), n_parallel)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_parallel) as executor:
+            futures = {executor.submit(process_one_task, t): t for t in task_tuples}
+            for future in concurrent.futures.as_completed(futures):
+                outcome = future.result()
+                if outcome is None:
+                    continue
+                total_cost += outcome["result"]["metadata"].get("cost_usd", 0)
+                if args.max_cost > 0 and total_cost >= args.max_cost:
+                    log.warning("Cost limit reached ($%.2f), cancelling remaining", total_cost)
+                    for f in futures:
+                        f.cancel()
+                    break
+                trajectories.append(outcome["traj"])
+                evaluated_tasks.append(outcome["task"])
+    else:
+        for tt in task_tuples:
+            if args.max_cost > 0 and total_cost >= args.max_cost:
+                log.warning("Cost limit reached ($%.2f)", total_cost)
+                break
+            outcome = process_one_task(tt)
+            if outcome is None:
+                continue
+            total_cost += outcome["result"]["metadata"].get("cost_usd", 0)
+            trajectories.append(outcome["traj"])
+            evaluated_tasks.append(outcome["task"])
 
     if not trajectories:
         log.error("No tasks completed")

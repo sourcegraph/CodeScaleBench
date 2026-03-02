@@ -980,6 +980,16 @@ Sourcegraph tools:
 }
 
 SYSTEM_PROMPT_SUFFIX = """
+## Precision Guidelines
+- Include ONLY source files that would need to be **read or modified** to address the task.
+- Do NOT include test files, documentation, or configuration files unless the task \
+explicitly asks about testing, docs, or configuration.
+- Do NOT include files that merely import or reference the relevant code — only files \
+that contain the logic central to the task.
+- When in doubt, ask: "Would a developer need to open this file to fix/understand the issue?" \
+If no, exclude it.
+- Aim for 1-5 files for simple bugs, 3-10 for moderate tasks, 10+ only for large refactors.
+
 ## Output
 When you have identified all relevant files, output a JSON object with:
 ```json
@@ -1262,6 +1272,119 @@ def _cli_error_metadata(model: str, backend: str, start_time: float) -> Dict[str
         "cli_mode": True,
         "error": True,
     }
+
+
+PRUNE_PROMPT = """\
+You are a precision filter for code context retrieval. Given a task description \
+and a list of predicted files, remove files that are NOT directly relevant.
+
+## Rules
+- Keep ONLY files that a developer would need to **read or modify** to address the task.
+- Remove test files unless the task is specifically about testing.
+- Remove documentation files unless the task is about docs.
+- Remove files that merely import or reference the relevant code.
+- When unsure, keep the file (recall > precision).
+
+## Task
+{task_description}
+
+## Predicted Files
+{file_list}
+
+## Output
+Return a JSON object with the filtered file list:
+```json
+{{
+  "files": [
+    {{"repo": "repo-name", "path": "relative/path/to/file"}}
+  ],
+  "pruned_count": <number of files removed>,
+  "text": "Brief explanation of what was removed and why."
+}}
+```
+"""
+
+
+def prune_oracle_cli(
+    oracle: Dict[str, Any],
+    ctx: Dict[str, Any],
+    prune_model: str = "claude-haiku-4-5-20251001",
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    """Run a pruning pass on the oracle output using a cheap model via CLI.
+
+    Asks a fast model to remove irrelevant files from the agent's output.
+    Returns the pruned oracle (or original if pruning fails).
+    """
+    files = oracle.get("files", [])
+    if len(files) <= 3:
+        # Too few to prune — skip
+        if verbose:
+            log.info("  Prune: skipping (%d files, <= 3)", len(files))
+        return oracle
+
+    task_desc = ctx.get("seed_prompt", "") or ctx.get("instruction", "")
+    file_list = "\n".join(
+        f"- {f.get('repo', '?')}: {f.get('path', '?')}" for f in files
+    )
+
+    prompt = PRUNE_PROMPT.format(
+        task_description=task_desc[:3000],
+        file_list=file_list,
+    )
+
+    cmd = [
+        "claude", "-p", prompt,
+        "--output-format", "json",
+        "--model", prune_model,
+        "--dangerously-skip-permissions",
+    ]
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
+    if verbose:
+        log.info("  Prune: %d files -> calling %s", len(files), prune_model)
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, env=env, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("  Prune: timeout, keeping original")
+        return oracle
+
+    if result.returncode != 0:
+        log.warning("  Prune: CLI failed (rc=%d), keeping original", result.returncode)
+        return oracle
+
+    try:
+        cli_output = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        log.warning("  Prune: failed to parse CLI output, keeping original")
+        return oracle
+
+    result_text = cli_output.get("result", "")
+    pruned = _extract_json_from_text(result_text)
+    if pruned is None or "files" not in pruned:
+        log.warning("  Prune: no valid JSON in output, keeping original")
+        return oracle
+
+    pruned_files = pruned.get("files", [])
+    prune_cost = cli_output.get("total_cost_usd", 0.0)
+
+    if verbose:
+        log.info("  Prune: %d -> %d files ($%.4f)",
+                 len(files), len(pruned_files), prune_cost)
+
+    # Merge: keep pruned files but preserve original symbols/chain/text
+    result_oracle = dict(oracle)
+    result_oracle["files"] = pruned_files
+    result_oracle["_prune_metadata"] = {
+        "original_count": len(files),
+        "pruned_count": len(files) - len(pruned_files),
+        "prune_model": prune_model,
+        "prune_cost_usd": prune_cost,
+    }
+    return result_oracle
 
 
 def build_user_message(
