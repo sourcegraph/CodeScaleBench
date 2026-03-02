@@ -656,10 +656,18 @@ def dispatch_tool(
             input_args.get("cwd", ""),
         )
     elif name == "read_file":
+        # Coerce start_line/end_line to int — models sometimes pass strings
+        def _to_int(val: Any, default: int = 0) -> int:
+            if isinstance(val, int):
+                return val
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return default
         return execute_read_file(
             input_args.get("path", ""),
-            input_args.get("start_line", 0),
-            input_args.get("end_line", 0),
+            _to_int(input_args.get("start_line", 0)),
+            _to_int(input_args.get("end_line", 0)),
         )
     elif name == "list_directory":
         return execute_list_directory(
