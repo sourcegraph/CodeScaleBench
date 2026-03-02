@@ -418,7 +418,7 @@ def run_retrieval_agent_on_cb_task(
 
     Returns the agent's oracle output.
     """
-    from scripts.context_retrieval_agent import (
+    from context_retrieval_agent import (
         run_agent, SourcegraphClient,
     )
 
@@ -798,9 +798,16 @@ def main() -> int:
         log.error("pip install anthropic")
         return 1
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    # OAuth token preferred (subscription billing), API key fallback
+    api_key = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+    if api_key:
+        log.info("Using OAuth token (CLAUDE_CODE_OAUTH_TOKEN)")
+    else:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if api_key:
+            log.info("Using API key (ANTHROPIC_API_KEY)")
     if not api_key:
-        log.error("ANTHROPIC_API_KEY not set")
+        log.error("Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY")
         return 1
 
     client = anthropic.Anthropic(api_key=api_key)
@@ -808,7 +815,7 @@ def main() -> int:
     # Set up SG client if needed
     sg = None
     if args.backend in ("deepsearch", "hybrid"):
-        from scripts.context_retrieval_agent import SourcegraphClient
+        from context_retrieval_agent import SourcegraphClient
         sg = SourcegraphClient()
 
     total_cost = 0.0
@@ -821,7 +828,12 @@ def main() -> int:
             break
 
         instance_id = task.get("instance_id", f"task_{i}")
-        repo_url = task.get("repo", task.get("repo_url", ""))
+        repo_url = task.get("repo_url", "")
+        if not repo_url:
+            # Construct from repo field (org/repo -> full URL)
+            repo_slug = task.get("repo", "")
+            if repo_slug and "/" in repo_slug:
+                repo_url = f"https://github.com/{repo_slug}"
         commit = task.get("base_commit", task.get("commit", "HEAD"))
 
         log.info("[%d/%d] %s", i + 1, len(tasks), instance_id)
