@@ -382,10 +382,45 @@ def convert_task_trace(
     }
 
 
-def _find_task_dirs(run_dir: Path, config_name: str) -> list[tuple[str, Path, Path]]:
+def _extract_task_id_from_job_log(
+    batch_dir: Path,
+    known_task_ids: list[str] | None = None,
+) -> str | None:
+    """Extract full task ID from job.log by matching against known task IDs.
+
+    Falls back to regex extraction if no known IDs provided.
+    """
+    job_log = batch_dir / "job.log"
+    if not job_log.exists():
+        return None
+    try:
+        text = job_log.read_text(errors="replace")
+    except OSError:
+        return None
+
+    # Primary: match against known task IDs from selection file
+    if known_task_ids:
+        for tid in known_task_ids:
+            if tid in text:
+                return tid
+
+    # Fallback: regex for baseline paths (reliable, no truncation)
+    m = re.search(r"benchmarks/ccb_contextbench/(cb-[^/]+)/environment", text)
+    if m:
+        return m.group(1)
+
+    return None
+
+
+def _find_task_dirs(
+    run_dir: Path,
+    config_name: str,
+    known_task_ids: list[str] | None = None,
+) -> list[tuple[str, Path, Path]]:
     """Find task transcript paths under a run directory for a given config.
 
     Returns list of (task_name, transcript_path, task_dir).
+    task_name is the full task ID extracted from job.log when possible.
     """
     results = []
     config_dir = run_dir / config_name
@@ -399,12 +434,16 @@ def _find_task_dirs(run_dir: Path, config_name: str) -> list[tuple[str, Path, Pa
         if not _BATCH_TS_RE.search(batch_dir.name):
             continue
 
+        # Try to get full task ID from job.log (avoids truncation)
+        full_task_id = _extract_task_id_from_job_log(batch_dir, known_task_ids)
+
         for task_dir in batch_dir.iterdir():
             if not task_dir.is_dir():
                 continue
             transcript = task_dir / "agent" / "claude-code.txt"
             if transcript.exists():
-                results.append((task_dir.name, transcript, task_dir))
+                task_name = full_task_id if full_task_id else task_dir.name
+                results.append((task_name, transcript, task_dir))
 
     # Old promoted format: config/task_dir/agent/claude-code.txt
     if not results:
@@ -427,8 +466,24 @@ def _task_name_to_instance_id(
     Harbor task names look like: cb-django__django-14434_abc123__XyZpQr
     ContextBench instance_ids look like: django__django-14434
 
+    When full task IDs are extracted from job.log, they look like:
+      cb-swe-polybench__typescript__maintenance__bugfix__708894b2
+    which match task_id in the selection file directly.
+
     Also handles mcp_ and bl_ prefixes.
     """
+    # Try matching the raw task name against selection BEFORE stripping.
+    # Full task IDs from job.log match task_id directly.
+    if selection:
+        for task in selection.get("tasks", []):
+            iid = task.get("instance_id", "")
+            tid = task.get("task_id", "")
+            if task_name == tid or task_name == iid:
+                return iid
+            if task_name.lower() == tid.lower() or task_name.lower() == iid.lower():
+                return iid
+
+    # Fall back to stripping for truncated directory names
     name = task_name
     # Strip Harbor random suffix: __[A-Za-z0-9]{6,8}
     name = re.sub(r"__[A-Za-z0-9]{5,8}$", "", name)
@@ -448,6 +503,21 @@ def _task_name_to_instance_id(
             tid = task.get("task_id", "")
             if name == iid or name == tid or f"cb-{name}" == tid:
                 return iid
+
+        # Harbor truncates task directory names, so try case-insensitive
+        # prefix matching — only if unambiguous
+        name_lower = name.lower()
+        candidates = []
+        for task in selection.get("tasks", []):
+            iid = task.get("instance_id", "")
+            tid = task.get("task_id", "")
+            tid_clean = tid[3:] if tid.startswith("cb-") else tid
+            if tid_clean.lower().startswith(name_lower) or iid.lower().startswith(name_lower):
+                candidates.append(iid)
+        if len(candidates) == 1:
+            return candidates[0]
+        elif candidates:
+            log.warning("Ambiguous prefix match for %r: %d candidates", name, len(candidates))
 
     # If no selection, return the cleaned name (may need manual mapping)
     return name if name else None
@@ -470,6 +540,11 @@ def convert_run(
 
     stats = {"baseline": 0, "mcp": 0, "skipped": 0, "no_match": 0}
 
+    # Build list of known task IDs for job.log matching
+    known_task_ids = None
+    if selection:
+        known_task_ids = [t["task_id"] for t in selection.get("tasks", []) if "task_id" in t]
+
     for config_label, config_names in [
         ("baseline", _BASELINE_CONFIGS),
         ("mcp", _MCP_CONFIGS),
@@ -477,7 +552,7 @@ def convert_run(
         trajectories = []
 
         for config_name in config_names:
-            task_dirs = _find_task_dirs(run_dir, config_name)
+            task_dirs = _find_task_dirs(run_dir, config_name, known_task_ids)
             if task_dirs:
                 log.info("Found %d tasks in %s/%s", len(task_dirs), run_dir.name, config_name)
 

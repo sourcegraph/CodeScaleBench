@@ -64,7 +64,7 @@ bash configs/run_selected_tasks.sh --dry-run
 
 ---
 
-## Benchmark Suites (SDLC-Aligned)
+## CodeScaleBench-SDLC
 
 Nine suites organized by software development lifecycle phase:
 
@@ -81,7 +81,7 @@ Nine suites organized by software development lifecycle phase:
 | `csb_sdlc_debug` | Debugging & Investigation | 20 | Root cause tracing, fault localization, provenance |
 | **Total** | | **180** | |
 
-## MCP-Unique Suites (Org-Scale Context Retrieval)
+## CodeScaleBench-Org
 
 Eleven additional suites measure cross-repo discovery, symbol resolution, dependency tracing, and deep-search-driven investigation in polyrepo environments.
 
