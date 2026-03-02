@@ -49,6 +49,7 @@ import os
 import re
 import shlex
 import subprocess
+import tempfile
 import sys
 import time
 from datetime import datetime, timezone
@@ -999,6 +1000,269 @@ Include only fields relevant to the task. Omit empty arrays.
 IMPORTANT: Output the JSON as a fenced code block with ```json markers.
 """
 
+# ---------------------------------------------------------------------------
+# CLI-mode system prompts (uses Claude CLI built-in tools)
+# ---------------------------------------------------------------------------
+
+CLI_SYSTEM_PROMPTS = {
+    "local": """\
+You are a code context retrieval specialist. Given a task description and \
+local repository paths, identify ALL source files, symbols, and dependency \
+chains relevant to answering the task.
+
+You have access to LOCAL TOOLS ONLY:
+- Bash (read-only): run grep, rg (ripgrep), find, ls, wc, and other read-only shell commands
+- Read: read source file contents
+- Glob: find files by glob patterns (e.g., "**/*.py")
+- Grep: search file contents with regex patterns (supports --type, -C context)
+
+You do NOT have access to any search engine, web API, or code search service.
+
+## Strategy
+1. Read the task carefully. Identify key entities (packages, types, functions).
+2. Start broad: use Glob and Bash (find/ls) to understand repo structure.
+3. Use Grep to trace import/dependency chains and find symbol definitions.
+4. Read candidate files with Read to verify relevance.
+5. Be THOROUGH — recall matters more than precision for oracle generation.
+6. For multi-repo tasks, search ALL repos, not just the most obvious one.
+""",
+
+    "deepsearch": """\
+You are a code context retrieval specialist. Given a task description, \
+identify ALL source files, symbols, and dependency chains relevant to \
+answering the task using Sourcegraph search tools.
+
+You have access to SEARCH TOOLS:
+- mcp__sourcegraph__sg_nls_search: AI-powered semantic code search
+- mcp__sourcegraph__sg_keyword_search: keyword/regex code search with filters
+
+## Strategy
+1. Read the task carefully. Identify key entities and concepts.
+2. Use mcp__sourcegraph__sg_nls_search for broad semantic exploration first.
+3. Use mcp__sourcegraph__sg_keyword_search for precise keyword/identifier matches.
+4. Vary your queries — try different terms, packages, file patterns.
+5. Be THOROUGH — recall matters more than precision for oracle generation.
+""",
+
+    "hybrid": """\
+You are a code context retrieval specialist. Given a task description and \
+local repository paths, identify ALL source files, symbols, and dependency \
+chains relevant to answering the task.
+
+You have access to BOTH local tools AND Sourcegraph search:
+
+Local tools:
+- Bash (read-only): run grep, rg (ripgrep), find, ls, and other read-only shell commands
+- Read: read source file contents
+- Glob: find files by glob patterns
+- Grep: search file contents with regex patterns
+
+Sourcegraph tools:
+- mcp__sourcegraph__sg_nls_search: AI-powered semantic code search
+- mcp__sourcegraph__sg_keyword_search: keyword/regex code search with filters
+
+## Strategy
+1. Read the task carefully. Identify key entities and concepts.
+2. ALWAYS start with Sourcegraph search to discover relevant files and repos — \
+even if local repos are available. The local repo set may be INCOMPLETE.
+3. Use local Grep/Bash (rg) to verify and refine findings against actual files.
+4. Use Grep for import tracing and symbol definitions.
+5. Cross-check: anything found by search should be verified locally, and \
+local findings should be checked for completeness via search.
+6. If local search finds nothing, ALWAYS try Sourcegraph search before \
+concluding a file doesn't exist.
+7. Be THOROUGH — recall matters more than precision for oracle generation.
+8. For multi-repo tasks, search ALL repos — including repos you might not \
+have locally.
+9. Stay FOCUSED on the specific task question. Include only files directly \
+relevant to answering the task.
+""",
+}
+
+
+def run_agent_cli(
+    ctx: Dict[str, Any],
+    repo_paths: Dict[str, Path],
+    model: str = DEFAULT_MODEL,
+    backend: str = "hybrid",
+    verbose: bool = False,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Run the retrieval agent via Claude CLI (subscription billing).
+
+    Uses the ``claude`` CLI in ``--print --output-format json`` mode.
+    Claude CLI handles the tool loop internally and bills through OAuth
+    subscription rather than API key billing.
+
+    Returns:
+        (oracle_result, metadata) — same interface as run_agent().
+    """
+    system = CLI_SYSTEM_PROMPTS.get(backend, CLI_SYSTEM_PROMPTS["hybrid"]) + SYSTEM_PROMPT_SUFFIX
+    user_msg = build_user_message(ctx, repo_paths)
+
+    # -- Determine allowed tools based on backend --
+    local_tools = ["Bash(read-only:true)", "Read", "Glob", "Grep"]
+    sg_tools = [
+        "mcp__sourcegraph__sg_keyword_search",
+        "mcp__sourcegraph__sg_nls_search",
+    ]
+
+    if backend == "local":
+        allowed_tools = local_tools
+    elif backend == "deepsearch":
+        allowed_tools = sg_tools
+    else:  # hybrid
+        allowed_tools = local_tools + sg_tools
+
+    # -- Write system prompt to temp file (avoids ARG_MAX) --
+    sys_prompt_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", prefix="ccb_sys_", delete=False,
+    )
+    sys_prompt_file.write(system)
+    sys_prompt_file.close()
+
+    # -- Generate MCP config for SG if needed --
+    mcp_config_path = None
+    if backend in ("deepsearch", "hybrid"):
+        sg_token = os.environ.get("SOURCEGRAPH_ACCESS_TOKEN", "")
+        sg_url = os.environ.get("SOURCEGRAPH_URL", "https://sourcegraph.sourcegraph.com")
+        sg_url = sg_url.rstrip("/")
+        if sg_token:
+            mcp_config = {
+                "mcpServers": {
+                    "sourcegraph": {
+                        "type": "http",
+                        "url": f"{sg_url}/.api/mcp/v1",
+                        "headers": {"Authorization": f"token {sg_token}"},
+                    }
+                }
+            }
+            mcp_file = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", prefix="ccb_mcp_", delete=False,
+            )
+            json.dump(mcp_config, mcp_file)
+            mcp_file.close()
+            mcp_config_path = mcp_file.name
+        else:
+            log.warning("SOURCEGRAPH_ACCESS_TOKEN not set; SG tools unavailable")
+            # Fall back to local-only tools
+            allowed_tools = local_tools
+
+    # -- Build CLI command --
+    cmd = [
+        "claude",
+        "-p", user_msg,
+        "--output-format", "json",
+        "--model", model,
+        "--append-system-prompt", system,
+        "--allowedTools", ",".join(allowed_tools),
+        "--dangerously-skip-permissions",
+    ]
+    if mcp_config_path:
+        cmd.extend(["--mcp-config", mcp_config_path])
+
+    # -- Environment: unset CLAUDECODE to avoid nesting detection --
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
+    if verbose:
+        log.info("CLI cmd: claude -p <user_msg> --model %s --allowedTools %s",
+                 model, ",".join(allowed_tools))
+
+    start_time = time.time()
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, env=env,
+            timeout=TASK_TIMEOUT_SEC + 60,  # extra margin for CLI overhead
+        )
+    except subprocess.TimeoutExpired:
+        log.error("Claude CLI timed out after %ds", TASK_TIMEOUT_SEC + 60)
+        return (
+            {"files": [], "text": "CLI timeout"},
+            _cli_error_metadata(model, backend, start_time),
+        )
+    finally:
+        # Clean up temp files
+        try:
+            os.unlink(sys_prompt_file.name)
+        except OSError:
+            pass
+        if mcp_config_path:
+            try:
+                os.unlink(mcp_config_path)
+            except OSError:
+                pass
+
+    if result.returncode != 0:
+        log.error("Claude CLI failed (rc=%d): %s", result.returncode,
+                  (result.stderr or result.stdout or "")[:500])
+        return (
+            {"files": [], "text": f"CLI error (rc={result.returncode})"},
+            _cli_error_metadata(model, backend, start_time),
+        )
+
+    # -- Parse JSON output --
+    try:
+        cli_output = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError) as e:
+        log.error("Failed to parse CLI JSON output: %s", e)
+        log.debug("Raw stdout: %s", result.stdout[:1000])
+        return (
+            {"files": [], "text": "CLI output parse error"},
+            _cli_error_metadata(model, backend, start_time),
+        )
+
+    # -- Extract oracle from result text --
+    result_text = cli_output.get("result", "")
+    oracle_result = _extract_json_from_text(result_text)
+    if oracle_result is None:
+        log.warning("Could not extract oracle JSON from CLI result text")
+        oracle_result = {"files": [], "text": "No oracle JSON in CLI output."}
+
+    # -- Build metadata from CLI output --
+    elapsed = time.time() - start_time
+    usage = cli_output.get("usage", {})
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    cache_read = usage.get("cache_read_input_tokens", 0)
+    cache_create = usage.get("cache_creation_input_tokens", 0)
+
+    metadata = {
+        "generator": "context_retrieval_agent_cli",
+        "model": model,
+        "backend": backend,
+        "input_tokens": input_tokens + cache_read + cache_create,
+        "output_tokens": output_tokens,
+        "tool_calls": cli_output.get("num_turns", 1) - 1,  # turns includes final
+        "elapsed_sec": round(elapsed, 1),
+        "cost_usd": round(cli_output.get("total_cost_usd", 0.0), 4),
+        "num_turns": cli_output.get("num_turns", 0),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "cli_mode": True,
+    }
+
+    if verbose:
+        log.info("  CLI done: %d turns, $%.4f, %.1fs",
+                 metadata["num_turns"], metadata["cost_usd"], elapsed)
+
+    return oracle_result, metadata
+
+
+def _cli_error_metadata(model: str, backend: str, start_time: float) -> Dict[str, Any]:
+    """Build error metadata for failed CLI runs."""
+    return {
+        "generator": "context_retrieval_agent_cli",
+        "model": model,
+        "backend": backend,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "tool_calls": 0,
+        "elapsed_sec": round(time.time() - start_time, 1),
+        "cost_usd": 0.0,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "cli_mode": True,
+        "error": True,
+    }
+
 
 def build_user_message(
     ctx: Dict[str, Any], repo_paths: Dict[str, Path]
@@ -1251,14 +1515,46 @@ def cross_validate_task(
     }
 
 
+def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
+    """Try to extract oracle JSON from a text string.
+
+    Tries in order: fenced ```json block, regex for {"files": ...}, raw parse.
+    Returns None if no valid JSON found.
+    """
+    if not text:
+        return None
+
+    # Try to extract JSON from fenced block
+    m = re.search(r"```json\s*\n(.*?)\n```", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Try to find any JSON object with "files" key
+    m = re.search(r"\{[^{}]*\"files\"[^{}]*\}", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    # Try the whole text
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    return None
+
+
 def _extract_json_from_messages(messages: List[Dict]) -> Dict[str, Any]:
     """Extract the oracle JSON from the last assistant message."""
-    # Walk backwards through messages to find the last assistant text
     for msg in reversed(messages):
         if msg.get("role") != "assistant":
             continue
         content = msg.get("content", "")
-        # content might be a list of blocks or a string
         if isinstance(content, list):
             text_parts = []
             for block in content:
@@ -1270,27 +1566,9 @@ def _extract_json_from_messages(messages: List[Dict]) -> Dict[str, Any]:
         else:
             text = str(content)
 
-        # Try to extract JSON from fenced block
-        m = re.search(r"```json\s*\n(.*?)\n```", text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(1))
-            except json.JSONDecodeError:
-                pass
-
-        # Try to find any JSON object
-        m = re.search(r"\{[^{}]*\"files\"[^{}]*\}", text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except json.JSONDecodeError:
-                pass
-
-        # Try the whole text
-        try:
-            return json.loads(text)
-        except (json.JSONDecodeError, ValueError):
-            pass
+        result = _extract_json_from_text(text)
+        if result is not None:
+            return result
 
     return {"files": [], "text": "Agent did not produce valid JSON output."}
 
@@ -1482,28 +1760,42 @@ def main() -> int:
         "--verbose", action="store_true",
         help="Verbose logging",
     )
+    # Execution mode
+    cli_group = parser.add_mutually_exclusive_group()
+    cli_group.add_argument(
+        "--use-cli", action="store_true", default=True,
+        help="Use Claude CLI for subscription billing (default)",
+    )
+    cli_group.add_argument(
+        "--use-sdk", action="store_true",
+        help="Use Anthropic SDK directly (requires ANTHROPIC_API_KEY)",
+    )
     args = parser.parse_args()
+    use_cli = not args.use_sdk
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    if not HAS_ANTHROPIC:
-        log.error("anthropic package not installed. pip install anthropic")
-        return 1
-
-    # OAuth token preferred (subscription billing), API key fallback
-    api_key = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
-    if api_key:
-        log.info("Using OAuth token (CLAUDE_CODE_OAUTH_TOKEN)")
+    if use_cli:
+        log.info("Using Claude CLI (subscription billing)")
     else:
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not HAS_ANTHROPIC:
+            log.error("anthropic package not installed. pip install anthropic")
+            return 1
+
+        # OAuth token preferred (subscription billing), API key fallback
+        api_key = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
         if api_key:
-            log.info("Using API key (ANTHROPIC_API_KEY)")
-    if not api_key and not args.dry_run:
-        log.error("Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY")
-        return 1
+            log.info("Using OAuth token (CLAUDE_CODE_OAUTH_TOKEN)")
+        else:
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if api_key:
+                log.info("Using API key (ANTHROPIC_API_KEY)")
+        if not api_key and not args.dry_run:
+            log.error("Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY")
+            return 1
 
     # Discover tasks
     tasks = discover_tasks(
@@ -1560,18 +1852,19 @@ def main() -> int:
         print(f"Estimated cost: ~${est_cost:.0f} ({args.model})")
         return 0
 
-    client = anthropic.Anthropic(api_key=api_key)
-    cache_dir = get_cache_dir()
-
-    # Set up Sourcegraph client if needed
+    client = None
     sg = None
-    if args.backend in ("deepsearch", "hybrid") or args.cross_validate:
-        sg = SourcegraphClient()
-        if not sg.token:
-            if args.backend == "deepsearch":
-                log.error("SOURCEGRAPH_ACCESS_TOKEN required for deepsearch backend")
-                return 1
-            log.warning("No SG token — deepsearch tools will be unavailable")
+    if not use_cli:
+        client = anthropic.Anthropic(api_key=api_key)
+        # Set up Sourcegraph client if needed (SDK mode only)
+        if args.backend in ("deepsearch", "hybrid") or args.cross_validate:
+            sg = SourcegraphClient()
+            if not sg.token:
+                if args.backend == "deepsearch":
+                    log.error("SOURCEGRAPH_ACCESS_TOKEN required for deepsearch backend")
+                    return 1
+                log.warning("No SG token — deepsearch tools will be unavailable")
+    cache_dir = get_cache_dir()
 
     total_cost = 0.0
     results_summary = []
@@ -1620,11 +1913,18 @@ def main() -> int:
 
         # Single-backend run
         try:
-            oracle, metadata = run_agent(
-                ctx, repo_paths, client,
-                model=args.model, backend=args.backend,
-                sg=sg, verbose=args.verbose,
-            )
+            if use_cli:
+                oracle, metadata = run_agent_cli(
+                    ctx, repo_paths,
+                    model=args.model, backend=args.backend,
+                    verbose=args.verbose,
+                )
+            else:
+                oracle, metadata = run_agent(
+                    ctx, repo_paths, client,
+                    model=args.model, backend=args.backend,
+                    sg=sg, verbose=args.verbose,
+                )
         except Exception as e:
             log.error("  Agent failed: %s", e)
             continue

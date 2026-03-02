@@ -413,13 +413,14 @@ def run_retrieval_agent_on_cb_task(
     backend: str,
     sg: Any = None,
     verbose: bool = False,
+    use_cli: bool = False,
 ) -> Dict[str, Any]:
     """Run our retrieval agent on a ContextBench task.
 
     Returns the agent's oracle output.
     """
     from context_retrieval_agent import (
-        run_agent, SourcegraphClient,
+        run_agent, run_agent_cli,
     )
 
     # Build a CCB-style context dict from ContextBench task
@@ -441,11 +442,18 @@ def run_retrieval_agent_on_cb_task(
 
     repo_paths = {repo_name: repo_path, instance_id: repo_path}
 
-    oracle, metadata = run_agent(
-        ctx, repo_paths, client,
-        model=model, backend=backend,
-        sg=sg, verbose=verbose,
-    )
+    if use_cli:
+        oracle, metadata = run_agent_cli(
+            ctx, repo_paths,
+            model=model, backend=backend,
+            verbose=verbose,
+        )
+    else:
+        oracle, metadata = run_agent(
+            ctx, repo_paths, client,
+            model=model, backend=backend,
+            sg=sg, verbose=verbose,
+        )
 
     return {
         "oracle": oracle,
@@ -710,7 +718,22 @@ def main() -> int:
     parser.add_argument(
         "--verbose", action="store_true",
     )
+    # Execution mode
+    cli_group = parser.add_mutually_exclusive_group()
+    cli_group.add_argument(
+        "--use-cli", action="store_true", default=True,
+        help="Use Claude CLI for subscription billing (default)",
+    )
+    cli_group.add_argument(
+        "--use-sdk", action="store_true",
+        help="Use Anthropic SDK directly (requires ANTHROPIC_API_KEY)",
+    )
+    parser.add_argument(
+        "--max-tasks", type=int, default=0,
+        help="Process at most N tasks (0 = all)",
+    )
     args = parser.parse_args()
+    use_cli = not args.use_sdk
 
     # Parse composite weights if provided
     composite_weights = None
@@ -791,38 +814,44 @@ def main() -> int:
             print(f"Would process {len(tasks)} tasks (model={args.model}, backend={args.backend})")
             return 0
 
-    # Check for anthropic
-    try:
-        import anthropic
-    except ImportError:
-        log.error("pip install anthropic")
-        return 1
-
-    # OAuth token preferred (subscription billing), API key fallback
-    api_key = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
-    if api_key:
-        log.info("Using OAuth token (CLAUDE_CODE_OAUTH_TOKEN)")
-    else:
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if api_key:
-            log.info("Using API key (ANTHROPIC_API_KEY)")
-    if not api_key:
-        log.error("Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY")
-        return 1
-
-    client = anthropic.Anthropic(api_key=api_key)
-
-    # Set up SG client if needed
+    client = None
     sg = None
-    if args.backend in ("deepsearch", "hybrid"):
-        from context_retrieval_agent import SourcegraphClient
-        sg = SourcegraphClient()
+    if use_cli:
+        log.info("Using Claude CLI (subscription billing)")
+    else:
+        # SDK mode: need anthropic package and API key
+        try:
+            import anthropic
+        except ImportError:
+            log.error("pip install anthropic")
+            return 1
+
+        api_key = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+        if api_key:
+            log.info("Using OAuth token (CLAUDE_CODE_OAUTH_TOKEN)")
+        else:
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if api_key:
+                log.info("Using API key (ANTHROPIC_API_KEY)")
+        if not api_key:
+            log.error("Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY")
+            return 1
+
+        client = anthropic.Anthropic(api_key=api_key)
+
+        # Set up SG client if needed (SDK mode only — CLI uses MCP)
+        if args.backend in ("deepsearch", "hybrid"):
+            from context_retrieval_agent import SourcegraphClient
+            sg = SourcegraphClient()
 
     total_cost = 0.0
     trajectories = []
     evaluated_tasks = []
 
     for i, task in enumerate(tasks):
+        if args.max_tasks > 0 and i >= args.max_tasks:
+            log.info("Max tasks limit reached (%d)", args.max_tasks)
+            break
         if args.max_cost > 0 and total_cost >= args.max_cost:
             log.warning("Cost limit reached ($%.2f)", total_cost)
             break
@@ -860,6 +889,7 @@ def main() -> int:
                 task, repo_path, client,
                 model=args.model, backend=args.backend,
                 sg=sg, verbose=args.verbose,
+                use_cli=use_cli,
             )
         except Exception as e:
             log.error("  Agent failed: %s", e)
