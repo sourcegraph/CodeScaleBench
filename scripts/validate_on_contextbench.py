@@ -223,64 +223,97 @@ def ccb_weighted_sample(
 ) -> List[Dict[str, Any]]:
     """Stratified sample with CCB repo boost and difficulty floor.
 
-    - Tasks from CCB-overlapping repos get 2x weight in stratified_sample()
+    - CCB-overlap strata get 2x allocation in proportional budgeting
     - At least `hard_floor` fraction are hard cases (>5 gold files)
-
-    Wraps stratified_sample() with pre/post filtering.
     """
     rng = random.Random(seed)
 
-    # Tag each task with CCB overlap
-    for t in tasks:
+    def _is_ccb_overlap(t: Dict) -> bool:
         repo = t.get("repo", t.get("repo_url", "")).lower()
-        t["_ccb_overlap"] = any(r in repo for r in CCB_OVERLAP_REPOS)
+        return any(r in repo for r in CCB_OVERLAP_REPOS)
 
-    # Duplicate CCB-overlap tasks to give them 2x weight
-    weighted = []
-    for t in tasks:
-        weighted.append(t)
-        if t.get("_ccb_overlap"):
-            weighted.append(t)  # 2x weight
+    # Group by (language, complexity) — same as stratified_sample
+    strata: Dict[Tuple, List[Dict]] = {}
+    for task in tasks:
+        iid = task.get("instance_id", "")
+        lang = _infer_language(iid, task)
+        complexity = _gold_context_size(task)
+        key = (lang, complexity)
+        strata.setdefault(key, []).append(task)
 
-    # Initial stratified sample from the weighted pool
-    initial = stratified_sample(weighted, n, seed)
+    if not strata:
+        return []
 
-    # Deduplicate (2x weight may cause duplicates)
-    seen_ids = set()
-    deduped = []
-    for t in initial:
-        iid = t.get("instance_id", id(t))
-        if iid not in seen_ids:
-            seen_ids.add(iid)
-            deduped.append(t)
+    # Compute effective weight per stratum: base count * (2 if has CCB overlap)
+    effective_sizes = {}
+    for key, group in strata.items():
+        ccb_count = sum(1 for t in group if _is_ccb_overlap(t))
+        # Boost: CCB-heavy strata get proportionally more allocation
+        effective_sizes[key] = len(group) + ccb_count  # +1 per CCB task = ~2x
+
+    total_eff = sum(effective_sizes.values())
+
+    # Proportional allocation with CCB boost baked in
+    allocation = {}
+    remaining = n
+    for key in sorted(strata.keys(), key=lambda k: effective_sizes[k], reverse=True):
+        share = max(1, round(n * effective_sizes[key] / total_eff))
+        share = min(share, len(strata[key]), remaining)
+        allocation[key] = share
+        remaining -= share
+        if remaining <= 0:
+            break
+
+    # Distribute remainder to largest effective strata
+    for key in sorted(strata.keys(), key=lambda k: effective_sizes[k], reverse=True):
+        if remaining <= 0:
+            break
+        can_add = len(strata[key]) - allocation.get(key, 0)
+        if can_add > 0:
+            add = min(can_add, remaining)
+            allocation[key] = allocation.get(key, 0) + add
+            remaining -= add
+
+    # Within each stratum, prefer CCB-overlap tasks first, then fill randomly
+    sampled = []
+    for key, count in allocation.items():
+        group = strata[key]
+        ccb_tasks = [t for t in group if _is_ccb_overlap(t)]
+        other_tasks = [t for t in group if not _is_ccb_overlap(t)]
+        rng.shuffle(ccb_tasks)
+        rng.shuffle(other_tasks)
+        # Take CCB tasks first, then fill from others
+        pick = (ccb_tasks + other_tasks)[:count]
+        sampled.extend(pick)
+
+    rng.shuffle(sampled)
 
     # Ensure hard-case floor (>5 gold files)
-    hard = [t for t in deduped if _gold_context_size(t) == "large"]
+    hard = [t for t in sampled if _gold_context_size(t) == "large"]
     min_hard = max(1, int(n * hard_floor))
 
     if len(hard) < min_hard:
-        # Find more hard cases from the full pool
+        seen_ids = {t.get("instance_id", id(t)) for t in sampled}
         hard_pool = [t for t in tasks
                      if _gold_context_size(t) == "large"
                      and t.get("instance_id", id(t)) not in seen_ids]
         rng.shuffle(hard_pool)
         needed = min_hard - len(hard)
-        extras = hard_pool[:needed]
-        deduped.extend(extras)
-        for t in extras:
-            seen_ids.add(t.get("instance_id", id(t)))
+        sampled.extend(hard_pool[:needed])
 
     # Trim to target size
-    if len(deduped) > n:
-        deduped = deduped[:n]
+    if len(sampled) > n:
+        sampled = sampled[:n]
 
-    # Clean up temp field
-    for t in tasks:
-        t.pop("_ccb_overlap", None)
-    for t in deduped:
-        t.pop("_ccb_overlap", None)
+    log.info(
+        "CCB-weighted sample: %d tasks from %d strata (requested %d)",
+        len(sampled), len(allocation), n,
+    )
+    n_ccb = sum(1 for t in sampled if _is_ccb_overlap(t))
+    n_hard = sum(1 for t in sampled if _gold_context_size(t) == "large")
+    log.info("  CCB-overlap: %d/%d, hard cases: %d/%d", n_ccb, len(sampled), n_hard, len(sampled))
 
-    return deduped
+    return sampled
 
 
 def load_tasks(
@@ -588,21 +621,40 @@ STRATUM_WARNING_THRESHOLD = 0.50  # Warn if any stratum is below this
 def compute_composite_score(
     file_recall: float,
     file_precision: float,
-    chain_recall: float,
-    symbol_recall: float,
+    chain_recall: float = 0.0,
+    symbol_recall: float = 0.0,
     weights: Optional[Dict[str, float]] = None,
 ) -> float:
     """Compute weighted composite score for go/no-go decision.
 
     Default weights: file_recall=0.40, file_precision=0.30,
                      chain_recall=0.20, symbol_recall=0.10
+
+    When chain_recall or symbol_recall are unavailable (None), their
+    weight is redistributed proportionally to the available components
+    so the score stays on a 0-1 scale.
     """
     w = weights or DEFAULT_COMPOSITE_WEIGHTS
-    return (
-        w["file_recall"] * file_recall
-        + w["file_precision"] * file_precision
-        + w["chain_recall"] * chain_recall
-        + w["symbol_recall"] * symbol_recall
+    components = {
+        "file_recall": file_recall,
+        "file_precision": file_precision,
+        "chain_recall": chain_recall,
+        "symbol_recall": symbol_recall,
+    }
+
+    # Identify which components have real values
+    available = {k: v for k, v in components.items() if v is not None}
+    if not available:
+        return 0.0
+
+    # Sum weights for available components, renormalize
+    raw_weight_sum = sum(w.get(k, 0) for k in available)
+    if raw_weight_sum == 0:
+        return 0.0
+
+    return sum(
+        (w.get(k, 0) / raw_weight_sum) * v
+        for k, v in available.items()
     )
 
 
@@ -1014,9 +1066,9 @@ def build_calibration_report(
     go_file_recall = file_recall >= FILE_RECALL_THRESHOLD
 
     # Composite go/no-go (richer signal)
-    # chain_recall and symbol_recall default to 0 when not available from ContextBench
-    chain_recall = simple_metrics.get("chain_recall", 0)
-    symbol_recall = simple_metrics.get("symbol_recall", 0)
+    # None signals "not measured" — weight is redistributed to available components
+    chain_recall = simple_metrics.get("chain_recall", None)
+    symbol_recall = simple_metrics.get("symbol_recall", None)
     cw = composite_weights or DEFAULT_COMPOSITE_WEIGHTS
     composite = compute_composite_score(file_recall, file_precision, chain_recall, symbol_recall, cw)
     go_composite = composite >= COMPOSITE_THRESHOLD
@@ -1029,7 +1081,7 @@ def build_calibration_report(
         metrics_dict = lang_metrics if stratum_type == "by_language" else comp_metrics
         for key, m in metrics_dict.items():
             sc = compute_composite_score(
-                m.get("recall", 0), m.get("precision", 0), 0, 0, cw,
+                m.get("recall", 0), m.get("precision", 0), None, None, cw,
             )
             stratum_composites[f"{stratum_type}/{key}"] = round(sc, 4)
             if sc < STRATUM_WARNING_THRESHOLD:
