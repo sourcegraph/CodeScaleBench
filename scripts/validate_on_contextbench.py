@@ -826,6 +826,14 @@ def main() -> int:
         "--prune", action="store_true",
         help="Run a pruning pass with haiku to remove irrelevant files",
     )
+    parser.add_argument(
+        "--instance-ids", type=str, default="",
+        help="Comma-separated instance ID suffixes to filter to (e.g., '7df7e1c0,157932b6')",
+    )
+    parser.add_argument(
+        "--instance-ids-file", type=str, default="",
+        help="JSON file containing a list of instance IDs to filter to",
+    )
     args = parser.parse_args()
     use_cli = not args.use_sdk
 
@@ -909,9 +917,30 @@ def main() -> int:
         if not tasks:
             return 1
 
-        if args.dry_run:
-            print(f"Would process {len(tasks)} tasks (model={args.model}, backend={args.backend})")
-            return 0
+    # Instance ID filtering (applies to both phase and standard modes)
+    if args.instance_ids or args.instance_ids_file:
+        filter_ids: set = set()
+        if args.instance_ids:
+            filter_ids.update(s.strip() for s in args.instance_ids.split(",") if s.strip())
+        if args.instance_ids_file:
+            with open(args.instance_ids_file) as f:
+                filter_ids.update(json.load(f))
+        before = len(tasks)
+        tasks = [
+            t for t in tasks
+            if t.get("instance_id", "") in filter_ids
+            or any(t.get("instance_id", "").endswith(suffix) for suffix in filter_ids)
+        ]
+        log.info("Instance ID filter: %d -> %d tasks", before, len(tasks))
+        if not tasks:
+            log.error("No tasks matched the instance ID filter")
+            return 1
+
+    if args.dry_run:
+        print(f"Would process {len(tasks)} tasks (model={args.model}, backend={args.backend})")
+        for t in tasks[:20]:
+            print(f"  {t.get('instance_id', '?')}")
+        return 0
 
     client = None
     sg = None

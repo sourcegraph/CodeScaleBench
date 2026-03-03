@@ -1,0 +1,43 @@
+# Rust Edition 2018 to 2021 Import Path Migration
+
+## Your Task
+
+Find all Rust source files in rust-lang/rust (standard library and core) that implement edition-specific import path handling: the edition-based macro_use difference, the prelude v1 vs v2 module exports, and the resolver behavior changes between edition 2018 and 2021.
+
+## Context
+
+You are working on a codebase task involving repos from the migration domain.
+
+## Available Resources
+
+The local `/workspace/` directory contains: sg-evals/rust--01f6ddf7, sg-evals/servo--be6a2f99.
+
+**Note:** Additional repositories are accessible via Sourcegraph MCP tools:
+- `sg-evals/rust--01f6ddf7` (rust-lang/rust)
+- `sg-evals/servo--be6a2f99` (servo/servo)
+
+## Output Format
+
+Create a file at `/workspace/answer.json` with your findings in the following structure:
+
+```json
+{
+  "files": [
+    {"repo": "org/repo-name", "path": "relative/path/to/file.go"}
+  ],
+  "symbols": [
+    {"repo": "org/repo-name", "path": "relative/path/to/file.go", "symbol": "SymbolName"}
+  ],
+  "chain": [
+    {"repo": "org/repo-name", "path": "relative/path/to/file.go", "symbol": "FunctionName"}
+  ],
+  "text": "Narrative explanation of your findings, citing repos and file paths."
+}
+```
+
+Include only the fields relevant to this task. Your answer is evaluated against a closed-world oracle — completeness matters.
+
+## Evaluation
+
+Your answer will be scored on:
+- **File recall and precision**: Did you find all relevant files?

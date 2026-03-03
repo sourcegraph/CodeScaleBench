@@ -282,6 +282,7 @@ def run_curator_in_sandbox(
     model: str = "claude-opus-4-6",
     backend: str = "hybrid",
     verbose: bool = False,
+    suite_name: str = "",
 ) -> Dict[str, Any]:
     """Run the curator agent inside a Daytona sandbox.
 
@@ -300,9 +301,11 @@ def run_curator_in_sandbox(
     from context_retrieval_agent import (
         CURATOR_SYSTEM_PROMPT,
         _tool_description_for_backend,
+        get_task_type_guidance,
     )
     system_prompt = CURATOR_SYSTEM_PROMPT.format(
         tool_description=_tool_description_for_backend(backend, cli_mode=True),
+        task_type_guidance=get_task_type_guidance(suite_name),
     )
 
     user_msg = (
@@ -325,12 +328,13 @@ def run_curator_in_sandbox(
         "Writing user message")
 
     # Build allowed tools based on backend
+    # V6: Deep Search banned. All backends use read-only Bash + keyword search.
     if backend == "local":
         allowed = "Bash(read-only:true),Read,Glob,Grep"
     elif backend == "deepsearch":
-        allowed = "Bash,mcp__sourcegraph__sg_keyword_search"
+        allowed = "Bash(read-only:true),Read,Glob,Grep,mcp__sourcegraph__sg_keyword_search"
     else:  # hybrid
-        allowed = "Bash,Read,Glob,Grep,mcp__sourcegraph__sg_keyword_search"
+        allowed = "Bash(read-only:true),Read,Glob,Grep,mcp__sourcegraph__sg_keyword_search"
 
     # Write config for the Python runner
     config = {
@@ -416,6 +420,7 @@ def process_task(
     backend: str,
     verbose: bool,
     prune: bool = False,
+    suite_name: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Process a single ContextBench task in a Daytona sandbox."""
     instance_id = task.get("instance_id", f"task_{idx}")
@@ -454,6 +459,7 @@ def process_task(
             model=model,
             backend=backend,
             verbose=verbose,
+            suite_name=suite_name,
         )
 
         # Optional haiku pruning pass (runs locally, not in sandbox)
@@ -512,6 +518,8 @@ def main() -> int:
     parser.add_argument("--out", type=str, default="", help="Output directory")
     parser.add_argument("--prune", action="store_true",
                         help="Run haiku pruning pass to improve precision")
+    parser.add_argument("--instance-ids", type=str, default="",
+                        help="Comma-separated instance ID suffixes to filter tasks")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -540,7 +548,14 @@ def main() -> int:
         return 1
 
     # Load tasks
-    if args.phase:
+    if args.instance_ids:
+        # Filter to specific instance IDs (match by suffix)
+        suffixes = [s.strip() for s in args.instance_ids.split(",") if s.strip()]
+        all_tasks = load_tasks(sample=0, seed=args.seed)
+        tasks = [t for t in all_tasks
+                 if any(t.get("instance_id", "").endswith(s) for s in suffixes)]
+        log.info("Filtered to %d tasks by instance ID suffixes", len(tasks))
+    elif args.phase:
         phase_size = 10 if args.phase == "test" else 50
         all_tasks = load_tasks(verified=args.verified or (args.phase == "test"), sample=0, seed=args.seed)
         tasks = ccb_weighted_sample(all_tasks, phase_size, seed=args.seed)
@@ -592,13 +607,25 @@ def main() -> int:
         for i, task in enumerate(tasks)
     ]
 
+    # Per-future timeout: SANDBOX_TIMEOUT_SEC + 120s buffer for setup/cleanup
+    future_timeout = SANDBOX_TIMEOUT_SEC + 120
+
     with ThreadPoolExecutor(max_workers=args.parallel) as executor:
         futures = {
             executor.submit(process_task, *ta): ta[1]  # idx
             for ta in task_args
         }
-        for future in as_completed(futures):
-            outcome = future.result()
+        for future in as_completed(futures, timeout=future_timeout + 60):
+            try:
+                outcome = future.result(timeout=future_timeout)
+            except TimeoutError:
+                idx = futures.get(future, "?")
+                log.warning("Task %s timed out (>%ds), skipping", idx, future_timeout)
+                continue
+            except Exception as e:
+                idx = futures.get(future, "?")
+                log.warning("Task %s raised %s: %s", idx, type(e).__name__, e)
+                continue
             if outcome is None:
                 continue
             cost = outcome["result"]["metadata"].get("cost_usd", 0)
