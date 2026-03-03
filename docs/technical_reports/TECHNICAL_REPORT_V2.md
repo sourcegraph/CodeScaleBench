@@ -988,7 +988,21 @@ The benchmark remains dominated by hard tasks. In this refreshed aggregation, ha
 
 ### 11.9 Impact by Codebase Size
 
-Repository-size bins are not available in the refreshed analysis artifact, but file-count bins are:
+Codebase-size analysis in the refreshed pass uses two available proxies:
+1) `context_length` bins from task metadata, and
+2) `files_count` bins.
+
+**By context-length bin:**
+
+| Context Length Bin | n | BL Mean | MCP Mean | Δ Reward | Var(Δ Reward) |
+|--------------------|---|---------|----------|----------|---------------|
+| <100K tokens | 222 | 0.400 | 0.433 | +0.034 | 0.026862 |
+| 100K-1M tokens | 98 | 0.639 | 0.670 | +0.031 | 0.093518 |
+| unknown | 50 | 0.523 | 0.571 | +0.048 | 0.059717 |
+
+MCP reward delta is positive across all context-size bins in this refreshed slice.
+
+**By files-count bin:**
 
 | Files Count Bin | n | BL Mean | MCP Mean | Δ Reward | Var(Δ Reward) |
 |----------------|---|---------|----------|----------|---------------|

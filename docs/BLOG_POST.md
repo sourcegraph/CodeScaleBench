@@ -118,23 +118,27 @@ Context retrieval isn't the bottleneck for every software development situation.
 
 ## MCP Value Scales With Codebase Size
 
-Note: the detailed repository-size table below is from an earlier V2 slice and is pending full re-extraction for the refreshed March 3 analysis snapshot.
+For the fully refreshed pass, I used task-level size proxies that are present for this dataset (`context_length` and `files_count`) with multi-run averages per task/config:
 
-One of the clearest patterns in the data: MCP's benefit increases monotonically with codebase size. We pulled repo sizes from the GitHub API for 365 of the 370 tasks and grouped them into bins:
+| Context Size Proxy | n | BL Mean | MCP Mean | Δ Reward | Var(Δ Reward) |
+|--------------------|---|---------|----------|----------|---------------|
+| <100K tokens | 222 | 0.400 | 0.433 | +0.034 | 0.026862 |
+| 100K–1M tokens | 98 | 0.639 | 0.670 | +0.031 | 0.093518 |
+| unknown | 50 | 0.523 | 0.571 | +0.048 | 0.059717 |
 
-| Repo Size | Approx LoC | n | Δ Reward | Δ Wall Clock | Δ Agent Exec | Δ $/task |
-|-----------|-----------|---|----------|-------------|-------------|---------|
-| <10 MB | <400K | 60 | −0.007 | −23s | −52s | +$1.39 |
-| 10–50 MB | 0.4–2M | 61 | **+0.043** | **−153s** | **−137s** | **−$2.74** |
-| 50–200 MB | 2–8M | 113 | +0.027 | +64s | −51s | +$0.03 |
-| 200MB–1GB | 8–40M | 104 | +0.033 | −13s | −97s | +$0.02 |
-| >1 GB | >40M | 27 | **+0.085** | −135s | −123s | +$0.06 |
+And by file-count bins:
 
-For the smallest repos, MCP slightly hurts reward and adds cost. At 10–50 MB you hit the sweet spot: better outcomes, much faster, and $2.74/task cheaper. Above 1 GB the reward lift is largest (+0.085), which lines up with what you'd expect — massive monorepo-scale codebases like Kubernetes and Chromium are exactly where retrieval tools shine because the agent can't feasibly grep through tens of millions of lines. Agent execution time is shorter with MCP across *every* size category.
+| Files Count Bin | n | BL Mean | MCP Mean | Δ Reward | Var(Δ Reward) |
+|----------------|---|---------|----------|----------|---------------|
+| <10 | 168 | 0.327 | 0.375 | +0.048 | 0.032454 |
+| 10–100 | 91 | 0.676 | 0.699 | +0.023 | 0.097068 |
+| unknown | 111 | 0.550 | 0.575 | +0.025 | 0.034117 |
 
-Breaking it down by difficulty: hard tasks (91% of the benchmark) show the best MCP profile — better reward (+0.023), faster (−58s wall clock, −95s agent), and cheaper (−$0.42/task). Expert tasks show a slight negative reward delta (−0.019) and much higher cost (+$3.01), suggesting that at the highest complexity tier the agent burns tokens on MCP searches that don't pay off.
+So in this refreshed slice, MCP reward delta is positive across all available size-proxy bins.
 
-By language, Go repos see the biggest cost savings (−$1.18/task, n=134), Rust sees the biggest wall-clock savings (−358s, n=12), and Python gets the best reward lift (+0.040, n=55). TypeScript is the only language where MCP hurts across all dimensions, though n=7 is too small to draw strong conclusions.
+Breaking it down by difficulty (with variance): hard tasks remain positive (+0.038, var 0.046768), medium tasks are most positive (+0.115, var 0.053039), and expert tasks remain negative (−0.057, var 0.070557).
+
+By language, the largest positive reward deltas are JavaScript (+0.135, n=8), Python (+0.070, n=55), and Go (+0.052, n=134). TypeScript is still the strongest negative outlier (−0.140, n=7).
 
 ## Retrieval Differences
 
