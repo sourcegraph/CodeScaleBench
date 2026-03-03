@@ -208,6 +208,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/plot_build_diary.py` - Utility script for plot build diary.
 - `scripts/plot_build_diary_supplementary.py` - Utility script for plot build diary supplementary.
 - `scripts/plot_build_narrative.py` - Utility script for plot build narrative.
+- `scripts/prepare_analysis_runs.py` - Utility script for prepare analysis runs.
 - `scripts/promote_agent_oracles.py` - Utility script for promote agent oracles.
 - `scripts/push_base_images_ghcr.sh` - Utility script for push base images ghcr.
 - `scripts/regenerate_artifact_dockerfiles.py` - Utility script for regenerate artifact dockerfiles.
@@ -223,6 +224,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/rerun_zero_mcp_tasks.sh` [one_off] - Historical one-off script: rerun zero mcp tasks.
 - `scripts/rescore_difficulty.py` - Utility script for rescore difficulty.
 - `scripts/run_judge.py` - Utility script for run judge.
+- `scripts/run_missing_oracles.sh` - Utility script for run missing oracles.
 - `scripts/scaffold_contextbench_tasks.py` - Utility script for scaffold contextbench tasks.
 - `scripts/scaffold_feature_tasks.py` - Utility script for scaffold feature tasks.
 - `scripts/scaffold_refactor_tasks.py` - Utility script for scaffold refactor tasks.

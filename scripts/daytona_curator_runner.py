@@ -283,6 +283,7 @@ def run_curator_in_sandbox(
     backend: str = "hybrid",
     verbose: bool = False,
     suite_name: str = "",
+    prompt_version: str = "phase1",
 ) -> Dict[str, Any]:
     """Run the curator agent inside a Daytona sandbox.
 
@@ -297,16 +298,20 @@ def run_curator_in_sandbox(
     if creds.get("oauth_creds"):
         access_token = creds["oauth_creds"]["access_token"]
 
-    # Build curator prompt from the template
-    from context_retrieval_agent import (
-        CURATOR_SYSTEM_PROMPT,
-        _tool_description_for_backend,
-        get_task_type_guidance,
-    )
-    system_prompt = CURATOR_SYSTEM_PROMPT.format(
-        tool_description=_tool_description_for_backend(backend, cli_mode=True),
-        task_type_guidance=get_task_type_guidance(suite_name),
-    )
+    # Build curator prompt based on version
+    if prompt_version == "phase1":
+        from context_retrieval_agent import get_phase1_system_prompt
+        system_prompt = get_phase1_system_prompt(backend)
+    else:
+        from context_retrieval_agent import (
+            CURATOR_SYSTEM_PROMPT,
+            _tool_description_for_backend,
+            get_task_type_guidance,
+        )
+        system_prompt = CURATOR_SYSTEM_PROMPT.format(
+            tool_description=_tool_description_for_backend(backend, cli_mode=True),
+            task_type_guidance=get_task_type_guidance(suite_name),
+        )
 
     user_msg = (
         f"## Task\n{problem_statement[:4000]}\n\n"
@@ -327,14 +332,17 @@ def run_curator_in_sandbox(
         f"echo '{msg_b64}' | base64 -d > /tmp/user_msg.txt",
         "Writing user message")
 
-    # Build allowed tools based on backend
-    # V6: Deep Search banned. All backends use read-only Bash + keyword search.
-    if backend == "local":
-        allowed = "Bash(read-only:true),Read,Glob,Grep"
-    elif backend == "deepsearch":
-        allowed = "Bash(read-only:true),Read,Glob,Grep,mcp__sourcegraph__sg_keyword_search"
-    else:  # hybrid
-        allowed = "Bash(read-only:true),Read,Glob,Grep,mcp__sourcegraph__sg_keyword_search"
+    # Build allowed tools based on backend and prompt version
+    if prompt_version == "phase1":
+        from context_retrieval_agent import get_phase1_allowed_tools
+        allowed = ",".join(get_phase1_allowed_tools(backend))
+    else:
+        if backend == "local":
+            allowed = "Bash(read-only:true),Read,Glob,Grep"
+        elif backend == "deepsearch":
+            allowed = "Bash(read-only:true),Read,Glob,Grep,mcp__sourcegraph__sg_keyword_search"
+        else:  # hybrid
+            allowed = "Bash(read-only:true),Read,Glob,Grep,mcp__sourcegraph__sg_keyword_search"
 
     # Write config for the Python runner
     config = {
@@ -421,6 +429,7 @@ def process_task(
     verbose: bool,
     prune: bool = False,
     suite_name: str = "",
+    prompt_version: str = "phase1",
 ) -> Optional[Dict[str, Any]]:
     """Process a single ContextBench task in a Daytona sandbox."""
     instance_id = task.get("instance_id", f"task_{idx}")
@@ -460,6 +469,7 @@ def process_task(
             backend=backend,
             verbose=verbose,
             suite_name=suite_name,
+            prompt_version=prompt_version,
         )
 
         # Optional haiku pruning pass (runs locally, not in sandbox)
@@ -508,6 +518,9 @@ def main() -> int:
     parser.add_argument("--phase", type=str, default="", choices=("", "test", "verify"),
                         help="Calibration phase: 'test' (10) or 'verify' (50)")
     parser.add_argument("--model", type=str, default="claude-opus-4-6")
+    parser.add_argument("--prompt-version", type=str, default="phase1",
+                        choices=("phase1", "v7"),
+                        help="Prompt version: phase1 (recall-focused) or v7 (edit-centric). Default: phase1")
     parser.add_argument("--backend", type=str, default="hybrid",
                         choices=("local", "deepsearch", "hybrid"))
     parser.add_argument("--parallel", type=int, default=DEFAULT_PARALLEL,
@@ -603,7 +616,7 @@ def main() -> int:
 
     task_args = [
         (task, i, len(tasks), daytona, creds, args.model, args.backend,
-         args.verbose, args.prune)
+         args.verbose, args.prune, "", args.prompt_version)
         for i, task in enumerate(tasks)
     ]
 

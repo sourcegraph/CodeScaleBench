@@ -865,7 +865,141 @@ def _extract_clone_urls(dockerfile_content: str) -> List[Dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Unified Curator System Prompt
+# Phase 1 Prompt (af296756c) — "Thorough Recall" style
+# ---------------------------------------------------------------------------
+# Per-backend CLI prompts + precision suffix. Scored F1=0.749 on 10-task
+# pilot, F1=0.697 on 50-task phase2 — significantly outperforms V6-V8
+# edit-centric prompts (F1=0.39-0.44). Enables sg_nls_search (semantic).
+
+PHASE1_CLI_PROMPTS = {
+    "local": """\
+You are a code context retrieval specialist. Given a task description and \
+local repository paths, identify ALL source files, symbols, and dependency \
+chains relevant to answering the task.
+
+You have access to LOCAL TOOLS ONLY:
+- Bash (read-only): run grep, rg (ripgrep), find, ls, wc, and other read-only shell commands
+- Read: read source file contents
+- Glob: find files by glob patterns (e.g., "**/*.py")
+- Grep: search file contents with regex patterns (supports --type, -C context)
+
+You do NOT have access to any search engine, web API, or code search service.
+
+## Strategy
+1. Read the task carefully. Identify key entities (packages, types, functions).
+2. Start broad: use Glob and Bash (find/ls) to understand repo structure.
+3. Use Grep to trace import/dependency chains and find symbol definitions.
+4. Read candidate files with Read to verify relevance.
+5. Be THOROUGH — recall matters more than precision for oracle generation.
+6. For multi-repo tasks, search ALL repos, not just the most obvious one.
+""",
+
+    "deepsearch": """\
+You are a code context retrieval specialist. Given a task description, \
+identify ALL source files, symbols, and dependency chains relevant to \
+answering the task using Sourcegraph search tools.
+
+You have access to SEARCH TOOLS:
+- mcp__sourcegraph__sg_nls_search: AI-powered semantic code search
+- mcp__sourcegraph__sg_keyword_search: keyword/regex code search with filters
+
+## Strategy
+1. Read the task carefully. Identify key entities and concepts.
+2. Use mcp__sourcegraph__sg_nls_search for broad semantic exploration first.
+3. Use mcp__sourcegraph__sg_keyword_search for precise keyword/identifier matches.
+4. Vary your queries — try different terms, packages, file patterns.
+5. Be THOROUGH — recall matters more than precision for oracle generation.
+""",
+
+    "hybrid": """\
+You are a code context retrieval specialist. Given a task description and \
+local repository paths, identify ALL source files, symbols, and dependency \
+chains relevant to answering the task.
+
+You have access to BOTH local tools AND Sourcegraph search:
+
+Local tools:
+- Bash (read-only): run grep, rg (ripgrep), find, ls, and other read-only shell commands
+- Read: read source file contents
+- Glob: find files by glob patterns
+- Grep: search file contents with regex patterns
+
+Sourcegraph tools:
+- mcp__sourcegraph__sg_nls_search: AI-powered semantic code search
+- mcp__sourcegraph__sg_keyword_search: keyword/regex code search with filters
+
+## Strategy
+1. Read the task carefully. Identify key entities and concepts.
+2. ALWAYS start with Sourcegraph search to discover relevant files and repos — \
+even if local repos are available. The local repo set may be INCOMPLETE.
+3. Use local Grep/Bash (rg) to verify and refine findings against actual files.
+4. Use Grep for import tracing and symbol definitions.
+5. Cross-check: anything found by search should be verified locally, and \
+local findings should be checked for completeness via search.
+6. If local search finds nothing, ALWAYS try Sourcegraph search before \
+concluding a file doesn't exist.
+7. Be THOROUGH — recall matters more than precision for oracle generation.
+8. For multi-repo tasks, search ALL repos — including repos you might not \
+have locally.
+9. Stay FOCUSED on the specific task question. Include only files directly \
+relevant to answering the task.
+""",
+}
+
+PHASE1_SUFFIX = """
+## Precision Guidelines
+- Include ONLY source files that would need to be **read or modified** to address the task.
+- Do NOT include test files, documentation, or configuration files unless the task \
+explicitly asks about testing, docs, or configuration.
+- Do NOT include files that merely import or reference the relevant code — only files \
+that contain the logic central to the task.
+- When in doubt, ask: "Would a developer need to open this file to fix/understand the issue?" \
+If no, exclude it.
+- Aim for 1-5 files for simple bugs, 3-10 for moderate tasks, 10+ only for large refactors.
+
+## Output
+When you have identified all relevant files, output a JSON object with:
+```json
+{
+  "files": [
+    {"repo": "repo-name", "path": "relative/path/to/file"}
+  ],
+  "symbols": [
+    {"repo": "repo-name", "path": "relative/path", "symbol": "SymbolName"}
+  ],
+  "chain": [
+    {"repo": "repo-name", "path": "relative/path", "symbol": "FuncName"}
+  ],
+  "text": "Brief explanation of your findings and methodology."
+}
+```
+Include only fields relevant to the task. Omit empty arrays.
+IMPORTANT: Output the JSON as a fenced code block with ```json markers.
+"""
+
+
+def get_phase1_system_prompt(backend: str) -> str:
+    """Return the Phase 1 system prompt for the given backend."""
+    return PHASE1_CLI_PROMPTS.get(backend, PHASE1_CLI_PROMPTS["hybrid"]) + PHASE1_SUFFIX
+
+
+def get_phase1_allowed_tools(backend: str) -> list:
+    """Return allowed tools for Phase 1 prompt (includes sg_nls_search)."""
+    local_tools = ["Bash(read-only:true)", "Read", "Glob", "Grep"]
+    sg_tools = [
+        "mcp__sourcegraph__sg_keyword_search",
+        "mcp__sourcegraph__sg_nls_search",
+    ]
+    if backend == "local":
+        return local_tools
+    elif backend == "deepsearch":
+        return sg_tools
+    else:  # hybrid
+        return local_tools + sg_tools
+
+
+# ---------------------------------------------------------------------------
+# Unified Curator System Prompt (V7+)
 # ---------------------------------------------------------------------------
 # Replaces the previous 6 backend-specific prompts (SDK x3 + CLI x3) and
 # SYSTEM_PROMPT_SUFFIX. All backends and modes share this single prompt,
@@ -1498,6 +1632,7 @@ def run_agent_cli(
     backend: str = "hybrid",
     verbose: bool = False,
     prune: bool = False,
+    prompt_version: str = "phase1",
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Run the retrieval agent via Claude CLI (subscription billing).
 
@@ -1505,31 +1640,35 @@ def run_agent_cli(
     Claude CLI handles the tool loop internally and bills through OAuth
     subscription rather than API key billing.
 
+    Args:
+        prompt_version: "phase1" (recall-focused, F1=0.749) or "v7" (edit-centric).
+
     Returns:
         (oracle_result, metadata) — same interface as run_agent().
     """
     suite = ctx.get("suite_name", "")
-    profile_name = SUITE_TO_PROFILE.get(suite, "EDIT_FOCUSED")
-    log.info("Curator profile: %s (suite=%s)", profile_name, suite or "(none)")
-    system = CURATOR_SYSTEM_PROMPT.format(
-        tool_description=_tool_description_for_backend(backend, cli_mode=True),
-        task_type_guidance=get_task_type_guidance(suite),
-    )
+
+    if prompt_version == "phase1":
+        # Phase 1 prompt: per-backend, recall-focused, includes sg_nls_search
+        log.info("Prompt: phase1 (recall-focused), backend=%s", backend)
+        system = get_phase1_system_prompt(backend)
+        allowed_tools = get_phase1_allowed_tools(backend)
+    else:
+        # V7+ prompt: edit-centric, task-type profiles
+        profile_name = SUITE_TO_PROFILE.get(suite, "EDIT_FOCUSED")
+        log.info("Prompt: %s, profile=%s, backend=%s", prompt_version, profile_name, backend)
+        system = CURATOR_SYSTEM_PROMPT.format(
+            tool_description=_tool_description_for_backend(backend, cli_mode=True),
+            task_type_guidance=get_task_type_guidance(suite),
+        )
+        local_tools = ["Bash(read-only:true)", "Read", "Glob", "Grep"]
+        sg_tools = ["mcp__sourcegraph__sg_keyword_search"]
+        if backend == "local":
+            allowed_tools = local_tools
+        else:
+            allowed_tools = local_tools + sg_tools
+
     user_msg = build_user_message(ctx, repo_paths)
-
-    # -- Determine allowed tools based on backend --
-    local_tools = ["Bash(read-only:true)", "Read", "Glob", "Grep"]
-    # V6: Deep Search banned. All backends use read-only Bash + keyword search.
-    sg_tools = [
-        "mcp__sourcegraph__sg_keyword_search",
-    ]
-
-    if backend == "local":
-        allowed_tools = local_tools
-    elif backend == "deepsearch":
-        allowed_tools = local_tools + sg_tools
-    else:  # hybrid
-        allowed_tools = local_tools + sg_tools
 
     # -- Write system prompt to temp file (avoids ARG_MAX) --
     sys_prompt_file = tempfile.NamedTemporaryFile(
@@ -1563,7 +1702,7 @@ def run_agent_cli(
         else:
             log.warning("SOURCEGRAPH_ACCESS_TOKEN not set; SG/Deep Search tools unavailable")
             # Fall back to local-only tools (no Deep Search without token)
-            allowed_tools = local_tools
+            allowed_tools = ["Bash(read-only:true)", "Read", "Glob", "Grep"]
 
     # -- Build CLI command --
     cmd = [
@@ -1654,6 +1793,7 @@ def run_agent_cli(
         "generator": "context_retrieval_agent_cli",
         "model": model,
         "backend": backend,
+        "prompt_version": prompt_version,
         "input_tokens": input_tokens + cache_read + cache_create,
         "output_tokens": output_tokens,
         "tool_calls": cli_output.get("num_turns", 1) - 1,  # turns includes final
@@ -2679,6 +2819,11 @@ def main() -> int:
         help="Tool backend: local, deepsearch, or hybrid (default: hybrid)",
     )
     parser.add_argument(
+        "--prompt-version", type=str, default="phase1",
+        choices=("phase1", "v7"),
+        help="Prompt version: phase1 (recall-focused, F1=0.749) or v7 (edit-centric). Default: phase1",
+    )
+    parser.add_argument(
         "--cross-validate", action="store_true",
         help="Run ALL backends on each task and report agreement metrics",
     )
@@ -2803,7 +2948,8 @@ def main() -> int:
     if args.max_tasks > 0:
         tasks = tasks[:args.max_tasks]
 
-    log.info("Found %d tasks (model=%s, backend=%s)", len(tasks), args.model, args.backend)
+    log.info("Found %d tasks (model=%s, backend=%s, prompt=%s)",
+             len(tasks), args.model, args.backend, args.prompt_version)
 
     if args.dry_run:
         for t in tasks:
@@ -2882,6 +3028,7 @@ def main() -> int:
                     ctx, repo_paths,
                     model=args.model, backend=args.backend,
                     verbose=args.verbose,
+                    prompt_version=args.prompt_version,
                 )
             else:
                 oracle, metadata = run_agent(
@@ -2995,6 +3142,24 @@ def _resolve_repos(
                 repo_paths[slug] = path
                 if target and target != ".":
                     repo_paths[target] = path
+            except Exception as e:
+                log.warning("Failed to clone %s: %s", slug, e)
+
+    if repo_paths:
+        return repo_paths
+
+    # Strategy 3: Extract repo from Dockerfile "# Repo:" comment (SWEAP images)
+    task_dir = Path(ctx.get("task_dir", ""))
+    dockerfile = task_dir / "environment" / "Dockerfile"
+    if dockerfile.exists():
+        text = dockerfile.read_text()
+        m = re.search(r"#\s*Repo:\s*(\S+)", text)
+        if m:
+            slug = m.group(1).strip()
+            log.info("  Resolved repo from Dockerfile comment: %s", slug)
+            try:
+                path = clone_repo(slug, cache_dir)
+                repo_paths[slug] = path
             except Exception as e:
                 log.warning("Failed to clone %s: %s", slug, e)
 
