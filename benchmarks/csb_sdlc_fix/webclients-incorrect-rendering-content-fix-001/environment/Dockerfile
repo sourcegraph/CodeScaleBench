@@ -1,7 +1,7 @@
 # SWE-bench Pro Task Environment
 # Repo: protonmail/webclients
 
-FROM jefzda/sweap-images:protonmail.webclients-protonmail__webclients-2f66db85455f4b22a47ffd853738f679b439593c
+FROM ghcr.io/sg-evals/sweap-images:protonmail.webclients-protonmail__webclients-2f66db85455f4b22a47ffd853738f679b439593c
 
 # Install uv for Python package management
 RUN curl -LsSf https://astral.sh/uv/0.7.13/install.sh 2>/dev/null | sh || true
