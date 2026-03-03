@@ -63,25 +63,24 @@ cross-repo tasks — not whether MCP can access information the baseline can't.
 
 ## Suite Structure
 
-Suites map to use case categories A-J (six active, two deferred):
+Suites map to use case categories A-K. Suite sizes use DOE-driven Neyman-optimal allocation to maximize statistical power per suite:
 
 | Suite | Category | Description | Tasks |
-|-------|----------|-------------|-------|
-| `csb_org_crossrepo_tracing` | A | Cross-repo dependency tracing + symbol resolution | 3 |
-| `csb_org_security` | B | Vulnerability + security remediation at scale | 2 |
-| `csb_org_migration` | C | Framework upgrades across repos | 2 |
-| `csb_org_incident` | D | On-call / incident debugging across microservices | 3 |
-| `csb_org_onboarding` | E | Architecture comprehension + API discovery | 3 |
-| `csb_org_compliance` | F | Compliance / audit / provenance | 2 |
-| `csb_org_crossorg` | G | Cross-org discovery (repos from different GitHub orgs) | 2 |
-| `csb_org_domain` | H | Domain-specific lineage (deferred) | 0 |
-| `csb_org_org` | I | Agentic coding correctness using org-wide context | 0 |
-| `csb_org_platform` | J | Platform / DevTools / tribal knowledge | 3 |
+|-------|----------|-------------|------:|
+| `csb_org_onboarding` | E | Architecture comprehension + API discovery | 28 |
+| `csb_org_migration` | C | Framework upgrades across repos | 26 |
+| `csb_org_security` | B | Vulnerability + security remediation at scale | 24 |
+| `csb_org_crossrepo_tracing` | A | Cross-repo dependency tracing + symbol resolution | 22 |
+| `csb_org_domain` | H | Domain-specific lineage and analysis | 20 |
+| `csb_org_incident` | D | On-call / incident debugging across microservices | 20 |
+| `csb_org_compliance` | F | Compliance / audit / provenance | 18 |
+| `csb_org_platform` | J | Platform / DevTools / tribal knowledge | 18 |
+| `csb_org_crossorg` | G | Cross-org discovery (repos from different GitHub orgs) | 15 |
+| `csb_org_org` | I | Agentic coding correctness using org-wide context | 15 |
+| `csb_org_crossrepo` | K | Cross-repo search, dependency discovery, impact analysis | 14 |
+| **Total** | | | **220** |
 
-**Full catalog: 20 tasks across 8 active suites** (categories H and I are
-deferred). Of these, 12 tasks across 6 suites have been evaluated in official
-runs; compliance and migration suites are pending first runs. See
-`configs/selected_mcp_unique_tasks.json` for the canonical selection list.
+All 220 Org tasks are registered in the unified `configs/selected_benchmark_tasks.json` alongside the 150 SDLC tasks (370 total).
 
 ## Repo Sets
 
@@ -167,7 +166,7 @@ python3 scripts/validate_mcp_task_instance.py \
 Expected: `ccx-dep-trace-001: VALID` (gold=1.0, empty=0.0)
 
 **Step 5: Register in selection file**
-Add an entry to `configs/selected_mcp_unique_tasks.json`.
+Add an entry to `configs/selected_benchmark_tasks.json`.
 
 **Step 6: Run preflight**
 ```bash
@@ -272,42 +271,31 @@ Each task has `tests/task_spec.json` with explicit criteria:
 
 ### Config Pairing
 
-Org tasks always use **artifact** configs:
+Org tasks use the standard **direct** configs (same as SDLC):
 
-- `baseline-local-artifact` — full repos cloned locally, agent writes `answer.json`
-- `mcp-remote-artifact` — empty workspace, agent uses MCP tools, writes `answer.json`
+- `baseline-local-direct` — full repos cloned locally
+- `mcp-remote-direct` — local code truncated, agent uses Sourcegraph MCP tools
 
-Do NOT use `-direct` configs for Org suites. Direct configs expect code
-changes (git diffs); Org verifiers expect an `answer.json` artifact
-scored against `oracle_answer.json`. The runner script auto-selects artifact
-configs when launched with `--selection-file configs/selected_mcp_unique_tasks.json`.
+Some legacy runs used `baseline-local-artifact` + `mcp-remote-artifact` configs; these are handled by analysis scripts but are no longer the default. All Org tasks are registered in the unified `configs/selected_benchmark_tasks.json`.
 
 ### Full Starter Pack
 
 ```bash
-# Both configs (baseline-local-artifact + mcp-remote-artifact)
-configs/run_selected_tasks.sh \
-  --selection-file configs/selected_mcp_unique_tasks.json \
-  --parallel 8
+# Both configs (baseline-local-direct + mcp-remote-direct)
+configs/run_selected_tasks.sh --benchmark csb_org --parallel 8
 
 # Dry run to preview
-configs/run_selected_tasks.sh \
-  --selection-file configs/selected_mcp_unique_tasks.json \
-  --dry-run
+configs/run_selected_tasks.sh --benchmark csb_org --dry-run
 ```
 
 ### Category-Filtered Run
 
 ```bash
-# Run only Category A (cross-repo tracing)
-configs/run_selected_tasks.sh \
-  --selection-file configs/selected_mcp_unique_tasks.json \
-  --use-case-category A
+# Run only cross-repo tracing suite
+configs/run_selected_tasks.sh --benchmark csb_org_crossrepo_tracing
 
-# Run only Category E (onboarding) with Deep Search tasks
-configs/run_selected_tasks.sh \
-  --selection-file configs/selected_mcp_unique_tasks.json \
-  --use-case-category E
+# Run only onboarding suite
+configs/run_selected_tasks.sh --benchmark csb_org_onboarding
 ```
 
 ### Monitoring
@@ -387,7 +375,7 @@ Hybrid score = 0.6 × verifier_reward + 0.4 × rubric_score.
 3. Update the Dockerfile to clone all required repos at pinned versions
 4. Update `instruction.md`, `task_spec.json`, and `oracle_answer.json`
 5. Verify with the validity gate
-6. Add to `configs/selected_mcp_unique_tasks.json`
+6. Add to `configs/selected_benchmark_tasks.json`
 
 ### Add a New Category (H, I)
 
@@ -439,7 +427,7 @@ design uses cross-org (different GitHub orgs) instead. To add cross-host:
 - **Q6**: Category I uses hybrid: test_ratio + context verification
 - **Q7**: Deep Search-specific tasks as variants within suites (E and J families)
 - **Q8**: No score thresholds initially — calibrate after first runs
-- **Q9**: Separate selection file `configs/selected_mcp_unique_tasks.json`
+- **Q9**: Unified selection file `configs/selected_benchmark_tasks.json` (370 tasks: 150 SDLC + 220 Org)
 - **Q10**: Oracle coverage counts items found via any tool (baseline and MCP comparable)
 
 ## Dual-Mode Verification (Artifact + Direct)

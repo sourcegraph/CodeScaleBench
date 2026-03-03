@@ -70,16 +70,16 @@ Nine suites organized by software development lifecycle phase:
 
 | Suite | SDLC Phase | Tasks | Description |
 |-------|-----------|------:|-------------|
-| `csb_sdlc_understand` | Requirements & Discovery | 20 | Codebase comprehension, onboarding, Q&A, knowledge recovery |
-| `csb_sdlc_design` | Architecture & Design | 20 | Architecture analysis, dependency graphs, change impact |
-| `csb_sdlc_fix` | Bug Repair | 20 | Diagnosing and fixing real bugs across production codebases |
-| `csb_sdlc_feature` | Feature Implementation | 20 | New features, interface implementation, big-code features |
-| `csb_sdlc_refactor` | Cross-File Refactoring | 20 | Cross-file refactoring, enterprise dependency refactoring, rename refactoring |
-| `csb_sdlc_test` | Testing & QA | 20 | Code review, performance testing, code search validation, test generation |
-| `csb_sdlc_document` | Documentation | 20 | API references, architecture docs, migration guides, runbooks |
-| `csb_sdlc_secure` | Security & Compliance | 20 | CVE analysis, reachability, governance, access control |
-| `csb_sdlc_debug` | Debugging & Investigation | 20 | Root cause tracing, fault localization, provenance |
-| **Total** | | **180** | |
+| `csb_sdlc_fix` | Bug Repair | 26 | Diagnosing and fixing real bugs across production codebases |
+| `csb_sdlc_feature` | Feature Implementation | 23 | New features, interface implementation, big-code features |
+| `csb_sdlc_debug` | Debugging & Investigation | 18 | Root cause tracing, fault localization, provenance |
+| `csb_sdlc_test` | Testing & QA | 18 | Code review, performance testing, code search validation, test generation |
+| `csb_sdlc_refactor` | Cross-File Refactoring | 16 | Cross-file refactoring, enterprise dependency refactoring, rename refactoring |
+| `csb_sdlc_design` | Architecture & Design | 14 | Architecture analysis, dependency graphs, change impact |
+| `csb_sdlc_document` | Documentation | 13 | API references, architecture docs, migration guides, runbooks |
+| `csb_sdlc_secure` | Security & Compliance | 12 | CVE analysis, reachability, governance, access control |
+| `csb_sdlc_understand` | Requirements & Discovery | 10 | Codebase comprehension, onboarding, Q&A, knowledge recovery |
+| **Total** | | **150** | |
 
 ## CodeScaleBench-Org
 
@@ -87,20 +87,20 @@ Eleven additional suites measure cross-repo discovery, symbol resolution, depend
 
 | Suite | Category | Tasks | Description |
 |-------|----------|------:|-------------|
-| `csb_org_crossrepo_tracing` | A: Dependency Tracing | 20 | Cross-repo dependency chains, blast radius, symbol resolution |
-| `csb_org_security` | B: Vulnerability Remediation | 20 | CVE mapping, missing auth middleware across repos |
-| `csb_org_migration` | C: Framework Migration | 20 | API migrations, breaking changes across repos |
-| `csb_org_incident` | D: Incident Debugging | 20 | Error-to-code-path tracing across microservices |
-| `csb_org_onboarding` | E: Onboarding & Comprehension | 20 | API consumption mapping, end-to-end flow, architecture maps |
-| `csb_org_compliance` | F: Compliance | 20 | Standards adherence, audit, and provenance workflows |
-| `csb_org_crossorg` | G: Cross-Org Discovery | 20 | Interface implementations and authoritative repo identification across orgs |
+| `csb_org_onboarding` | E: Onboarding & Comprehension | 28 | API consumption mapping, end-to-end flow, architecture maps |
+| `csb_org_migration` | C: Framework Migration | 26 | API migrations, breaking changes across repos |
+| `csb_org_security` | B: Vulnerability Remediation | 24 | CVE mapping, missing auth middleware across repos |
+| `csb_org_crossrepo_tracing` | A: Dependency Tracing | 22 | Cross-repo dependency chains, blast radius, symbol resolution |
 | `csb_org_domain` | H: Domain Lineage | 20 | Config propagation, architecture patterns, domain analysis |
-| `csb_org_org` | I: Organizational Context | 20 | Agentic discovery, org-wide coding correctness |
-| `csb_org_platform` | J: Platform Knowledge | 20 | Service template discovery and tribal knowledge |
-| `csb_org_crossrepo` | K: Cross-Repo Discovery | 20 | Cross-repo search, dependency discovery, impact analysis |
+| `csb_org_incident` | D: Incident Debugging | 20 | Error-to-code-path tracing across microservices |
+| `csb_org_compliance` | F: Compliance | 18 | Standards adherence, audit, and provenance workflows |
+| `csb_org_platform` | J: Platform Knowledge | 18 | Service template discovery and tribal knowledge |
+| `csb_org_crossorg` | G: Cross-Org Discovery | 15 | Interface implementations and authoritative repo identification across orgs |
+| `csb_org_org` | I: Organizational Context | 15 | Agentic discovery, org-wide coding correctness |
+| `csb_org_crossrepo` | K: Cross-Repo Discovery | 14 | Cross-repo search, dependency discovery, impact analysis |
 | **Total** | | **220** | |
 
-**Combined catalog total: 400 tasks** (180 SDLC across 9 suites + 220 Org across 11 suites). An additional 28 backup tasks are archived in `benchmarks/backups/`.
+**Combined canonical benchmark: 370 tasks** (150 SDLC across 9 suites + 220 Org across 11 suites). Suite sizes are DOE-driven (Neyman-optimal allocation) to maximize statistical power per suite rather than uniform 20-task sizing. An additional 28 backup tasks are archived in `benchmarks/backups/`.
 
 Both baseline and MCP-Full agents have access to **all repos** in each task's fixture. The only difference is the method: baseline reads code locally, MCP-Full uses Sourcegraph MCP tools (local code is truncated). This ensures we measure whether MCP tools help agents work better — not whether MCP can access repos the baseline can't.
 
@@ -113,7 +113,7 @@ See [docs/MCP_UNIQUE_TASKS.md](docs/MCP_UNIQUE_TASKS.md) for the full task syste
 All benchmarks are evaluated across two paper-level configurations (Baseline vs MCP-Full). The concrete run config names differ by task type:
 
 - **SDLC suites** (`csb_sdlc_feature`, `csb_sdlc_refactor`, `csb_sdlc_fix`, etc.): `baseline-local-direct` + `mcp-remote-direct`
-- **Org suites** (`csb_org_*`): `baseline-local-artifact` + `mcp-remote-artifact`
+- **Org suites** (`csb_org_*`): `baseline-local-direct` + `mcp-remote-direct` (some legacy runs used `baseline-local-artifact` + `mcp-remote-artifact`)
 
 Legacy run directory names (`baseline`, `sourcegraph_full`, `artifact_full`) may still appear in historical outputs and are handled by analysis scripts.
 
@@ -132,27 +132,27 @@ See [docs/reference/CONFIGS.md](docs/reference/CONFIGS.md) for the canonical con
 
 ```
 benchmarks/              # Task definitions organized by SDLC phase + Org
-  csb_sdlc_feature/      #   Feature Implementation (20 tasks)
-  csb_sdlc_refactor/     #   Cross-File Refactoring (20 tasks)
-  csb_sdlc_debug/        #   Debugging & Investigation (20 tasks)
-  csb_sdlc_design/       #   Architecture & Design (20 tasks)
-  csb_sdlc_document/     #   Documentation (20 tasks)
-  csb_sdlc_fix/          #   Bug Repair (20 tasks)
-  csb_sdlc_secure/       #   Security & Compliance (20 tasks)
-  csb_sdlc_test/         #   Testing & QA (20 tasks)
-  csb_sdlc_understand/   #   Requirements & Discovery (20 tasks)
+  csb_sdlc_fix/          #   Bug Repair (26 tasks)
+  csb_sdlc_feature/      #   Feature Implementation (23 tasks)
+  csb_sdlc_debug/        #   Debugging & Investigation (18 tasks)
+  csb_sdlc_test/         #   Testing & QA (18 tasks)
+  csb_sdlc_refactor/     #   Cross-File Refactoring (16 tasks)
+  csb_sdlc_design/       #   Architecture & Design (14 tasks)
+  csb_sdlc_document/     #   Documentation (13 tasks)
+  csb_sdlc_secure/       #   Security & Compliance (12 tasks)
+  csb_sdlc_understand/   #   Requirements & Discovery (10 tasks)
   backups/               #   Archived backup tasks (28 total)
-  csb_org_compliance/    #   Org: compliance & audit (20 tasks)
-  csb_org_crossorg/      #   Org: cross-org discovery (20 tasks)
-  csb_org_crossrepo/     #   Org: cross-repo discovery (20 tasks)
-  csb_org_crossrepo_tracing/  #   Org: dependency tracing (20 tasks)
+  csb_org_onboarding/    #   Org: onboarding (28 tasks)
+  csb_org_migration/     #   Org: framework migration (26 tasks)
+  csb_org_security/      #   Org: vulnerability remediation (24 tasks)
+  csb_org_crossrepo_tracing/  #   Org: dependency tracing (22 tasks)
   csb_org_domain/        #   Org: domain lineage (20 tasks)
   csb_org_incident/      #   Org: incident debugging (20 tasks)
-  csb_org_migration/     #   Org: framework migration (20 tasks)
-  csb_org_onboarding/    #   Org: onboarding (20 tasks)
-  csb_org_org/           #   Org: org context (20 tasks)
-  csb_org_platform/      #   Org: platform knowledge (20 tasks)
-  csb_org_security/      #   Org: vulnerability remediation (20 tasks)
+  csb_org_compliance/    #   Org: compliance & audit (18 tasks)
+  csb_org_platform/      #   Org: platform knowledge (18 tasks)
+  csb_org_crossorg/      #   Org: cross-org discovery (15 tasks)
+  csb_org_org/           #   Org: org context (15 tasks)
+  csb_org_crossrepo/     #   Org: cross-repo discovery (14 tasks)
 configs/                 # Run configs and task selection
   _common.sh             #   Shared infra: token refresh, parallel execution, multi-account
   sdlc_suite_2config.sh  #   Generic SDLC runner (used by phase wrappers below)
@@ -166,8 +166,7 @@ configs/                 # Run configs and task selection
   test_2config.sh        #   Phase wrapper: Test (20 tasks)
   run_selected_tasks.sh  #   Unified runner for all tasks
   validate_one_per_benchmark.sh  # Pre-flight smoke (1 task per suite)
-  selected_benchmark_tasks.json  # Canonical SDLC task selection with metadata
-  selected_mcp_unique_tasks.json # Org task selection with metadata
+  selected_benchmark_tasks.json  # Canonical task selection: 370 tasks (150 SDLC + 220 Org)
   use_case_registry.json #   100 GTM use cases (Org task source)
   archive/               #   Pre-SDLC migration scripts (preserved for history)
 scripts/                 # Metrics extraction, evaluation, and operational tooling
@@ -285,10 +284,10 @@ This section assumes Harbor is already installed and configured. If not, start w
 
 ### SDLC Tasks
 
-The unified runner executes all 180 SDLC tasks across the 2-config matrix:
+The unified runner executes all 370 canonical tasks across the 2-config matrix:
 
 ```bash
-# Run all 180 SDLC tasks across 2 configs
+# Run all 370 tasks across 2 configs
 bash configs/run_selected_tasks.sh
 
 # Run only the baseline config
@@ -304,30 +303,27 @@ bash configs/run_selected_tasks.sh --dry-run
 Per-phase runners are also available:
 
 ```bash
-bash configs/fix_2config.sh              # 20 Bug Repair tasks
-bash configs/feature_2config.sh          # 20 Feature Implementation tasks
-bash configs/refactor_2config.sh         # 20 Cross-File Refactoring tasks
-bash configs/understand_2config.sh       # 20 Requirements & Discovery tasks
-bash configs/design_2config.sh           # 20 Architecture & Design tasks
-bash configs/debug_2config.sh            # 20 Debugging & Investigation tasks
-bash configs/secure_2config.sh           # 20 Security & Compliance tasks
-bash configs/test_2config.sh             # 20 Testing & QA tasks
-bash configs/document_2config.sh         # 20 Documentation tasks
+bash configs/fix_2config.sh              # 26 Bug Repair tasks
+bash configs/feature_2config.sh          # 23 Feature Implementation tasks
+bash configs/debug_2config.sh            # 18 Debugging & Investigation tasks
+bash configs/test_2config.sh             # 18 Testing & QA tasks
+bash configs/refactor_2config.sh         # 16 Cross-File Refactoring tasks
+bash configs/design_2config.sh           # 14 Architecture & Design tasks
+bash configs/document_2config.sh         # 13 Documentation tasks
+bash configs/secure_2config.sh           # 12 Security & Compliance tasks
+bash configs/understand_2config.sh       # 10 Requirements & Discovery tasks
 ```
 
-### CodeScaleBench-Org Tasks
+### Filtering by Suite
 
-Org tasks use a separate selection file:
+All tasks (SDLC and Org) are in the unified `selected_benchmark_tasks.json`. Filter by suite with the `--benchmark` flag:
 
 ```bash
-# Run all Org tasks across 2 configs
-bash configs/run_selected_tasks.sh --selection-file configs/selected_mcp_unique_tasks.json
+# Run only Org security tasks
+bash configs/run_selected_tasks.sh --benchmark csb_org_security
 
-# Filter by use-case category
-bash configs/run_selected_tasks.sh --selection-file configs/selected_mcp_unique_tasks.json --benchmark csb_org_security
-
-# Dry run
-bash configs/run_selected_tasks.sh --selection-file configs/selected_mcp_unique_tasks.json --dry-run
+# Run only SDLC fix tasks
+bash configs/run_selected_tasks.sh --benchmark csb_sdlc_fix
 ```
 
 All runners support `--baseline-only`, `--full-only`, `--task TASK_ID`, and `--parallel N` flags.

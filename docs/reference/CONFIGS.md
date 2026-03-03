@@ -223,58 +223,32 @@ runs, with baseline comparisons using `none`. No other MCP modes are allowed.
 
 ## Running CodeScaleBench-Org Tasks
 
-Org tasks use a separate selection file and support category filtering.
+All tasks (SDLC and Org) are in the unified `configs/selected_benchmark_tasks.json`. Filter by suite with the `--benchmark` flag.
 
-### Selection File
+### Running Org Tasks
 
 ```bash
-# Run all 12 Org tasks (both configs)
-configs/run_selected_tasks.sh \
-  --selection-file configs/selected_mcp_unique_tasks.json
+# Run all 220 Org tasks (both configs)
+configs/run_selected_tasks.sh --benchmark csb_org
+
+# Run only a specific Org suite
+configs/run_selected_tasks.sh --benchmark csb_org_security
 
 # Dry run to preview
-configs/run_selected_tasks.sh \
-  --selection-file configs/selected_mcp_unique_tasks.json \
-  --dry-run
+configs/run_selected_tasks.sh --benchmark csb_org --dry-run
 ```
 
-The `--selection-file` flag accepts any path to a selection JSON file. The
-file format is compatible with `configs/selected_benchmark_tasks.json` but
-uses `mcp_suite` instead of `benchmark` for suite identification.
+### CodeScaleBench-Org vs SDLC Suites
 
-### Category Filter
-
-```bash
-# Run only category A (cross-repo tracing)
-configs/run_selected_tasks.sh \
-  --selection-file configs/selected_mcp_unique_tasks.json \
-  --use-case-category A
-
-# Run only Deep Search relevant tasks (E and J categories)
-configs/run_selected_tasks.sh \
-  --selection-file configs/selected_mcp_unique_tasks.json \
-  --use-case-category E
-configs/run_selected_tasks.sh \
-  --selection-file configs/selected_mcp_unique_tasks.json \
-  --use-case-category J
-```
-
-The `--use-case-category` flag filters tasks by the `use_case_category` field in
-the selection file (values: A through J, corresponding to the 10 csb_org_* suites).
-This flag is only meaningful when used with `--selection-file`.
-
-### CodeScaleBench-Org vs Standard Suites
-
-| Feature | Standard suites | Org suites |
-|---------|----------------|-------------------|
-| **Config pair** | `baseline-local-direct` + `mcp-remote-direct` | `baseline-local-artifact` + `mcp-remote-artifact` |
-| Selection file | `selected_benchmark_tasks.json` | `selected_mcp_unique_tasks.json` |
+| Feature | SDLC suites | Org suites |
+|---------|-------------|------------|
+| **Config pair** | `baseline-local-direct` + `mcp-remote-direct` | `baseline-local-direct` + `mcp-remote-direct` |
+| Selection file | `selected_benchmark_tasks.json` | `selected_benchmark_tasks.json` (unified) |
 | Suite prefix | `csb_sdlc_<phase>` | `csb_org_<category>` |
-| Agent output | Code changes (git diff) | `/workspace/answer.json` |
-| Verifier script | `tests/test.sh` | `tests/eval.sh` |
+| Verifier script | `tests/test.sh` | `tests/test.sh` (dispatches to eval.sh or direct_verifier.sh) |
 | Oracle format | task-specific | `oracle_answer.json` + `oracle_checks.py` |
 | Baseline Dockerfile | `Dockerfile` (full repo clone) | `Dockerfile` (full repo clone) |
-| MCP Dockerfile | `Dockerfile.sg_only` (truncated source) | `Dockerfile.artifact_only` (empty workspace) |
+| MCP Dockerfile | `Dockerfile.sg_only` (truncated source) | `Dockerfile.sg_only` (truncated source) |
 
 See `docs/MCP_UNIQUE_TASKS.md` for full task authoring and evaluation details.
 

@@ -93,7 +93,7 @@ cannot do. See `docs/MCP_UNIQUE_TASKS.md` for the full authoring guide.
 python3 scripts/generate_mcp_unique_tasks.py --use-case-ids <N> --curate-oracle --validate
 
 # 2. Register in selection file
-#    configs/selected_mcp_unique_tasks.json
+#    configs/selected_benchmark_tasks.json
 
 # 3. Validate
 python3 scripts/validate_mcp_task_instance.py --task-dir benchmarks/csb_org_<suite>/<task>

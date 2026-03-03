@@ -4,13 +4,13 @@
 > coverage, pairing, or reporting. This doc prevents the #1 recurring agent mistake:
 > incorrect task ID extraction leading to false "missing results" reports.
 
-## Task Counts (as of 2026-02-28)
+## Task Counts (as of 2026-03-03)
 
 | Category | Count | Notes |
 |---|---|---|
-| SDLC tasks | 199 | 9 suites (feature/refactor/debug/design/document/fix/secure/test/understand) |
-| Org tasks | 95 | 11 suites (csb_org_*) |
-| **Total** | **294** | csb_sdlc_build split into csb_sdlc_feature (20) + csb_sdlc_refactor (20) on 2026-02-28 |
+| SDLC tasks | 150 | 9 suites (feature/refactor/debug/design/document/fix/secure/test/understand) |
+| Org tasks | 220 | 11 suites (csb_org_*) |
+| **Total** | **370** | DOE-driven Neyman-optimal allocation. Old `csb_sdlc_build` was split into `csb_sdlc_feature` (23) + `csb_sdlc_refactor` (16) |
 
 ## Directory Layouts
 

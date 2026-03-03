@@ -152,10 +152,7 @@ benchmarks/<suite>/<task-id>/
 | **Baseline** | `baseline-local-direct` | Full local code | None                 | `Dockerfile`         | Evaluation context only |
 | **MCP**      | `mcp-remote-direct`     | Truncated/empty | 13 Sourcegraph tools | `Dockerfile.sg_only` | V5 MCP-first preamble   |
 
-For Org tasks, an additional artifact variant is used:
-
-- `baseline-local-artifact`: Full local code, structured `answer.json` output
-- `mcp-remote-artifact`: Truncated source, MCP tools, structured `answer.json` output
+Both SDLC and Org tasks use the same config pair (`baseline-local-direct` + `mcp-remote-direct`). Some legacy Org runs used `baseline-local-artifact` + `mcp-remote-artifact` configs; these are handled by analysis scripts but are no longer the default.
 
 ---
 
@@ -167,14 +164,17 @@ Tasks are drawn from established benchmarks and custom-authored challenges, then
 
 | Suite            | SDLC Phase                | Tasks | Difficulty Range | Languages                            |
 | ---------------- | ------------------------- | ----: | ---------------- | ------------------------------------ |
-| `csb_sdlc_understand` | Requirements & Discovery  |    20 | hard             | C++, Go, Java, Python, TS            |
-| `csb_sdlc_design`     | Architecture & Design     |    20 | hard--expert     | C, C++, Go, Java, Python             |
-| `csb_sdlc_fix`        | Bug Repair                |    25 | medium--hard     | C++, Go, Java, JS, Python, TS        |
-| `csb_sdlc_build`      | Feature & Refactoring     |    25 | medium--hard     | C#, C++, Go, Java, JS, Rust, TS      |
-| `csb_sdlc_test`       | Testing & QA              |    20 | medium--hard     | C, C#, C++, Go, Java, JS, Python, TS |
-| `csb_sdlc_document`   | Documentation             |    20 | hard             | C++, Go, Java, Python, TS            |
-| `csb_sdlc_secure`     | Security & Compliance     |    20 | medium--hard     | C, C++, Go, Java, Python             |
-| `csb_sdlc_debug`      | Debugging & Investigation |    20 | medium--expert   | C, C++, Go, Python, TS               |
+| `csb_sdlc_fix`        | Bug Repair                |    26 | medium--hard     | C++, Go, Java, JS, Python, TS        |
+| `csb_sdlc_feature`    | Feature Implementation    |    23 | medium--hard     | C#, C++, Go, Java, JS, Rust, TS      |
+| `csb_sdlc_debug`      | Debugging & Investigation |    18 | medium--expert   | C, C++, Go, Python, TS               |
+| `csb_sdlc_test`       | Testing & QA              |    18 | medium--hard     | C, C#, C++, Go, Java, JS, Python, TS |
+| `csb_sdlc_refactor`   | Cross-File Refactoring    |    16 | medium--hard     | C++, Go, Java, Python, Rust          |
+| `csb_sdlc_design`     | Architecture & Design     |    14 | hard--expert     | C, C++, Go, Java, Python             |
+| `csb_sdlc_document`   | Documentation             |    13 | hard             | C++, Go, Java, Python, TS            |
+| `csb_sdlc_secure`     | Security & Compliance     |    12 | medium--hard     | C, C++, Go, Java, Python             |
+| `csb_sdlc_understand` | Requirements & Discovery  |    10 | hard             | C++, Go, Java, Python, TS            |
+
+Suite sizes use DOE-driven Neyman-optimal allocation to maximize statistical power per suite. The old `csb_sdlc_build` suite was split into `csb_sdlc_feature` (23 tasks) and `csb_sdlc_refactor` (16 tasks) to better align with SDLC phases.
 
 ### 4.2 CodeScaleBench-Org Suites (220 tasks)
 
@@ -182,16 +182,17 @@ These tasks specifically measure org-scale cross-repository discovery capabiliti
 
 | Suite                       | Use Case Category            | Tasks | Description                               |
 | --------------------------- | ---------------------------- | ----: | ----------------------------------------- |
-| `csb_org_crossrepo_tracing` | A: Dependency Tracing        |     1 | Blast radius analysis, dependency chains  |
-| `csb_org_security`          | B: Vulnerability Remediation |    10 | CVE impact, missing auth middleware       |
-| `csb_org_migration`         | C: Framework Migration       |     7 | API migrations, breaking changes          |
-| `csb_org_incident`          | D: Incident Debugging        |    11 | Error-to-code-path tracing                |
-| `csb_org_onboarding`        | E: Onboarding                |    11 | API consumption, tribal knowledge         |
-| `csb_org_compliance`        | F: Compliance                |     7 | Standards adherence across repos          |
-| `csb_org_crossorg`          | G: Cross-Org Discovery       |     5 | Interface implementations                 |
-| `csb_org_domain`            | H: Domain Lineage            |    10 | Config propagation, architecture patterns |
-| `csb_org_org`               | I: Organizational Context    |     5 | Agentic discovery                         |
-| `csb_org_platform`          | J: Platform Knowledge        |     5 | Service templates, infrastructure         |
+| `csb_org_onboarding`        | E: Onboarding                |    28 | API consumption, tribal knowledge         |
+| `csb_org_migration`         | C: Framework Migration       |    26 | API migrations, breaking changes          |
+| `csb_org_security`          | B: Vulnerability Remediation |    24 | CVE impact, missing auth middleware       |
+| `csb_org_crossrepo_tracing` | A: Dependency Tracing        |    22 | Blast radius analysis, dependency chains  |
+| `csb_org_domain`            | H: Domain Lineage            |    20 | Config propagation, architecture patterns |
+| `csb_org_incident`          | D: Incident Debugging        |    20 | Error-to-code-path tracing                |
+| `csb_org_compliance`        | F: Compliance                |    18 | Standards adherence across repos          |
+| `csb_org_platform`          | J: Platform Knowledge        |    18 | Service templates, infrastructure         |
+| `csb_org_crossorg`          | G: Cross-Org Discovery       |    15 | Interface implementations                 |
+| `csb_org_org`               | I: Organizational Context    |    15 | Agentic discovery                         |
+| `csb_org_crossrepo`         | K: Cross-Repo Discovery      |    14 | Cross-repo search, impact analysis        |
 
 ### 4.3 Repository and Language Coverage
 
@@ -234,7 +235,7 @@ The 370 tasks in CodeScaleBench fall into two broad provenance categories:
 
 All tasks, regardless of inspiration source, use CSB-authored instructions and CSB-built verifiers running inside the CSB Docker environment.
 
-**Org tasks (81 tasks):** Derived from a custom **Use Case Registry** (`configs/use_case_registry.json`) for cross-repository code intelligence. Each use case was validated against Sourcegraph's actual search capabilities and curated into a benchmark task with oracle ground truth. These tasks specifically target org-scale scenarios where information is distributed across 3-20 repositories.
+**Org tasks (220 tasks):** Derived from a custom **Use Case Registry** (`configs/use_case_registry.json`) for cross-repository code intelligence. Each use case was validated against Sourcegraph's actual search capabilities and curated into a benchmark task with oracle ground truth. These tasks specifically target org-scale scenarios where information is distributed across 3-20 repositories. Suite sizes use DOE-driven Neyman-optimal allocation to maximize statistical power per suite.
 
 ### 5.2 GitHub Usage for Task Sourcing
 
@@ -325,7 +326,7 @@ Ground truth extraction uses task-type-specific strategies that match how each t
 - **Code-review tasks** (csb_sdlc_test): `expected_defects.json` provides structured defect annotations (file, line range, defect type)
 - **Fault-localization tasks** (csb_sdlc_debug): Ground truth file paths extracted from `instruction.md`
 
-**Org tasks (81 tasks)** use `oracle_answer.json` as the authoritative source, providing structured ground truth with files, symbols, dependency chains, and keywords (see Section 6.5).
+**Org tasks (220 tasks)** use `oracle_answer.json` as the authoritative source, providing structured ground truth with files, symbols, dependency chains, and keywords (see Section 6.5).
 
 ### 6.4 Ground Truth Data Model
 
@@ -953,6 +954,133 @@ MCP-remote-direct runs achieve higher file recall (0.474 vs. 0.326 baseline), su
 
 The positive correlation between codebase size metrics and reward (+0.33 for files_count, +0.32 for context_length) is counterintuitive but reflects task composition: larger codebases tend to have richer verification infrastructure (test suites, CI configurations) that helps the agent verify its work.
 
+### 11.7 Reward by Language
+
+Multi-run averaged reward by primary programming language across 369 paired canonical tasks. Languages with fewer than 3 tasks are grouped under "Other."
+
+| Language | n | Baseline Mean | MCP Mean | Delta | Wins | Losses | Neutral |
+|----------|---|---------------|----------|-------|------|--------|---------|
+| Go       | 134 | 0.430 | 0.457 | +0.028 | 56 | 44 | 34 |
+| C++      | 72  | 0.458 | 0.463 | +0.004 | 31 | 25 | 16 |
+| Java     | 57  | 0.425 | 0.437 | +0.012 | 30 | 22 | 5  |
+| Python   | 55  | 0.439 | 0.502 | +0.063 | 26 | 17 | 12 |
+| Rust     | 12  | 0.426 | 0.443 | +0.017 | 5  | 3  | 4  |
+| C        | 10  | 0.618 | 0.676 | +0.058 | 5  | 3  | 2  |
+| JavaScript | 8 | 0.414 | 0.514 | +0.100 | 2  | 3  | 3  |
+| TypeScript | 7 | 0.572 | 0.599 | +0.027 | 2  | 3  | 2  |
+| Java+C++ | 5   | 0.592 | 0.706 | +0.114 | 4  | 1  | 0  |
+| Other    | 9   | 0.424 | 0.468 | +0.043 | 4  | 3  | 2  |
+
+MCP provides a positive delta for all major languages. Python shows the largest single-language gain (+0.063, n=55), likely because Python tasks have more cross-repository dependencies that benefit from Sourcegraph search. JavaScript shows a +0.100 delta but with small n=8; the wide confidence interval makes this unreliable as a standalone finding. Go, the most represented language (n=134), shows a +0.028 delta, consistent with the overall pattern. The near-zero neutral rate for Java (5/57) indicates that Sourcegraph-mediated search consistently changes Java task outcomes—though not always positively.
+
+### 11.8 Reward by Difficulty
+
+| Difficulty | n   | Baseline Mean | MCP Mean | Delta  | Wins | Losses | Neutral |
+|-----------|-----|---------------|----------|--------|------|--------|---------|
+| Hard      | 337 | 0.443         | 0.470    | +0.026 | 155  | 115    | 67      |
+| Expert    | 21  | 0.562         | 0.577    | +0.015 | 7    | 9      | 5       |
+| Medium    | 11  | 0.307         | 0.444    | +0.137 | 4    | 0      | 7       |
+
+Difficulty is assigned by the `rescore_difficulty.py` pipeline, which combines code complexity, codebase size, and ground-truth depth into a composite score:
+
+```
+raw = 0.4 * size_score + 0.4 * complexity_score + 0.2 * ground_truth_depth_score
+difficulty = "medium" if raw < 0.35 else "hard" if raw < 0.75 else "expert"
+```
+
+The benchmark is dominated by "hard" tasks (337/369, 91%), reflecting the deliberate selection of non-trivial engineering challenges. The MCP delta is positive across all difficulty levels, with medium tasks showing the largest gain (+0.137). Expert tasks show a small delta (+0.015) with a slightly negative win/loss split (7/9), suggesting that at the highest complexity tier MCP provides inconsistent benefit.
+
+### 11.9 Reward by Codebase Size
+
+**By context length** (instruction + source context in tokens):
+
+| Context Length     | n   | Baseline Mean | MCP Mean | Delta  |
+|-------------------|-----|---------------|----------|--------|
+| < 100K tokens     | 222 | 0.369         | 0.403    | +0.033 |
+| 100K–1M tokens    | 97  | 0.605         | 0.607    | +0.002 |
+| Unknown           | 50  | 0.479         | 0.541    | +0.062 |
+
+**By files count** (number of files provided in task context):
+
+| Files Count    | n   | Baseline Mean | MCP Mean | Delta  |
+|---------------|-----|---------------|----------|--------|
+| < 10 files    | 167 | 0.314         | 0.352    | +0.038 |
+| 10–100 files  | 91  | 0.633         | 0.627    | −0.006 |
+| Unknown       | 111 | 0.491         | 0.536    | +0.045 |
+
+For tasks with small context (< 100K tokens), MCP provides a meaningful +0.033 improvement. At the 100K–1M token range, the delta collapses to near zero (+0.002), suggesting that once sufficient local context is available, remote search adds little value. Tasks with fewer files (< 10) benefit more from MCP (+0.038) than tasks with 10–100 files (−0.006). This pattern indicates that MCP's value concentrates on tasks where the agent must discover relevant code rather than navigate an already-provided codebase.
+
+### 11.10 MCP Tool Usage Patterns
+
+Based on n=344 MCP-config task evaluations with tool usage data:
+
+**Overall usage:**
+- Mean total tool calls per task: 34.4 (23.1 MCP + 11.2 local)
+- Mean MCP ratio: 0.78
+- Zero-MCP tasks: 0 (0.0%)—all MCP-config tasks used at least one Sourcegraph tool
+- Deep Search usage: near zero (0.0 mean calls per task)
+
+**Search strategy distribution** (n=335 tasks with search data):
+- Mean keyword searches per task: 8.5
+- Mean NLS (natural language search) per task: 1.1
+- Mean Deep Search per task: 0.0
+
+**MCP tool adoption by tool name** (from 602 MCP task runs across all evaluations):
+
+| Tool                         | Tasks Using | Total Calls | Mean Reward |
+|------------------------------|-------------|-------------|-------------|
+| sg_read_file                 | 602         | 6,324       | 0.622       |
+| sg_keyword_search            | 577         | 4,813       | 0.615       |
+| sg_list_files                | 447         | 1,791       | 0.613       |
+| sg_nls_search                | 256         | 587         | 0.525       |
+| sg_list_repos                | 215         | 270         | 0.451       |
+| sg_find_references           | 35          | 48          | 0.644       |
+| sg_commit_search             | 28          | 38          | 0.514       |
+| sg_diff_search               | 10          | 10          | 0.550       |
+| sg_compare_revisions         | 6           | 9           | 0.560       |
+| sg_deepsearch                | 6           | 8           | 0.563       |
+| sg_go_to_definition          | 5           | 6           | 0.341       |
+
+The agent overwhelmingly relies on keyword search (sg_keyword_search) and file reading (sg_read_file) as its primary MCP tools. Natural language search (sg_nls_search) is used in roughly 42% of tasks but contributes only 587 calls vs. 4,813 for keyword search. Deep Search is effectively unused (6 tasks, 8 calls across 602 MCP runs), indicating the agent does not discover or leverage this tool. The MCP ratio of 0.78 means 78% of all tool calls in MCP-config runs go through Sourcegraph—significantly higher in Org tasks (0.88–0.96) than SDLC tasks (0.31–0.88), because Org tasks have truncated local code and must rely on remote search.
+
+### 11.11 Cost Analysis
+
+Token-based cost computed from Claude Haiku 4.5 pricing (input $0.80/M, output $4.00/M, cache write $1.00/M, cache read $0.08/M). Based on n=323 paired tasks with cost data.
+
+| Category | n | Baseline Mean ($/task) | MCP Mean ($/task) | Delta |
+|----------|---|------------------------|-------------------|-------|
+| SDLC     | 103 | $0.463 | $0.539 | +$0.075 |
+| Org      | 220 | $0.221 | $0.211 | −$0.010 |
+| **Overall** | **323** | **$0.297** | **$0.333** | **+$0.017** |
+
+| Metric        | Baseline      | MCP           |
+|---------------|---------------|---------------|
+| Mean cost/task | $0.297       | $0.333        |
+| Median cost/task | $0.243     | $0.251        |
+| Total cost    | $98.43        | $114.56       |
+
+MCP adds approximately +$0.017/task (+5.8%) on average. This cost increase is concentrated in SDLC tasks (+$0.075/task, +16.2%), where the agent has full local code and MCP search adds overhead without replacing local tool calls. For Org tasks, MCP is actually slightly cheaper (−$0.010/task, −4.5%), because remote search replaces expensive local file-reading operations on truncated source trees. The median cost difference is minimal ($0.008), indicating the mean is pulled by a small number of high-cost SDLC tasks.
+
+### 11.12 Timing Analysis
+
+Wall-clock and agent execution time across n=369 paired canonical tasks.
+
+| Metric               | n   | Baseline Mean (s) | MCP Mean (s) | Delta    |
+|----------------------|-----|--------------------|--------------|----------|
+| Wall clock           | 369 | 403.1              | 356.2        | −46.8    |
+| Agent execution      | 369 | 237.1              | 146.7        | −90.4    |
+
+**By category:**
+
+| Category | n   | BL Wall (s) | MCP Wall (s) | Wall Delta | BL Cost | MCP Cost | Cost Delta |
+|----------|-----|-------------|--------------|------------|---------|----------|------------|
+| SDLC     | 149 | 530.3       | 506.9        | −23.4      | $0.463  | $0.539   | +$0.075    |
+| Org      | 220 | 316.9       | 254.2        | −62.7      | $0.221  | $0.211   | −$0.010    |
+
+MCP tasks are **47 seconds faster** on wall clock overall (−11.6%). **Org tasks are 63 seconds faster** with MCP (−19.8%), because remote search eliminates the need to read many local files when source is truncated. **SDLC tasks are also faster** (−23.4s, −4.4%), though the improvement is smaller since local code is already available.
+
+Agent execution time (excluding environment setup and verification) shows MCP is **90 seconds faster** overall (−38.1%). This means the agent's problem-solving phase is substantially shorter with MCP access, consistent across both task categories.
+
 ---
 
 ## 12. Threats to Validity
@@ -1067,7 +1195,7 @@ Major architectural decisions emerged through iterative dialogue:
 
 4. **V5 preamble design** (Feb 20): After discovering the git history bypass bug, Claude Code designed the "truncation constraint" approach that leads with "files not present."
 
-5. **Oracle auto-curation** (Feb 24): Claude Code designed the Sourcegraph-query-based oracle curation pipeline and validated all Org tasks (81 initial, later expanded to 220 via DOE rebalancing).
+5. **Oracle auto-curation** (Feb 24): Claude Code designed the Sourcegraph-query-based oracle curation pipeline and validated all 220 Org tasks (81 initial tasks expanded to 220 via scaffolding, promotion, and DOE-driven Neyman-optimal rebalancing).
 
 ### 14.6 Lessons Learned
 

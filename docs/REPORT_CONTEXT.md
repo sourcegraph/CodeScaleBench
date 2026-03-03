@@ -29,24 +29,25 @@ augmented with Sourcegraph MCP (Model Context Protocol) tools.
 
 ### 2.1 Task Taxonomy
 
-CodeScaleBench organizes **400 tasks** into two task families:
+CodeScaleBench organizes **370 tasks** into two task families:
 
-**SDLC-Phase Suites (180 tasks):** Nine suites aligned to software
+**SDLC-Phase Suites (150 tasks):** Nine suites aligned to software
 development lifecycle phases. Tasks are drawn from established benchmarks
 (SWE-bench Pro, DIBench, TheAgentCompany) and custom-authored challenges
-targeting specific SDLC activities.
+targeting specific SDLC activities. Suite sizes use DOE-driven Neyman-optimal
+allocation to maximize statistical power per suite.
 
 | Suite | Phase | Tasks | Difficulty | Languages |
 |-------|-------|------:|------------|-----------|
-| `csb_sdlc_understand` | Requirements & Discovery | 20 | hard | C++, Go, Java, Python, TS |
-| `csb_sdlc_design` | Architecture & Design | 20 | hard--very_hard | C, C++, Go, Java, Python |
-| `csb_sdlc_fix` | Bug Repair | 20 | medium--hard | C++, Go, Java, JS, Python, TS |
-| `csb_sdlc_feature` | Feature Implementation | 20 | medium--hard | C, C++, Go, Java, Python, Rust, TS |
-| `csb_sdlc_refactor` | Cross-File Refactoring | 20 | hard--expert | C, C++, Go, Java, Python, Rust |
-| `csb_sdlc_test` | Testing & QA | 20 | medium--hard | C, C#, C++, Go, Java, JS, Python, TS |
-| `csb_sdlc_document` | Documentation | 20 | hard | C++, Go, Java, Python, TS |
-| `csb_sdlc_secure` | Security & Compliance | 20 | medium--hard | C, C++, Go, Java, Python |
-| `csb_sdlc_debug` | Debugging & Investigation | 20 | medium--expert | C, C++, Go, Python, TS |
+| `csb_sdlc_fix` | Bug Repair | 26 | medium--hard | C++, Go, Java, JS, Python, TS |
+| `csb_sdlc_feature` | Feature Implementation | 23 | medium--hard | C, C++, Go, Java, Python, Rust, TS |
+| `csb_sdlc_debug` | Debugging & Investigation | 18 | medium--expert | C, C++, Go, Python, TS |
+| `csb_sdlc_test` | Testing & QA | 18 | medium--hard | C, C#, C++, Go, Java, JS, Python, TS |
+| `csb_sdlc_refactor` | Cross-File Refactoring | 16 | hard--expert | C, C++, Go, Java, Python, Rust |
+| `csb_sdlc_design` | Architecture & Design | 14 | hard--expert | C, C++, Go, Java, Python |
+| `csb_sdlc_document` | Documentation | 13 | hard | C++, Go, Java, Python, TS |
+| `csb_sdlc_secure` | Security & Compliance | 12 | medium--hard | C, C++, Go, Java, Python |
+| `csb_sdlc_understand` | Requirements & Discovery | 10 | hard | C++, Go, Java, Python, TS |
 
 **CodeScaleBench-Org Suites (220 tasks):** Eleven suites measuring org-scale cross-repo
 discovery tasks where the agent must find information distributed across 3-20
@@ -54,17 +55,17 @@ repositories.
 
 | Suite | Category | Tasks |
 |-------|----------|------:|
-| `csb_org_crossrepo_tracing` | Dependency Tracing | 20 |
-| `csb_org_security` | Vulnerability Remediation | 20 |
-| `csb_org_migration` | Framework Migration | 20 |
-| `csb_org_incident` | Incident Debugging | 20 |
-| `csb_org_onboarding` | Onboarding & Comprehension | 20 |
-| `csb_org_compliance` | Compliance | 20 |
-| `csb_org_crossorg` | Cross-Org Discovery | 20 |
+| `csb_org_onboarding` | Onboarding & Comprehension | 28 |
+| `csb_org_migration` | Framework Migration | 26 |
+| `csb_org_security` | Vulnerability Remediation | 24 |
+| `csb_org_crossrepo_tracing` | Dependency Tracing | 22 |
 | `csb_org_domain` | Domain Lineage | 20 |
-| `csb_org_org` | Organizational Context | 20 |
-| `csb_org_platform` | Platform Knowledge | 20 |
-| `csb_org_crossrepo` | Cross-Repo Discovery | 20 |
+| `csb_org_incident` | Incident Debugging | 20 |
+| `csb_org_compliance` | Compliance | 18 |
+| `csb_org_platform` | Platform Knowledge | 18 |
+| `csb_org_crossorg` | Cross-Org Discovery | 15 |
+| `csb_org_org` | Organizational Context | 15 |
+| `csb_org_crossrepo` | Cross-Repo Discovery | 14 |
 
 ### 2.2 Task Sources
 

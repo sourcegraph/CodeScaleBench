@@ -101,21 +101,14 @@ Disk: 290GB free
 
 ### Launch both configs (baseline + MCP-Full)
 ```bash
-# Full starter pack — both configs
-configs/run_selected_tasks.sh \
-  --selection-file configs/selected_mcp_unique_tasks.json \
-  --parallel 8
+# Full starter pack — both configs (all Org tasks)
+configs/run_selected_tasks.sh --benchmark csb_org --parallel 8
 
-# Category-specific run
-configs/run_selected_tasks.sh \
-  --selection-file configs/selected_mcp_unique_tasks.json \
-  --use-case-category A \
-  --parallel 4
+# Suite-specific run
+configs/run_selected_tasks.sh --benchmark csb_org_crossrepo_tracing --parallel 4
 
 # Single task test
-configs/run_selected_tasks.sh \
-  --selection-file configs/selected_mcp_unique_tasks.json \
-  --task ccx-onboard-041
+configs/run_selected_tasks.sh --task ccx-onboard-041
 ```
 
 ### Monitor progress

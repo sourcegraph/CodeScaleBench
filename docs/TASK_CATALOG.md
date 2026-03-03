@@ -1,6 +1,6 @@
 # CodeScaleBench Task Catalog
 
-A detailed reference for benchmark tasks in CodeScaleBench. This document catalogs the **180 SDLC tasks** organized across **9 SDLC-phase suites** (plus 220 Org tasks across 11 suites = **400 total**). The selection file (`configs/selected_benchmark_tasks.json`, version 2.0, last updated 2026-03-01) contains all 400 active tasks.
+A detailed reference for benchmark tasks in CodeScaleBench. This document catalogs the **150 SDLC tasks** organized across **9 SDLC-phase suites** (plus 220 Org tasks across 11 suites = **370 total**). Suite sizes use DOE-driven Neyman-optimal allocation. The unified selection file (`configs/selected_benchmark_tasks.json`) contains all 370 canonical tasks.
 
 **Selection methodology:** Tasks were chosen via stratified sampling across benchmarks, covering all SDLC phases. Each task is scored for MCP benefit using a weighted combination of context complexity (0.25), cross-file dependencies (0.30), semantic search potential (0.20), and tool-chain weight (0.25). See `docs/TASK_SELECTION.md` for full scoring methodology.
 
@@ -8,15 +8,15 @@ A detailed reference for benchmark tasks in CodeScaleBench. This document catalo
 
 ## Table of Contents
 
-1. [csb_sdlc_understand (20 tasks)](#1-csb_sdlc_understand--requirements--discovery)
-2. [csb_sdlc_design (20 tasks)](#2-csb_sdlc_design--architecture--design)
-3. [csb_sdlc_fix (20 tasks)](#3-csb_sdlc_fix--bug-repair)
-4. [csb_sdlc_feature (20 tasks)](#4-csb_sdlc_feature--feature-implementation)
-5. [csb_sdlc_refactor (20 tasks)](#5-csb_sdlc_refactor--cross-file-refactoring)
-6. [csb_sdlc_test (20 tasks)](#6-csb_sdlc_test--testing--qa)
-7. [csb_sdlc_document (20 tasks)](#7-csb_sdlc_document--documentation)
-8. [csb_sdlc_secure (20 tasks)](#8-csb_sdlc_secure--security--compliance)
-9. [csb_sdlc_debug (20 tasks)](#9-csb_sdlc_debug--debugging--investigation)
+1. [csb_sdlc_understand (10 tasks)](#1-csb_sdlc_understand--requirements--discovery)
+2. [csb_sdlc_design (14 tasks)](#2-csb_sdlc_design--architecture--design)
+3. [csb_sdlc_fix (26 tasks)](#3-csb_sdlc_fix--bug-repair)
+4. [csb_sdlc_feature (23 tasks)](#4-csb_sdlc_feature--feature-implementation)
+5. [csb_sdlc_refactor (16 tasks)](#5-csb_sdlc_refactor--cross-file-refactoring)
+6. [csb_sdlc_test (18 tasks)](#6-csb_sdlc_test--testing--qa)
+7. [csb_sdlc_document (13 tasks)](#7-csb_sdlc_document--documentation)
+8. [csb_sdlc_secure (12 tasks)](#8-csb_sdlc_secure--security--compliance)
+9. [csb_sdlc_debug (18 tasks)](#9-csb_sdlc_debug--debugging--investigation)
 10. [Summary Statistics](#summary-statistics)
 
 ---
@@ -25,7 +25,7 @@ A detailed reference for benchmark tasks in CodeScaleBench. This document catalo
 
 **Focus:** Codebase comprehension, natural-language Q&A, onboarding, knowledge discovery, and institutional memory recovery. Tasks require the agent to explain architecture, trace data flows, orient in unfamiliar projects, and recover fragmented knowledge.
 
-**20 tasks** | Languages: C++, Go, Java, Python, TypeScript | Difficulty: hard (all tasks)
+**10 tasks** | Languages: C++, Go, Java, Python, TypeScript | Difficulty: hard (all tasks)
 
 | Task ID | Lang | Difficulty | Repository | Category |
 |---------|------|-----------|------------|----------|
@@ -56,7 +56,7 @@ A detailed reference for benchmark tasks in CodeScaleBench. This document catalo
 
 **Focus:** Architecture analysis, dependency mapping, cross-repo reasoning, impact analysis, symbol resolution, and design-level decision-making. Tasks require the agent to understand system structure, trace dependency chains, and resolve cross-codebase symbols.
 
-**20 tasks** | Languages: C, C++, Go, Java, Python | Difficulty: hard--very_hard
+**14 tasks** | Languages: C, C++, Go, Java, Python | Difficulty: hard--expert
 
 | Task ID | Lang | Difficulty | Repository | Category |
 |---------|------|-----------|------------|----------|
@@ -87,7 +87,7 @@ A detailed reference for benchmark tasks in CodeScaleBench. This document catalo
 
 **Focus:** Fix real bugs from production open-source repositories. Includes SWE-bench Pro patches, PyTorch compiler/runtime fixes, enterprise multi-team ownership bugs, and large-codebase debugging fixes.
 
-**20 tasks** | Languages: C++, Go, Java, JavaScript, Python, TypeScript | Difficulty: medium--hard
+**26 tasks** | Languages: C++, Go, Java, JavaScript, Python, TypeScript | Difficulty: medium--hard
 
 | Task ID | Lang | Difficulty | Repository | Category |
 |---------|------|-----------|------------|----------|
@@ -123,7 +123,7 @@ A detailed reference for benchmark tasks in CodeScaleBench. This document catalo
 
 **Focus:** Feature implementation, interface implementation, and adding new capabilities to large codebases. Tasks range from implementing new API endpoints and middleware to adding features in 1GB+ monorepos.
 
-**20 tasks** | Languages: C, C++, Go, Java, Python, Python/C++, Rust, TypeScript | Difficulty: hard--expert
+**23 tasks** | Languages: C, C++, Go, Java, Python, Python/C++, Rust, TypeScript | Difficulty: medium--hard
 
 | Task ID | Lang | Difficulty | Repository | Category |
 |---------|------|-----------|------------|----------|
@@ -154,7 +154,7 @@ A detailed reference for benchmark tasks in CodeScaleBench. This document catalo
 
 **Focus:** Symbol renaming, module extraction, and cross-file restructuring. Tasks require identifying all references to a symbol across multiple files and consistently renaming or extracting them while maintaining compilation.
 
-**20 tasks** | Languages: C, C++, Go, Java, Python, Rust | Difficulty: hard--expert
+**16 tasks** | Languages: C, C++, Go, Java, Python, Rust | Difficulty: medium--hard
 
 | Task ID | Lang | Difficulty | Repository | Category |
 |---------|------|-----------|------------|----------|
@@ -185,7 +185,7 @@ A detailed reference for benchmark tasks in CodeScaleBench. This document catalo
 
 **Focus:** Code review with injected defects, codebase search, performance optimization profiling, and unit test writing. Tasks test the agent's ability to detect bugs, write tests, find code patterns, and optimize performance.
 
-**20 tasks** | Languages: C, C#, C++, Go, Java, JavaScript, Python, TypeScript | Difficulty: medium--hard
+**18 tasks** | Languages: C, C#, C++, Go, Java, JavaScript, Python, TypeScript | Difficulty: medium--hard
 
 | Task ID | Lang | Difficulty | Repository | Category |
 |---------|------|-----------|------------|----------|
@@ -220,7 +220,7 @@ A detailed reference for benchmark tasks in CodeScaleBench. This document catalo
 
 **Focus:** Generate accurate API documentation, architecture guides, and migration plans by reading and understanding source code. Tasks require deep codebase comprehension to produce comprehensive documentation.
 
-**20 tasks** | Languages: C++, Go, Java, Python, TypeScript | Difficulty: medium--hard
+**13 tasks** | Languages: C++, Go, Java, Python, TypeScript | Difficulty: hard
 
 | Task ID | Lang | Difficulty | Repository | Category |
 |---------|------|-----------|------------|----------|
@@ -251,7 +251,7 @@ A detailed reference for benchmark tasks in CodeScaleBench. This document catalo
 
 **Focus:** Security vulnerability triage (CVE analysis), reachability assessment, transitive dependency analysis, governance compliance (access control, audit trails, policy enforcement), and sensitive file exclusion.
 
-**20 tasks** | Languages: C, C++, Go, Java, Python | Difficulty: medium--hard
+**12 tasks** | Languages: C, C++, Go, Java, Python | Difficulty: medium--hard
 
 | Task ID | Lang | Difficulty | Repository | Category |
 |---------|------|-----------|------------|----------|
@@ -282,7 +282,7 @@ A detailed reference for benchmark tasks in CodeScaleBench. This document catalo
 
 **Focus:** Deep debugging, fault localization, regression hunting, causal chain tracing, and navigation-verified regression proving. Includes Linux kernel fault localization (expert difficulty) and navigation-verified tasks where the agent must both locate a bug and write a regression test.
 
-**20 tasks** | Languages: C, C++, Go, Python, TypeScript | Difficulty: medium--expert
+**18 tasks** | Languages: C, C++, Go, Python, TypeScript | Difficulty: medium--expert
 
 | Task ID | Lang | Difficulty | Repository | Category |
 |---------|------|-----------|------------|----------|
@@ -317,16 +317,16 @@ A detailed reference for benchmark tasks in CodeScaleBench. This document catalo
 
 | Suite | Tasks | Difficulty Range | Languages | Description |
 |-------|-------|-----------------|-----------|-------------|
-| csb_sdlc_understand | 34 | hard | C++, Go, Java, Python, TS | Comprehension, Q&A, onboarding |
-| csb_sdlc_design | 20 | hard--very_hard | C, C++, Go, Java, Python | Architecture, dependency mapping |
-| csb_sdlc_fix | 25 | medium--hard | C++, Go, Java, JS, Python, TS | Bug fixes, SWE-bench Pro patches |
-| csb_sdlc_feature | 20 | hard--expert | C, C++, Go, Java, Python, Python/C++, Rust, TS | Feature implementation, interface impl |
-| csb_sdlc_refactor | 20 | hard--expert | C, C++, Go, Java, Python, Rust | Cross-file renaming, module extraction |
-| csb_sdlc_test | 20 | medium--hard | C, C#, C++, Go, Java, JS, Python, TS | Code review, testing, perf, coverage analysis |
-| csb_sdlc_document | 20 | medium--hard | C++, Go, Java, Python, TS | API docs, arch guides, migration, runbooks |
-| csb_sdlc_secure | 20 | medium--hard | C, C++, Go, Java, Python | CVE triage, governance, access |
-| csb_sdlc_debug | 20 | medium--expert | C, C++, Go, Python, TS | Fault localization, regression |
+| csb_sdlc_fix | 26 | medium--hard | C++, Go, Java, JS, Python, TS | Bug fixes, SWE-bench Pro patches |
+| csb_sdlc_feature | 23 | medium--hard | C, C++, Go, Java, Python, Python/C++, Rust, TS | Feature implementation, interface impl |
+| csb_sdlc_debug | 18 | medium--expert | C, C++, Go, Python, TS | Fault localization, regression |
+| csb_sdlc_test | 18 | medium--hard | C, C#, C++, Go, Java, JS, Python, TS | Code review, testing, perf, coverage analysis |
+| csb_sdlc_refactor | 16 | medium--hard | C, C++, Go, Java, Python, Rust | Cross-file renaming, module extraction |
+| csb_sdlc_design | 14 | hard--expert | C, C++, Go, Java, Python | Architecture, dependency mapping |
+| csb_sdlc_document | 13 | hard | C++, Go, Java, Python, TS | API docs, arch guides, migration, runbooks |
+| csb_sdlc_secure | 12 | medium--hard | C, C++, Go, Java, Python | CVE triage, governance, access |
+| csb_sdlc_understand | 10 | hard | C++, Go, Java, Python, TS | Comprehension, Q&A, onboarding |
 
-**Total active tasks:** 180 (SDLC) + 220 (Org) = 400
+**Total canonical tasks:** 150 (SDLC) + 220 (Org) = 370
 **Languages covered:** C, C++, C#, Go, Java, JavaScript, Python, Rust, TypeScript
 **SDLC phases covered:** Requirements & Discovery, Architecture & Design, Bug Repair, Feature Implementation, Refactoring, Testing & QA, Documentation, Security & Compliance, Debugging & Investigation

@@ -64,14 +64,14 @@ Harbor has a built-in `DaytonaEnvironment` that plugs into the standard trial ru
 ```bash
 # Single task on Daytona
 BASELINE_MCP_TYPE=none harbor run \
-    --path benchmarks/csb_sdlc_build/cgen-deps-install-001 \
+    --path benchmarks/csb_sdlc_feature/servo-scrollend-event-feat-001 \
     --agent-import-path agents/claude_baseline_agent.py \
     --model claude-haiku-4-5-20251001 \
     --environment-type daytona
 
 # Full suite (60 concurrent sandboxes)
 BASELINE_MCP_TYPE=none harbor run \
-    --path benchmarks/csb_sdlc_build \
+    --path benchmarks/csb_sdlc_feature \
     --agent-import-path agents/claude_baseline_agent.py \
     --model claude-haiku-4-5-20251001 \
     --jobs-dir runs/staging/build_baseline_$(date +%Y%m%d) \
@@ -86,7 +86,7 @@ Run both configs concurrently, splitting the Daytona sandbox budget:
 ```bash
 # Terminal 1: Baseline (60 concurrent sandboxes)
 BASELINE_MCP_TYPE=none harbor run \
-    --path benchmarks/csb_sdlc_build \
+    --path benchmarks/csb_sdlc_feature \
     --agent-import-path agents/claude_baseline_agent.py \
     --model claude-haiku-4-5-20251001 \
     --jobs-dir runs/staging/paired_baseline_$(date +%Y%m%d) \
@@ -95,7 +95,7 @@ BASELINE_MCP_TYPE=none harbor run \
 
 # Terminal 2: MCP (60 concurrent sandboxes)
 BASELINE_MCP_TYPE=sourcegraph harbor run \
-    --path benchmarks/csb_sdlc_build \
+    --path benchmarks/csb_sdlc_feature \
     --agent-import-path agents/claude_baseline_agent.py \
     --model claude-haiku-4-5-20251001 \
     --jobs-dir runs/staging/paired_mcp_$(date +%Y%m%d) \
@@ -198,15 +198,15 @@ python3 scripts/daytona_runner.py --list-suites
 python3 scripts/daytona_runner.py --list-tasks --suite csb_sdlc_feature
 
 # Dry run (validate task selection, no sandboxes created)
-python3 scripts/daytona_runner.py --suite csb_sdlc_build --dry-run
+python3 scripts/daytona_runner.py --suite csb_sdlc_feature --dry-run
 
 # Run a single task
 python3 scripts/daytona_runner.py --task cgen-deps-install-001
 
 # Run a full suite
-python3 scripts/daytona_runner.py --suite csb_sdlc_build --parallel 4
+python3 scripts/daytona_runner.py --suite csb_sdlc_feature --parallel 4
 
-# Run all 283 tasks
+# Run all 370 tasks
 python3 scripts/daytona_runner.py --all --parallel 8
 ```
 

@@ -104,7 +104,7 @@ See [SCORING_SEMANTICS.md](SCORING_SEMANTICS.md) for full definitions.
 
 ## Calculation Example
 
-An agent runs all 9 suites (180 tasks) and achieves:
+An agent runs all 9 SDLC suites (150 tasks) and achieves:
 
 | Suite | Mean Reward |
 |-------|-------------|
@@ -122,4 +122,4 @@ An agent runs all 9 suites (180 tasks) and achieves:
 
 **Suites completed** = 9/9
 
-**Pass rate** = tasks with reward > 0.0 / total tasks = e.g., 131 / 180 ≈ 0.728
+**Pass rate** = tasks with reward > 0.0 / total tasks = e.g., 109 / 150 ≈ 0.727
