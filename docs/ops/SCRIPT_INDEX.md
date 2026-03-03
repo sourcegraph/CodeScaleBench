@@ -194,6 +194,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/fix_h3_tokens.py` [one_off] - Historical one-off script: fix h3 tokens.
 - `scripts/fix_workspace_perms.py` [one_off] - Historical one-off script: fix workspace perms.
 - `scripts/handoff_monitor_scrollend.sh` - Utility script for handoff monitor scrollend.
+- `scripts/hybrid_retrieval_pipeline.py` - Utility script for hybrid retrieval pipeline.
 - `scripts/hydrate_task_specs.py` - Utility script for hydrate task specs.
 - `scripts/icp_profiles.py` - Utility script for icp profiles.
 - `scripts/integrate_answer_json_wave1.py` - Utility script for integrate answer json wave1.

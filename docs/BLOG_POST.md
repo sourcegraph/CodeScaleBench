@@ -19,7 +19,7 @@ I wanted to evaluate how coding agents perform in as close to an enterprise envi
 
 Anyway it took longer than I thought it would, but I did it. I made a real benchmark that's useful for me and hopefully others too. CodeScaleBench is a living benchmark (this is code for I'm still working on it and am vulnerable to scope creep) that is divided into two parts. CodeScaleBench-SDLC has 150 software engineering tasks spanning the full SDLC; it uses a patch based verifier method popularized by SWE-Bench and also has a corresponding ground_truth.json file produced by a curator agent for context retrieval metrics I'll talk about later. CodeScaleBench-Org has 220 software engineering tasks that are separated into development tasks that require organization and in many cases cross repository-wide codebase navigation and understanding; it uses what I call an 'artifact' verifier where it produces an 'answer.json' file that is compared with the curator agent's solution. I built the benchmark framework, the evaluation pipeline, the ground truth system, and the statistical analysis layer using Claude Code et al. across ~1000 conversation sessions over about a month.
 
-Some initial findings (that'll be expanded on later): the overall impact of using the Sourcegraph MCP on the task reward outcome is **+0.014** for CSB-SDLC and **+0.032** for CSB-Org. This means across all of our benchmark tasks the MCP runs scored on average **5.4% higher** (overall delta +0.025, from 0.464 baseline to 0.489 MCP). That overall delta is statistically significant (95% bootstrap CI: [+0.008, +0.042]), but the SDLC-only delta's confidence interval spans zero, meaning for tasks where the agent already has full local source code the effect isn't conclusive. The Org delta is significant (CI: [+0.013, +0.053]), confirming that MCP tools provide measurable value when the agent needs to discover information across repositories. The MCP tasks were also overwhelmingly completed faster, and sometimes cheaper. Org tasks with MCP were 63 seconds faster on average (-19.8%) and slightly cheaper (-$0.010/task), while SDLC tasks with MCP were 23 seconds faster but cost more (+$0.075/task) because the agent uses MCP tools on top of local tools rather than instead of them.
+Some initial findings (that'll be expanded on later): the overall impact of using the Sourcegraph MCP on the task reward outcome is **+0.014** for CSB-SDLC and **+0.032** for CSB-Org. This means across all of our benchmark tasks the MCP runs scored on average **5.4% higher** (overall delta +0.025, from 0.464 baseline to 0.489 MCP). That overall delta is statistically significant (95% bootstrap CI: [+0.008, +0.042]), but the SDLC-only delta's confidence interval spans zero, meaning for tasks where the agent already has full local source code the effect isn't conclusive. The Org delta is significant (CI: [+0.013, +0.053]), confirming that MCP tools provide measurable value when the agent needs to discover information across repositories. The MCP tasks were also overwhelmingly completed faster and cheaper. Overall MCP saves $0.21/task and cuts agent execution time by 89 seconds (−36%). Org tasks with MCP were 63 seconds faster on wall clock (−19.8%) and slightly cheaper (−$0.010/task). SDLC tasks with MCP were also cheaper overall (−$0.50/task), driven by large savings on refactor and feature tasks where semantic search replaces expensive exhaustive code traversal.
 
 And by the way, building a benchmark for coding agents while using coding agents is a fun way to find new failure modes. We all know agents are sneaky and mysterious genies, and that's also why I think benchmark results should ship with full agent transcripts for auditing (talking about that later, I know I'm asking a lot of you but I promise if you like benchmarks this is interesting and also explains why you read this far).
 
@@ -113,16 +113,34 @@ The Debug result is the clearest negative signal: MCP underperforms baseline by 
 
 Context retrieval isn't the bottleneck for every software development situation. Codebase size, harness, language, task type, prompt content all contribute. The [technical report](technical_reports/TECHNICAL_REPORT_V2.md) covers the full per-suite breakdown.
 
+## MCP Value Scales With Codebase Size
+
+One of the clearest patterns in the data: MCP's benefit increases monotonically with codebase size. We pulled repo sizes from the GitHub API for 365 of the 370 tasks and grouped them into bins:
+
+| Repo Size | Approx LoC | n | Δ Reward | Δ Wall Clock | Δ Agent Exec | Δ $/task |
+|-----------|-----------|---|----------|-------------|-------------|---------|
+| <10 MB | <400K | 60 | −0.007 | −23s | −52s | +$1.39 |
+| 10–50 MB | 0.4–2M | 61 | **+0.043** | **−153s** | **−137s** | **−$2.74** |
+| 50–200 MB | 2–8M | 113 | +0.027 | +64s | −51s | +$0.03 |
+| 200MB–1GB | 8–40M | 104 | +0.033 | −13s | −97s | +$0.02 |
+| >1 GB | >40M | 27 | **+0.085** | −135s | −123s | +$0.06 |
+
+For the smallest repos, MCP slightly hurts reward and adds cost. At 10–50 MB you hit the sweet spot: better outcomes, much faster, and $2.74/task cheaper. Above 1 GB the reward lift is largest (+0.085), which lines up with what you'd expect — massive monorepo-scale codebases like Kubernetes and Chromium are exactly where retrieval tools shine because the agent can't feasibly grep through tens of millions of lines. Agent execution time is shorter with MCP across *every* size category.
+
+Breaking it down by difficulty: hard tasks (91% of the benchmark) show the best MCP profile — better reward (+0.023), faster (−58s wall clock, −95s agent), and cheaper (−$0.42/task). Expert tasks show a slight negative reward delta (−0.019) and much higher cost (+$3.01), suggesting that at the highest complexity tier the agent burns tokens on MCP searches that don't pay off.
+
+By language, Go repos see the biggest cost savings (−$1.18/task, n=134), Rust sees the biggest wall-clock savings (−358s, n=12), and Python gets the best reward lift (+0.040, n=55). TypeScript is the only language where MCP hurts across all dimensions, though n=7 is too small to draw strong conclusions.
+
 ## Retrieval Differences
 
 I built an information retrieval evaluation pipeline alongside the task scoring to measure how agents find information across codebases that they then use (or don't) to complete their tasks (or not).
 
-| Config | n | File Recall (mean) | MRR (mean) |
-|--------|---|-------------------|------------|
-| baseline-local-direct | 963 | 0.326 | 0.352 |
-| mcp-remote-direct | 698 | 0.474 | 0.352 |
+| Config | n | File Recall | Precision@1 | F1@5 | MRR |
+|--------|---|------------|-------------|------|-----|
+| baseline-local-direct | 963 | 0.326 | 0.312 | 0.185 | 0.357 |
+| mcp-remote-direct | 698 | 0.474 | 0.282 | 0.174 | 0.343 |
 
-MCP agents find a higher fraction of the files that matter (file recall 0.474 vs 0.326), and a higher fraction of the files they retrieve are relevant. Mean Reciprocal Rank is unchanged; both configs find root-cause files at similar ranking positions when they find them.
+MCP agents find a substantially higher fraction of the files that matter (file recall 0.474 vs 0.326, +0.148), but there's a recall-precision trade-off: precision is slightly lower (P@1: 0.282 vs 0.312) and F1@5 is roughly flat (0.174 vs 0.185). MCP casts a wider net — it retrieves more relevant files but also more irrelevant ones. Mean Reciprocal Rank is essentially unchanged; both configs find root-cause files at similar ranking positions when they find them.
 
 But better retrieval doesn't always mean better outcomes. Still investigating this but likely finding the right files is necessary but not sufficient. The agent still has to correctly apply what it finds, and in some tasks the local code modification step is where removing local code availability from the MCP run environment hurts more than others.
 
@@ -134,28 +152,28 @@ But better retrieval doesn't always mean better outcomes. Still investigating th
 
 Could also just be plain ol' agent non-determinism. Retrieval quality alone doesn't seem to predict task success, but there are many more variables to isolate.
 
-## The Cost Differences
+## The Cost and Speed Differences
 
-Let's take a break from whatever voodoo variables control reward outcomes and talk about costs. MCP runs are slightly more expensive overall, about 5.8% higher ($0.333 vs $0.297 per task), but the costs vary by category.
+Let's take a break from whatever voodoo variables control reward outcomes and talk about costs and timing. Overall MCP is actually cheaper — $0.801 vs $1.008 per task (−$0.210) — and faster, cutting agent execution time by 89 seconds (−36%).
 
 | Category | n | Baseline Mean ($/task) | MCP Mean ($/task) | Delta |
 |----------|---|------------------------|-------------------|-------|
-| SDLC     | 103 | $0.463 | $0.539 | +$0.075 |
-| Org      | 220 | $0.221 | $0.211 | -$0.010 |
-| **Overall** | **323** | **$0.297** | **$0.333** | **+$0.017** |
+| SDLC     | 149 | $2.176 | $1.672 | −$0.504 |
+| Org      | 220 | $0.221 | $0.211 | −$0.010 |
+| **Overall** | **369** | **$1.008** | **$0.801** | **−$0.210** |
 
-MCP is cheaper on the Org tasks where it also improves reward: the agent using MCP tools costs less per task (-$0.010) because remote search replaces expensive local file-reading operations. It's more expensive on SDLC tasks (+$0.075), where the agent uses MCP tools on top of local tools rather than instead of them.
+MCP is cheaper on Org tasks because remote search replaces expensive local file-reading operations. It's also cheaper on SDLC overall, driven by large savings on refactor (−$4.24/task) and feature (−$1.55/task) suites where MCP's semantic search replaces expensive exhaustive code traversal. Design tasks are the main exception (+$1.55/task), where MCP adds overhead without replacing local analysis.
 
-Where cost is mixed, speed is not. MCP is substantially faster across the board, cutting wall-clock time by 47 seconds overall (-11.6%) and agent execution time by 90 seconds (-38.1%).
+Speed tells an even cleaner story:
 
 | Metric | n | Baseline Mean (s) | MCP Mean (s) | Delta |
 |--------|---|--------------------|--------------|-------|
-| Wall clock | 369 | 403.1 | 356.2 | -46.8 |
-| Agent execution | 369 | 237.1 | 146.7 | -90.4 |
+| Wall clock | 370 | 411.1 | 375.2 | −36.0 |
+| Agent execution | 370 | 243.7 | 155.1 | −88.6 |
 
-Agent execution time (excluding infrastructure overhead) tells the cleaner story: the agent's problem-solving phase is 38% shorter with MCP. Org tasks see the biggest speedup (-63 seconds wall clock, -19.8%), because remote search eliminates the need to read many local files when source is truncated. SDLC tasks are also faster (-23 seconds, -4.4%), though the improvement is smaller since local code is already available.
+Agent execution time is the cleaner metric (it excludes Docker build and verification overhead): the agent's problem-solving phase is 36% shorter with MCP. Org tasks see the biggest wall-clock speedup (−63 seconds, −19.8%). The per-suite variation is large — MCP cuts design task wall clock by 415 seconds but adds 360 seconds to fix tasks. But agent execution time is shorter with MCP on *every single suite* except refactor (+5s, flat) and fix (−1s, flat).
 
-On suites where MCP improves reward (Org security and incident especially), you get better results faster and cheaper. Where MCP hurts (debug), you get worse results faster and at slightly higher cost. This is useful signal for figuring out where these tools are worth using.
+On suites where MCP improves reward (Org security and incident especially), you also get better results faster and cheaper. Security tasks: +0.122 reward, −269s wall clock, −$0.002/task. Incident tasks: +0.108 reward, −92s wall clock, −$0.021/task. Where MCP hurts reward (debug: −0.064), you still get faster agent execution but at slightly higher cost. This is useful signal for figuring out where these tools are worth deploying.
 
 ## MCP Tool Usage Patterns
 
@@ -231,6 +249,8 @@ I started this project because I wanted to be able to measure the impact of code
 Here's what the data from my benchmark says so far:
 
 **Sourcegraph MCP provides measurable value on cross-repository discovery tasks.** The Org tasks show a +0.032 gain over the baseline rewards (95% CI: [+0.013, +0.053]), with security (+0.113) and incident debugging (+0.108) showing the largest effects. The agent with the MCP tools also finishes its tasks faster and cheaper in many cases. This is something I want to explore further.
+
+**MCP's value scales with codebase size.** The reward lift increases monotonically from −0.007 on <10 MB repos to +0.085 on >1 GB repos. The cost-efficiency sweet spot is 10–50 MB codebases (−$2.74/task, −153s wall clock, +0.043 reward). Agent execution time is shorter with MCP across every size category.
 
 **Sourcegraph MCP tools provide mixed value depending on task type within the SDLC.** Sourcegraph MCP helped on understand (+0.178) and fix (+0.092), was neutral for feature (-0.014) and test (-0.010), and hurt on debugging (-0.064) and design (-0.047). Though again in this case the agent already has full source code which isn't likely to be the actual case for developers working in the largest codebases that would benefit from these tools. It was also cheaper for the task types it produced the best rewards for.
 

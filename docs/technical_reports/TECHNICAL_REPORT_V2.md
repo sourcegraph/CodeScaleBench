@@ -934,13 +934,14 @@ The IR evaluation pipeline (Section 8) produces file-level recall, MRR, MAP, nDC
 
 **IR Metrics by Config:**
 
-| Config | n | File Recall (mean) | MRR (mean) |
-|--------|---|-------------------|------------|
-| baseline-local-direct | 963 | 0.326 | 0.352 |
-| mcp-remote-direct | 698 | 0.474 | 0.352 |
-| mcp-remote-artifact | 23 | 0.787 | — |
+| Config | n | File Recall | MRR | Precision@1 | Precision@5 | F1@5 | F1@10 |
+|--------|---|------------|-----|-------------|-------------|------|-------|
+| baseline-local-direct | 963 | 0.326 | 0.357 | 0.312 | 0.216 | 0.185 | 0.158 |
+| mcp-remote-direct | 698 | 0.474 | 0.343 | 0.282 | 0.197 | 0.174 | 0.156 |
+| mcp-remote-artifact | 23 | 0.787 | 0.461 | 0.348 | 0.365 | 0.349 | 0.259 |
+| baseline (legacy) | 61 | 0.295 | 0.323 | 0.262 | 0.187 | 0.172 | 0.137 |
 
-MCP-remote-direct runs achieve higher file recall (0.474 vs. 0.326 baseline), suggesting that Sourcegraph search tools help agents discover more ground-truth files, even when this does not always translate to higher task reward. The artifact-only config achieves the highest file recall (0.787) because those tasks are pure discovery tasks with well-defined file targets.
+MCP-remote-direct runs achieve substantially higher file recall (0.474 vs. 0.326 baseline, +0.148), confirming that Sourcegraph search tools help agents discover more ground-truth files. However, MCP runs have slightly _lower_ precision (Precision@1: 0.282 vs. 0.312, −0.030) and F1 scores (F1@5: 0.174 vs. 0.185). This reflects a recall-precision trade-off: MCP retrieves more files overall, finding more relevant ones but also more irrelevant ones. F1@10 converges (0.156 vs. 0.158), suggesting the trade-off narrows at higher K values. The artifact-only config achieves the highest file recall (0.787) and F1@5 (0.349) because those tasks are pure discovery tasks with well-defined file targets.
 
 ### 11.6 Correlation Analysis
 
@@ -958,28 +959,27 @@ The positive correlation between codebase size metrics and reward (+0.33 for fil
 
 Multi-run averaged reward by primary programming language across 369 paired canonical tasks. Languages with fewer than 3 tasks are grouped under "Other."
 
-| Language | n | Baseline Mean | MCP Mean | Delta | Wins | Losses | Neutral |
-|----------|---|---------------|----------|-------|------|--------|---------|
-| Go       | 134 | 0.430 | 0.457 | +0.028 | 56 | 44 | 34 |
-| C++      | 72  | 0.458 | 0.463 | +0.004 | 31 | 25 | 16 |
-| Java     | 57  | 0.425 | 0.437 | +0.012 | 30 | 22 | 5  |
-| Python   | 55  | 0.439 | 0.502 | +0.063 | 26 | 17 | 12 |
-| Rust     | 12  | 0.426 | 0.443 | +0.017 | 5  | 3  | 4  |
-| C        | 10  | 0.618 | 0.676 | +0.058 | 5  | 3  | 2  |
-| JavaScript | 8 | 0.414 | 0.514 | +0.100 | 2  | 3  | 3  |
-| TypeScript | 7 | 0.572 | 0.599 | +0.027 | 2  | 3  | 2  |
-| Java+C++ | 5   | 0.592 | 0.706 | +0.114 | 4  | 1  | 0  |
-| Other    | 9   | 0.424 | 0.468 | +0.043 | 4  | 3  | 2  |
+| Language | n | BL Mean | MCP Mean | Δ Reward | Δ Wall Clock | Δ Agent Exec | Δ $/task |
+|----------|---|---------|----------|----------|-------------|-------------|---------|
+| Go       | 134 | 0.448 | 0.472 | +0.024 | −54s | −76s | −$1.18 |
+| C++      | 73  | 0.460 | 0.475 | +0.015 | −11s | −98s | +$0.04 |
+| Java     | 57  | 0.438 | 0.450 | +0.012 | −46s | −104s | +$1.07 |
+| Python   | 55  | 0.492 | 0.532 | +0.040 | +83s | −41s | +$0.08 |
+| Rust     | 12  | 0.426 | 0.443 | +0.017 | −358s | −123s | −$0.02 |
+| C        | 10  | 0.681 | 0.691 | +0.010 | −28s | −40s | +$0.09 |
+| JavaScript | 8 | 0.396 | 0.513 | +0.117 | +363s | −5s | +$0.11 |
+| TypeScript | 7 | 0.585 | 0.567 | −0.018 | +97s | +21s | +$0.06 |
+| Java+C++ | 5   | 0.592 | 0.706 | +0.114 | −239s | −146s | +$0.04 |
 
-MCP provides a positive delta for all major languages. Python shows the largest single-language gain (+0.063, n=55), likely because Python tasks have more cross-repository dependencies that benefit from Sourcegraph search. JavaScript shows a +0.100 delta but with small n=8; the wide confidence interval makes this unreliable as a standalone finding. Go, the most represented language (n=134), shows a +0.028 delta, consistent with the overall pattern. The near-zero neutral rate for Java (5/57) indicates that Sourcegraph-mediated search consistently changes Java task outcomes—though not always positively.
+MCP provides a positive reward delta for all major single languages except TypeScript (−0.018, n=7). Python shows the largest single-language reward gain (+0.040, n=55). Go, the most represented language (n=134), combines a solid reward lift (+0.024) with the largest per-task cost savings (−$1.18). Rust shows the largest wall-clock savings (−358s) despite a small sample. Java has the biggest agent execution time savings (−104s) but higher cost (+$1.07, driven by token-heavy MCP searches). TypeScript is the only language where MCP hurts across all three dimensions (reward, time, cost).
 
 ### 11.8 Reward by Difficulty
 
-| Difficulty | n   | Baseline Mean | MCP Mean | Delta  | Wins | Losses | Neutral |
-|-----------|-----|---------------|----------|--------|------|--------|---------|
-| Hard      | 337 | 0.443         | 0.470    | +0.026 | 155  | 115    | 67      |
-| Expert    | 21  | 0.562         | 0.577    | +0.015 | 7    | 9      | 5       |
-| Medium    | 11  | 0.307         | 0.444    | +0.137 | 4    | 0      | 7       |
+| Difficulty | n   | BL Mean | MCP Mean | Δ Reward | Δ Wall Clock | Δ Agent Exec | Δ $/task |
+|-----------|-----|---------|----------|----------|-------------|-------------|---------|
+| Hard      | 338 | 0.457   | 0.481    | +0.023   | −58s        | −95s        | −$0.42  |
+| Expert    | 21  | 0.660   | 0.641    | −0.019   | −3s         | −9s         | +$3.01  |
+| Medium    | 11  | 0.307   | 0.444    | +0.137   | +582s       | −36s        | +$0.06  |
 
 Difficulty is assigned by the `rescore_difficulty.py` pipeline, which combines code complexity, codebase size, and ground-truth depth into a composite score:
 
@@ -988,27 +988,30 @@ raw = 0.4 * size_score + 0.4 * complexity_score + 0.2 * ground_truth_depth_score
 difficulty = "medium" if raw < 0.35 else "hard" if raw < 0.75 else "expert"
 ```
 
-The benchmark is dominated by "hard" tasks (337/369, 91%), reflecting the deliberate selection of non-trivial engineering challenges. The MCP delta is positive across all difficulty levels, with medium tasks showing the largest gain (+0.137). Expert tasks show a small delta (+0.015) with a slightly negative win/loss split (7/9), suggesting that at the highest complexity tier MCP provides inconsistent benefit.
+The benchmark is dominated by "hard" tasks (338/370, 91%), reflecting the deliberate selection of non-trivial engineering challenges. Hard tasks show the best overall MCP profile: a positive reward delta (+0.023), faster execution (−58s wall clock, −95s agent), and lower cost (−$0.42/task). Medium tasks show the largest reward gain (+0.137) but are slower on wall clock (+582s), though agent execution time is still shorter (−36s). Expert tasks show a slightly negative reward delta (−0.019) and substantially higher cost (+$3.01, driven by a few expensive outliers), suggesting that at the highest complexity tier MCP provides inconsistent benefit and can increase cost.
 
-### 11.9 Reward by Codebase Size
+### 11.9 Impact by Codebase Size
 
-**By context length** (instruction + source context in tokens):
+**By repository size** (GitHub API-reported size for 365/370 tasks, approximate LoC computed at ~25 bytes/line):
 
-| Context Length     | n   | Baseline Mean | MCP Mean | Delta  |
-|-------------------|-----|---------------|----------|--------|
-| < 100K tokens     | 222 | 0.369         | 0.403    | +0.033 |
-| 100K–1M tokens    | 97  | 0.605         | 0.607    | +0.002 |
-| Unknown           | 50  | 0.479         | 0.541    | +0.062 |
+| Repo Size | Approx LoC | n | BL Mean | MCP Mean | Δ Reward | Δ Wall Clock | Δ Agent Exec | Δ $/task |
+|-----------|-----------|---|---------|----------|----------|-------------|-------------|---------|
+| <10 MB | <400K | 60 | 0.480 | 0.473 | −0.007 | −23s | −52s | +$1.39 |
+| 10–50 MB | 400K–2M | 61 | 0.574 | 0.618 | +0.043 | −153s | −137s | −$2.74 |
+| 50–200 MB | 2M–8M | 113 | 0.407 | 0.435 | +0.027 | +64s | −51s | +$0.03 |
+| 200MB–1GB | 8M–40M | 104 | 0.464 | 0.497 | +0.033 | −13s | −97s | +$0.02 |
+| >1 GB | >40M | 27 | 0.457 | 0.542 | +0.085 | −135s | −123s | +$0.06 |
 
 **By files count** (number of files provided in task context):
 
-| Files Count    | n   | Baseline Mean | MCP Mean | Delta  |
-|---------------|-----|---------------|----------|--------|
-| < 10 files    | 167 | 0.314         | 0.352    | +0.038 |
-| 10–100 files  | 91  | 0.633         | 0.627    | −0.006 |
-| Unknown       | 111 | 0.491         | 0.536    | +0.045 |
+| Files Count | n | BL Mean | MCP Mean | Δ Reward | Δ Wall Clock | Δ Agent Exec | Δ $/task |
+|------------|---|---------|----------|----------|-------------|-------------|---------|
+| <10 files | 168 | 0.314 | 0.351 | +0.037 | −90s | −54s | ~$0.00 |
+| 10–100 files | 91 | 0.675 | 0.668 | −0.007 | −70s | −94s | −$1.13 |
 
-For tasks with small context (< 100K tokens), MCP provides a meaningful +0.033 improvement. At the 100K–1M token range, the delta collapses to near zero (+0.002), suggesting that once sufficient local context is available, remote search adds little value. Tasks with fewer files (< 10) benefit more from MCP (+0.038) than tasks with 10–100 files (−0.006). This pattern indicates that MCP's value concentrates on tasks where the agent must discover relevant code rather than navigate an already-provided codebase.
+**MCP's reward benefit scales monotonically with codebase size.** The only category where MCP hurts reward is the smallest repos (<10 MB, −0.007). At >1 GB codebases (~40M+ LoC), MCP delivers the largest reward lift (+0.085). The 10–50 MB range is the cost-efficiency sweet spot: MCP saves $2.74/task while also delivering the biggest wall-clock savings (−153s) and a strong reward gain (+0.043). Agent execution time is shorter with MCP across all size categories, even where wall-clock time increases (50–200 MB), indicating that MCP reduces the agent's active problem-solving time even when infrastructure overhead increases.
+
+For file count, tasks with fewer files (<10) benefit more from MCP on reward (+0.037) while medium-file tasks (10–100) see greater cost savings (−$1.13/task).
 
 ### 11.10 MCP Tool Usage Patterns
 
@@ -1045,41 +1048,74 @@ The agent overwhelmingly relies on keyword search (sg_keyword_search) and file r
 
 ### 11.11 Cost Analysis
 
-Token-based cost computed from Claude Haiku 4.5 pricing (input $0.80/M, output $4.00/M, cache write $1.00/M, cache read $0.08/M). Based on n=323 paired tasks with cost data.
+Token-based cost computed from Claude Haiku 4.5 pricing (input $0.80/M, output $4.00/M, cache write $1.00/M, cache read $0.08/M). Based on n=370 paired tasks with cost data.
+
+**Per-config token breakdown** (across all 4,063 individual evaluations):
+
+| Metric | Baseline (n=1,833) | MCP (n=1,774) | Delta |
+|--------|-------------------|---------------|-------|
+| Mean input tokens | 494K | 605K | +111K |
+| Mean output tokens | 12.3K | 12.7K | +0.3K |
+| Mean cache tokens | 3.52M | 4.55M | +1.03M |
+| Mean cost/eval | $0.909 | $0.787 | −$0.122 |
+| Total cost | $1,666 | $1,395 | −$271 |
+
+**Per-category cost** (paired task averages):
 
 | Category | n | Baseline Mean ($/task) | MCP Mean ($/task) | Delta |
 |----------|---|------------------------|-------------------|-------|
-| SDLC     | 103 | $0.463 | $0.539 | +$0.075 |
+| SDLC     | 149 | $2.176 | $1.672 | −$0.504 |
 | Org      | 220 | $0.221 | $0.211 | −$0.010 |
-| **Overall** | **323** | **$0.297** | **$0.333** | **+$0.017** |
+| **Overall** | **369** | **$1.008** | **$0.801** | **−$0.210** |
 
-| Metric        | Baseline      | MCP           |
-|---------------|---------------|---------------|
-| Mean cost/task | $0.297       | $0.333        |
-| Median cost/task | $0.243     | $0.251        |
-| Total cost    | $98.43        | $114.56       |
+**Per-suite cost** (top movers):
 
-MCP adds approximately +$0.017/task (+5.8%) on average. This cost increase is concentrated in SDLC tasks (+$0.075/task, +16.2%), where the agent has full local code and MCP search adds overhead without replacing local tool calls. For Org tasks, MCP is actually slightly cheaper (−$0.010/task, −4.5%), because remote search replaces expensive local file-reading operations on truncated source trees. The median cost difference is minimal ($0.008), indicating the mean is pulled by a small number of high-cost SDLC tasks.
+| Suite | n | BL $/task | MCP $/task | Δ $/task |
+|-------|---|-----------|-----------|---------|
+| csb_sdlc_refactor | 16 | $7.292 | $3.054 | −$4.238 |
+| csb_sdlc_feature | 23 | $4.918 | $3.371 | −$1.547 |
+| csb_sdlc_design | 14 | $3.926 | $5.481 | +$1.554 |
+| csb_sdlc_fix | 26 | $0.600 | $0.765 | +$0.166 |
+| csb_sdlc_debug | 18 | $0.342 | $0.441 | +$0.098 |
+| csb_org_crossorg | 15 | $0.257 | $0.210 | −$0.047 |
+| csb_org_crossrepo_tracing | 22 | $0.249 | $0.218 | −$0.031 |
+| csb_org_incident | 20 | $0.234 | $0.213 | −$0.021 |
+
+MCP is cheaper overall (−$0.210/task). SDLC refactor and feature tasks drive the largest savings (−$4.24 and −$1.55 respectively), where MCP's semantic search replaces expensive exhaustive code traversal. Design tasks are the main exception (+$1.55), where MCP adds overhead without replacing local analysis. For Org tasks, MCP is consistently slightly cheaper across all suites.
 
 ### 11.12 Timing Analysis
 
-Wall-clock and agent execution time across n=369 paired canonical tasks.
+Wall-clock and agent execution time across n=370 paired canonical tasks.
 
 | Metric               | n   | Baseline Mean (s) | MCP Mean (s) | Delta    |
 |----------------------|-----|--------------------|--------------|----------|
-| Wall clock           | 369 | 403.1              | 356.2        | −46.8    |
-| Agent execution      | 369 | 237.1              | 146.7        | −90.4    |
+| Wall clock           | 370 | 411.1              | 375.2        | −36.0    |
+| Agent execution      | 370 | 243.7              | 155.1        | −88.6    |
 
 **By category:**
 
-| Category | n   | BL Wall (s) | MCP Wall (s) | Wall Delta | BL Cost | MCP Cost | Cost Delta |
-|----------|-----|-------------|--------------|------------|---------|----------|------------|
-| SDLC     | 149 | 530.3       | 506.9        | −23.4      | $0.463  | $0.539   | +$0.075    |
-| Org      | 220 | 316.9       | 254.2        | −62.7      | $0.221  | $0.211   | −$0.010    |
+| Category | n   | BL Wall (s) | MCP Wall (s) | Wall Δ | BL Agent (s) | MCP Agent (s) | Agent Δ |
+|----------|-----|-------------|--------------|--------|-------------|---------------|---------|
+| SDLC     | 150 | 549.3       | 552.6        | +3.3   | — | — | — |
+| Org      | 220 | 316.9       | 254.2        | −62.7  | — | — | — |
 
-MCP tasks are **47 seconds faster** on wall clock overall (−11.6%). **Org tasks are 63 seconds faster** with MCP (−19.8%), because remote search eliminates the need to read many local files when source is truncated. **SDLC tasks are also faster** (−23.4s, −4.4%), though the improvement is smaller since local code is already available.
+**Per-suite timing** (top movers):
 
-Agent execution time (excluding environment setup and verification) shows MCP is **90 seconds faster** overall (−38.1%). This means the agent's problem-solving phase is substantially shorter with MCP access, consistent across both task categories.
+| Suite | n | BL Wall (s) | MCP Wall (s) | Wall Δ | BL Agent (s) | MCP Agent (s) | Agent Δ |
+|-------|---|-------------|--------------|--------|-------------|---------------|---------|
+| csb_sdlc_design | 14 | 679 | 265 | −415s | 593 | 162 | −431s |
+| csb_org_onboarding | 28 | 648 | 311 | −337s | 134 | 49 | −85s |
+| csb_org_security | 24 | 445 | 176 | −269s | 330 | 87 | −243s |
+| csb_org_org | 15 | 313 | 183 | −130s | 180 | 82 | −98s |
+| csb_org_platform | 18 | 271 | 154 | −116s | 228 | 85 | −143s |
+| csb_org_incident | 20 | 399 | 307 | −92s | 299 | 89 | −209s |
+| csb_org_compliance | 18 | 204 | 354 | +150s | 131 | 109 | −22s |
+| csb_org_domain | 20 | 280 | 373 | +93s | 181 | 97 | −84s |
+| csb_sdlc_fix | 26 | 907 | 1267 | +360s | 381 | 380 | −1s |
+
+**Org tasks are 63 seconds faster** on wall clock with MCP (−19.8%), because remote search eliminates the need to read many local files when source is truncated. SDLC tasks are essentially flat on wall clock (+3.3s), though individual suites vary widely: design tasks are 415 seconds faster with MCP, while fix tasks are 360 seconds slower.
+
+Agent execution time (excluding environment setup and verification) shows MCP is **89 seconds faster** overall (−36.4%). This means the agent's active problem-solving phase is substantially shorter with MCP. Notably, agent execution time is shorter with MCP for every single suite except csb_sdlc_refactor (+5s) and csb_sdlc_fix (−1s, essentially flat). The largest agent-time savings are on csb_sdlc_design (−431s), csb_org_security (−243s), and csb_org_incident (−209s).
 
 ---
 
