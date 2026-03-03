@@ -864,43 +864,43 @@ Compared with prior drafts, this is a different analysis slice and should be tre
 
 ### 11.2 SDLC Suite Results (Paired Comparison)
 
-Paired deltas for SDLC suites in the refreshed analysis set (computed from per-task means across all available runs, with variance on per-task deltas):
+Paired deltas for SDLC suites in the refreshed analysis set (computed from per-task means across all available runs, with variance on per-task deltas and 95% bootstrap CIs):
 
-| Suite | n | Mean Reward Delta (MCP - Baseline) | Var(Δ Reward) |
-|-------|---|-------------------------------------|---------------|
-| csb_sdlc_understand | 10 | +0.1148 | 0.089103 |
-| csb_sdlc_refactor | 16 | +0.1029 | 0.256679 |
-| csb_sdlc_fix | 26 | +0.0986 | 0.055532 |
-| csb_sdlc_design | 14 | +0.0514 | 0.091786 |
-| csb_sdlc_document | 13 | +0.0415 | 0.007517 |
-| csb_sdlc_feature | 23 | +0.0130 | 0.118041 |
-| csb_sdlc_test | 18 | -0.0113 | 0.037797 |
-| csb_sdlc_debug | 18 | -0.0372 | 0.017479 |
-| csb_sdlc_secure | 12 | -0.0500 | 0.012604 |
+| Suite | n | Mean Reward Delta (MCP - Baseline) | Var(Δ Reward) | 95% CI |
+|-------|---|-------------------------------------|---------------|--------|
+| csb_sdlc_understand | 10 | +0.1148 | 0.089103 | [-0.0415, +0.3147] |
+| csb_sdlc_refactor | 16 | +0.1029 | 0.256679 | [-0.1519, +0.3425] |
+| csb_sdlc_fix | 26 | +0.0986 | 0.055532 | [+0.0165, +0.1967] |
+| csb_sdlc_design | 14 | +0.0514 | 0.091786 | [-0.1051, +0.2131] |
+| csb_sdlc_document | 13 | +0.0415 | 0.007517 | [-0.0038, +0.0900] |
+| csb_sdlc_feature | 23 | +0.0130 | 0.118041 | [-0.1134, +0.1604] |
+| csb_sdlc_test | 18 | -0.0113 | 0.037797 | [-0.0972, +0.0831] |
+| csb_sdlc_debug | 18 | -0.0372 | 0.017479 | [-0.0909, +0.0300] |
+| csb_sdlc_secure | 12 | -0.0500 | 0.012604 | [-0.1167, +0.0104] |
 
-**SDLC total (weighted by paired task count)**: **+0.0363** across **n=150** paired tasks.
+**SDLC total (weighted by paired task count)**: **+0.0363** across **n=150** paired tasks, 95% CI **[-0.0083, +0.0835]**.
 
 ### 11.3 Org Suite Results (Paired Comparison)
 
 Paired deltas for Org suites in the refreshed analysis set:
 
-| Suite | n | Mean Reward Delta (MCP - Baseline) | Var(Δ Reward) |
-|-------|---|-------------------------------------|---------------|
-| csb_org_incident | 20 | +0.1125 | 0.056807 |
-| csb_org_security | 24 | +0.1057 | 0.055106 |
-| csb_org_org | 15 | +0.0568 | 0.015604 |
-| csb_org_crossrepo_tracing | 22 | +0.0514 | 0.035013 |
-| csb_org_migration | 26 | +0.0381 | 0.020784 |
-| csb_org_crossorg | 15 | +0.0252 | 0.004410 |
-| csb_org_compliance | 18 | +0.0153 | 0.012530 |
-| csb_org_onboarding | 28 | +0.0083 | 0.029982 |
-| csb_org_domain | 20 | -0.0165 | 0.006946 |
-| csb_org_crossrepo | 14 | -0.0242 | 0.003717 |
-| csb_org_platform | 18 | -0.0287 | 0.009930 |
+| Suite | n | Mean Reward Delta (MCP - Baseline) | Var(Δ Reward) | 95% CI |
+|-------|---|-------------------------------------|---------------|--------|
+| csb_org_incident | 20 | +0.1125 | 0.056807 | [+0.0246, +0.2305] |
+| csb_org_security | 24 | +0.1057 | 0.055106 | [+0.0250, +0.2102] |
+| csb_org_org | 15 | +0.0568 | 0.015604 | [-0.0067, +0.1180] |
+| csb_org_crossrepo_tracing | 22 | +0.0514 | 0.035013 | [-0.0040, +0.1407] |
+| csb_org_migration | 26 | +0.0381 | 0.020784 | [-0.0087, +0.1006] |
+| csb_org_crossorg | 15 | +0.0252 | 0.004410 | [-0.0094, +0.0572] |
+| csb_org_compliance | 18 | +0.0153 | 0.012530 | [-0.0353, +0.0707] |
+| csb_org_onboarding | 28 | +0.0083 | 0.029982 | [-0.0503, +0.0782] |
+| csb_org_domain | 20 | -0.0165 | 0.006946 | [-0.0523, +0.0209] |
+| csb_org_crossrepo | 14 | -0.0242 | 0.003717 | [-0.0558, +0.0073] |
+| csb_org_platform | 18 | -0.0287 | 0.009930 | [-0.0800, +0.0113] |
 
-**Org total (weighted by paired task count)**: **+0.0339** across **n=220** paired tasks.
+**Org total (weighted by paired task count)**: **+0.0339** across **n=220** paired tasks, 95% CI **[+0.0133, +0.0571]**.
 
-**Overall paired delta**: **+0.0349** across **n=370** paired tasks.
+**Overall paired delta**: **+0.0349** across **n=370** paired tasks, 95% CI **[+0.0130, +0.0579]**.
 
 ### 11.4 V1 → V2 Results Comparison
 
@@ -909,9 +909,9 @@ The refreshed analysis set supersedes the prior V2 numeric snapshot in this sect
 | Metric | Refreshed Value |
 |--------|------------------|
 | Paired tasks | 370 |
-| Overall reward delta | +0.0349 |
-| SDLC reward delta | +0.0363 |
-| Org reward delta | +0.0339 |
+| Overall reward delta | +0.0349 (95% CI: [+0.0130, +0.0579]) |
+| SDLC reward delta | +0.0363 (95% CI: [-0.0083, +0.0835]) |
+| Org reward delta | +0.0339 (95% CI: [+0.0133, +0.0571]) |
 | Reward-delta variance | 0.048985 |
 | Mean wall-clock delta | -36.22s |
 | Mean agent-execution delta | -101.06s |

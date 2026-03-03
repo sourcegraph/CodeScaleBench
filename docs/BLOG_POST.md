@@ -19,7 +19,7 @@ I wanted to evaluate how coding agents perform in as close to an enterprise envi
 
 Anyway it took longer than I thought it would, but I did it. I made a real benchmark that's useful for me and hopefully others too. CodeScaleBench is a living benchmark (this is code for I'm still working on it and am vulnerable to scope creep) that is divided into two parts. CodeScaleBench-SDLC has 150 software engineering tasks spanning the full SDLC; it uses a patch based verifier method popularized by SWE-Bench and also has a corresponding ground_truth.json file produced by a curator agent for context retrieval metrics I'll talk about later. CodeScaleBench-Org has 220 software engineering tasks that are separated into development tasks that require organization and in many cases cross repository-wide codebase navigation and understanding; it uses what I call an 'artifact' verifier where it produces an 'answer.json' file that is compared with the curator agent's solution. I built the benchmark framework, the evaluation pipeline, the ground truth system, and the statistical analysis layer using Claude Code et al. across ~1000 conversation sessions over about a month.
 
-Some initial findings (that'll be expanded on later): on the current analysis snapshot (generated March 3, 2026), metrics are computed by averaging multiple runs per task/config first, then pairing those per-task means. That yields a paired reward delta of **+0.036** for CSB-SDLC, **+0.034** for CSB-Org, and **+0.035** overall across **370** baseline/MCP task pairs, with reward-delta variance **0.048985**. The highest positive suite deltas are `csb_org_incident` (+0.113), `csb_org_security` (+0.106), `csb_sdlc_understand` (+0.115), and `csb_sdlc_refactor` (+0.103). Timing and cost no longer show the earlier contradictory pattern: MCP is faster on wall-clock on average (367.11s baseline vs 330.89s MCP, −36.22s) and much faster on agent execution (−101.06s), but slightly more expensive (+$0.040/task, +13.49% on means).
+Some initial findings (that'll be expanded on later): on the current analysis snapshot (generated March 3, 2026), metrics are computed by averaging multiple runs per task/config first, then pairing those per-task means. That yields a paired reward delta of **+0.036** for CSB-SDLC (95% CI: [-0.008, +0.084]), **+0.034** for CSB-Org (95% CI: [+0.013, +0.057]), and **+0.035** overall (95% CI: [+0.013, +0.058]) across **370** baseline/MCP task pairs, with reward-delta variance **0.048985**. The highest positive suite deltas are `csb_org_incident` (+0.113), `csb_org_security` (+0.106), `csb_sdlc_understand` (+0.115), and `csb_sdlc_refactor` (+0.103). Timing and cost no longer show the earlier contradictory pattern: MCP is faster on wall-clock on average (367.11s baseline vs 330.89s MCP, −36.22s) and much faster on agent execution (−101.06s), but slightly more expensive (+$0.040/task, +13.49% on means).
 
 And by the way, building a benchmark for coding agents while using coding agents is a fun way to find new failure modes. We all know agents are sneaky and mysterious genies, and that's also why I think benchmark results should ship with full agent transcripts for auditing (talking about that later, I know I'm asking a lot of you but I promise if you like benchmarks this is interesting and also explains why you read this far).
 
@@ -69,7 +69,7 @@ Breaking it down by SDLC element (which is how I designed this side of the bench
 | debug | 18 | -0.019 |
 | secure | 7 | **-0.071** |
 
-SDLC total: mean paired delta **+0.036** (n=150 paired tasks).
+SDLC total: mean paired delta **+0.036** (n=150 paired tasks, 95% CI: [-0.008, +0.084]).
 
 ## Where Sourcegraph MCP Wins
 
@@ -89,7 +89,7 @@ From that table above, the largest SDLC gains in this snapshot are design (+0.14
 | platform | 18 | -0.015 |
 | crossrepo | 14 | -0.027 |
 
-Org total: mean paired delta **+0.034** (n=220 paired tasks). When the agent needs to find information scattered across multiple repos, MCP tools still help overall in this snapshot.
+Org total: mean paired delta **+0.034** (n=220 paired tasks, 95% CI: [+0.013, +0.057]). When the agent needs to find information scattered across multiple repos, MCP tools still help overall in this snapshot.
 
 The biggest effects are on security (+0.113) and incident debugging (+0.108). These are the tasks that look most like real enterprise work: tracing a vulnerability across a dozen repos, mapping error paths across microservices, figuring out mysterious (haunted?) codebases.
 
