@@ -39,6 +39,21 @@ for tid, meta in TASK_META.items():
         ORG_TASKS.add(tid)
 
 
+# Merged suite mapping (reporting-layer only, original suites preserved)
+# See docs/analysis/suite_merge_analysis.md for rationale
+SUITE_MERGE_MAP = {
+    "csb_org_crossorg": "crossorg_merged",
+    "csb_org_org": "crossorg_merged",
+    "csb_org_compliance": "compliance_platform",
+    "csb_org_platform": "compliance_platform",
+}
+
+
+def get_merged_suite(benchmark: str) -> str:
+    """Map a benchmark suite to its merged name, or return original."""
+    return SUITE_MERGE_MAP.get(benchmark, benchmark)
+
+
 def normalize_task_name(raw_name: str) -> str:
     """Strip Harbor prefixes/suffixes to get canonical task name."""
     name = raw_name
@@ -273,11 +288,18 @@ def compute_paired_stats(records):
             vals = [r[field] for r in records if r.get(field) is not None]
             return statistics.mean(vals) if vals else None
 
+        # Get benchmark suite from task metadata
+        task_meta = find_task_metadata(task_name)
+        benchmark = task_meta.get("benchmark", "unknown")
+        merged_suite = get_merged_suite(benchmark)
+
         paired.append({
             "task_name": task_name,
             "language": meta["language"],
             "difficulty": meta["difficulty"],
             "suite_type": meta["suite_type"],
+            "benchmark": benchmark,
+            "merged_suite": merged_suite,
             "task_context_length": meta.get("task_context_length"),
             "task_files_count": meta.get("task_files_count"),
             "bl_reward": bl_mean,
@@ -537,6 +559,14 @@ def main():
     print("\n=== REWARD BY SUITE TYPE ===")
     suite_stats = breakdown_by(paired, "suite_type")
     print(json.dumps(suite_stats, indent=2))
+
+    print("\n=== REWARD BY BENCHMARK SUITE ===")
+    bench_stats = breakdown_by(paired, "benchmark")
+    print(json.dumps(bench_stats, indent=2))
+
+    print("\n=== REWARD BY MERGED SUITE ===")
+    merged_stats = breakdown_by(paired, "merged_suite")
+    print(json.dumps(merged_stats, indent=2))
 
     print("\n=== REWARD BY CODEBASE SIZE (Context Length) ===")
     ctx_stats = breakdown_by_bins(

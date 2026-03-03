@@ -53,6 +53,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/reliability_analysis.py` - Analysis/comparison script for reliability analysis.
 - `scripts/retrieval_eval_pipeline.py` - Analysis/comparison script for retrieval eval pipeline.
 - `scripts/retrieval_impact_analysis.py` - Analysis/comparison script for retrieval impact analysis.
+- `scripts/suite_power_analysis.py` - Analysis/comparison script for suite power analysis.
 - `scripts/variance_gap_analysis.py` - Analysis/comparison script for variance gap analysis.
 
 ## QA & Quality
@@ -225,6 +226,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/scaffold_contextbench_tasks.py` - Utility script for scaffold contextbench tasks.
 - `scripts/scaffold_feature_tasks.py` - Utility script for scaffold feature tasks.
 - `scripts/scaffold_refactor_tasks.py` - Utility script for scaffold refactor tasks.
+- `scripts/scaffold_swebench_pro_tasks.py` - Utility script for scaffold swebench pro tasks.
 - `scripts/scan_swebench_errors.py` - Utility script for scan swebench errors.
 - `scripts/sdlc_anomaly_scan.py` - Utility script for sdlc anomaly scan.
 - `scripts/select_contextbench_pilot.py` - Utility script for select contextbench pilot.
