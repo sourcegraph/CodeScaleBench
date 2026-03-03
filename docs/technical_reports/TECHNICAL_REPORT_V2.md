@@ -942,10 +942,10 @@ This indicates retrieval quality remains moderate on computable tasks, but groun
 
 **IR aggregates by configuration type (baseline vs MCP):**
 
-| Config Type | n | File Recall | MRR | MAP | Context Efficiency |
-|-------------|---|-------------|-----|-----|--------------------|
-| baseline | 132 | 0.3295 | 0.3462 | 0.2307 | 0.1843 |
-| mcp | 179 | 0.5558 | 0.3778 | 0.2667 | 0.2043 |
+| Config Type | n | File Recall | Precision@5 | Recall@5 | F1@5 | MRR |
+|-------------|---|-------------|-------------|----------|------|-----|
+| baseline | 132 | 0.3295 | 0.2121 | 0.2368 | 0.1850 | 0.3462 |
+| mcp | 179 | 0.5558 | 0.2145 | 0.2476 | 0.2001 | 0.3778 |
 
 MCP runs show higher recall and slightly higher ranking/efficiency metrics on computable retrieval tasks.
 

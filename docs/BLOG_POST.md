@@ -157,10 +157,10 @@ The refreshed retrieval pipeline run confirms moderate retrieval quality overall
 
 On the computable subset, aggregated baseline vs MCP retrieval metrics are:
 
-| Config Type | n | File Recall | MRR | MAP | Context Efficiency |
-|-------------|---|-------------|-----|-----|--------------------|
-| baseline | 132 | 0.330 | 0.346 | 0.231 | 0.184 |
-| mcp | 179 | 0.556 | 0.378 | 0.267 | 0.204 |
+| Config Type | n | File Recall | Precision@5 | Recall@5 | F1@5 | MRR |
+|-------------|---|-------------|-------------|----------|------|-----|
+| baseline | 132 | 0.330 | 0.212 | 0.237 | 0.185 | 0.346 |
+| mcp | 179 | 0.556 | 0.215 | 0.248 | 0.200 | 0.378 |
 
 But better retrieval doesn't always mean better outcomes. Still investigating this but likely finding the right files is necessary but not sufficient. The agent still has to correctly apply what it finds, and in some tasks the local code modification step is where removing local code availability from the MCP run environment hurts more than others.
 
