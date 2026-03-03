@@ -164,6 +164,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/add_verification_metadata.py` - Utility script for add verification metadata.
 - `scripts/audit_official_scores.py` - Utility script for audit official scores.
 - `scripts/audit_unpinned_repos.py` - Utility script for audit unpinned repos.
+- `scripts/audit_v2_report_data.py` - Utility script for audit v2 report data.
 - `scripts/backfill_instruction_artifacts.py` [one_off] - Historical one-off script: backfill instruction artifacts.
 - `scripts/backfill_size_metadata.py` [one_off] - Historical one-off script: backfill size metadata.
 - `scripts/backfill_triage_from_manifest.py` [one_off] - Historical one-off script: backfill triage from manifest.
@@ -182,11 +183,13 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/docgen_quality_sweep.py` - Utility script for docgen quality sweep.
 - `scripts/doe_power_curves.py` - Utility script for doe power curves.
 - `scripts/doe_select_tasks.py` - Utility script for doe select tasks.
+- `scripts/ds_hybrid_retrieval.py` - Utility script for ds hybrid retrieval.
 - `scripts/ds_wrapper.sh` - Utility script for ds wrapper.
 - `scripts/export_official_results.py` - Utility script for export official results.
 - `scripts/extract_analysis_metrics.py` - Utility script for extract analysis metrics.
 - `scripts/extract_build_diary.py` - Utility script for extract build diary.
 - `scripts/extract_build_narrative.py` - Utility script for extract build narrative.
+- `scripts/extract_v2_report_data.py` - Utility script for extract v2 report data.
 - `scripts/find_mcp_distracted.py` - Utility script for find mcp distracted.
 - `scripts/fix_h3_tokens.py` [one_off] - Historical one-off script: fix h3 tokens.
 - `scripts/fix_workspace_perms.py` [one_off] - Historical one-off script: fix workspace perms.
