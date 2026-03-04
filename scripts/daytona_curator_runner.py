@@ -59,14 +59,51 @@ SANDBOX_MEMORY_GB = 4
 SANDBOX_DISK_GB = 10  # Daytona Tier 3 max is 10GB per sandbox
 SANDBOX_TIMEOUT_SEC = 900  # 15 min per task
 
-# Max concurrent sandboxes (Tier 3 = 125, but be conservative for long tasks)
-DEFAULT_PARALLEL = 20
+# Max concurrent sandboxes (Tier 3 = 250 vCPU / 2 CPU per sandbox = 125 max)
+# Leave headroom for sandbox creation overlap and other users
+DEFAULT_PARALLEL = 55
 
 # TAC image tasks → known GitHub repos (no clone URL in Dockerfile)
 TAC_REPO_MAP = {
     "bustub": {"slug": "cmu-db/bustub", "commit": "HEAD"},
     "openhands": {"slug": "All-Hands-AI/OpenHands", "commit": "HEAD"},
 }
+
+
+def cleanup_orphaned_sandboxes(daytona_client, label_filter: str = "curator") -> int:
+    """Delete all sandboxes with purpose=curator label left from previous runs.
+
+    Called at startup to reclaim CPU quota from crashed/killed runs.
+    Returns count of sandboxes deleted.
+    """
+    try:
+        sandboxes = []
+        for item in daytona_client.list():
+            if isinstance(item, tuple) and item[0] == "items":
+                sandboxes = item[1]
+                break
+
+        if not sandboxes:
+            return 0
+
+        deleted = 0
+        for s in sandboxes:
+            labels = getattr(s, "labels", {}) or {}
+            if labels.get("purpose") != label_filter:
+                continue
+            try:
+                daytona_client.delete(s)
+                deleted += 1
+            except Exception:
+                pass  # Sandbox in transitional state, will be caught by auto-stop
+
+        if deleted:
+            log.info("Cleaned up %d orphaned curator sandboxes (of %d total)",
+                     deleted, len(sandboxes))
+        return deleted
+    except Exception as e:
+        log.warning("Orphan cleanup failed: %s", e)
+        return 0
 
 
 def load_credentials() -> Dict[str, Any]:
@@ -227,6 +264,38 @@ def _extract_repo_info_for_sandbox(ctx: Dict[str, Any]) -> List[Dict[str, str]]:
                 "slug": slug,
             }]
 
+    # Strategy 5: repo_fixture local_checkout_repos (Org tasks with MCP-only access)
+    # These tasks have no Dockerfile clones — agent accesses repos via MCP at benchmark
+    # time. For curator ground truth generation, clone local_checkout_repos so the
+    # curator can do thorough local exploration alongside MCP search.
+    repo_fixture = ctx.get("repo_fixture", {})
+    if repo_fixture:
+        local_checkout = repo_fixture.get("local_checkout_repos", [])
+        if local_checkout:
+            # Disk guard: skip if estimated LOC exceeds sandbox disk capacity
+            LOC_DISK_THRESHOLD = 15_000_000  # ~10GB rough approximation
+            total_loc = 0
+            for full_name in local_checkout:
+                for r in repo_fixture.get("repos", []):
+                    if r.get("full_name") == full_name:
+                        total_loc += r.get("loc_estimate", 0)
+
+            if total_loc > LOC_DISK_THRESHOLD:
+                log.warning("[strategy5] %s: skipping local clone (total LOC %d > threshold %d)",
+                            ctx.get("task_name", "?"), total_loc, LOC_DISK_THRESHOLD)
+                return []
+
+            for full_name in local_checkout:
+                name = full_name.split("/")[-1] if "/" in full_name else full_name
+                repos.append({
+                    "url": f"https://github.com/{full_name}.git",
+                    "commit": "HEAD",
+                    "name": name,
+                    "slug": full_name,
+                })
+            if repos:
+                return repos
+
     return []
 
 
@@ -283,7 +352,8 @@ def setup_curator_sandbox(
             memory=SANDBOX_MEMORY_GB,
             disk=SANDBOX_DISK_GB,
         ),
-        auto_stop_interval=0,
+        auto_stop_interval=20,  # Auto-stop after 20 min idle (prevents orphans)
+        auto_archive_interval=60,  # Auto-archive after 1 hour
     )
 
     sandbox = daytona_client.create(params, timeout=600)
@@ -421,7 +491,16 @@ def _build_python_runner() -> str:
     """
     return '''#!/usr/bin/env python3
 """Run claude CLI for curator agent (avoids shell quoting issues)."""
-import json, os, subprocess, sys
+import json, os, signal, subprocess, sys
+
+# OS-level timeout: signal.alarm fires SIGALRM after 840s regardless of
+# whether subprocess.run(timeout=...) fires correctly. This prevents the
+# Daytona sandbox from hanging indefinitely when the SDK timeout fails.
+def _sigalrm_handler(signum, frame):
+    print("ERROR: OS-level timeout (SIGALRM) fired after 840s", file=sys.stderr)
+    sys.exit(124)  # Standard timeout exit code
+
+signal.signal(signal.SIGALRM, _sigalrm_handler)
 
 # Read inputs
 sys_prompt = open("/tmp/system_prompt.txt").read()
@@ -452,7 +531,11 @@ if config.get("mcp_config"):
 
 os.chdir(config.get("workdir", "/workspace/repo"))
 
-result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=840)
+signal.alarm(840)  # Start OS-level timeout
+try:
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=840)
+finally:
+    signal.alarm(0)  # Cancel alarm if subprocess completes normally
 
 # Output: print stdout (JSON from claude), stderr to stderr for debugging
 if result.stderr:
@@ -754,6 +837,7 @@ def process_sdlc_task(
     backend: str,
     verbose: bool,
     prompt_version: str = "phase1",
+    overwrite: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Process a single SDLC task for ground truth generation in a Daytona sandbox."""
     from context_retrieval_agent import (
@@ -823,7 +907,7 @@ def process_sdlc_task(
                 "generator": "daytona_curator_runner",
             }
             write_curator_outputs(
-                task_dir, result["oracle"], metadata, ctx, overwrite=True,
+                task_dir, result["oracle"], metadata, ctx, overwrite=overwrite,
             )
         else:
             log.warning("[%d/%d] %s: no files found by curator", idx + 1, total, task_name)
@@ -961,6 +1045,17 @@ def _run_sdlc_mode(args, creds: Dict[str, Any]) -> int:
         log.error("No tasks found")
         return 1
 
+    # Skip unsupported task types (onboarding-search uses function_id schema)
+    SKIP_TASK_PATTERNS = ("ccx-onboard-search-",)
+    before_skip = len(tasks)
+    tasks = [
+        t for t in tasks
+        if not any(t.name.startswith(pat) for pat in SKIP_TASK_PATTERNS)
+    ]
+    if len(tasks) < before_skip:
+        log.info("Skipped %d unsupported task types (onboarding-search)",
+                 before_skip - len(tasks))
+
     # Filter to missing-only if requested
     original_count = len(tasks)
     if args.missing_only:
@@ -975,6 +1070,24 @@ def _run_sdlc_mode(args, creds: Dict[str, Any]) -> int:
                 filtered.append(t)
         tasks = filtered
         log.info("Filtered %d -> %d tasks (missing_only=True)", original_count, len(tasks))
+
+    # Skip tasks that already have _agent variant files (for idempotent re-runs)
+    if args.skip_agent_variants:
+        before_agent = len(tasks)
+        filtered2 = []
+        for t in tasks:
+            tests_dir = t / "tests"
+            suite = t.parent.name
+            is_org = suite.startswith(("csb_org_", "ccb_mcp_"))
+            if is_org:
+                agent_file = tests_dir / "oracle_answer_agent.json"
+            else:
+                agent_file = tests_dir / "ground_truth_agent.json"
+            if not agent_file.exists():
+                filtered2.append(t)
+        tasks = filtered2
+        log.info("Filtered %d -> %d tasks (skip_agent_variants=True)",
+                 before_agent, len(tasks))
 
     if args.max_tasks > 0:
         tasks = tasks[:args.max_tasks]
@@ -1006,6 +1119,9 @@ def _run_sdlc_mode(args, creds: Dict[str, Any]) -> int:
         log.error("daytona_sdk not installed: pip install daytona-sdk")
         return 1
 
+    # Clean up orphaned sandboxes from previous crashed/killed runs
+    cleanup_orphaned_sandboxes(daytona)
+
     # Run tasks in parallel
     total_cost = 0.0
     completed = []
@@ -1013,7 +1129,7 @@ def _run_sdlc_mode(args, creds: Dict[str, Any]) -> int:
 
     task_args = [
         (task_dir, i, len(tasks), daytona, creds, args.model, args.backend,
-         args.verbose, args.prompt_version)
+         args.verbose, args.prompt_version, args.overwrite_existing)
         for i, task_dir in enumerate(tasks)
     ]
 
@@ -1027,8 +1143,29 @@ def _run_sdlc_mode(args, creds: Dict[str, Any]) -> int:
         executor.submit(process_sdlc_task, *ta): ta[0]  # task_dir
         for ta in task_args
     }
+
+    # Signal handler: on SIGTERM/SIGINT, cancel futures and let finally blocks run
+    import signal as _signal
+    _shutdown_requested = False
+
+    def _graceful_shutdown(signum, frame):
+        nonlocal _shutdown_requested
+        if _shutdown_requested:
+            return  # Avoid re-entry
+        _shutdown_requested = True
+        sig_name = _signal.Signals(signum).name
+        log.warning("Received %s — cancelling pending futures and cleaning up sandboxes", sig_name)
+        for f in futures:
+            f.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    _signal.signal(_signal.SIGTERM, _graceful_shutdown)
+    _signal.signal(_signal.SIGINT, _graceful_shutdown)
+
     try:
         for future in as_completed(futures, timeout=global_timeout):
+            if _shutdown_requested:
+                break
             task_dir = futures.get(future, Path("?"))
             try:
                 outcome = future.result(timeout=future_timeout)
@@ -1066,6 +1203,8 @@ def _run_sdlc_mode(args, creds: Dict[str, Any]) -> int:
     finally:
         # Non-blocking shutdown — don't wait for stuck Daytona SDK threads
         executor.shutdown(wait=False, cancel_futures=True)
+        # Best-effort cleanup of any remaining sandboxes
+        cleanup_orphaned_sandboxes(daytona)
 
     # Summary
     print(f"\n{'=' * 60}")
@@ -1134,6 +1273,9 @@ def _run_contextbench_mode(args, creds: Dict[str, Any]) -> int:
         log.error("daytona_sdk not installed: pip install daytona-sdk")
         return 1
 
+    # Clean up orphaned sandboxes from previous crashed/killed runs
+    cleanup_orphaned_sandboxes(daytona)
+
     # Output directory
     out_dir = Path(args.out) if args.out else RESULTS_DIR / f"daytona_{time.strftime('%Y%m%d_%H%M%S')}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1184,6 +1326,7 @@ def _run_contextbench_mode(args, creds: Dict[str, Any]) -> int:
                     sum(1 for f in futures if not f.done()))
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
+        cleanup_orphaned_sandboxes(daytona)
 
     if not trajectories:
         log.error("No tasks completed")
@@ -1268,6 +1411,10 @@ def main() -> int:
                             help="Single task directory to process")
     sdlc_group.add_argument("--missing-only", action="store_true",
                             help="Only process tasks missing ground_truth.json")
+    sdlc_group.add_argument("--overwrite-existing", action="store_true",
+                            help="Overwrite existing ground_truth.json (default: write to _agent variant)")
+    sdlc_group.add_argument("--skip-agent-variants", action="store_true",
+                            help="Skip tasks that already have *_agent.json files (idempotent re-runs)")
 
     # ContextBench mode flags
     cb_group = parser.add_argument_group("ContextBench mode (calibration)")
