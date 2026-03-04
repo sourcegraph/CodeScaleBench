@@ -1040,8 +1040,22 @@ before retrying."""
                 # Build the wrapper script content
                 script_lines = [
                     '#!/bin/bash',
-                    'export PATH=/usr/local/bin:/usr/bin:/bin:$PATH',
+                    'export PATH=/usr/bin:/usr/local/bin:/bin:$PATH',
                     'export CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000',
+                    '# Some task images do not ship coreutils stdbuf. Provide a',
+                    '# no-op shim so Harbor command templates still run.',
+                    'if ! command -v stdbuf >/dev/null 2>&1; then',
+                    '  stdbuf() {',
+                    '    while [ $# -gt 0 ]; do',
+                    '      case "$1" in',
+                    '        -o*|-e*|-i*) shift ;;',
+                    '        --) shift; break ;;',
+                    '        *) break ;;',
+                    '      esac',
+                    '    done',
+                    '    "$@"',
+                    '  }',
+                    'fi',
                     '# Detect working directory',
                     'if [ -d /workspace ]; then WORKDIR=/workspace',
                     'elif [ -d /app ]; then WORKDIR=/app',
@@ -1281,7 +1295,21 @@ before retrying."""
             # Pure baseline - no MCP
             logger.info("BaselineClaudeCodeAgent: Pure baseline (no MCP)")
 
-        await super().setup(environment)
+        # Some benchmark images preinstall Claude Code at build time. On a subset of
+        # Debian-based images, Harbor's generic install script can fail due to
+        # non-interactive GPG/TTY constraints (e.g., "gpg: cannot open /dev/tty").
+        # If the installer fails but `claude` is already available, continue.
+        try:
+            await super().setup(environment)
+        except RuntimeError:
+            probe = await environment.exec("which claude >/dev/null 2>&1 && claude --version || true")
+            if probe.return_code == 0 and (probe.stdout or "").strip():
+                logger.warning(
+                    "Agent install script failed, but claude is already present in image; "
+                    "continuing with preinstalled Claude Code."
+                )
+            else:
+                raise
 
     async def _setup_subscription_auth(self, environment: BaseEnvironment) -> None:
         """Setup Claude Code subscription authentication in container.

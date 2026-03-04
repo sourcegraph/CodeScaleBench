@@ -80,7 +80,7 @@ def canonicalize_task_id(task_id: str) -> str:
             # Harbor MCP task dirs often append a short disambiguation suffix.
             t = re.sub(r"_[A-Za-z0-9]{6,8}$", "", t)
             break
-    return t
+    return t.lower()
 
 
 def parse_batch_ts_to_epoch(batch_name: str) -> float:
@@ -111,7 +111,7 @@ def load_flagged_pairs(audit_report: Path, v2_report: Path) -> set[tuple[str, st
     if audit_report.is_file():
         data = json.loads(audit_report.read_text())
         for entry in _iter_flag_entries(data.get("flags", {})):
-            task = (entry.get("task") or "").strip()
+            task = canonicalize_task_id((entry.get("task") or "").strip())
             variant = normalize_variant(entry.get("config"))
             if task and variant:
                 flagged.add((task, variant))
@@ -119,7 +119,7 @@ def load_flagged_pairs(audit_report: Path, v2_report: Path) -> set[tuple[str, st
     if v2_report.is_file():
         data = json.loads(v2_report.read_text())
         for item in data.get("suspicious", []):
-            task = (item.get("task") or "").strip()
+            task = canonicalize_task_id((item.get("task") or "").strip())
             variant = normalize_variant(item.get("config"))
             if task and variant:
                 flagged.add((task, variant))
@@ -139,11 +139,59 @@ def load_promotable_overrides(review_file: Path | None) -> set[tuple[str, str]]:
     for row in data.get("reviews", []):
         if row.get("recommended_status") != "promotable":
             continue
-        task = (row.get("task_id") or "").strip()
+        task = canonicalize_task_id((row.get("task_id") or "").strip())
         variant = normalize_variant(row.get("variant"))
         if task and variant:
             promotable.add((task, variant))
     return promotable
+
+
+def load_vetted_allowset(selection_file: Path | None) -> set[tuple[str, str, str]] | None:
+    """Build allowset from selected_benchmark_tasks.json using metadata per-suite targets.
+
+    Returns a set of (subset, suite, canonical_task_id), or None if no file provided.
+    """
+    if selection_file is None:
+        return None
+    if not selection_file.is_file():
+        return None
+
+    try:
+        data = json.loads(selection_file.read_text())
+    except Exception:
+        return None
+
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+
+    per_suite = data.get("metadata", {}).get("per_suite", {})
+    if not isinstance(per_suite, dict):
+        return None
+
+    # Keep first N tasks per suite in file order, where N is the metadata target.
+    selected_per_suite: dict[str, int] = defaultdict(int)
+    allowset: set[tuple[str, str, str]] = set()
+    for row in tasks:
+        if not isinstance(row, dict):
+            continue
+        suite = (row.get("benchmark") or row.get("mcp_suite") or "").strip()
+        if suite not in per_suite:
+            continue
+        if not (suite.startswith("csb_sdlc") or suite.startswith("csb_org")):
+            continue
+        target_n = per_suite.get(suite)
+        if not isinstance(target_n, int) or target_n <= 0:
+            continue
+        if selected_per_suite[suite] >= target_n:
+            continue
+        task_id = canonicalize_task_id(str(row.get("task_id") or "").strip())
+        if not task_id:
+            continue
+        subset = "csb_sdlc" if suite.startswith("csb_sdlc") else "csb_org"
+        allowset.add((subset, suite, task_id))
+        selected_per_suite[suite] += 1
+    return allowset
 
 
 @dataclass
@@ -252,6 +300,7 @@ def choose_top3_paired(
     records: list[TaskRun],
     flagged_pairs: set[tuple[str, str]],
     promotable_pairs: set[tuple[str, str]],
+    allowset: set[tuple[str, str, str]] | None = None,
 ) -> dict:
     # Keep latest run per (subset, suite, run_dir, task, variant) to avoid duplicate task_metrics views.
     dedup: dict[tuple[str, str, str, str, str], TaskRun] = {}
@@ -264,6 +313,8 @@ def choose_top3_paired(
     # Build independent high-quality pools by task and variant, then pair by recency rank.
     grouped: dict[tuple[str, str, str], dict[str, list[TaskRun]]] = defaultdict(lambda: {"baseline": [], "mcp": []})
     for rec in dedup.values():
+        if allowset is not None and (rec.subset, rec.suite, rec.task_id) not in allowset:
+            continue
         pair_key = (rec.task_id, rec.variant)
         if pair_key in flagged_pairs and pair_key not in promotable_pairs:
             continue
@@ -375,6 +426,15 @@ def main() -> int:
         default=ROOT / "runs" / "analysis" / "flag_reclassification_review.json",
         help="Optional review file; flagged sides marked promotable will be included.",
     )
+    parser.add_argument(
+        "--allowlist-selection-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional selected_benchmark_tasks.json path. When provided, only the vetted "
+            "per-suite target counts from metadata.per_suite are included."
+        ),
+    )
     parser.add_argument("--no-clean", action="store_true", help="Do not remove existing output first.")
     args = parser.parse_args()
 
@@ -384,8 +444,9 @@ def main() -> int:
 
     flagged_pairs = load_flagged_pairs(args.audit_report, args.v2_audit_report)
     promotable_pairs = load_promotable_overrides(args.reclassification_review)
+    allowset = load_vetted_allowset(args.allowlist_selection_file)
     records = discover_runs(args.source)
-    selected_result = choose_top3_paired(records, flagged_pairs, promotable_pairs)
+    selected_result = choose_top3_paired(records, flagged_pairs, promotable_pairs, allowset=allowset)
     selected = selected_result["selected"]
     under_target = selected_result["under_target"]
     summary = materialize_analysis(selected, args.output)
@@ -403,6 +464,8 @@ def main() -> int:
             "audit_report": str(args.audit_report),
             "v2_audit_report": str(args.v2_audit_report),
             "reclassification_review": str(args.reclassification_review),
+            "allowlist_selection_file": str(args.allowlist_selection_file) if args.allowlist_selection_file else None,
+            "allowset_size": len(allowset) if allowset is not None else None,
             "flagged_pairs_count": len(flagged_pairs),
             "promotable_override_pairs_count": len(promotable_pairs),
             "discovered_runs_count": len(records),
