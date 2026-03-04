@@ -15,20 +15,16 @@ Usage:
 """
 
 import argparse
-import csv
 import json
 import glob
 import os
 import re
-import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
-from matplotlib.gridspec import GridSpec
 import numpy as np
 
 # ── Palettes (same as main figure) ─────────────────────────────────────────

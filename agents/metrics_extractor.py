@@ -10,7 +10,6 @@ Parses claude-code.txt (JSON lines) and result.json to extract:
 """
 
 import json
-import re
 from collections import Counter
 from dataclasses import dataclass, field, asdict
 from datetime import datetime

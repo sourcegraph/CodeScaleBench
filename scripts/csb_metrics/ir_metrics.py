@@ -642,7 +642,7 @@ def extract_time_to_context(
         return {}
 
     # Parse timestamps from trajectory steps
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     def _parse_ts(s: str) -> Optional[float]:
         if not s:

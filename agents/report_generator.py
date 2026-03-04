@@ -6,7 +6,6 @@ Generates human-readable Markdown reports comparing agent variants.
 
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from .metrics_aggregator import JobMetrics, AgentMetrics
 

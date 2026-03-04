@@ -24,7 +24,7 @@ def test_config_loading():
     """Test configuration loading and validation."""
     print("[TEST] Config loading...")
     
-    from lib.config.loader import load_config, validate_config, ConfigError
+    from lib.config.loader import load_config
     from lib.config.schema import ExperimentConfig
     
     config_path = SCRIPT_DIR / "configs" / "smoke_test.yaml"

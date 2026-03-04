@@ -39,7 +39,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("daytona_curator")
 
@@ -1224,8 +1224,7 @@ def _run_sdlc_mode(args, creds: Dict[str, Any]) -> int:
 def _run_contextbench_mode(args, creds: Dict[str, Any]) -> int:
     """ContextBench mode: calibration with trajectory + metrics output."""
     from validate_on_contextbench import (
-        load_tasks, ccb_weighted_sample, stratified_sample,
-        compute_simple_file_metrics, compute_chunk_metrics,
+        load_tasks, ccb_weighted_sample, compute_simple_file_metrics, compute_chunk_metrics,
         build_calibration_report,
     )
 

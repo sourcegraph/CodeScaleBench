@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from aggregate_status import (
-    RUNS_DIR, SKIP_PATTERNS, DIR_PREFIX_TO_SUITE, CONFIGS,
+    RUNS_DIR, CONFIGS,
     should_skip, detect_suite, _iter_task_dirs, classify_task,
 )
 

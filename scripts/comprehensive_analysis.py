@@ -26,7 +26,6 @@ import glob
 import math
 import re
 import statistics
-import sys
 from collections import defaultdict, Counter
 from datetime import datetime
 from pathlib import Path

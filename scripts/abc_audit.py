@@ -15,7 +15,6 @@ Usage:
 import argparse
 import json
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -28,7 +27,6 @@ SELECTED_TASKS_PATH = PROJECT_ROOT / "configs" / "selected_benchmark_tasks.json"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from abc_criteria import (
-    ALL_CRITERIA,
     CRITERIA_BY_ID,
     AuditReport,
     CriterionResult,

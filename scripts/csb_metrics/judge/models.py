@@ -6,7 +6,6 @@ Compatible with Python 3.10+.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional

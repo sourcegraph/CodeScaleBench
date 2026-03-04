@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -20,15 +20,9 @@ from ccb_metrics.judge import (
     JudgeInput,
     JudgeResult,
     LLMJudge,
-    OracleBundle,
     normalize_score,
 )
 from ccb_metrics.judge.backends import AnthropicBackend, JudgeBackendError
-from ccb_metrics.judge.prompts import (
-    DIRECT_REVIEW_PROMPT,
-    REFERENCE_COMPLETENESS_PROMPT,
-    REFERENCE_CORRECTNESS_PROMPT,
-)
 
 # ---------------------------------------------------------------------------
 # Shared fixtures / helpers

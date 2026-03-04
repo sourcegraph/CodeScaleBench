@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Tests for scripts/abc_score_task.py — ABC Task Quality Scorer."""
 
-import json
 import sys
 from pathlib import Path
 

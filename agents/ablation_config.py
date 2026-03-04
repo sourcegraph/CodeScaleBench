@@ -11,7 +11,6 @@ Parses YAML job configuration files for ablation studies, defining:
 import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 
 @dataclass

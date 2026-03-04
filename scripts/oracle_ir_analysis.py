@@ -33,7 +33,6 @@ import math
 import re
 import statistics
 import sys
-from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional

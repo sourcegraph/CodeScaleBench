@@ -26,7 +26,6 @@ Usage:
 
 import argparse
 import json
-import os
 import sys
 import time
 from collections import defaultdict
@@ -37,7 +36,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from status_fingerprints import fingerprint_error
-from config_utils import discover_configs, is_mcp_config, config_short_name
+from config_utils import discover_configs, config_short_name
 
 # ---------------------------------------------------------------------------
 # Constants (duplicated from generate_manifest.py for independence)

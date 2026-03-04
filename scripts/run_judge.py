@@ -25,7 +25,7 @@ from typing import Optional
 # Ensure scripts/ is on path for sibling imports
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from csb_metrics.judge import LLMJudge, JudgeInput, JudgeResult, OracleBundle
+from csb_metrics.judge import LLMJudge, JudgeInput, JudgeResult
 from csb_metrics.judge.oracle import discover_oracle
 from csb_metrics.discovery import (
     resolve_task_transcript_path,

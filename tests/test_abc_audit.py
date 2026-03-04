@@ -4,7 +4,6 @@
 import json
 import sys
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -25,7 +24,6 @@ from abc_audit import (
     check_r2_no_contamination,
     check_r3_readme,
     check_r5_error_catalog,
-    check_r8_task_selection_docs,
     check_r11_fingerprint_coverage,
     check_r12_repro_instructions,
     check_r13_manifest,

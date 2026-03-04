@@ -10,7 +10,6 @@ and reward scores. Groups by task, computes means, and flags anomalies:
 import json
 import os
 import re
-import sys
 from collections import defaultdict
 from pathlib import Path
 

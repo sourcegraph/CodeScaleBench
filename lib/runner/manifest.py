@@ -6,15 +6,13 @@ The manifest tracks the overall experiment, all runs, and all pairs.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 from lib.config.schema import ExperimentConfig
 from lib.config.loader import get_config_hash
 from lib.matrix.expander import RunSpec, PairSpec
-from lib.runner.pair_scheduler import ScheduledRun, PairExecution, RunStatus
+from lib.runner.pair_scheduler import ScheduledRun, PairExecution
 
 
 class ExperimentManifest:

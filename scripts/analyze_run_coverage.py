@@ -8,7 +8,6 @@ completed runs in runs/official/ to identify gaps.
 
 import json
 import os
-import sys
 from collections import defaultdict
 from pathlib import Path
 

@@ -18,15 +18,12 @@ import argparse
 import csv
 import json
 import os
-import sys
 from datetime import datetime, timedelta
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import matplotlib.ticker as mticker
-import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 import numpy as np
 

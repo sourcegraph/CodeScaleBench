@@ -12,7 +12,6 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from .metrics_extractor import TrialMetrics, extract_trial_metrics
 

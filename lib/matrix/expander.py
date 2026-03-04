@@ -6,10 +6,8 @@ handling all combinations of benchmarks, models, MCP modes, seeds, and tasks.
 
 from __future__ import annotations
 
-import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
 
 from lib.config.schema import (
     ExperimentConfig,

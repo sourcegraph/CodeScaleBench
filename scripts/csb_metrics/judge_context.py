@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Optional
 
 from .discovery import (
-    discover_runs,
     _extract_task_id,
     _is_batch_dir,
     _is_task_dir,
@@ -391,7 +390,6 @@ def _find_task_dirs(runs_dir: Path) -> list[dict]:
     Returns list of dicts with keys: task_dir, run_name, benchmark, config_name,
     model, timestamp.
     """
-    import re
     from .discovery import _infer_benchmark, _extract_model_from_config, _extract_batch_timestamp
 
     results = []

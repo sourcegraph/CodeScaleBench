@@ -8,15 +8,13 @@ Ensures that for each (task, model, seed) combination:
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Callable, Iterator
+from typing import Callable
 
 from lib.matrix.expander import RunSpec, PairSpec
 from lib.runner.executor import HarborExecutor, ExecutionResult
-from lib.runner.task_validator import TaskValidator
 
 
 class RunStatus(str, Enum):

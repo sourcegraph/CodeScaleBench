@@ -19,10 +19,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config_utils import discover_configs, is_mcp_config, config_short_name
+from config_utils import discover_configs, config_short_name
 from aggregate_status import (
-    RUNS_DIR, SKIP_PATTERNS,
-    should_skip, detect_suite, _iter_task_dirs, _extract_task_name,
+    RUNS_DIR, should_skip, detect_suite, _iter_task_dirs, _extract_task_name,
 )
 
 # Anthropic pricing (per token, as of 2025)

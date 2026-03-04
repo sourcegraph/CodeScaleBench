@@ -23,12 +23,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import random
-import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent

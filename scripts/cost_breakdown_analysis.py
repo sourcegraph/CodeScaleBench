@@ -23,7 +23,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config_utils import discover_configs, is_mcp_config, is_config_dir, config_short_name
+from config_utils import is_config_dir, config_short_name
 
 RUNS_DIR = Path(__file__).resolve().parent.parent / "runs" / "official"
 OUTPUT_JSON = Path(__file__).resolve().parent.parent / "docs" / "cost_breakdown.json"

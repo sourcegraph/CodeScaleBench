@@ -54,7 +54,6 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from ds_hybrid_retrieval import (
     DS_PROMPT_TEMPLATE,
-    _extract_gold_files_from_row,
     _normalize_path,
     ds_create_conversation,
     ds_poll_conversation,
@@ -66,10 +65,8 @@ from context_retrieval_agent import (
     CURATOR_SYSTEM_PROMPT,
     _extract_json_from_text,
     _tool_description_for_backend,
-    clone_repo,
     get_cache_dir,
     get_task_type_guidance,
-    run_agent_cli,
 )
 
 log = logging.getLogger("hybrid_pipeline")

@@ -9,7 +9,6 @@ Output: JSON manifest of repo→commit→mirror mappings ready for mirror creati
 
 import json
 import re
-import sys
 from collections import defaultdict
 from pathlib import Path
 

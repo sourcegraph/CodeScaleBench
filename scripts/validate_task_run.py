@@ -19,7 +19,7 @@ import json
 import glob
 import os
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Optional
 

@@ -20,7 +20,6 @@ Usage:
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -250,7 +249,6 @@ def run_golden_test(
 
         # Write mock files to host tmpdir, then mount and copy inside container.
         # This avoids OS argument-list-too-long for large files (e.g. solve.sh).
-        import base64
         staging_dir = Path(tmpdir) / "staging"
         staging_dir.mkdir()
         inject_cmds = []

@@ -19,7 +19,6 @@ Usage:
 from __future__ import annotations
 
 import json
-import math
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -29,14 +28,13 @@ from statistics import mean, stdev, median
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
-from config_utils import discover_configs, is_mcp_config, is_config_dir, config_short_name
+from config_utils import is_config_dir
 
 from csb_metrics.statistics import (
     welchs_t_test,
     cohens_d,
     mcnemar_test,
     bootstrap_ci_dict as bootstrap_ci,
-    MetricComparison,
 )
 
 # ---------------------------------------------------------------------------

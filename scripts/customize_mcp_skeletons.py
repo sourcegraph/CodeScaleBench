@@ -12,7 +12,6 @@ Adds missing files required by the reference task pattern:
 
 import json
 import os
-import re
 import shutil
 import sys
 

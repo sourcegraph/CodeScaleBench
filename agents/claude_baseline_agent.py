@@ -510,7 +510,6 @@ class BaselineClaudeCodeAgent(ClaudeCode):
         Fix: filter out 'subagents' directories and return the top-level session dir
         which always contains the main session JSONL file.
         """
-        from pathlib import Path
 
         sessions_root = self.logs_dir / "sessions"
         if not sessions_root.exists():

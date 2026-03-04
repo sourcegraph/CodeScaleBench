@@ -11,7 +11,6 @@ import json
 import os
 import re
 import time
-from typing import Any
 
 
 class JudgeBackendError(Exception):

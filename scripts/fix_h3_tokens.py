@@ -33,7 +33,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
-from config_utils import discover_configs, is_mcp_config, config_short_name
+from config_utils import discover_configs
 
 RUNS_DIR = PROJECT_ROOT / "runs" / "official"
 

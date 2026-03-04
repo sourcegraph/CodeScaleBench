@@ -7,12 +7,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from lib.matrix.expander import PairSpec
-from lib.runner.pair_scheduler import PairExecution, RunStatus
+from lib.runner.pair_scheduler import PairExecution
 
 if TYPE_CHECKING:
     from lib.exporter.canonical import V2Exporter

@@ -7,7 +7,6 @@ Fixes false-positive MCP connection errors and adds DS polling retry analysis.
 import json
 import os
 import re
-import sys
 from collections import defaultdict
 from pathlib import Path
 

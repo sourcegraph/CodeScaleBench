@@ -49,7 +49,6 @@ from normalize_retrieval_events import (
     _extract_files_from_tool_result,
     _extract_symbols_from_tool_input,
     _is_mcp,
-    _is_retrieval_tool,
     _tool_category,
 )
 

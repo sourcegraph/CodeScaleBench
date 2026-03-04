@@ -2,9 +2,7 @@
 """Rename task folders and update all references per task_rename_map.json."""
 
 import json
-import os
 import re
-import shutil
 import sys
 from pathlib import Path
 

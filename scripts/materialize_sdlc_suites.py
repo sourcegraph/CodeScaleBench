@@ -10,7 +10,7 @@ import argparse
 import json
 import os
 import shutil
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 

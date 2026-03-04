@@ -7,9 +7,7 @@ and produces breakdowns by language, difficulty, codebase size, timing, cost, to
 """
 
 import json
-import glob
 import re
-import os
 import sys
 from collections import defaultdict
 from datetime import datetime

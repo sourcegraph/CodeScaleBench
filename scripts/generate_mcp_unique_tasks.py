@@ -16,13 +16,12 @@ Usage:
 import argparse
 import json
 import logging
-import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from string import Template
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------

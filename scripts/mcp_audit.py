@@ -20,7 +20,7 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config_utils import discover_configs, is_mcp_config, is_config_dir, config_short_name
+from config_utils import is_config_dir
 
 RUNS_DIR = Path(__file__).resolve().parent.parent / "runs" / "official"
 SELECTION_FILE = Path(__file__).resolve().parent.parent / "configs" / "selected_benchmark_tasks.json"
@@ -310,7 +310,7 @@ def _extract_from_result_json(result_file: Path, config_name: str) -> dict | Non
     reward = rewards.get("reward", rewards.get("score", 0.0))
 
     # Parse timing
-    from datetime import datetime, timezone
+    from datetime import datetime
     def parse_ts(s):
         if not s:
             return None

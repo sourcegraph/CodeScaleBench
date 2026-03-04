@@ -23,7 +23,7 @@ import json
 import shutil
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 RUNS_DIR = Path(__file__).resolve().parent.parent / "runs" / "official"

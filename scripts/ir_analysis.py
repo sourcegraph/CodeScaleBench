@@ -32,7 +32,7 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config_utils import discover_configs, is_mcp_config, is_config_dir, config_short_name
+from config_utils import is_mcp_config, is_config_dir, config_short_name
 
 from csb_metrics.ground_truth import (
     build_ground_truth_registry,
@@ -45,7 +45,6 @@ from csb_metrics.ir_metrics import (
     aggregate_ir_scores,
     extract_retrieved_files,
     extract_time_to_context,
-    extract_tokens_before_first_relevant,
     extract_cost_metrics_before_first_relevant,
     extract_agent_time_to_first_relevant,
     IRScores,
