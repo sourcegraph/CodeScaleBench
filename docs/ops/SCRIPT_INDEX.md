@@ -209,6 +209,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/plot_build_diary.py` - Utility script for plot build diary.
 - `scripts/plot_build_diary_supplementary.py` - Utility script for plot build diary supplementary.
 - `scripts/plot_build_narrative.py` - Utility script for plot build narrative.
+- `scripts/plot_csb_mcp_blog_figures.py` - Utility script for plot csb mcp blog figures.
 - `scripts/prepare_analysis_runs.py` - Utility script for prepare analysis runs.
 - `scripts/promote_agent_oracles.py` - Utility script for promote agent oracles.
 - `scripts/push_base_images_ghcr.sh` - Utility script for push base images ghcr.

@@ -109,15 +109,17 @@ Curated GT deltas (`MCP - baseline`, combined):
 
 ### 2) Gains persist across size bins, with strongest lift in 1M-5M proxy bucket
 
-Curated GT deltas (`MCP - baseline`):
-- `<1M`: F1@10 +0.1007, Total +0.1318
-- `1M-5M`: F1@10 +0.2680, Total +0.2392
-- `5M-20M`: F1@10 +0.0648, Total +0.0565
-- `>20M`: F1@10 +0.1247, Total +0.1075
+Curated GT deltas (`MCP - baseline`) by revised LOC size bands:
+- `<400K` (n=15): F1@10 +0.2503, Total +0.2780
+- `400K-2M` (n=31): F1@10 +0.2618, Total +0.2424
+- `2M-8M` (n=143): F1@10 +0.1796, Total +0.1622
+- `8M-40M` (n=74): F1@10 +0.0719, Total +0.0590
+- `>40M` (n=3): F1@10 +0.0242, Total +0.0667
+- `unknown` (n=63): F1@10 +0.0992, Total +0.1601
 
 Interpretation: retrieval lift is not uniform, but MCP shows clear upside where task context is more distributed and retrieval-heavy.
 
-Method note: I corrected an Org path-normalization bug in an earlier draft where some baseline paths were mismatched due to path shape differences (for example `repo/repo/path` vs `repo/path`).
+Method note: I corrected an Org path-normalization bug in an earlier draft where some baseline paths were mismatched due to path shape differences (for example `repo/repo/path` vs `repo/path`). I also replaced SDLC size proxies with non-proxy repository size mapping for the size-bin slice in this version.
 
 ## Cost and Speed
 

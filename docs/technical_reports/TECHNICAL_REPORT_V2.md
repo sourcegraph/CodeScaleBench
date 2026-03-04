@@ -992,18 +992,20 @@ On curated ground truth (`MCP - Baseline`, combined):
 | single_repo | 158 | +0.0853 | +0.1119 |
 | multi_repo | 171 | +0.2089 | +0.1862 |
 
-Curated size-bin deltas (`MCP - Baseline`):
+Curated size-bin deltas (`MCP - Baseline`), using the revised LOC bands shared with prior repo-size analysis:
 
-| Size Bin (proxy) | n | Δ F1@10 | Δ Total File Recall |
+| Size Bin | n | Δ F1@10 | Δ Total File Recall |
 |------------------|---:|--------:|--------------------:|
-| <1M | 139 | +0.1007 | +0.1318 |
-| 1M-5M | 104 | +0.2680 | +0.2392 |
-| 5M-20M | 57 | +0.0648 | +0.0565 |
-| >20M | 29 | +0.1247 | +0.1075 |
+| <400K | 15 | +0.2503 | +0.2780 |
+| 400K-2M | 31 | +0.2618 | +0.2424 |
+| 2M-8M | 143 | +0.1796 | +0.1622 |
+| 8M-40M | 74 | +0.0719 | +0.0590 |
+| >40M | 3 | +0.0242 | +0.0667 |
+| unknown | 63 | +0.0992 | +0.1601 |
 
 These slices indicate MCP retrieval gains are larger on multi-repo tasks than single-repo tasks in this snapshot.
 
-Methodology note: size bins here are metadata-driven proxies (`repo_set` fixture LOC totals for Org; `context_length` proxy for SDLC with fallback), so they should be interpreted as directional rather than exact physical repository size measurements.
+Methodology note: size bins here are no longer `context_length` proxies. Org tasks use fixture `loc_estimate` totals; SDLC tasks use repository size from GitHub metadata mapped into the same LOC bands (`docs/analysis/repo_size_bins_revised_20260303.json` conventions). `unknown` indicates tasks without resolved size metadata in this pass.
 
 ### 11.6 Correlation Analysis
 
