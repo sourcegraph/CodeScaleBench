@@ -103,7 +103,7 @@ Either way, the **control plane** is the spec + manifest; the runner is a consum
 
 ## Relation to existing v2 experiment YAMLs
 
-The repo already has a **v2 experiment path** (`lib/config`, `lib/matrix/expander`, `run-eval run -c experiment.yaml`) that uses Harbor’s **registry** and dataset/task_names. That path is well-suited to benchmarks like swebenchpro that are in the registry.
+The repo already has a **v2 experiment path** (`lib/config`, `lib/matrix/expander`, `scripts/run-eval run -c experiment.yaml`) that uses Harbor’s **registry** and dataset/task_names. That path is well-suited to benchmarks like swebenchpro that are in the registry.
 
 The **control plane layer** described here is complementary:
 

@@ -1,8 +1,14 @@
 # CodeScaleBench
 
-Benchmark suite for evaluating how AI coding agents leverage external context tools on software engineering tasks across the SDLC. Developed as the reproducibility artifact for the paper *"CodeScaleBench: Evaluating Coding Agents on Real-Scale Software Engineering Tasks Across the Development Lifecycle."*
+Benchmark suite for evaluating how AI coding agents leverage external context tools on software engineering tasks across the SDLC.
 
-This repository contains **benchmark task definitions**, **evaluation configs**, and a **metrics extraction pipeline**. Tasks are executed via the [Harbor](https://github.com/laude-institute/harbor/tree/main) runner with the Claude Code agent harness.
+This repository contains:
+- **Benchmark task definitions** (SDLC and Org suites with task specs, tests, and metadata)
+- **Evaluation and run configs** (paired baseline vs MCP-enabled execution modes)
+- **Metrics extraction and reporting pipelines** for score/cost/retrieval analysis
+- **Run artifacts and agent traces** (in `runs/` and published summaries under `docs/official_results/`)
+
+Tasks are executed via the [Harbor](https://github.com/laude-institute/harbor/tree/main) runner with the Claude Code agent harness.
 
 ---
 
@@ -12,7 +18,6 @@ This repository contains **benchmark task definitions**, **evaluation configs**,
 
 - Researchers evaluating coding agents on realistic software engineering tasks
 - Practitioners comparing baseline vs MCP-enabled agent configurations
-- Contributors authoring new benchmark tasks or extending evaluation tooling
 
 ### What you can do without Harbor
 
@@ -37,10 +42,11 @@ ls benchmarks
 Running benchmark tasks requires:
 
 - [Harbor](https://github.com/laude-institute/harbor/tree/main) installed and configured
-- **Daytona** account and API key (preferred — no local Docker needed, up to 125 concurrent sandboxes). See `docs/DAYTONA.md`
-- OR Docker (only needed for 21 sweap-images tasks incompatible with Daytona)
-- Valid agent/runtime credentials used by your Harbor setup
-- A Max subscription (for the default harness path documented in this repo)
+
+Our internal default setup often uses:
+- **Daytona** account and API key (preferred in this repo). See `docs/DAYTONA.md`
+- Docker for Daytona-incompatible tasks
+- Agent/runtime credentials as needed by your Harbor harness
 
 Recommended pre-run checks:
 
@@ -60,7 +66,6 @@ bash configs/run_selected_tasks.sh --dry-run
 - `docs/START_HERE_BY_TASK.md` for task-oriented navigation
 - `docs/reference/CONFIGS.md` for the 2-config evaluation matrix
 - `docs/EVALUATION_PIPELINE.md` for scoring and reporting outputs
-- `docs/REPO_HEALTH.md` for the pre-push health gate
 
 ---
 
@@ -87,17 +92,17 @@ Eleven additional suites measure cross-repo discovery, symbol resolution, depend
 
 | Suite | Category | Tasks | Description |
 |-------|----------|------:|-------------|
-| `csb_org_onboarding` | E: Onboarding & Comprehension | 28 | API consumption mapping, end-to-end flow, architecture maps |
-| `csb_org_migration` | C: Framework Migration | 26 | API migrations, breaking changes across repos |
-| `csb_org_security` | B: Vulnerability Remediation | 24 | CVE mapping, missing auth middleware across repos |
-| `csb_org_crossrepo_tracing` | A: Dependency Tracing | 22 | Cross-repo dependency chains, blast radius, symbol resolution |
-| `csb_org_domain` | H: Domain Lineage | 20 | Config propagation, architecture patterns, domain analysis |
-| `csb_org_incident` | D: Incident Debugging | 20 | Error-to-code-path tracing across microservices |
-| `csb_org_compliance` | F: Compliance | 18 | Standards adherence, audit, and provenance workflows |
-| `csb_org_platform` | J: Platform Knowledge | 18 | Service template discovery and tribal knowledge |
-| `csb_org_crossorg` | G: Cross-Org Discovery | 15 | Interface implementations and authoritative repo identification across orgs |
-| `csb_org_org` | I: Organizational Context | 15 | Agentic discovery, org-wide coding correctness |
-| `csb_org_crossrepo` | K: Cross-Repo Discovery | 14 | Cross-repo search, dependency discovery, impact analysis |
+| `csb_org_onboarding` | Onboarding & Comprehension | 28 | API consumption mapping, end-to-end flow, architecture maps |
+| `csb_org_migration` | Framework Migration | 26 | API migrations, breaking changes across repos |
+| `csb_org_security` | Vulnerability Remediation | 24 | CVE mapping, missing auth middleware across repos |
+| `csb_org_crossrepo_tracing` | Dependency Tracing | 22 | Cross-repo dependency chains, blast radius, symbol resolution |
+| `csb_org_domain` | Domain Lineage | 20 | Config propagation, architecture patterns, domain analysis |
+| `csb_org_incident` | Incident Debugging | 20 | Error-to-code-path tracing across microservices |
+| `csb_org_compliance` | Compliance | 18 | Standards adherence, audit, and provenance workflows |
+| `csb_org_platform` | Platform Knowledge | 18 | Service template discovery and tribal knowledge |
+| `csb_org_crossorg` | Cross-Org Discovery | 15 | Interface implementations and authoritative repo identification across orgs |
+| `csb_org_org` | Organizational Context | 15 | Agentic discovery, org-wide coding correctness |
+| `csb_org_crossrepo` | Cross-Repo Discovery | 14 | Cross-repo search, dependency discovery, impact analysis |
 | **Total** | | **220** | |
 
 **Combined canonical benchmark: 370 tasks** (150 SDLC across 9 suites + 220 Org across 11 suites). Suite sizes are DOE-driven (Neyman-optimal allocation) to maximize statistical power per suite rather than uniform 20-task sizing. An additional 28 backup tasks are archived in `benchmarks/backups/`.
@@ -110,16 +115,16 @@ See [docs/MCP_UNIQUE_TASKS.md](docs/MCP_UNIQUE_TASKS.md) for the full task syste
 
 ## 2-Config Evaluation Matrix
 
-All benchmarks are evaluated across two paper-level configurations (Baseline vs MCP-Full). The concrete run config names differ by task type:
+All benchmarks are evaluated across two primary configurations (Baseline vs MCP-Full). The concrete run config names differ by task type:
 
 - **SDLC suites** (`csb_sdlc_feature`, `csb_sdlc_refactor`, `csb_sdlc_fix`, etc.): `baseline-local-direct` + `mcp-remote-direct`
 - **Org suites** (`csb_org_*`): `baseline-local-direct` + `mcp-remote-direct` (some legacy runs used `baseline-local-artifact` + `mcp-remote-artifact`)
 
 Legacy run directory names (`baseline`, `sourcegraph_full`, `artifact_full`) may still appear in historical outputs and are handled by analysis scripts.
 
-At the paper level, the distinction is still:
+At a high level, the distinction is:
 
-| Paper Config Name | Internal MCP mode | MCP Tools Available |
+| Config Name | Internal MCP mode | MCP Tools Available |
 |-------------------|---------------------|---------------------|
 | Baseline | `none` | None (agent uses only built-in tools) |
 | MCP-Full | `sourcegraph_full` / `artifact_full` (task-dependent) | All 13 Sourcegraph MCP tools including `sg_deepsearch`, `sg_deepsearch_read` |
