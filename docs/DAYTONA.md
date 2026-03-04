@@ -251,6 +251,32 @@ python3 scripts/build_daytona_registry.py
 | `RATE_LIMIT_PREFLIGHT_MODE` | No | Behavior when account is limited: `skip` (default) or `fail` |
 | `RATE_LIMIT_PROBE_TIMEOUT_SEC` | No | Timeout in seconds for per-account probe (default `20`) |
 
+## Cost control and cleanup
+
+Bulk runs (full suite, high parallelism) drive cost from **compute** (many concurrent sandboxes) and **storage** (snapshots created when building from task Dockerfiles). Some of that is inherent to running 283+ tasks; you can still reduce spend and reclaim storage.
+
+### Reduce ongoing spend
+
+- **Cap per-sandbox storage**: Set `export DAYTONA_OVERRIDE_STORAGE=10240` before launching so no sandbox exceeds Daytona’s 10GB limit. Lowers storage cost and avoids failures on tasks that request 20GB in `task.toml`.
+- **Lower parallelism**: Use fewer concurrent sandboxes (e.g. `-n 30` instead of 60) if you’re within rate limits; wall clock increases but cost per run drops.
+- **Run smaller batches**: Use `--path` to a single suite or a subset of tasks when you don’t need a full-suite run.
+
+### Clean up snapshots
+
+Each **sandbox** is deleted after the trial (Harbor + Daytona and the standalone runner both delete sandboxes). **Snapshots** (image templates built from Dockerfiles) can persist in your Daytona org and incur storage until removed. Bulk runs with many unique task Dockerfiles can leave many snapshots behind.
+
+- **Dashboard**: [Daytona Snapshots](https://app.daytona.io/dashboard/snapshots) — list and delete snapshots you no longer need. Snapshots auto-deactivate after 2 weeks of no use; deleting them frees storage.
+- **CLI**: `daytona snapshot list` and `daytona snapshot delete <name>` (see [Daytona CLI](https://daytona.io/docs/en/tools/cli)).
+- **Script**: `python3 scripts/daytona_snapshot_cleanup.py --list` to list snapshots; `--delete-all` or `--delete-prefix PREFIX` to remove them (requires confirmation). Use this to prune one-off or old snapshots after big runs.
+
+### Orphan sandboxes
+
+If a run is killed or crashes, sandboxes can be left running and keep consuming quota. The curator runner cleans up its own orphans at startup (`purpose=curator`). For Harbor/standalone runs, check [Daytona Sandboxes](https://app.daytona.io/dashboard/sandboxes) and stop or delete any that are no longer needed.
+
+### Was the bulk-run cost inevitable?
+
+Partly. Running the full suite at high parallelism will always use a lot of compute (vCPU × time) and will create many image builds (one per unique Dockerfile). What you can control: **delete unused snapshots** to cut storage cost, **cap storage** and **tune parallelism** for future runs, and **clean up orphan sandboxes** so they don’t keep billing.
+
 ## Troubleshooting
 
 **"Missing DAYTONA_API_KEY"**: Set the env var or create `~/.config/daytona/env.sh`.

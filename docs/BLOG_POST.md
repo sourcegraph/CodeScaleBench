@@ -174,15 +174,31 @@ Could also just be plain ol' agent non-determinism. Retrieval quality alone does
 
 ## The Cost and Speed Differences
 
-Let's take a break from whatever voodoo variables control reward outcomes and talk about costs and timing. In the refreshed paired analysis, MCP is faster on time metrics but slightly more expensive.
+Let's take a break from whatever voodoo variables control reward outcomes and talk about costs and timing.
 
-| Category | n | Mean Cost Delta |
-|----------|---|------------------|
-| Overall | 369 | **+$0.040/task** |
+I updated cost reporting to a cleaner canonical pairing method on `runs/official/_raw`: for each `(model, task)` pair, keep the latest valid baseline run and latest valid MCP run, then compare those one-to-one (task-weighted, stratified by model).
 
-This updated snapshot indicates MCP token/tool usage overhead is currently dominating cost in the analysis set.
+Headline cost results from that method:
 
-Suite-level cost is mixed: MCP is cheaper on several Org suites (for example crossorg −$0.062/task and incident −$0.048/task) but more expensive on some SDLC suites (refactor +$0.398/task, feature +$0.211/task). The full per-suite cost table is in the technical report.
+| Model | n paired tasks | BL $/task | MCP $/task | MCP vs BL |
+|-------|-----------------|-----------|------------|-----------|
+| haiku | 392 | 0.7333 | 0.5121 | **-30.16%** |
+| sonnet | 9 | 1.4830 | 1.3951 | **-5.93%** |
+| opus | 96 | 58.8995 | 94.8916 | **+61.11%** |
+
+So the cost story is model-dependent: MCP is cheaper on haiku/sonnet in this slice, but substantially more expensive on opus.
+
+![Paired MCP vs baseline cost by model and size](assets/blog/codescalebench_mcp/figure_7_cost_pairing_by_model_and_size.png)
+
+And for haiku specifically (same canonical pairing), cost as a function of size proxies:
+
+| Context Length Bin | n | BL $/task | MCP $/task | MCP vs BL |
+|--------------------|---|-----------|------------|-----------|
+| <100K | 222 | 0.2349 | 0.2146 | **-8.65%** |
+| 100K-1M | 98 | 1.4832 | 0.5094 | **-65.66%** |
+| unknown | 72 | 1.2491 | 1.4331 | **+14.73%** |
+
+The large `unknown` bucket is important context here: size metadata coverage is incomplete in this slice, so the known-size bins are cleaner than aggregate unknown.
 
 Speed tells an even cleaner story:
 

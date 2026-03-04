@@ -1109,42 +1109,42 @@ The dominant pattern is unchanged: keyword search + read-file dominate MCP usage
 
 ### 11.11 Cost Analysis
 
-Token-based cost in this snapshot is derived from the `analysis_set_metrics_20260303.json` paired analysis.
+Updated cost results are now reported from `runs/official/_raw` with a model-stratified, task-weighted canonical pairing:
 
-| Metric | Value |
-|--------|-------|
-| Paired tasks with cost deltas | 369 |
-| Mean paired cost delta (MCP vs baseline) | **+$0.040/task** |
-| Mean paired cost delta (%; per-task mean) | **+17.67%** |
-| Cost delta (% of means) | **+13.49%** |
+- Normalize task IDs (`mcp_`/`sgonly_`/random suffix stripped).
+- For each `(model, task)`, keep the latest valid baseline and latest valid MCP run.
+- Compare one pair per task (`output_tokens > 0` and `agent_execution_seconds >= 10`).
 
-Cost is slightly higher in MCP on this refreshed slice.
-The cost-paired count is 369 (not 370) because one paired task, `openlibrary-solr-boolean-fix-001`, has `null` MCP-side cost in all three MCP runs in the March 3 analysis set.
+Source artifact: `docs/analysis/mcp_cost_pairs_official_raw_20260304.json`.
+Figure: `docs/assets/blog/codescalebench_mcp/figure_7_cost_pairing_by_model_and_size.{png,svg}`.
 
-**Cost per benchmark suite (per-task multi-run means):**
+| Model | n paired tasks | BL $/task | MCP $/task | Δ $/task | MCP vs BL |
+|-------|-----------------|-----------|------------|----------|-----------|
+| haiku | 392 | 0.7333 | 0.5121 | -0.2212 | **-30.16%** |
+| sonnet | 9 | 1.4830 | 1.3951 | -0.0880 | **-5.93%** |
+| opus | 96 | 58.8995 | 94.8916 | +35.9921 | **+61.11%** |
 
-| Suite | n | BL $/task | MCP $/task | Δ $/task | Var(Δ $/task) |
-|------|---|-----------|------------|----------|---------------|
-| csb_org_compliance | 18 | 0.2679 | 0.2521 | -0.0158 | 0.003486 |
-| csb_org_crossorg | 15 | 0.2756 | 0.2136 | -0.0620 | 0.017902 |
-| csb_org_crossrepo | 14 | 0.2575 | 0.2523 | -0.0052 | 0.005375 |
-| csb_org_crossrepo_tracing | 22 | 0.2478 | 0.2187 | -0.0292 | 0.003282 |
-| csb_org_domain | 20 | 0.2108 | 0.2258 | +0.0150 | 0.003268 |
-| csb_org_incident | 20 | 0.2465 | 0.1989 | -0.0476 | 0.007914 |
-| csb_org_migration | 26 | 0.2534 | 0.2501 | -0.0033 | 0.009546 |
-| csb_org_onboarding | 28 | 0.1029 | 0.1049 | +0.0020 | 0.000860 |
-| csb_org_org | 15 | 0.2362 | 0.2193 | -0.0169 | 0.001710 |
-| csb_org_platform | 18 | 0.1940 | 0.2149 | +0.0209 | 0.001999 |
-| csb_org_security | 24 | 0.2167 | 0.2146 | -0.0020 | 0.003105 |
-| csb_sdlc_debug | 18 | 0.3669 | 0.4569 | +0.0901 | 0.023810 |
-| csb_sdlc_design | 14 | 0.4100 | 0.3590 | -0.0510 | 0.097988 |
-| csb_sdlc_document | 13 | 0.2669 | 0.2974 | +0.0305 | 0.014390 |
-| csb_sdlc_feature | 23 | 0.4965 | 0.7079 | +0.2114 | 0.183988 |
-| csb_sdlc_fix | 26 | 0.5997 | 0.7057 | +0.1059 | 0.065870 |
-| csb_sdlc_refactor | 15 | 0.3194 | 0.7173 | +0.3980 | 0.147469 |
-| csb_sdlc_secure | 12 | 0.4825 | 0.5657 | +0.0832 | 0.030859 |
-| csb_sdlc_test | 18 | 0.2641 | 0.2976 | +0.0335 | 0.015625 |
-| csb_sdlc_understand | 10 | 0.3519 | 0.4475 | +0.0956 | 0.022037 |
+This replaces the prior single pooled cost headline and makes the model effect explicit: MCP is cheaper on haiku/sonnet in this slice, but more expensive on opus.
+
+**Haiku cost by codebase-size proxies (same canonical pairing):**
+
+By context-length bin:
+
+| Context Length Bin | n | BL $/task | MCP $/task | Δ $/task | MCP vs BL |
+|--------------------|---|-----------|------------|----------|-----------|
+| <100K | 222 | 0.2349 | 0.2146 | -0.0203 | **-8.65%** |
+| 100K-1M | 98 | 1.4832 | 0.5094 | -0.9739 | **-65.66%** |
+| unknown | 72 | 1.2491 | 1.4331 | +0.1840 | **+14.73%** |
+
+By files-count bin:
+
+| Files Count Bin | n | BL $/task | MCP $/task | Δ $/task | MCP vs BL |
+|----------------|---|-----------|------------|----------|-----------|
+| <10 | 168 | 0.2615 | 0.2432 | -0.0184 | **-7.03%** |
+| 10-100 | 91 | 1.5677 | 0.5064 | -1.0613 | **-67.70%** |
+| unknown | 133 | 0.7583 | 0.8557 | +0.0975 | **+12.86%** |
+
+Coverage note: `unknown` size bins remain non-trivial, so size-conditioned estimates should be interpreted primarily from known bins.
 
 ### 11.12 Timing Analysis
 
