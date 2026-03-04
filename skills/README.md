@@ -11,7 +11,7 @@ Only **project-specific** (CSB) skills are kept here. General-purpose skills
 Running a benchmark suite like CodeScaleBench involves many repetitive multi-step workflows: validating tasks, launching runs, triaging failures, comparing configs, generating reports. Rather than re-explaining these workflows each session, skills encode the operational knowledge once and let any AI agent execute them reliably.
 
 Skills are particularly valuable for:
-- **Onboarding** — New contributors (human or AI) can immediately operate the benchmark
+- **Onboarding** — New operators (human or AI) can immediately operate the benchmark
 - **Consistency** — The same procedure runs the same way every time
 - **Composability** — Skills can be chained (e.g., check-infra → validate-tasks → run-benchmark)
 - **Tool-agnostic** — Works with any agent that reads markdown instructions
@@ -21,7 +21,7 @@ Skills are particularly valuable for:
 ```
 skills/
 ├── README.md                  ← You are here
-├── ccb/                       ← Consolidated CSB skill guides (grouped by phase)
+├── csb/                       ← Consolidated CSB skill guides (grouped by phase)
 │   ├── pre-run.md             ← Infrastructure checks, task validation, launching runs
 │   ├── monitoring.md          ← Run status, watching benchmark progress
 │   ├── triage-rerun.md        ← Failure investigation, quick reruns to verify fixes
@@ -69,7 +69,7 @@ skills/
 | MCP Audit | [mcp-audit](mcp-audit/SKILL.md) | Analyzing MCP tool usage patterns |
 | Quick Rerun | [quick-rerun](quick-rerun/SKILL.md) | Verifying a fix on a single task |
 | Re-extract Metrics | [reextract-metrics](reextract-metrics/SKILL.md) | After extraction bug fixes |
-| Repo Health | [repo-health](repo-health/SKILL.md) | Before commit or push — reduce drift, keep branches clean |
+| Repo Health | [repo-health](repo-health/SKILL.md) | Before syncing changes — reduce drift and keep repository checks green |
 | Run Benchmark | [run-benchmark](run-benchmark/SKILL.md) | Launching paired or gap-fill benchmark runs |
 | Run Status | [run-status](run-status/SKILL.md) | Quick check on active runs |
 | Scaffold Task | [scaffold-task](scaffold-task/SKILL.md) | Creating new benchmark tasks |
@@ -80,20 +80,20 @@ skills/
 | Watch Benchmarks | [watch-benchmarks](watch-benchmarks/SKILL.md) | Full status dashboard for all runs |
 | What's Next | [whats-next](whats-next/SKILL.md) | Deciding the highest-value next action |
 
-### Consolidated Guides (`ccb/`)
+### Consolidated Guides (`csb/`)
 
-The `ccb/` subdirectory groups the same skills by workflow phase for quick
+The `csb/` subdirectory groups the same skills by workflow phase for quick
 reference. These are summaries — the individual `SKILL.md` files have the
 full detail.
 
 | Guide | File | Covers |
 |-------|------|--------|
-| Pre-Run | [ccb/pre-run.md](ccb/pre-run.md) | check-infra, validate-tasks, run-benchmark |
-| Monitoring | [ccb/monitoring.md](ccb/monitoring.md) | run-status, watch-benchmarks |
-| Triage & Rerun | [ccb/triage-rerun.md](ccb/triage-rerun.md) | triage-failure, quick-rerun |
-| Analysis | [ccb/analysis.md](ccb/analysis.md) | compare-configs, mcp-audit, ir-analysis, cost-report, evaluate-traces |
-| Maintenance | [ccb/maintenance.md](ccb/maintenance.md) | sync-metadata, reextract-metrics, archive-run, generate-report, whats-next |
-| Task Authoring | [ccb/task-authoring.md](ccb/task-authoring.md) | scaffold-task, score-tasks, benchmark-audit |
+| Pre-Run | [csb/pre-run.md](csb/pre-run.md) | check-infra, validate-tasks, run-benchmark |
+| Monitoring | [csb/monitoring.md](csb/monitoring.md) | run-status, watch-benchmarks |
+| Triage & Rerun | [csb/triage-rerun.md](csb/triage-rerun.md) | triage-failure, quick-rerun |
+| Analysis | [csb/analysis.md](csb/analysis.md) | compare-configs, mcp-audit, ir-analysis, cost-report, evaluate-traces |
+| Maintenance | [csb/maintenance.md](csb/maintenance.md) | sync-metadata, reextract-metrics, archive-run, generate-report, whats-next |
+| Task Authoring | [csb/task-authoring.md](csb/task-authoring.md) | scaffold-task, score-tasks, benchmark-audit |
 
 ## How to Use These Skills
 

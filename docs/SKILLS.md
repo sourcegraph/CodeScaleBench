@@ -8,7 +8,7 @@ Skills solve a practical problem: running a benchmark involves many multi-step w
 
 ## Skill Categories
 
-### CSB Operations (`skills/ccb/`)
+### CSB Operations (`skills/csb/`)
 
 Project-specific skills for operating the CodeScaleBench pipeline:
 
