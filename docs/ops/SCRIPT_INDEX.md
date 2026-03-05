@@ -110,6 +110,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 
 ## Infra & Mirrors
 
+- `scripts/build_conversation_db.py` - Infrastructure or mirror management script for build conversation db.
 - `scripts/build_daytona_registry.py` - Infrastructure or mirror management script for build daytona registry.
 - `scripts/build_linux_base_images.sh` - Infrastructure or mirror management script for build linux base images.
 - `scripts/create_mcp_expansion_mirrors.sh` - Infrastructure or mirror management script for create mcp expansion mirrors.
@@ -188,6 +189,8 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/doe_select_tasks.py` - Utility script for doe select tasks.
 - `scripts/ds_hybrid_retrieval.py` - Utility script for ds hybrid retrieval.
 - `scripts/ds_wrapper.sh` - Utility script for ds wrapper.
+- `scripts/export_conversation_blog_assets.py` - Utility script for export conversation blog assets.
+- `scripts/export_engineering_diary_assets.py` - Utility script for export engineering diary assets.
 - `scripts/export_official_results.py` - Utility script for export official results.
 - `scripts/extract_analysis_metrics.py` - Utility script for extract analysis metrics.
 - `scripts/extract_build_diary.py` - Utility script for extract build diary.
@@ -211,6 +214,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/plot_build_diary.py` - Utility script for plot build diary.
 - `scripts/plot_build_diary_supplementary.py` - Utility script for plot build diary supplementary.
 - `scripts/plot_build_narrative.py` - Utility script for plot build narrative.
+- `scripts/plot_conversation_blog_svgs.py` - Utility script for plot conversation blog svgs.
 - `scripts/plot_csb_mcp_blog_figures.py` - Utility script for plot csb mcp blog figures.
 - `scripts/prepare_analysis_runs.py` - Utility script for prepare analysis runs.
 - `scripts/promote_agent_oracles.py` - Utility script for promote agent oracles.

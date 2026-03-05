@@ -33,7 +33,10 @@ from typing import Any
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
-    tomllib = None
+    try:
+        import tomli as tomllib  # type: ignore[import-not-found,assignment]
+    except ModuleNotFoundError:
+        tomllib = None
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_REPO_BLOB_BASE = "https://github.com/sourcegraph/CodeScaleBench/blob/main"
@@ -81,6 +84,57 @@ SDLC_MIN_VALID_TASKS = {
     "csb_sdlc_test": 20,
     "csb_sdlc_understand": 20,
 }
+MCP_EXPECTED_CONFIGS = {"mcp", "mcp-remote-direct", "mcp-remote-artifact", "sourcegraph_full", "artifact_full"}
+IR_METRIC_KEYS = {
+    "file_recall",
+    "line_recall",
+    "line_precision",
+    "mrr",
+    "ttfr",
+    "ttfr_step",
+    "tt_all_r",
+    "n_steps_to_first",
+    "tokens_before_first_relevant",
+    "cost_before_first_relevant",
+    "output_tokens_before_first_relevant",
+    "agent_time_to_first_relevant",
+}
+_PLACEHOLDER_REPOS = {"org/repo", "org/repo-name", "unknown", "repo"}
+_NON_REPO_PREFIXES = {"workspace", "logs", "tmp", "home", "root", "usr", "csb_sdlc_crossrepo", "app"}
+_NON_REPO_OWNERS = {
+    "api",
+    "service",
+    "source",
+    "internal",
+    "src",
+    "pilot",
+    "xds",
+    "v1",
+    "v2",
+    "v3",
+    "keyword_search",
+    "read_file",
+    "symbol",
+    "concepts",
+    "usage",
+    "callers",
+    "caller",
+    "clients",
+    "org",
+}
+_REPO_ALIAS_OVERRIDES = {
+    "etcd": "etcd-io/etcd",
+    "kubernetes": "kubernetes/kubernetes",
+    "containerd": "containerd/containerd",
+    "istio": "istio/istio",
+    "go-control-plane": "envoyproxy/go-control-plane",
+    "data-plane-api": "envoyproxy/data-plane-api",
+    "grpc-go": "grpc/grpc-go",
+    "envoy": "envoyproxy/envoy",
+}
+_SELECTED_TASK_INDEX: dict[str, dict[str, Any]] | None = None
+_REPO_SET_INDEX: dict[str, dict[str, Any]] | None = None
+_REPO_INFO_INDEX: dict[str, dict[str, Any]] | None = None
 
 
 @dataclass
@@ -114,12 +168,15 @@ class TaskRecord:
     bundled_trace_paths: dict[str, str | None]
     checksums: dict[str, str | None]
     repositories: list[str]
+    repository_details: list[dict[str, Any]]
     benchmark_task_path: str | None
     instruction_text: str | None
     agent_name: str | None
     model_name: str | None
+    task_category: str | None
     context_metrics: dict[str, Any]
     ir_metrics: dict[str, Any]
+    flags: list[str]
     trace_events: list[dict[str, Any]]
     trace_tool_calls: list[dict[str, Any]]
     trace_code_changes: list[dict[str, Any]]
@@ -325,15 +382,309 @@ def _load_task_metrics(task_dir: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _load_ir_metrics(task_dir: Path) -> dict[str, Any]:
-    path = task_dir / "verifier" / "ir_metrics.json"
+def _normalize_repo_name(repo: Any) -> str:
+    if not isinstance(repo, str):
+        return ""
+    name = repo.strip()
+    if name.startswith("github.com/"):
+        name = name[len("github.com/"):]
+    return name
+
+
+def _repo_key(repo: Any) -> str:
+    return _normalize_repo_name(repo).lower()
+
+
+def _is_placeholder_repo(repo: Any) -> bool:
+    return _repo_key(repo) in _PLACEHOLDER_REPOS
+
+
+def _first_non_empty(*values: Any) -> str | None:
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        text = value.strip()
+        if not text:
+            continue
+        if text.lower() in {"unknown", "null", "none", "tbd"}:
+            continue
+        return text
+    return None
+
+
+def _load_json_dict(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
-        return {}
+        return None
     try:
-        data = json.loads(path.read_text())
+        payload = json.loads(path.read_text())
     except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _load_selected_task_index() -> dict[str, dict[str, Any]]:
+    global _SELECTED_TASK_INDEX
+    if _SELECTED_TASK_INDEX is not None:
+        return _SELECTED_TASK_INDEX
+    index: dict[str, dict[str, Any]] = {}
+    selected_path = PROJECT_ROOT / "configs" / "selected_benchmark_tasks.json"
+    payload = _load_json_dict(selected_path)
+    tasks = payload.get("tasks") if isinstance(payload, dict) else None
+    if isinstance(tasks, list):
+        for entry in tasks:
+            if not isinstance(entry, dict):
+                continue
+            task_id = entry.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                continue
+            index[_canonical_task_name(task_id)] = entry
+    _SELECTED_TASK_INDEX = index
+    return _SELECTED_TASK_INDEX
+
+
+def _load_repo_fixture_indexes() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    global _REPO_SET_INDEX, _REPO_INFO_INDEX
+    if _REPO_SET_INDEX is not None and _REPO_INFO_INDEX is not None:
+        return _REPO_SET_INDEX, _REPO_INFO_INDEX
+
+    repo_sets: dict[str, dict[str, Any]] = {}
+    repo_info: dict[str, dict[str, Any]] = {}
+    repo_sets_dir = PROJECT_ROOT / "fixtures" / "repo_sets"
+    for fixture_path in sorted(repo_sets_dir.glob("*.json")):
+        fixture = _load_json_dict(fixture_path)
+        if not isinstance(fixture, dict):
+            continue
+        set_id = fixture.get("id") if isinstance(fixture.get("id"), str) else fixture_path.stem
+        repo_sets[set_id] = fixture
+        default_language = _first_non_empty(fixture.get("primary_language"))
+        repos = fixture.get("repos")
+        if not isinstance(repos, list):
+            continue
+        for repo in repos:
+            if not isinstance(repo, dict):
+                continue
+            logical_name = _first_non_empty(repo.get("logical_name"))
+            full_name = _first_non_empty(repo.get("full_name"))
+            display_name = logical_name or full_name
+            if not display_name:
+                continue
+            info = {
+                "name": display_name,
+                "language": _first_non_empty(repo.get("language"), default_language),
+                "approx_loc": _safe_int(repo.get("loc_estimate")),
+                "repo_set_id": set_id,
+            }
+            for alias in (display_name, logical_name, full_name):
+                key = _repo_key(alias)
+                if key and key not in repo_info:
+                    repo_info[key] = info
+
+    _REPO_SET_INDEX = repo_sets
+    _REPO_INFO_INDEX = repo_info
+    return _REPO_SET_INDEX, _REPO_INFO_INDEX
+
+
+def _resolve_repo_candidate(raw: Any, repo_info: dict[str, dict[str, Any]]) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip().strip("`\"'")
+    if not text:
+        return None
+
+    github_match = re.search(r"github\.com/([^/\s]+)/([^/\s]+)", text)
+    if github_match:
+        org = github_match.group(1)
+        repo = github_match.group(2)
+        repo = repo[:-4] if repo.endswith(".git") else repo
+        if org == "sg-evals":
+            text = repo.split("--", 1)[0]
+        else:
+            text = f"{org}/{repo.split('--', 1)[0]}"
+    else:
+        text = text[:-4] if text.endswith(".git") else text
+        if text.startswith("sg-evals/"):
+            text = text.split("/", 1)[1].split("--", 1)[0]
+
+    normalized = _normalize_repo_name(text)
+    if not normalized:
+        return None
+    key = _repo_key(normalized)
+    if key in _PLACEHOLDER_REPOS:
+        return None
+
+    if "/" in normalized:
+        prefix = normalized.split("/", 1)[0].lower()
+        if prefix in _NON_REPO_PREFIXES:
+            return None
+
+    info = repo_info.get(key)
+    if info and isinstance(info.get("name"), str):
+        return _normalize_repo_name(info["name"])
+
+    if "/" not in normalized:
+        if key in _REPO_ALIAS_OVERRIDES:
+            return _REPO_ALIAS_OVERRIDES[key]
+        suffix_matches = []
+        for repo_key, info_payload in repo_info.items():
+            if repo_key.endswith(f"/{key}") and isinstance(info_payload.get("name"), str):
+                suffix_matches.append(_normalize_repo_name(info_payload["name"]))
+        deduped_suffix = sorted({m for m in suffix_matches if m})
+        if len(deduped_suffix) == 1:
+            return deduped_suffix[0]
+
+    if not _is_probable_repo_name(normalized):
+        return None
+    return normalized
+
+
+def _is_probable_repo_name(value: str) -> bool:
+    normalized = _normalize_repo_name(value)
+    if not normalized or "/" not in normalized:
+        return False
+    owner, repo = normalized.split("/", 1)
+    if owner.lower() in _NON_REPO_OWNERS:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", owner):
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", repo):
+        return False
+    repo_lower = repo.lower()
+    if repo_lower.endswith(
+        (
+            ".go",
+            ".py",
+            ".proto",
+            ".md",
+            ".txt",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".js",
+            ".ts",
+            ".java",
+            ".scala",
+            ".rs",
+            ".cc",
+            ".cpp",
+            ".h",
+            ".hpp",
+            ".c",
+        )
+    ):
+        return False
+    return True
+
+
+def _extract_repo_candidates_from_instruction(instruction_text: str, repo_info: dict[str, dict[str, Any]]) -> list[str]:
+    candidates: list[str] = []
+    for pattern in (r"`([^`]+)`", r'"([^"]+)"', r"'([^']+)'"):
+        for match in re.finditer(pattern, instruction_text):
+            token = match.group(1).strip()
+            if not token:
+                continue
+            if "github.com/" not in token and not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", token):
+                continue
+            resolved = _resolve_repo_candidate(token, repo_info)
+            if resolved:
+                candidates.append(resolved)
+    return candidates
+
+
+def _extract_repo_candidates_from_task_yaml(task_path: Path, repo_info: dict[str, dict[str, Any]]) -> list[str]:
+    path = task_path / "task.yaml"
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except Exception:
+        return []
+
+    candidates: list[str] = []
+    in_repos_block = False
+    repos_indent = 0
+    for line in lines:
+        if not in_repos_block:
+            if re.match(r"^\s*repos\s*:\s*$", line):
+                in_repos_block = True
+                repos_indent = len(line) - len(line.lstrip())
+            continue
+        if not line.strip():
+            continue
+        line_indent = len(line) - len(line.lstrip())
+        if line_indent <= repos_indent:
+            break
+        match = re.match(r"^\s*-\s*([A-Za-z0-9._/\-]+)\s*$", line)
+        if not match:
+            continue
+        resolved = _resolve_repo_candidate(match.group(1), repo_info)
+        if resolved:
+            candidates.append(resolved)
+    return candidates
+
+
+def _extract_repo_candidates_from_dockerfiles(task_path: Path, repo_info: dict[str, dict[str, Any]]) -> list[str]:
+    env_dir = task_path / "environment"
+    if not env_dir.is_dir():
+        return []
+    candidates: list[str] = []
+    for dockerfile in sorted(env_dir.glob("Dockerfile*")):
+        if not dockerfile.is_file():
+            continue
+        try:
+            text = dockerfile.read_text(errors="replace")
+        except Exception:
+            continue
+
+        for match in re.finditer(r"(?im)^\s*#\s*Clone\s+([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\s*$", text):
+            resolved = _resolve_repo_candidate(match.group(1), repo_info)
+            if resolved:
+                candidates.append(resolved)
+        for match in re.finditer(r"github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)", text):
+            org = match.group(1)
+            repo = match.group(2).split("--", 1)[0]
+            raw = f"{org}/{repo}"
+            resolved = _resolve_repo_candidate(raw, repo_info)
+            if resolved:
+                candidates.append(resolved)
+    return candidates
+
+
+def _extract_ir_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    ir: dict[str, Any] = {}
+    for key in IR_METRIC_KEYS:
+        value = payload.get(key)
+        if value is not None:
+            ir[key] = value
+    metrics = payload.get("metrics")
+    if isinstance(metrics, dict):
+        for key in IR_METRIC_KEYS:
+            value = metrics.get(key)
+            if value is not None and key not in ir:
+                ir[key] = value
+    expected_files = payload.get("expected_files")
+    actual_files = payload.get("actual_files")
+    if isinstance(expected_files, list):
+        ir["expected_files_count"] = len(expected_files)
+    if isinstance(actual_files, list):
+        ir["actual_files_count"] = len(actual_files)
+    return ir
+
+
+def _load_ir_metrics(task_dir: Path, task_metrics: dict[str, Any] | None) -> dict[str, Any]:
+    ir_metrics: dict[str, Any] = {}
+    if isinstance(task_metrics, dict):
+        ir_metrics.update(_extract_ir_fields(task_metrics))
+
+    reward_payload = _load_json_dict(task_dir / "verifier" / "reward.json")
+    if isinstance(reward_payload, dict):
+        ir_metrics.update(_extract_ir_fields(reward_payload))
+
+    for ir_path in (task_dir / "ir_metrics.json", task_dir / "verifier" / "ir_metrics.json"):
+        payload = _load_json_dict(ir_path)
+        if isinstance(payload, dict):
+            extracted = _extract_ir_fields(payload)
+            ir_metrics.update(extracted if extracted else {k: v for k, v in payload.items() if v is not None})
+    return ir_metrics
 
 
 def _extract_task_instruction(task_dir: Path, task_path_from_result: str | None) -> str | None:
@@ -355,13 +706,34 @@ def _extract_task_instruction(task_dir: Path, task_path_from_result: str | None)
     return None
 
 
-def _extract_repo_metadata(task_metrics: dict[str, Any] | None, task_path_from_result: str | None) -> tuple[list[str], str | None]:
+def _extract_repo_metadata(
+    task_metrics: dict[str, Any] | None,
+    task_path_from_result: str | None,
+    task_name: str,
+    suite: str,
+) -> tuple[list[str], list[dict[str, Any]], str | None, str | None, int | None]:
     repos: list[str] = []
+    repo_details: list[dict[str, Any]] = []
     benchmark_task_path: str | None = None
+    task_category: str | None = None
+    task_language: str | None = None
+    task_context_length: int | None = None
+    repo_set_id: str | None = None
+
     if task_metrics and isinstance(task_metrics.get("repo"), str) and task_metrics.get("repo"):
         repos.append(task_metrics["repo"])
+    if task_metrics:
+        task_category = _first_non_empty(task_metrics.get("category"), task_category)
+        task_language = _first_non_empty(task_metrics.get("language"), task_language)
+        task_context_length = _safe_int(task_metrics.get("task_context_length"))
 
-    task_path = Path(task_path_from_result) if isinstance(task_path_from_result, str) and task_path_from_result else None
+    task_path_candidates: list[Path] = []
+    if isinstance(task_path_from_result, str) and task_path_from_result:
+        task_path_candidates.append(Path(task_path_from_result))
+    canonical_name = _canonical_task_name(task_name)
+    task_path_candidates.append(PROJECT_ROOT / "benchmarks" / suite / canonical_name)
+    task_path_candidates.append(PROJECT_ROOT / "benchmarks" / suite / task_name)
+    task_path = next((candidate for candidate in task_path_candidates if candidate.is_dir()), None)
     if task_path and task_path.is_dir():
         try:
             benchmark_task_path = str(task_path.relative_to(PROJECT_ROOT))
@@ -376,10 +748,121 @@ def _extract_repo_metadata(task_metrics: dict[str, Any] | None, task_path_from_r
                     repo_val = task_section.get("repo")
                     if isinstance(repo_val, str) and repo_val:
                         repos.append(repo_val)
+                    repo_set_id = _first_non_empty(task_section.get("repo_set_id"), repo_set_id)
+                    task_category = _first_non_empty(task_category, task_section.get("category"))
+                    task_language = _first_non_empty(task_language, task_section.get("language"))
                 except Exception:
                     pass
+        task_spec = _load_json_dict(task_path / "tests" / "task_spec.json")
+        if isinstance(task_spec, dict):
+            task_category = _first_non_empty(task_category, task_spec.get("family"), task_spec.get("category"))
+            artifacts = task_spec.get("artifacts")
+            if isinstance(artifacts, dict):
+                repo_set_id = _first_non_empty(repo_set_id, artifacts.get("repo_set_id"))
+                oracle = artifacts.get("oracle")
+                if isinstance(oracle, dict):
+                    required_files = oracle.get("required_files")
+                    if isinstance(required_files, list):
+                        for file_entry in required_files:
+                            if isinstance(file_entry, dict):
+                                repo_val = file_entry.get("repo")
+                                if isinstance(repo_val, str) and repo_val:
+                                    repos.append(repo_val)
+
+    selected_entry = _load_selected_task_index().get(_canonical_task_name(task_name))
+    if isinstance(selected_entry, dict):
+        selected_repo = selected_entry.get("repo")
+        if isinstance(selected_repo, str) and selected_repo:
+            repos.append(selected_repo)
+        task_category = _first_non_empty(task_category, selected_entry.get("category"), selected_entry.get("sdlc_phase"))
+        task_language = _first_non_empty(task_language, selected_entry.get("language"))
+        if task_context_length is None:
+            task_context_length = _safe_int(selected_entry.get("context_length"))
+        repo_set_id = _first_non_empty(repo_set_id, selected_entry.get("repo_set_id"))
+
+    repo_sets, repo_info = _load_repo_fixture_indexes()
+
+    if task_path and task_path.is_dir():
+        for instruction_name in ("instruction.md", "instruction_mcp.md", "instruction.txt"):
+            instruction_path = task_path / instruction_name
+            if not instruction_path.is_file():
+                continue
+            try:
+                instruction_text = instruction_path.read_text(errors="replace")
+            except Exception:
+                continue
+            repos.extend(_extract_repo_candidates_from_instruction(instruction_text, repo_info))
+        repos.extend(_extract_repo_candidates_from_task_yaml(task_path, repo_info))
+        repos.extend(_extract_repo_candidates_from_dockerfiles(task_path, repo_info))
+
+    seen_detail_names: set[str] = set()
+
+    def add_detail(name: str, language: str | None, approx_loc: int | None) -> None:
+        clean_name = _normalize_repo_name(name)
+        if not clean_name:
+            return
+        key = clean_name.lower()
+        if key in seen_detail_names:
+            return
+        seen_detail_names.add(key)
+        repo_details.append(
+            {
+                "name": clean_name,
+                "language": language,
+                "approx_loc": approx_loc,
+            }
+        )
+
+    fixture = repo_sets.get(repo_set_id or "")
+    if isinstance(fixture, dict):
+        fixture_language = _first_non_empty(task_language, fixture.get("primary_language"))
+        fixture_repos = fixture.get("repos")
+        if isinstance(fixture_repos, list):
+            for repo_entry in fixture_repos:
+                if not isinstance(repo_entry, dict):
+                    continue
+                display_name = _first_non_empty(repo_entry.get("logical_name"), repo_entry.get("full_name"))
+                if not display_name:
+                    continue
+                add_detail(
+                    display_name,
+                    _first_non_empty(repo_entry.get("language"), fixture_language),
+                    _safe_int(repo_entry.get("loc_estimate")),
+                )
+
+    for repo in repos:
+        normalized_repo = _normalize_repo_name(repo)
+        if not normalized_repo:
+            continue
+        if _is_placeholder_repo(normalized_repo) and repo_details:
+            continue
+        info = repo_info.get(_repo_key(normalized_repo))
+        if info:
+            add_detail(
+                str(info.get("name") or normalized_repo),
+                _first_non_empty(task_language, info.get("language")),
+                _safe_int(info.get("approx_loc")),
+            )
+        else:
+            add_detail(normalized_repo, task_language, None)
+
+    repositories = [d["name"] for d in repo_details if isinstance(d.get("name"), str) and d.get("name")]
+    if not repositories:
+        repositories = sorted(
+            {
+                _normalize_repo_name(repo)
+                for repo in repos
+                if _normalize_repo_name(repo) and not _is_placeholder_repo(repo)
+            }
+        )
+    if not repositories:
+        repositories = sorted({_normalize_repo_name(repo) for repo in repos if _normalize_repo_name(repo)})
+
     deduped = sorted({r for r in repos if r})
-    return deduped, benchmark_task_path
+    if not repositories and deduped:
+        repositories = sorted({_normalize_repo_name(r) for r in deduped if _normalize_repo_name(r)})
+
+    return repositories, repo_details, benchmark_task_path, task_category, task_context_length
 
 
 def _find_trace_paths(task_dir: Path) -> dict[str, str | None]:
@@ -444,6 +927,7 @@ def _parse_transcript(
 
     message_events: list[dict[str, Any]] = []
     sequence = 0
+    pending_tool_calls: dict[str, dict[str, Any]] = {}
 
     def _append_message(
         msg_type: str,
@@ -482,6 +966,51 @@ def _parse_transcript(
             }
         )
         sequence += 1
+
+    def _tool_result_to_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    block_type = str(block.get("type") or "")
+                    if block_type in {"text", "tool_result"}:
+                        inner = block.get("text", block.get("content", ""))
+                        if isinstance(inner, str):
+                            parts.append(inner)
+                        elif isinstance(inner, list):
+                            for inner_block in inner:
+                                if isinstance(inner_block, dict):
+                                    inner_text = inner_block.get("text", inner_block.get("content", ""))
+                                    if isinstance(inner_text, str):
+                                        parts.append(inner_text)
+                                elif isinstance(inner_block, str):
+                                    parts.append(inner_block)
+                    elif isinstance(block.get("content"), str):
+                        parts.append(str(block.get("content")))
+                elif isinstance(block, str):
+                    parts.append(block)
+            return "\n".join(p for p in parts if p)
+        if isinstance(content, dict):
+            raw = content.get("content")
+            if raw is not None:
+                extracted = _tool_result_to_text(raw)
+                if extracted:
+                    return extracted
+            return json.dumps(content, sort_keys=True)
+        return ""
+
+    def _attach_tool_output(tool_use_id: str, output_payload: Any, output_text: str, timestamp: str | None) -> None:
+        if not tool_use_id:
+            return
+        call = pending_tool_calls.get(tool_use_id)
+        if call is None:
+            return
+        call["output"] = output_payload if output_payload is not None else output_text
+        call["output_text"] = output_text
+        if timestamp and not call.get("result_timestamp"):
+            call["result_timestamp"] = timestamp
 
     for line in lines:
         line_count += 1
@@ -547,15 +1076,18 @@ def _parse_transcript(
                         }
                     )
                 if len(detailed_tool_calls) < TASK_PAGE_EVENT_LIMIT:
-                    detailed_tool_calls.append(
-                        {
-                            "sequence": sequence - 1,
-                            "timestamp": ts,
-                            "tool": tool_name,
-                            "tool_use_id": tool_call_id or None,
-                            "input": tool_input_payload,
-                        }
-                    )
+                    call_detail = {
+                        "sequence": sequence - 1,
+                        "timestamp": ts,
+                        "tool": tool_name,
+                        "tool_use_id": tool_call_id or None,
+                        "input": tool_input_payload,
+                        "output": None,
+                        "output_text": "",
+                    }
+                    detailed_tool_calls.append(call_detail)
+                    if tool_call_id:
+                        pending_tool_calls[tool_call_id] = call_detail
                 if tool_name == "Edit":
                     if len(detailed_code_changes) < TASK_PAGE_EVENT_LIMIT:
                         detailed_code_changes.append(
@@ -591,32 +1123,63 @@ def _parse_transcript(
             continue
 
         if msg_type == "user":
-            tool_use_result = payload.get("toolUseResult")
-            if isinstance(tool_use_result, dict):
-                result_content = tool_use_result.get("content")
-                tool_use_id = str(tool_use_result.get("tool_use_id") or tool_use_result.get("toolUseId") or "")
-                mapped_tool = tool_use_id_to_name.get(tool_use_id)
-                if isinstance(result_content, str):
-                    _append_message("user", "tool_result", result_content, tool=mapped_tool, timestamp=ts)
-                elif isinstance(result_content, list):
-                    text_parts: list[str] = []
-                    for block in result_content:
-                        if isinstance(block, dict):
-                            if block.get("type") == "text":
-                                text_parts.append(str(block.get("text") or ""))
-                            elif block.get("type") == "tool_result":
-                                text_parts.append(str(block.get("content") or ""))
-                        elif isinstance(block, str):
-                            text_parts.append(block)
-                    _append_message("user", "tool_result", "\n".join(text_parts), tool=mapped_tool, timestamp=ts)
-                else:
-                    _append_message("user", "tool_result", tool=mapped_tool, timestamp=ts)
+            message = payload.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            top_level_tool_result = payload.get("tool_use_result")
+            camel_tool_result = payload.get("toolUseResult")
+
+            handled_tool_result = False
+            if isinstance(content, list):
+                tool_result_blocks = [
+                    block for block in content if isinstance(block, dict) and str(block.get("type") or "") == "tool_result"
+                ]
+                if tool_result_blocks:
+                    handled_tool_result = True
+                    for block in tool_result_blocks:
+                        tool_use_id = str(block.get("tool_use_id") or block.get("toolUseId") or "")
+                        mapped_tool = tool_use_id_to_name.get(tool_use_id)
+                        block_content = block.get("content")
+                        block_text = _tool_result_to_text(block_content)
+                        output_payload: Any = block_content
+                        # Claude transcript commonly includes richer structured data here.
+                        if top_level_tool_result is not None and len(tool_result_blocks) == 1:
+                            output_payload = top_level_tool_result
+                        elif isinstance(camel_tool_result, dict):
+                            output_payload = camel_tool_result
+                        if not block_text and output_payload is not None:
+                            block_text = _tool_result_to_text(output_payload)
+                        _append_message(
+                            "user",
+                            "tool_result",
+                            block_text,
+                            tool=mapped_tool,
+                            payload=output_payload if isinstance(output_payload, dict) else None,
+                            timestamp=ts,
+                        )
+                        _attach_tool_output(tool_use_id, output_payload, block_text, ts)
+            if handled_tool_result:
                 continue
 
-            message = payload.get("message")
-            if not isinstance(message, dict):
+            if isinstance(camel_tool_result, dict):
+                tool_use_id = str(camel_tool_result.get("tool_use_id") or camel_tool_result.get("toolUseId") or "")
+                mapped_tool = tool_use_id_to_name.get(tool_use_id)
+                result_text = _tool_result_to_text(camel_tool_result.get("content"))
+                _append_message(
+                    "user",
+                    "tool_result",
+                    result_text,
+                    tool=mapped_tool,
+                    payload=camel_tool_result,
+                    timestamp=ts,
+                )
+                _attach_tool_output(tool_use_id, camel_tool_result, result_text, ts)
                 continue
-            content = message.get("content")
+
+            if top_level_tool_result is not None:
+                result_text = _tool_result_to_text(top_level_tool_result)
+                _append_message("user", "tool_result", result_text, payload=top_level_tool_result if isinstance(top_level_tool_result, dict) else None, timestamp=ts)
+                continue
+
             if isinstance(content, str):
                 _append_message("user", "text", content, timestamp=ts)
             elif isinstance(content, list):
@@ -699,6 +1262,17 @@ def _parse_trajectory(trajectory_path: Path) -> dict[str, Any]:
         tool_calls = step.get("tool_calls")
         if not isinstance(tool_calls, list):
             continue
+        observation_payload = step.get("observation")
+        observation_by_call_id: dict[str, Any] = {}
+        if isinstance(observation_payload, dict):
+            results = observation_payload.get("results")
+            if isinstance(results, list):
+                for result in results:
+                    if not isinstance(result, dict):
+                        continue
+                    source_call_id = str(result.get("source_call_id") or "")
+                    if source_call_id:
+                        observation_by_call_id[source_call_id] = result.get("content")
         for call in tool_calls:
             if not isinstance(call, dict):
                 continue
@@ -708,8 +1282,10 @@ def _parse_trajectory(trajectory_path: Path) -> dict[str, Any]:
                 or call.get("name")
                 or "unknown"
             )
+            tool_call_id = str(call.get("tool_call_id") or call.get("id") or "")
             arguments = call.get("arguments")
             arguments_payload = arguments if isinstance(arguments, dict) else {}
+            call_output = observation_by_call_id.get(tool_call_id)
             counts[tool_name] += 1
             if len(events) < AUDIT_EVENT_LIMIT:
                 events.append(
@@ -717,7 +1293,10 @@ def _parse_trajectory(trajectory_path: Path) -> dict[str, Any]:
                         "step_id": step_id if isinstance(step_id, int) else None,
                         "timestamp": timestamp if isinstance(timestamp, str) else None,
                         "tool": tool_name,
+                        "tool_use_id": tool_call_id or None,
                         "arguments": arguments_payload,
+                        "input": arguments_payload,
+                        "output": call_output,
                     }
                 )
             if tool_name == "Edit" and len(code_changes) < TASK_PAGE_EVENT_LIMIT:
@@ -863,8 +1442,13 @@ def _extract_task_record(
     task_id = result_payload.get("task_id") if isinstance(result_payload.get("task_id"), dict) else {}
     task_path_from_result = task_id.get("path") if isinstance(task_id, dict) else None
     instruction_text = _extract_task_instruction(task_dir, task_path_from_result)
-    repositories, benchmark_task_path = _extract_repo_metadata(task_metrics, task_path_from_result)
-    ir_metrics = _load_ir_metrics(task_dir)
+    repositories, repository_details, benchmark_task_path, task_category, fallback_context_length = _extract_repo_metadata(
+        task_metrics,
+        task_path_from_result,
+        task_name,
+        suite,
+    )
+    ir_metrics = _load_ir_metrics(task_dir, task_metrics)
 
     agent_info = result_payload.get("agent_info") if isinstance(result_payload.get("agent_info"), dict) else {}
     agent_name = None
@@ -895,6 +1479,17 @@ def _extract_task_record(
         ):
             if key in task_metrics:
                 context_metrics[key] = task_metrics.get(key)
+    if context_metrics.get("task_context_length") is None and fallback_context_length is not None:
+        context_metrics["task_context_length"] = fallback_context_length
+
+    flags: list[str] = []
+    if (
+        config_name in MCP_EXPECTED_CONFIGS
+        and tool_calls_total is not None
+        and tool_calls_total > 0
+        and (tool_calls_mcp or 0) == 0
+    ):
+        flags.append("mcp_run_zero_mcp_calls")
 
     trace_events = transcript_detail.get("events") if isinstance(transcript_detail.get("events"), list) else []
     trace_tool_calls = transcript_detail.get("tool_calls") if isinstance(transcript_detail.get("tool_calls"), list) else []
@@ -959,12 +1554,15 @@ def _extract_task_record(
             "transcript_sha256": tx_sha,
         },
         repositories=repositories,
+        repository_details=repository_details,
         benchmark_task_path=benchmark_task_path,
         instruction_text=instruction_text,
         agent_name=agent_name,
         model_name=model_name,
+        task_category=task_category,
         context_metrics=context_metrics,
         ir_metrics=ir_metrics,
+        flags=flags,
         trace_events=trace_events[:TASK_PAGE_EVENT_LIMIT],
         trace_tool_calls=trace_tool_calls[:TASK_PAGE_EVENT_LIMIT],
         trace_code_changes=trace_code_changes[:TASK_PAGE_EVENT_LIMIT],
@@ -977,6 +1575,7 @@ def _extract_task_record(
             "run_dir": run_dir_name,
             "config": config_name,
             "task_name": task_name,
+            "task_category": task_category,
             "task_dir": str(task_dir.relative_to(PROJECT_ROOT)),
             "result_path": str(result_path.relative_to(PROJECT_ROOT)),
             "trace_paths": trace_paths,
@@ -1003,6 +1602,9 @@ def _extract_task_record(
             "tool_calls_by_name": tool_calls_by_name,
             "context_metrics": context_metrics,
             "ir_metrics": ir_metrics,
+            "repositories": repositories,
+            "repository_details": repository_details,
+            "flags": flags,
         },
         "parsed_trace": {
             "transcript": transcript_audit,
@@ -1104,6 +1706,8 @@ def _to_task_dict(
         "agent_name": record.agent_name,
         "model_name": record.model_name,
         "repositories": record.repositories,
+        "repository_details": record.repository_details,
+        "task_category": record.task_category,
         "benchmark_task_path": record.benchmark_task_path,
         "started_at": record.started_at,
         "task_dir": record.task_dir,
@@ -1123,6 +1727,9 @@ def _to_task_dict(
         "search_calls_nls": record.search_calls_nls,
         "search_calls_deepsearch": record.search_calls_deepsearch,
         "tool_calls_by_name": record.tool_calls_by_name,
+        "context_metrics": record.context_metrics,
+        "ir_metrics": record.ir_metrics,
+        "flags": record.flags,
         "sample_tool_calls": record.sample_tool_calls,
         "trace_available": record.trace_available,
         "trace_paths": record.trace_paths,
@@ -1159,11 +1766,41 @@ def _build_task_page(record: TaskRecord) -> str:
         return text[:limit] + "\n... (truncated)"
 
     repo_text = ", ".join(record.repositories) if record.repositories else "-"
+    task_category_text = record.task_category or "-"
     benchmark_text = record.benchmark_task_path or "-"
     instruction_text = record.instruction_text or "No instruction found."
     audit_href = f"../{record.audit_page}" if record.audit_page else None
     trajectory_href = f"../{record.bundled_trace_paths['trajectory']}" if record.bundled_trace_paths.get("trajectory") else None
     transcript_href = f"../{record.bundled_trace_paths['transcript']}" if record.bundled_trace_paths.get("transcript") else None
+
+    repo_rows = []
+    for repo_meta in record.repository_details:
+        if not isinstance(repo_meta, dict):
+            continue
+        repo_name = str(repo_meta.get("name") or "")
+        if not repo_name:
+            continue
+        repo_language = str(repo_meta.get("language") or "-")
+        repo_size = _safe_int(repo_meta.get("approx_loc"))
+        repo_size_text = f"~{repo_size:,}" if repo_size is not None else "-"
+        repo_rows.append(
+            f"<tr><td><code>{esc(repo_name)}</code></td><td>{esc(repo_language)}</td><td>{esc(repo_size_text)}</td></tr>"
+        )
+    repo_rows_html = "".join(repo_rows) or "<tr><td colspan='3'>No repository metadata available</td></tr>"
+
+    flag_labels = {
+        "mcp_run_zero_mcp_calls": "MCP config run used zero MCP tools",
+    }
+    flag_items = [flag_labels.get(flag, flag) for flag in record.flags]
+    flag_html = ""
+    if flag_items:
+        items = "".join(f"<li>{esc(flag)}</li>" for flag in flag_items)
+        flag_html = (
+            "<div class='panel' style='border-color:#6b3f2a;background:#231711'>"
+            "<h2>Warnings</h2>"
+            f"<ul>{items}</ul>"
+            "</div>"
+        )
 
     tool_rows = []
     for tool, count in sorted((record.tool_calls_by_name or {}).items(), key=lambda kv: (-kv[1], kv[0])):
@@ -1200,10 +1837,15 @@ def _build_task_page(record: TaskRecord) -> str:
     for idx, call in enumerate(record.trace_tool_calls[:TASK_PAGE_EVENT_LIMIT], start=1):
         tool_name = call.get("tool") or "unknown"
         call_input = call.get("input", call.get("arguments", {}))
+        call_output = call.get("output")
+        if call_output is None and isinstance(call.get("output_text"), str) and call.get("output_text"):
+            call_output = call.get("output_text")
+        output_html = f"<h4>Output</h4><pre>{fmt_json(call_output)}</pre>" if call_output is not None else ""
         tool_call_blocks.append(
             "<details>"
             f"<summary>{idx}. <code>{esc(tool_name)}</code> @ {esc(call.get('timestamp') or '-')}</summary>"
-            f"<pre>{fmt_json(call_input)}</pre>"
+            f"<h4>Input</h4><pre>{fmt_json(call_input)}</pre>"
+            f"{output_html}"
             "</details>"
         )
     tool_call_html = "".join(tool_call_blocks) or "<p>No tool call payloads parsed.</p>"
@@ -1280,16 +1922,25 @@ def _build_task_page(record: TaskRecord) -> str:
   <div class="wrap">
     <h1>{esc(record.task_name)}</h1>
     <p class="meta">Suite <code>{esc(record.suite)}</code> | Run <code>{esc(record.run_dir)}</code> | Config <code>{esc(record.config)}</code></p>
+    {flag_html}
 
     <div class="panel">
       <h2>Task Information</h2>
       <div class="grid">
         <div class="metric"><div class="k">Repositories</div><div class="v" style="font-size:14px">{esc(repo_text)}</div></div>
         <div class="metric"><div class="k">Task ID</div><div class="v" style="font-size:14px">{esc(record.task_name)}</div></div>
+        <div class="metric"><div class="k">Task Category</div><div class="v" style="font-size:14px">{esc(task_category_text)}</div></div>
         <div class="metric"><div class="k">Agent</div><div class="v" style="font-size:16px">{esc(record.agent_name or "-")}</div></div>
         <div class="metric"><div class="k">Model</div><div class="v" style="font-size:16px">{esc(record.model_name or "-")}</div></div>
       </div>
       <p class="meta" style="margin-top:10px">Benchmark path: <code>{esc(benchmark_text)}</code></p>
+      <details>
+        <summary>Repository metadata</summary>
+        <table>
+          <thead><tr><th>Repository</th><th>Primary Language</th><th>Approx Size (LOC)</th></tr></thead>
+          <tbody>{repo_rows_html}</tbody>
+        </table>
+      </details>
       <details>
         <summary>Task instruction sent to agent</summary>
         <pre>{esc(instruction_text)}</pre>
@@ -1630,7 +2281,7 @@ def _build_index_html() -> str:
     </div>
     <div id=\"stats\" class=\"meta\"></div>
     <table>
-      <thead><tr><th>Suite</th><th>Run</th><th>Config</th><th>Task</th><th>Status</th><th>Reward</th><th>MCP ratio</th><th>Tools</th><th>Trace</th></tr></thead>
+      <thead><tr><th>Suite</th><th>Run</th><th>Config</th><th>Task</th><th>Status</th><th>Reward</th><th>MCP ratio</th><th>Tools</th><th>Flags</th><th>Trace</th></tr></thead>
       <tbody id=\"rows\"></tbody>
     </table>
   </div>
@@ -1723,6 +2374,7 @@ def _build_index_html() -> str:
               <td>${fmt(t.reward,3)}</td>
               <td>${fmt(t.mcp_ratio,3)}</td>
               <td>${t.tool_calls_total ?? '-'}</td>
+              <td>${(t.flags || []).join(', ') || '-'}</td>
               <td>${trace}</td>
             `;
             rowsEl.appendChild(tr);
