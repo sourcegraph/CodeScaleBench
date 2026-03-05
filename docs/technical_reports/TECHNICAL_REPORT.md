@@ -1,14 +1,13 @@
 # CodeScaleBench: A Systematic Evaluation Framework for Assessing the Impact of Enhanced Code Intelligence on AI Coding Agent Performance
 
 **White Paper Technical Report**
-**Date:** March 3, 2026
 **Last Modified:** March 5, 2026
 
 ---
 
 ## Abstract
 
-CodeScaleBench (CSB) is a benchmark suite of **370 software engineering tasks** spanning the full Software Development Lifecycle (SDLC), designed to measure whether external code intelligence tools -- specifically Sourcegraph's Model Context Protocol (MCP) tools -- improve AI coding agent performance. The benchmark evaluates agents under two controlled conditions: a baseline with full local source code and no external tools, and an MCP-augmented configuration where source code is unavailable locally and the agent must use remote code intelligence tools (semantic search, symbol resolution, dependency tracing, etc.) to navigate codebases. In the analysis set used in this report update (generated March 3, 2026 from `runs/analysis`), there are **1,281 valid scored rows**, **1,822 total historical rows**, and **370 paired baseline/MCP tasks** after averaging multiple runs per task/config. The overall paired reward delta is **+0.0349** (MCP minus baseline), with **+0.0363** on SDLC and **+0.0339** on Org. Retrieval evaluation on the same analysis set yields **799** event files, **311** computable tasks, and aggregate file-level metrics of **0.4598 file recall** and **0.3644 MRR**. This report documents the benchmark design, construction, retrieval evaluation pipeline, verifier architecture, and current findings.
+CodeScaleBench (CSB) is a benchmark suite of **370 software engineering tasks** spanning the full Software Development Lifecycle (SDLC), designed to evaluate AI coding agents on large-codebase and cross-repository software engineering work. This report evaluates one context-retrieval condition using Model Context Protocol (MCP) tools against a baseline condition with local source access and no external retrieval tools. In the analysis set used here (generated March 3, 2026 from `runs/analysis`), there are **1,281 valid scored rows**, **1,822 total rows**, and **370 paired baseline/MCP tasks** after averaging multiple runs per task/config. The overall paired reward delta is **+0.0349** (MCP minus baseline), with **+0.0363** on SDLC and **+0.0339** on Org, and the report provides suite-level reward breakdowns across all 20 suites. Retrieval evaluation on the same analysis set yields **799** event files, **311** computable tasks, and aggregate file-level metrics of **0.4598 file recall** and **0.3644 MRR**. The report also includes pair-normalized cost and time calculations from matched baseline/MCP tasks, including average cost-per-task and wall-clock deltas. This report documents the benchmark design, construction, retrieval evaluation pipeline, verifier architecture, and current findings.
 
 ---
 
@@ -27,8 +26,7 @@ CodeScaleBench (CSB) is a benchmark suite of **370 software engineering tasks** 
 11. [Results](#11-results)
 12. [Threats to Validity](#12-threats-to-validity)
 13. [Future Work](#13-future-work)
-14. [Development Process: Building a Benchmark with Claude Code](#14-development-process-building-a-benchmark-with-claude-code)
-15. [Appendices](#15-appendices)
+14. [Appendices](#14-appendices)
 
 ---
 
@@ -137,7 +135,7 @@ benchmarks/<suite>/<task-id>/
 | **Baseline** | `baseline-local-direct` | Full local code | None                 | `Dockerfile`         | Evaluation context only |
 | **MCP**      | `mcp-remote-direct`     | Truncated/empty | 13 Sourcegraph tools | `Dockerfile.sg_only` | V5 MCP-first preamble   |
 
-Both SDLC and Org tasks use the same config pair (`baseline-local-direct` + `mcp-remote-direct`). Some legacy Org runs used `baseline-local-artifact` + `mcp-remote-artifact` configs; these are handled by analysis scripts but are no longer the default.
+Both SDLC and Org tasks use the same config pair (`baseline-local-direct` + `mcp-remote-direct`).
 
 ---
 
@@ -691,7 +689,7 @@ The MCP preamble is a block of instructions prepended to the task prompt for MCP
 
 The preamble also performs **repository scoping** — a `{repo_scope}` placeholder is substituted at launch time with the specific `repo:^github.com/ORG/REPO$` filter patterns for the task's target repositories, so the agent searches the correct repos from its first query.
 
-The current preamble (V5) went through 5 design iterations to balance forcing MCP adoption against over-constraining agent behavior (see Section 10.1 for the full iteration history).
+The preamble communicates MCP environment constraints and tool usage guidance while preserving agent flexibility.
 
 ### 9.3 MCP Tool Suite
 
@@ -773,53 +771,28 @@ git push --force origin orphan-main:main
 
 ## 10. Key Decisions
 
-### 10.1 Preamble Design Iterations
+### 10.1 Configuration Control
 
-The agent preamble -- instructions prepended to each task -- underwent 5 major iterations:
+The benchmark uses two controlled configurations for matched comparison:
 
-| Version   | Date      | Strategy                         | Outcome                                                                                   |
-| --------- | --------- | -------------------------------- | ----------------------------------------------------------------------------------------- |
-| **V1/V2** | Early Feb | Minimal MCP mentions             | 0 SG tool calls even with tools available                                                 |
-| **V3**    | Feb 7     | "MANDATORY" triple reinforcement | 90%+ adoption but overly prescriptive; caused "MCP death spiral" on broken mirrors        |
-| **V4**    | Feb 12    | "Soft guidance" header           | 60% zero-MCP adoption; too permissive                                                     |
-| **V5**    | Feb 20    | "Truncation constraint" lead     | Effective: leads with "files not present", forces MCP without mandating specific workflow |
+- `baseline-local-direct`: full local source access, no external retrieval tools
+- `mcp-remote-direct`: truncated local source, MCP-based remote retrieval
 
-**The "MCP Death Spiral" discovery** (V3 era): When the aggressive V3 preamble mandated MCP usage, agents on tasks with broken mirrors or wrong repo names would waste their entire context window on failing SG queries, scoring 0.0 where baseline scored 1.0. This directly motivated the V5 design.
+This isolation ensures that measured deltas reflect the access method rather than differences in task content or verifier logic.
 
-**The git history bypass bug** (V5 motivation): Five of 9 test tasks used `git show HEAD:filename` to recover full source from git history, completely defeating sg_only truncation. V5 fix: recommit truncated state so `git show HEAD:` returns empty files.
+### 10.2 Verifier Determinism
 
-### 10.2 SG_base Dropping Decision (Feb 12)
+Task scoring is deterministic and in-container:
 
-**Data that informed the decision**:
+- SDLC tasks use executable verifier scripts (`test.sh`)
+- Org tasks use oracle-driven scoring (`eval.sh` + oracle checks)
+- All tasks write a scalar reward to `/logs/verifier/reward.txt`
 
-| Config   | n_tasks | Mean Reward | Key Finding                    |
-| -------- | ------- | ----------- | ------------------------------ |
-| Baseline | 161     | 0.521       | Reference performance          |
-| SG_base  | 161     | 0.478       | Slightly _worse_ than baseline |
-| SG_full  | 156     | 0.631       | +0.111 vs baseline             |
+Optional analysis layers (LLM judge, IR metrics, bootstrap CIs) are additive and do not override primary reward.
 
-**Rationale**: SG_base (keyword+NLS search only, no Deep Search) showed no meaningful improvement over baseline. The value came from the comprehensive MCP configuration. Maintaining 3 configs tripled compute cost without providing discriminative data.
+### 10.3 Data Inclusion Rules
 
-### 10.3 DependEval Benchmark Removal
-
-DependEval (9 tasks for dependency resolution) was removed because:
-
-- Missing `code_content.txt` files
-- Empty problem statements
-- Wrong ground_truth format
-- "Code is inline, not in repos" -- fundamentally incompatible with MCP comparison since there was no external repository to index
-
-### 10.4 Verifier Bug Discoveries and Fixes
-
-Major verifier bugs discovered through QA audit (Feb 6):
-
-| Bug                                 | Impact                                                                  | Fix                            |
-| ----------------------------------- | ----------------------------------------------------------------------- | ------------------------------ |
-| TAC score extraction silent failure | 3 tasks reported 0 instead of real scores (1.0, 0.667, 0.2)             | Fixed `\|\| echo "0"` fallback |
-| CrossRepo wrong path                | All 8 runs crashed: `/task/tests/` instead of `/tests/`                 | Updated paths                  |
-| PyTorch `make test` no-op           | 10/12 tasks had broken verifiers: `test/` dir caused GNU make collision | Renamed target                 |
-| CodeReview brittle matching         | `"For is null"` vs `"For == null"` penalized correct code               | Relaxed matching               |
-| Baseline instruction contamination  | 30/156 instructions had SG refs leaking into baseline                   | Cleaned                        |
+Reported metrics in Section 11 are computed from valid scored rows and matched baseline/MCP task pairs. Pair-normalized analysis is performed at the canonical task level by averaging available valid runs per task/config before computing deltas.
 
 ---
 
@@ -829,7 +802,7 @@ Major verifier bugs discovered through QA audit (Feb 6):
 
 This section reflects the analysis export generated on **March 3, 2026** from `runs/analysis`:
 - Valid scored rows in export: **1,281**
-- Historical rows in `all_tasks`: **1,822**
+- Total rows in `all_tasks`: **1,822**
 - Paired baseline/MCP tasks with both sides present: **370**
 - Suites represented: **20** (9 SDLC + 11 Org)
 
@@ -1155,62 +1128,7 @@ All current results use Claude Code as the sole agent harness. The framework alr
 
 ---
 
-## 14. Development Process: Building a Benchmark with Claude Code
-
-CodeScaleBench was primarily developed with Claude Code. This section documents the development process for methodological transparency.
-
-### 14.1 Development Timeline
-
-```
- Jan 30 ─── Feb 3 ─── Feb 6 ─── Feb 10 ─── Feb 15 ─── Feb 20 ─── Feb 25 ─── Mar 2 ── Mar 3
-    │          │         │          │           │           │          │          │         │
-    ▼          ▼         ▼          ▼           ▼           ▼          ▼          ▼         ▼
-  Paper     Task      QA Audit   Trace      Enterprise  V5 Preamble  Oracle    Rename    V2 Report
-  draft +   selection  (28       audit,     expansion,  sg_only      curation  CCB→CSB   370/370
-  initial   pipeline,  issues),  SG_base    governance  Dockerfile   complete  DOE       coverage,
-  PRD       SDLC       verifier  dropped,   simulation  redesign     for 73    rebalance multi-run
-            taxonomy,  bugs,     Opus 4.6                             MCP tasks 370 tasks  analysis
-            5→3 cfg    mirrors   reruns                                         Daytona
-```
-
-### 14.2 Scale of Claude Code Usage
-
-The development produced **~1,000 conversation sessions** (JSONL transcripts) spanning January 30 -- March 3, 2026. Claude Code was used to:
-
-- **Design and implement** the task selection and benchmarking logic
-- **Generate** all 255 `Dockerfile.sg_only` variants and 85 `Dockerfile.artifact_only` files
-- **Build** the IR evaluation pipeline (5 stages, ~3,500 lines of Python)
-- **Create** the oracle evaluation system (7 check functions, 3-pass repo normalization)
-- **Develop** the agent preamble through 5 iterations (V1→V5)
-- **Implement** the clone-at-verify pattern for fair MCP evaluation
-- **Author** infrastructure scripts (mirror creation, token management, parallel execution)
-- **Debug** critical issues (verifier bugs, git history bypass, MCP death spiral)
-- **Produce** analysis reports and statistical evaluation code
-
-### 14.3 Key Workflow Pattern
-
-The development followed a consistent pattern:
-
-1. **User provides high-level intent** → "I want SDLC-aligned task taxonomy"
-2. **Claude Code explores codebase** → reads existing tasks, benchmarks, documentation
-3. **Claude Code generates PRD** → structured user stories with acceptance criteria
-4. **Implementation via autonomous sessions** → Ralph agent system executes PRDs
-5. **User reviews and iterates** → identifies gaps, requests changes
-6. **QA and validation** → automated checks + manual audit
-
-### 14.4 Lessons Learned
-
-1. **AI is effective at benchmark infrastructure**: Generating Dockerfiles, writing evaluation scripts, and building metrics pipelines are well-suited to AI-assisted development.
-
-2. **Domain expertise remains critical**: Methodology and validity threat analysis required human judgment that couldn't be fully automated.
-
-3. **Iterative QA is essential**: The Feb 6 QA audit found 28 issues (9 critical) in infrastructure that was largely AI-generated. Systematic validation caught bugs that individual reviews missed.
-
-4. **Preamble engineering is non-trivial**: Five iterations were needed to find the right balance between forcing MCP usage and avoiding prescriptive constraints.
-
----
-
-## 15. Appendices
+## 14. Appendices
 
 ### Appendix A: Statistical Methods
 
