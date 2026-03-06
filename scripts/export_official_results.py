@@ -143,6 +143,21 @@ _REPO_ALIAS_OVERRIDES = {
 _SELECTED_TASK_INDEX: dict[str, dict[str, Any]] | None = None
 _REPO_SET_INDEX: dict[str, dict[str, Any]] | None = None
 _REPO_INFO_INDEX: dict[str, dict[str, Any]] | None = None
+BENCHMARK_METADATA_KEYS = (
+    "context_length",
+    "files_count",
+    "repo_size_bytes",
+    "repo_size_mb",
+    "repo_file_count",
+    "repo_directory_count",
+    "repo_approx_loc",
+    "repo_complexity",
+    "repo_complexity_label",
+    "task_complexity",
+    "task_complexity_label",
+    "repo_languages",
+    "repo_primary_language",
+)
 
 
 @dataclass
@@ -177,6 +192,7 @@ class TaskRecord:
     checksums: dict[str, str | None]
     repositories: list[str]
     repository_details: list[dict[str, Any]]
+    benchmark_metadata: dict[str, Any]
     benchmark_task_path: str | None
     instruction_text: str | None
     agent_name: str | None
@@ -458,6 +474,32 @@ def _load_selected_task_index() -> dict[str, dict[str, Any]]:
             index[_canonical_task_name(task_id)] = entry
     _SELECTED_TASK_INDEX = index
     return _SELECTED_TASK_INDEX
+
+
+def _selected_task_metadata(task_name: str) -> dict[str, Any]:
+    entry = _load_selected_task_index().get(_canonical_task_name(task_name))
+    if not isinstance(entry, dict):
+        return {}
+    metadata: dict[str, Any] = {}
+    for key in BENCHMARK_METADATA_KEYS:
+        value = entry.get(key)
+        if value is not None:
+            metadata[key] = value
+    return metadata
+
+
+def _canonicalize_benchmark_path(path: Path | str | None) -> str | None:
+    if path is None:
+        return None
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = (PROJECT_ROOT / candidate).resolve(strict=False)
+    else:
+        candidate = candidate.resolve(strict=False)
+    try:
+        return str(candidate.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(candidate)
 
 
 def _load_repo_fixture_indexes() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
@@ -747,16 +789,16 @@ def _extract_repo_metadata(
 
     task_path_candidates: list[Path] = []
     if isinstance(task_path_from_result, str) and task_path_from_result:
-        task_path_candidates.append(Path(task_path_from_result))
+        result_candidate = Path(task_path_from_result)
+        if not result_candidate.is_absolute():
+            result_candidate = PROJECT_ROOT / result_candidate
+        task_path_candidates.append(result_candidate)
     canonical_name = _canonical_task_name(task_name)
     task_path_candidates.append(PROJECT_ROOT / "benchmarks" / suite / canonical_name)
     task_path_candidates.append(PROJECT_ROOT / "benchmarks" / suite / task_name)
     task_path = next((candidate for candidate in task_path_candidates if candidate.is_dir()), None)
     if task_path and task_path.is_dir():
-        try:
-            benchmark_task_path = str(task_path.relative_to(PROJECT_ROOT))
-        except ValueError:
-            benchmark_task_path = str(task_path)
+        benchmark_task_path = _canonicalize_benchmark_path(task_path)
         if tomllib is not None:
             task_toml = task_path / "task.toml"
             if task_toml.is_file():
@@ -1466,6 +1508,7 @@ def _extract_task_record(
         task_name,
         suite,
     )
+    benchmark_metadata = _selected_task_metadata(task_name)
     ir_metrics = _load_ir_metrics(task_dir, task_metrics)
 
     agent_info = result_payload.get("agent_info") if isinstance(result_payload.get("agent_info"), dict) else {}
@@ -1573,6 +1616,7 @@ def _extract_task_record(
         },
         repositories=repositories,
         repository_details=repository_details,
+        benchmark_metadata=benchmark_metadata,
         benchmark_task_path=benchmark_task_path,
         instruction_text=instruction_text,
         agent_name=agent_name,
@@ -1666,7 +1710,7 @@ def _fmt_int(value: int | None) -> str:
 
 def _suite_from_run_dir(run_dir_name: str, prefix_map: dict[str, str]) -> str:
     suite = detect_suite(run_dir_name, prefix_map)
-    if suite:
+    if suite and suite not in {"csb_org", "csb_sdlc", "ccb_mcp"}:
         return suite
 
     if run_dir_name.startswith(("ccb_", "csb_")):
@@ -1693,7 +1737,7 @@ def _to_task_dict(
     benchmark_repo_path: str | None = None
     benchmark_dir = PROJECT_ROOT / "benchmarks" / record.suite / canonical_name
     if benchmark_dir.is_dir():
-        benchmark_repo_path = str(benchmark_dir.relative_to(PROJECT_ROOT))
+        benchmark_repo_path = _canonicalize_benchmark_path(benchmark_dir)
 
     task_page_repo_path: str | None = None
     try:
@@ -1727,6 +1771,7 @@ def _to_task_dict(
         "repository_details": record.repository_details,
         "task_category": record.task_category,
         "benchmark_task_path": record.benchmark_task_path,
+        **record.benchmark_metadata,
         "started_at": record.started_at,
         "task_dir": record.task_dir,
         "status": record.status,
@@ -1807,6 +1852,59 @@ def _build_task_page(record: TaskRecord) -> str:
             f"<tr><td><code>{esc(repo_name)}</code></td><td>{esc(repo_language)}</td><td>{esc(repo_size_text)}</td></tr>"
         )
     repo_rows_html = "".join(repo_rows) or "<tr><td colspan='3'>No repository metadata available</td></tr>"
+
+    benchmark_rows = []
+    metadata = record.benchmark_metadata
+    if metadata.get("repo_primary_language") is not None:
+        benchmark_rows.append(f"<tr><td>Primary Language</td><td>{esc(metadata.get('repo_primary_language'))}</td></tr>")
+    if metadata.get("repo_size_mb") is not None:
+        benchmark_rows.append(
+            f"<tr><td>Repository Size (MB)</td><td>{esc(_fmt_float(_safe_float(metadata.get('repo_size_mb')), 3))}</td></tr>"
+        )
+    if metadata.get("repo_approx_loc") is not None:
+        benchmark_rows.append(
+            f"<tr><td>Approx LOC</td><td>{esc(_fmt_int(_safe_int(metadata.get('repo_approx_loc'))))}</td></tr>"
+        )
+    if metadata.get("files_count") is not None:
+        benchmark_rows.append(
+            f"<tr><td>Files Count</td><td>{esc(_fmt_int(_safe_int(metadata.get('files_count'))))}</td></tr>"
+        )
+    if metadata.get("repo_file_count") is not None:
+        benchmark_rows.append(
+            f"<tr><td>Repo File Count</td><td>{esc(_fmt_int(_safe_int(metadata.get('repo_file_count'))))}</td></tr>"
+        )
+    if metadata.get("repo_directory_count") is not None:
+        benchmark_rows.append(
+            f"<tr><td>Repo Directory Count</td><td>{esc(_fmt_int(_safe_int(metadata.get('repo_directory_count'))))}</td></tr>"
+        )
+    if metadata.get("context_length") is not None:
+        benchmark_rows.append(
+            f"<tr><td>Context Length</td><td>{esc(_fmt_int(_safe_int(metadata.get('context_length'))))}</td></tr>"
+        )
+    if metadata.get("repo_complexity") is not None:
+        benchmark_rows.append(
+            f"<tr><td>Repo Complexity</td><td>{esc(_fmt_float(_safe_float(metadata.get('repo_complexity')), 3))} "
+            f"({esc(metadata.get('repo_complexity_label') or '-')})</td></tr>"
+        )
+    if metadata.get("task_complexity") is not None:
+        benchmark_rows.append(
+            f"<tr><td>Task Complexity</td><td>{esc(_fmt_float(_safe_float(metadata.get('task_complexity')), 3))} "
+            f"({esc(metadata.get('task_complexity_label') or '-')})</td></tr>"
+        )
+    repo_languages = metadata.get("repo_languages")
+    if isinstance(repo_languages, list) and repo_languages:
+        language_parts = []
+        for item in repo_languages:
+            if not isinstance(item, dict):
+                continue
+            language = item.get("language")
+            files = _safe_int(item.get("files"))
+            if not language:
+                continue
+            language_parts.append(f"{language} ({files})" if files is not None else str(language))
+        if language_parts:
+            benchmark_rows.append(f"<tr><td>Repo Languages</td><td>{esc(', '.join(language_parts))}</td></tr>")
+    benchmark_rows_html = "".join(benchmark_rows) or "<tr><td colspan='2'>No benchmark metadata available</td></tr>"
 
     flag_items = [TASK_FLAG_LABELS.get(flag, flag) for flag in record.flags]
     flag_html = ""
@@ -1956,6 +2054,12 @@ def _build_task_page(record: TaskRecord) -> str:
         <table>
           <thead><tr><th>Repository</th><th>Primary Language</th><th>Approx Size (LOC)</th></tr></thead>
           <tbody>{repo_rows_html}</tbody>
+        </table>
+      </details>
+      <details>
+        <summary>Benchmark metadata</summary>
+        <table>
+          <tbody>{benchmark_rows_html}</tbody>
         </table>
       </details>
       <details>
@@ -2279,6 +2383,7 @@ def _build_index_html() -> str:
     .pill { padding:2px 8px; border-radius:999px; font-size:12px; }
     .passed { background: rgba(71,209,140,0.2); }
     .failed { background: rgba(255,204,102,0.2); }
+    .task-meta { margin-top:4px; font-size:12px; color:var(--muted); }
   </style>
 </head>
 <body>
@@ -2314,6 +2419,7 @@ def _build_index_html() -> str:
     const statsEl = document.getElementById('stats');
 
     function fmt(v, d=3) { return (v===null || v===undefined) ? '-' : Number(v).toFixed(d); }
+    function fmtInt(v) { return (v===null || v===undefined) ? '-' : Number(v).toLocaleString(); }
     function uniqueSorted(values) { return [...new Set(values)].sort(); }
     function resetOptions(selectEl, allLabel, values) {
       const previous = selectEl.value;
@@ -2382,11 +2488,18 @@ def _build_index_html() -> str:
             const trajLink = t.trajectory_github ? `<a href=\"${t.trajectory_github}\" target=\"_blank\" rel=\"noopener\">trajectory</a>` : '';
             const auditLink = t.audit_github ? `<a href=\"${t.audit_github}\" target=\"_blank\" rel=\"noopener\">audit</a>` : '';
             const extras = [repoLink, benchmarkLink, trajLink, auditLink].filter(Boolean).join(' | ');
+            const metadata = [];
+            if (t.repo_primary_language) metadata.push(`lang=${t.repo_primary_language}`);
+            if (t.repo_size_mb !== null && t.repo_size_mb !== undefined) metadata.push(`size=${fmt(t.repo_size_mb, 1)} MB`);
+            if (t.repo_complexity !== null && t.repo_complexity !== undefined) metadata.push(`repo_complexity=${fmt(t.repo_complexity, 3)}`);
+            if (t.task_complexity !== null && t.task_complexity !== undefined) metadata.push(`task_complexity=${fmt(t.task_complexity, 3)}`);
+            if (t.files_count !== null && t.files_count !== undefined) metadata.push(`files=${fmtInt(t.files_count)}`);
+            if (t.benchmark_task_path) metadata.push(`path=${t.benchmark_task_path}`);
             tr.innerHTML = `
               <td class=\"mono\">${t.suite || 'unknown'}</td>
               <td class=\"mono\">${t.run_dir}</td>
               <td class=\"mono\">${t.config}</td>
-              <td><a href=\"${t.task_page}\">${t.task_name}</a>${extras ? `<div style=\"margin-top:4px;font-size:12px\">${extras}</div>` : ''}</td>
+              <td><a href=\"${t.task_page}\">${t.task_name}</a>${extras ? `<div style=\"margin-top:4px;font-size:12px\">${extras}</div>` : ''}${metadata.length ? `<div class=\"task-meta\">${metadata.join(' | ')}</div>` : ''}</td>
               <td><span class=\"pill ${t.status}\">${t.status}</span></td>
               <td>${fmt(t.reward,3)}</td>
               <td>${fmt(t.mcp_ratio,3)}</td>

@@ -2,7 +2,7 @@
 
 This bundle is generated from `runs/analysis/` and includes only valid scored tasks (`passed`/`failed` with numeric reward) that pass config-specific validity checks.
 
-Generated: `2026-03-05T22:59:58.640809+00:00`
+Generated: `2026-03-06T17:22:32.405540+00:00`
 
 ## Local Browse
 
