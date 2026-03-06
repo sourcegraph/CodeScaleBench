@@ -237,6 +237,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/scaffold_contextbench_tasks.py` - Utility script for scaffold contextbench tasks.
 - `scripts/scaffold_feature_tasks.py` - Utility script for scaffold feature tasks.
 - `scripts/scaffold_refactor_tasks.py` - Utility script for scaffold refactor tasks.
+- `scripts/scaffold_scaling_gap_sdlc_tasks.py` - Utility script for scaffold scaling gap sdlc tasks.
 - `scripts/scaffold_swebench_pro_tasks.py` - Utility script for scaffold swebench pro tasks.
 - `scripts/scan_swebench_errors.py` - Utility script for scan swebench errors.
 - `scripts/sdlc_anomaly_scan.py` - Utility script for sdlc anomaly scan.
