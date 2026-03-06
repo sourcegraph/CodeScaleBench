@@ -3,20 +3,24 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git ca-certificates python3 curl \
+    git \
+    ca-certificates \
+    python3 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Pre-create claude user
-RUN (adduser --disabled-password --gecos '' claude 2>/dev/null || true)
-
-# Clone repo as claude user
-USER claude
 WORKDIR /workspace
-RUN git clone --depth 1 https://github.com/pingcap/tidb.git . || \
-    (git init && git config user.email "agent@example.com" && git config user.name "Agent")
-USER root
 
-RUN mkdir -p /logs/agent /logs/verifier && \
-    chown -R claude:claude /logs
+# Clone repo at pinned version
+RUN git clone --depth 1 https://github.com/sg-evals/tidb--v8.5.0.git . && \
+    git config user.email "agent@benchmark.local" && \
+    git config user.name "Agent"
+
+# Create logs directory for agent output
+RUN mkdir -p /logs/agent /logs/verifier
+
+# Pre-create claude user and set ownership at build time
+RUN (adduser --disabled-password --gecos '' claude 2>/dev/null || true) && \
+    for d in /workspace /logs; do [ -d "$d" ] && chown -R claude:claude "$d"; done || true
 
 ENTRYPOINT []

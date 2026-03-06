@@ -173,7 +173,9 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/backfill_triage_from_manifest.py` [one_off] - Historical one-off script: backfill triage from manifest.
 - `scripts/check_harness_readiness.py` - Utility script for check harness readiness.
 - `scripts/compare_contextbench_results.py` - Utility script for compare contextbench results.
+- `scripts/compare_ir_old_vs_new_gt.py` - Utility script for compare ir old vs new gt.
 - `scripts/compare_old_new_ground_truth.py` - Utility script for compare old new ground truth.
+- `scripts/compute_analysis_ir_metrics.py` - Utility script for compute analysis ir metrics.
 - `scripts/compute_bootstrap_cis.py` - Utility script for compute bootstrap cis.
 - `scripts/context_retrieval_agent.py` - Utility script for context retrieval agent.
 - `scripts/control_plane.py` - Utility script for control plane.
@@ -235,6 +237,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/rescore_difficulty.py` - Utility script for rescore difficulty.
 - `scripts/run_judge.py` - Utility script for run judge.
 - `scripts/run_missing_oracles.sh` - Utility script for run missing oracles.
+- `scripts/run_scaling_gap_oracles.sh` - Utility script for run scaling gap oracles.
 - `scripts/scaffold_contextbench_tasks.py` - Utility script for scaffold contextbench tasks.
 - `scripts/scaffold_feature_tasks.py` - Utility script for scaffold feature tasks.
 - `scripts/scaffold_refactor_tasks.py` - Utility script for scaffold refactor tasks.
@@ -244,6 +247,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/sdlc_anomaly_scan.py` - Utility script for sdlc anomaly scan.
 - `scripts/select_contextbench_pilot.py` - Utility script for select contextbench pilot.
 - `scripts/smoke_artifact_verifier.py` - Utility script for smoke artifact verifier.
+- `scripts/smoke_test_tasks.py` - Utility script for smoke test tasks.
 - `scripts/verify_retrieval_eval_smoke.py` - Utility script for verify retrieval eval smoke.
 
 ## Regeneration
