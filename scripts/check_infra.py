@@ -105,7 +105,6 @@ def check_oauth_token(home_dir: str | None = None) -> dict:
     remaining_min = int(remaining_s / 60)
 
     has_refresh = bool(oauth.get("refreshToken"))
-    has_access = bool(oauth.get("accessToken"))
 
     if remaining_s <= 0:
         # Access token expired — try to refresh it

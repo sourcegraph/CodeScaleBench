@@ -106,12 +106,15 @@ if [ ${#TASK_ROWS[@]} -eq 0 ]; then
 fi
 
 declare -A TASK_PATH_BY_ID
+declare -A TASK_SUITE_BY_ID
 TASK_IDS=()
 for row in "${TASK_ROWS[@]}"; do
     task_id=$(echo "$row" | cut -f1)
     task_path=$(echo "$row" | cut -f2)
+    benchmark=$(echo "$row" | cut -f3)
     TASK_IDS+=("$task_id")
     TASK_PATH_BY_ID["$task_id"]="$task_path"
+    TASK_SUITE_BY_ID["$task_id"]="$benchmark"
 done
 
 if [ -z "${PARALLEL_JOBS:-}" ] || [ "$PARALLEL_JOBS" -lt 1 ] 2>/dev/null; then
@@ -148,6 +151,22 @@ echo "Run baseline: $RUN_BASELINE"
 echo "Run MCP-Full: $RUN_FULL"
 echo ""
 
+if [ "${HARBOR_ENV:-}" = "daytona" ]; then
+    clear_daytona_cost_guard_ready
+    _cost_guard_cmd=(
+        python3 "$REPO_ROOT/scripts/daytona_cost_guard.py" preflight
+        --selection-file "$SELECTION_FILE"
+        --parallel-tasks "$PARALLEL_JOBS"
+        --concurrency "$CONCURRENCY"
+        --policy "$DAYTONA_COST_POLICY"
+    )
+    [ -n "$BENCHMARK_FILTER" ] && _cost_guard_cmd+=(--benchmark "$BENCHMARK_FILTER")
+    [ "$RUN_BASELINE" = true ] && _cost_guard_cmd+=(--config "baseline-local-direct")
+    [ "$RUN_FULL" = true ] && _cost_guard_cmd+=(--config "mcp-remote-direct")
+    "${_cost_guard_cmd[@]}" || exit 1
+    mark_daytona_cost_guard_ready
+fi
+
 _cursor_run_single() {
     local task_id=$1
     local _task_home=$2
@@ -174,7 +193,13 @@ _cursor_run_single() {
     fi
 
     echo "Running task: $task_id ($config)"
-    BASELINE_MCP_TYPE="$mcp_type" harbor run \
+    DAYTONA_LABEL_RUN_ID="$(basename "$JOBS_BASE")" \
+    DAYTONA_LABEL_BENCHMARK="${TASK_SUITE_BY_ID[$task_id]}" \
+    DAYTONA_LABEL_TASK_ID="$task_id" \
+    DAYTONA_LABEL_CONFIG="$config" \
+    DAYTONA_LABEL_CATEGORY="$CATEGORY" \
+    TASK_SOURCE_DIR="$task_path" \
+    BASELINE_MCP_TYPE="$mcp_type" harbor_run_guarded \
         --path "$task_path" \
         --agent-import-path "$AGENT_PATH" \
         --model "$MODEL" \

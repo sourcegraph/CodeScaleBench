@@ -371,12 +371,6 @@ def cmd_export(args) -> int:
     print(f"[V2 EXPORT] Experiment: {experiment_id}")
     print(f"[V2 EXPORT] Re-exporting from Harbor outputs...")
     
-    from lib.exporter.canonical import V2Exporter
-    from lib.exporter.harbor_parser import HarborParser
-    
-    exporter = V2Exporter(output_root=exp_dir.parent)
-    parser = HarborParser()
-    
     runs_exported = 0
     for run_info in manifest_data.get("runs", []):
         run_id = run_info.get("run_id")

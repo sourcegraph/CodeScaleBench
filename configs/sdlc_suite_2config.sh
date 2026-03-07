@@ -156,6 +156,9 @@ esac
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 JOBS_BASE="runs/${CATEGORY}/${SUITE_STEM}_${MODEL_SHORT}_${TIMESTAMP}"
+BL_CONFIG=$(baseline_config_for "$FULL_CONFIG")
+BL_MCP=$(config_to_mcp_type "$BL_CONFIG")
+FULL_MCP=$(config_to_mcp_type "$FULL_CONFIG")
 
 echo "=============================================="
 echo "SDLC: ${SUITE_LABEL}"
@@ -171,6 +174,24 @@ echo "Run MCP-Full: ${RUN_FULL} (${FULL_CONFIG})"
 echo ""
 
 mkdir -p "${JOBS_BASE}"
+
+if [ "${HARBOR_ENV:-}" = "daytona" ]; then
+    clear_daytona_cost_guard_ready
+    _cost_guard_cmd=(
+        python3 "$REPO_ROOT/scripts/daytona_cost_guard.py" preflight
+        --suite "$SUITE"
+        --parallel-tasks "$PARALLEL_JOBS"
+        --concurrency "$CONCURRENCY"
+        --policy "$DAYTONA_COST_POLICY"
+    )
+    for task_id in "${TASK_IDS[@]}"; do
+        _cost_guard_cmd+=(--task-id "$task_id")
+    done
+    [ "$RUN_BASELINE" = true ] && _cost_guard_cmd+=(--config "$BL_CONFIG")
+    [ "$RUN_FULL" = true ] && _cost_guard_cmd+=(--config "$FULL_CONFIG")
+    "${_cost_guard_cmd[@]}" || exit 1
+    mark_daytona_cost_guard_ready
+fi
 
 log_section() {
     echo ""
@@ -293,7 +314,12 @@ _sdlc_run_single() {
 
     TASK_SOURCE_DIR="$task_path" \
     INSTRUCTION_VARIANT="$instruction_variant" \
-    BASELINE_MCP_TYPE=$mcp_type harbor run \
+    DAYTONA_LABEL_RUN_ID="$(basename "$JOBS_BASE")" \
+    DAYTONA_LABEL_BENCHMARK="$SUITE" \
+    DAYTONA_LABEL_TASK_ID="$task_id" \
+    DAYTONA_LABEL_CONFIG="$config" \
+    DAYTONA_LABEL_CATEGORY="$CATEGORY" \
+    BASELINE_MCP_TYPE=$mcp_type harbor_run_guarded \
         --job-name "$job_name" \
         --path "$run_task_path" \
         --agent-import-path "$AGENT_PATH" \
@@ -301,7 +327,6 @@ _sdlc_run_single() {
         --jobs-dir "$jobs_subdir" \
         -n $CONCURRENCY \
         --timeout-multiplier $TIMEOUT_MULTIPLIER \
-        ${HARBOR_ENV:+--env "$HARBOR_ENV"} \
         ${DAYTONA_OVERRIDE_STORAGE:+--override-storage-mb "$DAYTONA_OVERRIDE_STORAGE"} \
         2>&1 | tee "${jobs_subdir}/${task_id}.log" \
         || {
@@ -332,16 +357,14 @@ run_task_batch() {
 
 # Pre-build all Docker images to warm the cache before agent runs.
 # This moves Docker build time out of the critical path (API session slots).
-if [ "$SKIP_PREBUILD" = false ]; then
+if [ "$SKIP_PREBUILD" = false ] && [ "${HARBOR_ENV:-}" = "daytona" ]; then
+    log_section "Skipping local prebuild for ${SUITE} because Daytona builds remotely"
+elif [ "$SKIP_PREBUILD" = false ]; then
     log_section "Pre-building Docker images for ${SUITE}"
     # Pass selected task IDs so prebuild only builds images for tasks we'll run
     _task_list=$(IFS=,; echo "${TASK_IDS[*]}")
     prebuild_images "$SUITE" --tasks "$_task_list"
 fi
-
-BL_CONFIG=$(baseline_config_for "$FULL_CONFIG")
-BL_MCP=$(config_to_mcp_type "$BL_CONFIG")
-FULL_MCP=$(config_to_mcp_type "$FULL_CONFIG")
 
 if [ "$RUN_BASELINE" = true ] && [ "$RUN_FULL" = true ]; then
     run_paired_configs TASK_IDS _sdlc_run_single "$JOBS_BASE"

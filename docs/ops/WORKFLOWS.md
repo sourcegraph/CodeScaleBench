@@ -10,12 +10,22 @@
 ## Run Batch Workflow
 1. Run infra checks (`scripts/check_infra.py`).
 2. Validate tasks (`scripts/validate_tasks_preflight.py`).
-3. Launch benchmark via `configs/*` runner (interactive confirmation required).
-4. Monitor with `scripts/aggregate_status.py` and classify errors.
-5. Validate outputs (`scripts/validate_task_run.py`).
-6. Triage before reruns.
-7. Regenerate manifest/report after completion.
-8. Run `scripts/repo_health.py` before commit/push.
+3. If using Daytona, inspect current account state with `scripts/daytona_cost_guard.py summary` when needed.
+4. Launch benchmark via `configs/*` runner only (interactive confirmation required).
+5. Do not use raw Daytona `harbor run` for benchmark batches; the wrappers enforce preflight and labeling.
+6. Monitor with `scripts/aggregate_status.py` and classify errors.
+7. Validate outputs (`scripts/validate_task_run.py`).
+8. Triage before reruns.
+9. Regenerate manifest/report after completion.
+10. Run `scripts/repo_health.py` before commit/push.
+
+### Daytona wrapper rules
+
+- All benchmark launchers should source `configs/_common.sh`.
+- Daytona launches should go through `harbor_run_guarded`, not raw `harbor run`.
+- The launcher should run `scripts/daytona_cost_guard.py preflight` before the first Daytona launch.
+- Wrapper-driven targeted reruns should still be launched from repo root so relative task/config paths and logs resolve cleanly.
+- Only set `HARBOR_ALLOW_UNGUARDED_DAYTONA=1` for deliberate break-glass debugging.
 
 ## Triage Workflow
 1. Confirm error class via `docs/ERROR_CATALOG.md` and status fingerprints.

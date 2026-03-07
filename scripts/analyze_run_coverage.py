@@ -208,8 +208,6 @@ def main():
     print("COVERAGE ANALYSIS: CURATED TASKS vs COMPLETED RUNS")
     print("=" * 100)
 
-    config_modes_of_interest = ["baseline", "sourcegraph_full"]
-
     grand_total = {
         "curated": 0,
         "both_complete": 0,

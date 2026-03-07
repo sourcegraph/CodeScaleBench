@@ -15,12 +15,10 @@ Usage:
 
 import argparse
 import json
-import os
 import re
 import subprocess
-import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

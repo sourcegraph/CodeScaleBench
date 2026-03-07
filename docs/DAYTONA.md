@@ -59,25 +59,26 @@ export SRC_ACCESS_TOKEN="sgp_..."
 
 Harbor has a built-in `DaytonaEnvironment` that plugs into the standard trial runner. Add `--environment-type daytona` to any `harbor run` command to execute on Daytona cloud sandboxes instead of local Docker.
 
+### Repository policy
+
+For benchmark batches in this repo, do not launch raw Daytona `harbor run` commands directly.
+
+- Use the `configs/*` launcher wrappers.
+- The wrappers now run `scripts/daytona_cost_guard.py preflight` before launch.
+- The wrappers inject a repo-local Daytona environment that labels sandboxes with run, benchmark, task, config, and launcher metadata.
+- The shared wrapper blocks Daytona launches unless preflight has succeeded, unless you deliberately set `HARBOR_ALLOW_UNGUARDED_DAYTONA=1`.
+
+This matters because unlabeled or orphaned sandboxes are what made cost attribution and cleanup difficult.
+
 ### Quick Start
 
 ```bash
-# Single task on Daytona
-BASELINE_MCP_TYPE=none harbor run \
-    --path benchmarks/csb_sdlc_feature/servo-scrollend-event-feat-001 \
-    --agent-import-path agents/claude_baseline_agent.py \
-    --model claude-haiku-4-5-20251001 \
-    --environment-type daytona
-
-# Full suite (60 concurrent sandboxes)
-BASELINE_MCP_TYPE=none harbor run \
-    --path benchmarks/csb_sdlc_feature \
-    --agent-import-path agents/claude_baseline_agent.py \
-    --model claude-haiku-4-5-20251001 \
-    --jobs-dir runs/staging/build_baseline_$(date +%Y%m%d) \
-    -n 60 \
-    --environment-type daytona
+# Preferred: repo launcher wrapper with Daytona guard + labels
+export HARBOR_ENV=daytona
+./configs/run_selected_tasks.sh --benchmark csb_sdlc_feature --baseline-only
 ```
+
+Use direct `harbor run --env daytona` only for ad hoc debugging when you intentionally accept bypassing the benchmark cost/label workflow.
 
 ### Paired Runs (Baseline vs MCP)
 
@@ -157,6 +158,49 @@ When planning large runs on Daytona, you should:
 - **Leave headroom.** Stay comfortably below documented limits to avoid throttling or transient failures.
 
 > The exact numeric limits, RPMs, and cost per run are deployment‑specific. The tables in blog posts or internal docs are examples only; always derive concrete numbers from your own infrastructure and pricing.
+
+## Cost guard workflow
+
+The repo now has a built-in Daytona guard at `scripts/daytona_cost_guard.py`.
+
+### Summary current account state
+
+```bash
+python3 scripts/daytona_cost_guard.py summary
+```
+
+This reports:
+- active sandboxes and active hourly burn
+- unlabeled active sandboxes
+- snapshot count and storage burn
+- top active sandboxes and largest snapshots
+
+### Preflight a planned batch
+
+```bash
+python3 scripts/daytona_cost_guard.py preflight \
+  --selection-file configs/selected_benchmark_tasks.json \
+  --benchmark csb_sdlc_feature \
+  --config baseline-local-direct \
+  --config mcp-remote-direct \
+  --parallel-tasks 40 \
+  --concurrency 1
+```
+
+The launcher wrappers call this automatically in Daytona mode. Policy thresholds live in `configs/daytona_cost_policy.json`.
+
+### Enforcement path
+
+The enforcement chain is:
+
+1. Launcher wrapper runs Daytona preflight.
+2. Wrapper marks preflight as complete in the shell.
+3. Wrapper calls the shared `harbor_run_guarded` helper.
+4. `harbor_run_guarded` refuses Daytona launches without a successful preflight.
+5. `harbor_run_guarded` injects the repo-local Daytona environment import path so sandbox labels are always attached.
+
+Launcher note:
+- The shared launcher helper now exports `REPO_ROOT` automatically when sourced, so repo wrappers can invoke `scripts/daytona_cost_guard.py` reliably during targeted reruns as well as full batches.
 
 ## Alternative: Standalone Runner
 
@@ -254,6 +298,12 @@ python3 scripts/build_daytona_registry.py
 ## Cost control and cleanup
 
 Bulk runs (full suite, high parallelism) drive cost from **compute** (many concurrent sandboxes) and **storage** (snapshots created when building from task Dockerfiles). Some of that is inherent to running 283+ tasks; you can still reduce spend and reclaim storage.
+
+### Current cleanup priorities
+
+- Active unlabeled sandboxes are urgent because they keep burning compute and cannot be attributed cleanly.
+- Snapshots are less urgent unless storage burn is materially large; they are usually a monthly-storage issue, not an hourly-compute issue.
+- Prefer deleting orphan sandboxes first, then pruning stale benchmark snapshots.
 
 ### Reduce ongoing spend
 

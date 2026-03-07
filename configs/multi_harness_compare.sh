@@ -27,6 +27,8 @@ cd "$REPO_ROOT"
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
 source "$SCRIPT_DIR/_common.sh"
+load_credentials
+enforce_subscription_mode
 
 SELECTION_FILE="$REPO_ROOT/configs/selected_benchmark_tasks.json"
 REGISTRY_FILE="$REPO_ROOT/configs/harness_registry.json"
@@ -172,12 +174,15 @@ if [ ${#TASK_ROWS[@]} -eq 0 ]; then
 fi
 
 declare -A TASK_PATH_BY_ID
+declare -A TASK_SUITE_BY_ID
 TASK_IDS=()
 for row in "${TASK_ROWS[@]}"; do
     task_id=$(echo "$row" | cut -f1)
     task_path=$(echo "$row" | cut -f2)
+    benchmark=$(echo "$row" | cut -f3)
     TASK_IDS+=("$task_id")
     TASK_PATH_BY_ID["$task_id"]="$task_path"
+    TASK_SUITE_BY_ID["$task_id"]="$benchmark"
 done
 
 HARNESS_LABEL="$(IFS=- ; echo "${HARNESS_IDS[*]}")"
@@ -203,6 +208,26 @@ echo "Dry run: $DRY_RUN"
 echo "Jobs directory base: $JOBS_BASE"
 echo ""
 
+if [ "$DRY_RUN" = false ] && [ "${HARBOR_ENV:-}" = "daytona" ]; then
+    clear_daytona_cost_guard_ready
+    _cost_guard_cmd=(
+        python3 "$REPO_ROOT/scripts/daytona_cost_guard.py" preflight
+        --selection-file "$SELECTION_FILE"
+        --parallel-tasks "$PARALLEL_JOBS"
+        --concurrency "$CONCURRENCY"
+        --policy "$DAYTONA_COST_POLICY"
+    )
+    [ -n "$BENCHMARK_FILTER" ] && _cost_guard_cmd+=(--benchmark "$BENCHMARK_FILTER")
+    for task_id in "${TASK_IDS[@]}"; do
+        _cost_guard_cmd+=(--task-id "$task_id")
+    done
+    for harness_id in "${HARNESS_IDS[@]}"; do
+        _cost_guard_cmd+=(--config "baseline-local-direct" --config "mcp-remote-direct")
+    done
+    "${_cost_guard_cmd[@]}" || exit 1
+    mark_daytona_cost_guard_ready
+fi
+
 run_variant() {
     local harness_id=$1
     local mode=$2
@@ -225,11 +250,17 @@ run_variant() {
         fi
 
         if [ "$DRY_RUN" = true ]; then
-            echo "[DRY RUN] BASELINE_MCP_TYPE=$mcp_type harbor run --path $task_path --agent-import-path $agent_path --model $model --jobs-dir $jobs_dir -n $CONCURRENCY --timeout-multiplier $TIMEOUT_MULTIPLIER"
+            echo "[DRY RUN] BASELINE_MCP_TYPE=$mcp_type harbor_run_guarded --path $task_path --agent-import-path $agent_path --model $model --jobs-dir $jobs_dir -n $CONCURRENCY --timeout-multiplier $TIMEOUT_MULTIPLIER"
             return 0
         fi
 
-        BASELINE_MCP_TYPE="$mcp_type" harbor run \
+        DAYTONA_LABEL_RUN_ID="$(basename "$JOBS_BASE")" \
+        DAYTONA_LABEL_BENCHMARK="${TASK_SUITE_BY_ID[$task_id]}" \
+        DAYTONA_LABEL_TASK_ID="$task_id" \
+        DAYTONA_LABEL_CONFIG="${harness_id}_${mode}" \
+        DAYTONA_LABEL_CATEGORY="$CATEGORY" \
+        TASK_SOURCE_DIR="$task_path" \
+        BASELINE_MCP_TYPE="$mcp_type" harbor_run_guarded \
             --path "$task_path" \
             --agent-import-path "$agent_path" \
             --model "$model" \

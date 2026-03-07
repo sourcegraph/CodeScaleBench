@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 from harbor.environments.base import BaseEnvironment
@@ -74,6 +75,7 @@ Use repo/file filters to keep results focused. Start narrow and widen only when 
         super().__init__(*args, **kwargs)
 
     def create_run_agent_commands(self, instruction: str):
+        instruction = self._resolve_instruction_text(instruction)
         instruction = self._prepare_instruction(instruction)
         self._save_instruction_artifact(instruction)
         return super().create_run_agent_commands(instruction)
@@ -93,13 +95,30 @@ Use repo/file filters to keep results focused. Start narrow and widen only when 
     def _prepare_instruction(self, instruction: str) -> str:
         mcp_type = os.environ.get("BASELINE_MCP_TYPE", "none").lower()
         repo = self._get_repo_display()
+        repo_list = self._get_repo_list()
+
+        if mcp_type in ("sourcegraph_full", "sourcegraph_base", "sourcegraph_isolated") and (
+            instruction.lstrip().startswith("# IMPORTANT: Source Code Access")
+            or instruction.lstrip().startswith("## EVALUATION CONTEXT")
+        ):
+            return instruction
+
         parts = [self.EVALUATION_CONTEXT_PROMPT.strip()]
 
         if mcp_type in ("sourcegraph_full", "sourcegraph_base", "sourcegraph_isolated"):
-            scope = (
-                f"**Target Repository:** `github.com/{repo}`\n"
-                "- Include `repo:^github.com/{repo}$` filters in keyword_search"
-            )
+            if repo_list:
+                scope_lines = ["**Target Repositories (version-pinned mirrors):**\n"]
+                for repo_name in repo_list:
+                    sg_full = f"github.com/{repo_name}"
+                    scope_lines.append(f"- `{sg_full}` — use `repo:^{sg_full}$` filter")
+                scope_lines.append("")
+                scope_lines.append("Scope all search queries to these repos.")
+                scope = "\n".join(scope_lines)
+            else:
+                scope = (
+                    f"**Target Repository:** `github.com/{repo}`\n"
+                    f"- Include `repo:^github.com/{repo}$` filters in keyword_search"
+                )
             parts.append(self.V4_PREAMBLE_TEMPLATE.format(repo_scope=scope))
         elif mcp_type == "sourcegraph":
             parts.append("## Sourcegraph MCP Guidance")
@@ -115,13 +134,17 @@ Use repo/file filters to keep results focused. Start narrow and widen only when 
         return "\n\n".join(parts) + "\n\n" + instruction
 
     def _get_repo_display(self) -> str:
-        sg_repo = os.environ.get("SOURCEGRAPH_REPO_NAME", "")
+        cache = self._container_env_cache
+        sg_repo = os.environ.get("SOURCEGRAPH_REPO_NAME", "") or cache.get("SOURCEGRAPH_REPO_NAME", "")
         if sg_repo:
             if sg_repo.startswith("github.com/"):
                 return sg_repo[len("github.com/") :]
             return sg_repo
 
-        cache = self._container_env_cache
+        repo_list = self._get_repo_list()
+        if repo_list:
+            return repo_list[0]
+
         locobench = cache.get("LOCOBENCH_PROJECT_ID") or os.environ.get("LOCOBENCH_PROJECT_ID", "")
         if locobench:
             return f"sg-evals/locobench-{locobench}"
@@ -132,12 +155,81 @@ Use repo/file filters to keep results focused. Start narrow and widen only when 
 
         return "the codebase"
 
+    def _get_repo_list(self) -> list[str]:
+        cache = self._container_env_cache
+        repos_str = os.environ.get("SOURCEGRAPH_REPOS", "") or cache.get("SOURCEGRAPH_REPOS", "")
+        if not repos_str:
+            repos_str = self._parse_sourcegraph_repos_from_dockerfile()
+        if not repos_str:
+            return []
+        return [r.strip() for r in repos_str.split(",") if r.strip()]
+
+    def _parse_sourcegraph_repos_from_dockerfile(self) -> str:
+        task_source_dir = os.environ.get("TASK_SOURCE_DIR", "")
+        if not task_source_dir:
+            return ""
+
+        env_dir = Path(task_source_dir) / "environment"
+        if not env_dir.is_dir():
+            return ""
+
+        for df_name in ("Dockerfile.artifact_only", "Dockerfile.sg_only", "Dockerfile"):
+            df_path = env_dir / df_name
+            if not df_path.is_file():
+                continue
+            try:
+                for line in df_path.read_text().splitlines():
+                    match = re.match(r'^ENV\s+SOURCEGRAPH_REPOS\s*=\s*"([^"]+)"', line)
+                    if match:
+                        logger.info("Dockerfile fallback: SOURCEGRAPH_REPOS=%s from %s", match.group(1), df_name)
+                        return match.group(1)
+            except OSError:
+                continue
+        return ""
+
+    def _resolve_instruction_text(self, instruction: str) -> str:
+        task_source_dir = os.environ.get("TASK_SOURCE_DIR", "")
+        if not task_source_dir:
+            return instruction
+
+        task_source_path = Path(task_source_dir)
+        mcp_type = os.environ.get("BASELINE_MCP_TYPE", "none").lower()
+        instruction_variant = os.environ.get("INSTRUCTION_VARIANT", "default").lower()
+
+        if mcp_type in ("sourcegraph_full", "sourcegraph_base", "sourcegraph_isolated"):
+            mcp_instruction = task_source_path / "instruction_mcp.md"
+            if mcp_instruction.exists():
+                logger.info("Using MCP instruction from %s", mcp_instruction)
+                return mcp_instruction.read_text()
+
+        if instruction_variant != "default":
+            variant_candidates = [instruction_variant]
+            if "_" in instruction_variant:
+                base_variant = instruction_variant.split("_", 1)[0]
+                if base_variant and base_variant not in variant_candidates:
+                    variant_candidates.append(base_variant)
+
+            for candidate in variant_candidates:
+                variant_path = task_source_path / f"instruction_{candidate}.md"
+                if variant_path.exists():
+                    logger.info("Using instruction variant %s from %s", candidate, variant_path)
+                    return variant_path.read_text()
+
+            logger.warning(
+                "Instruction variant '%s' not found in %s (tried: %s), using provided instruction",
+                instruction_variant,
+                task_source_dir,
+                ", ".join(variant_candidates),
+            )
+
+        return instruction
+
     async def _propagate_container_env(self, environment: BaseEnvironment) -> None:
         if os.environ.get("BASELINE_MCP_TYPE", "none").lower() == "none":
             return
         cache = {}
-        for var in ("LOCOBENCH_PROJECT_ID", "SWEBENCH_REPO_COMMIT"):
-            if os.environ.get("SOURCEGRAPH_REPO_NAME") or os.environ.get(var):
+        for var in ("SOURCEGRAPH_REPO_NAME", "SOURCEGRAPH_REPOS", "LOCOBENCH_PROJECT_ID", "SWEBENCH_REPO_COMMIT"):
+            if os.environ.get(var):
                 continue
             try:
                 result = await environment.exec(f"echo ${{{var}:-}}")

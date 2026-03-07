@@ -32,6 +32,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 
 ## Analysis & Comparison
 
+- `scripts/analyze_harness_design.py` - Analysis/comparison script for analyze harness design.
 - `scripts/analyze_mcp_unique_haiku.py` - Analysis/comparison script for analyze mcp unique haiku.
 - `scripts/analyze_minimum_subset.py` - Analysis/comparison script for analyze minimum subset.
 - `scripts/analyze_paired_cost_official_raw.py` - Analysis/comparison script for analyze paired cost official raw.
@@ -115,6 +116,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 ## Infra & Mirrors
 
 - `scripts/build_conversation_db.py` - Infrastructure or mirror management script for build conversation db.
+- `scripts/build_core_manifest.py` - Infrastructure or mirror management script for build core manifest.
 - `scripts/build_daytona_registry.py` - Infrastructure or mirror management script for build daytona registry.
 - `scripts/build_linux_base_images.sh` - Infrastructure or mirror management script for build linux base images.
 - `scripts/create_mcp_expansion_mirrors.sh` - Infrastructure or mirror management script for create mcp expansion mirrors.
@@ -148,6 +150,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 
 ## Validation
 
+- `scripts/validate_core_manifest.py` - Validation script for validate core manifest.
 - `scripts/validate_enterprise_readiness.py` - Validation script for validate enterprise readiness.
 - `scripts/validate_on_contextbench.py` - Validation script for validate on contextbench.
 
@@ -160,6 +163,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/generate_repoqa_largerepo_tasks.py` - Generation script for generate repoqa largerepo tasks.
 - `scripts/generate_sgonly_dockerfiles.py` - Generation script for generate sgonly dockerfiles.
 - `scripts/generate_start_here_by_task.py` - Generation script for generate start here by task.
+- `scripts/generate_verifier_labels.py` - Generation script for generate verifier labels.
 
 ## Migration
 
@@ -197,6 +201,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/daytona_snapshot_cleanup.py` - Utility script for daytona snapshot cleanup.
 - `scripts/dependeval_eval_dr.py` - Utility script for dependeval eval dr.
 - `scripts/dependeval_eval_me.py` - Utility script for dependeval eval me.
+- `scripts/derive_n_repos.py` - Utility script for derive n repos.
 - `scripts/docgen_quality_sweep.py` - Utility script for docgen quality sweep.
 - `scripts/doe_power_curves.py` - Utility script for doe power curves.
 - `scripts/doe_select_tasks.py` - Utility script for doe select tasks.

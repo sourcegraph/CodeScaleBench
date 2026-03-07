@@ -21,6 +21,7 @@ cd "$REPO_ROOT"
 
 # Agent code lives in-repo under agents/
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+source "$SCRIPT_DIR/_common.sh"
 
 SELECTION_FILE="$REPO_ROOT/configs/selected_benchmark_tasks.json"
 MODEL="${MODEL:-anthropic/claude-haiku-4-5-20251001}"
@@ -168,6 +169,24 @@ if [ "$DRY_RUN" = true ]; then
     exit 0
 fi
 
+if [ "$SMOKE_RUNTIME" = false ] && [ "${HARBOR_ENV:-}" = "daytona" ]; then
+    clear_daytona_cost_guard_ready
+    _cost_guard_cmd=(
+        python3 "$REPO_ROOT/scripts/daytona_cost_guard.py" preflight
+        --selection-file "$SELECTION_FILE"
+        --parallel-tasks "${#TASK_LINES[@]}"
+        --concurrency 1
+        --policy "$DAYTONA_COST_POLICY"
+        --config "baseline-local-direct"
+    )
+    for line in "${TASK_LINES[@]}"; do
+        IFS=$'\t' read -r _bm _path <<< "$line"
+        _cost_guard_cmd+=(--task-id "$(basename "$_path")")
+    done
+    "${_cost_guard_cmd[@]}" || exit 1
+    mark_daytona_cost_guard_ready
+fi
+
 mkdir -p "$JOBS_DIR"
 
 # Ensure ccb-repo-* base images are built before Docker builds.
@@ -236,7 +255,13 @@ for line in "${TASK_LINES[@]}"; do
         ) &
     else
         echo "Launching harbor smoke: $bm ($path)"
-        BASELINE_MCP_TYPE=none harbor run \
+        DAYTONA_LABEL_RUN_ID="$(basename "$JOBS_DIR")" \
+        DAYTONA_LABEL_BENCHMARK="$bm" \
+        DAYTONA_LABEL_TASK_ID="$(basename "$abs_path")" \
+        DAYTONA_LABEL_CONFIG="baseline-local-direct" \
+        DAYTONA_LABEL_CATEGORY="validation" \
+        TASK_SOURCE_DIR="$abs_path" \
+        BASELINE_MCP_TYPE=none harbor_run_guarded \
             --path "$abs_path" \
             --agent-import-path "$AGENT_PATH" \
             --model "$MODEL" \

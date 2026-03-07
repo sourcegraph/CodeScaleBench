@@ -45,6 +45,8 @@ export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 source "$SCRIPT_DIR/_common.sh"
 
 SELECTION_FILE="$REPO_ROOT/configs/selected_benchmark_tasks.json"
+DAYTONA_COST_POLICY="${DAYTONA_COST_POLICY:-$REPO_ROOT/configs/daytona_cost_policy.json}"
+DAYTONA_PARALLEL_TASK_CAP="${DAYTONA_PARALLEL_TASK_CAP:-60}"
 
 # ============================================
 # PARSE ARGUMENTS
@@ -190,8 +192,11 @@ preflight_rate_limits
 # local Docker is limited by account sessions.
 if [ "$PARALLEL_TASKS" -eq 0 ]; then
     if [ "${HARBOR_ENV:-}" = "daytona" ]; then
-        PARALLEL_TASKS=124   # 62 task pairs x 2 runs each = 124 sandboxes (Tier 3 limit: 125)
-        echo "Parallel tasks auto-set to $PARALLEL_TASKS (Daytona mode, 62 task pairs x 2 configs, 1 sandbox headroom)"
+        if [ "$DAYTONA_PARALLEL_TASK_CAP" -gt 124 ]; then
+            DAYTONA_PARALLEL_TASK_CAP=124
+        fi
+        PARALLEL_TASKS=$DAYTONA_PARALLEL_TASK_CAP
+        echo "Parallel tasks auto-set to $PARALLEL_TASKS (Daytona mode, capped by DAYTONA_PARALLEL_TASK_CAP=${DAYTONA_PARALLEL_TASK_CAP})"
     else
         PARALLEL_TASKS=$PARALLEL_JOBS  # inherits SESSIONS_PER_ACCOUNT * num_accounts from _common.sh
         echo "Parallel tasks auto-set to $PARALLEL_TASKS (local Docker, $SESSIONS_PER_ACCOUNT sessions x ${#CLAUDE_HOMES[@]} accounts)"
@@ -409,12 +414,33 @@ if [ "$RUN_FULL" = true ]; then
     echo ""
 fi
 
-# 3. Docker daemon
-if timeout 10 docker info >/dev/null 2>&1; then
-    echo "Docker:       OK"
+# 3. Execution environment readiness
+if [ "${HARBOR_ENV:-}" = "daytona" ]; then
+    echo "Execution env: Daytona"
+    echo "Cost policy:   $DAYTONA_COST_POLICY"
+    _cost_guard_cmd=(
+        python3 "$REPO_ROOT/scripts/daytona_cost_guard.py" preflight
+        --selection-file "$SELECTION_FILE"
+        --parallel-tasks "$PARALLEL_TASKS"
+        --concurrency "$CONCURRENCY"
+        --policy "$DAYTONA_COST_POLICY"
+    )
+    [ -n "$BENCHMARK_FILTER" ] && _cost_guard_cmd+=(--benchmark "$BENCHMARK_FILTER")
+    [ -n "$USE_CASE_CATEGORY_FILTER" ] && _cost_guard_cmd+=(--use-case-category "$USE_CASE_CATEGORY_FILTER")
+    [ "$RUN_BASELINE" = true ] && _cost_guard_cmd+=(--config "$BASELINE_CONFIG")
+    [ "$RUN_FULL" = true ] && _cost_guard_cmd+=(--config "$FULL_CONFIG")
+    if ! "${_cost_guard_cmd[@]}"; then
+        echo "BLOCKED: Daytona cost guard rejected this launch."
+        exit 1
+    fi
+    mark_daytona_cost_guard_ready
 else
-    echo "Docker:       FAIL — daemon not responding"
-    exit 1
+    if timeout 10 docker info >/dev/null 2>&1; then
+        echo "Docker:       OK"
+    else
+        echo "Docker:       FAIL — daemon not responding"
+        exit 1
+    fi
 fi
 
 # 4. Account token freshness
@@ -451,7 +477,9 @@ else
 fi
 
 # 6. Prebuild status
-if [ "$SKIP_PREBUILD" = false ]; then
+if [ "${HARBOR_ENV:-}" = "daytona" ]; then
+    echo "Prebuild:     skipped (Daytona builds remotely)"
+elif [ "$SKIP_PREBUILD" = false ]; then
     echo "Prebuild:     enabled (${!BENCHMARK_COUNTS[*]})"
 else
     echo "Prebuild:     SKIPPED (--skip-prebuild)"
@@ -474,7 +502,7 @@ echo ""
 # ============================================
 # DOCKER IMAGE PRE-BUILD
 # ============================================
-if [ "$SKIP_PREBUILD" = false ]; then
+if [ "$SKIP_PREBUILD" = false ] && [ "${HARBOR_ENV:-}" != "daytona" ]; then
     echo "=== Pre-building Docker images ==="
     ensure_base_images
     for bm in $(echo "${!BENCHMARK_COUNTS[@]}" | tr ' ' '\n' | sort); do
@@ -631,7 +659,12 @@ _launch_task_pair() {
             export HOME="$_bl_home"
             TASK_SOURCE_DIR="$abs_path" \
             INSTRUCTION_VARIANT="default" \
-            BASELINE_MCP_TYPE=$BL_MCP_TYPE harbor run \
+            DAYTONA_LABEL_RUN_ID="$(basename "$(dirname "$bl_jobs_dir")")" \
+            DAYTONA_LABEL_BENCHMARK="$bm" \
+            DAYTONA_LABEL_TASK_ID="$task_id" \
+            DAYTONA_LABEL_CONFIG="$BASELINE_CONFIG" \
+            DAYTONA_LABEL_CATEGORY="$CATEGORY" \
+            BASELINE_MCP_TYPE=$BL_MCP_TYPE harbor_run_guarded \
                 --path "$_bl_task_path" \
                 --agent-import-path "$AGENT_PATH" \
                 --model "$MODEL" \
@@ -701,7 +734,12 @@ _launch_task_pair() {
             TASK_SOURCE_DIR="$abs_path" \
             INSTRUCTION_VARIANT="$_instruction_variant" \
             SOURCEGRAPH_REPOS="$_sg_repos" \
-            BASELINE_MCP_TYPE=$FULL_MCP_TYPE harbor run \
+            DAYTONA_LABEL_RUN_ID="$(basename "$(dirname "$full_jobs_dir")")" \
+            DAYTONA_LABEL_BENCHMARK="$bm" \
+            DAYTONA_LABEL_TASK_ID="$task_id" \
+            DAYTONA_LABEL_CONFIG="$FULL_CONFIG" \
+            DAYTONA_LABEL_CATEGORY="$CATEGORY" \
+            BASELINE_MCP_TYPE=$FULL_MCP_TYPE harbor_run_guarded \
                 --path "$_mcp_task_path" \
                 --agent-import-path "$AGENT_PATH" \
                 --model "$MODEL" \

@@ -8,6 +8,111 @@
 # All runs use Claude Max subscription (OAuth tokens).
 # API key mode has been removed. USE_SUBSCRIPTION is always true.
 export USE_SUBSCRIPTION=true
+DAYTONA_ENV_IMPORT_PATH="${DAYTONA_ENV_IMPORT_PATH:-ccb_harbor.daytona:GuardedDaytonaEnvironment}"
+DAYTONA_ENFORCE_GUARD="${DAYTONA_ENFORCE_GUARD:-1}"
+DAYTONA_COST_POLICY="${DAYTONA_COST_POLICY:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/configs/daytona_cost_policy.json}"
+
+mark_daytona_cost_guard_ready() {
+    export DAYTONA_COST_GUARD_PREFLIGHT_DONE=1
+}
+
+clear_daytona_cost_guard_ready() {
+    unset DAYTONA_COST_GUARD_PREFLIGHT_DONE 2>/dev/null || true
+}
+
+_ccb_repo_root() {
+    cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd
+}
+
+# Launchers and helper scripts should always have a repo root available for
+# invoking repo-local utilities such as the Daytona cost guard.
+export REPO_ROOT="${REPO_ROOT:-$(_ccb_repo_root)}"
+
+_harbor_args_include_env_flag() {
+    local arg
+    for arg in "$@"; do
+        if [ "$arg" = "--env" ] || [ "$arg" = "-e" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+_parse_harbor_arg_value() {
+    local wanted="$1"
+    shift
+    local prev=""
+    local arg
+    for arg in "$@"; do
+        if [ "$prev" = "$wanted" ]; then
+            printf '%s' "$arg"
+            return 0
+        fi
+        prev="$arg"
+    done
+    return 1
+}
+
+harbor_run_guarded() {
+    local repo_root
+    repo_root="$(_ccb_repo_root)"
+    local args=("$@")
+    local command=(harbor run)
+
+    local use_daytona=false
+    if [ "${HARBOR_ENV:-}" = "daytona" ]; then
+        use_daytona=true
+    elif _harbor_args_include_env_flag "${args[@]}" && [ "$(_parse_harbor_arg_value --env "${args[@]}")" = "daytona" ]; then
+        use_daytona=true
+    elif _harbor_args_include_env_flag "${args[@]}" && [ "$(_parse_harbor_arg_value -e "${args[@]}")" = "daytona" ]; then
+        use_daytona=true
+    fi
+
+    if [ "$use_daytona" = true ]; then
+        if [ "${DAYTONA_ENFORCE_GUARD}" = "1" ] \
+            && [ "${DAYTONA_COST_GUARD_PREFLIGHT_DONE:-}" != "1" ] \
+            && [ "${HARBOR_ALLOW_UNGUARDED_DAYTONA:-}" != "1" ]; then
+            echo "ERROR: Daytona launch blocked. Run the Daytona cost preflight first or set HARBOR_ALLOW_UNGUARDED_DAYTONA=1."
+            return 1
+        fi
+
+        if ! _harbor_args_include_env_flag "${args[@]}"; then
+            command+=(--env daytona)
+        fi
+
+        command+=(--environment-import-path "$DAYTONA_ENV_IMPORT_PATH")
+
+        local task_path jobs_dir job_name model
+        task_path="$(_parse_harbor_arg_value --path "${args[@]}")"
+        jobs_dir="$(_parse_harbor_arg_value --jobs-dir "${args[@]}")"
+        job_name="$(_parse_harbor_arg_value --job-name "${args[@]}")"
+        model="$(_parse_harbor_arg_value --model "${args[@]}")"
+
+        local task_source_dir config_name run_id benchmark task_id category launcher mcp_type
+        task_source_dir="${TASK_SOURCE_DIR:-$task_path}"
+        config_name="${DAYTONA_LABEL_CONFIG:-$(basename "${jobs_dir:-unknown}")}"
+        run_id="${DAYTONA_LABEL_RUN_ID:-$(basename "$(dirname "${jobs_dir:-unknown}")")}"
+        benchmark="${DAYTONA_LABEL_BENCHMARK:-$(basename "$(dirname "${task_source_dir:-unknown}")")}"
+        task_id="${DAYTONA_LABEL_TASK_ID:-$(basename "${task_source_dir:-unknown}")}"
+        category="${DAYTONA_LABEL_CATEGORY:-$(basename "$(dirname "$(dirname "${jobs_dir:-unknown}")")")}"
+        launcher="${DAYTONA_LABEL_LAUNCHER:-$(basename "$0")}"
+        mcp_type="${DAYTONA_LABEL_MCP_TYPE:-${BASELINE_MCP_TYPE:-}}"
+
+        [ -n "$launcher" ] && command+=(--ek "label_launcher=$launcher")
+        [ -n "$run_id" ] && command+=(--ek "label_run_id=$run_id")
+        [ -n "$benchmark" ] && command+=(--ek "label_benchmark=$benchmark")
+        [ -n "$task_id" ] && command+=(--ek "label_task_id=$task_id")
+        [ -n "$config_name" ] && command+=(--ek "label_config=$config_name")
+        [ -n "$job_name" ] && command+=(--ek "label_job_name=$job_name")
+        [ -n "$category" ] && command+=(--ek "label_category=$category")
+        [ -n "$model" ] && command+=(--ek "label_model=$model")
+        [ -n "$mcp_type" ] && command+=(--ek "label_mcp_type=$mcp_type")
+        [ -n "$task_source_dir" ] && command+=(--ek "task_source_dir=$task_source_dir")
+    fi
+
+    command+=("${args[@]}")
+    "${command[@]}"
+}
 
 # Guard function: call this in each 3config script instead of the old if/else auth block.
 enforce_subscription_mode() {

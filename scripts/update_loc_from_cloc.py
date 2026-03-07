@@ -71,6 +71,8 @@ SG_EVALS_TO_CANONICAL = {
     "sg-evals/elasticsearch--v8.17.0": "elastic/elasticsearch",
     "sg-evals/ceph--v19.2.1": "ceph/ceph",
     "sg-evals/ClickHouse--v24.12": "ClickHouse/ClickHouse",
+    "sg-evals/expressjs-express": "expressjs/express",
+    "sg-evals/scipy": "scipy/scipy",
 }
 
 # Special bare-name repos
@@ -79,6 +81,10 @@ BARE_NAME_MAP = {
     "pytorch": "pytorch/pytorch",
     "torvalds/linux": "linux",
     "chromium/chromium": "chromium/src",
+}
+
+REPO_ALIAS_MAP = {
+    "sourcegraph-testing/prometheus-common": "prometheus/common",
 }
 
 # Multi-repo comma-separated entries -> list of cloc keys
@@ -92,6 +98,8 @@ def resolve_repo_to_cloc_key(repo_str: str) -> list[str]:
     """Return list of cloc keys to look up for a given repo string."""
     if not repo_str:
         return []
+    if repo_str in REPO_ALIAS_MAP:
+        return [REPO_ALIAS_MAP[repo_str]]
     if "," in repo_str:
         # Check explicit mapping first
         if repo_str in MULTI_REPO_MAP:
@@ -113,10 +121,102 @@ def resolve_repo_to_cloc_key(repo_str: str) -> list[str]:
     return [repo_str]
 
 
-def update_task(task: dict, cloc_data: dict) -> bool:
-    """Update a single task's LOC fields from cloc data. Returns True if updated."""
+def find_task_dir(task: dict) -> Path | None:
+    """Resolve a task to its benchmark directory."""
+    task_dir = task.get("task_dir")
+    if task_dir:
+        path = PROJ_ROOT / task_dir
+        if path.is_dir():
+            return path
+
+    benchmark = task.get("benchmark")
+    task_id = task.get("task_id")
+    if not benchmark or not task_id:
+        return None
+
+    bench_dir = PROJ_ROOT / "benchmarks" / benchmark
+    if not bench_dir.is_dir():
+        return None
+
+    direct = bench_dir / str(task_id)
+    if direct.is_dir():
+        return direct
+
+    lower = bench_dir / str(task_id).lower()
+    if lower.is_dir():
+        return lower
+
+    target = str(task_id).lower()
+    for child in bench_dir.iterdir():
+        if child.name.lower() == target:
+            return child
+    return None
+
+
+def _collect_repos(value, repos: set[str]) -> None:
+    """Recursively collect repo names from oracle structures."""
+    if isinstance(value, dict):
+        repo = value.get("repo")
+        if isinstance(repo, str) and repo:
+            repos.add(repo)
+        for nested in value.values():
+            _collect_repos(nested, repos)
+    elif isinstance(value, list):
+        for nested in value:
+            _collect_repos(nested, repos)
+
+
+def repos_from_task_spec(task: dict) -> list[str]:
+    """Extract canonical repo identifiers from a task's oracle spec."""
+    task_dir = find_task_dir(task)
+    if task_dir is None:
+        return []
+
+    spec_path = task_dir / "tests" / "task_spec.json"
+    if not spec_path.is_file():
+        return []
+
+    try:
+        spec = json.loads(spec_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    repos: set[str] = set()
+    oracle = spec.get("artifacts", {}).get("oracle", {})
+    _collect_repos(oracle, repos)
+
+    canonical = []
+    for repo in sorted(repos):
+        keys = resolve_repo_to_cloc_key(repo)
+        if keys:
+            canonical.extend(keys)
+        else:
+            canonical.append(repo)
+
+    return sorted(dict.fromkeys(canonical))
+
+
+def resolve_repos_for_task(task: dict) -> tuple[list[str], str | None]:
+    """Resolve cloc keys for a task, falling back to task-spec repo metadata."""
     repo_str = task.get("repo", "")
     cloc_keys = resolve_repo_to_cloc_key(repo_str)
+    if cloc_keys:
+        return list(dict.fromkeys(cloc_keys)), None
+
+    fallback_repos = repos_from_task_spec(task)
+    if not fallback_repos:
+        return [], None
+
+    canonical_repo_str = ",".join(fallback_repos)
+    cloc_keys = []
+    for repo in fallback_repos:
+        cloc_keys.extend(resolve_repo_to_cloc_key(repo))
+    return list(dict.fromkeys(cloc_keys)), canonical_repo_str
+
+
+def update_task(task: dict, cloc_data: dict) -> bool:
+    """Update a single task's LOC fields from cloc data. Returns True if updated."""
+    cloc_keys, canonical_repo_str = resolve_repos_for_task(task)
 
     if not cloc_keys:
         return False
@@ -152,6 +252,8 @@ def update_task(task: dict, cloc_data: dict) -> bool:
     task["repo_cloc_top_languages"] = [
         {"language": lang, "code_lines": lines} for lang, lines in sorted_langs
     ]
+    if canonical_repo_str and task.get("repo") in ("", "org/repo"):
+        task["repo"] = canonical_repo_str
 
     return True
 

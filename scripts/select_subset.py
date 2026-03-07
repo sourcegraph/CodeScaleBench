@@ -2,7 +2,7 @@
 """Select a representative subset of benchmark tasks for validation runs.
 
 Stratified sampling across suites, languages, difficulties, and codebase
-size bands to produce subsets that preserve the full benchmark's distribution.
+LOC bands to produce subsets that preserve the full benchmark's distribution.
 
 Suites are classified by observed MCP effect-size direction so the subset
 covers the full spectrum: high-positive, near-zero, negative, and mixed.
@@ -68,14 +68,19 @@ SUITE_BUCKETS = {
 MIN_PER_SUITE = 3
 
 
-def size_band(mb: float) -> str:
-    if mb < 100:
-        return "<100MB"
-    elif mb < 500:
-        return "100-500MB"
-    elif mb < 1000:
-        return "500MB-1GB"
-    return ">=1GB"
+def loc_band(loc: int | None) -> str:
+    """Bucket repositories by cloc-derived code lines."""
+    if loc is None:
+        return "unknown"
+    if loc < 400_000:
+        return "<400K"
+    if loc < 2_000_000:
+        return "400K-2M"
+    if loc < 8_000_000:
+        return "2M-8M"
+    if loc < 40_000_000:
+        return "8M-40M"
+    return ">40M"
 
 
 def primary_language(lang: str) -> str:
@@ -161,9 +166,9 @@ def allocate_per_suite(tasks: list[dict], target: int) -> dict[str, int]:
 # ---------------------------------------------------------------------------
 
 def sample_suite(suite_tasks: list[dict], n: int, rng: random.Random) -> list[dict]:
-    """Pick n tasks from a suite, stratified by language and size band.
+    """Pick n tasks from a suite, stratified by language and LOC band.
 
-    We build strata as (primary_language, size_band) pairs and sample
+    We build strata as (primary_language, loc_band) pairs and sample
     proportionally from each stratum.  If a stratum is too small we
     take all of it and redistribute.
     """
@@ -174,8 +179,8 @@ def sample_suite(suite_tasks: list[dict], n: int, rng: random.Random) -> list[di
     strata: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for t in suite_tasks:
         lang = primary_language(t.get("language", "other"))
-        sb = size_band(t.get("repo_size_mb", 0) or 0)
-        strata[(lang, sb)].append(t)
+        lb = loc_band(t.get("repo_approx_loc"))
+        strata[(lang, lb)].append(t)
 
     selected: list[dict] = []
     remaining_n = n
@@ -383,8 +388,8 @@ def write_outputs(selected: list[dict], name: str, alloc: dict[str, int],
     diff_dist = Counter(t.get("difficulty", "?") for t in selected)
     print(f"Difficulties: {dict(diff_dist)}")
 
-    size_dist = Counter(size_band(t.get("repo_size_mb", 0) or 0) for t in selected)
-    print(f"Size bands: {dict(size_dist)}")
+    loc_dist = Counter(loc_band(t.get("repo_approx_loc")) for t in selected)
+    print(f"LOC bands: {dict(loc_dist)}")
 
     if show_power:
         print(power_report(alloc, sigmas, selected))

@@ -23,7 +23,6 @@ Writes the actual listen port to /tmp/sg_proxy_port on startup.
 import argparse
 import json
 import os
-import sys
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.request

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -49,6 +50,35 @@ def check_selection_file(repo_root: Path) -> int:
         print(f"  selection_file: FAILED (invalid JSON: {e})")
         return 1
     print("  selection_file: OK")
+    return 0
+
+
+def check_launch_policy(repo_root: Path) -> int:
+    """Reject raw harbor run invocations in launcher scripts outside the shared wrapper."""
+    configs_dir = repo_root / "configs"
+    offenders: list[str] = []
+    raw_harbor_pattern = re.compile(r"(^|[^\w])harbor run([^\w]|$)")
+
+    for script_path in sorted(configs_dir.glob("*.sh")):
+        if script_path.name == "_common.sh":
+            continue
+        for lineno, raw_line in enumerate(script_path.read_text().splitlines(), start=1):
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("echo ") or stripped.startswith('echo"') or stripped.startswith("printf "):
+                continue
+            if raw_harbor_pattern.search(raw_line):
+                offenders.append(f"{script_path.relative_to(repo_root)}:{lineno}")
+
+    if offenders:
+        print("  launch_policy: FAILED")
+        print("    Raw `harbor run` is not allowed in configs/*.sh outside configs/_common.sh.")
+        for offender in offenders[:15]:
+            print(f"    {offender}")
+        return 1
+
+    print("  launch_policy: OK")
     return 0
 
 
@@ -102,6 +132,8 @@ def main() -> int:
 
         if name == "selection_file":
             code = check_selection_file(REPO_ROOT)
+        elif name == "launch_policy":
+            code = check_launch_policy(REPO_ROOT)
         elif spec.get("script"):
             script = spec["script"]
             script_args = spec.get("args") or []

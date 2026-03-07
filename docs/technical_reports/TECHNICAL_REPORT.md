@@ -999,15 +999,15 @@ The benchmark remains dominated by hard tasks. In this aggregation, hard and med
 
 ### 11.9 Impact by Codebase Size
 
-Codebase-size analysis in this pass uses estimated LOC from GitHub repository size (`/repos/{owner}/{repo}.size` in KB), mapped to shared LOC bands.
+Codebase-scale analysis now uses cloc-derived repository LOC (`repo_approx_loc`), not GitHub repository size proxies. The canonical LOC bands are shared across reports and selection scripts.
 
-| Estimated LOC Band | n | BL Mean | MCP Mean | Δ Reward |
-|--------------------|---|---------|----------|----------|
-| <400K | 3 | 0.850 | 0.770 | -0.080 |
-| 400K-2M | 8 | 0.140 | 0.399 | +0.259 |
-| 2M-8M | 48 | 0.521 | 0.483 | -0.037 |
-| 8M-40M | 166 | 0.489 | 0.544 | +0.055 |
-| >40M | 145 | 0.462 | 0.492 | +0.030 |
+| LOC Band (cloc) | n | BL Mean | MCP Mean | Δ Reward |
+|-----------------|---|---------|----------|----------|
+| <400K | 50 | 0.404 | 0.483 | +0.079 |
+| 400K-2M | 169 | 0.516 | 0.525 | +0.009 |
+| 2M-8M | 129 | 0.433 | 0.433 | +0.000 |
+| 8M-40M | 47 | 0.494 | 0.511 | +0.017 |
+| >40M | 3 | 0.201 | 0.309 | +0.108 |
 
 MCP reward impact is size-dependent: strong positive lift in 400K-2M and moderate lift in 8M-40M and >40M, with mixed signal in smaller/mid bands.
 

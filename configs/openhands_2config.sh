@@ -216,6 +216,25 @@ echo "ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:+set (${#ANTHROPIC_API_KEY} chars)}
 echo "Storage override: ${DAYTONA_OVERRIDE_STORAGE:-<none>} MB"
 echo ""
 
+if [ "${HARBOR_ENV:-}" = "daytona" ]; then
+    clear_daytona_cost_guard_ready
+    _cost_guard_cmd=(
+        python3 "$REPO_ROOT/scripts/daytona_cost_guard.py" preflight
+        --selection-file "$SELECTION_FILE"
+        --parallel-tasks "$PARALLEL_JOBS"
+        --concurrency "$CONCURRENCY"
+        --policy "$DAYTONA_COST_POLICY"
+    )
+    [ -n "$BENCHMARK_FILTER" ] && _cost_guard_cmd+=(--benchmark "$BENCHMARK_FILTER")
+    for task_id in "${TASK_IDS[@]}"; do
+        _cost_guard_cmd+=(--task-id "$task_id")
+    done
+    [ "$RUN_BASELINE" = true ] && _cost_guard_cmd+=(--config "baseline-local-direct")
+    [ "$RUN_FULL" = true ] && _cost_guard_cmd+=(--config "mcp-remote-direct")
+    "${_cost_guard_cmd[@]}" || exit 1
+    mark_daytona_cost_guard_ready
+fi
+
 _openhands_run_single() {
     local task_id=$1
     local _task_home=$2
@@ -293,14 +312,19 @@ if os.path.exists(creds_file):
     fi
 
     echo "Running task: $task_id ($config)"
-    BASELINE_MCP_TYPE="$mcp_type" harbor run \
+    DAYTONA_LABEL_RUN_ID="$(basename "$JOBS_BASE")" \
+    DAYTONA_LABEL_BENCHMARK="${TASK_SUITE_BY_ID[$task_id]}" \
+    DAYTONA_LABEL_TASK_ID="$task_id" \
+    DAYTONA_LABEL_CONFIG="$config" \
+    DAYTONA_LABEL_CATEGORY="$CATEGORY" \
+    TASK_SOURCE_DIR="$task_path" \
+    BASELINE_MCP_TYPE="$mcp_type" harbor_run_guarded \
         --path "$_run_path" \
         --agent-import-path "$AGENT_PATH" \
         --model "$MODEL" \
         --jobs-dir "$jobs_subdir" \
         -n "$CONCURRENCY" \
         --timeout-multiplier "$TIMEOUT_MULTIPLIER" \
-        ${HARBOR_ENV:+--env "$HARBOR_ENV"} \
         ${DAYTONA_OVERRIDE_STORAGE:+--override-storage-mb "$DAYTONA_OVERRIDE_STORAGE"} \
         2>&1 | tee "${jobs_subdir}/${task_id}.log" \
         || echo "WARNING: Task $task_id ($config) failed"
