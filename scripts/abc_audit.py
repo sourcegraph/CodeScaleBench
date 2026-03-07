@@ -1056,6 +1056,67 @@ def check_ob_negated_solutions(tasks: list[Path]) -> CriterionResult:
     )
 
 
+def check_og_determinism(tasks: list[Path]) -> CriterionResult:
+    """O.g: Verifiers produce deterministic results (no unseeded randomness)."""
+    issues = []
+    # Non-deterministic commands that affect scoring when used in comparisons
+    NONDETERMINISTIC_CMDS = re.compile(
+        r'\$RANDOM|\buuidgen\b|\bshuf\b'
+    )
+    # date command substitution used in comparisons/assertions (not just logging)
+    DATE_IN_COMPARISON = re.compile(
+        r'(?:\[\s*.*\$\(date\b|==\s*.*\$\(date\b|!=\s*.*\$\(date\b)'
+    )
+    # mktemp used in assertions/comparisons (not just for scratch files)
+    MKTEMP_IN_ASSERT = re.compile(
+        r'(?:diff|cmp|==|!=|grep|assert).*\$\(mktemp|mktemp.*(?:diff|cmp|==|!=|grep|assert)'
+    )
+    for task_dir in tasks:
+        verifier = _get_primary_verifier(task_dir)
+        if not verifier:
+            continue
+
+        content = verifier.read_text(errors="replace")
+        task_name = task_dir.name
+        task_issues = []
+
+        if verifier.suffix == ".sh":
+            if NONDETERMINISTIC_CMDS.search(content):
+                matches = NONDETERMINISTIC_CMDS.findall(content)
+                task_issues.append(f"non-deterministic command: {matches[0]}")
+
+            if DATE_IN_COMPARISON.search(content):
+                task_issues.append("date output used in comparison/assertion")
+
+            if MKTEMP_IN_ASSERT.search(content):
+                task_issues.append("mktemp path used in assertion/comparison")
+
+        elif verifier.suffix == ".py":
+            # Flag unseeded random usage
+            if re.search(r'\brandom\.\w+\(', content):
+                # Check if random is seeded
+                if not re.search(r'random\.seed\(', content):
+                    task_issues.append("unseeded random module usage")
+            # Flag uuid usage in assertions
+            if re.search(r'\buuid\.\w+\(', content):
+                task_issues.append("uuid generation in verifier")
+
+        if task_issues:
+            issues.append(f"{task_name}: {'; '.join(task_issues)}")
+
+    if not issues:
+        return CriterionResult(
+            criterion_id="O.g", status=Status.PASS,
+            evidence=f"No non-deterministic patterns found across {len(tasks)} verifiers",
+        )
+    return CriterionResult(
+        criterion_id="O.g", status=Status.WARN,
+        evidence="\n".join(issues[:10]),
+        remediation="Remove non-deterministic commands from verifier scoring logic, or seed random generators",
+        details={"issue_count": len(issues), "issues": issues[:20]},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main auditor
 # ---------------------------------------------------------------------------
@@ -1071,6 +1132,7 @@ TASK_CHECKS = {
     "O.a": check_oa_equivalent_solutions,
     "O.b": check_ob_negated_solutions,
     "O.c": check_oc_empty_solution_rejected,
+    "O.g": check_og_determinism,
     "O.d": check_od_error_handling,
     "O.e": check_oe_multiple_assertions,
     "O.h": check_oh_reward_format,
@@ -1099,7 +1161,7 @@ PROJECT_CHECKS = {
 }
 
 # Semi-automated / manual checks (skip with note)
-SKIP_CHECKS = {"T.2", "T.9", "O.f", "O.g", "R.6"}
+SKIP_CHECKS = {"T.2", "T.9", "O.f", "R.6"}
 
 
 def audit_suite(suite: str, dimension: Optional[Dimension] = None) -> AuditReport:
