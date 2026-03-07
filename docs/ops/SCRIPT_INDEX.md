@@ -160,6 +160,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/generate_artifact_only_dockerfiles.py` - Generation script for generate artifact only dockerfiles.
 - `scripts/generate_coverage_gap_configs.py` - Generation script for generate coverage gap configs.
 - `scripts/generate_instruction_mcp.py` - Generation script for generate instruction mcp.
+- `scripts/generate_promoted_verifiers.py` - Generation script for generate promoted verifiers.
 - `scripts/generate_repoqa_largerepo_tasks.py` - Generation script for generate repoqa largerepo tasks.
 - `scripts/generate_sgonly_dockerfiles.py` - Generation script for generate sgonly dockerfiles.
 - `scripts/generate_start_here_by_task.py` - Generation script for generate start here by task.
@@ -237,6 +238,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/prepare_analysis_runs.py` - Utility script for prepare analysis runs.
 - `scripts/promote_agent_oracles.py` - Utility script for promote agent oracles.
 - `scripts/promote_blocked.py` - Utility script for promote blocked.
+- `scripts/promoted_verifier.py` - Utility script for promoted verifier.
 - `scripts/push_base_images_ghcr.sh` - Utility script for push base images ghcr.
 - `scripts/regenerate_artifact_dockerfiles.py` - Utility script for regenerate artifact dockerfiles.
 - `scripts/rehost_sweap_images.py` - Utility script for rehost sweap images.
