@@ -889,6 +889,64 @@ def check_r13_manifest() -> CriterionResult:
     )
 
 
+def check_t10_shared_state(tasks: list[Path]) -> CriterionResult:
+    """T.10: Tasks don't share mutable state (no hardcoded ports, shared /tmp, named volumes)."""
+    issues = []
+    for task_dir in tasks:
+        task_name = task_dir.name
+        task_issues = []
+
+        # Scan Dockerfiles
+        env_dir = task_dir / "environment"
+        if env_dir.is_dir():
+            for df in env_dir.iterdir():
+                if df.name.startswith("Dockerfile") and df.is_file():
+                    content = df.read_text(errors="replace")
+                    # Check for EXPOSE (binds to host ports)
+                    exposed = re.findall(r"^\s*EXPOSE\s+(\d+)", content, re.MULTILINE)
+                    if exposed:
+                        task_issues.append(f"{df.name}: EXPOSE {', '.join(exposed)}")
+
+        # Scan test.sh / eval.sh for shared state
+        for rel in ("tests/test.sh", "tests/eval.sh"):
+            script = task_dir / rel
+            if not script.is_file():
+                continue
+            content = script.read_text(errors="replace")
+
+            # Hardcoded ports (e.g., localhost:8080, 0.0.0.0:3000, -p 8080:8080)
+            port_binds = re.findall(r"-p\s+(\d+:\d+)", content)
+            if port_binds:
+                task_issues.append(f"{rel}: host port binding {', '.join(port_binds)}")
+
+            # Fixed /tmp paths (e.g., /tmp/mytest, /tmp/results) — skip dynamic like /tmp/$$ or mktemp
+            fixed_tmp = re.findall(r"/tmp/([a-zA-Z][a-zA-Z0-9_.-]+)", content)
+            # Filter out common safe patterns (mktemp results, variable expansions)
+            fixed_tmp = [t for t in fixed_tmp if not re.match(r"tmp\.", t)]
+            if fixed_tmp:
+                task_issues.append(f"{rel}: fixed /tmp paths: /tmp/{', /tmp/'.join(fixed_tmp[:3])}")
+
+            # Named Docker volumes
+            named_vols = re.findall(r"docker\s+.*-v\s+([a-zA-Z]\w+):/", content)
+            if named_vols:
+                task_issues.append(f"{rel}: named Docker volumes: {', '.join(named_vols)}")
+
+        if task_issues:
+            issues.append(f"{task_name}: {'; '.join(task_issues)}")
+
+    if not issues:
+        return CriterionResult(
+            criterion_id="T.10", status=Status.PASS,
+            evidence=f"No shared-state concerns found across {len(tasks)} tasks",
+        )
+    return CriterionResult(
+        criterion_id="T.10", status=Status.FAIL,
+        evidence="\n".join(issues[:10]),
+        remediation="Remove hardcoded ports, use mktemp for temp paths, avoid named Docker volumes",
+        details={"issue_count": len(issues), "issues": issues[:20]},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main auditor
 # ---------------------------------------------------------------------------
@@ -908,6 +966,7 @@ TASK_CHECKS = {
     "O.i": check_oi_partial_credit,
     "R.1": check_r1_files_exist,
     "R.2": check_r2_no_contamination,
+    "T.10": check_t10_shared_state,
 }
 
 # Functions that take suite: str
@@ -929,7 +988,7 @@ PROJECT_CHECKS = {
 }
 
 # Semi-automated / manual checks (skip with note)
-SKIP_CHECKS = {"T.2", "T.9", "T.10", "O.a", "O.b", "O.f", "O.g", "R.6"}
+SKIP_CHECKS = {"T.2", "T.9", "O.a", "O.b", "O.f", "O.g", "R.6"}
 
 
 def audit_suite(suite: str, dimension: Optional[Dimension] = None) -> AuditReport:
