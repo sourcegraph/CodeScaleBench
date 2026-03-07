@@ -1556,6 +1556,234 @@ def check_t7_metadata_sync(tasks: list[Path]) -> CriterionResult:
     )
 
 
+def check_t10_shared_state(tasks: list[Path]) -> CriterionResult:
+    """T.10: Tasks don't share mutable state (no hardcoded ports, shared /tmp, named volumes)."""
+    issues = []
+    for task_dir in tasks:
+        task_name = task_dir.name
+        task_issues = []
+
+        # Scan Dockerfiles
+        env_dir = task_dir / "environment"
+        if env_dir.is_dir():
+            for df in env_dir.iterdir():
+                if df.name.startswith("Dockerfile") and df.is_file():
+                    content = df.read_text(errors="replace")
+                    # Check for EXPOSE (binds to host ports)
+                    exposed = re.findall(r"^\s*EXPOSE\s+(\d+)", content, re.MULTILINE)
+                    if exposed:
+                        task_issues.append(f"{df.name}: EXPOSE {', '.join(exposed)}")
+
+        # Scan test.sh / eval.sh for shared state
+        for rel in ("tests/test.sh", "tests/eval.sh"):
+            script = task_dir / rel
+            if not script.is_file():
+                continue
+            content = script.read_text(errors="replace")
+
+            # Hardcoded ports (e.g., localhost:8080, 0.0.0.0:3000, -p 8080:8080)
+            port_binds = re.findall(r"-p\s+(\d+:\d+)", content)
+            if port_binds:
+                task_issues.append(f"{rel}: host port binding {', '.join(port_binds)}")
+
+            # Fixed /tmp paths (e.g., /tmp/mytest, /tmp/results) — skip dynamic like /tmp/$$ or mktemp
+            fixed_tmp = re.findall(r"/tmp/([a-zA-Z][a-zA-Z0-9_.-]+)", content)
+            # Filter out common safe patterns (mktemp results, variable expansions)
+            fixed_tmp = [t for t in fixed_tmp if not re.match(r"tmp\.", t)]
+            if fixed_tmp:
+                task_issues.append(f"{rel}: fixed /tmp paths: /tmp/{', /tmp/'.join(fixed_tmp[:3])}")
+
+            # Named Docker volumes
+            named_vols = re.findall(r"docker\s+.*-v\s+([a-zA-Z]\w+):/", content)
+            if named_vols:
+                task_issues.append(f"{rel}: named Docker volumes: {', '.join(named_vols)}")
+
+        if task_issues:
+            issues.append(f"{task_name}: {'; '.join(task_issues)}")
+
+    if not issues:
+        return CriterionResult(
+            criterion_id="T.10", status=Status.PASS,
+            evidence=f"No shared-state concerns found across {len(tasks)} tasks",
+        )
+    return CriterionResult(
+        criterion_id="T.10", status=Status.FAIL,
+        evidence="\n".join(issues[:10]),
+        remediation="Remove hardcoded ports, use mktemp for temp paths, avoid named Docker volumes",
+        details={"issue_count": len(issues), "issues": issues[:20]},
+    )
+
+
+def check_oa_equivalent_solutions(tasks: list[Path]) -> CriterionResult:
+    """O.a: Verifiers accept functionally equivalent solutions (no overly-strict matching)."""
+    issues = []
+    for task_dir in tasks:
+        verifier = _get_primary_verifier(task_dir)
+        if not verifier:
+            continue
+
+        content = verifier.read_text(errors="replace")
+        task_name = task_dir.name
+        task_issues = []
+
+        if verifier.suffix == ".sh":
+            # Flag grep -Fx (exact fixed-string line match)
+            if re.search(r"\bgrep\s+.*-[A-Za-z]*F[A-Za-z]*x|grep\s+.*-[A-Za-z]*x[A-Za-z]*F", content):
+                task_issues.append("grep -Fx (exact fixed-string match)")
+
+            # Flag direct string equality tests: [ "$var" = "hardcoded" ] or == "hardcoded"
+            strict_eq = re.findall(r'\[\s*"\$\w+"\s*==?\s*"([^"]+)"\s*\]', content)
+            if strict_eq:
+                task_issues.append(f"exact string comparison against: {', '.join(strict_eq[:3])}")
+
+            # Flag diff without any tolerance flags (allow diff -w, diff -b, diff --ignore)
+            diff_calls = re.finditer(r"\bdiff\s+([^\n|;&]+)", content)
+            for m in diff_calls:
+                args = m.group(1)
+                if re.search(r"-[A-Za-z]*[wbBi]|--ignore|--strip", args):
+                    continue
+                if "<(" in args:
+                    continue
+                task_issues.append("diff without tolerance flags (-w/-b/--ignore)")
+                break
+
+        if task_issues:
+            issues.append(f"{task_name}: {'; '.join(task_issues)}")
+
+    if not issues:
+        return CriterionResult(
+            criterion_id="O.a", status=Status.PASS,
+            evidence=f"No overly-strict matching found across {len(tasks)} verifiers",
+        )
+    return CriterionResult(
+        criterion_id="O.a", status=Status.WARN,
+        evidence="\n".join(issues[:10]),
+        remediation="Consider using flexible matching (regex, -i flag, tolerance) in verifiers",
+        details={"issue_count": len(issues), "issues": issues[:20]},
+    )
+
+
+def check_ob_negated_solutions(tasks: list[Path]) -> CriterionResult:
+    """O.b: Verifiers reject negated/inverted solutions (no keyword-only matching)."""
+    issues = []
+    for task_dir in tasks:
+        verifier = _get_primary_verifier(task_dir)
+        if not verifier or verifier.suffix != ".sh":
+            continue
+
+        content = verifier.read_text(errors="replace")
+        task_name = task_dir.name
+        task_issues = []
+
+        # Find bare grep for a single short keyword without robust flags.
+        # These could match "NOT keyword" or "the answer is definitely not keyword".
+        # Exclude greps with flags: -E (regex), -P (perl), -w (word boundary),
+        # -c (count), -r/-R (recursive code search), -l (file list), -q (boolean),
+        # -n (line numbers).
+        bare_greps = re.finditer(
+            r"""grep\s+(?:-[A-Za-z]*\s+)*['"]([^'"]{1,20})['"]\s+(\S+)""",
+            content,
+        )
+        for m in bare_greps:
+            keyword = m.group(1).strip()
+            target = m.group(2)
+            prefix = m.group(0).split(keyword)[0]
+
+            # Skip multi-word or regex patterns (inherently more specific)
+            if re.search(r"[.*+?^${}()|\\[\]]", keyword) or " " in keyword:
+                continue
+
+            # Skip if grep has flags that make matching more robust
+            if re.search(r"-[A-Za-z]*[cEPrlRwqn]", prefix):
+                continue
+
+            # Skip if grepping source code files (not agent output)
+            if re.search(r"\.(py|js|ts|go|java|rs|c|cpp|sh|rb|yaml|yml|toml|json|md)$", target):
+                continue
+
+            # Skip if target is log/reward/result paths (structured output)
+            if re.search(r"/logs/|reward\.|result\.|\.log", target):
+                continue
+
+            task_issues.append(f"bare grep for '{keyword}' could match negated answer")
+
+        if task_issues:
+            issues.append(f"{task_name}: {'; '.join(task_issues[:3])}")
+
+    if not issues:
+        return CriterionResult(
+            criterion_id="O.b", status=Status.PASS,
+            evidence=f"No keyword-only matching vulnerable to negation across {len(tasks)} verifiers",
+        )
+    return CriterionResult(
+        criterion_id="O.b", status=Status.WARN,
+        evidence="\n".join(issues[:10]),
+        remediation="Use multi-word patterns, regex with context, or structured JSON validation instead of bare keyword grep",
+        details={"issue_count": len(issues), "issues": issues[:20]},
+    )
+
+
+def check_og_determinism(tasks: list[Path]) -> CriterionResult:
+    """O.g: Verifiers produce deterministic results (no unseeded randomness)."""
+    issues = []
+    # Non-deterministic commands that affect scoring when used in comparisons
+    NONDETERMINISTIC_CMDS = re.compile(
+        r'\$RANDOM|\buuidgen\b|\bshuf\b'
+    )
+    # date command substitution used in comparisons/assertions (not just logging)
+    DATE_IN_COMPARISON = re.compile(
+        r'(?:\[\s*.*\$\(date\b|==\s*.*\$\(date\b|!=\s*.*\$\(date\b)'
+    )
+    # mktemp used in assertions/comparisons (not just for scratch files)
+    MKTEMP_IN_ASSERT = re.compile(
+        r'(?:diff|cmp|==|!=|grep|assert).*\$\(mktemp|mktemp.*(?:diff|cmp|==|!=|grep|assert)'
+    )
+    for task_dir in tasks:
+        verifier = _get_primary_verifier(task_dir)
+        if not verifier:
+            continue
+
+        content = verifier.read_text(errors="replace")
+        task_name = task_dir.name
+        task_issues = []
+
+        if verifier.suffix == ".sh":
+            if NONDETERMINISTIC_CMDS.search(content):
+                matches = NONDETERMINISTIC_CMDS.findall(content)
+                task_issues.append(f"non-deterministic command: {matches[0]}")
+
+            if DATE_IN_COMPARISON.search(content):
+                task_issues.append("date output used in comparison/assertion")
+
+            if MKTEMP_IN_ASSERT.search(content):
+                task_issues.append("mktemp path used in assertion/comparison")
+
+        elif verifier.suffix == ".py":
+            # Flag unseeded random usage
+            if re.search(r'\brandom\.\w+\(', content):
+                # Check if random is seeded
+                if not re.search(r'random\.seed\(', content):
+                    task_issues.append("unseeded random module usage")
+            # Flag uuid usage in assertions
+            if re.search(r'\buuid\.\w+\(', content):
+                task_issues.append("uuid generation in verifier")
+
+        if task_issues:
+            issues.append(f"{task_name}: {'; '.join(task_issues)}")
+
+    if not issues:
+        return CriterionResult(
+            criterion_id="O.g", status=Status.PASS,
+            evidence=f"No non-deterministic patterns found across {len(tasks)} verifiers",
+        )
+    return CriterionResult(
+        criterion_id="O.g", status=Status.WARN,
+        evidence="\n".join(issues[:10]),
+        remediation="Remove non-deterministic commands from verifier scoring logic, or seed random generators",
+        details={"issue_count": len(issues), "issues": issues[:20]},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main auditor
 # ---------------------------------------------------------------------------
