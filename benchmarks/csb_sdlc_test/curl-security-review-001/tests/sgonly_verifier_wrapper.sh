@@ -151,11 +151,8 @@ if [ -f "$MANIFEST" ]; then
         echo "[sg_only_verifier] Running defect injection: $INJECT_SCRIPT"
         cd "$WORKDIR"
         chmod +x "$INJECT_SCRIPT"
-        if bash "$INJECT_SCRIPT"; then
-            echo "[sg_only_verifier] Defect injection complete"
-        else
-            echo "[sg_only_verifier] WARNING: Defect injection failed (exit $?) — scoring will proceed with degraded accuracy"
-        fi
+        bash "$INJECT_SCRIPT"
+        echo "[sg_only_verifier] Defect injection complete"
     fi
 
     # 4. Overlay agent changes

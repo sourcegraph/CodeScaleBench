@@ -14,6 +14,7 @@ TRANSCRIPT_CANDIDATE_RELATIVE_PATHS: tuple[str, ...] = (
     "agent/gemini-code.txt",
     "agent/copilot-code.txt",
     "agent/openhands-code.txt",
+    "agent/openhands.txt",
     "agent/transcript.jsonl",
     "agent/transcript.txt",
     "claude-code.txt",

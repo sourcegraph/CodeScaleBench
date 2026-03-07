@@ -34,6 +34,7 @@ from csb_metrics.ir_metrics import (
 from csb_metrics.extractors import (
     extract_task_from_result_json,
     extract_task_tokens_from_transcript,
+    extract_task_tokens_from_trajectory,
     extract_swebench_partial_score,
     extract_tool_usage_from_trajectory,
     extract_tool_usage_from_transcript,
@@ -100,6 +101,33 @@ def _lookup_ground_truth(task_id: str, registry: dict[str, TaskGroundTruth]) -> 
     return None
 
 
+def _detect_harness(task_dir: Path, result_json: Path) -> str:
+    """Detect which agent harness produced the output.
+
+    Returns 'openhands', 'claude_code', or 'unknown'.
+    """
+    # Check for OpenHands-specific files
+    if (task_dir / "agent" / "openhands.txt").is_file():
+        return "openhands"
+    if (task_dir / "agent" / "openhands.trajectory.json").is_file():
+        return "openhands"
+
+    # Check result.json agent import_path
+    try:
+        data = json.loads(result_json.read_text())
+        import_path = (data.get("config") or {}).get("agent", {}).get("import_path", "")
+        if "openhands" in import_path.lower():
+            return "openhands"
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    # Check for Claude Code transcript
+    if (task_dir / "agent" / "claude-code.txt").is_file():
+        return "claude_code"
+
+    return "unknown"
+
+
 def process_task_dir(
     task_dir: Path,
     benchmark: str,
@@ -122,11 +150,19 @@ def process_task_dir(
     if tm.task_id == "unknown":
         tm.task_id = _extract_task_id(task_dir.name)
 
+    # Detect harness from result.json config or agent output files
+    is_openhands = _detect_harness(task_dir, result_json) == "openhands"
+
     # Token data: prefer transcript (actual API usage) over result.json
     # (result.json n_input_tokens can include cumulative MCP result tokens,
     # inflating counts by 100x for MCP-enabled runs)
     transcript_path = task_dir / "agent" / "claude-code.txt"
     tokens = extract_task_tokens_from_transcript(transcript_path)
+    if tokens.get("input_tokens") is None and is_openhands:
+        # OpenHands: extract from trajectory.json final_metrics
+        tokens = extract_task_tokens_from_trajectory(
+            task_dir / "agent" / "trajectory.json"
+        )
     if tokens.get("input_tokens") is not None:
         tm.input_tokens = tokens["input_tokens"]
         tm.output_tokens = tokens["output_tokens"]

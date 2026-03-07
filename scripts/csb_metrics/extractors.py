@@ -233,6 +233,62 @@ def extract_task_tokens_from_transcript(
     }
 
 
+def extract_task_tokens_from_trajectory(
+    trajectory_json_path: str | Path,
+) -> dict:
+    """Extract token usage from trajectory.json final_metrics.
+
+    OpenHands trajectories include a ``final_metrics`` block with totals.
+    Also sums per-step ``metrics`` if ``final_metrics`` is absent.
+    """
+    empty = {
+        "input_tokens": None,
+        "output_tokens": None,
+        "cache_creation_input_tokens": None,
+        "cache_read_input_tokens": None,
+        "total_cost_usd": None,
+    }
+    path = Path(trajectory_json_path)
+    if not path.is_file():
+        return empty
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return empty
+
+    fm = data.get("final_metrics") or {}
+    if fm.get("total_prompt_tokens") is not None:
+        return {
+            "input_tokens": fm.get("total_prompt_tokens"),
+            "output_tokens": fm.get("total_completion_tokens"),
+            "cache_creation_input_tokens": None,
+            "cache_read_input_tokens": fm.get("total_cached_tokens"),
+            "total_cost_usd": fm.get("total_cost_usd"),
+        }
+
+    # Fallback: sum per-step metrics
+    prompt = comp = cached = 0
+    cost = 0.0
+    found = False
+    for step in data.get("steps") or []:
+        m = step.get("metrics")
+        if m:
+            found = True
+            prompt += m.get("prompt_tokens", 0)
+            comp += m.get("completion_tokens", 0)
+            cached += m.get("cached_tokens", 0)
+            cost += m.get("cost_usd", 0.0)
+    if not found:
+        return empty
+    return {
+        "input_tokens": prompt,
+        "output_tokens": comp,
+        "cache_creation_input_tokens": None,
+        "cache_read_input_tokens": cached,
+        "total_cost_usd": cost,
+    }
+
+
 def extract_swebench_partial_score(
     test_stdout_path: str | Path,
 ) -> Optional[float]:
@@ -286,16 +342,26 @@ def _empty_tool_usage() -> dict:
 
 # Tools bundled with Claude Code (non-MCP)
 _LOCAL_TOOLS = {
+    # Claude Code tools
     "Bash", "Read", "Edit", "Write", "Grep", "Glob",
     "Task", "TaskOutput", "TodoWrite", "WebFetch", "WebSearch",
     "NotebookEdit", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
     "Skill", "TaskStop", "ToolSearch",
+    # OpenHands tools
+    "execute_bash", "str_replace_editor", "read_file", "think", "finish",
+    "task_tracker",
+}
+
+
+_OPENHANDS_MCP_TOOLS = {
+    "keyword_search", "nls_search", "deepsearch", "list_repos",
+    "read_file_content", "search_symbols", "get_file_metadata",
 }
 
 
 def _is_mcp_tool(name: str) -> bool:
-    """Return True if the tool name indicates an MCP tool (mcp__ prefix)."""
-    return name.startswith("mcp__")
+    """Return True if the tool name indicates an MCP tool."""
+    return name.startswith("mcp__") or name in _OPENHANDS_MCP_TOOLS
 
 
 def _build_tool_usage_dict(tool_counts: dict[str, int]) -> dict:
@@ -523,6 +589,10 @@ _SEARCH_TOOL_MAP = {
     "sg_keyword_search": "keyword",
     "sg_nls_search": "nls",
     "sg_deepsearch": "deepsearch",
+    # OpenHands MCP tools (bare names, no mcp__ prefix)
+    "keyword_search": "keyword",
+    "nls_search": "nls",
+    "deepsearch": "deepsearch",
 }
 
 
@@ -754,6 +824,28 @@ def extract_code_changes_from_trajectory(
                 content = args.get("content", "")
                 if content:
                     lines_added += content.count("\n") + 1
+
+            elif name == "str_replace_editor":
+                # OpenHands edit tool — commands: str_replace, create, insert
+                fp = args.get("path")
+                cmd = args.get("command", "")
+                if fp:
+                    files_touched.add(fp)
+                if cmd == "str_replace":
+                    old = args.get("old_str", "")
+                    new = args.get("new_str", "")
+                    if old:
+                        lines_removed += old.count("\n") + 1
+                    if new:
+                        lines_added += new.count("\n") + 1
+                elif cmd == "create":
+                    text = args.get("file_text", "")
+                    if text:
+                        lines_added += text.count("\n") + 1
+                elif cmd == "insert":
+                    text = args.get("new_str", "")
+                    if text:
+                        lines_added += text.count("\n") + 1
 
     if not files_touched:
         return _empty_code_changes()
