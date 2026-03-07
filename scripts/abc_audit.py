@@ -1225,6 +1225,87 @@ def check_of_edge_cases(tasks: list[Path]) -> CriterionResult:
     )
 
 
+def check_t7_metadata_sync(tasks: list[Path]) -> CriterionResult:
+    """T.7: task.toml metadata matches selected_benchmark_tasks.json."""
+    if not SELECTED_TASKS_PATH.is_file():
+        return CriterionResult(
+            criterion_id="T.7", status=Status.WARN,
+            evidence="selected_benchmark_tasks.json not found",
+            remediation="Run: python3 scripts/select_benchmark_tasks.py",
+        )
+
+    try:
+        selected_data = json.loads(SELECTED_TASKS_PATH.read_text())
+    except json.JSONDecodeError:
+        return CriterionResult(
+            criterion_id="T.7", status=Status.FAIL,
+            evidence="selected_benchmark_tasks.json is invalid JSON",
+        )
+
+    # Build lookup from selected_benchmark_tasks.json by task_id
+    selected_by_id: dict[str, dict] = {}
+    for entry in selected_data.get("tasks", []):
+        tid = entry.get("task_id", "")
+        if tid:
+            selected_by_id[tid] = entry
+
+    mismatches = []
+    missing_in_json = []
+
+    for task_dir in tasks:
+        toml_path = task_dir / "task.toml"
+        if not toml_path.is_file():
+            continue
+
+        toml = parse_task_toml_simple(toml_path)
+        task_id = toml.get("task.id", task_dir.name)
+        task_name = task_dir.name
+
+        if task_id not in selected_by_id:
+            missing_in_json.append(task_name)
+            continue
+
+        entry = selected_by_id[task_id]
+        task_mismatches = []
+
+        # Compare fields: toml key → json key
+        field_map = [
+            ("metadata.language", "language"),
+            ("metadata.difficulty", "difficulty"),
+            ("task.repo", "repo"),
+        ]
+        for toml_key, json_key in field_map:
+            toml_val = toml.get(toml_key, "").lower()
+            json_val = str(entry.get(json_key, "")).lower()
+            if toml_val and json_val and toml_val != json_val:
+                task_mismatches.append(f"{json_key}: toml={toml_val!r} vs json={json_val!r}")
+
+        if task_mismatches:
+            mismatches.append(f"{task_name}: {'; '.join(task_mismatches)}")
+
+    issues = []
+    if mismatches:
+        issues.extend(mismatches)
+    if missing_in_json:
+        issues.append(f"{len(missing_in_json)} tasks not in selected_benchmark_tasks.json: {', '.join(missing_in_json[:5])}")
+
+    if not issues:
+        return CriterionResult(
+            criterion_id="T.7", status=Status.PASS,
+            evidence=f"All {len(tasks)} tasks synced with selected_benchmark_tasks.json",
+        )
+
+    # Value mismatches → FAIL; only missing entries → WARN
+    status = Status.FAIL if mismatches else Status.WARN
+    return CriterionResult(
+        criterion_id="T.7", status=status,
+        evidence="\n".join(issues[:10]),
+        remediation="Run: python3 scripts/sync_metadata.py or update task.toml / selected_benchmark_tasks.json",
+        details={"mismatch_count": len(mismatches), "missing_count": len(missing_in_json),
+                 "mismatches": mismatches[:20], "missing": missing_in_json[:20]},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main auditor
 # ---------------------------------------------------------------------------
@@ -1236,6 +1317,7 @@ TASK_CHECKS = {
     "T.3": check_t3_no_api_keys,
     "T.4": check_t4_git_sha,
     "T.5": check_t5_no_solution_leak,
+    "T.7": check_t7_metadata_sync,
     "T.8": check_t8_oracle_exists,
     "O.a": check_oa_equivalent_solutions,
     "O.b": check_ob_negated_solutions,
