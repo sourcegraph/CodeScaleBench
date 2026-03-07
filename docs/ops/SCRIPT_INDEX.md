@@ -130,6 +130,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/sync_oracle_files.py` - Infrastructure or mirror management script for sync oracle files.
 - `scripts/sync_pytorch_verifiers.sh` - Infrastructure or mirror management script for sync pytorch verifiers.
 - `scripts/update_gt_registry.py` - Infrastructure or mirror management script for update gt registry.
+- `scripts/update_loc_from_cloc.py` - Infrastructure or mirror management script for update loc from cloc.
 - `scripts/update_sg_only_mirrors.py` - Infrastructure or mirror management script for update sg only mirrors.
 
 ## Library / Helpers
@@ -250,6 +251,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/scaffold_refactor_tasks.py` - Utility script for scaffold refactor tasks.
 - `scripts/scaffold_scaling_gap_sdlc_tasks.py` - Utility script for scaffold scaling gap sdlc tasks.
 - `scripts/scaffold_swebench_pro_tasks.py` - Utility script for scaffold swebench pro tasks.
+- `scripts/scaffold_task_expansion_wave1.py` - Utility script for scaffold task expansion wave1.
 - `scripts/scan_swebench_errors.py` - Utility script for scan swebench errors.
 - `scripts/sdlc_anomaly_scan.py` - Utility script for sdlc anomaly scan.
 - `scripts/select_contextbench_pilot.py` - Utility script for select contextbench pilot.

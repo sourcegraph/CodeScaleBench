@@ -1863,7 +1863,7 @@ def _build_task_page(record: TaskRecord) -> str:
         )
     if metadata.get("repo_approx_loc") is not None:
         benchmark_rows.append(
-            f"<tr><td>Approx LOC</td><td>{esc(_fmt_int(_safe_int(metadata.get('repo_approx_loc'))))}</td></tr>"
+            f"<tr><td>Lines of Code (cloc)</td><td>{esc(_fmt_int(_safe_int(metadata.get('repo_approx_loc'))))}</td></tr>"
         )
     if metadata.get("files_count") is not None:
         benchmark_rows.append(

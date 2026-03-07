@@ -97,6 +97,9 @@ _TEXT_EXTENSIONS = set(_LANGUAGE_BY_EXTENSION) | {
     ".yml",
 }
 
+_CLOC_COUNTS_PATH = Path("results/repo_cloc_counts.json")
+_CLOC_COUNTS_CACHE: dict[str, int] | None = None
+
 _REPO_SIZE_CACHE_PATH = Path("docs/analysis/github_repo_size_kb_cache.json")
 _REPO_SIZE_KB_CACHE: dict[str, int] | None = None
 _REPO_SIZE_API_CACHE_PATH = Path(".cache/repo_size_api_kb_cache.json")
@@ -106,6 +109,37 @@ _REPO_ALIASES = {
     "pytorch": "pytorch/pytorch",
     "tutanota/tutanota": "tutao/tutanota",
 }
+
+
+def _load_cloc_counts() -> dict[str, int]:
+    """Load repo -> total_code_lines mapping from cloc results."""
+    global _CLOC_COUNTS_CACHE
+    if _CLOC_COUNTS_CACHE is not None:
+        return _CLOC_COUNTS_CACHE
+    if not _CLOC_COUNTS_PATH.is_file():
+        _CLOC_COUNTS_CACHE = {}
+        return _CLOC_COUNTS_CACHE
+    try:
+        data = json.loads(_CLOC_COUNTS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    _CLOC_COUNTS_CACHE = {
+        repo: info["total_code_lines"]
+        for repo, info in data.items()
+        if isinstance(info, dict) and "total_code_lines" in info
+    }
+    return _CLOC_COUNTS_CACHE
+
+
+def _get_cloc_loc(repo: str) -> int | None:
+    """Look up precise LOC from cloc counts, handling aliases."""
+    cache = _load_cloc_counts()
+    if repo in cache:
+        return cache[repo]
+    alias = _REPO_ALIASES.get(repo)
+    if alias and alias in cache:
+        return cache[alias]
+    return None
 
 
 def _read_toml(path: Path) -> dict:
@@ -505,7 +539,11 @@ def _git_tree_metrics(repo: str, rev: str, cache_dir: Path, git_timeout_sec: int
     repo_size_kb = _get_repo_size_kb(repo)
     repo_size_bytes = int(repo_size_kb * 1024) if repo_size_kb is not None else None
     repo_size_mb = round(repo_size_kb / 1024, 3) if repo_size_kb is not None else None
-    repo_approx_loc = int(repo_size_bytes // 30) if repo_size_bytes is not None else None
+    # Prefer cloc-based LOC counts from results/repo_cloc_counts.json.
+    # Fallback to bytes//30 heuristic only if cloc data unavailable.
+    repo_approx_loc = _get_cloc_loc(repo)
+    if repo_approx_loc is None:
+        repo_approx_loc = int(repo_size_bytes // 30) if repo_size_bytes is not None else None
 
     repo_languages = [
         {
