@@ -12,7 +12,7 @@ Stable specifications and policy/reference documents.
 - `docs/SCORING_SEMANTICS.md`
 - `docs/EVALUATION_PIPELINE.md`
 - `docs/RETRIEVAL_EVAL_SPEC.md`
-- `docs/MCP_UNIQUE_CALIBRATION.md`
+- `docs/ORG_CALIBRATION.md`
 
 ## Policy / Governance
 - `docs/REPO_HEALTH.md`
@@ -23,4 +23,4 @@ Stable specifications and policy/reference documents.
 ## Task / Suite Inventory
 - `docs/TASK_CATALOG.md`
 - `docs/TASK_SELECTION.md`
-- `docs/MCP_UNIQUE_TASKS.md`
+- `docs/ORG_TASKS.md`

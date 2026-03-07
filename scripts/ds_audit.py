@@ -42,7 +42,7 @@ DIR_PREFIX_TO_SUITE = {
     "ccb_secure": "csb_sdlc_secure",
     "ccb_test": "csb_sdlc_test",
     "ccb_understand": "csb_sdlc_understand",
-    # Legacy MCP-unique prefixes
+    # Legacy org-scale prefixes
     "ccb_mcp_crossrepo_tracing": "csb_org_crossrepo_tracing",
     "ccb_mcp_crossrepo": "csb_org_crossrepo",
     "ccb_mcp_security": "csb_org_security",

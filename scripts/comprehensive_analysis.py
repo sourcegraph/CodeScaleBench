@@ -262,9 +262,9 @@ def extract_suite_from_benchmark(benchmark):
 
 
 def extract_suite_family(suite):
-    """Group suites into SDLC vs MCP-unique."""
+    """Group suites into SDLC vs org-scale."""
     if suite.startswith(("csb_org_", "ccb_mcp_")):
-        return "mcp_unique"
+        return "org"
     elif suite.startswith(("csb_sdlc_", "ccb_")):
         return "sdlc"
     return "other"
@@ -378,7 +378,7 @@ def enrich_task_metrics(task_metrics, selected_tasks):
             tm["task_files_count"] = sel["files_count"]
         if tm.get("benchmark") is None and sel.get("benchmark") is not None:
             tm["benchmark"] = sel["benchmark"]
-        # Add mcp_unique flag
+        # Add org-scale flag (reads legacy "mcp_unique" key from config)
         tm["_mcp_unique"] = sel.get("mcp_unique", False)
 
 

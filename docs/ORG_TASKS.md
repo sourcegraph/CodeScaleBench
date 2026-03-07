@@ -222,7 +222,7 @@ python3 -c "import sys; sys.exit(0 if float('$SCORE') > 0 else 1)"
 **Composite score** = mean of primary scores across all configured checks.
 
 No hardcoded thresholds — raw scores enable calibration. See
-`docs/MCP_UNIQUE_CALIBRATION.md` for threshold guidance after first runs.
+`docs/ORG_CALIBRATION.md` for threshold guidance after first runs.
 
 ### Agent Answer Format
 
@@ -478,7 +478,7 @@ See `configs/use_case_registry.json` — entries with
 
 ## See Also
 
-- `docs/MCP_UNIQUE_CALIBRATION.md` — Static oracle analysis + threshold calibration
+- `docs/ORG_CALIBRATION.md` — Static oracle analysis + threshold calibration
 - `docs/CONFIGS.md` — Run configs including `--selection-file` and `--use-case-category`
 - `docs/SCORING_SEMANTICS.md` — Oracle check scoring and hybrid rubric scoring
 - `docs/EXTENSIBILITY.md` — Adding new suites and tasks

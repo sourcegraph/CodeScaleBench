@@ -94,7 +94,7 @@ def _resolve_task_dir_name(suite: str, task_name: str) -> str:
 
 
 def _is_mcp_suite(suite: str) -> bool:
-    """Check if a suite is an MCP-unique suite."""
+    """Check if a suite is an org-scale suite."""
     return suite.startswith((MCP_SUITE_PREFIX, LEGACY_MCP_PREFIX))
 
 
@@ -485,7 +485,7 @@ def load_instruction_md(suite: str, task_name: str) -> Optional[str]:
 
 
 def load_task_spec(suite: str, task_name: str) -> Optional[dict]:
-    """Load task_spec.json for MCP-unique tasks."""
+    """Load task_spec.json for org-scale tasks."""
     resolved = _resolve_task_dir_name(suite, task_name)
     path = BENCHMARKS_DIR / suite / resolved / "tests" / "task_spec.json"
     if not path.is_file():
@@ -632,7 +632,7 @@ def check_score_legitimacy(
             "detail": f"Status is 'errored' but reward is {reward} > 0 — suspicious",
         })
 
-    # For MCP-unique tasks, check oracle alignment
+    # For org-scale tasks, check oracle alignment
     if _is_mcp_suite(suite) and task_spec is not None:
         oracle = (task_spec.get("artifacts") or {}).get("oracle", {})
         evaluation = task_spec.get("evaluation", {})
@@ -661,7 +661,7 @@ def check_score_legitimacy(
                 "task": task_name,
                 "config": config,
                 "detail": (
-                    "MCP-unique task has evaluation checks in task_spec.json "
+                    "Org-scale task has evaluation checks in task_spec.json "
                     "but oracle arrays are all empty — oracle_checks evaluator "
                     "may produce vacuous scores"
                 ),
@@ -973,7 +973,7 @@ def check_verifier_consistency(
     # Load task.toml
     toml_data = load_task_toml(suite, task_name)
 
-    # For MCP-unique tasks, check verification command path
+    # For org-scale tasks, check verification command path
     if _is_mcp_suite(suite):
         verify_cmd = toml_data.get("verification.command", "")
         if verify_cmd:

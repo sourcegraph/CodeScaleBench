@@ -1,5 +1,5 @@
 #!/bin/bash
-# eval.sh — MCP-unique benchmark evaluator for CCX-dep-trace-001
+# eval.sh — org-scale benchmark evaluator for CCX-dep-trace-001
 # Exit-code-first (SWE-Factory pattern):
 #   exit 0 — agent produced useful output (composite score > 0)
 #   exit 1 — total failure (composite score == 0 or missing answer)

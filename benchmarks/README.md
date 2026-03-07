@@ -42,7 +42,7 @@ These suites measure cross-repo discovery, tracing, and org-scale code intellige
 | `csb_org_crossrepo` | 14 | Cross-repo search, dependency discovery, impact analysis |
 | **Total** | **220** | |
 
-For suite taxonomy, authoring, and oracle evaluation details, see [`docs/MCP_UNIQUE_TASKS.md`](../docs/MCP_UNIQUE_TASKS.md).
+For suite taxonomy, authoring, and oracle evaluation details, see [`docs/ORG_TASKS.md`](../docs/ORG_TASKS.md).
 
 ---
 

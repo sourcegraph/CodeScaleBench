@@ -90,7 +90,7 @@ SDLC_SUITES = [
     "csb_sdlc_understand",
 ]
 
-MCP_UNIQUE_SUITES = [
+ORG_SUITES = [
     "csb_org_crossrepo_tracing", "csb_org_crossrepo", "csb_org_crossorg",
     "csb_org_compliance", "csb_org_domain", "csb_org_incident",
     "csb_org_migration", "csb_org_onboarding", "csb_org_org",
@@ -757,11 +757,11 @@ def discover_tasks(
     if sdlc_all:
         suites = SDLC_SUITES
     elif mcp_all:
-        suites = MCP_UNIQUE_SUITES
+        suites = ORG_SUITES
     elif suite:
         suites = [suite]
     else:
-        suites = SDLC_SUITES + MCP_UNIQUE_SUITES
+        suites = SDLC_SUITES + ORG_SUITES
 
     tasks = []
     for s in suites:
@@ -794,7 +794,7 @@ def load_task_context(task_dir: Path) -> Dict[str, Any]:
     else:
         ctx["instruction"] = ""
 
-    # Try task_spec.json (MCP-unique tasks)
+    # Try task_spec.json (org-scale tasks)
     task_spec_path = task_dir / "tests" / "task_spec.json"
     if not task_spec_path.exists():
         task_spec_path = task_dir / "task_spec.json"
@@ -2069,14 +2069,14 @@ def parse_task_for_curator(task_dir: Path) -> Dict[str, Any]:
     """Phase 0: Parse task artifacts to build structured context for the curator.
 
     Enriches load_task_context() output with:
-      - task_type: 'sdlc' or 'mcp_unique'
+      - task_type: 'sdlc' or 'org'
       - is_multi_repo: bool
       - test_sh_diff_targets: files referenced in git diff commands in test.sh
       - test_sh_file_patterns: general file references in test.sh
     """
     ctx = load_task_context(task_dir)
     suite = ctx.get("suite_name", "")
-    ctx["task_type"] = "mcp_unique" if suite.startswith(("csb_org_", "ccb_mcp_")) else "sdlc"
+    ctx["task_type"] = "org" if suite.startswith(("csb_org_", "ccb_mcp_")) else "sdlc"
 
     # Detect multi-repo from Dockerfile env vars or fixture
     ctx["is_multi_repo"] = bool(ctx.get("repo_fixture", {}).get("repos", []))
@@ -2762,7 +2762,7 @@ def write_curator_outputs(
 
     Produces up to 3 files:
       1. ground_truth.json (or ground_truth_agent.json) — IR pipeline format
-      2. oracle_answer.json (MCP-unique only) — artifact verifier format
+      2. oracle_answer.json (org-scale only) — artifact verifier format
       3. ground_truth_meta.json — sidecar with confidence and provenance
 
     If overwrite=False (default), existing files are not touched and the
@@ -2788,7 +2788,7 @@ def write_curator_outputs(
     outputs["ground_truth"] = gt_path
     log.info("Wrote ground_truth: %s", gt_path)
 
-    # 2. oracle_answer.json (MCP-unique only, artifact verifier format)
+    # 2. oracle_answer.json (org-scale only, artifact verifier format)
     suite = ctx.get("suite_name", "")
     if suite.startswith(("csb_org_", "ccb_mcp_")):
         oracle_fmt = _convert_to_oracle_schema(raw_oracle, ctx)
@@ -2889,7 +2889,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--mcp-all", action="store_true",
-        help="Process all MCP-unique tasks",
+        help="Process all org-scale tasks",
     )
     # Agent configuration
     parser.add_argument(
@@ -3206,7 +3206,7 @@ def _resolve_repos(
     """Resolve repos for a task — clone if needed, return path mapping."""
     repo_paths: Dict[str, Path] = {}
 
-    # Strategy 1: Use repo fixture (MCP-unique tasks)
+    # Strategy 1: Use repo fixture (org-scale tasks)
     fixture = ctx.get("repo_fixture")
     if fixture:
         specs = fixture.get("repos", [])

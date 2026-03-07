@@ -109,7 +109,7 @@ Eleven additional suites measure cross-repo discovery, symbol resolution, depend
 
 Both baseline and MCP-Full agents have access to **all repos** in each task's fixture. The only difference is the method: baseline reads code locally, MCP-Full uses Sourcegraph MCP tools (local code is truncated). This ensures we measure whether MCP tools help agents work better — not whether MCP can access repos the baseline can't.
 
-See [docs/MCP_UNIQUE_TASKS.md](docs/MCP_UNIQUE_TASKS.md) for the full task system, authoring guide, and oracle evaluation framework. See [docs/MCP_UNIQUE_CALIBRATION.md](docs/MCP_UNIQUE_CALIBRATION.md) for oracle coverage analysis.
+See [docs/ORG_TASKS.md](docs/ORG_TASKS.md) for the full task system, authoring guide, and oracle evaluation framework. See [docs/ORG_CALIBRATION.md](docs/ORG_CALIBRATION.md) for oracle coverage analysis.
 
 ---
 
@@ -203,8 +203,8 @@ docs/                    # Operational documentation
   TASK_CATALOG.md        #   Detailed per-task reference
   TASK_SELECTION.md      #   Selection criteria, difficulty calibration, MCP scoring
   SCORING_SEMANTICS.md   #   Reward and pass interpretation per benchmark
-  MCP_UNIQUE_TASKS.md    #   Org task system, authoring, oracle evaluation
-  MCP_UNIQUE_CALIBRATION.md # Oracle coverage analysis and threshold calibration
+  ORG_TASKS.md           #   Org task system, authoring, oracle evaluation
+  ORG_CALIBRATION.md # Oracle coverage analysis and threshold calibration
   WORKFLOW_METRICS.md    #   Timing/cost metric definitions
   AGENT_INTERFACE.md     #   Runtime I/O contract for agents
   EXTENSIBILITY.md       #   Safe suite/task/config extension guide

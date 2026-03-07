@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic oracle check library for MCP-unique benchmark evaluation.
+"""Deterministic oracle check library for org-scale benchmark evaluation.
 
 Provides reusable check functions that eval.sh scripts invoke to score agent
 answers against closed-world oracle definitions. Returns raw scores (no

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Oracle-based IR analysis for MCP-unique benchmark tasks.
+"""Oracle-based IR analysis for org-scale benchmark tasks.
 
 Computes retrieval quality metrics (precision, recall, MRR, nDCG, MAP,
 context efficiency, time-to-context) using oracle ground truth from
@@ -9,7 +9,7 @@ Uses csb_metrics.retrieval for oracle item loading and tool call extraction,
 and csb_metrics.ir_metrics for pure IR math functions.
 
 Usage:
-    # Analyze staging MCP-unique runs (default)
+    # Analyze staging org-scale runs (default)
     python3 scripts/oracle_ir_analysis.py
 
     # JSON output
@@ -464,7 +464,7 @@ def _extract_task_id(dirname: str) -> str:
 
 
 def _detect_suite(run_dir_name: str) -> Optional[str]:
-    """Detect MCP-unique suite from run directory name."""
+    """Detect org-scale suite from run directory name."""
     m = re.match(r"((?:csb_org|ccb_mcp)_\w+?)_\w+_\d{8}_\d{6}", run_dir_name)
     if m:
         return m.group(1)
@@ -483,8 +483,8 @@ def _config_type(name: str) -> str:
     return "unknown"
 
 
-def walk_mcp_unique_runs(runs_dir: Path, suite_filter: str = "") -> list[dict]:
-    """Walk MCP-unique run directories and collect task info.
+def walk_org_runs(runs_dir: Path, suite_filter: str = "") -> list[dict]:
+    """Walk org-scale run directories and collect task info.
 
     Returns list of dicts: {task_id, suite, config, config_type, task_dir,
     transcript, result_path, reward}
@@ -499,7 +499,7 @@ def walk_mcp_unique_runs(runs_dir: Path, suite_filter: str = "") -> list[dict]:
             continue
         if any(pat in run_dir.name for pat in SKIP_PATTERNS):
             continue
-        # Only MCP-unique runs
+        # Only org-scale runs
         if "ccb_mcp_" not in run_dir.name and "csb_org_" not in run_dir.name:
             continue
 
@@ -993,7 +993,7 @@ def format_report(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Oracle-based IR analysis for MCP-unique benchmark tasks."
+        description="Oracle-based IR analysis for org-scale benchmark tasks."
     )
     parser.add_argument("--json", action="store_true", help="JSON output")
     parser.add_argument("--per-task", action="store_true", help="Show per-task detail")
@@ -1010,10 +1010,10 @@ def main():
     args = parse_args()
     runs_dir = Path(args.runs_dir)
 
-    print(f"Scanning {runs_dir} for MCP-unique runs...", file=sys.stderr)
+    print(f"Scanning {runs_dir} for org-scale runs...", file=sys.stderr)
 
     # Discover task runs
-    all_runs = walk_mcp_unique_runs(runs_dir, suite_filter=args.suite)
+    all_runs = walk_org_runs(runs_dir, suite_filter=args.suite)
     print(f"Found {len(all_runs)} task runs", file=sys.stderr)
 
     # Compute oracle IR for each

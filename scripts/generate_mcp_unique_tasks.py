@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate MCP-unique benchmark task directories from the use case registry.
+"""Generate org-scale benchmark task directories from the use case registry.
 
 Reads configs/use_case_registry.json and fixtures/repo_sets/*.json, fills
 templates from templates/csb-org/, and writes task directories under
@@ -434,7 +434,7 @@ def validate_generated_task(task_dir: Path) -> bool:
     toml_file = task_dir / "task.toml"
     if toml_file.exists():
         content = toml_file.read_text()
-        if "mcp_suite" not in content or "mcp_unique = true" not in content:
+        if "mcp_suite" not in content or "org_scale = true" not in content:
             logging.error("task.toml missing required fields: %s", toml_file)
             ok = False
     else:
@@ -484,7 +484,7 @@ def validate_generated_task(task_dir: Path) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Generate MCP-unique benchmark task directories from the use case registry.",
+        description="Generate org-scale benchmark task directories from the use case registry.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

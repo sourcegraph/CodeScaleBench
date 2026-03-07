@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate MCP-unique task instances using the fail2pass gate.
+"""Validate org-scale task instances using the fail2pass gate.
 
 Ensures every task is non-degenerate:
   - Gold oracle answer scores > 0 (task is solvable)
@@ -174,7 +174,7 @@ def validate_task(task_dir: Path, verbose: bool = False, fix: bool = False) -> s
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Validate MCP-unique task instances (fail2pass gate)."
+        description="Validate org-scale task instances (fail2pass gate)."
     )
     parser.add_argument(
         "--task-dir", action="append", required=True,

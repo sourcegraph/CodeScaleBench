@@ -229,7 +229,7 @@ composite_score = mean([check_1_primary_score, check_2_primary_score, ...])
 composite == 0 (total failure). Harbor reads the score from `/logs/verifier/reward.txt`.
 
 **No hardcoded thresholds**: Raw scores enable post-run calibration. See
-`docs/MCP_UNIQUE_CALIBRATION.md` for threshold guidance after first runs complete.
+`docs/ORG_CALIBRATION.md` for threshold guidance after first runs complete.
 
 ### Agent Answer Format
 

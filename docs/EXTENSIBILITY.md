@@ -84,7 +84,7 @@ When adding benchmark environment variants, keep canonical task definitions inta
 ## 7) Add CodeScaleBench-Org Tasks (csb_org_* suites)
 
 Org tasks measure org-scale cross-repo discovery — what local-only agents
-cannot do. See `docs/MCP_UNIQUE_TASKS.md` for the full authoring guide.
+cannot do. See `docs/ORG_TASKS.md` for the full authoring guide.
 
 **Quick start:**
 

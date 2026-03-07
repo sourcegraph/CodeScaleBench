@@ -329,7 +329,7 @@ these should be implemented without explicit policy discussion.**
   confidence flags that downstream consumers use for filtering but not
   score modification.
 
-### `docs/MCP_UNIQUE_TASKS.md` / `docs/MCP_UNIQUE_CALIBRATION.md`
+### `docs/ORG_TASKS.md` / `docs/ORG_CALIBRATION.md`
 
 - **Oracle coverage integration**: Org task oracle items could be
   mapped to retrieval events for oracle-aware retrieval scoring.
@@ -354,4 +354,4 @@ these should be implemented without explicit policy discussion.**
 - `schemas/retrieval_events_schema.json` — JSON Schema definition
 - `docs/EVALUATION_PIPELINE.md` — primary evaluation pipeline
 - `docs/SCORING_SEMANTICS.md` — reward interpretation
-- `docs/MCP_UNIQUE_TASKS.md` — Org task system
+- `docs/ORG_TASKS.md` — Org task system

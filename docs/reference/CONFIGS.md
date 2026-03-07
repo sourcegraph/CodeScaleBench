@@ -250,7 +250,7 @@ configs/run_selected_tasks.sh --benchmark csb_org --dry-run
 | Baseline Dockerfile | `Dockerfile` (full repo clone) | `Dockerfile` (full repo clone) |
 | MCP Dockerfile | `Dockerfile.sg_only` (truncated source) | `Dockerfile.sg_only` (truncated source) |
 
-See `docs/MCP_UNIQUE_TASKS.md` for full task authoring and evaluation details.
+See `docs/ORG_TASKS.md` for full task authoring and evaluation details.
 
 ## SCIP Precise Indexing Ablation
 
