@@ -1,7 +1,7 @@
-FROM golang:1.23-alpine AS base
+FROM golang:1.23-bookworm AS base
 
 # Install git, bash, and python3 (needed by verifier test.sh scoring)
-RUN apk add --no-cache git bash python3
+RUN apt-get update && apt-get install -y --no-install-recommends git bash python3 && rm -rf /var/lib/apt/lists/*
 
 # Clone repos at pinned commits
 WORKDIR /workspace

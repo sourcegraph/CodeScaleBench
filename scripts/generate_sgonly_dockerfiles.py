@@ -79,7 +79,7 @@ CSB_REPO_BASE_MAP = {
     },
     "ccb-repo-flipt-3d5a345f": {
         "from": "golang:1.23-bookworm",
-        "packages": ["git", "curl"],
+        "packages": ["git", "curl", "python3"],
         "mirror": "sg-evals/flipt--3d5a345f",
     },
     "ccb-repo-envoy-1d0ba73a": {
@@ -94,7 +94,7 @@ CSB_REPO_BASE_MAP = {
     },
     "ccb-repo-kafka-0753c489": {
         "from": "eclipse-temurin:17-jdk",
-        "packages": ["git", "curl"],
+        "packages": ["git", "curl", "python3"],
         "mirror": "sg-evals/kafka--0753c489",
     },
     "ccb-repo-kafka-e678b4b": {
