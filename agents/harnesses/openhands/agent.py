@@ -105,6 +105,15 @@ class OpenHandsHarnessAgent(BaselineHarnessMixin, OpenHands):
             source_path=proxy_src,
             target_path="/tmp/sg_auth_proxy.py",
         )
+        # Ensure python3 is available (Java/Go images may not have it)
+        ensure_python = (
+            "command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1 || { "
+            "(apt-get update && apt-get install -y --no-install-recommends python3) 2>/dev/null || "
+            "(apk add --no-cache python3) 2>/dev/null || "
+            "(yum install -y python3) 2>/dev/null || true; }"
+        )
+        await environment.exec(ensure_python)
+
         # Start proxy as background daemon (try python3, fall back to python)
         start_cmd = (
             f"SG_MCP_URL={mcp_endpoint} "
