@@ -1047,6 +1047,86 @@ def check_ob_negated_solutions(tasks: list[Path]) -> CriterionResult:
         details={"issue_count": len(issues), "issues": issues[:20]},
     )
 
+def check_of_edge_cases(tasks: list[Path]) -> CriterionResult:
+    """O.f: Verifiers handle edge cases (missing files, empty output, malformed JSON)."""
+    issues = []
+    for task_dir in tasks:
+        verifier = _get_primary_verifier(task_dir)
+        if not verifier:
+            continue
+
+        content = verifier.read_text(errors="replace")
+        task_name = task_dir.name
+        task_issues = []
+
+        if verifier.suffix == ".sh":
+            # Check: reads files without existence check
+            # Look for cat/source/. on files that aren't guarded by [ -f ] or test -f
+            # Heuristic: find file reads that don't have a preceding existence guard
+            file_reads = re.findall(
+                r'(?:cat|source|\.\s+)(/(?:workspace|logs|tests|tmp)/\S+)', content
+            )
+            for fpath in file_reads:
+                # Check if there's a corresponding -f guard for this path
+                escaped = re.escape(fpath)
+                if not re.search(rf'(?:\[\s*-[ferd]\s+["\']?{escaped}|test\s+-[ferd]\s+["\']?{escaped})', content):
+                    # Check if the file is a known static file (test.sh itself, libraries)
+                    if not re.search(r'verifier_lib\.sh|sgonly_verifier|answer_json_verifier', fpath):
+                        task_issues.append(f"reads {fpath} without existence check")
+                        break  # one per task is enough
+
+            # Check: jq/python json.loads without error handling
+            # Flag jq calls without 2>/dev/null, || fallback, or try/except
+            jq_calls = list(re.finditer(r'\bjq\s+(?:-[A-Za-z]+\s+)?[\'"]', content))
+            for m in jq_calls:
+                # Get surrounding context (the line containing the jq call)
+                start = content.rfind('\n', 0, m.start()) + 1
+                end = content.find('\n', m.end())
+                if end == -1:
+                    end = len(content)
+                line = content[start:end]
+                # Check if error handling is present
+                if not re.search(r'2>/dev/null|\|\|\s|if\s.*jq|try|catch', line):
+                    task_issues.append("jq without error handling (no 2>/dev/null or || fallback)")
+                    break
+
+            # Check: empty output handling — commands that read agent output without
+            # checking if it's non-empty first
+            # Flag: direct use of $(cat file) in comparisons without -s (non-empty file) check
+            cat_subst = re.findall(r'\$\(cat\s+(/\S+)\)', content)
+            for fpath in cat_subst:
+                escaped = re.escape(fpath)
+                if not re.search(rf'(?:\[\s*-s\s+["\']?{escaped}|\[\s*-f\s+["\']?{escaped})', content):
+                    if '/logs/' in fpath or '/workspace/' in fpath:
+                        task_issues.append(f"uses $(cat {fpath}) without checking file is non-empty")
+                        break
+
+        elif verifier.suffix == ".py":
+            # Check: json.loads/json.load without try/except
+            if re.search(r'json\.loads?\(', content):
+                if not re.search(r'try\s*:', content):
+                    task_issues.append("json.loads/load without try/except")
+
+            # Check: open() without existence check or try/except
+            if re.search(r'open\(', content):
+                if not re.search(r'try\s*:|os\.path\.exists|Path.*exists|\.is_file', content):
+                    task_issues.append("open() without existence check or try/except")
+
+        if task_issues:
+            issues.append(f"{task_name}: {'; '.join(task_issues[:2])}")
+
+    if not issues:
+        return CriterionResult(
+            criterion_id="O.f", status=Status.PASS,
+            evidence=f"Edge-case handling adequate across {len(tasks)} verifiers",
+        )
+    return CriterionResult(
+        criterion_id="O.f", status=Status.WARN,
+        evidence="\n".join(issues[:10]),
+        remediation="Add file existence checks ([ -f ]), error handling for jq/JSON parsing, and empty output guards",
+        details={"issue_count": len(issues), "issues": issues[:20]},
+    )
+
 
 # ---------------------------------------------------------------------------
 # Main auditor
@@ -1062,6 +1142,7 @@ TASK_CHECKS = {
     "T.8": check_t8_oracle_exists,
     "O.a": check_oa_equivalent_solutions,
     "O.b": check_ob_negated_solutions,
+    "O.f": check_of_edge_cases,
     "O.c": check_oc_empty_solution_rejected,
     "O.d": check_od_error_handling,
     "O.e": check_oe_multiple_assertions,
@@ -1090,7 +1171,7 @@ PROJECT_CHECKS = {
 }
 
 # Semi-automated / manual checks (skip with note)
-SKIP_CHECKS = {"T.2", "T.9", "T.10", "O.f", "O.g", "R.6"}
+SKIP_CHECKS = {"T.2", "T.9", "T.10", "O.g", "R.6"}
 
 
 def audit_suite(suite: str, dimension: Optional[Dimension] = None) -> AuditReport:
