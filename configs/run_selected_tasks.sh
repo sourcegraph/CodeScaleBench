@@ -496,7 +496,11 @@ fi
 echo "----------------------------------------------"
 echo "Ready to launch $TOTAL_AGENT_RUNS agent runs ($PARALLEL_TASKS parallel)."
 echo ""
-read -r -p "Press Enter to proceed, Ctrl+C to abort... " _
+if [ "${CSB_SKIP_CONFIRM:-}" = "1" ]; then
+    echo "[auto] Skipping confirmation (CSB_SKIP_CONFIRM=1)"
+else
+    read -r -p "Press Enter to proceed, Ctrl+C to abort... " _
+fi
 echo ""
 
 # ============================================

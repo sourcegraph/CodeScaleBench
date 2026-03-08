@@ -301,7 +301,11 @@ except: print('unknown')
     fi
 
     echo "----------------------------------------------"
-    read -r -p "Press Enter to proceed, Ctrl+C to abort... " _
+    if [ "${CSB_SKIP_CONFIRM:-}" = "1" ]; then
+        echo "[auto] Skipping confirmation (CSB_SKIP_CONFIRM=1)"
+    else
+        read -r -p "Press Enter to proceed, Ctrl+C to abort... " _
+    fi
     echo ""
 }
 

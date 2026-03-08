@@ -227,6 +227,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/integrate_answer_json_wave2.py` - Utility script for integrate answer json wave2.
 - `scripts/integrate_answer_json_wave3.py` - Utility script for integrate answer json wave3.
 - `scripts/judge_demo.py` - Utility script for judge demo.
+- `scripts/launch_sonnet46_benchmark.sh` - Utility script for launch sonnet46 benchmark.
 - `scripts/list_gemini_models.py` - Utility script for list gemini models.
 - `scripts/mirror_largerepo_expansion.sh` - Utility script for mirror largerepo expansion.
 - `scripts/organize_official_by_model.py` - Utility script for organize official by model.
