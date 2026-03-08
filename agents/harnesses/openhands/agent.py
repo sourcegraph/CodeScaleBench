@@ -129,22 +129,36 @@ class OpenHandsHarnessAgent(BaselineHarnessMixin, OpenHands):
             env=env,
         ))
 
-        # Build a Python launcher script that reads the task from file and
-        # passes it as a proper argv element to openhands.core.main.
-        # This completely bypasses shell quoting/expansion issues.
+        # Build a Python launcher script that reads the task from file,
+        # runs openhands.core.main, pipes output to a log file, and cleans up
+        # orphan daemons. Everything stays in Python — no shell quoting at all.
         mcp_config = self._build_mcp_config_toml()
         config_file_path = "~/.openhands/config.toml"
 
         launcher_lines = [
-            "import sys, subprocess",
+            "import os, signal, subprocess, sys",
+            f"os.environ['SANDBOX_VOLUMES'] = os.getcwd() + ':/workspace:rw'",
             f"task = open('{self._TASK_FILE}').read()",
             "cmd = [sys.executable, '-m', 'openhands.core.main', '--task=' + task]",
         ]
         if mcp_config:
             launcher_lines.append(f"cmd.append('--config-file={config_file_path}')")
-        launcher_lines.append("sys.exit(subprocess.call(cmd, stdin=subprocess.DEVNULL))")
+        launcher_lines.extend([
+            "log = open('/logs/agent/openhands.txt', 'wb')",
+            "proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)",
+            "for line in proc.stdout:",
+            "    sys.stdout.buffer.write(line)",
+            "    sys.stdout.buffer.flush()",
+            "    log.write(line)",
+            "log.close()",
+            "rc = proc.wait()",
+            # Kill known OpenHands daemons that outlive the main process
+            "for pat in ['jupyter-kernelgateway', 'ipykernel_launcher', 'openhands.runtime.action_execution_server', 'tmux']:",
+            "    subprocess.run(['pkill', '-f', pat], capture_output=True)",
+            "sys.exit(rc)",
+        ])
 
-        launcher_script = "; ".join(launcher_lines)
+        launcher_script = "\n".join(launcher_lines)
         launcher_b64 = base64.b64encode(launcher_script.encode()).decode()
 
         # Write launcher, then execute it — two separate commands to avoid
@@ -155,14 +169,8 @@ class OpenHandsHarnessAgent(BaselineHarnessMixin, OpenHands):
             env=env,
         ))
 
-        main_cmd = (
-            f"SANDBOX_VOLUMES=${{PWD}}:/workspace:rw "
-            f"/opt/openhands-venv/bin/python {launcher_path}"
-            " 2>&1 | stdbuf -oL tee /logs/agent/openhands.txt"
-        )
-
         exec_inputs.append(ExecInput(
-            command=f"{{ {main_cmd} }}{self._CLEANUP_SUFFIX}",
+            command=f"/opt/openhands-venv/bin/python {launcher_path}",
             env=env,
         ))
 
