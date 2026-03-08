@@ -1,10 +1,13 @@
 """OpenHands harness agent wired to Harbor's OpenHands CLI with shared baseline tooling."""
 
+import base64
 import json
 import logging
 import os
+import shlex
 
 from harbor.agents import utils as harbor_utils
+from harbor.agents.installed.base import ExecInput
 from harbor.environments.base import BaseEnvironment
 from harbor.agents.installed.openhands import OpenHands
 
@@ -86,6 +89,9 @@ class OpenHandsHarnessAgent(BaselineHarnessMixin, OpenHands):
         "exit $_oh_rc"
     )
 
+    # Path inside the container where the instruction file is written.
+    _TASK_FILE = "/tmp/oh_task_instruction.txt"
+
     def create_run_agent_commands(self, instruction: str):
         instruction = self._resolve_instruction_text(instruction)
         instruction = self._prepare_instruction(instruction)
@@ -96,10 +102,55 @@ class OpenHandsHarnessAgent(BaselineHarnessMixin, OpenHands):
         ):
             instruction = f"{self.OPENHANDS_WORKSPACE_PREAMBLE}\n\n{instruction}"
         self._save_instruction_artifact(instruction)
-        exec_inputs = OpenHands.create_run_agent_commands(self, instruction)
-        # Append daemon cleanup so Daytona session exits cleanly
-        for ei in exec_inputs:
-            ei.command = f"{{ {ei.command} }}{self._CLEANUP_SUFFIX}"
+
+        # --- Work around Harbor bug: shlex.quote() breaks on instructions
+        # containing single quotes, backticks, etc.  Instead of passing the
+        # instruction as a shell-quoted CLI argument, we base64-encode it and
+        # decode it inside the container to a temp file, then read it back
+        # with $(cat ...).  Base64 is shell-safe (no quotes to break). ---
+        b64_instruction = base64.b64encode(instruction.encode()).decode()
+
+        # Build env dict the same way upstream OpenHands does, but skip the
+        # broken --task= quoting.  We call the parent's method to get env
+        # setup, then replace the command that uses shlex.quote.
+        upstream_inputs = OpenHands.create_run_agent_commands(self, instruction)
+
+        # The upstream returns 1-2 ExecInputs:
+        #   [0] (optional): MCP config.toml write
+        #   [-1]: the actual openhands.core.main command (the broken one)
+        # We keep everything except the last command and rebuild it.
+        env = upstream_inputs[-1].env or {}
+
+        exec_inputs = upstream_inputs[:-1]  # keep MCP config setup if present
+
+        # Write instruction file via base64 decode (shell-safe, no quoting)
+        exec_inputs.append(ExecInput(
+            command=f"echo '{b64_instruction}' | base64 -d > {self._TASK_FILE}",
+            env=env,
+        ))
+
+        # Build the openhands command reading task from file
+        mcp_config = self._build_mcp_config_toml()
+        config_file_path = "~/.openhands/config.toml"
+
+        commands = [
+            "SANDBOX_VOLUMES=${PWD}:/workspace:rw",
+            "/opt/openhands-venv/bin/python -m openhands.core.main",
+            f'--task="$(cat {self._TASK_FILE})"',
+        ]
+        if mcp_config:
+            commands.append(f"--config-file={config_file_path}")
+
+        main_cmd = (
+            " ".join(commands)
+            + " 2>&1 </dev/null | stdbuf -oL tee /logs/agent/openhands.txt"
+        )
+
+        exec_inputs.append(ExecInput(
+            command=f"{{ {main_cmd} }}{self._CLEANUP_SUFFIX}",
+            env=env,
+        ))
+
         return exec_inputs
 
     def _build_workspace_guidance(self, workdir: str) -> str:
