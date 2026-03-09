@@ -1613,7 +1613,7 @@ def main() -> int:
             log.error("DAYTONA_API_KEY required. Set in env or ~/.config/daytona/env.sh")
             return 1
         if not creds.get("oauth_creds"):
-            log.error("OAuth credentials required. Check ~/.claude-homes/account1/.claude/.credentials.json")
+            log.error("OAuth credentials required. Check ~/.claude-homes/accountN/.claude/.credentials.json")
             return 1
 
     # Dispatch to appropriate mode

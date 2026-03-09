@@ -7,6 +7,7 @@ then exchanges the resulting code for OAuth credentials.
 Usage:
     # Login for a specific account
     python3 scripts/headless_login.py --home ~/.claude-homes/account1
+    python3 scripts/headless_login.py --account 4
 
     # Login for all accounts interactively
     python3 scripts/headless_login.py --all-accounts
@@ -20,6 +21,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -34,6 +36,7 @@ AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
 SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers"
+ACCOUNT_NAME_RE = re.compile(r"account(\d+)$")
 
 
 def generate_pkce():
@@ -163,6 +166,25 @@ def save_credentials(home_dir: str, token_data: dict):
     print(f"  Token valid for {expires_in // 60} minutes")
 
 
+def discover_account_homes(real_home: str) -> list[Path]:
+    homes_dir = Path(real_home) / ".claude-homes"
+    if not homes_dir.is_dir():
+        return []
+
+    homes = [
+        path
+        for path in homes_dir.iterdir()
+        if path.is_dir() and ACCOUNT_NAME_RE.fullmatch(path.name)
+    ]
+    return sorted(homes, key=lambda path: int(ACCOUNT_NAME_RE.fullmatch(path.name).group(1)))
+
+
+def ensure_account_home(real_home: str, account_num: int) -> Path:
+    account_home = Path(real_home) / ".claude-homes" / f"account{account_num}"
+    (account_home / ".claude").mkdir(parents=True, exist_ok=True)
+    return account_home
+
+
 def login_account(home_dir: str, label: str = ""):
     """Run the headless login flow for one account."""
     display = label or home_dir
@@ -200,36 +222,41 @@ def main():
     )
     parser.add_argument("--home", default=None,
                         help="Home directory for credentials (default: $HOME)")
+    parser.add_argument(
+        "--account",
+        type=int,
+        default=None,
+        help="Account number under ~/.claude-homes/accountN to create/use.",
+    )
     parser.add_argument("--all-accounts", action="store_true",
-                        help="Login for all accounts under ~/.claude-homes/")
+                        help="Login for all existing accounts under ~/.claude-homes/")
     args = parser.parse_args()
 
     real_home = os.environ.get("HOME", os.path.expanduser("~"))
 
+    if args.home and args.account is not None:
+        parser.error("--home and --account are mutually exclusive")
+    if args.all_accounts and args.account is not None:
+        parser.error("--all-accounts and --account are mutually exclusive")
+
     if args.all_accounts:
-        homes_dir = Path(real_home) / ".claude-homes"
-        if not homes_dir.is_dir():
-            print(f"No multi-account directory at {homes_dir}")
+        account_homes = discover_account_homes(real_home)
+        if not account_homes:
+            homes_dir = Path(real_home) / ".claude-homes"
+            print(f"No account directories found at {homes_dir}")
             sys.exit(1)
 
-        account_num = 1
-        while True:
-            account_home = homes_dir / f"account{account_num}"
-            creds = account_home / ".claude" / ".credentials.json"
-            if creds.is_file() or account_home.is_dir():
-                login_account(str(account_home), f"account{account_num}")
-                account_num += 1
-            else:
-                break
-
-        if account_num == 1:
-            print("No accounts found.")
-            sys.exit(1)
+        for account_home in account_homes:
+            login_account(str(account_home), account_home.name)
 
         print(f"\n{'=' * 60}")
-        print(f"All {account_num - 1} accounts processed.")
+        print(f"All {len(account_homes)} accounts processed.")
         print(f"{'=' * 60}")
     else:
+        if args.account is not None:
+            account_home = ensure_account_home(real_home, args.account)
+            login_account(str(account_home), f"account{args.account}")
+            return
         home = args.home or real_home
         login_account(home)
 

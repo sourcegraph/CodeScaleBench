@@ -27,6 +27,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -66,6 +67,7 @@ CONFIG_INSTRUCTION_MAP = {
 }
 
 MCP_CONFIGS = {"mcp-remote-direct", "mcp-remote-artifact"}
+ACCOUNT_NAME_RE = re.compile(r"account(\d+)$")
 
 
 def resolve_dockerfile_name(task: "TaskSpec", config_name: str) -> str:
@@ -134,17 +136,36 @@ def _account_creds_path(account_num: int) -> Path:
     return Path.home() / ".claude-homes" / f"account{account_num}" / ".claude" / ".credentials.json"
 
 
+def _discover_account_numbers() -> List[int]:
+    homes_dir = Path.home() / ".claude-homes"
+    if not homes_dir.is_dir():
+        return []
+
+    account_numbers: List[int] = []
+    for path in homes_dir.iterdir():
+        if not path.is_dir():
+            continue
+        match = ACCOUNT_NAME_RE.fullmatch(path.name)
+        if match:
+            account_numbers.append(int(match.group(1)))
+    return sorted(account_numbers)
+
+
 def list_oauth_accounts() -> List[dict]:
     accounts = []
-    num = 1
-    while True:
+    for num in _discover_account_numbers():
         creds_path = _account_creds_path(num)
         if not creds_path.exists():
             alt_path = creds_path.parent / "credentials.json"
             if alt_path.exists():
                 creds_path = alt_path
             else:
-                break
+                accounts.append({
+                    "num": num,
+                    "path": str(creds_path),
+                    "error": "missing credentials",
+                })
+                continue
         try:
             creds = json.loads(creds_path.read_text())
             oauth = creds.get("claudeAiOauth", {})
@@ -159,7 +180,6 @@ def list_oauth_accounts() -> List[dict]:
             })
         except Exception as e:
             accounts.append({"num": num, "path": str(creds_path), "error": str(e)})
-        num += 1
     return accounts
 
 

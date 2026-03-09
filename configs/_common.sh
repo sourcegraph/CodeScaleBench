@@ -27,6 +27,11 @@ _ccb_repo_root() {
 # Launchers and helper scripts should always have a repo root available for
 # invoking repo-local utilities such as the Daytona cost guard.
 export REPO_ROOT="${REPO_ROOT:-$(_ccb_repo_root)}"
+ACCOUNT_HEALTH_STATE_FILE="${ACCOUNT_HEALTH_STATE_FILE:-$REPO_ROOT/runs/state/account_health.json}"
+ACCOUNT_HEALTH_PREFLIGHT="${ACCOUNT_HEALTH_PREFLIGHT:-1}"
+ACCOUNT_MIN_TOKEN_MINUTES="${ACCOUNT_MIN_TOKEN_MINUTES:-90}"
+TOKEN_PREFLIGHT_MODE="${TOKEN_PREFLIGHT_MODE:-readonly}"
+AUTO_REFRESH_TOKENS="${AUTO_REFRESH_TOKENS:-0}"
 
 _harbor_args_include_env_flag() {
     local arg
@@ -112,6 +117,93 @@ harbor_run_guarded() {
 
     command+=("${args[@]}")
     "${command[@]}"
+}
+
+account_readiness_preflight() {
+    if [ "${ACCOUNT_HEALTH_PREFLIGHT}" != "1" ]; then
+        echo "Account readiness preflight: disabled (ACCOUNT_HEALTH_PREFLIGHT=${ACCOUNT_HEALTH_PREFLIGHT})"
+        return 0
+    fi
+
+    if [ ${#CLAUDE_HOMES[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    local report_json
+    local report_rc=0
+    local cmd=(
+        python3 "$REPO_ROOT/scripts/account_health.py" preflight
+        --format json
+        --state-file "$ACCOUNT_HEALTH_STATE_FILE"
+        --real-home "$REAL_HOME"
+        --sessions-per-account "$SESSIONS_PER_ACCOUNT"
+        --min-token-minutes "$ACCOUNT_MIN_TOKEN_MINUTES"
+    )
+    local home_dir
+    for home_dir in "${CLAUDE_HOMES[@]}"; do
+        cmd+=(--home "$home_dir")
+    done
+
+    report_json="$("${cmd[@]}" 2>/dev/null)" || report_rc=$?
+    if [ -z "$report_json" ]; then
+        echo "WARNING: account readiness preflight produced no output; continuing with discovered accounts"
+        return 0
+    fi
+
+    local report_file
+    report_file=$(mktemp)
+    printf '%s' "$report_json" > "$report_file"
+
+    echo "Account readiness preflight:"
+    python3 - "$report_file" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+for account in data.get("accounts", []):
+    token = account.get("token", {})
+    remaining = token.get("remaining_minutes")
+    remaining_text = "unknown"
+    if remaining is not None:
+        remaining_text = f"{remaining}m"
+    print(
+        f"  - {account['label']}: {account['status']}, "
+        f"slots {account['available_slots']}/{account['sessions_per_account']}, "
+        f"active {account['active_assignments']}, token {token.get('token_state')} ({remaining_text})"
+    )
+print(f"  Recommendation: {data.get('recommended_action')}")
+print(f"  Summary: {data.get('summary')}")
+PY
+
+    mapfile -t CLAUDE_HOMES < <(python3 - "$report_file" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+for home in data.get("ready_homes", []):
+    print(home)
+PY
+    )
+
+    local recommended_parallel
+    recommended_parallel=$(python3 - "$report_file" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+print(data.get("recommended_parallel_jobs", 0))
+PY
+    )
+    rm -f "$report_file"
+
+    if [ "$report_rc" -ne 0 ] || [ ${#CLAUDE_HOMES[@]} -eq 0 ]; then
+        echo "ERROR: account readiness preflight found no safe accounts. Wait, refresh login, or swap to API."
+        return 1
+    fi
+
+    if [ -n "${recommended_parallel:-}" ] && [ "$recommended_parallel" -gt 0 ] && [ "${PARALLEL_JOBS:-0}" -gt 0 ] && [ "$PARALLEL_JOBS" -gt "$recommended_parallel" ]; then
+        echo "Account readiness preflight: capping PARALLEL_JOBS from $PARALLEL_JOBS to $recommended_parallel"
+        PARALLEL_JOBS=$recommended_parallel
+    fi
+
+    return 0
 }
 
 # Guard function: call this in each 3config script instead of the old if/else auth block.
@@ -558,8 +650,8 @@ check_trajectory_coverage() {
 PARALLEL_JOBS=${PARALLEL_JOBS:-0}
 
 # Max concurrent sessions per Max-plan account before hitting rate limits.
-# Based on empirical testing: ~4 concurrent Claude Code sessions per Max account.
-SESSIONS_PER_ACCOUNT=${SESSIONS_PER_ACCOUNT:-4}
+# Current local throughput target is 6 concurrent Claude Code sessions per account.
+SESSIONS_PER_ACCOUNT=${SESSIONS_PER_ACCOUNT:-6}
 
 # ============================================
 # MULTI-ACCOUNT SUPPORT
@@ -589,8 +681,9 @@ RATE_LIMIT_PROBE_PROMPT="${RATE_LIMIT_PROBE_PROMPT:-Reply with exactly OK.}"
 
 # Check whether an account's OAuth token is valid (or can be refreshed).
 # Args: $1 = account home directory (e.g., ~/.claude-homes/account1)
-# Returns 0 if the token is valid (or was successfully refreshed), 1 otherwise.
-# Uses REFRESH_MARGIN (default 30 min) as the validity threshold.
+# Returns 0 if the token is currently usable, 1 otherwise.
+# TOKEN_PREFLIGHT_MODE=readonly (default) never mutates credentials during launch
+# preflight. TOKEN_PREFLIGHT_MODE=refresh preserves the historical refresh path.
 _check_account_token() {
     local account_home=$1
     local creds_file="$account_home/.claude/.credentials.json"
@@ -643,8 +736,24 @@ TOKCHK
             return 0
             ;;
         expiring)
-            # Token is expired or expiring soon — try refresh
-            echo "    Token expiring soon — attempting refresh..."
+            local _expiring_payload="${token_status#expiring:}"
+            local _mins="${_expiring_payload%%:*}"
+            local _has_refresh="${_expiring_payload##*:}"
+            if [ "$_mins" -gt 0 ]; then
+                echo "    Token valid but inside refresh margin (${_mins} min remaining)"
+                return 0
+            fi
+
+            if [ "${TOKEN_PREFLIGHT_MODE}" != "refresh" ]; then
+                if [ "$_has_refresh" = "True" ] || [ "$_has_refresh" = "true" ]; then
+                    echo "    Token expired and refresh token exists, but TOKEN_PREFLIGHT_MODE=readonly"
+                else
+                    echo "    Token expired and no refresh token is available"
+                fi
+                return 1
+            fi
+
+            echo "    Token expiring/expired — attempting refresh..."
             local _refresh_out
             _refresh_out=$(HOME="$account_home" refresh_claude_token 2>&1)
             local _refresh_rc=$?
@@ -672,7 +781,7 @@ TOKCHK
     esac
 }
 
-# Detect all accounts under ~/.claude-homes/accountN/ (N=1,2,3,...).
+# Detect all accounts under ~/.claude-homes/accountN/.
 # Skips accounts listed in SKIP_ACCOUNTS.
 # Also skips accounts with expired/invalid tokens (after attempting refresh).
 # Falls back to $HOME if no account directories are found.
@@ -680,32 +789,41 @@ TOKCHK
 setup_multi_accounts() {
     CLAUDE_HOMES=()
     local skipped_accounts=()
+    local homes_root="$REAL_HOME/.claude-homes"
+    local account_dirs=()
+    local account_home
+    for account_home in "$homes_root"/account*; do
+        [ -d "$account_home" ] || continue
+        account_dirs+=("$account_home")
+    done
 
-    # Check for explicit account directories: account1, account2, ...
-    local account_num=1
-    while true; do
-        local account_name="account$account_num"
-        local account_home="$REAL_HOME/.claude-homes/$account_name"
-        if [ -f "$account_home/.claude/.credentials.json" ]; then
-            # Check skip list
+    if [ ${#account_dirs[@]} -gt 0 ]; then
+        while IFS= read -r account_home; do
+            [ -n "$account_home" ] || continue
+            local account_name
+            account_name=$(basename "$account_home")
+
             if [[ -n "$SKIP_ACCOUNTS" ]] && [[ " $SKIP_ACCOUNTS " == *" $account_name "* ]]; then
                 echo "  Skipping $account_name (in SKIP_ACCOUNTS)"
                 skipped_accounts+=("$account_name")
-            else
-                # Check token validity
-                echo "  Checking $account_name token..."
-                if _check_account_token "$account_home"; then
-                    CLAUDE_HOMES+=("$account_home")
-                else
-                    echo "  Skipping $account_name (token expired/invalid — re-authenticate with: python3 scripts/headless_login.py --home ~/.claude-homes/$account_name)"
-                    skipped_accounts+=("$account_name")
-                fi
+                continue
             fi
-            account_num=$((account_num + 1))
-        else
-            break
-        fi
-    done
+
+            if [ ! -f "$account_home/.claude/.credentials.json" ]; then
+                echo "  Skipping $account_name (missing credentials — authenticate with: python3 scripts/headless_login.py --account ${account_name#account})"
+                skipped_accounts+=("$account_name")
+                continue
+            fi
+
+            echo "  Checking $account_name token..."
+            if _check_account_token "$account_home"; then
+                CLAUDE_HOMES+=("$account_home")
+            else
+                echo "  Skipping $account_name (token expired/invalid — re-authenticate with: python3 scripts/headless_login.py --account ${account_name#account})"
+                skipped_accounts+=("$account_name")
+            fi
+        done < <(printf '%s\n' "${account_dirs[@]}" | sort -V)
+    fi
 
     # Restore HOME in case refresh_claude_token changed it
     export HOME="$REAL_HOME"
@@ -727,6 +845,8 @@ setup_multi_accounts() {
         fi
     fi
 
+    account_readiness_preflight || return 1
+
     # Auto-set PARALLEL_JOBS = sessions_per_account * num_accounts
     if [ "$PARALLEL_JOBS" -eq 0 ]; then
         PARALLEL_JOBS=$(( SESSIONS_PER_ACCOUNT * ${#CLAUDE_HOMES[@]} ))
@@ -743,6 +863,12 @@ ensure_fresh_token_all() {
     # Ensure account homes are discovered so refresh is never silently skipped.
     if [ ${#CLAUDE_HOMES[@]} -eq 0 ]; then
         setup_multi_accounts
+    fi
+
+    if [ "${AUTO_REFRESH_TOKENS}" != "1" ]; then
+        echo "Token refresh: disabled (AUTO_REFRESH_TOKENS=${AUTO_REFRESH_TOKENS}); using read-only preflight state"
+        export HOME="$REAL_HOME"
+        return 0
     fi
 
     # Safety fallback in case setup_multi_accounts did not populate for any reason.
@@ -893,9 +1019,13 @@ preflight_rate_limits() {
 #   - PID tracking and exit code collection
 #
 # Returns 0 if all tasks succeeded, 1 if any failed.
-# Rate-limit / account-exhaustion patterns (checked in task log output).
-# If a failed task's log matches any of these, it's eligible for retry on a different account.
+# Rate-limit / account-exhaustion patterns (checked in task log output/result.json).
+# If a failed task's output matches any of these, it's eligible for retry on a different account.
 RATE_LIMIT_PATTERNS="rate.limit|429|too many requests|throttl|overloaded|token.*refresh.*fail|credentials.*expired|403.*Forbidden|capacity|resource_exhausted"
+
+# Explicit Claude runtime rejection markers. These show up in claude-code.txt even
+# when the task subprocess exits 0, so they need a dedicated check.
+REJECTED_RATE_LIMIT_PATTERNS='"type":"rate_limit_event".*"status":"rejected"|"error":"rate_limit"|You'\''ve hit your limit'
 
 # Daytona-specific transient error patterns (sandbox resource contention).
 # These are retried on the SAME account (not an auth issue) with backoff.
@@ -924,6 +1054,33 @@ _is_rate_limited() {
     result_files=$(find "$log_dir" -name "result.json" -newer "$log_dir" -path "*${task_id}*" 2>/dev/null || true)
     for rf in $result_files; do
         if grep -qEi "$RATE_LIMIT_PATTERNS" "$rf" 2>/dev/null; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Check whether a task transcript contains an explicit rejected Claude rate limit.
+# This catches invalid runs that still exit successfully from the launcher.
+# Args: $1 = task_id, $2 = log directory
+# Returns 0 if an explicit rejected rate-limit marker is present, 1 otherwise.
+_has_rejected_rate_limit_marker() {
+    local task_id=$1
+    local log_dir=$2
+
+    local transcript_files
+    transcript_files=$(find "$log_dir" -name "claude-code.txt" -path "*${task_id}*" 2>/dev/null || true)
+    for tf in $transcript_files; do
+        if grep -qE "$REJECTED_RATE_LIMIT_PATTERNS" "$tf" 2>/dev/null; then
+            return 0
+        fi
+    done
+
+    local result_files
+    result_files=$(find "$log_dir" -name "result.json" -path "*${task_id}*" 2>/dev/null || true)
+    for rf in $result_files; do
+        if grep -qE "$REJECTED_RATE_LIMIT_PATTERNS" "$rf" 2>/dev/null; then
             return 0
         fi
     done
@@ -978,12 +1135,56 @@ _pick_alternate_account() {
     echo ""
 }
 
+_account_health_record_begin() {
+    local account_home=$1
+    local assignment_id=$2
+    local task_id=$3
+    local run_id=$4
+    local launcher=$5
+    local pid=$6
+
+    [ -f "$REPO_ROOT/scripts/account_health.py" ] || return 0
+    python3 "$REPO_ROOT/scripts/account_health.py" begin-assignment \
+        --state-file "$ACCOUNT_HEALTH_STATE_FILE" \
+        --home "$account_home" \
+        --assignment-id "$assignment_id" \
+        --task-id "$task_id" \
+        --run-id "$run_id" \
+        --launcher "$launcher" \
+        --pid "$pid" >/dev/null 2>&1 || true
+}
+
+_account_health_record_end() {
+    local account_home=$1
+    local assignment_id=$2
+
+    [ -f "$REPO_ROOT/scripts/account_health.py" ] || return 0
+    python3 "$REPO_ROOT/scripts/account_health.py" end-assignment \
+        --state-file "$ACCOUNT_HEALTH_STATE_FILE" \
+        --home "$account_home" \
+        --assignment-id "$assignment_id" >/dev/null 2>&1 || true
+}
+
+_account_health_record_rate_limit() {
+    local account_home=$1
+    local task_id=$2
+    local reason=${3:-runtime rate limit detected}
+
+    [ -f "$REPO_ROOT/scripts/account_health.py" ] || return 0
+    python3 "$REPO_ROOT/scripts/account_health.py" mark-rate-limit \
+        --state-file "$ACCOUNT_HEALTH_STATE_FILE" \
+        --home "$account_home" \
+        --task-id "$task_id" \
+        --reason "$reason" >/dev/null 2>&1 || true
+}
+
 run_tasks_parallel() {
     local -n _task_ids=$1
     local cmd_fn=$2
     local pids=()
     local task_for_pid=()
     local home_for_pid=()
+    local assignment_for_pid=()
     local failed=0
     local abort=false
     local account_idx=0
@@ -1002,14 +1203,51 @@ run_tasks_parallel() {
 
     # Infer log directory from the calling script's jobs_subdir variable (if set)
     local _log_dir="${jobs_subdir:-}"
+    local _run_id
+    _run_id="${DAYTONA_LABEL_RUN_ID:-$(basename "$(dirname "${_log_dir:-$PWD}")")}"
+    local _launcher
+    _launcher="$(basename "$0")"
 
     echo "Parallel execution: ${#_task_ids[@]} tasks, max $PARALLEL_JOBS concurrent, $num_accounts account(s)"
+
+    _deactivate_account() {
+        local failed_home=$1
+        local kept=()
+        local home
+        for home in "${CLAUDE_HOMES[@]}"; do
+            if [ "$home" != "$failed_home" ]; then
+                kept+=("$home")
+            fi
+        done
+        if [ ${#kept[@]} -lt ${#CLAUDE_HOMES[@]} ]; then
+            CLAUDE_HOMES=("${kept[@]}")
+            num_accounts=${#CLAUDE_HOMES[@]}
+            if [ "$num_accounts" -eq 0 ]; then
+                echo "ACCOUNT RATE-LIMIT: no accounts remain in rotation"
+                failed=1
+                abort=true
+                return
+            fi
+            if [ "$num_accounts" -gt 0 ] && [ "$account_idx" -ge "$num_accounts" ]; then
+                account_idx=0
+            fi
+            if [ "$PARALLEL_JOBS" -gt 0 ]; then
+                local max_jobs=$(( SESSIONS_PER_ACCOUNT * num_accounts ))
+                if [ "$PARALLEL_JOBS" -gt "$max_jobs" ]; then
+                    echo "ACCOUNT RATE-LIMIT: capping PARALLEL_JOBS from $PARALLEL_JOBS to $max_jobs"
+                    PARALLEL_JOBS=$max_jobs
+                fi
+            fi
+            echo "ACCOUNT RATE-LIMIT: removed $(basename "$failed_home") from current rotation (${num_accounts} account(s) remain)"
+        fi
+    }
 
     # _kill_all: terminate all running task PIDs.
     _kill_all() {
         if [ ${#pids[@]} -eq 0 ]; then return; fi
         echo "FAIL-FAST: Killing ${#pids[@]} running task(s)..."
         for i in "${!pids[@]}"; do
+            _account_health_record_end "${home_for_pid[$i]}" "${assignment_for_pid[$i]}"
             kill "${pids[$i]}" 2>/dev/null || true
             echo "  Killed ${task_for_pid[$i]} (PID ${pids[$i]})"
         done
@@ -1020,6 +1258,7 @@ run_tasks_parallel() {
         pids=()
         task_for_pid=()
         home_for_pid=()
+        assignment_for_pid=()
     }
 
     # _reap_one: check finished PIDs, handle rate-limit retries.
@@ -1031,15 +1270,34 @@ run_tasks_parallel() {
                 done_pid="${pids[$i]}"
                 local _task="${task_for_pid[$i]}"
                 local _home="${home_for_pid[$i]}"
+                local _assignment="${assignment_for_pid[$i]}"
                 local _exit=0
                 wait "$done_pid" 2>/dev/null || _exit=$?
+                _account_health_record_end "$_home" "$_assignment"
 
-                if [ "$_exit" -ne 0 ]; then
+                if [ -n "$_log_dir" ] && \
+                   [ -z "${_retried[$_task]:-}" ] && \
+                   _has_rejected_rate_limit_marker "$_task" "$_log_dir"; then
+                    _account_health_record_rate_limit "$_home" "$_task" "runtime rejected Claude rate limit detected"
+                    _deactivate_account "$_home"
+                    local alt_home
+                    alt_home=$(_pick_alternate_account "$_home")
+                    if [ -n "$alt_home" ]; then
+                        echo "RATE-LIMIT RETRY: Task $_task hit a rejected Claude rate limit on $(basename "$_home"), will retry on $(basename "$alt_home")"
+                        retry_tasks+=("$_task")
+                        retry_homes+=("$alt_home")
+                        _retried[$_task]=1
+                    else
+                        echo "WARNING: Task $_task hit a rejected Claude rate limit but no alternate account is available"
+                        failed=1
+                    fi
+                elif [ "$_exit" -ne 0 ]; then
                     # Check if this is a rate-limit failure eligible for retry
                     if [ -n "$_log_dir" ] && \
-                       [ "$num_accounts" -gt 1 ] && \
                        [ -z "${_retried[$_task]:-}" ] && \
                        _is_rate_limited "$_task" "$_log_dir"; then
+                        _account_health_record_rate_limit "$_home" "$_task" "runtime rate-limit pattern matched"
+                        _deactivate_account "$_home"
                         local alt_home
                         alt_home=$(_pick_alternate_account "$_home")
                         if [ -n "$alt_home" ]; then
@@ -1084,10 +1342,12 @@ run_tasks_parallel() {
                 unset 'pids[i]'
                 unset 'task_for_pid[i]'
                 unset 'home_for_pid[i]'
+                unset 'assignment_for_pid[i]'
                 # Re-index arrays
                 pids=("${pids[@]}")
                 task_for_pid=("${task_for_pid[@]}")
                 home_for_pid=("${home_for_pid[@]}")
+                assignment_for_pid=("${assignment_for_pid[@]}")
                 break
             fi
         done
@@ -1102,10 +1362,14 @@ run_tasks_parallel() {
             export HOME="$task_home"
             $cmd_fn "$task_id" "$task_home"
         ) &
-        pids+=($!)
+        local _pid=$!
+        local _assignment_id="${task_id}__${_pid}"
+        _account_health_record_begin "$task_home" "$_assignment_id" "$task_id" "$_run_id" "$_launcher" "$_pid"
+        pids+=($_pid)
         task_for_pid+=("$task_id")
         home_for_pid+=("$task_home")
-        echo "  Launched task $task_id (PID $!, account HOME=$task_home)"
+        assignment_for_pid+=("$_assignment_id")
+        echo "  Launched task $task_id (PID $_pid, account HOME=$task_home)"
         # Stagger launches to avoid Harbor batch-directory timestamp collisions
         sleep 2
     }

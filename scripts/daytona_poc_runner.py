@@ -24,6 +24,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -85,6 +86,7 @@ def load_src_access_token():
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Official Claude Code CLI client ID
 OAUTH_TOKEN_URL = "https://console.anthropic.com/api/oauth/token"
 REFRESH_MARGIN = 1800  # 30 minutes — refresh if token expires within this window
+ACCOUNT_NAME_RE = re.compile(r"account(\d+)$")
 
 
 def _account_creds_path(account_num):
@@ -97,11 +99,26 @@ def _account_home(account_num):
     return Path.home() / ".claude-homes" / f"account{account_num}"
 
 
+def _discover_account_numbers():
+    """Return configured account numbers under ~/.claude-homes/accountN."""
+    homes_dir = Path.home() / ".claude-homes"
+    if not homes_dir.is_dir():
+        return []
+
+    account_numbers = []
+    for path in homes_dir.iterdir():
+        if not path.is_dir():
+            continue
+        match = ACCOUNT_NAME_RE.fullmatch(path.name)
+        if match:
+            account_numbers.append(int(match.group(1)))
+    return sorted(account_numbers)
+
+
 def list_oauth_accounts():
     """List available OAuth accounts and their token status."""
     accounts = []
-    num = 1
-    while True:
+    for num in _discover_account_numbers():
         creds_path = _account_creds_path(num)
         if not creds_path.exists():
             # Also try without leading dot
@@ -109,7 +126,12 @@ def list_oauth_accounts():
             if alt_path.exists():
                 creds_path = alt_path
             else:
-                break
+                accounts.append({
+                    "num": num,
+                    "path": str(creds_path),
+                    "error": "missing credentials",
+                })
+                continue
         try:
             creds = json.loads(creds_path.read_text())
             oauth = creds.get("claudeAiOauth", {})
@@ -126,7 +148,6 @@ def list_oauth_accounts():
             })
         except Exception as e:
             accounts.append({"num": num, "path": str(creds_path), "error": str(e)})
-        num += 1
     return accounts
 
 
@@ -551,7 +572,7 @@ def main():
     )
     parser.add_argument(
         "--account", type=int, default=1,
-        help="OAuth account number (1-3). Used with --auth oauth. Default: 1",
+        help="OAuth account number under ~/.claude-homes/accountN. Default: 1",
     )
     parser.add_argument(
         "--list-accounts", action="store_true",
@@ -566,7 +587,7 @@ def main():
             print("No OAuth accounts found at ~/.claude-homes/accountN/.claude/.credentials.json")
             print("\nTo set up accounts, create the directory structure:")
             print("  mkdir -p ~/.claude-homes/account1/.claude")
-            print("  # Then run: HOME=~/.claude-homes/account1 claude  (to login via browser)")
+            print("  # Or run: python3 scripts/headless_login.py --account 1")
         else:
             print(f"Found {len(accounts)} OAuth account(s):\n")
             for a in accounts:
@@ -598,8 +619,7 @@ def main():
             print(f"ERROR: Failed to load OAuth credentials for account {args.account}: {e}")
             print("\nTo set up OAuth accounts:")
             print(f"  mkdir -p ~/.claude-homes/account{args.account}/.claude")
-            print(f"  HOME=~/.claude-homes/account{args.account} claude")
-            print("  # Complete browser login, then credentials are saved automatically")
+            print(f"  python3 scripts/headless_login.py --account {args.account}")
             sys.exit(1)
     else:
         anthropic_key = load_anthropic_api_key()

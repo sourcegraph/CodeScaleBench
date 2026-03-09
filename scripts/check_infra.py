@@ -18,6 +18,8 @@ import sys
 import time
 from pathlib import Path
 
+from account_health import collect_account_status, discover_account_homes
+
 REAL_HOME = os.environ.get("HOME", os.path.expanduser("~"))
 
 
@@ -75,7 +77,7 @@ def try_refresh_token(creds_file: Path) -> dict | None:
     return {"expires_in": expires_in, "remaining_min": expires_in // 60}
 
 
-def check_oauth_token(home_dir: str | None = None) -> dict:
+def check_oauth_token(home_dir: str | None = None, allow_refresh: bool = False) -> dict:
     """Check OAuth token validity and time remaining."""
     home = home_dir or REAL_HOME
     creds_file = Path(home) / ".claude" / ".credentials.json"
@@ -107,8 +109,8 @@ def check_oauth_token(home_dir: str | None = None) -> dict:
     has_refresh = bool(oauth.get("refreshToken"))
 
     if remaining_s <= 0:
-        # Access token expired — try to refresh it
-        if has_refresh:
+        if has_refresh and allow_refresh:
+            # Access token expired — optional refresh path
             refresh_result = try_refresh_token(creds_file)
             if refresh_result:
                 return {
@@ -128,12 +130,14 @@ def check_oauth_token(home_dir: str | None = None) -> dict:
                     "has_refresh_token": has_refresh,
                     "home": home,
                 }
+        status = "WARN" if has_refresh else "FAIL"
+        action = "refresh/login recommended" if has_refresh else "Run: claude login"
         return {
             "check": "oauth_token",
-            "status": "FAIL",
-            "message": f"Token EXPIRED ({abs(remaining_min)} min ago), no refresh token. Run: claude login",
+            "status": status,
+            "message": f"Token EXPIRED ({abs(remaining_min)} min ago), {action}",
             "remaining_minutes": remaining_min,
-            "has_refresh_token": False,
+            "has_refresh_token": has_refresh,
             "home": home,
         }
     elif remaining_s < 1800:  # < 30 min
@@ -156,32 +160,29 @@ def check_oauth_token(home_dir: str | None = None) -> dict:
         }
 
 
-def check_multi_account_tokens() -> list[dict]:
+def check_multi_account_tokens(allow_refresh: bool = False) -> list[dict]:
     """Check tokens for all accounts under ~/.claude-homes/."""
-    results = []
-    homes_dir = Path(REAL_HOME) / ".claude-homes"
+    real_home_path = Path(REAL_HOME)
+    return [
+        check_oauth_token(
+            None if home == real_home_path else str(home),
+            allow_refresh=allow_refresh,
+        )
+        for home in discover_account_homes(real_home_path)
+    ]
 
-    if not homes_dir.is_dir():
-        # Single account mode
-        results.append(check_oauth_token())
-        return results
 
-    account_num = 1
-    found_any = False
-    while True:
-        account_home = homes_dir / f"account{account_num}"
-        creds = account_home / ".claude" / ".credentials.json"
-        if creds.is_file():
-            found_any = True
-            results.append(check_oauth_token(str(account_home)))
-            account_num += 1
-        else:
-            break
-
-    if not found_any:
-        results.append(check_oauth_token())
-
-    return results
+def check_account_readiness() -> dict:
+    """Summarize launch-safe accounts using deterministic local signals."""
+    report = collect_account_status()
+    summary = report["summary"]
+    action = report["recommended_action"]
+    status = "OK" if report["ok_to_launch"] else "FAIL"
+    return {
+        "check": "account_readiness",
+        "status": status,
+        "message": f"{summary}; action={action}",
+    }
 
 
 def check_env_local() -> dict:
@@ -380,7 +381,7 @@ def format_table(results: list[dict]) -> str:
     elif warns:
         lines.append(f"\033[93mREADY with {warns} warning(s). Runs may partially fail.\033[0m")
     else:
-        lines.append(f"\033[92mALL CLEAR: Infrastructure ready for benchmark runs.\033[0m")
+        lines.append("\033[92mALL CLEAR: Infrastructure ready for benchmark runs.\033[0m")
 
     return "\n".join(lines)
 
@@ -390,12 +391,18 @@ def main():
         description="Check infrastructure readiness before benchmark runs."
     )
     parser.add_argument("--format", choices=["table", "json"], default="table")
+    parser.add_argument(
+        "--refresh-tokens",
+        action="store_true",
+        help="Allow OAuth token refresh during infra check.",
+    )
     args = parser.parse_args()
 
     results = []
 
     # Token checks (handles multi-account)
-    results.extend(check_multi_account_tokens())
+    results.extend(check_multi_account_tokens(allow_refresh=args.refresh_tokens))
+    results.append(check_account_readiness())
 
     # Environment
     results.append(check_env_local())
