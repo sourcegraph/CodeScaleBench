@@ -96,6 +96,21 @@ change_detection = {
 if any(change_detection.values()):
     checks["change_detected"] = 1.0
     details["change_detection"] = change_detection
+else:
+    # No-changes guard: env counts are all 0.  Verify via git that the agent
+    # actually modified the repo — if not, force reward to 0.0 so tests that
+    # pass on the unmodified repo don't produce false-positive scores.
+    import subprocess as _sp
+    _verify = os.environ.get("VERIFY_REPO") or os.environ.get("TASK_REPO_ROOT") or "/workspace"
+    try:
+        _d = _sp.run(["git", "diff", "HEAD", "--stat"], capture_output=True, text=True, cwd=_verify, timeout=5)
+        _u = _sp.run(["git", "ls-files", "--others", "--exclude-standard"], capture_output=True, text=True, cwd=_verify, timeout=5)
+        if not _d.stdout.strip() and not _u.stdout.strip():
+            reward = 0.0
+            checks["no_changes_guard"] = 0.0
+            details["no_changes_guard"] = "git confirmed zero agent changes"
+    except Exception:
+        pass
 output_path = os.environ.get("VALIDATION_OUTPUT_PATH")
 if output_path:
     details["output_path"] = output_path

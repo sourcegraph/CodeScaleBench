@@ -136,6 +136,11 @@ class OpenHandsHarnessAgent(BaselineHarnessMixin, OpenHands):
             else:
                 env.pop("PYTHONPATH", None)
         env["PYTHONSAFEPATH"] = "1"
+        # Core-level env vars control LocalRuntime plugin loading.
+        # AGENT_ENABLE_JUPYTER only sets the agent config — the runtime
+        # reads the core-level config to decide whether to start jupyter.
+        env["ENABLE_JUPYTER"] = "false"
+        env["ENABLE_BROWSING"] = "false"
         env["AGENT_ENABLE_JUPYTER"] = "false"
         env["AGENT_ENABLE_BROWSING"] = "false"
 
@@ -294,6 +299,14 @@ class OpenHandsHarnessAgent(BaselineHarnessMixin, OpenHands):
 
     def _build_config_toml(self, mcp_url: str | None = None) -> str:
         lines = [
+            # Core-level settings control plugin loading in LocalRuntime.
+            # Without [core], enable_jupyter under [agent] is ignored and
+            # the jupyter-kernelgateway plugin starts, fails to bind, and
+            # crashes with tenacity.RetryError in _wait_until_alive.
+            "[core]",
+            "enable_jupyter = false",
+            "enable_browsing = false",
+            "",
             "[agent]",
             f"enable_mcp = {'true' if mcp_url else 'false'}",
             "enable_jupyter = false",

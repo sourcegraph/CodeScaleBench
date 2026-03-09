@@ -515,9 +515,13 @@ def check_test_ratio(
             elif line_stripped.startswith("FAIL") or line_stripped.startswith("--- FAIL"):
                 failed += 1
 
-        # Fallback: if no structured output, use exit code
+        # Fallback: if no structured output, use exit code — but only when
+        # there is actual test output.  An empty/trivial exit-0 (e.g. the
+        # agent made no changes and the test script returned cleanly) must
+        # NOT be scored as a passing test.
         if passed == 0 and failed == 0:
-            if proc.returncode == 0:
+            has_output = len(output.strip()) > 0
+            if proc.returncode == 0 and has_output:
                 passed = 1
             else:
                 failed = 1
