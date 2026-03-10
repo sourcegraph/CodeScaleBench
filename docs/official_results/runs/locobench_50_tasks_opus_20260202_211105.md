@@ -1,0 +1,36 @@
+# locobench_50_tasks_opus_20260202_211105
+
+## sourcegraph_full
+
+- Valid tasks: `24`
+- Mean reward: `0.500`
+- Pass rate: `1.000`
+- Scorer families: `unknown (24)`
+- Output contracts: `unknown (24)`
+
+| Task | Status | Reward | Passed | Scorer Family | Output Contract | MCP Ratio | Tool Calls | Trace |
+|---|---|---:|---|---|---|---:|---:|---|
+| [c_blockchain_nft_expert_071_bug_investigation_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--c_blockchain_nft_expert_071_bug_investigation_expert_01--a9acdcdbca.html) | `passed` | 0.475 | `True` | `-` | `-` | 0.021 | 47 | traj, tx |
+| [c_blockchain_nft_expert_071_cross_file_refactoring_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--c_blockchain_nft_expert_071_cross_file_refactoring_expert_01--0cf17d737e.html) | `passed` | 0.524 | `True` | `-` | `-` | 0.189 | 53 | traj, tx |
+| [c_fintech_payment_expert_065_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--c_fintech_payment_expert_065_architectural_understanding_expert_01--dcccc99dea.html) | `passed` | 0.509 | `True` | `-` | `-` | 0.083 | 36 | traj, tx |
+| [c_ml_nlp_expert_017_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--c_ml_nlp_expert_017_architectural_understanding_expert_01--7c9a5c7873.html) | `passed` | 0.568 | `True` | `-` | `-` | 0.059 | 34 | traj, tx |
+| [cpp_data_analytics_expert_010_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--cpp_data_analytics_expert_010_architectural_understanding_expert_01--d1a0efbd7e.html) | `passed` | 0.467 | `True` | `-` | `-` | 0.054 | 37 | traj, tx |
+| [cpp_system_security_expert_064_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--cpp_system_security_expert_064_architectural_understanding_expert_01--15f12e18de.html) | `passed` | 0.595 | `True` | `-` | `-` | 0.037 | 27 | traj, tx |
+| [cpp_web_blog_expert_040_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--cpp_web_blog_expert_040_architectural_understanding_expert_01--34276e0f08.html) | `passed` | 0.491 | `True` | `-` | `-` | 0.019 | 53 | traj, tx |
+| [cpp_web_dashboard_expert_039_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--cpp_web_dashboard_expert_039_architectural_understanding_expert_01--5b4bc17bae.html) | `passed` | 0.430 | `True` | `-` | `-` | 0.103 | 29 | traj, tx |
+| [csharp_blockchain_defi_expert_070_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--csharp_blockchain_defi_expert_070_architectural_understanding_expert_01--da934e6cc5.html) | `passed` | 0.426 | `True` | `-` | `-` | 0.065 | 31 | traj, tx |
+| [csharp_data_etl_expert_047_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--csharp_data_etl_expert_047_architectural_understanding_expert_01--0e2c6ee154.html) | `passed` | 0.515 | `True` | `-` | `-` | 0.039 | 51 | traj, tx |
+| [csharp_data_warehouse_expert_012_cross_file_refactoring_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--csharp_data_warehouse_expert_012_cross_file_refactoring_expert_01--0ae5a657d3.html) | `passed` | 0.497 | `True` | `-` | `-` | 0.018 | 56 | traj, tx |
+| [csharp_mobile_game_expert_024_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--csharp_mobile_game_expert_024_architectural_understanding_expert_01--681d07d8fe.html) | `passed` | 0.469 | `True` | `-` | `-` | 0.040 | 25 | traj, tx |
+| [csharp_web_blog_expert_076_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--csharp_web_blog_expert_076_architectural_understanding_expert_01--e316c864ee.html) | `passed` | 0.603 | `True` | `-` | `-` | 0.022 | 45 | traj, tx |
+| [java_api_rest_expert_006_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--java_api_rest_expert_006_architectural_understanding_expert_01--365742fc3c.html) | `passed` | 0.565 | `True` | `-` | `-` | 0.025 | 40 | traj, tx |
+| [java_mobile_social_expert_058_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--java_mobile_social_expert_058_architectural_understanding_expert_01--ad0499e2db.html) | `passed` | 0.485 | `True` | `-` | `-` | 0.125 | 32 | traj, tx |
+| [java_web_ecommerce_expert_036_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--java_web_ecommerce_expert_036_architectural_understanding_expert_01--6e048bf397.html) | `passed` | 0.420 | `True` | `-` | `-` | 0.028 | 36 | traj, tx |
+| [javascript_blockchain_nft_expert_035_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--javascript_blockchain_nft_expert_035_architectural_understanding_expert_01--162a2130ec.html) | `passed` | 0.477 | `True` | `-` | `-` | 0.057 | 35 | traj, tx |
+| [javascript_ml_nlp_expert_053_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--javascript_ml_nlp_expert_053_architectural_understanding_expert_01--8b270b688a.html) | `passed` | 0.496 | `True` | `-` | `-` | 0.020 | 49 | traj, tx |
+| [javascript_web_social_expert_073_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--javascript_web_social_expert_073_architectural_understanding_expert_01--5b7a28198d.html) | `passed` | 0.527 | `True` | `-` | `-` | 0.024 | 42 | traj, tx |
+| [python_fintech_payment_expert_029_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--python_fintech_payment_expert_029_architectural_understanding_expert_01--039bc8b0b8.html) | `passed` | 0.436 | `True` | `-` | `-` | 0.071 | 28 | traj, tx |
+| [rust_blockchain_nft_expert_071_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--rust_blockchain_nft_expert_071_architectural_understanding_expert_01--4dd5e12061.html) | `passed` | 0.484 | `True` | `-` | `-` | 0.043 | 46 | traj, tx |
+| [rust_ml_computer_vision_expert_054_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--rust_ml_computer_vision_expert_054_architectural_understanding_expert_01--e2208f64a8.html) | `passed` | 0.532 | `True` | `-` | `-` | 0.041 | 49 | traj, tx |
+| [rust_web_social_expert_073_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--rust_web_social_expert_073_architectural_understanding_expert_01--f88d2b834a.html) | `passed` | 0.527 | `True` | `-` | `-` | 0.022 | 46 | traj, tx |
+| [typescript_desktop_productivity_expert_055_architectural_understanding_expert_01](../tasks/locobench_50_tasks_opus_20260202_211105--sourcegraph_full--typescript_desktop_productivity_expert_055_architectural_understanding_expert_01--bdc1cd2f9a.html) | `passed` | 0.489 | `True` | `-` | `-` | 0.815 | 54 | traj, tx |

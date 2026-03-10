@@ -1,35 +1,20 @@
-# csb_org_security_haiku_20260301_191250
-
-## baseline-local-direct
-
-- Valid tasks: `8`
-- Mean reward: `0.000`
-- Pass rate: `0.000`
-
-| Task | Status | Reward | MCP Ratio | Tool Calls | Trace |
-|---|---|---:|---:|---:|---|
-| [ccx-vuln-remed-161](../tasks/csb_org_security_haiku_20260301_191250--baseline-local-direct--ccx-vuln-remed-161.html) | `failed` | 0.000 | 0.000 | 33 | traj, tx |
-| [ccx-vuln-remed-162](../tasks/csb_org_security_haiku_20260301_191250--baseline-local-direct--ccx-vuln-remed-162.html) | `failed` | 0.000 | 0.000 | 48 | traj, tx |
-| [ccx-vuln-remed-163](../tasks/csb_org_security_haiku_20260301_191250--baseline-local-direct--ccx-vuln-remed-163.html) | `failed` | 0.000 | 0.000 | 31 | traj, tx |
-| [ccx-vuln-remed-164](../tasks/csb_org_security_haiku_20260301_191250--baseline-local-direct--ccx-vuln-remed-164.html) | `failed` | 0.000 | 0.000 | 30 | traj, tx |
-| [ccx-vuln-remed-166](../tasks/csb_org_security_haiku_20260301_191250--baseline-local-direct--ccx-vuln-remed-166.html) | `failed` | 0.000 | 0.000 | 13 | traj, tx |
-| [ccx-vuln-remed-167](../tasks/csb_org_security_haiku_20260301_191250--baseline-local-direct--ccx-vuln-remed-167.html) | `failed` | 0.000 | 0.000 | 121 | traj, tx |
-| [ccx-vuln-remed-168](../tasks/csb_org_security_haiku_20260301_191250--baseline-local-direct--ccx-vuln-remed-168.html) | `failed` | 0.000 | 0.000 | 21 | traj, tx |
-| [ccx-vuln-remed-169](../tasks/csb_org_security_haiku_20260301_191250--baseline-local-direct--ccx-vuln-remed-169.html) | `failed` | 0.000 | 0.000 | 44 | traj, tx |
+# ccb_mcp_security_haiku_20260301_191250
 
 ## mcp-remote-direct
 
 - Valid tasks: `8`
 - Mean reward: `0.000`
 - Pass rate: `0.000`
+- Scorer families: `oracle_checks (4), unknown (4)`
+- Output contracts: `answer_json_native (4), unknown (4)`
 
-| Task | Status | Reward | MCP Ratio | Tool Calls | Trace |
-|---|---|---:|---:|---:|---|
-| [mcp_ccx-vuln-remed-161_4fjoon](../tasks/csb_org_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-161_4fjoon.html) | `failed` | 0.000 | 0.952 | 21 | traj, tx |
-| [mcp_ccx-vuln-remed-162_v34kpn](../tasks/csb_org_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-162_v34kpn.html) | `failed` | 0.000 | 0.944 | 18 | traj, tx |
-| [mcp_ccx-vuln-remed-163_f4gqay](../tasks/csb_org_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-163_f4gqay.html) | `failed` | 0.000 | 0.970 | 33 | traj, tx |
-| [mcp_ccx-vuln-remed-164_plv8au](../tasks/csb_org_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-164_plv8au.html) | `failed` | 0.000 | 0.836 | 61 | traj, tx |
-| [mcp_ccx-vuln-remed-166_0dderl](../tasks/csb_org_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-166_0dderl.html) | `failed` | 0.000 | 0.846 | 13 | traj, tx |
-| [mcp_ccx-vuln-remed-167_t4ejww](../tasks/csb_org_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-167_t4ejww.html) | `failed` | 0.000 | 0.964 | 28 | traj, tx |
-| [mcp_ccx-vuln-remed-168_jvizk3](../tasks/csb_org_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-168_jvizk3.html) | `failed` | 0.000 | 0.900 | 20 | traj, tx |
-| [mcp_ccx-vuln-remed-169_qpihjj](../tasks/csb_org_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-169_qpihjj.html) | `failed` | 0.000 | 0.938 | 16 | traj, tx |
+| Task | Status | Reward | Passed | Scorer Family | Output Contract | MCP Ratio | Tool Calls | Trace |
+|---|---|---:|---|---|---|---:|---:|---|
+| [mcp_ccx-vuln-remed-161_4fjoon](../tasks/ccb_mcp_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-161_4fjoon--736b20b6e1.html) | `failed` | 0.000 | `False` | `oracle_checks` | `answer_json_native` | 0.952 | 21 | traj, tx |
+| [mcp_ccx-vuln-remed-162_v34kpn](../tasks/ccb_mcp_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-162_v34kpn--acca8a4389.html) | `failed` | 0.000 | `False` | `oracle_checks` | `answer_json_native` | 0.944 | 18 | traj, tx |
+| [mcp_ccx-vuln-remed-163_f4gqay](../tasks/ccb_mcp_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-163_f4gqay--0b1a8c200b.html) | `failed` | 0.000 | `False` | `-` | `-` | 0.970 | 33 | traj, tx |
+| [mcp_ccx-vuln-remed-164_plv8au](../tasks/ccb_mcp_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-164_plv8au--8703b2f638.html) | `failed` | 0.000 | `False` | `-` | `-` | 0.836 | 61 | traj, tx |
+| [mcp_ccx-vuln-remed-166_0dderl](../tasks/ccb_mcp_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-166_0dderl--852ab6cd39.html) | `failed` | 0.000 | `False` | `-` | `-` | 0.846 | 13 | traj, tx |
+| [mcp_ccx-vuln-remed-167_t4ejww](../tasks/ccb_mcp_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-167_t4ejww--438bc1a4de.html) | `failed` | 0.000 | `False` | `oracle_checks` | `answer_json_native` | 0.964 | 28 | traj, tx |
+| [mcp_ccx-vuln-remed-168_jvizk3](../tasks/ccb_mcp_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-168_jvizk3--adeacc5c64.html) | `failed` | 0.000 | `False` | `-` | `-` | 0.900 | 20 | traj, tx |
+| [mcp_ccx-vuln-remed-169_qpihjj](../tasks/ccb_mcp_security_haiku_20260301_191250--mcp-remote-direct--mcp_ccx-vuln-remed-169_qpihjj--abac0712cd.html) | `failed` | 0.000 | `False` | `oracle_checks` | `answer_json_native` | 0.938 | 16 | traj, tx |

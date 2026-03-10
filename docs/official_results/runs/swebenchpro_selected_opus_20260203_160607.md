@@ -1,0 +1,29 @@
+# swebenchpro_selected_opus_20260203_160607
+
+## sourcegraph_base
+
+- Valid tasks: `17`
+- Mean reward: `0.412`
+- Pass rate: `0.412`
+- Scorer families: `unknown (17)`
+- Output contracts: `unknown (17)`
+
+| Task | Status | Reward | Passed | Scorer Family | Output Contract | MCP Ratio | Tool Calls | Trace |
+|---|---|---:|---|---|---|---:|---:|---|
+| [instance_ansible__ansible-4c5ce5a1a9e79a845aff4978cfeb72a0d4ecf7d6-v1055803c3a812189a1133297f7f5468579283f86](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_ansible__ansible-4c5ce5a1a9e79a845aff4978cfeb72a0d4ecf7d6-v1055803c3a812189a1133297f7f5468579283f86--84715bc113.html) | `failed` | 0.000 | `False` | `-` | `-` | 0.000 | 68 | traj, tx |
+| [instance_ansible__ansible-811093f0225caa4dd33890933150a81c6a6d5226-v1055803c3a812189a1133297f7f5468579283f86](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_ansible__ansible-811093f0225caa4dd33890933150a81c6a6d5226-v1055803c3a812189a1133297f7f5468579283f86--7aed5e9345.html) | `failed` | 0.000 | `False` | `-` | `-` | 0.020 | 245 | traj, tx |
+| [instance_ansible__ansible-b2a289dcbb702003377221e25f62c8a3608f0e89-v173091e2e36d38c978002990795f66cfc0af30ad](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_ansible__ansible-b2a289dcbb702003377221e25f62c8a3608f0e89-v173091e2e36d38c978002990795f66cfc0af30ad--7e207f23d2.html) | `failed` | 0.000 | `False` | `-` | `-` | 0.046 | 87 | traj, tx |
+| [instance_ansible__ansible-e40889e7112ae00a21a2c74312b330e67a766cc0-v1055803c3a812189a1133297f7f5468579283f86](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_ansible__ansible-e40889e7112ae00a21a2c74312b330e67a766cc0-v1055803c3a812189a1133297f7f5468579283f86--eeca1a1729.html) | `failed` | 0.000 | `False` | `-` | `-` | 0.029 | 69 | traj, tx |
+| [instance_nodebb__nodebb-eb49a64974ca844bca061744fb3383f5d13b02ad-vnan](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_nodebb__nodebb-eb49a64974ca844bca061744fb3383f5d13b02ad-vnan--748f6b02b7.html) | `failed` | 0.000 | `False` | `-` | `-` | 0.371 | 70 | traj, tx |
+| [instance_protonmail__webclients-369fd37de29c14c690cb3b1c09a949189734026f](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_protonmail__webclients-369fd37de29c14c690cb3b1c09a949189734026f--a3728ee161.html) | `failed` | 0.000 | `False` | `-` | `-` | - | - | tx |
+| [instance_protonmail__webclients-8be4f6cb9380fcd2e67bcb18cef931ae0d4b869c](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_protonmail__webclients-8be4f6cb9380fcd2e67bcb18cef931ae0d4b869c--43f68dcce9.html) | `failed` | 0.000 | `False` | `-` | `-` | - | - | tx |
+| [instance_protonmail__webclients-c6f65d205c401350a226bb005f42fac1754b0b5b](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_protonmail__webclients-c6f65d205c401350a226bb005f42fac1754b0b5b--f9d2d8813f.html) | `failed` | 0.000 | `False` | `-` | `-` | - | - | tx |
+| [instance_protonmail__webclients-caf10ba9ab2677761c88522d1ba8ad025779c492](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_protonmail__webclients-caf10ba9ab2677761c88522d1ba8ad025779c492--cb5a740b27.html) | `failed` | 0.000 | `False` | `-` | `-` | - | - | tx |
+| [instance_tutao__tutanota-f373ac3808deefce8183dad8d16729839cc330c1-v2939aa9f4356f0dc9f523ee5ce19d09e08ab979b](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_tutao__tutanota-f373ac3808deefce8183dad8d16729839cc330c1-v2939aa9f4356f0dc9f523ee5ce19d09e08ab979b--329f6dcff4.html) | `failed` | 0.000 | `False` | `-` | `-` | 0.049 | 61 | traj, tx |
+| [instance_element-hq__element-web-cf3c899dd1f221aa1a1f4c5a80dffc05b9c21c85-vnan](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_element-hq__element-web-cf3c899dd1f221aa1a1f4c5a80dffc05b9c21c85-vnan--5741832593.html) | `passed` | 1.000 | `True` | `-` | `-` | 0.042 | 71 | traj, tx |
+| [instance_flipt-io__flipt-3d5a345f94c2adc8a0eaa102c189c08ad4c0f8e8](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_flipt-io__flipt-3d5a345f94c2adc8a0eaa102c189c08ad4c0f8e8--56f448a735.html) | `passed` | 1.000 | `True` | `-` | `-` | 0.053 | 94 | traj, tx |
+| [instance_flipt-io__flipt-9f8127f225a86245fa35dca4885c2daef824ee55](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_flipt-io__flipt-9f8127f225a86245fa35dca4885c2daef824ee55--c531d5314e.html) | `passed` | 1.000 | `True` | `-` | `-` | 0.035 | 114 | traj, tx |
+| [instance_flipt-io__flipt-b433bd05ce405837804693bebd5f4b88d87133c8](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_flipt-io__flipt-b433bd05ce405837804693bebd5f4b88d87133c8--bbfe706b53.html) | `passed` | 1.000 | `True` | `-` | `-` | 0.071 | 28 | traj, tx |
+| [instance_flipt-io__flipt-c188284ff0c094a4ee281afebebd849555ebee59](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_flipt-io__flipt-c188284ff0c094a4ee281afebebd849555ebee59--7fc6c33872.html) | `passed` | 1.000 | `True` | `-` | `-` | 0.009 | 112 | traj, tx |
+| [instance_nodebb__nodebb-76c6e30282906ac664f2c9278fc90999b27b1f48-vd59a5728dfc977f44533186ace531248c2917516](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_nodebb__nodebb-76c6e30282906ac664f2c9278fc90999b27b1f48-vd59a5728dfc977f44533186ace531248c2917516--41e45d24e5.html) | `passed` | 1.000 | `True` | `-` | `-` | 0.154 | 26 | traj, tx |
+| [instance_nodebb__nodebb-f1a80d48cc45877fcbadf34c2345dd9709722c7f-v4fbcfae8b15e4ce5d132c408bca69ebb9cf146ed](../tasks/swebenchpro_selected_opus_20260203_160607--sourcegraph_base--instance_nodebb__nodebb-f1a80d48cc45877fcbadf34c2345dd9709722c7f-v4fbcfae8b15e4ce5d132c408bca69ebb9cf146ed--615208716e.html) | `passed` | 1.000 | `True` | `-` | `-` | 0.033 | 30 | traj, tx |
