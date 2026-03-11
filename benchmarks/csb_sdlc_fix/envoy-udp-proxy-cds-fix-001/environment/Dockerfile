@@ -23,4 +23,8 @@ WORKDIR /workspace
 
 RUN chmod -R a+rwX /workspace
 
+# Create log directories
+RUN mkdir -p /logs/agent /logs/verifier
+RUN chown -R claude:claude /logs
+
 ENTRYPOINT []

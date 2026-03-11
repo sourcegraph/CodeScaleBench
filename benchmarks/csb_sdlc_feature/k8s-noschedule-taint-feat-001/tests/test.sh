@@ -222,7 +222,7 @@ echo "[x] Go compilation check passed"
 # Run taint-related tests if the package exists; failures reduce score
 # but don't zero it out (keyword scoring still applies).
 UNIT_TEST_PASS=1
-go test ./pkg/apis/core/taint/... 2>/logs/verifier/test_errors.txt && TEST_RC=0 || TEST_RC=$?
+timeout 600 go test ./pkg/apis/core/taint/... 2>/logs/verifier/test_errors.txt && TEST_RC=0 || TEST_RC=$?
 if [ "$TEST_RC" -eq 0 ]; then
     echo "[x] Taint unit tests passed"
 elif [ "$TEST_RC" -eq 1 ]; then

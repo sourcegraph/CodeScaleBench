@@ -23,6 +23,7 @@ RUN git config --global user.email "agent@example.com" && \
 
 # Create log directories
 RUN mkdir -p /logs/agent /logs/verifier
+RUN chown -R claude:claude /logs
 
 # Pre-create claude user and set ownership at build time so Harbor's
 # runtime chown is a no-op (avoids 15-30 min delay on large repos).

@@ -211,8 +211,8 @@ fi
 # but don't zero it out (keyword scoring still applies).
 UNIT_TEST_PASS=0
 # Look for scroll-related test files and run them
-if cargo test --no-run 2>/dev/null | grep -qi "scroll"; then
-    cargo test scroll 2>/logs/verifier/test_errors.txt && TEST_RC=0 || TEST_RC=$?
+if timeout 600 cargo test --no-run 2>/dev/null | grep -qi "scroll"; then
+    timeout 600 cargo test scroll 2>/logs/verifier/test_errors.txt && TEST_RC=0 || TEST_RC=$?
     if [ "$TEST_RC" -eq 0 ]; then
         echo "[x] Scroll-related tests passed"
         UNIT_TEST_PASS=1
@@ -221,7 +221,7 @@ if cargo test --no-run 2>/dev/null | grep -qi "scroll"; then
     fi
 else
     # Try running tests matching scrollend specifically
-    cargo test scrollend 2>/logs/verifier/test_errors.txt && TEST_RC=0 || TEST_RC=$?
+    timeout 600 cargo test scrollend 2>/logs/verifier/test_errors.txt && TEST_RC=0 || TEST_RC=$?
     if [ "$TEST_RC" -eq 0 ]; then
         echo "[x] scrollend tests passed"
         UNIT_TEST_PASS=1

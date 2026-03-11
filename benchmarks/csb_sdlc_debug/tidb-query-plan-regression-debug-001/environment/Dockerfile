@@ -18,6 +18,7 @@ RUN git clone --depth 1 https://github.com/sg-evals/tidb--v8.5.0.git . && \
 
 # Create logs directory for agent output
 RUN mkdir -p /logs/agent /logs/verifier
+RUN chown -R claude:claude /logs
 
 # Pre-create claude user and set ownership at build time
 RUN (adduser --disabled-password --gecos '' claude 2>/dev/null || true) && \

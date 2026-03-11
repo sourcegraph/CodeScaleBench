@@ -34,6 +34,10 @@
         4. **Narrow down** candidates until you find the exact function
 
 
+## Task Contract
+
+- `TASK_OUTPUT=/workspace/answer.json`
+
         ## Output Format
 
         You MUST provide your answer as valid JSON and **SAVE IT TO A FILE**:
@@ -46,12 +50,12 @@
         }
         ```
 
-        **CRITICAL**: You MUST save the JSON to `/app/solution.json`. This location is required for verification.
+        **CRITICAL**: You MUST save the JSON to `/workspace/answer.json`. This location is required for verification.
 
         **Your final step MUST be to run this exact bash command:**
 
         ```bash
-        cat > /app/solution.json << 'JSONEOF'
+        cat > /workspace/answer.json << 'JSONEOF'
         {
           "function_path": "ACTUAL_PATH",
           "function_name": "ACTUAL_NAME",
