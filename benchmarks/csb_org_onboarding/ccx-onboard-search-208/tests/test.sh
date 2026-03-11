@@ -11,9 +11,12 @@ set -eo pipefail
 # Firefox mirror clone that causes VerifierTimeoutError on MCP runs.
 
 echo "Starting RepoQA verifier..." 1>&2
-TASK_WORKDIR="${TASK_WORKDIR:-/app}"
+TASK_WORKDIR="${TASK_WORKDIR:-/workspace}"
+export TASK_WORKDIR
 TASK_REPO_ROOT="${TASK_REPO_ROOT:-$TASK_WORKDIR}"
+export TASK_REPO_ROOT
 TASK_OUTPUT="${TASK_OUTPUT:-$TASK_WORKDIR/solution.json}"
+export TASK_OUTPUT
 cd "$TASK_REPO_ROOT" || { echo "ERROR: Cannot cd to $TASK_REPO_ROOT"; exit 1; }
 mkdir -p /logs/verifier
 
@@ -64,7 +67,7 @@ fi
 
 SOLUTION_FILE="$TASK_OUTPUT"
 if [ ! -f "$SOLUTION_FILE" ]; then
-    echo "ERROR: Agent did not create solution.json in /app/"
+    echo "ERROR: Agent did not create solution.json at $TASK_OUTPUT"
     echo '{"score": 0.0}' > /logs/verifier/reward.json
     echo "0.0" > /logs/verifier/reward.txt
     write_validation_failure "invalid_output" "missing_required_output" \
@@ -81,7 +84,7 @@ from verifiers import SemanticRetrievalQAVerifier
 try:
     with open("/tests/ground_truth.json") as f:
         ground_truth = json.load(f)
-    with open(os.environ.get("TASK_OUTPUT", "/app/solution.json")) as f:
+    with open(os.environ.get("TASK_OUTPUT", os.environ.get("TASK_WORKDIR", "/workspace") + "/solution.json")) as f:
         raw = f.read()
     matches = re.findall(r"```(?:json)?\s*\n(.*?)```", raw, re.DOTALL)
     if matches:
@@ -102,7 +105,7 @@ try:
         "passed": score >= 1.0,
         "output_contract": {
             "mode": "solution_json",
-            "primary_path": os.environ.get("TASK_OUTPUT", "/app/solution.json"),
+            "primary_path": os.environ.get("TASK_OUTPUT", os.environ.get("TASK_WORKDIR", "/workspace") + "/solution.json"),
             "required_artifact": True,
         },
         "sub_scores": {
@@ -143,7 +146,7 @@ except Exception as e:
         "passed": False,
         "output_contract": {
             "mode": "solution_json",
-            "primary_path": os.environ.get("TASK_OUTPUT", "/app/solution.json"),
+            "primary_path": os.environ.get("TASK_OUTPUT", os.environ.get("TASK_WORKDIR", "/workspace") + "/solution.json"),
             "required_artifact": True,
         },
         "sub_scores": {},

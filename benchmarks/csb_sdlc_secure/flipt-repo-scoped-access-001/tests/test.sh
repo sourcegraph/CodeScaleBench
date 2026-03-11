@@ -206,7 +206,9 @@ fi
 
 # Check 4 (0.25): Go compilation succeeds
 echo "Running Go compilation check..."
-if go build ./internal/server/evaluation/... 2>/logs/verifier/build_errors.txt; then
+# Disable go.work to avoid version mismatches when sg_only verifier restores the
+# full repo (its go.work may require a newer Go than the container provides).
+if GOWORK=off go build ./internal/server/evaluation/... 2>/logs/verifier/build_errors.txt; then
     echo "[x] Go compilation passed"
     SCORE_NUMERATOR=$((SCORE_NUMERATOR + 25))
 else

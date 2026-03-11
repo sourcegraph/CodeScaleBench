@@ -101,12 +101,27 @@ else:
     # No-changes guard: env counts are all 0.  Verify via git that the agent
     # actually modified the repo — if not, force reward to 0.0 so tests that
     # pass on the unmodified repo don't produce false-positive scores.
+    # Checks origin ref too, so agents that commit their work (e.g. OpenHands
+    # runtime auto-commits) are not falsely penalised.
     import subprocess as _sp
     _verify = os.environ.get("VERIFY_REPO") or os.environ.get("TASK_REPO_ROOT") or "/workspace"
     try:
+        _has_changes = False
         _d = _sp.run(["git", "diff", "HEAD", "--stat"], capture_output=True, text=True, cwd=_verify, timeout=5)
+        if _d.stdout.strip():
+            _has_changes = True
         _u = _sp.run(["git", "ls-files", "--others", "--exclude-standard"], capture_output=True, text=True, cwd=_verify, timeout=5)
-        if not _d.stdout.strip() and not _u.stdout.strip():
+        if _u.stdout.strip():
+            _has_changes = True
+        if not _has_changes:
+            for _ref in ["origin/HEAD", "origin/main", "origin/master"]:
+                _rv = _sp.run(["git", "rev-parse", "--verify", _ref], capture_output=True, text=True, cwd=_verify, timeout=5)
+                if _rv.returncode == 0:
+                    _cd = _sp.run(["git", "diff", _ref, "HEAD", "--stat"], capture_output=True, text=True, cwd=_verify, timeout=5)
+                    if _cd.stdout.strip():
+                        _has_changes = True
+                    break
+        if not _has_changes:
             reward = 0.0
             checks["no_changes_guard"] = 0.0
             details["no_changes_guard"] = "git confirmed zero agent changes"

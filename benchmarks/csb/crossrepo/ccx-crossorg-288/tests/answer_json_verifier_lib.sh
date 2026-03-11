@@ -243,13 +243,15 @@ if not changes:
 
 # Apply diffs in-place — container is ephemeral, no need to preserve /repo_full
 repo_full = "/repo_full"
-verify_repo = repo_full
-
 if not os.path.isdir(repo_full):
-    print(f"[answer_json_verifier] WARNING: {repo_full} not found. Cannot apply diffs.")
+    # Fallback to /workspace when /repo_full is unavailable (e.g. non-Harbor harnesses)
+    repo_full = os.environ.get("TASK_REPO_ROOT") or os.environ.get("VERIFY_REPO") or "/workspace"
+if not os.path.isdir(repo_full):
+    print(f"[answer_json_verifier] WARNING: neither /repo_full nor /workspace found. Cannot apply diffs.")
     with open("/tmp/.answer_json_no_changes", "w") as f:
         f.write("1")
     sys.exit(0)
+verify_repo = repo_full
 
 # Ensure verifier (root) can write to repo_full
 subprocess.run(["chmod", "-R", "u+w", repo_full], capture_output=True)
@@ -329,11 +331,7 @@ if [ -f /tmp/.answer_json_verify_repo ]; then
     echo "[answer_json_verifier] VERIFY_REPO set to $VERIFY_REPO"
 elif [ -f /tmp/.answer_json_no_changes ]; then
     # Analysis-only: no repo copy needed, use /workspace or /repo_full as fallback
-    if [ -d /repo_full ]; then
-        export VERIFY_REPO="/repo_full"
-    else
-        export VERIFY_REPO="${VERIFY_REPO:-/workspace}"
-    fi
+    export VERIFY_REPO="${VERIFY_REPO:-/workspace}"
     echo "[answer_json_verifier] Analysis-only mode, VERIFY_REPO=$VERIFY_REPO"
 else
     export VERIFY_REPO="${VERIFY_REPO:-/workspace}"

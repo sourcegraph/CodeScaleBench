@@ -181,6 +181,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 
 - `scripts/account_health.py` - Utility script for account health.
 - `scripts/add_verification_metadata.py` - Utility script for add verification metadata.
+- `scripts/apply_verifier_fixes.py` - Utility script for apply verifier fixes.
 - `scripts/audit_canonical_evaluation_contract.py` - Utility script for audit canonical evaluation contract.
 - `scripts/audit_gt_coverage.py` - Utility script for audit gt coverage.
 - `scripts/audit_official_scores.py` - Utility script for audit official scores.
