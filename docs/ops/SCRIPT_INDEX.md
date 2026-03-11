@@ -160,6 +160,7 @@ Generated from `scripts/registry.json` by `scripts/generate_script_index.py`.
 - `scripts/generate_artifact_dockerfiles.py` - Generation script for generate artifact dockerfiles.
 - `scripts/generate_artifact_only_dockerfiles.py` - Generation script for generate artifact only dockerfiles.
 - `scripts/generate_coverage_gap_configs.py` - Generation script for generate coverage gap configs.
+- `scripts/generate_csb_selection.py` - Generation script for generate csb selection.
 - `scripts/generate_instruction_mcp.py` - Generation script for generate instruction mcp.
 - `scripts/generate_promoted_verifiers.py` - Generation script for generate promoted verifiers.
 - `scripts/generate_repoqa_largerepo_tasks.py` - Generation script for generate repoqa largerepo tasks.

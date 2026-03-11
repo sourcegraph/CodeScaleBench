@@ -57,6 +57,59 @@ run_all_checks = _load_run_all_checks()
 # remaining checks proportionally.
 
 SUITE_WEIGHTS: Dict[str, Dict[str, float]] = {
+    # --- Unified csb/ suites (merged) ---
+    "csb_understand": {  # sdlc_understand + sdlc_design + org_domain + org_onboarding
+        "file_set_match": 0.35,
+        "symbol_resolution": 0.20,
+        "dependency_chain": 0.25,
+        "keyword_presence": 0.20,
+    },
+    "csb_debug": {  # sdlc_debug + org_incident
+        "file_set_match": 0.50,
+        "symbol_resolution": 0.20,
+        "keyword_presence": 0.30,
+    },
+    "csb_security": {  # sdlc_secure + org_security + org_compliance
+        "file_set_match": 0.40,
+        "keyword_presence": 0.30,
+        "symbol_resolution": 0.20,
+        "provenance": 0.10,
+    },
+    "csb_refactor": {  # sdlc_refactor + org_migration
+        "file_set_match": 0.40,
+        "symbol_resolution": 0.25,
+        "dependency_chain": 0.20,
+        "keyword_presence": 0.15,
+    },
+    "csb_feature": {  # sdlc_feature + org_org
+        "file_set_match": 0.40,
+        "symbol_resolution": 0.25,
+        "dependency_chain": 0.20,
+        "keyword_presence": 0.15,
+    },
+    "csb_fix": {  # sdlc_fix
+        "file_set_match": 0.50,
+        "symbol_resolution": 0.20,
+        "keyword_presence": 0.30,
+    },
+    "csb_test": {  # sdlc_test
+        "file_set_match": 0.50,
+        "keyword_presence": 0.30,
+        "symbol_resolution": 0.20,
+    },
+    "csb_document": {  # sdlc_document
+        "file_set_match": 0.35,
+        "keyword_presence": 0.40,
+        "symbol_resolution": 0.15,
+        "provenance": 0.10,
+    },
+    "csb_crossrepo": {  # org_crossrepo + org_crossrepo_tracing + org_crossorg + org_platform
+        "file_set_match": 0.30,
+        "symbol_resolution": 0.20,
+        "dependency_chain": 0.35,
+        "keyword_presence": 0.15,
+    },
+    # --- Legacy suite keys (backward compat for existing runs) ---
     "csb_sdlc_understand": {
         "file_set_match": 0.40,
         "symbol_resolution": 0.25,
@@ -128,7 +181,7 @@ def compute_weighted_composite(
 
     Returns a dict with composite_score, per-check scores, and weight info.
     """
-    weights = SUITE_WEIGHTS.get(target_suite, SUITE_WEIGHTS["csb_sdlc_understand"])
+    weights = SUITE_WEIGHTS.get(target_suite, SUITE_WEIGHTS["csb_understand"])
 
     # Filter to checks that are actually present in results
     active_weights = {k: v for k, v in weights.items() if k in check_results}

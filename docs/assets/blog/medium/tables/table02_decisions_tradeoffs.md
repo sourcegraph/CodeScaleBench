@@ -1,0 +1,34 @@
+# Decisions and Tradeoffs
+
+| Day | Theme | Role | Decision Snippet |
+|---|---|---|---|
+| 2026-03-05 | Reproducibility Tradeoffs | assistant | I’ve added the dedupe logic and started a full rebuild. Next I’ll report concrete drop stats (`input/kept/dropped`) and the new session/message totals so you can see the bloat r... |
+| 2026-03-05 | Curation Depth | assistant | Yes, and it’s stale: `~/.claude/tom/transcript-memory.db` was last updated on **2026-02-08**. I’m adding it as another explicit input to the unified builder so you keep its hist... |
+| 2026-03-04 | Curation Depth | assistant | I’ve got a paired result, but it’s strict on recognized suite mapping; that excludes many legacy raw runs. I’m doing one quick pass to quantify what got excluded and confirm whe... |
+| 2026-03-04 | Curation Depth | assistant | You’re right, it’s still noisy. I’ll make the top-level truly clean now: keep only `MANIFEST.json`, `_raw`, `csb_sdlc`, and `csb_org`, and move the extra report files + legacy `... |
+| 2026-03-04 | Quality vs Speed | assistant | I need one correction before executing: the 423 promote rows span multiple archive wrapper layouts (`archive/...`, `official_archive_.../...`, `qa_needed/.../...`, etc.), so pro... |
+| 2026-03-04 | Curation Depth | assistant | You’re correct: I only fixed path matching; I did **not** yet switch the size slice to the non-proxy repo-size method. I’m fixing that now by recomputing size bins with real rep... |
+| 2026-03-04 | Curation Depth | assistant | I’ve got enough context to run a full deterministic re-audit now. I’m going to execute a one-off validator that checks each candidate path for required artifacts + hard validity... |
+| 2026-03-04 | Reproducibility Tradeoffs | assistant | I’ve extracted the manifest’s authoritative inclusion/dedupe rules. Next I’m inspecting the prior review JSON/TSV schemas to preserve the same provenance logic, then I’ll run a ... |
+| 2026-03-04 | Curation Depth | assistant | Using the `archive-run` workflow as the closest match for this audit/promotion cleanup task, but adapting it to validation (not moving/deleting) by re-verifying each candidate r... |
+| 2026-03-04 | Curation Depth | assistant | I’ll run a fresh, end-to-end validation pass from `archive_promotion_candidates_ready_20260304.tsv`: re-check per-trial validity artifacts, verify non-duplication against curren... |
+| 2026-03-04 | General | assistant | I’ll force cleanup the 26 blocked archive directories by normalizing permissions and deleting them, then I’ll verify none remain. I’ll also keep the full promotable list intact ... |
+| 2026-03-04 | Curation Depth | assistant | I hit a noisy global search, so I’m switching to targeted SDLC run directories to avoid unrelated archives. I’ll extract the latest SDLC run IDs, then compute the exact failed/t... |
+| 2026-03-04 | Curation Depth | assistant | I’m investigating the failed SDLC remainder now so we can prepare a clean completion run plan for tomorrow. First I’ll locate the latest run artifacts and classify the 21 remain... |
+| 2026-03-04 | General | assistant | Action list is ready (1 full promote, 11 trial-level salvage, 2 blocked keep). I’m executing those moves now, then I’ll refresh manifest/triage/integrity so official stays valid. |
+| 2026-03-04 | General | assistant | I’ll do both: generate an explicit `backup_runs` action list (`promote`, `partial salvage`, `keep blocked`) and execute it. First I’m checking for run-name collisions with exist... |
+| 2026-03-04 | Local vs Remote Execution | assistant | I’ll audit `runs/daytona` the same way we audited archive: classify run status/validity with promotion gates, then compare against `runs/official` by exact run name and by task-... |
+| 2026-03-04 | General | assistant | I’ll generate the concrete action list now from the two audit JSON reports, split into `promote`, `keep archived (duplicate)`, and `partial-task salvage`, and then give you the ... |
+| 2026-03-04 | Local vs Remote Execution | assistant | I also saw your note about the remote URL. I’m updating `origin` to `https://github.com/sourcegraph/CodeScaleBench.git` now, then I’ll share the archive-sweep findings. |
+| 2026-03-04 | Local vs Remote Execution | user | yes our remote should be set to that. do a validation sweep of the archive directory now to verify whether or not any promotable task outputs were accidentally moved there at so... |
+| 2026-03-04 | Infra Reliability | assistant | I’ve already moved the `_analysis_*` run folders to `runs/archive`, committed all current repo changes on `main`, and started the push. I’m checking the current git state now to... |
+| 2026-03-04 | Infra Reliability | assistant | The move hit a name collision in `runs/archive`. I’m retrying with a unique timestamped destination, then I’ll run repo health and proceed to commit/push. |
+| 2026-03-04 | Curation Depth | assistant | I found the last blocker: `csb_sdlc_feature_haiku_20260303_184719` is tracked by MANIFEST but was triaged `exclude`. I’m switching that triage to `include` and re-running integr... |
+| 2026-03-04 | General | user | do a sweep on the READY staging runs to m ake sure whatever you promote is valid, and mov any with ERROR to archive; what are RUNNING and BLOCKED? nothing is currrently running,... |
+| 2026-03-04 | Reproducibility Tradeoffs | assistant | I have the staging triage inventory; next I’m extracting final summary counts and then performing the archive-directory move using a depth-limited scan to avoid the permission-p... |
+| 2026-03-04 | Reproducibility Tradeoffs | assistant | I hit long-running scans due very large JSON outputs and some permission-protected workspace mirror paths. I’m switching to focused commands: promotion eligibility from `runs/st... |
+| 2026-03-04 | Curation Depth | assistant | Done. I updated that README section to: - Use `Baseline vs MCP` (removed `MCP-Full`) - Remove the legacy directory naming note entirely - Keep only current run-config pairs for ... |
+| 2026-03-04 | Quality vs Speed | user | let's not push runs/official to the repo now since runs/analysis is what we're using for the runs explorer now for anyone who wants to audit the work that passed our QA (we shou... |
+| 2026-03-03 | Curation Depth | assistant | Both dry runs show the right numbers: - **SDLC**: 160 → 150 tasks (10 already have `_agent` variants) - **Org**: 221 → 14 skipped (onboarding-search) → 207 → 199 tasks (8 alread... |
+| 2026-03-03 | Curation Depth | assistant | Let me first assess the current state — which tasks have calibrated curator ground truth vs old-format — and then plan the re-curation approach. |
+| 2026-03-03 | Curation Depth | assistant | 13 of 14 curator agents started (1 still cloning). Run8 is underway with the fixed timeout code. The global timeout is now 1800 seconds (30 minutes) instead of 1080, so it shoul... |
