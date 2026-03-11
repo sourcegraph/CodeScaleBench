@@ -35,11 +35,11 @@ Config names encode three independent dimensions:
 | `mcp-remote-artifact` | MCP | Source deleted | `review.json` | `artifact_full` | `Dockerfile.artifact_only` |
 | `mcp-scip-remote-artifact` | MCP + SCIP | Source deleted | `review.json` | `artifact_full` | `Dockerfile.artifact_only` |
 
-**Standard SDLC suites** (`csb_sdlc_feature`, `csb_sdlc_refactor`, `csb_sdlc_debug`, etc.) use
+**Direct-mode tasks** (most implementation work types: fix, feature, refactor, debug, test, document, secure) use
 `baseline-local-direct` + `mcp-remote-direct`. The agent produces code changes
 and the verifier checks git diffs / test results.
 
-**Org suites** (`csb_org_*`) default to `baseline-local-artifact` +
+**Artifact-mode tasks** (most comprehension/analysis work types: crossrepo, understand, security, some refactor) default to `baseline-local-artifact` +
 `mcp-remote-artifact`. The agent produces `/workspace/answer.json` and the
 verifier scores it against an oracle. Tasks with `"verification_modes":
 ["artifact", "direct"]` in `configs/use_case_registry.json` additionally
@@ -221,36 +221,32 @@ fail-fast if that model is unavailable in the configured Codex environment.
 For this rollout, Codex MCP policy is sourcegraph_full-only for MCP-enabled
 runs, with baseline comparisons using `none`. No other MCP modes are allowed.
 
-## Running CodeScaleBench-Org Tasks
+## Running Tasks
 
-All tasks (SDLC and Org) are in the unified `configs/selected_benchmark_tasks.json`. Filter by suite with the `--benchmark` flag.
-
-### Running Org Tasks
+All 275 tasks are in `configs/selected_benchmark_tasks.json`. Filter by source directory with the `--benchmark` flag:
 
 ```bash
-# Run all 220 Org tasks (both configs)
-configs/run_selected_tasks.sh --benchmark csb_org
+# Run all tasks (both configs)
+configs/run_selected_tasks.sh
 
-# Run only a specific Org suite
+# Run tasks from a specific source directory
 configs/run_selected_tasks.sh --benchmark csb_org_security
 
 # Dry run to preview
-configs/run_selected_tasks.sh --benchmark csb_org --dry-run
+configs/run_selected_tasks.sh --dry-run
 ```
 
-### CodeScaleBench-Org vs SDLC Suites
+### Verifier Modes by Source Directory
 
-| Feature | SDLC suites | Org suites |
-|---------|-------------|------------|
+| Feature | `csb_sdlc_*` directories | `csb_org_*` directories |
+|---------|--------------------------|------------------------|
 | **Config pair** | `baseline-local-direct` + `mcp-remote-direct` | `baseline-local-direct` + `mcp-remote-direct` |
-| Selection file | `selected_benchmark_tasks.json` | `selected_benchmark_tasks.json` (unified) |
-| Suite prefix | `csb_sdlc_<phase>` | `csb_org_<category>` |
 | Verifier script | `tests/test.sh` | `tests/test.sh` (dispatches to eval.sh or direct_verifier.sh) |
 | Oracle format | task-specific | `oracle_answer.json` + `oracle_checks.py` |
 | Baseline Dockerfile | `Dockerfile` (full repo clone) | `Dockerfile` (full repo clone) |
 | MCP Dockerfile | `Dockerfile.sg_only` (truncated source) | `Dockerfile.sg_only` (truncated source) |
 
-See `docs/ORG_TASKS.md` for full task authoring and evaluation details.
+Note: The `csb_sdlc_*`/`csb_org_*` prefixes are legacy directory names from the original build phases. All tasks target enterprise-scale codebases. See `docs/explanations/taxonomy_rationale.md` for the unified work-type taxonomy used in reporting.
 
 ## SCIP Precise Indexing Ablation
 

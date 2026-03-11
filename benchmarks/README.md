@@ -1,50 +1,26 @@
 # CodeScaleBench Benchmarks
 
-This directory contains SDLC-aligned suites plus Org org-scale retrieval suites. The canonical task set is defined by [`unified_benchmark_manifest.json`](../configs/unified_benchmark_manifest.json) (275 tasks across 20 suites: 131 SDLC + 144 Org). Suite sizes use DOE-driven Neyman-optimal allocation to maximize statistical power per suite.
+275 tasks representing realistic developer work in large, enterprise-scale codebases. Tasks are organized by **developer work type** across 20 source directories. Suite sizes use DOE-driven Neyman-optimal allocation.
 
-Non-canonical tasks are archived in `backups/`.
-
-See [`docs/TASK_SELECTION.md`](../docs/TASK_SELECTION.md) for selection methodology.
+Non-canonical tasks are archived in `backups/`. See [`docs/explanations/taxonomy_rationale.md`](../docs/explanations/taxonomy_rationale.md) for the design rationale. See [`docs/TASK_SELECTION.md`](../docs/TASK_SELECTION.md) for selection methodology.
 
 ---
 
-## SDLC Suite Overview
+## Work Types
 
-| Suite | SDLC Phase | Tasks | Description |
-|-------|-----------|------:|-------------|
-| `csb_sdlc_feature` | Feature Implementation | 23 | New features, interface implementation, big-code features |
-| `csb_sdlc_fix` | Bug Repair | 19 | Diagnosing and fixing real bugs across production codebases |
-| `csb_sdlc_refactor` | Cross-File Refactoring | 18 | Cross-file refactoring, enterprise dependency refactoring, rename refactoring |
-| `csb_sdlc_debug` | Debugging & Investigation | 13 | Root cause tracing, fault localization, provenance |
-| `csb_sdlc_secure` | Security & Compliance | 13 | CVE analysis, reachability, governance, access control |
-| `csb_sdlc_test` | Testing & QA | 12 | Code review, performance testing, code search validation, test generation |
-| `csb_sdlc_design` | Architecture & Design | 11 | Architecture analysis, dependency graphs, change impact |
-| `csb_sdlc_document` | Documentation | 11 | API references, architecture docs, migration guides, runbooks |
-| `csb_sdlc_understand` | Requirements & Discovery | 11 | Codebase comprehension, onboarding, Q&A, knowledge recovery |
-| **Total** | | **131** | |
+| Work Type | Tasks | Source Directories | Repo Scope |
+|-----------|------:|-------------------|------------|
+| **crossrepo** | 47 | `csb_org_crossrepo` (11), `csb_org_crossrepo_tracing` (11), `csb_org_crossorg` (12), `csb_org_platform` (13) | 18 single, 9 dual, 20 multi |
+| **understand** | 44 | `csb_sdlc_understand` (11), `csb_sdlc_design` (11), `csb_org_domain` (11), `csb_org_onboarding` (11) | 36 single, 4 dual, 4 multi |
+| **refactor** | 43 | `csb_sdlc_refactor` (18), `csb_org_migration` (25) | 26 single, 2 dual, 15 multi |
+| **security** | 39 | `csb_sdlc_secure` (13), `csb_org_security` (13), `csb_org_compliance` (13) | 26 single, 2 dual, 11 multi |
+| **feature** | 34 | `csb_sdlc_feature` (23), `csb_org_org` (11) | 24 single, 2 dual, 8 multi |
+| **debug** | 26 | `csb_sdlc_debug` (13), `csb_org_incident` (13) | 15 single, 8 dual, 3 multi |
+| **fix** | 19 | `csb_sdlc_fix` (19) | 19 single |
+| **test** | 12 | `csb_sdlc_test` (12) | 12 single |
+| **document** | 11 | `csb_sdlc_document` (11) | 10 single, 1 dual |
 
----
-
-## CodeScaleBench-Org Suite Overview
-
-These suites measure cross-repo discovery, tracing, and org-scale code intelligence use cases.
-
-| Suite | Tasks | Description |
-|-------|------:|-------------|
-| `csb_org_migration` | 25 | Framework and platform migrations across repos |
-| `csb_org_compliance` | 13 | Compliance, audit, and provenance workflows |
-| `csb_org_incident` | 13 | Incident debugging across services and repos |
-| `csb_org_platform` | 13 | Platform/devtools and tribal-knowledge discovery |
-| `csb_org_security` | 13 | Vulnerability remediation and security analysis at org scale |
-| `csb_org_crossorg` | 12 | Cross-org discovery and authoritative repo identification |
-| `csb_org_crossrepo` | 11 | Cross-repo search, dependency discovery, impact analysis |
-| `csb_org_crossrepo_tracing` | 11 | Cross-repo dependency tracing and symbol resolution |
-| `csb_org_domain` | 11 | Domain-specific lineage and analysis workflows |
-| `csb_org_onboarding` | 11 | Onboarding, architecture comprehension, API discovery |
-| `csb_org_org` | 11 | Org-wide coding correctness tasks requiring broad context |
-| **Total** | **144** | |
-
-For suite taxonomy, authoring, and oracle evaluation details, see [`docs/ORG_TASKS.md`](../docs/ORG_TASKS.md).
+The on-disk `csb_sdlc_*` and `csb_org_*` prefixes are legacy naming from the original build phases. All tasks target enterprise-scale codebases; the prefix does not imply a meaningful SDLC/Org distinction. The reporting layer maps directories to work types for analysis.
 
 ---
 
@@ -69,7 +45,7 @@ Each task follows this layout:
 # Run all 275 canonical tasks across 2 configs
 bash configs/run_selected_tasks.sh
 
-# Run a single SDLC phase
+# Run a specific source directory
 bash configs/run_selected_tasks.sh --benchmark csb_sdlc_fix
 
 # Single task
@@ -79,4 +55,4 @@ harbor run --path benchmarks/csb_sdlc_feature/servo-scrollend-event-feat-001 \
   -n 1
 ```
 
-See [`docs/CONFIGS.md`](../docs/CONFIGS.md) for the full tool-by-tool breakdown of each config.
+See [`docs/reference/CONFIGS.md`](../docs/reference/CONFIGS.md) for the full tool-by-tool breakdown of each config.

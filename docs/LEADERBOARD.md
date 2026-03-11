@@ -43,39 +43,39 @@ Tasks that error (agent crash, timeout, container failure) count as **reward = 0
 
 ## Per-Benchmark Completeness
 
-To qualify for a suite's leaderboard, a submission must include results for **all** tasks in that suite. The 9 SDLC suites and required task counts are:
+To qualify for a work type's leaderboard, a submission must include results for **all** tasks in that work type. The 9 work types and required task counts are:
 
-| Suite | Tasks | Reward Type |
-|-------|------:|-------------|
-| csb_sdlc_understand | 34 | varies by task |
-| csb_sdlc_design | 20 | varies by task |
-| csb_sdlc_fix | 25 | varies by task |
-| csb_sdlc_feature | 20 | varies by task |
-| csb_sdlc_refactor | 20 | varies by task |
-| csb_sdlc_test | 20 | varies by task |
-| csb_sdlc_document | 20 | varies by task |
-| csb_sdlc_secure | 20 | varies by task |
-| csb_sdlc_debug | 20 | varies by task |
+| Work Type | Tasks | Reward Type |
+|-----------|------:|-------------|
+| crossrepo | 47 | varies by task |
+| understand | 44 | varies by task |
+| refactor | 43 | varies by task |
+| security | 39 | varies by task |
+| feature | 34 | varies by task |
+| debug | 26 | varies by task |
+| fix | 19 | varies by task |
+| test | 12 | varies by task |
+| document | 11 | varies by task |
 
 Reward semantics (test_ratio, diff_similarity, checklist, etc.) are defined per task; see [SCORING_SEMANTICS.md](SCORING_SEMANTICS.md).
 
-A submission missing any task in a suite does **not** appear on that suite's leaderboard. Partial results are retained in the data for analysis but excluded from rankings.
+A submission missing any task in a work type does **not** appear on that work type's leaderboard. Partial results are retained in the data for analysis but excluded from rankings.
 
 ## Aggregate Score
 
-The **CSB Aggregate Score** is the unweighted (macro) average of per-benchmark mean rewards:
+The **CSB Aggregate Score** is the unweighted (macro) average of per-work-type mean rewards:
 
 ```
-csb_aggregate = sum(per_benchmark_mean_rewards) / N_qualifying_benchmarks
+csb_aggregate = sum(per_work_type_mean_rewards) / N_qualifying_work_types
 ```
 
-All suites carry equal weight regardless of task count. The aggregate score is computed over suites where the submission has complete results. A submission with complete results for 8 of 9 suites gets an aggregate over those 8. Submissions with more complete suites are ranked higher when scores are close.
+All work types carry equal weight regardless of task count. The aggregate score is computed over work types where the submission has complete results. A submission with complete results for 8 of 9 work types gets an aggregate over those 8. Submissions with more complete work types are ranked higher when scores are close.
 
 ## Tie-Breaking
 
 When two submissions have equal mean reward (to 3 decimal places), ties are broken in order:
 
-1. **Suites completed** — number of suites with full task coverage (more is better)
+1. **Work types completed** — number of work types with full task coverage (more is better)
 2. **Pass rate** — fraction of tasks with reward > 0.0 (higher is better)
 3. **Median reward** — median of per-task rewards (higher is better)
 4. **Token efficiency** — total tokens used, `n_input_tokens + n_output_tokens` (lower is better)

@@ -52,8 +52,8 @@ Harbor run output (result.json, transcript)
 
 ## Layer 1: Deterministic Verifiers
 
-Every task ships a `tests/test.sh` (SDLC tasks) or `tests/eval.sh` (Org
-tasks) that runs inside the Docker container after the agent finishes. The
+Every task ships a `tests/test.sh` or `tests/eval.sh`
+that runs inside the Docker container after the agent finishes. The
 verifier writes a reward (0.0–1.0) to `/logs/verifier/reward.txt`. Canonical
 tasks should also emit `/logs/verifier/validation_result.json` using the schema
 in [docs/reference/VALIDATION_RESULT_SCHEMA.md](reference/VALIDATION_RESULT_SCHEMA.md)
@@ -165,9 +165,9 @@ python3 scripts/run_judge.py --run runs/official/my_run/ --force
 
 Output: `judge_result.json` written alongside each task's `result.json`.
 
-### Hybrid Scoring (CodeScaleBench-Org Tasks)
+### Hybrid Scoring (Tasks with Criteria)
 
-Org tasks with `tests/criteria.json` support hybrid evaluation:
+Tasks with `tests/criteria.json` support hybrid evaluation:
 `composite = 0.6 * verifier_reward + 0.4 * rubric_score`. Enable with
 `--hybrid` flag on `run_judge.py`.
 
