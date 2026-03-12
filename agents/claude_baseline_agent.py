@@ -1150,6 +1150,21 @@ before retrying."""
                 # CRITICAL: Add autonomous environment variables
                 # These enable headless/autonomous operation mode
                 env = cmd.env or {}
+
+                # SECURITY: Strip auth credentials from container env vars.
+                # Harbor's parent class injects ANTHROPIC_API_KEY and
+                # CLAUDE_CODE_OAUTH_TOKEN as -e flags on docker compose exec,
+                # making them visible to `env` / `printenv` inside the
+                # container.  If the agent runs `env` (e.g. for debugging),
+                # the key ends up in the trajectory and can leak into
+                # committed HTML reports.
+                #
+                # Instead, setup() writes credentials to a file inside the
+                # container that Claude Code reads at startup.  This keeps
+                # the secret out of the process environment entirely.
+                env.pop("ANTHROPIC_API_KEY", None)
+                env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+
                 env_with_autonomous = {
                     **env,
                     'FORCE_AUTO_BACKGROUND_TASKS': '1',
@@ -1194,7 +1209,15 @@ before retrying."""
                     ExecInput(command=modified_command, env=env_with_autonomous)
                 )
             else:
-                result.append(cmd)
+                # Strip auth env vars from non-claude commands too (e.g. mkdir setup)
+                if cmd.env:
+                    sanitized_env = {
+                        k: v for k, v in cmd.env.items()
+                        if k not in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+                    }
+                    result.append(ExecInput(command=cmd.command, env=sanitized_env))
+                else:
+                    result.append(cmd)
 
         return result
 
@@ -1300,6 +1323,11 @@ before retrying."""
         if use_subscription:
             await self._setup_subscription_auth(environment)
 
+        # SECURITY: Write auth credentials to a file inside the container
+        # instead of relying on env vars (which leak via `env` in trajectories).
+        # Claude Code reads ~/.claude/.credentials.json at startup.
+        await self._write_container_auth_file(environment)
+
         mcp_type = os.environ.get("BASELINE_MCP_TYPE", "none").lower()
 
         if mcp_type == "sourcegraph":
@@ -1383,6 +1411,58 @@ before retrying."""
         os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = access_token
         # Also clear any stale ANTHROPIC_API_KEY to avoid conflicts
         os.environ.pop("ANTHROPIC_API_KEY", None)
+
+    async def _write_container_auth_file(self, environment: BaseEnvironment) -> None:
+        """Write Claude Code auth credentials to a file inside the container.
+
+        This avoids passing secrets as environment variables (visible to `env`).
+        Claude Code reads $CLAUDE_CONFIG_DIR/../.credentials.json at startup,
+        which for our setup is /logs/agent/.credentials.json.
+
+        Falls back to ANTHROPIC_API_KEY env var if no OAuth token is available
+        (legacy API key auth path — still stripped from Docker exec env vars
+        in create_run_agent_commands to avoid trajectory leaks).
+        """
+        oauth_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
+        if not oauth_token and not api_key:
+            logger.warning("_write_container_auth_file: No auth credentials available")
+            return
+
+        # Claude Code looks for .credentials.json in the parent of CLAUDE_CONFIG_DIR.
+        # CLAUDE_CONFIG_DIR = /logs/agent/sessions, so credentials go to /logs/agent/.
+        creds_dir = "/logs/agent"
+
+        if oauth_token:
+            # Write OAuth credentials in the format Claude Code expects
+            creds_json = json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": oauth_token,
+                    "expiresAt": 9999999999999,
+                }
+            })
+            logger.info("_write_container_auth_file: Writing OAuth credentials file")
+        else:
+            # API key auth: Claude Code can also read this from the credentials file
+            # but primarily uses ANTHROPIC_API_KEY env var.  Write it as a file and
+            # also keep the env var for backward compat with older Claude Code versions.
+            # NOTE: create_run_agent_commands strips it from docker exec -e flags.
+            creds_json = json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": api_key,
+                    "expiresAt": 9999999999999,
+                }
+            })
+            logger.info("_write_container_auth_file: Writing API key as credentials file")
+
+        # Write the credentials file with restricted permissions
+        escaped_creds = creds_json.replace("'", "'\\''")
+        await environment.exec(
+            f"mkdir -p {creds_dir} && "
+            f"printf '%s' '{escaped_creds}' > {creds_dir}/.credentials.json && "
+            f"chmod 600 {creds_dir}/.credentials.json"
+        )
 
     @staticmethod
     def _refresh_subscription_token(creds_file: Path, creds: dict) -> str:
