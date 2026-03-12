@@ -40,21 +40,15 @@ curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/insta
 - `configs/AGENTS.md` - run launcher wrappers and confirmation gate policy
 - `docs/AGENTS.md` - documentation IA and canonical vs archive guidance
 
-## Compaction / Handoff Checkpoints
-- Compact after exploration, before multi-file edits.
-- Compact after launching a benchmark batch.
-- Compact after completing a triage batch or report generation pass.
-- When handing work to a new session, use the generic `/handoff` skill to generate an inline copy/paste handoff prompt.
-- Do not create a markdown handoff file unless the user explicitly asks for one.
-- Use `docs/ops/HANDOFF_TEMPLATE.md` as a checklist for what the handoff should include.
+## Compaction / Handoff
+- Compact after exploration, after launching a batch, and after triage/report passes.
+- Use `/handoff` skill for session handoffs (inline prompt, not a markdown file unless asked).
+- Use `docs/ops/HANDOFF_TEMPLATE.md` as checklist.
 
-## Landing the Plane (Session Completion)
-- Track remaining follow-up in issues or beads.
-- Run `python3 scripts/repo_health.py` (or `--quick` for docs/config-only changes).
-- Update issue/task status.
-- `git pull --rebase && git push && git status` and confirm `main` is up to date with `origin/main`.
-- Clean up and hand off using `/handoff` plus `docs/ops/HANDOFF_TEMPLATE.md`.
-- Work is not complete until push succeeds.
+## Landing the Plane
+- Run `python3 scripts/repo_health.py` (or `--quick` for docs/config-only).
+- `git pull --rebase && git push && git status` -- work is not done until push succeeds.
+- Track follow-ups in issues or beads. Update status.
 
 ## Canonical Maps
 - `docs/START_HERE_BY_TASK.md` - task-based read order
@@ -71,54 +65,63 @@ curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/insta
 - After removing directories from the repo, also clean references from `scripts/sync_agent_guides.py` (`LOCAL_SOURCES`) and `scripts/docs_consistency_check.py` (`LOCAL_AGENT_TARGET_DIRS`).
 
 ### Daytona / Harbor
-- Daytona builds images from Dockerfiles at sandbox creation time (`Image.from_dockerfile()`). Dockerfile fixes pushed to `main` take effect on the next run -- **no manual image rebuild needed**. Exception: pre-built GHCR base images must be rebuilt separately.
-- Harbor+Daytona (`harbor run --environment-type daytona`) is the recommended production approach. The standalone `scripts/daytona_runner.py` is for quick validation only.
-- Use `BASELINE_MCP_TYPE` env var to control MCP configuration: `none`, `sourcegraph`, `deepsearch`.
-- Daytona SDK (`daytona_sdk`) over CLI for sandbox interaction -- the CLI is interactive-only for SSH.
-- GHCR packages default to **private** for personal accounts and visibility cannot be changed via API. Use the GitHub web UI or push to an org.
+- Daytona builds from Dockerfiles at sandbox creation. Fixes on `main` take effect next run (exception: pre-built GHCR base images need separate rebuild).
+- Harbor+Daytona (`harbor run --environment-type daytona`) is recommended. `scripts/daytona_runner.py` is for quick validation only.
+- `BASELINE_MCP_TYPE` env var: `none`, `sourcegraph`, `deepsearch`.
+- Use Daytona SDK (`daytona_sdk`) over CLI (CLI is interactive-only for SSH).
+- GHCR packages default **private** for personal accounts; visibility change requires GitHub web UI.
+- Snapshot names are **positional**: `daytona snapshot create ccb-name`, NOT `--name`.
+- CLI/API version mismatch causes "Forbidden" errors. Keep CLI version in sync.
+- Registry types enum: `internal`, `organization`, `transient`, `backup`. Use `organization` for GHCR/Docker Hub.
 
 ### Docker / Build
 - `uv tool install` segfaults on ARM64/QEMU emulation. Use `pip install` instead, or switch to Daytona (native x86_64).
 - Build-push-clean pattern when building Docker images with limited disk (~45GB): build one image, push, then clean locally before the next.
 - Colons in agent names (e.g., `module:ClassName`) break Docker volume mounts. Sanitize paths: replace `:` with `__`.
+- Add `|| git init` fallback to all `git clone` commands in Dockerfiles for network resilience. Applied to 269 Dockerfiles.
+- Add `chown claude:claude /logs` and `adduser claude` to Dockerfiles for cross-harness (OH) permission compatibility.
 
 ### MCP Configuration (inside sandboxes)
-- `.mcp.json` must be placed at `$CLAUDE_CONFIG_DIR` (typically `/logs/agent/sessions/`), not `/app/` or `/root/`.
-- Claude Code requires the `--mcp-config` CLI flag to load MCP config -- it does not auto-detect.
-- Inject MCP usage instructions into the task prompt. Agents won't use MCP tools just because they're available.
-- Set `NODE_TLS_REJECT_UNAUTHORIZED=0` for Node.js SSL in Docker containers (curl working does not mean Node.js fetch will work).
-- Sourcegraph MCP uses **stdio transport** (`npx @sourcegraph/cody --stdio`), NOT HTTP. HTTP 405 = correct endpoint, wrong protocol.
-- Sourcegraph skills show empty in headless mode. Embed skill prompt content in CLAUDE.md directly.
+- `.mcp.json` at `$CLAUDE_CONFIG_DIR` (typically `/logs/agent/sessions/`), not `/app/` or `/root/`.
+- Claude Code needs `--mcp-config` flag; it does not auto-detect. Inject MCP usage instructions into the task prompt.
+- `NODE_TLS_REJECT_UNAUTHORIZED=0` for Node.js SSL in containers.
+- Sourcegraph: **stdio transport** (`npx @sourcegraph/cody --stdio`), NOT HTTP. HTTP 405 = wrong protocol.
+- Sourcegraph skills show empty in headless mode. Embed prompt content in CLAUDE.md.
 - Sourcegraph env vars: `SOURCEGRAPH_URL` and `SOURCEGRAPH_ACCESS_TOKEN` (NOT `_ENDPOINT` or `_TOKEN`).
 
 ### Harbor Result Format
-- Timing fields (`started_at`, `finished_at`) live at the **top level** of `result.json`, not nested under `timing`.
-- `trajectory.json` is generated by Harbor's `_convert_events_to_trajectory()` post-processing, NOT by Claude Code CLI directly.
-- SWE-bench `test.sh` redirects stdout to a temp file -- Harbor never sees the parser's `START_TEST_OUTPUT`/`END_TEST_OUTPUT` markers via its normal capture.
-- Token usage data lives in `trajectory.json`; plain transcript parsers do not see it.
-- Harbor task contract requires writing `/logs/verifier/reward.txt`.
+- Timing fields (`started_at`, `finished_at`) at **top level** of `result.json`, not nested under `timing`.
+- `trajectory.json` generated by Harbor's `_convert_events_to_trajectory()`, not by Claude Code CLI.
+- SWE-bench `test.sh` redirects stdout to temp file; Harbor never sees `START_TEST_OUTPUT`/`END_TEST_OUTPUT` markers.
+- Token usage in `trajectory.json`; transcript parsers don't see it. Contract: write `/logs/verifier/reward.txt`.
+
+### Security / Credentials
+- **Never pass credentials via Docker `-e` flags.** They leak into trajectory HTML when an agent runs `env`. Use file-based injection: write to `/logs/agent/.credentials.json` with `chmod 600`.
+- `scripts/sanitize_secrets.py` redacts real API keys (Anthropic, OpenAI, Sourcegraph, GitHub, Daytona) at result generation time. Maintains allowlist for known fake benchmark fixtures.
+
+### Harness-Agnostic Verifiers
+- **no_changes_guard** must use `git diff origin/main HEAD` (not `git diff HEAD`) for agents that auto-commit (e.g., OpenHands). Otherwise the guard falsely penalizes normal OH behavior.
+- Verifier path fallback chains: use `${TASK_WORKDIR:-/workspace}` for working directory and `${TASK_REPO_ROOT:-${VERIFY_REPO:-/workspace}}` for repo root. Enables same verifier across Harbor and OpenHands.
+- Set `GOWORK=off` in test.sh when sg_only verifier restores full repo. The go.work file may require a newer Go version than the container provides.
 
 ### Validation / Scoring
-- `validators.py` is duplicated across `ccb_build` tasks. Changes must be applied to **all copies** (verify with `sha256sum`).
-- Install scripts that print "INSTALL_SUCCESS" regardless of actual outcome are common. Always verify the binary exists and is executable.
-- Agent completing in **<2 seconds** = agent never installed/ran (smoke test heuristic).
-- Trial directory names are truncated with hash suffixes (e.g., `c_api_graphql_expert_079_archite__pm9xcPn`). The real task name lives in `config.json` at `task.path`.
-- LoCoBench task IDs contain multi-word fields (e.g., `game_engine`, `cross_file_refactoring`). Use the 3-digit task number as a positional anchor for parsing instead of rigid regexes that assume single-word fields.
-- **no_changes_guard**: Python sets `reward = 0.0` but bash `echo "$score"` uses the original variable. Write `reward.txt` inside the Python block, not after it.
-- Wrap all test runners with `timeout 600`. Add `--forceExit` to Jest. Indefinite hangs (>2h) observed without timeout.
-- Jest + TypeScript needs 4-6GB RAM. Set `memory_mb = 8192` in `task.toml` for front-end test suites (default 2GB causes OOM).
-- **CSB dual-score**: agents produce file edits + `answer.json`; scored independently. Fallback: `promoted_verifier.py` → `oracle_checks.py` → heuristic.
-- Rate-limited results (score=0, duration <30s): quarantine with `scripts/quarantine_invalid_tasks.py --execute`.
+- `validators.py` duplicated across `ccb_build` tasks. Changes must hit **all copies** (verify with `sha256sum`).
+- Install scripts printing "INSTALL_SUCCESS" regardless of outcome are common. Verify binary exists.
+- Agent completing in **<2s** = never installed/ran. Trial dir names truncated with hash; real name in `config.json` at `task.path`.
+- LoCoBench task IDs have multi-word fields. Use 3-digit task number as positional anchor.
+- **no_changes_guard**: write `reward.txt` inside Python block, not in bash after it.
+- `timeout 600` on all test runners. `--forceExit` for Jest. Jest+TS needs `memory_mb = 8192`.
+- **CSB dual-score**: file edits + `answer.json` scored independently. Fallback: `promoted_verifier.py` -> `oracle_checks.py` -> heuristic.
+- Rate-limited results (score=0, <30s): `scripts/quarantine_invalid_tasks.py --execute`.
 - Bare `$VAR` in `instruction.md` gets expanded. Use `<placeholder>` syntax.
 
 ### Git / Auth
-- `gh auth refresh` without `-s <scope>` is a no-op for adding scopes. Must use `gh auth refresh -h github.com -s write:packages` explicitly.
-- Environment variables must be **explicitly exported** for Harbor subprocesses. Use `set -a` before sourcing `.env.local`.
-- Account readiness tracked in `runs/state/account_health.json`. Launchers source `configs/_common.sh` and filter unsafe accounts.
-- GitHub push protection blocks synthetic API keys. Squash with `git reset --soft origin/main`.
-- Shallow clones (`--depth 1`) fail on push. Always use full clones for repos that will be pushed.
-- Some repos use `master` as default branch. Detect with `git symbolic-ref refs/remotes/origin/HEAD`.
-- GitHub secret scanning blocks embedded secrets. Unblock via the `/security/secret-scanning/unblock-secret/` URL.
+- `gh auth refresh` needs explicit `-s <scope>`: `gh auth refresh -h github.com -s write:packages`.
+- Env vars must be **exported** for Harbor subprocesses. Use `set -a` before sourcing `.env.local`.
+- Account readiness: `runs/state/account_health.json`. Launchers source `configs/_common.sh`.
+- GitHub push protection blocks synthetic keys. Squash with `git reset --soft origin/main`.
+- Shallow clones fail on push. Some repos use `master`; detect with `git symbolic-ref refs/remotes/origin/HEAD`.
+- GitHub secret scanning: unblock via `/security/secret-scanning/unblock-secret/` URL.
 
 ### Python / Subprocess
 - `dict.get(key, default)` does NOT protect against `None` values. Use `data.get("key") or default_value`.
