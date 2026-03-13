@@ -65,7 +65,7 @@ curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/insta
 - After removing directories from the repo, also clean references from `scripts/sync_agent_guides.py` (`LOCAL_SOURCES`) and `scripts/docs_consistency_check.py` (`LOCAL_AGENT_TARGET_DIRS`).
 
 ### Daytona / Harbor
-- Daytona builds from Dockerfiles at sandbox creation. Fixes on `main` take effect next run (exception: pre-built GHCR base images need separate rebuild).
+- Daytona builds from Dockerfiles at sandbox creation. Fixes on `main` take effect next run (pre-built GHCR images need separate rebuild).
 - Harbor+Daytona (`harbor run --environment-type daytona`) is recommended. `scripts/daytona_runner.py` is for quick validation only.
 - `BASELINE_MCP_TYPE` env var: `none`, `sourcegraph`, `deepsearch`.
 - Use Daytona SDK (`daytona_sdk`) over CLI (CLI is interactive-only for SSH).
@@ -75,11 +75,12 @@ curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/insta
 - Registry types enum: `internal`, `organization`, `transient`, `backup`. Use `organization` for GHCR/Docker Hub.
 
 ### Docker / Build
-- `uv tool install` segfaults on ARM64/QEMU emulation. Use `pip install` instead, or switch to Daytona (native x86_64).
-- Build-push-clean pattern when building Docker images with limited disk (~45GB): build one image, push, then clean locally before the next.
-- Colons in agent names (e.g., `module:ClassName`) break Docker volume mounts. Sanitize paths: replace `:` with `__`.
+- `uv tool install` segfaults on ARM64/QEMU. Use `pip install` or Daytona (native x86_64).
+- Build-push-clean pattern for limited disk (~45GB): build, push, clean before next image.
+- Colons in agent names break Docker volume mounts. Replace `:` with `__`.
 - Add `|| git init` fallback to all `git clone` commands in Dockerfiles for network resilience. Applied to 269 Dockerfiles.
 - Add `chown claude:claude /logs` and `adduser claude` to Dockerfiles for cross-harness (OH) permission compatibility.
+- `jefzda/` → `ghcr.io/sg-evals/` migration incomplete: 33 active Dockerfiles in `csb/debug/` and `csb/fix/` still reference `jefzda/`.
 
 ### MCP Configuration (inside sandboxes)
 - `.mcp.json` at `$CLAUDE_CONFIG_DIR` (typically `/logs/agent/sessions/`), not `/app/` or `/root/`.
@@ -96,13 +97,15 @@ curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/insta
 - Token usage in `trajectory.json`; transcript parsers don't see it. Contract: write `/logs/verifier/reward.txt`.
 
 ### Security / Credentials
-- **Never pass credentials via Docker `-e` flags.** They leak into trajectory HTML when an agent runs `env`. Use file-based injection: write to `/logs/agent/.credentials.json` with `chmod 600`.
-- `scripts/sanitize_secrets.py` redacts real API keys (Anthropic, OpenAI, Sourcegraph, GitHub, Daytona) at result generation time. Maintains allowlist for known fake benchmark fixtures.
+- **Never pass credentials via Docker `-e` flags** (leak into trajectory HTML). Use file-based injection: `/logs/agent/.credentials.json` with `chmod 600`.
+- `scripts/sanitize_secrets.py` redacts real API keys at result generation time. Not yet integrated into `export_official_results.py` (manual invocation required).
+- `sanitize_secrets.py` `_FAKE_INDICATORS` substring matching is too broad -- `"example"`, `"test_key"`, `"dummy"` can bypass redaction of real secrets. Use exact-match `FAKE_KEY_ALLOWLIST` instead.
 
 ### Harness-Agnostic Verifiers
-- **no_changes_guard** must use `git diff origin/main HEAD` (not `git diff HEAD`) for agents that auto-commit (e.g., OpenHands). Otherwise the guard falsely penalizes normal OH behavior.
-- Verifier path fallback chains: use `${TASK_WORKDIR:-/workspace}` for working directory and `${TASK_REPO_ROOT:-${VERIFY_REPO:-/workspace}}` for repo root. Enables same verifier across Harbor and OpenHands.
-- Set `GOWORK=off` in test.sh when sg_only verifier restores full repo. The go.work file may require a newer Go version than the container provides.
+- **no_changes_guard** must use `git diff origin/main HEAD` (not `git diff HEAD`) for auto-committing agents (e.g., OpenHands).
+- Verifier fallbacks: `${TASK_WORKDIR:-/workspace}` for workdir, `${TASK_REPO_ROOT:-${VERIFY_REPO:-/workspace}}` for repo root.
+- Set `GOWORK=off` in test.sh when sg_only verifier restores full repo (go.work may need newer Go).
+- 6 tasks still hardcode `/workspace` without fallbacks: 3 in `csb_sdlc_understand` (document search), 3 in `csb_org_onboarding` (`answer.json`). Zero scores on non-Harbor harnesses.
 
 ### Validation / Scoring
 - `validators.py` duplicated across `ccb_build` tasks. Changes must hit **all copies** (verify with `sha256sum`).
@@ -114,6 +117,9 @@ curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/insta
 - **CSB dual-score**: file edits + `answer.json` scored independently. Fallback: `promoted_verifier.py` -> `oracle_checks.py` -> heuristic.
 - Rate-limited results (score=0, <30s): `scripts/quarantine_invalid_tasks.py --execute`.
 - Bare `$VAR` in `instruction.md` gets expanded. Use `<placeholder>` syntax.
+- Pass rate logic duplicated in `generate_eval_report.py` and `csb_metrics/models.py`. Sync both on changes.
+- `repo_health.py` fallback dict missing `prompt_hygiene` and `launch_policy` checks (3 of 5 only).
+- `cost_report.py`: `defaultdict(int)` + `.get("baseline", 1)` returns `0` when key exists. Use `or 1`.
 
 ### Git / Auth
 - `gh auth refresh` needs explicit `-s <scope>`: `gh auth refresh -h github.com -s write:packages`.
@@ -126,6 +132,7 @@ curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/insta
 ### Python / Subprocess
 - `dict.get(key, default)` does NOT protect against `None` values. Use `data.get("key") or default_value`.
 - `with open(log) as f: subprocess.Popen(stdout=f)` closes the handle. Use `open()` without context manager for long-running subprocesses.
+- `json.load(open(path))` leaks file descriptors. Use `with open(path) as f: json.load(f)`. Affects 12 scripts.
 - macOS Bash 3.2 lacks `declare -A`. Use pipe-delimited strings with `IFS='|' read -r`.
 
 ### LLM Judge
@@ -134,13 +141,17 @@ curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/insta
 - Tool categorization order matters: check MCP prefix (`mcp__`) before substring checks (e.g., `deep_search`) to avoid miscategorization of `mcp__deep_search`.
 
 ### OpenHands
-- `sandbox_plugins` is a list (not property). Strip ALL plugins (`= []`) -- `agent_skills` indexes `/workspace` at startup (120s timeout on large repos). TOML config has no effect in v1.4.0.
+- Strip ALL `sandbox_plugins` (`= []`) -- `agent_skills` indexes `/workspace` at startup (120s timeout). TOML config has no effect in v1.4.0.
 - `shlex.quote()` breaks on shell metacharacters (0% execution). Base64-encode instructions on host, decode inside container.
-- Background daemons outlive the main process and hang Daytona poll. Wrap with `pkill` cleanup; guard with `shutil.which('pkill')` (missing on minimal images).
+- Background daemons hang Daytona poll. Wrap with `pkill` cleanup; guard with `shutil.which('pkill')`.
 - Alpine lacks `apt-get` (OH installer requirement). Use `bookworm` variants.
 - OH MCP client has ~30s timeout. Block `deepsearch`/`deepsearch_read` in auth proxy; redirect to `keyword_search`/`nls_search`.
-- `chown -R /workspace` blocks port binding >120s on large repos. Edit installed `runtime_init.py` source -- monkey-patches don't propagate to action_execution_server subprocess.
+- `chown -R /workspace` blocks >120s on large repos. Edit installed `runtime_init.py` source directly.
 - Set `PYTHONSAFEPATH=1` to prevent repo-local packages from shadowing installed deps.
+
+### CI / Workflows
+- `docs-consistency.yml` is redundant -- subsumed by `repo_health.yml`. Doubles CI minutes.
+- Export HTML silently truncates at 1200 rows (`filtered.slice(0, 1200)` in `export_official_results.py`).
 
 ### Pre-commit / Pytest / Ralph
 - Secret-detection hooks false-positive on code that _detects_ secrets. Use `--no-verify` when flagged code is detection logic.
