@@ -5,22 +5,17 @@ Keep it small. Use it to route to the right workflow and local guide, not as the
 full operations manual.
 
 ## Non-Negotiables
-- All work happens on `main` by default. If you use feature branches, keep them small, short-lived, and easy to fast-forward back into `main`.
-- Every `harbor run` must be gated by interactive confirmation.
-- Before commit/push, run `python3 scripts/repo_health.py` (or `--quick` for docs/config-only changes).
-- Prefer a **remote execution environment** (e.g., Daytona) for large benchmark runs; use local Docker only when a task’s image or registry is incompatible with your cloud environment. See `docs/DAYTONA.md`.
-- Set **parallelism based on your own account and model limits**. Avoid exceeding documented concurrency or rate caps for your environment or provider.
-- Before launching any benchmark batch, check account readiness with `python3 scripts/check_infra.py` or `python3 scripts/account_health.py status`. Do not assume OAuth accounts are usable just because credentials exist.
+- All work on `main`. Feature branches: small, short-lived, fast-forward merge.
+- Every `harbor run` gated by interactive confirmation.
+- Before commit/push: `python3 scripts/repo_health.py` (or `--quick` for docs/config-only).
+- Prefer **Daytona** for large runs; local Docker only for incompatible tasks. See `docs/DAYTONA.md`.
+- Set parallelism to your account/model limits. Don’t exceed documented concurrency caps.
+- Pre-launch: `python3 scripts/check_infra.py` or `account_health.py status`. Don’t assume OAuth accounts work.
 
 ## Beads Prerequisite and Usage
-- Keep the Beads CLI (`bd`, alias `beads`) up to date before running agent workflows that rely on task graphs.
-- Install or update with the official installer:
-```bash
-curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
-```
-- Verify install/version with `bd --version` (or `beads --version`).
-- Do not use `bd edit`; use non-interactive `bd create/update/close --json` or stdin-based `--description=-`.
-- Typical flow: `bd ready --json`, `bd create ... --json`, `bd update <id> --claim`, `bd close <id> --reason "Done"`.
+- Install: `curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash`
+- Verify: `bd --version`. No `bd edit`; use `bd create/update/close --json` or `--description=-`.
+- Flow: `bd ready --json`, `bd create ... --json`, `bd update <id> --claim`, `bd close <id> --reason "Done"`.
 
 ## Minimal Loading Policy
 - Default load order: this file + one relevant skill + one relevant doc.
@@ -70,8 +65,7 @@ curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/insta
 - `BASELINE_MCP_TYPE` env var: `none`, `sourcegraph`, `deepsearch`.
 - Use Daytona SDK (`daytona_sdk`) over CLI (CLI is interactive-only for SSH).
 - GHCR packages default **private** for personal accounts; visibility change requires GitHub web UI.
-- Snapshot names are **positional**: `daytona snapshot create ccb-name`, NOT `--name`.
-- CLI/API version mismatch causes "Forbidden" errors. Keep CLI version in sync.
+- Snapshots are **positional** (`daytona snapshot create ccb-name`). CLI/API version mismatch → "Forbidden".
 - Registry types enum: `internal`, `organization`, `transient`, `backup`. Use `organization` for GHCR/Docker Hub.
 
 ### Docker / Build
@@ -100,7 +94,7 @@ curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/insta
 - **no_changes_guard** must use `git diff origin/main HEAD` (not `git diff HEAD`) for auto-committing agents (e.g., OpenHands).
 - Verifier fallbacks: `${TASK_WORKDIR:-/workspace}` for workdir, `${TASK_REPO_ROOT:-${VERIFY_REPO:-/workspace}}` for repo root.
 - Set `GOWORK=off` in test.sh when sg_only verifier restores full repo (go.work may need newer Go).
-- **122 active tasks** (259 total with backups) hardcode `ANSWER_PATH="/workspace/answer.json"` without fallbacks. Also check `ANSWER_JSON` variable in `answer_json_verifier_lib.sh`. All use same template pattern; bulk fix feasible. Zero scores on non-Harbor harnesses.
+- **122 active tasks** hardcode `ANSWER_PATH="/workspace/answer.json"`. Check `ANSWER_JSON` in verifier lib. Bulk fix feasible; zero scores on non-Harbor.
 
 ### Scripts / Code Quality
 - **abc_audit.py duplicate functions**: `check_oa_equivalent_solutions`, `check_ob_negated_solutions`, `check_og_determinism`, `check_t10_shared_state` each defined twice. Python uses last definition silently.
@@ -130,6 +124,12 @@ curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/insta
 ### Schema / Suite Naming
 - 3 schemas use deprecated `ccb_mcp_*` enums; actual names are `csb_org_*`. 8 schema files have zero consumers.
 - **16 copies of `DIR_PREFIX_TO_SUITE`** across 30+ scripts with divergent definitions. Centralize in `csb_metrics/suite_registry.py`.
+- Schema examples embed legacy suite names (`ccb_crossrepo`, `ccb_locobench`); should be `csb_org_*`/`csb_sdlc_*`.
+
+### Skills / Automation
+- **54 stale paths**: 25 skill files hardcode `~/CodeScaleBench` (actual `~/CodeContextBench`). Use `$(git rev-parse --show-toplevel)`.
+- **21 stale config refs**: `sourcegraph_full` in 14 skill files + 5 schemas. `BASELINE_MCP_TYPE=sourcegraph_full` is invalid (accepts `none`/`sourcegraph`/`deepsearch`).
+- **3 deprecated model IDs**: `claude-opus-4-5-20251101` → `claude-opus-4-6` in skills.
 
 ### Git / Auth
 - `gh auth refresh -h github.com -s write:packages` (explicit scope needed).
@@ -140,26 +140,24 @@ curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/insta
 - **Remote URL stale**: `CodeContextBench.git` redirects to `CodeScaleBench.git`. Update local git remote config.
 
 ### Python / Subprocess
-- `dict.get(key, default)` doesn't guard against `None`. Use `data.get("key") or default_value`.
-- `with open(log) as f: Popen(stdout=f)` closes handle. Use bare `open()` for long-running subprocesses.
-- `json.load(open(path))` leaks FDs; use `with open`. macOS Bash 3.2 lacks `declare -A`; use `IFS='|' read -r`.
+- `dict.get(key, default)` doesn't guard `None`; use `or default_value`. `json.load(open())` leaks FDs; use `with open`.
+- `with open(log) as f: Popen(stdout=f)` closes handle; use bare `open()`. macOS Bash 3.2 lacks `declare -A`.
+- No `pyproject.toml`/`requirements.txt`. 200+ scripts + 9 tests use `sys.path.insert` hack. Blocks packaging, onboarding.
 
 ### LLM Judge
-- Include "Respond with valid JSON only" in prompts. Unescaped quotes break parsing.
-- Task-type-aware rubrics. Check `mcp__` prefix before substring-based tool categorization.
+- "Respond with valid JSON only" in prompts. Task-type-aware rubrics. Check `mcp__` prefix before substring-based categorization.
 
 ### OpenHands
-- `sandbox_plugins = []`. Base64-encode instructions. Alpine → `bookworm`. MCP client ~30s timeout.
-- Block `deepsearch`/`deepsearch_read` in proxy; redirect to `keyword_search`/`nls_search`.
-- `chown -R /workspace` blocks on large repos. Edit `runtime_init.py`. Set `PYTHONSAFEPATH=1`.
+- `sandbox_plugins = []`. Base64-encode instructions. Alpine → `bookworm`. MCP client ~30s timeout. Block `deepsearch`/`deepsearch_read` in proxy.
+- `chown -R /workspace` blocks large repos; edit `runtime_init.py`. Set `PYTHONSAFEPATH=1`.
 
 ### CI / Workflows
 - `docs-consistency.yml` redundant (subsumed by `repo_health.yml`). Export HTML truncates at 1200 rows.
+- 4 workflows use 3 Python versions (3.10/3.11/3.12); standardize to 3.10. `roam.yml` unpinned `pip install roam-code`.
 
 ### Pre-commit / Pytest / Ralph
-- Secret-detection false-positives on detection code. Use `--no-verify` when flagged code is detection logic.
-- Classes named `TestPlan`/`TestCase`/`TestResult` auto-collected by pytest. Rename to `EvaluationPlan` etc.
-- Ralph: `progress.txt` on feature branches, compound after merge. `prd.json` is single-active; archive before overwrite.
+- Secret-detection false-positives: use `--no-verify` when flagged code is detection logic. Classes `TestPlan`/`TestCase`/`TestResult` auto-collected by pytest; rename.
+- Ralph: `prd.json` single-active; archive before overwrite. `prd-archive/` and `prd.json` not gitignored; risk of accidental commit.
 
 ## Maintenance
 - Root and local `AGENTS.md` / `CLAUDE.md` files are generated from sources in `docs/ops/`.
