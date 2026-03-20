@@ -111,14 +111,15 @@ full operations manual.
 - Pass rate logic duplicated in `generate_eval_report.py` and `csb_metrics/models.py`.
 - `cost_report.py`: `defaultdict(int)` + `.get("baseline", 1)` returns `0`. Use `or 1`.
 - **TARGET_SUITE**: 55 stale, 220 missing. `dual_score_lib.sh` `scorer_artifact` always `"auto"`.
-- **Falsy bugs**: `max_score=0` as false; `None` MCP metrics misclassified. `promote_run.py` crashes on non-dict env. `generate_eval_report.py:147` `mcp_mode or config_name` falls through on empty string.
+- **Falsy bugs**: `max_score=0` as false; `None` MCP metrics misclassified. `promote_run.py` crashes on non-dict env. `generate_eval_report.py:147,1005` `mcp_mode or config_name` falls through on empty string (both sites).
 - `models.py` `from_dict()` mutates caller's dict via `.pop()`.
 
 ### Agent / Runner Robustness
 - **Agent `/tmp` race**: `claude_baseline_agent.py:1134` uses fixed `/tmp/claude_system_prompt.txt`, `/tmp/claude_run.sh`. Concurrent tasks cross-contaminate. Use `mktemp`.
-- **Token refresh**: `claude_baseline_agent.py:1523` only catches `HTTPError`. Add `URLError`/`socket.timeout`. `e.read()` leaks socket FD; use `with e:`.
+- **Token refresh**: `claude_baseline_agent.py:1523` only catches `HTTPError`; add `URLError`/`socket.timeout`.
+- **LOCOBENCH path**: `claude_baseline_agent.py:31` `LOCOBENCH_CLAUDE_MD_TEMPLATE` hardcodes `/home/stephanie_jarmak/CodeScaleBench`; crash on other machines.
 - **Runner pipefail**: `run_selected_tasks.sh:681` `harbor_run_guarded | tee || echo` -- `||` applies to `tee` (always 0). Add `set -o pipefail`.
-- **Runner cleanup**: No `trap` for temp dirs on early exit. `mktemp` failure (line 648) silently copies to CWD.
+- **Runner cleanup**: No `trap` for temp dirs. `mktemp` failure (line 648) silently copies to CWD.
 - **`grep -P` macOS**: `run_selected_tasks.sh:726` + 12 task test.sh files silently fail on BSD grep. Use `sed -n` or POSIX alternatives.
 - **`_common.sh` sparse array**: `unset` + `pids=("${pids[@]}")` doesn't compact sparse arrays in Bash; gaps persist (lines 1344-1352).
 
@@ -149,13 +150,13 @@ full operations manual.
 - Secret-detection false-positives: use `--no-verify` when flagged code is detection logic.
 - Ralph: `prd.json` single-active; archive before overwrite. `prd-archive/` and `prd.json` not gitignored.
 
-### Scripts / Code Quality (Mar 17 additions)
-- `apply_verifier_fixes.py:9` hardcodes `~/CodeScaleBench` path; fails on other machines.
-- `context_retrieval_agent.py:432,544,552,584` `shell=True` + "no allowlist" (line 429); injection risk.
-- Non-atomic writes: `aggregate_status.py:669`, `apply_verifier_fixes.py:103,117,134`; use temp+rename.
-- Bare `except:`: `audit_v2_report_data.py:104`, `ds_audit.py:244,288`, `extract_v2_report_data.py:144,286`.
-- FD leaks: 17+ sites: `daytona_curator_runner.py:564`, `generate_csb_org_tasks.py:494`, `generate_promoted_verifiers.py:220`, `sync_oracle_files.py:50`, `validate_task_run.py:217`.
-- **Ruff** S603/S604, SIM115, BLE001 catch shell injection, FD leaks, bare excepts; add `pyproject.toml`. SIM115 skips `Popen(stdout=f)` (fix manually). `sanitize_secrets.py`: per-file S105/S106 ignores (intentional fake keys).
+### Scripts / Code Quality (Mar 17-18 additions)
+- `apply_verifier_fixes.py:9` hardcodes `~/CodeScaleBench` path; crash on other machines.
+- `context_retrieval_agent.py:432+` `shell=True` without allowlist; injection risk.
+- Non-atomic writes: `aggregate_status.py:669`, `apply_verifier_fixes.py:103+`; use temp+rename.
+- Bare `except:`: `audit_v2_report_data.py:104`, `ds_audit.py:244+`, `extract_v2_report_data.py:144+`.
+- FD leaks: 17+ sites; use `with open()`. `export_official_results.py:45` `DEFAULT_REPO_BLOB_BASE` → old org `CodeScaleBench`; links 404.
+- **Ruff** S603/S604, SIM115, BLE001; add `pyproject.toml`. SIM115 skips `Popen(stdout=f)`. `sanitize_secrets.py`: S105/S106 per-file ignores.
 
 ## Maintenance
 - Root and local `AGENTS.md` / `CLAUDE.md` files are generated from sources in `docs/ops/`.
