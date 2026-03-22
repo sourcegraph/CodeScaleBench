@@ -114,7 +114,7 @@ full operations manual.
 
 ### Agent / Runner Robustness
 - **Agent `/tmp` race**: `claude_baseline_agent.py:1134` uses fixed `/tmp/claude_system_prompt.txt`, `/tmp/claude_run.sh`. Concurrent tasks cross-contaminate. Use `mktemp`.
-- **Token refresh**: `claude_baseline_agent.py:1523` only catches `HTTPError`; add `URLError`/`socket.timeout`.
+- **Token refresh**: `claude_baseline_agent.py:1523`, `daytona_runner.py:220`, `daytona_poc_runner.py:197` only catch `HTTPError`; add `URLError`/`socket.timeout`.
 - **LOCOBENCH path**: `claude_baseline_agent.py:31` `LOCOBENCH_CLAUDE_MD_TEMPLATE` hardcodes `/home/stephanie_jarmak/CodeScaleBench`; crash on other machines.
 - **Runner pipefail**: `run_selected_tasks.sh:681` `harbor_run_guarded | tee || echo` -- `||` applies to `tee` (always 0). Add `set -o pipefail`.
 - **Runner cleanup**: No `trap` for temp dirs. `mktemp` failure (line 648) silently copies to CWD.
