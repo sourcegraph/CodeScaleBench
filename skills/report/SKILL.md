@@ -1,6 +1,6 @@
 ---
 name: report
-description: Generate evaluation reports, analyze run costs, and compare configurations.
+description: "Generate CodeScaleBench evaluation reports, analyze benchmark run costs, and compare baseline vs MCP configuration performance. Use when the user asks for benchmark results, cost breakdowns, config comparisons, MCP impact analysis, or pass-rate summaries."
 ---
 
 # Skill: Reports & Analysis
@@ -8,41 +8,39 @@ description: Generate evaluation reports, analyze run costs, and compare configu
 ## Scope
 
 Use this skill when the user asks to:
-- Generate comprehensive evaluation reports
-- Analyze run costs and spending
-- Compare configurations and model performance
-- Perform impact analysis (IR, MCP effects)
-- Export and visualize results
+- Generate evaluation reports for benchmark runs
+- Analyze run costs and token spending by model or suite
+- Compare baseline vs MCP (Sourcegraph) configuration performance
+- Assess information retrieval (IR) and oracle impact
+- Summarize pass rates, model success, or cost-per-task metrics
 
-## Canonical Commands
+## Reporting Workflow
 
-```bash
-# Generate full evaluation report
-python3 scripts/maintenance/generate_eval_report.py
+1. **Verify run completion** — confirm runs finished before reporting:
+   ```bash
+   python3 scripts/analysis/aggregate_status.py --staging
+   ```
+   If completion rate is below target, use `/status` to investigate before generating reports.
 
-# Cost breakdown analysis
-python3 scripts/evaluation/cost_report.py --run-dir runs/staging/run_dir
+2. **Generate the report** — pick the command matching your goal (see "When to Use Which Report" below).
 
-# Cost analysis by model/suite
-python3 scripts/evaluation/cost_breakdown_analysis.py --staging
+3. **Compare configurations** — for A/B analysis between baseline and MCP:
+   ```bash
+   python3 scripts/evaluation/compare_configs.py --config1 baseline --config2 sourcegraph_full
+   ```
 
-# Compare configurations
-python3 scripts/evaluation/compare_configs.py --config1 baseline --config2 sourcegraph_full
+4. **Review and share** — check output for anomalies (unexpected zero scores, missing suites) before sharing results.
 
-# IR analysis (information retrieval)
-python3 scripts/evaluation/ir_analysis.py --run-dir runs/staging/run_dir
+## When to Use Which Report
 
-# Oracle impact analysis
-python3 scripts/evaluation/oracle_ir_analysis.py --runs-dir runs/staging
-```
-
-## Report Types
-
-- **Evaluation Report** — task-level metrics, pass rates by suite/model
-- **Cost Report** — token usage, API calls, infrastructure costs
-- **Config Comparison** — baseline vs MCP performance delta
-- **Impact Analysis** — retrieval quality and verifier contribution
-- **Trend Analysis** — performance over time across runs
+| Goal | Command |
+|------|---------|
+| Full evaluation summary (pass rates, model scores) | `python3 scripts/maintenance/generate_eval_report.py` |
+| Cost breakdown for a single run | `python3 scripts/evaluation/cost_report.py --run-dir runs/staging/<run>` |
+| Cost comparison across models/suites | `python3 scripts/evaluation/cost_breakdown_analysis.py --staging` |
+| Baseline vs MCP performance delta | `python3 scripts/evaluation/compare_configs.py --config1 baseline --config2 sourcegraph_full` |
+| Retrieval quality (IR tasks) | `python3 scripts/evaluation/ir_analysis.py --run-dir runs/staging/<run>` |
+| Oracle and verifier contribution | `python3 scripts/evaluation/oracle_ir_analysis.py --runs-dir runs/staging` |
 
 ## Key Metrics
 
