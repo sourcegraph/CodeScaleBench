@@ -40,11 +40,13 @@ CONFIGS_SET = {
 
 
 def norm_task(name: str) -> str:
+    # Task IDs were renamed from CCX-* to ccx-*; fold case so both spellings
+    # merge into one task instead of colliding on case-insensitive filesystems.
     for prefix in ("mcp_", "bl_", "sgonly_", "artifact_"):
         if name.startswith(prefix):
             name = name[len(prefix):]
     name = re.sub(r"__[A-Za-z0-9]{7}$", "", name)
-    return re.sub(r"_+[A-Za-z0-9]{4,8}$", "", name)
+    return re.sub(r"_+[A-Za-z0-9]{4,8}$", "", name).lower()
 
 
 def scan_results(scan_dirs: list[Path], model_short: str) -> dict:
